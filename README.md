@@ -1,3 +1,6 @@
+<img width="1025" height="672" alt="image" src="https://github.com/user-attachments/assets/6f68cbeb-dfa3-40dc-b7dd-222f1583a07b" />
+
+
 # MarketView
 
 Real-time market data dashboard built with Gradio and the Alpaca streaming API. Shows live candlestick bars, trade volume profile, and news for any US equity.
