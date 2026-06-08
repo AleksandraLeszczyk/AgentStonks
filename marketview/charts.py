@@ -368,29 +368,30 @@ def _add_avg_lines(
         )
 
 
-def _add_vwap(df: pd.DataFrame, fig: go.Figure, show_candle_body: bool = True) -> None:
-    """Per-bar VWAP from Alpaca's vw field, drawn as tick marks in data coordinates."""
-    if "vw" not in df.columns:
+def _add_vwap(df: pd.DataFrame, fig: go.Figure, vwap_style: str = "dot", show_candle_body: bool = True) -> None:
+    """Per-bar VWAP from Alpaca's vw field. vwap_style: 'line', 'dot', or 'hide'."""
+    if "vw" not in df.columns or vwap_style == "hide":
         return
 
-    if show_candle_body:
+    if vwap_style == "line":
         fig.add_trace(
             go.Scatter(
                 x=df["t"],
                 y=df["vw"],
-                mode="markers",
+                mode="lines",
                 name="VWAP",
-                marker=dict(symbol="circle", color="#000000", size=6),
+                line=dict(color="#000000", width=1.5),
                 opacity=0.9,
                 hovertemplate="<b>VWAP:</b> %{y:.4f}<extra></extra>",
             ),
             row=1, col=1,
         )
     else:
-        marker_colors = [
-            PALETTE["up"] if c >= o else PALETTE["down"]
-            for c, o in zip(df["c"], df["o"])
-        ]
+        marker_colors = (
+            "#000000"
+            if show_candle_body
+            else [PALETTE["up"] if c >= o else PALETTE["down"] for c, o in zip(df["c"], df["o"])]
+        )
         fig.add_trace(
             go.Scatter(
                 x=df["t"],
@@ -460,7 +461,7 @@ def build_chart(
     gaussian_max_components: int = 0,
     show_gaussian_centers: bool = False,
     daily_bars: Optional[list[dict]] = None,
-    show_vwap: bool = False,
+    vwap_style: str = "hide",
     show_candle_body: bool = True,
     show_whiskers: bool = True,
 ) -> go.Figure:
@@ -582,8 +583,8 @@ def build_chart(
                 col=1,
             )
 
-    if show_vwap:
-        _add_vwap(df, fig, show_candle_body=show_candle_body)
+    if vwap_style != "hide":
+        _add_vwap(df, fig, vwap_style=vwap_style, show_candle_body=show_candle_body)
 
     if ma_periods:
         _add_moving_averages(df, fig, ma_periods)

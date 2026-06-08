@@ -152,7 +152,7 @@ def _live_panel() -> None:
             gaussian_max_components=state.gaussian_max_components,
             show_gaussian_centers=state.show_gaussian_centers,
             daily_bars=state.daily_bars,
-            show_vwap=state.show_vwap,
+            vwap_style=state.vwap_style,
             show_candle_body=state.show_candle_body,
             show_whiskers=state.show_whiskers,
         )
@@ -196,7 +196,7 @@ def build_ui() -> None:
         st.subheader("Candle")
         show_candle_body = st.checkbox("Body", value=True)
         show_whiskers = st.checkbox("Whiskers", value=True)
-        show_vwap = st.checkbox("VWAP", value=False)
+        vwap_style = st.selectbox("VWAP", ["hide", "dot", "line"], index=0)
 
         st.subheader("Overlays")
         vwma_selection = st.multiselect(
@@ -235,7 +235,7 @@ def build_ui() -> None:
     state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
     state.show_candle_body = show_candle_body
     state.show_whiskers = show_whiskers
-    state.show_vwap = show_vwap
+    state.vwap_style = vwap_style
     state.show_fib = show_fib
     state.gaussian_max_components = max_components if fit_enabled else 0
     state.show_gaussian_centers = show_gaussian_centers if fit_enabled else False

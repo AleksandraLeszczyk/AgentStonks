@@ -28,7 +28,7 @@ _DEFAULTS: dict[str, object] = {
     "show_1y_avg": False,
     "gaussian_max_components": 0,
     "show_gaussian_centers": False,
-    "show_vwap": False,
+    "vwap_style": "hide",
     "show_candle_body": True,
     "show_whiskers": True,
 }
@@ -57,7 +57,7 @@ class AppState:
         self.show_1y_avg: bool = False
         self.gaussian_max_components: int = 0
         self.show_gaussian_centers: bool = False
-        self.show_vwap: bool = False
+        self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_whiskers: bool = True
 
