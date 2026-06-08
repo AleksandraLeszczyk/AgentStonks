@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 import websocket
@@ -9,8 +10,23 @@ from .config import BARS_STREAM_URL, NEWS_STREAM_URL
 from .state import AppState
 
 
-def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState) -> None:
+_TF_MINUTES: dict[str, int] = {
+    "1Min": 1, "5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60, "1Day": 1440,
+}
+
+
+def _floor_ts(ts: str, minutes: int) -> str:
+    """Floor an ISO timestamp to the nearest N-minute bucket."""
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    total = dt.hour * 60 + dt.minute
+    floored = (total // minutes) * minutes
+    dt = dt.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
+    return dt.isoformat()
+
+
+def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
     """Open Alpaca WebSocket and stream real-time bars and trades into state."""
+    tf_minutes = _TF_MINUTES.get(timeframe, 1)
 
     def on_open(ws: websocket.WebSocketApp) -> None:
         ws.send(json.dumps({"action": "auth", "key": key, "secret": secret}))
@@ -34,8 +50,20 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 state.status = f"✅ Streaming {symbol} ({feed.upper()})"
             elif t == "b" and msg.get("S") == symbol:
                 bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v") if k in msg}
-                with state.lock:
-                    state.bars.append(bar)
+                if tf_minutes == 1:
+                    with state.lock:
+                        state.bars.append(bar)
+                else:
+                    bucket = _floor_ts(bar["t"], tf_minutes)
+                    with state.lock:
+                        if state.bars and state.bars[-1]["t"] == bucket:
+                            last = state.bars[-1]
+                            last["h"] = max(last["h"], bar["h"])
+                            last["l"] = min(last["l"], bar["l"])
+                            last["c"] = bar["c"]
+                            last["v"] = last["v"] + bar["v"]
+                        else:
+                            state.bars.append({**bar, "t": bucket})
             elif t == "t" and msg.get("S") == symbol:
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
                 with state.lock:
@@ -61,7 +89,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
     ws.run_forever(ping_interval=20, ping_timeout=10)
 
 
-def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState) -> None:
+def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
     """Close any existing bars/trades stream and start a new background thread."""
     if state.ws:
         try:
@@ -71,7 +99,7 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         time.sleep(0.5)
 
     threading.Thread(
-        target=_start_stream, args=(symbol, key, secret, feed, state), daemon=True
+        target=_start_stream, args=(symbol, key, secret, feed, state, timeframe), daemon=True
     ).start()
 
 

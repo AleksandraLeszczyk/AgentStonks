@@ -9,17 +9,28 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, Optional
 
 import pandas as pd
 import requests
-from openai import OpenAI
 from pydantic import BaseModel
 
 
+ImpactLabel = Literal["positive", "negative", "neutral", "small", "unknown"]
+
+
 class Impact(BaseModel):
-    impact_type: Literal["positive", "negative", "neutral"] | None
-    impact_scale: Literal["small", "medium", "large"] | None
+    impact_type: Optional[Literal["positive", "negative", "neutral"]] = None
+    impact_scale: Optional[Literal["small", "medium", "large"]] = None
+
+
+class _SingleImpact(BaseModel):
+    index: int
+    impact: ImpactLabel
+
+
+class _BatchImpact(BaseModel):
+    scores: list[_SingleImpact]
 
 
 class News(BaseModel):
@@ -27,8 +38,8 @@ class News(BaseModel):
     text: str
     timestamp: str
     url: str
-    sentiment: float | None = None
-    impact: Impact | None = None
+    sentiment: Optional[float] = None
+    impact: Optional[Impact] = None
 
 
 class SelectedNews(BaseModel):
@@ -132,6 +143,7 @@ _IMPACT_FORMAT = (
 
 def estimate_impact_news(symbol: str, news: list[News]) -> list[News]:
     """Score each news item for market impact using Gemini via OpenAI-compat API."""
+    from openai import OpenAI
     client = OpenAI(
         api_key=os.environ["GEMINI_API_KEY"],
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -166,6 +178,7 @@ _SELECTION_FORMAT = r'Answer only as JSON: {"news": [{"title": str, "text": str}
 
 def select_important_news(symbol: str, news: list[News], top_n: int = 10) -> list[News]:
     """Use LLM to pick the most market-relevant articles from a larger list."""
+    from openai import OpenAI
     client = OpenAI(
         api_key=os.environ["GEMINI_API_KEY"],
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -200,3 +213,65 @@ def get_most_important_news_week(keyword: str, symbol: str, worldnews_api_key: s
     """Fetch a week of news by keyword, then filter to the most impactful ones."""
     last_week = get_last_week_news(keywords=keyword, worldnews_api_key=worldnews_api_key)
     return select_important_news(symbol=symbol, news=last_week)
+
+
+_SCORE_SYSTEM = """\
+You are a financial analyst. For each numbered news item, determine its impact on the given stock symbol.
+
+REASONING RULES (apply in order):
+1. If the news is DIRECTLY about the symbol → assess sentiment normally.
+2. If the news is about a DIRECT COMPETITOR → invert: competitor's good news = negative for symbol; competitor's bad news = positive for symbol.
+3. If the news is about the BROADER SECTOR or MACRO → assess indirect relevance to the symbol.
+4. If it is unclear → use "unknown".
+
+Impact labels:
+  "positive" – likely pushes the symbol's stock UP
+  "negative" – likely pushes the symbol's stock DOWN
+  "neutral"  – unlikely to move the symbol significantly
+  "small"    – minor effect expected (either direction)
+  "unknown"  – cannot determine impact on this symbol
+"""
+
+
+def score_news_impacts(symbol: str, news_items: list[dict], api_key: str) -> dict[str, str]:
+    """Score all news items in a single LLM call. Returns {news_id: impact_label}."""
+    if not news_items:
+        return {}
+
+    from openai import OpenAI
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+
+    numbered = "\n".join(
+        f"{i}. Headline: {item.get('headline', '')} | "
+        f"Summary: {_clean_text(item.get('summary') or item.get('content') or '')}"
+        for i, item in enumerate(news_items)
+    )
+
+    completion = client.chat.completions.parse(
+        model="gemini-2.0-flash",
+        messages=[
+            {"role": "system", "content": _SCORE_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Symbol: {symbol}\n\n"
+                    f"News articles:\n{numbered}\n\n"
+                    f"Return a JSON object with key \"scores\" containing an array of "
+                    f"{{\"index\": <int>, \"impact\": <label>}} for each article."
+                ),
+            },
+        ],
+        response_format=_BatchImpact,
+    )
+
+    scored = completion.choices[0].message.parsed
+    result: dict[str, str] = {}
+    for entry in scored.scores:
+        if 0 <= entry.index < len(news_items):
+            news_id = str(news_items[entry.index].get("id", ""))
+            if news_id:
+                result[news_id] = entry.impact
+    return result
