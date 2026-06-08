@@ -21,7 +21,7 @@ def _get_state() -> AppState:
 
 
 def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
-    mapping = {"VWAP(5)": 5, "VWAP(15)": 15, "VWAP(60)": 60}
+    mapping = {"VWMA(5)": 5, "VWMA(15)": 15, "VWMA(60)": 60}
     return [mapping[s] for s in ma_selection if s in mapping]
 
 
@@ -153,6 +153,8 @@ def _live_panel() -> None:
             show_gaussian_centers=state.show_gaussian_centers,
             daily_bars=state.daily_bars,
             show_vwap=state.show_vwap,
+            show_candle_body=state.show_candle_body,
+            show_whiskers=state.show_whiskers,
         )
         if (state.symbol and bars)
         else empty_chart()
@@ -191,10 +193,15 @@ def build_ui() -> None:
             type="password",
             placeholder="From env ALPACA_SECRET if blank",
         )
+        st.subheader("Candle")
+        show_candle_body = st.checkbox("Body", value=True)
+        show_whiskers = st.checkbox("Whiskers", value=True)
+        show_vwap = st.checkbox("VWAP", value=False)
+
         st.subheader("Overlays")
-        vwAP_selection = st.multiselect(
-            "VWAP",
-            ["VWAP(5)", "VWAP(15)", "VWAP(60)"],
+        vwma_selection = st.multiselect(
+            "VWMA",
+            ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
             default=[],
         )
         avg_selection = st.multiselect(
@@ -202,7 +209,6 @@ def build_ui() -> None:
             ["7d Avg", "28d Avg", "1y Avg"],
             default=[],
         )
-        show_vwap = st.checkbox("VWAP", value=False)
         show_fib = st.checkbox("Fibonacci levels", value=False)
 
         with st.expander("Price Profile Fit"):
@@ -225,8 +231,10 @@ def build_ui() -> None:
         stop_clicked = c2.button("⏹ Stop", use_container_width=True)
 
     state = _get_state()
-    state.ma_periods = _parse_ma_periods(vwAP_selection)
+    state.ma_periods = _parse_ma_periods(vwma_selection)
     state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
+    state.show_candle_body = show_candle_body
+    state.show_whiskers = show_whiskers
     state.show_vwap = show_vwap
     state.show_fib = show_fib
     state.gaussian_max_components = max_components if fit_enabled else 0

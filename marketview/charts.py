@@ -307,7 +307,7 @@ def _add_moving_averages(df: pd.DataFrame, fig: go.Figure, periods: list[int]) -
                 x=df["t"],
                 y=vwap,
                 mode="lines",
-                name=f"VWAP({period})",
+                name=f"VWMA({period})",
                 line=dict(color=MA_COLORS.get(period, "#ffffff"), width=1.5, dash="solid"),
                 opacity=0.85,
             ),
@@ -368,23 +368,41 @@ def _add_avg_lines(
         )
 
 
-def _add_vwap(df: pd.DataFrame, fig: go.Figure) -> None:
-    """Per-bar VWAP from Alpaca's vw field."""
+def _add_vwap(df: pd.DataFrame, fig: go.Figure, show_candle_body: bool = True) -> None:
+    """Per-bar VWAP from Alpaca's vw field, drawn as tick marks in data coordinates."""
     if "vw" not in df.columns:
         return
-    fig.add_trace(
-        go.Scatter(
-            x=df["t"],
-            y=df["vw"],
-            mode="markers",
-            name="VWAP",
-            marker=dict(color="#000000", size=4),
-            opacity=0.9,
-            hovertemplate="<b>VWAP:</b> %{y:.4f}<extra></extra>",
-        ),
-        row=1,
-        col=1,
-    )
+
+    if show_candle_body:
+        fig.add_trace(
+            go.Scatter(
+                x=df["t"],
+                y=df["vw"],
+                mode="markers",
+                name="VWAP",
+                marker=dict(symbol="circle", color="#000000", size=6),
+                opacity=0.9,
+                hovertemplate="<b>VWAP:</b> %{y:.4f}<extra></extra>",
+            ),
+            row=1, col=1,
+        )
+    else:
+        marker_colors = [
+            PALETTE["up"] if c >= o else PALETTE["down"]
+            for c, o in zip(df["c"], df["o"])
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=df["t"],
+                y=df["vw"],
+                mode="markers",
+                name="VWAP",
+                marker=dict(symbol="circle", color=marker_colors, size=6),
+                opacity=0.9,
+                hovertemplate="<b>VWAP:</b> %{y:.4f}<extra></extra>",
+            ),
+            row=1, col=1,
+        )
 
 
 def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
@@ -421,6 +439,13 @@ def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
         )
 
 
+def _bar_width_ms(df: pd.DataFrame) -> float:
+    if len(df) < 2:
+        return 60_000
+    delta_ms = float(df["t"].diff().dropna().dt.total_seconds().median() * 1000)
+    return delta_ms * 0.8
+
+
 def build_chart(
     bars: list[dict],
     news: list[dict],
@@ -436,6 +461,8 @@ def build_chart(
     show_gaussian_centers: bool = False,
     daily_bars: Optional[list[dict]] = None,
     show_vwap: bool = False,
+    show_candle_body: bool = True,
+    show_whiskers: bool = True,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -471,21 +498,46 @@ def build_chart(
     else:
         gmm_components = []
 
-    fig.add_trace(
-        go.Candlestick(
-            x=df["t"],
-            open=df["o"],
-            high=df["h"],
-            low=df["l"],
-            close=df["c"],
-            name=symbol,
-            increasing=dict(line=dict(color=PALETTE["up"], width=1), fillcolor=PALETTE["up"]),
-            decreasing=dict(line=dict(color=PALETTE["down"], width=1), fillcolor=PALETTE["down"]),
-            whiskerwidth=0.2,
-        ),
-        row=1,
-        col=1,
-    )
+    body_colors = [PALETTE["up"] if c >= o else PALETTE["down"] for c, o in zip(df["c"], df["o"])]
+    body_base = [min(o, c) for o, c in zip(df["o"], df["c"])]
+    body_height = [abs(c - o) for o, c in zip(df["o"], df["c"])]
+
+    if show_candle_body:
+        fig.add_trace(
+            go.Bar(
+                x=df["t"],
+                y=body_height,
+                base=body_base,
+                marker_color=body_colors,
+                marker_line_width=0,
+                name=symbol,
+                width=_bar_width_ms(df),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if show_whiskers:
+        for direction, color in (("up", PALETTE["up"]), ("down", PALETTE["down"])):
+            wx, wy = [], []
+            for t, lo, hi, o, c in zip(df["t"], df["l"], df["h"], df["o"], df["c"]):
+                if (c >= o) != (direction == "up"):
+                    continue
+                wx += [t, t, None]
+                wy += [lo, hi, None]
+            if wx:
+                fig.add_trace(
+                    go.Scatter(
+                        x=wx,
+                        y=wy,
+                        mode="lines",
+                        line=dict(color=color, width=1),
+                        name="Wicks",
+                        showlegend=False,
+                    ),
+                    row=1,
+                    col=1,
+                )
 
     vol_colors = [
         PALETTE["up"] if c >= o else PALETTE["down"]
@@ -531,7 +583,7 @@ def build_chart(
             )
 
     if show_vwap:
-        _add_vwap(df, fig)
+        _add_vwap(df, fig, show_candle_body=show_candle_body)
 
     if ma_periods:
         _add_moving_averages(df, fig, ma_periods)
