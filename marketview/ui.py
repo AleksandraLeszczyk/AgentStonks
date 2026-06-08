@@ -180,6 +180,9 @@ def build_ui() -> None:
 
     with st.sidebar:
         st.header("Controls")
+        c1, c2 = st.columns(2)
+        start_clicked = c1.button("▶ Start", type="primary", use_container_width=True)
+        stop_clicked = c2.button("⏹ Stop", use_container_width=True)
         symbol = st.text_input("Symbol", value="AAPL", placeholder="AAPL, TSLA, MSFT…")
         timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
         feed = st.selectbox("Feed", FEEDS, index=0)
@@ -226,9 +229,6 @@ def build_ui() -> None:
                 disabled=not fit_enabled,
             )
 
-        c1, c2 = st.columns(2)
-        start_clicked = c1.button("▶ Start", type="primary", use_container_width=True)
-        stop_clicked = c2.button("⏹ Stop", use_container_width=True)
 
     state = _get_state()
     state.ma_periods = _parse_ma_periods(vwma_selection)
