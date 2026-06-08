@@ -463,6 +463,7 @@ def build_chart(
     daily_bars: Optional[list[dict]] = None,
     vwap_style: str = "hide",
     show_candle_body: bool = True,
+    show_percentile_body: bool = False,
     show_whiskers: bool = True,
 ) -> go.Figure:
     if not bars:
@@ -512,6 +513,46 @@ def build_chart(
                 marker_color=body_colors,
                 marker_line_width=0,
                 name=symbol,
+                width=_bar_width_ms(df),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if show_percentile_body:
+        # Fallback: OHLCV-based approximation (20%/80% of the bar's wick range)
+        p20 = (df["l"] + 0.2 * (df["h"] - df["l"])).values.copy()
+        p80 = (df["l"] + 0.8 * (df["h"] - df["l"])).values.copy()
+
+        if not df_trades.empty:
+            # Override fallback with actual trade percentiles where data exists
+            bar_ts = df["t"].sort_values()
+            last_gap = (bar_ts.iloc[-1] - bar_ts.iloc[-2]) if len(bar_ts) >= 2 else pd.Timedelta(minutes=1)
+            bins = pd.DatetimeIndex(bar_ts.tolist() + [bar_ts.iloc[-1] + last_gap])
+            trade_t = df_trades["t"]
+            if trade_t.dt.tz is None:
+                trade_t = trade_t.dt.tz_localize("UTC")
+            else:
+                trade_t = trade_t.dt.tz_convert("UTC")
+            bin_idx = pd.cut(trade_t, bins=bins, right=False, labels=False)
+            df_binned = pd.DataFrame({"bin_idx": bin_idx, "p": df_trades["p"].values}).dropna(subset=["bin_idx"])
+            df_binned["bin_idx"] = df_binned["bin_idx"].astype(int)
+            pct = df_binned.groupby("bin_idx")["p"].quantile([0.2, 0.8]).unstack()
+            pct.columns = ["p20", "p80"]
+            for i, row in pct.iterrows():
+                p20[i] = row["p20"]
+                p80[i] = row["p80"]
+
+        pct_colors = [PALETTE["up"] if c >= o else PALETTE["down"] for c, o in zip(df["c"], df["o"])]
+        fig.add_trace(
+            go.Bar(
+                x=df["t"],
+                y=p80 - p20,
+                base=p20,
+                marker_color=pct_colors,
+                marker_line_width=0,
+                opacity=0.45,
+                name="20%-80%",
                 width=_bar_width_ms(df),
             ),
             row=1,
@@ -584,7 +625,7 @@ def build_chart(
             )
 
     if vwap_style != "hide":
-        _add_vwap(df, fig, vwap_style=vwap_style, show_candle_body=show_candle_body)
+        _add_vwap(df, fig, vwap_style=vwap_style, show_candle_body=show_candle_body or show_percentile_body)
 
     if ma_periods:
         _add_moving_averages(df, fig, ma_periods)

@@ -30,6 +30,7 @@ _DEFAULTS: dict[str, object] = {
     "show_gaussian_centers": False,
     "vwap_style": "hide",
     "show_candle_body": True,
+    "show_percentile_body": False,
     "show_whiskers": True,
 }
 
@@ -59,6 +60,7 @@ class AppState:
         self.show_gaussian_centers: bool = False
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
+        self.show_percentile_body: bool = False
         self.show_whiskers: bool = True
 
     def __getattr__(self, name: str) -> object:

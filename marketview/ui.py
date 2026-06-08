@@ -154,6 +154,7 @@ def _live_panel() -> None:
             daily_bars=state.daily_bars,
             vwap_style=state.vwap_style,
             show_candle_body=state.show_candle_body,
+            show_percentile_body=state.show_percentile_body,
             show_whiskers=state.show_whiskers,
         )
         if (state.symbol and bars)
@@ -197,7 +198,8 @@ def build_ui() -> None:
             placeholder="From env ALPACA_SECRET if blank",
         )
         st.subheader("Candle")
-        show_candle_body = st.checkbox("Body", value=True)
+        show_candle_body = st.checkbox("Open-Close", value=True)
+        show_percentile_body = st.checkbox("20%-80%", value=False)
         show_whiskers = st.checkbox("Whiskers", value=True)
         vwap_style = st.selectbox("VWAP", ["hide", "dot", "line"], index=0)
 
@@ -234,6 +236,7 @@ def build_ui() -> None:
     state.ma_periods = _parse_ma_periods(vwma_selection)
     state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
     state.show_candle_body = show_candle_body
+    state.show_percentile_body = show_percentile_body
     state.show_whiskers = show_whiskers
     state.vwap_style = vwap_style
     state.show_fib = show_fib
