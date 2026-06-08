@@ -64,6 +64,33 @@ def fetch_trades(
     return r.json().get("trades", {}).get(symbol, [])
 
 
+def fetch_daily_bars(
+    symbol: str,
+    key: str,
+    secret: str,
+    feed: str = "iex",
+    lookback_days: int = 365,
+) -> list[dict]:
+    """Fetch daily OHLCV bars going back lookback_days for multi-day avg computations."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=lookback_days)
+    r = requests.get(
+        f"{DATA_REST}/v2/stocks/bars",
+        headers=_headers(key, secret),
+        params=dict(
+            symbols=symbol,
+            timeframe="1Day",
+            start=start.isoformat(),
+            end=end.isoformat(),
+            limit=lookback_days + 10,
+            feed=feed,
+        ),
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json().get("bars", {}).get(symbol, [])
+
+
 def fetch_news(
     symbol: str,
     key: str,

@@ -1,12 +1,13 @@
 import colorsys
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from .config import PALETTE
+from .config import AVG_LINE_COLORS, FIB_LEVELS, MA_COLORS, PALETTE
 
 
 def empty_chart(msg: str = "Enter a symbol and click Start") -> go.Figure:
@@ -32,12 +33,95 @@ def empty_chart(msg: str = "Enter a symbol and click Start") -> go.Figure:
     return fig
 
 
+_GAUSSIAN_COLORS = ["#e0e0e0", "#60a5fa", "#fb923c", "#a78bfa", "#34d399"]
+
+
+def _gmm_em(
+    centers: np.ndarray,
+    bin_weights: np.ndarray,
+    n: int,
+    seed: int,
+    max_iter: int = 300,
+    tol: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Weighted EM for a 1-D n-component GMM fitted directly to histogram bins.
+    bin_weights are the volume counts per bin.
+    Returns (mixing_weights, means, stds, mixture_density_per_bin).
+    """
+    rng = np.random.default_rng(seed)
+    total_w = bin_weights.sum()
+    cdf = np.cumsum(bin_weights) / total_w
+    q = rng.uniform(0, 1, n)
+    means = centers[np.searchsorted(cdf, q)].astype(float)
+    w_norm = bin_weights / total_w
+    global_mean = float(np.dot(w_norm, centers))
+    global_std = float(np.sqrt(np.dot(w_norm, (centers - global_mean) ** 2)))
+    stds = np.full(n, max(global_std / n, 1e-6))
+    mix = np.ones(n) / n
+    log_lik = -np.inf
+    density = np.ones(len(centers))
+
+    for _ in range(max_iter):
+        # E-step
+        resp = np.column_stack([
+            mix[k] * np.exp(-0.5 * ((centers - means[k]) / stds[k]) ** 2)
+            / (stds[k] * np.sqrt(2 * np.pi))
+            for k in range(n)
+        ])
+        density = resp.sum(axis=1)
+        density_safe = np.where(density == 0, 1e-300, density)
+        resp /= density_safe[:, None]
+
+        # Weighted M-step
+        eff = resp * bin_weights[:, None]
+        Nk = eff.sum(axis=0)
+        mix = Nk / total_w
+        means = (eff * centers[:, None]).sum(axis=0) / np.maximum(Nk, 1e-10)
+        stds = np.sqrt((eff * (centers[:, None] - means) ** 2).sum(axis=0) / np.maximum(Nk, 1e-10))
+        stds = np.maximum(stds, 1e-6)
+
+        new_log_lik = float((bin_weights * np.log(density_safe)).sum())
+        if abs(new_log_lik - log_lik) < tol:
+            break
+        log_lik = new_log_lik
+
+    return mix, means, stds, density
+
+
+def _fit_gaussian_mixture(
+    bin_centers: np.ndarray,
+    weights: np.ndarray,
+    n_components: int,
+    n_init: int = 5,
+) -> list[tuple[float, float, float]]:
+    """
+    Fit exactly n_components Gaussians to a weighted histogram via EM (pure numpy).
+    Runs n_init random restarts and returns the best by weighted log-likelihood.
+    Returns a list of (mixing_weight, mean, std) tuples.
+    """
+    if weights.sum() == 0 or bin_centers.std() == 0:
+        return []
+
+    best_wll = -np.inf
+    best_params: tuple = ()
+    for init in range(n_init):
+        mix, mu, sigma, density = _gmm_em(bin_centers, weights, n_components, seed=init)
+        wll = float((weights * np.log(np.maximum(density, 1e-300))).sum())
+        if wll > best_wll:
+            best_wll, best_params = wll, (mix, mu, sigma)
+
+    mix, mu, sigma = best_params
+    return [(float(mix[i]), float(mu[i]), float(sigma[i])) for i in range(len(mix))]
+
+
 def _plot_price_distribution(
     df_trades: pd.DataFrame,
     fig: go.Figure,
     n_price_bins: int = 50,
     n_time_buckets: int = 20,
-) -> go.Figure:
+    gaussian_max_components: int = 0,
+) -> tuple[go.Figure, list[tuple[float, float, float]]]:
     """
     Add a horizontal volume-weighted price distribution histogram to col 2.
     Colors run violet→red from oldest to newest trades.
@@ -102,6 +186,71 @@ def _plot_price_distribution(
             col=2,
         )
 
+    components: list[tuple[float, float, float]] = []
+    if gaussian_max_components > 0:
+        total_per_bin = (
+            agg.groupby("bin_idx")["s"]
+            .sum()
+            .reindex(range(n_price_bins), fill_value=0)
+            .values
+        )
+        total_vol = total_per_bin.sum()
+        if total_vol > 0:
+            components = _fit_gaussian_mixture(bin_centers, total_per_bin, gaussian_max_components)
+            if components:
+                price_smooth = np.linspace(price_min, price_max, 400)
+                scale = total_vol * bin_width
+
+                if len(components) > 1:
+                    mixture_pdf = sum(
+                        w * np.exp(-0.5 * ((price_smooth - mu) / sigma) ** 2)
+                        / (sigma * np.sqrt(2 * np.pi))
+                        for w, mu, sigma in components
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=mixture_pdf * scale,
+                            y=price_smooth,
+                            mode="lines",
+                            name="GMM envelope",
+                            line=dict(color="#ffffff", width=2),
+                            opacity=0.9,
+                            hovertemplate=(
+                                "<b>Price:</b> %{y:.4f}<br>"
+                                "<b>Fitted vol:</b> %{x:,.0f}"
+                                "<extra></extra>"
+                            ),
+                        ),
+                        row=1,
+                        col=2,
+                    )
+
+                for i, (w, mu, sigma) in enumerate(components):
+                    pdf = (
+                        w
+                        * np.exp(-0.5 * ((price_smooth - mu) / sigma) ** 2)
+                        / (sigma * np.sqrt(2 * np.pi))
+                    )
+                    color = _GAUSSIAN_COLORS[i % len(_GAUSSIAN_COLORS)]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=pdf * scale,
+                            y=price_smooth,
+                            mode="lines",
+                            name=f"G{i + 1}  μ={mu:.2f}  σ={sigma:.2f}",
+                            line=dict(color=color, width=1.5, dash="dot"),
+                            opacity=0.85,
+                            hovertemplate=(
+                                f"<b>G{i + 1}</b>  μ={mu:.2f}  σ={sigma:.2f}<br>"
+                                "<b>Price:</b> %{y:.4f}<br>"
+                                "<b>Fitted vol:</b> %{x:,.0f}"
+                                "<extra></extra>"
+                            ),
+                        ),
+                        row=1,
+                        col=2,
+                    )
+
     # Invisible scatter to attach a colorbar legend
     fig.add_trace(
         go.Scatter(
@@ -145,7 +294,112 @@ def _plot_price_distribution(
         bargroupgap=0,
         height=700,
     )
-    return fig
+    return fig, components if gaussian_max_components > 0 else []
+
+
+def _add_moving_averages(df: pd.DataFrame, fig: go.Figure, periods: list[int]) -> None:
+    for period in periods:
+        if len(df) < period:
+            continue
+        vwma = (df["c"] * df["v"]).rolling(window=period).sum() / df["v"].rolling(window=period).sum()
+        fig.add_trace(
+            go.Scatter(
+                x=df["t"],
+                y=vwma,
+                mode="lines",
+                name=f"VWMA({period})",
+                line=dict(color=MA_COLORS.get(period, "#ffffff"), width=1.5, dash="solid"),
+                opacity=0.85,
+            ),
+            row=1,
+            col=1,
+        )
+
+
+def _add_avg_lines(
+    df_all: pd.DataFrame,
+    fig: go.Figure,
+    show_7d: bool = True,
+    show_28d: bool = True,
+    show_1y: bool = False,
+    x0_dt: Optional[datetime] = None,
+    df_daily: Optional[pd.DataFrame] = None,
+) -> None:
+    """Horizontal VWAP-style average price lines for 7-day, 28-day, and 1-year lookbacks."""
+    if df_all.empty:
+        return
+    latest = df_all["t"].max()
+    # Use daily bars for multi-day lookbacks when available so the windows
+    # contain the right data regardless of how much intraday history is loaded.
+    df_hist = df_daily if (df_daily is not None and not df_daily.empty) else df_all
+    lookbacks = [
+        ("7d",  pd.Timedelta(days=7),   "7d avg",  show_7d),
+        ("28d", pd.Timedelta(days=28),  "28d avg", show_28d),
+        ("1y",  pd.Timedelta(days=365), "1y avg",  show_1y),
+    ]
+    x0 = pd.Timestamp(x0_dt) if x0_dt is not None else df_all["t"].iloc[0]
+    x1 = latest
+    for key, delta, label, visible in lookbacks:
+        if not visible:
+            continue
+        hist_latest = df_hist["t"].max()
+        window = df_hist[df_hist["t"] >= hist_latest - delta]
+        if window.empty:
+            continue
+        total_vol = window["v"].sum()
+        if total_vol == 0:
+            continue
+        avg = (window["c"] * window["v"]).sum() / total_vol
+        color = AVG_LINE_COLORS[key]
+        fig.add_shape(
+            type="line",
+            x0=x0, x1=x1,
+            y0=avg, y1=avg,
+            line=dict(color=color, width=1, dash="dash"),
+            row=1, col=1,
+        )
+        fig.add_annotation(
+            xref="x", yref="y",
+            x=x1, y=avg,
+            text=f" {label} {avg:.2f}",
+            font=dict(color=color, size=10, family="monospace"),
+            showarrow=False,
+            xanchor="left",
+        )
+
+
+def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
+    price_high = df["h"].max()
+    price_low = df["l"].min()
+    price_range = price_high - price_low
+    if price_range == 0:
+        return
+
+    x_start = df["t"].iloc[0]
+    x_end = df["t"].iloc[-1]
+
+    for ratio, label in FIB_LEVELS:
+        level = price_high - ratio * price_range
+        fig.add_shape(
+            type="line",
+            x0=x_start,
+            x1=x_end,
+            y0=level,
+            y1=level,
+            line=dict(color="#d4af37", width=1, dash="dot"),
+            row=1,
+            col=1,
+        )
+        fig.add_annotation(
+            xref="x",
+            yref="y",
+            x=x_end,
+            y=level,
+            text=f" {label} {level:.2f}",
+            font=dict(color="#d4af37", size=10, family="monospace"),
+            showarrow=False,
+            xanchor="left",
+        )
 
 
 def build_chart(
@@ -154,13 +408,22 @@ def build_chart(
     trades: list[dict],
     symbol: str,
     session_start: datetime,
+    ma_periods: Optional[list] = None,
+    show_fib: bool = False,
+    show_7d_avg: bool = True,
+    show_28d_avg: bool = True,
+    show_1y_avg: bool = False,
+    gaussian_max_components: int = 0,
+    show_gaussian_centers: bool = False,
+    daily_bars: Optional[list[dict]] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
 
-    df = pd.DataFrame(bars)
-    df["t"] = pd.to_datetime(df["t"], utc=True)
-    df = df[df["t"] > session_start].sort_values("t").reset_index(drop=True)
+    df_all = pd.DataFrame(bars)
+    df_all["t"] = pd.to_datetime(df_all["t"], utc=True)
+    df_all = df_all.sort_values("t").reset_index(drop=True)
+    df = df_all[df_all["t"] > session_start].reset_index(drop=True)
     if df.empty:
         return empty_chart("Waiting for data…")
 
@@ -181,7 +444,12 @@ def build_chart(
     )
 
     if not df_trades.empty:
-        fig = _plot_price_distribution(df_trades, fig)
+        fig, gmm_components = _plot_price_distribution(
+            df_trades, fig,
+            gaussian_max_components=gaussian_max_components,
+        )
+    else:
+        gmm_components = []
 
     fig.add_trace(
         go.Candlestick(
@@ -242,6 +510,45 @@ def build_chart(
                 col=1,
             )
 
+    if ma_periods:
+        _add_moving_averages(df, fig, ma_periods)
+
+    df_daily: Optional[pd.DataFrame] = None
+    if daily_bars:
+        df_daily = pd.DataFrame(daily_bars)
+        df_daily["t"] = pd.to_datetime(df_daily["t"], utc=True)
+
+    _add_avg_lines(
+        df_all, fig,
+        show_7d=show_7d_avg, show_28d=show_28d_avg, show_1y=show_1y_avg,
+        x0_dt=session_start,
+        df_daily=df_daily,
+    )
+
+    if show_gaussian_centers and gmm_components:
+        x0 = df["t"].iloc[0]
+        x1 = df["t"].iloc[-1]
+        for i, (_, mu, _) in enumerate(gmm_components):
+            color = _GAUSSIAN_COLORS[i % len(_GAUSSIAN_COLORS)]
+            fig.add_shape(
+                type="line",
+                x0=x0, x1=x1,
+                y0=mu, y1=mu,
+                line=dict(color=color, width=1, dash="dash"),
+                row=1, col=1,
+            )
+            fig.add_annotation(
+                xref="x", yref="y",
+                x=x1, y=mu,
+                text=f" G{i + 1} {mu:.2f}",
+                font=dict(color=color, size=10, family="monospace"),
+                showarrow=False,
+                xanchor="left",
+            )
+
+    if show_fib:
+        _add_fibonacci_levels(df, fig)
+
     last = df.iloc[-1]
     color = PALETTE["up"] if last["c"] >= last["o"] else PALETTE["down"]
     fig.add_annotation(
@@ -267,7 +574,13 @@ def build_chart(
             font=dict(size=18),
             x=0.02,
         ),
-        xaxis_rangeslider_visible=False,
+        xaxis=dict(
+            range=[
+                pd.Timestamp(session_start).isoformat(),
+                df["t"].max().isoformat(),
+            ],
+            rangeslider=dict(visible=False),
+        ),
         xaxis2=dict(showgrid=True, gridcolor=PALETTE["grid"]),
         yaxis=dict(showgrid=True, gridcolor=PALETTE["grid"], tickfont=dict(size=11)),
         yaxis2=dict(showgrid=True, gridcolor=PALETTE["grid"], tickfont=dict(size=10)),

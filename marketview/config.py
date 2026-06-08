@@ -25,10 +25,24 @@ PALETTE: dict[str, str] = {
     "orange": "#fb923c",
 }
 
-CUSTOM_CSS = f"""
-body, .gradio-container {{ background: {PALETTE['bg']} !important; }}
-.gr-button-primary {{ background: {PALETTE['accent']} !important; border:none !important; }}
-.gr-button {{ border-radius: 6px !important; }}
-footer {{ display: none !important; }}
-label {{ color: {PALETTE['muted']} !important; font-size:12px !important; }}
-"""
+MA_COLORS: dict[int, str] = {
+    5:  "#60a5fa",  # blue
+    15: "#fb923c",  # orange
+    60: "#a78bfa",  # violet
+}
+
+AVG_LINE_COLORS: dict[str, str] = {
+    "7d":  "#34d399",  # green
+    "28d": "#fbbf24",  # amber
+    "1y":  "#f472b6",  # pink
+}
+
+FIB_LEVELS: list[tuple[float, str]] = [
+    (0.0,   "0%"),
+    (0.236, "23.6%"),
+    (0.382, "38.2%"),
+    (0.5,   "50%"),
+    (0.618, "61.8%"),
+    (0.786, "78.6%"),
+    (1.0,   "100%"),
+]
