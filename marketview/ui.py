@@ -21,7 +21,7 @@ def _get_state() -> AppState:
 
 
 def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
-    mapping = {"VWMA(5)": 5, "VWMA(15)": 15, "VWMA(60)": 60}
+    mapping = {"VWAP(5)": 5, "VWAP(15)": 15, "VWAP(60)": 60}
     return [mapping[s] for s in ma_selection if s in mapping]
 
 
@@ -152,6 +152,7 @@ def _live_panel() -> None:
             gaussian_max_components=state.gaussian_max_components,
             show_gaussian_centers=state.show_gaussian_centers,
             daily_bars=state.daily_bars,
+            show_vwap=state.show_vwap,
         )
         if (state.symbol and bars)
         else empty_chart()
@@ -191,9 +192,9 @@ def build_ui() -> None:
             placeholder="From env ALPACA_SECRET if blank",
         )
         st.subheader("Overlays")
-        vwma_selection = st.multiselect(
-            "VWMA",
-            ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
+        vwAP_selection = st.multiselect(
+            "VWAP",
+            ["VWAP(5)", "VWAP(15)", "VWAP(60)"],
             default=[],
         )
         avg_selection = st.multiselect(
@@ -201,6 +202,7 @@ def build_ui() -> None:
             ["7d Avg", "28d Avg", "1y Avg"],
             default=[],
         )
+        show_vwap = st.checkbox("VWAP", value=False)
         show_fib = st.checkbox("Fibonacci levels", value=False)
 
         with st.expander("Price Profile Fit"):
@@ -223,8 +225,9 @@ def build_ui() -> None:
         stop_clicked = c2.button("⏹ Stop", use_container_width=True)
 
     state = _get_state()
-    state.ma_periods = _parse_ma_periods(vwma_selection)
+    state.ma_periods = _parse_ma_periods(vwAP_selection)
     state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
+    state.show_vwap = show_vwap
     state.show_fib = show_fib
     state.gaussian_max_components = max_components if fit_enabled else 0
     state.show_gaussian_centers = show_gaussian_centers if fit_enabled else False
@@ -286,8 +289,8 @@ def build_ui() -> None:
                     if gemini_key and news:
                         try:
                             state.news_impacts = score_news_impacts(sym, news, gemini_key)
-                        except Exception as _exc:
-                            pass
+                        except Exception as exc:
+                            state.status = f"News impact scoring failed: {exc}"
                     state.status = "Connecting WebSocket…"
                     launch_stream(sym, key, secret, feed, state, timeframe)
                     launch_stream_news(sym, key, secret, state)

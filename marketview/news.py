@@ -6,6 +6,7 @@ Required env vars: GEMINI_API_KEY, WORLD_NEWS_API_KEY
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime, timedelta
@@ -13,10 +14,12 @@ from typing import Literal, Optional
 
 import pandas as pd
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 ImpactLabel = Literal["positive", "negative", "neutral", "small", "unknown"]
+
+_VALID_LABELS: frozenset[str] = frozenset({"positive", "negative", "neutral", "small", "unknown"})
 
 
 class Impact(BaseModel):
@@ -26,7 +29,13 @@ class Impact(BaseModel):
 
 class _SingleImpact(BaseModel):
     index: int
-    impact: ImpactLabel
+    impact: str  # keep permissive; normalised below
+
+    @field_validator("impact", mode="before")
+    @classmethod
+    def normalise(cls, v: object) -> str:
+        s = str(v).lower().strip()
+        return s if s in _VALID_LABELS else "unknown"
 
 
 class _BatchImpact(BaseModel):
@@ -268,6 +277,12 @@ def score_news_impacts(symbol: str, news_items: list[dict], api_key: str) -> dic
     )
 
     scored = completion.choices[0].message.parsed
+    if scored is None:
+        raw = completion.choices[0].message.content or ""
+        try:
+            scored = _BatchImpact.model_validate(json.loads(raw))
+        except Exception:
+            return {}
     result: dict[str, str] = {}
     for entry in scored.scores:
         if 0 <= entry.index < len(news_items):

@@ -49,7 +49,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
             elif t == "subscription":
                 state.status = f"✅ Streaming {symbol} ({feed.upper()})"
             elif t == "b" and msg.get("S") == symbol:
-                bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v") if k in msg}
+                bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v", "vw") if k in msg}
                 if tf_minutes == 1:
                     with state.lock:
                         state.bars.append(bar)
@@ -61,7 +61,10 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                             last["h"] = max(last["h"], bar["h"])
                             last["l"] = min(last["l"], bar["l"])
                             last["c"] = bar["c"]
-                            last["v"] = last["v"] + bar["v"]
+                            new_v = last["v"] + bar["v"]
+                            if "vw" in bar and "vw" in last and new_v > 0:
+                                last["vw"] = (last["vw"] * last["v"] + bar["vw"] * bar["v"]) / new_v
+                            last["v"] = new_v
                         else:
                             state.bars.append({**bar, "t": bucket})
             elif t == "t" and msg.get("S") == symbol:

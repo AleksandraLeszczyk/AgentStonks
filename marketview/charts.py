@@ -301,13 +301,13 @@ def _add_moving_averages(df: pd.DataFrame, fig: go.Figure, periods: list[int]) -
     for period in periods:
         if len(df) < period:
             continue
-        vwma = (df["c"] * df["v"]).rolling(window=period).sum() / df["v"].rolling(window=period).sum()
+        vwap = (df["c"] * df["v"]).rolling(window=period).sum() / df["v"].rolling(window=period).sum()
         fig.add_trace(
             go.Scatter(
                 x=df["t"],
-                y=vwma,
+                y=vwap,
                 mode="lines",
-                name=f"VWMA({period})",
+                name=f"VWAP({period})",
                 line=dict(color=MA_COLORS.get(period, "#ffffff"), width=1.5, dash="solid"),
                 opacity=0.85,
             ),
@@ -368,6 +368,25 @@ def _add_avg_lines(
         )
 
 
+def _add_vwap(df: pd.DataFrame, fig: go.Figure) -> None:
+    """Per-bar VWAP from Alpaca's vw field."""
+    if "vw" not in df.columns:
+        return
+    fig.add_trace(
+        go.Scatter(
+            x=df["t"],
+            y=df["vw"],
+            mode="markers",
+            name="VWAP",
+            marker=dict(color="#000000", size=4),
+            opacity=0.9,
+            hovertemplate="<b>VWAP:</b> %{y:.4f}<extra></extra>",
+        ),
+        row=1,
+        col=1,
+    )
+
+
 def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
     price_high = df["h"].max()
     price_low = df["l"].min()
@@ -416,6 +435,7 @@ def build_chart(
     gaussian_max_components: int = 0,
     show_gaussian_centers: bool = False,
     daily_bars: Optional[list[dict]] = None,
+    show_vwap: bool = False,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -509,6 +529,9 @@ def build_chart(
                 row=1,
                 col=1,
             )
+
+    if show_vwap:
+        _add_vwap(df, fig)
 
     if ma_periods:
         _add_moving_averages(df, fig, ma_periods)

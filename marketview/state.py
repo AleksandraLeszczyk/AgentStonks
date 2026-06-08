@@ -28,6 +28,7 @@ _DEFAULTS: dict[str, object] = {
     "show_1y_avg": False,
     "gaussian_max_components": 0,
     "show_gaussian_centers": False,
+    "show_vwap": False,
 }
 
 
@@ -54,6 +55,7 @@ class AppState:
         self.show_1y_avg: bool = False
         self.gaussian_max_components: int = 0
         self.show_gaussian_centers: bool = False
+        self.show_vwap: bool = False
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.
