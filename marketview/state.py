@@ -32,6 +32,8 @@ _DEFAULTS: dict[str, object] = {
     "show_candle_body": True,
     "show_percentile_body": False,
     "show_whiskers": True,
+    "last_price": None,
+    "prev_close": None,
 }
 
 
@@ -62,6 +64,8 @@ class AppState:
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False
         self.show_whiskers: bool = True
+        self.last_price: float | None = None
+        self.prev_close: float | None = None
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

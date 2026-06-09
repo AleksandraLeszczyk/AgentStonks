@@ -71,6 +71,8 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
                 with state.lock:
                     state.trades.append(trade)
+                    if "p" in msg:
+                        state.last_price = float(msg["p"])
             elif t == "error":
                 state.status = f"Stream error: {msg.get('msg')}"
 
@@ -100,6 +102,11 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         except Exception:
             pass
         time.sleep(0.5)
+
+    with state.lock:
+        if state.bars:
+            state.prev_close = state.bars[-1].get("c")
+        state.last_price = None
 
     threading.Thread(
         target=_start_stream, args=(symbol, key, secret, feed, state, timeframe), daemon=True

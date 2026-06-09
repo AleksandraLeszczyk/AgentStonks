@@ -129,6 +129,30 @@ def _news_html(news: list[dict], symbol: str, impacts: Optional[dict] = None) ->
 build_news_html = _news_html
 
 
+def _last_price_html(price: float | None, prev_close: float | None, symbol: str) -> str:
+    if price is None:
+        return ""
+    change = price - prev_close if prev_close else None
+    pct = (change / prev_close * 100) if change is not None and prev_close else None
+    if change is None:
+        arrow, color, delta_str = "", PALETTE["muted"], ""
+    elif change >= 0:
+        arrow, color = "▲", "#26c6a2"
+        delta_str = f"+{change:.2f} ({pct:+.2f}%)"
+    else:
+        arrow, color = "▼", "#ef5350"
+        delta_str = f"{change:.2f} ({pct:.2f}%)"
+    return (
+        f'<div style="display:flex;align-items:baseline;gap:12px;'
+        f'font-family:Inter,monospace;padding:4px 0 8px;">'
+        f'<span style="font-size:28px;font-weight:700;color:{PALETTE["text"]};'
+        f'letter-spacing:-0.5px;">${price:,.4f}</span>'
+        f'<span style="font-size:14px;font-weight:600;color:{color};">'
+        f'{arrow} {delta_str}</span>'
+        f'</div>'
+    )
+
+
 @st.fragment(run_every=POLL_SEC)
 def _live_panel() -> None:
     state = _get_state()
@@ -136,6 +160,11 @@ def _live_panel() -> None:
 
     with state.lock:
         bars = list(state.bars)
+        last_price = state.last_price
+        prev_close = state.prev_close
+
+    if state.symbol:
+        st.html(_last_price_html(last_price, prev_close, state.symbol))
 
     fig = (
         build_chart(
@@ -186,17 +215,18 @@ def build_ui() -> None:
         stop_clicked = c2.button("⏹ Stop", use_container_width=True)
         symbol = st.text_input("Symbol", value="AAPL", placeholder="AAPL, TSLA, MSFT…")
         timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
-        feed = st.selectbox("Feed", FEEDS, index=0)
-        api_key = st.text_input(
-            "Alpaca API Key",
-            type="password",
-            placeholder="From env ALPACA_API_KEY if blank",
-        )
-        api_secret = st.text_input(
-            "Alpaca Secret",
-            type="password",
-            placeholder="From env ALPACA_SECRET if blank",
-        )
+        with st.expander("Connection"):
+            feed = st.selectbox("Feed", FEEDS, index=0)
+            api_key = st.text_input(
+                "Alpaca API Key",
+                type="password",
+                placeholder="From env ALPACA_API_KEY if blank",
+            )
+            api_secret = st.text_input(
+                "Alpaca Secret",
+                type="password",
+                placeholder="From env ALPACA_SECRET if blank",
+            )
         st.subheader("Candle")
         show_candle_body = st.checkbox("Open-Close", value=True)
         show_percentile_body = st.checkbox("20%-80%", value=False)

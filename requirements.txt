@@ -12,6 +12,6 @@ pytest>=7.4.0
 pytest-mock>=3.12.0
 
 # Optional — LLM news pipeline (marketview/news.py)
-# openai>=1.0.0
-# worldnewsapi>=2.0.0
-# pydantic>=2.0.0
+openai>=1.0.0
+worldnewsapi>=2.0.0
+pydantic>=2.0.0
