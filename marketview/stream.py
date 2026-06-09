@@ -44,7 +44,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
             elif t == "success" and msg.get("msg") == "authenticated":
                 state.status = f"Authenticated – subscribing to {symbol} bars…"
                 ws.send(
-                    json.dumps({"action": "subscribe", "bars": [symbol], "trades": [symbol]})
+                    json.dumps({"action": "subscribe", "bars": [symbol], "trades": [symbol], "quotes": [symbol]})
                 )
             elif t == "subscription":
                 state.status = f"✅ Streaming {symbol} ({feed.upper()})"
@@ -73,6 +73,15 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     state.trades.append(trade)
                     if "p" in msg:
                         state.last_price = float(msg["p"])
+            elif t == "q" and msg.get("S") == symbol:
+                if "bp" in msg:
+                    state.bid_price = float(msg["bp"])
+                if "bs" in msg:
+                    state.bid_size = float(msg["bs"])
+                if "ap" in msg:
+                    state.ask_price = float(msg["ap"])
+                if "as" in msg:
+                    state.ask_size = float(msg["as"])
             elif t == "error":
                 state.status = f"Stream error: {msg.get('msg')}"
 
@@ -107,6 +116,10 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         if state.bars:
             state.prev_close = state.bars[-1].get("c")
         state.last_price = None
+        state.bid_price = None
+        state.bid_size = None
+        state.ask_price = None
+        state.ask_size = None
 
     threading.Thread(
         target=_start_stream, args=(symbol, key, secret, feed, state, timeframe), daemon=True

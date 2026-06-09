@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from .charts import build_chart, empty_chart
-from .config import FEEDS, MAX_BARS, PALETTE, POLL_SEC, SESSION_START, TIMEFRAMES
+from .config import CHART_POLL_SEC, FEEDS, MAX_BARS, PALETTE, POLL_SEC, SESSION_START, TIMEFRAMES
 from .news import score_news_impacts
 from .rest import fetch_bars, fetch_daily_bars, fetch_news, fetch_trades
 from .state import AppState
@@ -129,42 +129,101 @@ def _news_html(news: list[dict], symbol: str, impacts: Optional[dict] = None) ->
 build_news_html = _news_html
 
 
-def _last_price_html(price: float | None, prev_close: float | None, symbol: str) -> str:
-    if price is None:
+def _quote_html(
+    price: float | None,
+    prev_close: float | None,
+    bid: float | None,
+    bid_size: float | None,
+    ask: float | None,
+    ask_size: float | None,
+    symbol: str,
+) -> str:
+    if price is None and bid is None and ask is None:
         return ""
-    change = price - prev_close if prev_close else None
+    change = price - prev_close if price is not None and prev_close else None
     pct = (change / prev_close * 100) if change is not None and prev_close else None
     if change is None:
-        arrow, color, delta_str = "", PALETTE["muted"], ""
+        arrow, chg_color, delta_str = "", PALETTE["muted"], ""
     elif change >= 0:
-        arrow, color = "▲", "#26c6a2"
+        arrow, chg_color = "▲", "#26c6a2"
         delta_str = f"+{change:.2f} ({pct:+.2f}%)"
     else:
-        arrow, color = "▼", "#ef5350"
+        arrow, chg_color = "▼", "#ef5350"
         delta_str = f"{change:.2f} ({pct:.2f}%)"
+
+    price_row = ""
+    if price is not None:
+        price_row = (
+            f'<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:10px;">'
+            f'<span style="font-size:28px;font-weight:700;color:{PALETTE["text"]};'
+            f'letter-spacing:-0.5px;">${price:,.4f}</span>'
+            f'<span style="font-size:14px;font-weight:600;color:{chg_color};">'
+            f'{arrow} {delta_str}</span>'
+            f'</div>'
+        )
+
+    def _side(label: str, p: float | None, sz: float | None, color: str) -> str:
+        if p is None:
+            return ""
+        size_str = f'<span style="font-size:11px;color:{PALETTE["muted"]};margin-left:4px;">{sz:,.0f}</span>' if sz else ""
+        return (
+            f'<div style="display:flex;flex-direction:column;align-items:center;'
+            f'background:{PALETTE["panel"]};border:1px solid {PALETTE["grid"]};'
+            f'border-radius:8px;padding:8px 16px;min-width:100px;">'
+            f'<span style="font-size:10px;font-weight:600;color:{PALETTE["muted"]};'
+            f'letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">{label}</span>'
+            f'<span style="font-size:18px;font-weight:700;color:{color};">${p:,.4f}</span>'
+            f'{size_str}'
+            f'</div>'
+        )
+
+    bid_card = _side("Bid", bid, bid_size, "#ef5350")
+    ask_card = _side("Ask", ask, ask_size, "#26c6a2")
+    spread_row = ""
+    if bid is not None and ask is not None:
+        spread = ask - bid
+        spread_row = (
+            f'<span style="font-size:11px;color:{PALETTE["muted"]};align-self:center;">'
+            f'spread {spread:.4f}</span>'
+        )
+
+    ba_row = ""
+    if bid_card or ask_card:
+        ba_row = (
+            f'<div style="display:flex;gap:10px;align-items:stretch;">'
+            f'{bid_card}{spread_row}{ask_card}'
+            f'</div>'
+        )
+
     return (
-        f'<div style="display:flex;align-items:baseline;gap:12px;'
-        f'font-family:Inter,monospace;padding:4px 0 8px;">'
-        f'<span style="font-size:28px;font-weight:700;color:{PALETTE["text"]};'
-        f'letter-spacing:-0.5px;">${price:,.4f}</span>'
-        f'<span style="font-size:14px;font-weight:600;color:{color};">'
-        f'{arrow} {delta_str}</span>'
+        f'<div style="font-family:Inter,monospace;padding:4px 0 8px;">'
+        f'{price_row}{ba_row}'
         f'</div>'
     )
 
 
 @st.fragment(run_every=POLL_SEC)
-def _live_panel() -> None:
+def _price_ticker() -> None:
     state = _get_state()
     st.caption(f"Status: {state.status}")
+    if state.symbol:
+        with state.lock:
+            last_price = state.last_price
+            prev_close = state.prev_close
+            bid_price = state.bid_price
+            bid_size = state.bid_size
+            ask_price = state.ask_price
+            ask_size = state.ask_size
+        html = _quote_html(last_price, prev_close, bid_price, bid_size, ask_price, ask_size, state.symbol)
+        if html:
+            st.html(html)
 
+
+@st.fragment(run_every=CHART_POLL_SEC)
+def _chart_panel() -> None:
+    state = _get_state()
     with state.lock:
         bars = list(state.bars)
-        last_price = state.last_price
-        prev_close = state.prev_close
-
-    if state.symbol:
-        st.html(_last_price_html(last_price, prev_close, state.symbol))
 
     fig = (
         build_chart(
@@ -191,6 +250,11 @@ def _live_panel() -> None:
     )
     st.plotly_chart(fig, use_container_width=True)
     st.html(_news_html(state.news, state.symbol, state.news_impacts))
+
+
+def _live_panel() -> None:
+    _price_ticker()
+    _chart_panel()
 
 
 def build_ui() -> None:

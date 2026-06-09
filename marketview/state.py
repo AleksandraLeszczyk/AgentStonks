@@ -34,6 +34,10 @@ _DEFAULTS: dict[str, object] = {
     "show_whiskers": True,
     "last_price": None,
     "prev_close": None,
+    "bid_price": None,
+    "bid_size": None,
+    "ask_price": None,
+    "ask_size": None,
 }
 
 
@@ -66,6 +70,10 @@ class AppState:
         self.show_whiskers: bool = True
         self.last_price: float | None = None
         self.prev_close: float | None = None
+        self.bid_price: float | None = None
+        self.bid_size: float | None = None
+        self.ask_price: float | None = None
+        self.ask_size: float | None = None
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.
