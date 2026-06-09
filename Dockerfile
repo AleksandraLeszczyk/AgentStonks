@@ -8,6 +8,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY marketview/ marketview/
 COPY main.py .
 
-EXPOSE 7860
+EXPOSE 8501
 
-CMD ["python", "main.py"]
+CMD ["streamlit", "run", "main.py", "--server.port=8501", "--server.address=0.0.0.0"]
