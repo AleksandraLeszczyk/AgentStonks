@@ -534,6 +534,7 @@ def build_chart(
                 trade_t = trade_t.dt.tz_localize("UTC")
             else:
                 trade_t = trade_t.dt.tz_convert("UTC")
+            trade_t = trade_t.dt.as_unit("us")
             bin_idx = pd.cut(trade_t, bins=bins, right=False, labels=False)
             df_binned = pd.DataFrame({"bin_idx": bin_idx, "p": df_trades["p"].values}).dropna(subset=["bin_idx"])
             df_binned["bin_idx"] = df_binned["bin_idx"].astype(int)
