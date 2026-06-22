@@ -281,7 +281,58 @@ def _chart_panel() -> None:
     st.html(_news_html(state.news, state.symbol, state.news_impacts))
 
 
+def _live_chart_controls() -> None:
+    state = _get_state()
+    with st.expander("Chart Settings"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Candle**")
+            show_candle_body = st.checkbox("Open-Close", value=True)
+            show_percentile_body = st.checkbox("20%-80%", value=False)
+            show_whiskers = st.checkbox("Whiskers", value=True)
+            vwap_style = st.selectbox("VWAP", ["hide", "dot", "line"], index=0)
+        with c2:
+            st.markdown("**Overlays**")
+            vwma_selection = st.multiselect(
+                "VWMA",
+                ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
+                default=[],
+            )
+            avg_selection = st.multiselect(
+                "Average Lines",
+                ["7d Avg", "28d Avg", "1y Avg"],
+                default=[],
+            )
+            show_fib = st.checkbox("Fibonacci levels", value=False)
+
+        st.markdown("**Price Profile Fit**")
+        fit_enabled = st.checkbox("Fit Gaussian mixture", value=False)
+        max_components = st.slider(
+            "Components",
+            min_value=1,
+            max_value=5,
+            value=1,
+            disabled=not fit_enabled,
+        )
+        show_gaussian_centers = st.checkbox(
+            "Show centers on candle chart",
+            value=False,
+            disabled=not fit_enabled,
+        )
+
+    state.ma_periods = _parse_ma_periods(vwma_selection)
+    state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
+    state.show_candle_body = show_candle_body
+    state.show_percentile_body = show_percentile_body
+    state.show_whiskers = show_whiskers
+    state.vwap_style = vwap_style
+    state.show_fib = show_fib
+    state.gaussian_max_components = max_components if fit_enabled else 0
+    state.show_gaussian_centers = show_gaussian_centers if fit_enabled else False
+
+
 def _live_panel() -> None:
+    _live_chart_controls()
     _price_ticker()
     _chart_panel()
 
@@ -328,6 +379,8 @@ def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
         return "🧠", PALETTE["text"], "analysis"
     if etype == "cycle_start":
         return "🔄", PALETTE["accent"], "cycle start"
+    if etype == "news_alert":
+        return "📰", PALETTE["accent"], "NEWS ALERT"
     if etype == "error":
         return "⚠️", PALETTE["down"], "error"
     return "ℹ️", PALETTE["muted"], "status"
@@ -354,7 +407,7 @@ def _agent_entry_body(entry: dict) -> str:
         args_html = f"<div style='color:{PALETTE['muted']}'>args: {html.escape(json.dumps(args))}</div>" if args else ""
         result = html.escape(entry.get("result_preview", ""))
         return f"{args_html}<div>{result}</div>"
-    if etype in ("analysis", "error", "status", "cycle_start"):
+    if etype in ("analysis", "error", "status", "cycle_start", "news_alert"):
         return f"<div>{html.escape(entry.get('text', ''))}</div>"
     return ""
 
@@ -382,7 +435,10 @@ def _agent_log_html(log: list[dict]) -> str:
           {_agent_entry_body(entry)}
         </div>"""
         )
-    return f"<div style='font-family:Inter,sans-serif;'>{''.join(cards)}</div>"
+    return (
+        "<div style='font-family:Inter,sans-serif; max-height:420px; overflow-y:auto;'>"
+        f"{''.join(cards)}</div>"
+    )
 
 
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
@@ -431,7 +487,8 @@ def _agent_panel(symbol: str) -> None:
     st.caption(
         "Runs an LLM research agent that reads already-fetched ticker data and makes "
         "paper buy/sell/sleep calls on a fixed interval. Instead of sleeping blind, the agent "
-        "can set a price alert to wake up early if the price crosses a level it's watching. "
+        "can set a price alert to wake up early if the price crosses a level it's watching, "
+        "and it always wakes up early if fresh news breaks for the ticker. "
         "No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
@@ -507,51 +564,7 @@ def build_ui() -> None:
                 type="password",
                 placeholder="From env ALPACA_SECRET if blank",
             )
-        st.subheader("Candle")
-        show_candle_body = st.checkbox("Open-Close", value=True)
-        show_percentile_body = st.checkbox("20%-80%", value=False)
-        show_whiskers = st.checkbox("Whiskers", value=True)
-        vwap_style = st.selectbox("VWAP", ["hide", "dot", "line"], index=0)
-
-        st.subheader("Overlays")
-        vwma_selection = st.multiselect(
-            "VWMA",
-            ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
-            default=[],
-        )
-        avg_selection = st.multiselect(
-            "Average Lines",
-            ["7d Avg", "28d Avg", "1y Avg"],
-            default=[],
-        )
-        show_fib = st.checkbox("Fibonacci levels", value=False)
-
-        with st.expander("Price Profile Fit"):
-            fit_enabled = st.checkbox("Fit Gaussian mixture", value=False)
-            max_components = st.slider(
-                "Components",
-                min_value=1,
-                max_value=5,
-                value=1,
-                disabled=not fit_enabled,
-            )
-            show_gaussian_centers = st.checkbox(
-                "Show centers on candle chart",
-                value=False,
-                disabled=not fit_enabled,
-            )
-
-
     state = _get_state()
-    state.ma_periods = _parse_ma_periods(vwma_selection)
-    state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
-    state.show_candle_body = show_candle_body
-    state.show_percentile_body = show_percentile_body
-    state.show_whiskers = show_whiskers
-    state.vwap_style = vwap_style
-    state.show_fib = show_fib
-    state.gaussian_max_components = max_components if fit_enabled else 0
-    state.show_gaussian_centers = show_gaussian_centers if fit_enabled else False
 
     timeframe_changed = (
         state.symbol

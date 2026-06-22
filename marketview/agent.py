@@ -80,6 +80,12 @@ and set alert_price and alert_condition ("above" or "below"). This wakes \
 you up early -- as soon as the price crosses that level -- instead of \
 waiting out the full fixed cycle interval blind to what happens in between. \
 Use plain "sleep" when no specific level is worth watching.
+
+Regardless of which action you choose, you will also be woken up early -- \
+before the next scheduled cycle -- if fresh news for the ticker arrives \
+while you're waiting. You don't need to do anything to enable this; it \
+happens automatically so a sleep/alert decision is never blind to breaking \
+news.
 """
 
 TOOLS: list[dict] = [
@@ -457,8 +463,10 @@ def _alert_triggered(price: float, alert: dict) -> bool:
 
 
 def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
-    """Wait up to `cycle_sec`, but wake early if the agent set a price alert and it fires."""
+    """Wait up to `cycle_sec`, but wake early if a price alert fires or fresh news arrives."""
     deadline = time.monotonic() + cycle_sec
+    with state.lock:
+        news_baseline = len(state.news)
     while not stop_event.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -474,6 +482,16 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
                 )
                 state.price_alert = None
                 return
+        with state.lock:
+            news_count = len(state.news)
+            new_articles = list(state.news)[news_baseline:] if news_count > news_baseline else []
+        if new_articles:
+            headline = new_articles[-1].get("headline", "")
+            text = f"{len(new_articles)} new news item(s) for the ticker; waking early."
+            if headline:
+                text += f" Latest: {headline}"
+            _log(state, {"type": "news_alert", "text": text})
+            return
         stop_event.wait(min(AGENT_ALERT_POLL_SEC, remaining))
 
 

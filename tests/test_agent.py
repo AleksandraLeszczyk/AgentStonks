@@ -253,6 +253,36 @@ class TestAlertTrigger:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types
 
+    def test_wait_returns_early_when_news_arrives(self):
+        state = AppState()
+        state.news = [{"id": "1", "headline": "old headline"}]
+        stop_event = threading.Event()
+
+        def add_news_after_start():
+            start.wait()
+            with state.lock:
+                state.news.append({"id": "2", "headline": "breaking: new development"})
+
+        start = threading.Event()
+        finished = threading.Event()
+
+        def run():
+            start.set()
+            _wait_for_next_cycle(state, stop_event, cycle_sec=60)
+            finished.set()
+
+        adder = threading.Thread(target=add_news_after_start)
+        thread = threading.Thread(target=run)
+        thread.start()
+        adder.start()
+        thread.join(timeout=5)
+        adder.join(timeout=5)
+
+        assert finished.is_set()
+        with state.lock:
+            log_types = [e["type"] for e in state.agent_log]
+        assert "news_alert" in log_types
+
     def test_wait_respects_stop_event_without_alert(self):
         state = AppState()
         stop_event = threading.Event()
