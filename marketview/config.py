@@ -9,6 +9,14 @@ CHART_POLL_SEC = 30
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]
 FEEDS = ["iex", "sip"]
 
+# Trading agent
+AGENT_MODEL = "gemini-2.0-flash"
+AGENT_CYCLE_SEC = 60
+AGENT_LOG_POLL_SEC = 4
+AGENT_MAX_TOOL_ITERS = 8
+PAPER_STARTING_CASH = 100_000.0
+TRADE_FIXED_COST = 1.15
+
 # 13:20 UTC = 09:20 ET, just before market open (09:30 ET)
 SESSION_START = datetime.now(tz=timezone.utc).replace(
     hour=13, minute=20, second=0, microsecond=0

@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
-from marketview.charts import build_chart, build_historical_chart, empty_chart
+from marketview.charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
 
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
@@ -83,6 +83,53 @@ class TestBuildChart:
         fig = build_chart([old_bar], [], [], "AAPL", SESSION_START)
         texts = [a["text"] for a in fig.layout.annotations]
         assert any("Waiting" in t for t in texts)
+
+    def test_decision_markers_plot_buy_and_sell(self):
+        decisions = [
+            {"ts": "2024-01-15T14:00:30Z", "action": "buy", "price": 100.5, "filled_quantity": 2, "status": "filled"},
+            {"ts": "2024-01-15T14:01:30Z", "action": "sell", "price": 102.0, "filled_quantity": 2, "status": "filled"},
+        ]
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=decisions)
+        names = [t.name for t in fig.data]
+        assert "Agent buy" in names
+        assert "Agent sell" in names
+
+    def test_decision_markers_ignored_when_no_price(self):
+        decisions = [{"ts": "2024-01-15T14:00:30Z", "action": "sleep", "price": None, "filled_quantity": 0}]
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=decisions)
+        names = [t.name for t in fig.data]
+        assert "Agent sleep" not in names
+
+    def test_no_decisions_does_not_error(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=None)
+        assert isinstance(fig, go.Figure)
+
+
+class TestBuildPerformanceChart:
+    def test_no_points_returns_placeholder(self):
+        fig = build_performance_chart([], [], "AAPL")
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("No agent performance" in t for t in texts)
+
+    def test_returns_figure_with_value_line(self):
+        points = [
+            {"ts": "2024-01-15T14:00:00Z", "price": 100.0, "cash": 1000.0, "position": 0.0, "value": 1000.0},
+            {"ts": "2024-01-15T14:01:00Z", "price": 102.0, "cash": 1000.0, "position": 0.0, "value": 1000.0},
+        ]
+        fig = build_performance_chart(points, [], "AAPL")
+        names = [t.name for t in fig.data]
+        assert "Portfolio value" in names
+
+    def test_markers_for_buy_and_sell_decisions(self):
+        points = [{"ts": "2024-01-15T14:00:00Z", "price": 100.0, "cash": 900.0, "position": 1.0, "value": 1000.0}]
+        markers = [
+            {"ts": "2024-01-15T14:00:00Z", "action": "buy", "value": 1000.0},
+            {"ts": "2024-01-15T14:00:30Z", "action": "sell", "value": 1005.0},
+        ]
+        fig = build_performance_chart(points, markers, "AAPL")
+        names = [t.name for t in fig.data]
+        assert "Agent buy" in names
+        assert "Agent sell" in names
 
 
 def _close_series(values: list[float], start: str = "2024-01-01") -> pd.Series:

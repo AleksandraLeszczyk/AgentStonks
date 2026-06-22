@@ -5,7 +5,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import websocket
 
-from .config import MAX_BARS
+    from .decisions import DecisionTracker
+
+from .config import MAX_BARS, PAPER_STARTING_CASH
 
 _DEFAULTS: dict[str, object] = {
     "bars": None,  # handled specially
@@ -38,6 +40,11 @@ _DEFAULTS: dict[str, object] = {
     "bid_size": None,
     "ask_price": None,
     "ask_size": None,
+    "agent_log": [],
+    "agent_running": False,
+    "agent_stop_event": None,
+    "decision_tracker": None,
+    "starting_budget": PAPER_STARTING_CASH,
 }
 
 
@@ -74,6 +81,11 @@ class AppState:
         self.bid_size: float | None = None
         self.ask_price: float | None = None
         self.ask_size: float | None = None
+        self.agent_log: list[dict] = []
+        self.agent_running: bool = False
+        self.agent_stop_event: "threading.Event | None" = None
+        self.decision_tracker: "DecisionTracker | None" = None
+        self.starting_budget: float = PAPER_STARTING_CASH
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

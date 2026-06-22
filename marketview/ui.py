@@ -1,13 +1,30 @@
 import html
+import json
 import os
 import re
+from dataclasses import asdict
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
-from .charts import build_chart, build_historical_chart, empty_chart
-from .config import CHART_POLL_SEC, FEEDS, MAX_BARS, PALETTE, POLL_SEC, SESSION_START, TIMEFRAMES
+from .agent import launch_agent, stop_agent
+from .charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
+from .config import (
+    AGENT_CYCLE_SEC,
+    AGENT_LOG_POLL_SEC,
+    AGENT_MODEL,
+    CHART_POLL_SEC,
+    FEEDS,
+    MAX_BARS,
+    PAPER_STARTING_CASH,
+    PALETTE,
+    POLL_SEC,
+    SESSION_START,
+    TIMEFRAMES,
+    TRADE_FIXED_COST,
+)
+from .decisions import DecisionTracker
 from .historical import (
     HISTORICAL_PERIODS,
     SPY_SYMBOL,
@@ -17,6 +34,7 @@ from .historical import (
     fetch_earnings_dates,
 )
 from .news import score_news_impacts
+from .performance import compute_equity_curve, decision_markers, summarize
 from .rest import fetch_bars, fetch_daily_bars, fetch_news, fetch_trades
 from .state import AppState
 from .stream import launch_stream, launch_stream_news
@@ -233,6 +251,8 @@ def _chart_panel() -> None:
     with state.lock:
         bars = list(state.bars)
 
+    decisions = state.decision_tracker.trade_markers() if state.decision_tracker else None
+
     fig = (
         build_chart(
             bars,
@@ -252,6 +272,7 @@ def _chart_panel() -> None:
             show_candle_body=state.show_candle_body,
             show_percentile_body=state.show_percentile_body,
             show_whiskers=state.show_whiskers,
+            decisions=decisions,
         )
         if (state.symbol and bars)
         else empty_chart()
@@ -289,6 +310,161 @@ def _historical_panel(symbol: str) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
+    """Return (icon, accent_color, label) for an agent log entry."""
+    etype = entry.get("type")
+    if etype == "decision":
+        action = entry.get("action")
+        if action == "buy":
+            return "🟢", PALETTE["up"], "BUY"
+        if action == "sell":
+            return "🔴", PALETTE["down"], "SELL"
+        return "💤", PALETTE["muted"], "SLEEP"
+    if etype == "tool_call":
+        return "🛠️", PALETTE["accent"], str(entry.get("name", "tool"))
+    if etype == "analysis":
+        return "🧠", PALETTE["text"], "analysis"
+    if etype == "cycle_start":
+        return "🔄", PALETTE["accent"], "cycle start"
+    if etype == "error":
+        return "⚠️", PALETTE["down"], "error"
+    return "ℹ️", PALETTE["muted"], "status"
+
+
+def _agent_entry_body(entry: dict) -> str:
+    etype = entry.get("type")
+    if etype == "decision":
+        price = entry.get("price")
+        price_str = f"${price:,.4f}" if price is not None else "—"
+        qty = entry.get("quantity") or 0
+        regime = html.escape(str(entry.get("regime", "unknown")))
+        reasoning = html.escape(entry.get("reasoning", ""))
+        return (
+            f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b></div>"
+            f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
+        )
+    if etype == "tool_call":
+        args = entry.get("args") or {}
+        args_html = f"<div style='color:{PALETTE['muted']}'>args: {html.escape(json.dumps(args))}</div>" if args else ""
+        result = html.escape(entry.get("result_preview", ""))
+        return f"{args_html}<div>{result}</div>"
+    if etype in ("analysis", "error", "status", "cycle_start"):
+        return f"<div>{html.escape(entry.get('text', ''))}</div>"
+    return ""
+
+
+def _agent_log_html(log: list[dict]) -> str:
+    if not log:
+        return f"<p style='color:{PALETTE['muted']};padding:12px'>No agent activity yet.</p>"
+    cards = []
+    for entry in reversed(log):
+        icon, color, label = _agent_entry_style(entry)
+        try:
+            ts_fmt = pd.to_datetime(entry.get("ts", "")).strftime("%H:%M:%S")
+        except Exception:
+            ts_fmt = str(entry.get("ts", ""))
+        cards.append(
+            f"""
+        <div style="background:{PALETTE['panel']}; border-radius:8px; padding:10px 14px;
+                    border-left:3px solid {color}; border-top:1px solid {PALETTE['grid']};
+                    border-right:1px solid {PALETTE['grid']}; border-bottom:1px solid {PALETTE['grid']};
+                    margin-bottom:8px; font-size:12px; color:{PALETTE['text']};">
+          <div style="display:flex; justify-content:space-between; color:{PALETTE['muted']}; font-size:11px; margin-bottom:4px;">
+            <span>{icon} <b style="color:{color}">{html.escape(label)}</b></span>
+            <span>{ts_fmt}</span>
+          </div>
+          {_agent_entry_body(entry)}
+        </div>"""
+        )
+    return f"<div style='font-family:Inter,sans-serif;'>{''.join(cards)}</div>"
+
+
+@st.fragment(run_every=AGENT_LOG_POLL_SEC)
+def _agent_log_panel() -> None:
+    state = _get_state()
+    tracker = state.decision_tracker
+    if tracker:
+        snap = tracker.snapshot()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Paper cash", f"${snap['cash']:,.2f}")
+        c2.metric("Position", f"{snap['position']:.2f} sh")
+        c3.metric("Decisions", len(snap["decisions"]))
+    with state.lock:
+        log = list(state.agent_log)
+    st.html(_agent_log_html(log[-50:]))
+
+
+@st.fragment(run_every=AGENT_LOG_POLL_SEC)
+def _agent_performance_panel(symbol: str) -> None:
+    state = _get_state()
+    tracker = state.decision_tracker
+    if not tracker:
+        st.plotly_chart(empty_chart("Start the agent to track performance"), use_container_width=True)
+        return
+
+    snap = tracker.snapshot()
+    decisions = [asdict(d) for d in snap["decisions"]]
+    with state.lock:
+        bars = list(state.bars)
+
+    points = compute_equity_curve(bars, decisions, state.starting_budget, SESSION_START)
+    markers = decision_markers(decisions, SESSION_START)
+    stats = summarize(points, decisions, state.starting_budget)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Portfolio value", f"${stats['current_value']:,.2f}", f"{stats['return_pct']:+.2f}%")
+    c2.metric("Fees paid", f"${stats['total_fees']:,.2f}")
+    c3.metric("Starting budget", f"${stats['starting_cash']:,.2f}")
+
+    fig = build_performance_chart(points, markers, symbol or state.symbol)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _agent_panel(symbol: str) -> None:
+    state = _get_state()
+    st.caption(
+        "Runs an LLM research agent that reads already-fetched ticker data and makes "
+        "paper buy/sell/sleep calls on a fixed interval. No real orders are ever placed. "
+        f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
+    )
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    starting_budget = c1.number_input(
+        "Starting budget ($)",
+        min_value=0.0,
+        value=PAPER_STARTING_CASH,
+        step=100.0,
+        key="agent_starting_budget",
+    )
+    start_clicked = c2.button("▶ Start Agent", type="primary", use_container_width=True, key="agent_start")
+    stop_clicked = c3.button("⏹ Stop Agent", use_container_width=True, key="agent_stop")
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+
+    if start_clicked:
+        sym = symbol.strip().upper() or state.symbol
+        with state.lock:
+            has_bars = bool(state.bars)
+        if not sym or not state.api_key or not has_bars:
+            st.error("Start the Live stream for a symbol first (sidebar ▶ Start) so the agent has data to read.")
+        elif not gemini_key:
+            st.error("GEMINI_API_KEY is not set; the agent needs an LLM key to reason about decisions.")
+        else:
+            state.starting_budget = starting_budget
+            state.decision_tracker = DecisionTracker(starting_cash=starting_budget, trade_cost=TRADE_FIXED_COST)
+            state.agent_log = []
+            launch_agent(state, state.decision_tracker, sym, gemini_key, model=AGENT_MODEL, cycle_sec=AGENT_CYCLE_SEC)
+
+    if stop_clicked:
+        stop_agent(state)
+
+    status = "🟢 running" if state.agent_running else "⚪ idle"
+    watching = f" — watching {state.symbol}" if state.agent_running and state.symbol else ""
+    st.caption(f"Status: {status}{watching}")
+
+    _agent_performance_panel(symbol)
+    _agent_log_panel()
+
+
 def build_ui() -> None:
     st.set_page_config(
         page_title="Market Stream",
@@ -296,13 +472,13 @@ def build_ui() -> None:
         layout="wide",
     )
 
-    st.markdown(
-        f"<h1 style='color:{PALETTE['text']};font-family:Inter,sans-serif;margin:0 0 4px'>"
-        "📈 Market Stream</h1>"
-        f"<p style='color:{PALETTE['muted']};font-size:13px;margin:0'>"
-        "Real-time candlestick bars &amp; news via Alpaca streaming API</p>",
-        unsafe_allow_html=True,
-    )
+    # st.markdown(
+    #     f"<h1 style='color:{PALETTE['text']};font-family:Inter,sans-serif;margin:0 0 4px'>"
+    #     "📈 Market Stream</h1>"
+    #     f"<p style='color:{PALETTE['muted']};font-size:13px;margin:0'>"
+    #     "Real-time candlestick bars &amp; news via Alpaca streaming API</p>",
+    #     unsafe_allow_html=True,
+    # )
 
     with st.sidebar:
         st.header("Controls")
@@ -440,7 +616,7 @@ def build_ui() -> None:
                 pass
         state.status = "Stopped"
 
-    tab_live, tab_historical = st.tabs(["📡 Live", "🗂️ Historical"])
+    tab_live, tab_historical, tab_agent = st.tabs(["📡 Live", "🗂️ Historical", "🤖 Agent"])
 
     with tab_live:
         st.caption(
@@ -450,3 +626,6 @@ def build_ui() -> None:
 
     with tab_historical:
         _historical_panel(symbol)
+
+    with tab_agent:
+        _agent_panel(symbol)

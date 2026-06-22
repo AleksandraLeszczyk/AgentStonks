@@ -1,6 +1,6 @@
 import threading
 
-from marketview.config import MAX_BARS
+from marketview.config import MAX_BARS, PAPER_STARTING_CASH
 from marketview.state import AppState
 
 
@@ -13,6 +13,11 @@ def test_initial_values():
     assert s.status == "Idle"
     assert s.ws is None
     assert s.ws_news is None
+    assert s.agent_log == []
+    assert s.agent_running is False
+    assert s.agent_stop_event is None
+    assert s.decision_tracker is None
+    assert s.starting_budget == PAPER_STARTING_CASH
 
 
 def test_bars_deque_respects_max_bars():

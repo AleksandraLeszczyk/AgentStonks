@@ -12,6 +12,7 @@ lxml>=5.0.0
 # Testing
 pytest>=7.4.0
 pytest-mock>=3.12.0
+requests-mock>=1.11.0
 
 # Optional — LLM news pipeline (marketview/news.py)
 openai>=1.0.0

@@ -440,6 +440,43 @@ def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
         )
 
 
+def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: datetime) -> None:
+    """Plot filled agent buy/sell decisions as markers on the price chart."""
+    if not decisions:
+        return
+    df = pd.DataFrame(decisions)
+    if df.empty or "ts" not in df.columns or "price" not in df.columns:
+        return
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df = df[(df["ts"] > session_start) & df["price"].notna()]
+    if df.empty:
+        return
+
+    markers = (
+        ("buy", "triangle-up", PALETTE["up"]),
+        ("sell", "triangle-down", PALETTE["down"]),
+    )
+    for action, marker_symbol, color in markers:
+        sub = df[df["action"] == action]
+        if sub.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=sub["ts"],
+                y=sub["price"],
+                mode="markers",
+                marker=dict(symbol=marker_symbol, size=14, color=color, line=dict(width=1.5, color="#ffffff")),
+                name=f"Agent {action}",
+                customdata=sub.get("filled_quantity", sub.get("quantity")),
+                hovertemplate=(
+                    f"<b>Agent {action}</b><br>Price: %{{y:.4f}}<br>Qty: %{{customdata:.2f}}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+
+
 def _bar_width_ms(df: pd.DataFrame) -> float:
     if len(df) < 2:
         return 60_000
@@ -465,6 +502,7 @@ def build_chart(
     show_candle_body: bool = True,
     show_percentile_body: bool = False,
     show_whiskers: bool = True,
+    decisions: Optional[list[dict]] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -667,6 +705,8 @@ def build_chart(
     if show_fib:
         _add_fibonacci_levels(df, fig)
 
+    _add_decision_markers(decisions or [], fig, session_start)
+
     last = df.iloc[-1]
     color = PALETTE["up"] if last["c"] >= last["o"] else PALETTE["down"]
     fig.add_annotation(
@@ -705,6 +745,66 @@ def build_chart(
         legend=dict(orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)"),
         margin=dict(l=10, r=10, t=50, b=10),
         height=520,
+    )
+    return fig
+
+
+def build_performance_chart(
+    points: list[dict],
+    markers: list[dict],
+    symbol: str,
+) -> go.Figure:
+    """Agent equity curve: portfolio value per bar, with markers at filled decisions."""
+    if not points:
+        return empty_chart("No agent performance data yet")
+
+    df = pd.DataFrame(points)
+    df["ts"] = pd.to_datetime(df["ts"])
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["ts"],
+            y=df["value"],
+            mode="lines",
+            name="Portfolio value",
+            line=dict(color=PALETTE["accent"], width=2),
+            hovertemplate="<b>%{x|%H:%M}</b><br>Value: $%{y:,.2f}<extra></extra>",
+        )
+    )
+
+    if markers:
+        df_m = pd.DataFrame(markers)
+        df_m["ts"] = pd.to_datetime(df_m["ts"])
+        for action, marker_symbol, color in (
+            ("buy", "triangle-up", PALETTE["up"]),
+            ("sell", "triangle-down", PALETTE["down"]),
+        ):
+            sub = df_m[df_m["action"] == action]
+            if sub.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["ts"],
+                    y=sub["value"],
+                    mode="markers",
+                    marker=dict(symbol=marker_symbol, size=12, color=color, line=dict(width=1.5, color="#ffffff")),
+                    name=f"Agent {action}",
+                    hovertemplate=f"<b>Agent {action}</b><br>Value: $%{{y:,.2f}}<extra></extra>",
+                )
+            )
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=PALETTE["bg"],
+        plot_bgcolor=PALETTE["panel"],
+        font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
+        title=dict(text=f"<b>{symbol}</b> agent portfolio value", font=dict(size=16), x=0.02),
+        xaxis=dict(showgrid=True, gridcolor=PALETTE["grid"]),
+        yaxis=dict(showgrid=True, gridcolor=PALETTE["grid"], tickprefix="$"),
+        legend=dict(orientation="h", y=1.08, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=420,
     )
     return fig
 
