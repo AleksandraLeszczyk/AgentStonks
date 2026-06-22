@@ -635,9 +635,21 @@ def _agent_panel(symbol: str) -> None:
         "No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
-    provider = state.llm_provider
-    model = state.llm_model
-    st.caption(f"LLM: **{provider}** ({model or DEFAULT_AGENT_MODELS[provider]}) — change in sidebar ▸ LLM.")
+    with st.expander("LLM", expanded=True):
+        provider = st.selectbox(
+            "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
+        )
+        model = st.text_input(
+            "Model (optional)",
+            value=state.llm_model,
+            placeholder=f"Default: {DEFAULT_AGENT_MODELS[provider]}",
+            key="agent_llm_model",
+        )
+        state.llm_provider = provider
+        state.llm_model = model
+        env_var = ENV_KEYS[provider]
+        if not os.getenv(env_var):
+            st.caption(f"⚠️ {env_var} is not set.")
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
@@ -721,23 +733,6 @@ def build_ui() -> None:
                 placeholder="From env ALPACA_SECRET if blank",
             )
     state = _get_state()
-
-    with st.sidebar:
-        with st.expander("LLM"):
-            provider = st.selectbox(
-                "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="sidebar_llm_provider"
-            )
-            model = st.text_input(
-                "Model (optional)",
-                value=state.llm_model,
-                placeholder=f"Default: {DEFAULT_AGENT_MODELS[provider]}",
-                key="sidebar_llm_model",
-            )
-            state.llm_provider = provider
-            state.llm_model = model
-            env_var = ENV_KEYS[provider]
-            if not os.getenv(env_var):
-                st.caption(f"⚠️ {env_var} is not set.")
 
     tab_live, tab_historical, tab_agent = st.tabs(["📡 Live", "🗂️ Historical", "🤖 Agent"])
 
