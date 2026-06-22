@@ -7,7 +7,7 @@ from typing import Any
 import websocket
 
 from .config import BARS_STREAM_URL, NEWS_STREAM_URL
-from .state import AppState
+from .state import AppState, alert_triggered
 
 
 _TF_MINUTES: dict[str, int] = {
@@ -73,6 +73,24 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     state.trades.append(trade)
                     if "p" in msg:
                         state.last_price = float(msg["p"])
+                    price = state.last_price
+                    alerts = state.price_alerts
+                    tracker = state.decision_tracker
+
+                # Keep portfolio value marked-to-market independently of the
+                # agent loop -- it never has to fetch or compute this itself.
+                if tracker is not None and price is not None:
+                    snap = tracker.snapshot()
+                    state.portfolio_value = snap["cash"] + snap["position"] * price
+
+                if price is not None and alerts:
+                    hit = next((a for a in alerts if alert_triggered(price, a)), None)
+                    if hit is not None:
+                        state.price_alerts = []
+                        state.agent_wake_reason = (
+                            f"Price alert hit at {price} ({hit['condition']} {hit['price']})."
+                        )
+                        state.agent_wake_event.set()
             elif t == "q" and msg.get("S") == symbol:
                 if "bp" in msg:
                     state.bid_price = float(msg["bp"])
@@ -153,6 +171,12 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
                 }
                 with state.lock:
                     state.news.append(article)
+                headline = article.get("headline", "")
+                text = "Fresh news arrived for the ticker."
+                if headline:
+                    text += f" Latest: {headline}"
+                state.agent_wake_reason = text
+                state.agent_wake_event.set()
             elif t == "error":
                 state.status = f"News stream error: {msg.get('msg')}"
 

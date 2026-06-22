@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from .config import AGENT_ALERT_POLL_SEC, AGENT_MAX_TOOL_ITERS
+from .config import AGENT_MAX_TOOL_ITERS
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
+from .state import alert_triggered
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
@@ -164,7 +164,10 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "get_position",
-            "description": "Get the current paper trading position size and cash balance.",
+            "description": (
+                "Get the current paper trading position size, cash balance, and total "
+                "portfolio value (cash + position marked to the latest price)."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -285,9 +288,15 @@ def _tool_get_news(state: "AppState", limit: object = None) -> dict:
     }
 
 
-def _tool_get_position(tracker: "DecisionTracker") -> dict:
+def _tool_get_position(state: "AppState", tracker: "DecisionTracker") -> dict:
     snap = tracker.snapshot()
-    return {"cash": snap["cash"], "position": snap["position"], "decisions_so_far": len(snap["decisions"])}
+    return {
+        "cash": snap["cash"],
+        "position": snap["position"],
+        # Kept fresh independently by the price stream, not fetched here.
+        "portfolio_value": state.portfolio_value,
+        "decisions_so_far": len(snap["decisions"]),
+    }
 
 
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
@@ -296,7 +305,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_daily_bars": lambda args, state, tracker: _tool_get_daily_bars(state, args.get("limit")),
     "get_volume_stats": lambda args, state, tracker: _tool_get_volume_stats(state),
     "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),
-    "get_position": lambda args, state, tracker: _tool_get_position(tracker),
+    "get_position": lambda args, state, tracker: _tool_get_position(state, tracker),
 }
 
 
@@ -392,11 +401,35 @@ def run_agent_cycle(
                     alerts.append({"price": float(alert_low_price), "condition": "below"})
                 if alert_high_price is not None:
                     alerts.append({"price": float(alert_high_price), "condition": "above"})
+
+                if action == "alert" and not alerts:
+                    # Some models (small/cheap ones especially) pick action="alert" but
+                    # forget the optional price fields. Reject and let the model retry
+                    # instead of silently demoting to sleep -- it never sees that
+                    # happen otherwise, so it can't course-correct.
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": json.dumps(
+                                {
+                                    "error": (
+                                        "action 'alert' requires alert_low_price and/or "
+                                        "alert_high_price. Call submit_decision again with at "
+                                        "least one price level, or use action 'sleep' if no "
+                                        "level is worth watching."
+                                    )
+                                }
+                            ),
+                        }
+                    )
+                    continue
+
                 if action in ("buy", "sell") and quantity > 0:
                     decision = tracker.record_trade(
                         symbol, action, quantity, reasoning, state.api_key, state.api_secret, state.feed
                     )
-                elif action == "alert" and alerts:
+                elif action == "alert":
                     decision = tracker.record_alert(symbol, alerts, reasoning)
                     state.price_alerts = alerts
                 else:
@@ -452,51 +485,42 @@ def run_agent_cycle(
         )
 
 
-def _alert_triggered(price: float, alert: dict) -> bool:
-    target = alert.get("price")
-    condition = alert.get("condition")
-    if target is None:
-        return False
-    if condition == "above":
-        return price >= target
-    if condition == "below":
-        return price <= target
-    return False
-
-
 def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
-    """Wait up to `cycle_sec`, but wake early if a price alert fires or fresh news arrives."""
-    deadline = time.monotonic() + cycle_sec
-    with state.lock:
-        news_baseline = len(state.news)
-    while not stop_event.is_set():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        alerts = state.price_alerts
-        if alerts:
-            with state.lock:
-                price = state.last_price
-            if price is not None:
-                hit = next((a for a in alerts if _alert_triggered(price, a)), None)
-                if hit is not None:
-                    _log(
-                        state,
-                        {"type": "status", "text": f"Price alert hit at {price} ({hit['condition']} {hit['price']}); waking early."},
-                    )
-                    state.price_alerts = []
-                    return
+    """Block for up to `cycle_sec` -- a real sleep, not a poll loop.
+
+    Wakes early only if `state.agent_wake_event` is set, which the price/news
+    stream threads do directly the moment a price alert condition is met or
+    fresh news arrives -- never on a timer just to check state.
+    """
+    state.agent_wake_event.clear()
+    state.agent_wake_reason = None
+    if stop_event.is_set():
+        return
+
+    # The stream only signals on the *next* tick, so an alert level that's
+    # already satisfied by the current price (the instant it's set) would
+    # otherwise wait for a tick that may not come. Catch that once, up front.
+    alerts = state.price_alerts
+    if alerts:
         with state.lock:
-            news_count = len(state.news)
-            new_articles = list(state.news)[news_baseline:] if news_count > news_baseline else []
-        if new_articles:
-            headline = new_articles[-1].get("headline", "")
-            text = f"{len(new_articles)} new news item(s) for the ticker; waking early."
-            if headline:
-                text += f" Latest: {headline}"
-            _log(state, {"type": "news_alert", "text": text})
-            return
-        stop_event.wait(min(AGENT_ALERT_POLL_SEC, remaining))
+            price = state.last_price
+        if price is not None:
+            hit = next((a for a in alerts if alert_triggered(price, a)), None)
+            if hit is not None:
+                state.price_alerts = []
+                _log(
+                    state,
+                    {"type": "status", "text": f"Price alert hit at {price} ({hit['condition']} {hit['price']}); waking early."},
+                )
+                return
+
+    woke_early = state.agent_wake_event.wait(timeout=cycle_sec)
+    if stop_event.is_set():
+        return
+    if woke_early and state.agent_wake_reason:
+        _log(state, {"type": "status", "text": f"{state.agent_wake_reason} Waking early."})
+    state.agent_wake_event.clear()
+    state.agent_wake_reason = None
 
 
 def _agent_loop(
@@ -546,3 +570,6 @@ def stop_agent(state: "AppState") -> None:
     if state.agent_stop_event:
         state.agent_stop_event.set()
     state.agent_running = False
+    # Interrupt a blocked _wait_for_next_cycle immediately instead of letting
+    # it sit until the timeout expires.
+    state.agent_wake_event.set()

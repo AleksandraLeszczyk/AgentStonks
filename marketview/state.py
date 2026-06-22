@@ -46,9 +46,24 @@ _DEFAULTS: dict[str, object] = {
     "decision_tracker": None,
     "starting_budget": PAPER_STARTING_CASH,
     "price_alerts": [],
+    "portfolio_value": None,
+    "agent_wake_event": None,  # handled specially
+    "agent_wake_reason": None,
     "llm_provider": "gemini",
     "llm_model": "",
 }
+
+
+def alert_triggered(price: float, alert: dict) -> bool:
+    target = alert.get("price")
+    condition = alert.get("condition")
+    if target is None:
+        return False
+    if condition == "above":
+        return price >= target
+    if condition == "below":
+        return price <= target
+    return False
 
 
 class AppState:
@@ -90,6 +105,9 @@ class AppState:
         self.decision_tracker: "DecisionTracker | None" = None
         self.starting_budget: float = PAPER_STARTING_CASH
         self.price_alerts: list[dict] = []
+        self.portfolio_value: float | None = None
+        self.agent_wake_event: threading.Event = threading.Event()
+        self.agent_wake_reason: str | None = None
         self.llm_provider: str = "gemini"
         self.llm_model: str = ""
 
@@ -101,6 +119,8 @@ class AppState:
             value: object = deque(maxlen=MAX_BARS)
         elif name == "lock":
             value = threading.Lock()
+        elif name == "agent_wake_event":
+            value = threading.Event()
         else:
             raw = _DEFAULTS[name]
             # Return a fresh copy for mutables so instances don't share state.

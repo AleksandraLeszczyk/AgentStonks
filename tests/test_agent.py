@@ -3,7 +3,6 @@ import threading
 from types import SimpleNamespace
 
 from marketview.agent import (
-    _alert_triggered,
     _dispatch_tool,
     _tool_get_news,
     _tool_get_quote,
@@ -13,7 +12,7 @@ from marketview.agent import (
 )
 from marketview.broker import Broker
 from marketview.decisions import DecisionTracker
-from marketview.state import AppState
+from marketview.state import AppState, alert_triggered
 
 
 class FakeBroker(Broker):
@@ -227,7 +226,52 @@ class TestRunAgentCycle:
         ]
         assert state.price_alerts == decision.alerts
 
-    def test_alert_with_missing_fields_falls_back_to_sleep(self):
+    def test_alert_with_missing_fields_is_rejected_and_retried(self):
+        """An incomplete alert call (no price levels) must not be silently downgraded to
+        sleep -- the model gets an error back and a chance to correct itself, since it
+        otherwise has no way to know its alert was dropped."""
+        state = AppState()
+        state.symbol = "AAPL"
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call("c1", "submit_decision", {"action": "alert", "reasoning": "no level chosen"})
+                ]
+            ),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c2",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "watching for a breakout above resistance",
+                            "alert_high_price": 150.0,
+                        },
+                    )
+                ]
+            ),
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
+
+        snap = tracker.snapshot()
+        assert len(snap["decisions"]) == 1
+        assert snap["decisions"][0].action == "alert"
+        assert snap["decisions"][0].alerts == [{"price": 150.0, "condition": "above"}]
+        assert state.price_alerts == [{"price": 150.0, "condition": "above"}]
+
+        # the rejected first attempt must have been surfaced back to the model as a tool result
+        first_call_messages = client.calls[1]
+        tool_results = [m["content"] for m in first_call_messages if m.get("role") == "tool"]
+        assert any("requires alert_low_price" in c for c in tool_results)
+
+    def test_alert_with_missing_fields_falls_back_to_sleep_if_never_corrected(self):
         state = AppState()
         state.symbol = "AAPL"
         state.api_key = "k"
@@ -240,24 +284,26 @@ class TestRunAgentCycle:
                     _tool_call("c1", "submit_decision", {"action": "alert", "reasoning": "no level chosen"})
                 ]
             )
+            for _ in range(3)
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
+        assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
         assert state.price_alerts == []
 
 
 class TestAlertTrigger:
     def test_alert_triggered_above(self):
-        assert _alert_triggered(151.0, {"price": 150.0, "condition": "above"}) is True
-        assert _alert_triggered(149.0, {"price": 150.0, "condition": "above"}) is False
+        assert alert_triggered(151.0, {"price": 150.0, "condition": "above"}) is True
+        assert alert_triggered(149.0, {"price": 150.0, "condition": "above"}) is False
 
     def test_alert_triggered_below(self):
-        assert _alert_triggered(99.0, {"price": 100.0, "condition": "below"}) is True
-        assert _alert_triggered(101.0, {"price": 100.0, "condition": "below"}) is False
+        assert alert_triggered(99.0, {"price": 100.0, "condition": "below"}) is True
+        assert alert_triggered(101.0, {"price": 100.0, "condition": "below"}) is False
 
     def test_wait_returns_early_when_alert_fires(self):
         state = AppState()
@@ -310,15 +356,18 @@ class TestAlertTrigger:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types
 
-    def test_wait_returns_early_when_news_arrives(self):
+    def test_wait_returns_early_when_woken_externally(self):
+        """The actual news/alert detection now lives in the stream callbacks (see
+        stream.py), which signal `agent_wake_event` directly. This simulates that
+        external signal to verify `_wait_for_next_cycle` is a real, event-driven
+        block rather than a self-polling loop."""
         state = AppState()
-        state.news = [{"id": "1", "headline": "old headline"}]
         stop_event = threading.Event()
 
-        def add_news_after_start():
+        def signal_after_start():
             start.wait()
-            with state.lock:
-                state.news.append({"id": "2", "headline": "breaking: new development"})
+            state.agent_wake_reason = "Fresh news arrived for the ticker."
+            state.agent_wake_event.set()
 
         start = threading.Event()
         finished = threading.Event()
@@ -328,17 +377,17 @@ class TestAlertTrigger:
             _wait_for_next_cycle(state, stop_event, cycle_sec=60)
             finished.set()
 
-        adder = threading.Thread(target=add_news_after_start)
+        signaler = threading.Thread(target=signal_after_start)
         thread = threading.Thread(target=run)
         thread.start()
-        adder.start()
+        signaler.start()
         thread.join(timeout=5)
-        adder.join(timeout=5)
+        signaler.join(timeout=5)
 
         assert finished.is_set()
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
-        assert "news_alert" in log_types
+        assert "status" in log_types
 
     def test_wait_respects_stop_event_without_alert(self):
         state = AppState()
