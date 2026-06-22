@@ -74,13 +74,16 @@ and why this specific action follows from it. Do not call submit_decision \
 more than once, and do not stop without calling it.
 
 Be decisive but not reckless: sleep is a valid and often correct decision. \
-If you'd otherwise sleep but there's a specific price level that would \
-change your mind before the next scheduled cycle (e.g. a breakout level, a \
-support level, a stop-loss trigger), use action "alert" instead of "sleep" \
-and set alert_price and alert_condition ("above" or "below"). This wakes \
-you up early -- as soon as the price crosses that level -- instead of \
-waiting out the full fixed cycle interval blind to what happens in between. \
-Use plain "sleep" when no specific level is worth watching.
+If you'd otherwise sleep but there's a specific price level (or a bracket of \
+two -- a downside level and an upside level, e.g. a stop-loss below and a \
+breakout level above) that would change your mind before the next scheduled \
+cycle, use action "alert" instead of "sleep" and set alert_low_price (wakes \
+you when price falls to/below it) and/or alert_high_price (wakes you when \
+price rises to/above it). Set just one for a single level, or both to watch \
+a range from both sides in one cycle. This wakes you up early -- as soon as \
+either level is crossed -- instead of waiting out the full fixed cycle \
+interval blind to what happens in between. Use plain "sleep" when no \
+specific level is worth watching.
 
 Regardless of which action you choose, you will also be woken up early -- \
 before the next scheduled cycle -- if fresh news for the ticker arrives \
@@ -190,19 +193,18 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "description": "Concise justification covering regime, strategy, and why this action follows from it.",
                     },
-                    "alert_price": {
+                    "alert_low_price": {
                         "type": "number",
                         "description": (
-                            "Required when action is 'alert': the price level that should wake "
-                            "the agent early, before the next fixed cycle."
+                            "When action is 'alert': wake the agent early if price falls to or "
+                            "below this level. Optional -- set this, alert_high_price, or both."
                         ),
                     },
-                    "alert_condition": {
-                        "type": "string",
-                        "enum": ["above", "below"],
+                    "alert_high_price": {
+                        "type": "number",
                         "description": (
-                            "Required when action is 'alert': whether to trigger when price "
-                            "rises to/above alert_price, or falls to/below it."
+                            "When action is 'alert': wake the agent early if price rises to or "
+                            "above this level. Optional -- set this, alert_low_price, or both."
                         ),
                     },
                 },
@@ -321,7 +323,7 @@ def run_agent_cycle(
     max_iters: int = AGENT_MAX_TOOL_ITERS,
 ) -> None:
     """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision."""
-    state.price_alert = None
+    state.price_alerts = []
     messages: list[dict] = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT},
         {
@@ -383,20 +385,20 @@ def run_agent_cycle(
                 quantity = float(args.get("quantity") or 0)
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
-                alert_price = args.get("alert_price")
-                alert_condition = args.get("alert_condition")
+                alert_low_price = args.get("alert_low_price")
+                alert_high_price = args.get("alert_high_price")
+                alerts = []
+                if alert_low_price is not None:
+                    alerts.append({"price": float(alert_low_price), "condition": "below"})
+                if alert_high_price is not None:
+                    alerts.append({"price": float(alert_high_price), "condition": "above"})
                 if action in ("buy", "sell") and quantity > 0:
                     decision = tracker.record_trade(
                         symbol, action, quantity, reasoning, state.api_key, state.api_secret, state.feed
                     )
-                elif action == "alert" and alert_price and alert_condition in ("above", "below"):
-                    alert_price = float(alert_price)
-                    decision = tracker.record_alert(symbol, alert_price, alert_condition, reasoning)
-                    state.price_alert = {
-                        "price": alert_price,
-                        "condition": alert_condition,
-                        "reasoning": reasoning,
-                    }
+                elif action == "alert" and alerts:
+                    decision = tracker.record_alert(symbol, alerts, reasoning)
+                    state.price_alerts = alerts
                 else:
                     decision = tracker.record_sleep(symbol, reasoning)
                 _log(
@@ -409,8 +411,7 @@ def run_agent_cycle(
                         "quantity": decision.filled_quantity,
                         "reasoning": reasoning,
                         "regime": regime,
-                        "alert_price": decision.alert_price,
-                        "alert_condition": decision.alert_condition,
+                        "alerts": decision.alerts,
                     },
                 )
                 result_content = json.dumps(
@@ -472,17 +473,19 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
-        alert = state.price_alert
-        if alert is not None:
+        alerts = state.price_alerts
+        if alerts:
             with state.lock:
                 price = state.last_price
-            if price is not None and _alert_triggered(price, alert):
-                _log(
-                    state,
-                    {"type": "status", "text": f"Price alert hit at {price} ({alert['condition']} {alert['price']}); waking early."},
-                )
-                state.price_alert = None
-                return
+            if price is not None:
+                hit = next((a for a in alerts if _alert_triggered(price, a)), None)
+                if hit is not None:
+                    _log(
+                        state,
+                        {"type": "status", "text": f"Price alert hit at {price} ({hit['condition']} {hit['price']}); waking early."},
+                    )
+                    state.price_alerts = []
+                    return
         with state.lock:
             news_count = len(state.news)
             new_articles = list(state.news)[news_baseline:] if news_count > news_baseline else []

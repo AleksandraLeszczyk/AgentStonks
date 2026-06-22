@@ -45,7 +45,7 @@ _DEFAULTS: dict[str, object] = {
     "agent_stop_event": None,
     "decision_tracker": None,
     "starting_budget": PAPER_STARTING_CASH,
-    "price_alert": None,
+    "price_alerts": [],
     "llm_provider": "gemini",
     "llm_model": "",
 }
@@ -89,7 +89,7 @@ class AppState:
         self.agent_stop_event: "threading.Event | None" = None
         self.decision_tracker: "DecisionTracker | None" = None
         self.starting_budget: float = PAPER_STARTING_CASH
-        self.price_alert: dict | None = None
+        self.price_alerts: list[dict] = []
         self.llm_provider: str = "gemini"
         self.llm_model: str = ""
 

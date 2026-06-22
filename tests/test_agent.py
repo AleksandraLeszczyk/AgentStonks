@@ -172,8 +172,7 @@ class TestRunAgentCycle:
                         {
                             "action": "alert",
                             "reasoning": "wait for breakout above resistance",
-                            "alert_price": 150.0,
-                            "alert_condition": "above",
+                            "alert_high_price": 150.0,
                         },
                     )
                 ]
@@ -189,13 +188,44 @@ class TestRunAgentCycle:
         assert decision.action == "alert"
         assert decision.status == "noop"
         assert decision.price is None
-        assert decision.alert_price == 150.0
-        assert decision.alert_condition == "above"
-        assert state.price_alert == {
-            "price": 150.0,
-            "condition": "above",
-            "reasoning": "wait for breakout above resistance",
-        }
+        assert decision.alerts == [{"price": 150.0, "condition": "above"}]
+        assert state.price_alerts == [{"price": 150.0, "condition": "above"}]
+
+    def test_alert_decision_supports_both_low_and_high_levels(self):
+        state = AppState()
+        state.symbol = "AAPL"
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c1",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "watching a breakout above resistance or a breakdown below support",
+                            "alert_low_price": 95.0,
+                            "alert_high_price": 150.0,
+                        },
+                    )
+                ]
+            )
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+
+        snap = tracker.snapshot()
+        decision = snap["decisions"][0]
+        assert decision.action == "alert"
+        assert decision.alerts == [
+            {"price": 95.0, "condition": "below"},
+            {"price": 150.0, "condition": "above"},
+        ]
+        assert state.price_alerts == decision.alerts
 
     def test_alert_with_missing_fields_falls_back_to_sleep(self):
         state = AppState()
@@ -217,7 +247,7 @@ class TestRunAgentCycle:
 
         snap = tracker.snapshot()
         assert snap["decisions"][0].action == "sleep"
-        assert state.price_alert is None
+        assert state.price_alerts == []
 
 
 class TestAlertTrigger:
@@ -232,7 +262,7 @@ class TestAlertTrigger:
     def test_wait_returns_early_when_alert_fires(self):
         state = AppState()
         state.last_price = 151.0
-        state.price_alert = {"price": 150.0, "condition": "above", "reasoning": "breakout watch"}
+        state.price_alerts = [{"price": 150.0, "condition": "above"}]
         stop_event = threading.Event()
 
         start = threading.Event()
@@ -248,7 +278,34 @@ class TestAlertTrigger:
         thread.join(timeout=5)
 
         assert finished.is_set()
-        assert state.price_alert is None  # cleared once triggered
+        assert state.price_alerts == []  # cleared once triggered
+        with state.lock:
+            log_types = [e["type"] for e in state.agent_log]
+        assert "status" in log_types
+
+    def test_wait_returns_early_when_low_side_of_bracket_fires(self):
+        state = AppState()
+        state.last_price = 94.0
+        state.price_alerts = [
+            {"price": 95.0, "condition": "below"},
+            {"price": 150.0, "condition": "above"},
+        ]
+        stop_event = threading.Event()
+
+        start = threading.Event()
+        finished = threading.Event()
+
+        def run():
+            start.set()
+            _wait_for_next_cycle(state, stop_event, cycle_sec=60)
+            finished.set()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert finished.is_set()
+        assert state.price_alerts == []  # both levels cleared once either fires
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types

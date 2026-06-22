@@ -31,8 +31,7 @@ class Decision:
     cash_after: float
     position_after: float
     fee: float = 0.0
-    alert_price: Optional[float] = None
-    alert_condition: Optional[str] = None
+    alerts: Optional[list[dict]] = None
 
 
 class DecisionTracker:
@@ -68,10 +67,12 @@ class DecisionTracker:
             self.decisions.append(decision)
         return decision
 
-    def record_alert(
-        self, symbol: str, alert_price: float, alert_condition: str, reasoning: str
-    ) -> Decision:
-        """Record a no-op cycle where the agent set a price alert instead of trading."""
+    def record_alert(self, symbol: str, alerts: list[dict], reasoning: str) -> Decision:
+        """Record a no-op cycle where the agent set one or two price alerts instead of trading.
+
+        `alerts` holds 1-2 entries shaped like {"price": float, "condition": "above" | "below"}
+        -- typically a low (below) and/or high (above) level to wake the agent early on.
+        """
         decision = Decision(
             ts=datetime.now(timezone.utc).isoformat(),
             symbol=symbol,
@@ -83,8 +84,7 @@ class DecisionTracker:
             status="noop",
             cash_after=self.cash,
             position_after=self.position,
-            alert_price=alert_price,
-            alert_condition=alert_condition,
+            alerts=alerts,
         )
         with self.lock:
             self.decisions.append(decision)

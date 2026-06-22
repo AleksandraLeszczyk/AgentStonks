@@ -420,9 +420,11 @@ def _agent_entry_body(entry: dict) -> str:
         regime = html.escape(str(entry.get("regime", "unknown")))
         reasoning = html.escape(entry.get("reasoning", ""))
         extra = ""
-        if entry.get("action") == "alert" and entry.get("alert_price") is not None:
-            condition = html.escape(str(entry.get("alert_condition", "")))
-            extra = f" · Wake when price <b>{condition}</b> <b>${entry['alert_price']:,.4f}</b>"
+        if entry.get("action") == "alert" and entry.get("alerts"):
+            levels = " or ".join(
+                f"<b>{html.escape(str(a['condition']))}</b> <b>${a['price']:,.4f}</b>" for a in entry["alerts"]
+            )
+            extra = f" · Wake when price {levels}"
         return (
             f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b>{extra}</div>"
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
@@ -512,7 +514,8 @@ def _agent_panel(symbol: str) -> None:
     st.caption(
         "Runs an LLM research agent that reads already-fetched ticker data and makes "
         "paper buy/sell/sleep calls on a fixed interval. Instead of sleeping blind, the agent "
-        "can set a price alert to wake up early if the price crosses a level it's watching, "
+        "can set a price alert (a low level, a high level, or both) to wake up early if the "
+        "price crosses a level it's watching, "
         "and it always wakes up early if fresh news breaks for the ticker. "
         "No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
