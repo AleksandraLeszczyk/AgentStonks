@@ -51,6 +51,22 @@ class TestComputeEquityCurve:
         points = compute_equity_curve([old_bar] + BARS, [], 1000.0, SESSION_START)
         assert len(points) == 3
 
+    def test_live_price_appends_trailing_point_priced_off_live_price(self):
+        decisions = [_decision("2024-01-15T14:00:30Z", "buy", 100.0, cash_after=898.85, position_after=1.0)]
+        points = compute_equity_curve(BARS, decisions, 1000.0, SESSION_START, live_price=110.0)
+        assert len(points) == 4
+        assert points[-1]["price"] == 110.0
+        assert points[-1]["value"] == 898.85 + 1.0 * 110.0
+        assert points[-1]["position"] == 1.0
+
+    def test_live_price_works_with_no_bars(self):
+        points = compute_equity_curve([], [], 1000.0, SESSION_START, live_price=105.0)
+        assert len(points) == 1
+        assert points[0]["value"] == 1000.0
+
+    def test_no_live_price_and_no_bars_returns_empty(self):
+        assert compute_equity_curve([], [], 1000.0, SESSION_START, live_price=None) == []
+
 
 class TestDecisionMarkers:
     def test_filters_out_sleep_and_rejected(self):

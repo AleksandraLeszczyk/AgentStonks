@@ -21,35 +21,46 @@ def compute_equity_curve(
     decisions: list[dict],
     starting_cash: float,
     session_start: datetime,
+    live_price: float | None = None,
 ) -> list[dict]:
-    """One point per bar at/after `session_start`: portfolio value = cash + position * close.
+    """One point per bar at/after `session_start`: portfolio value = cash + position * close,
+    plus a trailing "now" point priced off `live_price` so the curve keeps advancing between
+    bar closes and agent decisions.
 
     Before the first decision, the portfolio is `starting_cash` cash and no position.
     From each decision onward, value uses that decision's post-trade cash/position.
     """
-    if not bars:
-        return []
-
-    df = pd.DataFrame(bars)
-    df["t"] = pd.to_datetime(df["t"], utc=True)
-    df = df[df["t"] > pd.Timestamp(session_start)].sort_values("t")
-    if df.empty:
-        return []
-
     ordered = sorted(decisions, key=lambda d: d["ts"])
     decision_ts = [pd.Timestamp(d["ts"]) for d in ordered]
 
     points: list[dict] = []
-    for row in df.itertuples():
-        idx = bisect.bisect_right(decision_ts, row.t) - 1
-        if idx >= 0:
-            cash, position = ordered[idx]["cash_after"], ordered[idx]["position_after"]
-        else:
-            cash, position = starting_cash, 0.0
-        price = float(row.c)
+    if bars:
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"], utc=True)
+        df = df[df["t"] > pd.Timestamp(session_start)].sort_values("t")
+        for row in df.itertuples():
+            idx = bisect.bisect_right(decision_ts, row.t) - 1
+            if idx >= 0:
+                cash, position = ordered[idx]["cash_after"], ordered[idx]["position_after"]
+            else:
+                cash, position = starting_cash, 0.0
+            price = float(row.c)
+            points.append(
+                {
+                    "ts": row.t.isoformat(),
+                    "price": price,
+                    "cash": cash,
+                    "position": position,
+                    "value": cash + position * price,
+                }
+            )
+
+    if live_price is not None:
+        cash, position = (ordered[-1]["cash_after"], ordered[-1]["position_after"]) if ordered else (starting_cash, 0.0)
+        price = float(live_price)
         points.append(
             {
-                "ts": row.t.isoformat(),
+                "ts": pd.Timestamp.now(tz="UTC").isoformat(),
                 "price": price,
                 "cash": cash,
                 "position": position,

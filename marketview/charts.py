@@ -759,7 +759,7 @@ def build_performance_chart(
         return empty_chart("No agent performance data yet")
 
     df = pd.DataFrame(points)
-    df["ts"] = pd.to_datetime(df["ts"])
+    df["ts"] = pd.to_datetime(df["ts"], format="ISO8601")
 
     fig = go.Figure()
     fig.add_trace(
@@ -775,7 +775,7 @@ def build_performance_chart(
 
     if markers:
         df_m = pd.DataFrame(markers)
-        df_m["ts"] = pd.to_datetime(df_m["ts"])
+        df_m["ts"] = pd.to_datetime(df_m["ts"], format="ISO8601")
         for action, marker_symbol, color in (
             ("buy", "triangle-up", PALETTE["up"]),
             ("sell", "triangle-down", PALETTE["down"]),

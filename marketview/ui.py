@@ -497,8 +497,10 @@ def _agent_performance_panel(symbol: str) -> None:
     decisions = [asdict(d) for d in snap["decisions"]]
     with state.lock:
         bars = list(state.bars)
+        live_price = state.last_price
 
-    points = compute_equity_curve(bars, decisions, state.starting_budget, SESSION_START)
+    live_price = live_price or (bars[-1]["c"] if bars else None)
+    points = compute_equity_curve(bars, decisions, state.starting_budget, SESSION_START, live_price=live_price)
     markers = decision_markers(decisions, SESSION_START)
     stats = summarize(points, decisions, state.starting_budget)
 
@@ -518,6 +520,7 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
         bars = list(state.bars)
         trades = list(state.trades)
         agent_log = list(state.agent_log)
+        live_price = state.last_price
 
     tracker = state.decision_tracker
     decisions = [asdict(d) for d in tracker.snapshot()["decisions"]] if tracker else []
@@ -566,7 +569,10 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
     performance_fig = None
     performance_stats = None
     if tracker:
-        points = compute_equity_curve(bars, decisions, state.starting_budget, SESSION_START)
+        report_live_price = live_price or (bars[-1]["c"] if bars else None)
+        points = compute_equity_curve(
+            bars, decisions, state.starting_budget, SESSION_START, live_price=report_live_price
+        )
         markers = decision_markers(decisions, SESSION_START)
         performance_stats = summarize(points, decisions, state.starting_budget)
         performance_fig = build_performance_chart(points, markers, sym)
