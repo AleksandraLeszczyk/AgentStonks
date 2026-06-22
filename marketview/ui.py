@@ -319,6 +319,8 @@ def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
             return "🟢", PALETTE["up"], "BUY"
         if action == "sell":
             return "🔴", PALETTE["down"], "SELL"
+        if action == "alert":
+            return "⏰", PALETTE["accent"], "ALERT"
         return "💤", PALETTE["muted"], "SLEEP"
     if etype == "tool_call":
         return "🛠️", PALETTE["accent"], str(entry.get("name", "tool"))
@@ -339,8 +341,12 @@ def _agent_entry_body(entry: dict) -> str:
         qty = entry.get("quantity") or 0
         regime = html.escape(str(entry.get("regime", "unknown")))
         reasoning = html.escape(entry.get("reasoning", ""))
+        extra = ""
+        if entry.get("action") == "alert" and entry.get("alert_price") is not None:
+            condition = html.escape(str(entry.get("alert_condition", "")))
+            extra = f" · Wake when price <b>{condition}</b> <b>${entry['alert_price']:,.4f}</b>"
         return (
-            f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b></div>"
+            f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b>{extra}</div>"
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
         )
     if etype == "tool_call":
@@ -424,7 +430,9 @@ def _agent_panel(symbol: str) -> None:
     state = _get_state()
     st.caption(
         "Runs an LLM research agent that reads already-fetched ticker data and makes "
-        "paper buy/sell/sleep calls on a fixed interval. No real orders are ever placed. "
+        "paper buy/sell/sleep calls on a fixed interval. Instead of sleeping blind, the agent "
+        "can set a price alert to wake up early if the price crosses a level it's watching. "
+        "No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
     c1, c2, c3 = st.columns([1.2, 1, 1])

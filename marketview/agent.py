@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from .config import AGENT_MAX_TOOL_ITERS, AGENT_MODEL
+from .config import AGENT_ALERT_POLL_SEC, AGENT_MAX_TOOL_ITERS, AGENT_MODEL
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
@@ -66,12 +67,19 @@ this is one ticker in what should be a diversified book, not the whole \
 account.
 
 6. FINALIZE. Call submit_decision exactly once, with the regime you \
-established, the action (buy/sell/sleep), a quantity (omit or 0 for sleep), \
-and reasoning that ties together the regime, the strategy, and why this \
-specific action follows from it. Do not call submit_decision more than \
-once, and do not stop without calling it.
+established, the action (buy/sell/sleep/alert), a quantity (omit or 0 for \
+sleep/alert), and reasoning that ties together the regime, the strategy, \
+and why this specific action follows from it. Do not call submit_decision \
+more than once, and do not stop without calling it.
 
-Be decisive but not reckless: sleep is a valid and often correct decision.
+Be decisive but not reckless: sleep is a valid and often correct decision. \
+If you'd otherwise sleep but there's a specific price level that would \
+change your mind before the next scheduled cycle (e.g. a breakout level, a \
+support level, a stop-loss trigger), use action "alert" instead of "sleep" \
+and set alert_price and alert_condition ("above" or "below"). This wakes \
+you up early -- as soon as the price crosses that level -- instead of \
+waiting out the full fixed cycle interval blind to what happens in between. \
+Use plain "sleep" when no specific level is worth watching.
 """
 
 TOOLS: list[dict] = [
@@ -155,16 +163,16 @@ TOOLS: list[dict] = [
         "function": {
             "name": "submit_decision",
             "description": (
-                "Finalize this trading cycle with exactly one decision: buy, sell, or sleep. "
-                "Must be called exactly once, after analysis is complete."
+                "Finalize this trading cycle with exactly one decision: buy, sell, sleep, or "
+                "alert. Must be called exactly once, after analysis is complete."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["buy", "sell", "sleep"]},
+                    "action": {"type": "string", "enum": ["buy", "sell", "sleep", "alert"]},
                     "quantity": {
                         "type": "number",
-                        "description": "Shares to buy/sell. Ignored for sleep. Must be > 0 for buy/sell.",
+                        "description": "Shares to buy/sell. Ignored for sleep/alert. Must be > 0 for buy/sell.",
                     },
                     "regime": {
                         "type": "string",
@@ -174,6 +182,21 @@ TOOLS: list[dict] = [
                     "reasoning": {
                         "type": "string",
                         "description": "Concise justification covering regime, strategy, and why this action follows from it.",
+                    },
+                    "alert_price": {
+                        "type": "number",
+                        "description": (
+                            "Required when action is 'alert': the price level that should wake "
+                            "the agent early, before the next fixed cycle."
+                        ),
+                    },
+                    "alert_condition": {
+                        "type": "string",
+                        "enum": ["above", "below"],
+                        "description": (
+                            "Required when action is 'alert': whether to trigger when price "
+                            "rises to/above alert_price, or falls to/below it."
+                        ),
                     },
                 },
                 "required": ["action", "reasoning"],
@@ -291,6 +314,7 @@ def run_agent_cycle(
     max_iters: int = AGENT_MAX_TOOL_ITERS,
 ) -> None:
     """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision."""
+    state.price_alert = None
     messages: list[dict] = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT},
         {
@@ -352,10 +376,20 @@ def run_agent_cycle(
                 quantity = float(args.get("quantity") or 0)
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
+                alert_price = args.get("alert_price")
+                alert_condition = args.get("alert_condition")
                 if action in ("buy", "sell") and quantity > 0:
                     decision = tracker.record_trade(
                         symbol, action, quantity, reasoning, state.api_key, state.api_secret, state.feed
                     )
+                elif action == "alert" and alert_price and alert_condition in ("above", "below"):
+                    alert_price = float(alert_price)
+                    decision = tracker.record_alert(symbol, alert_price, alert_condition, reasoning)
+                    state.price_alert = {
+                        "price": alert_price,
+                        "condition": alert_condition,
+                        "reasoning": reasoning,
+                    }
                 else:
                     decision = tracker.record_sleep(symbol, reasoning)
                 _log(
@@ -368,6 +402,8 @@ def run_agent_cycle(
                         "quantity": decision.filled_quantity,
                         "reasoning": reasoning,
                         "regime": regime,
+                        "alert_price": decision.alert_price,
+                        "alert_condition": decision.alert_condition,
                     },
                 )
                 result_content = json.dumps(
@@ -408,6 +444,39 @@ def run_agent_cycle(
         )
 
 
+def _alert_triggered(price: float, alert: dict) -> bool:
+    target = alert.get("price")
+    condition = alert.get("condition")
+    if target is None:
+        return False
+    if condition == "above":
+        return price >= target
+    if condition == "below":
+        return price <= target
+    return False
+
+
+def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
+    """Wait up to `cycle_sec`, but wake early if the agent set a price alert and it fires."""
+    deadline = time.monotonic() + cycle_sec
+    while not stop_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        alert = state.price_alert
+        if alert is not None:
+            with state.lock:
+                price = state.last_price
+            if price is not None and _alert_triggered(price, alert):
+                _log(
+                    state,
+                    {"type": "status", "text": f"Price alert hit at {price} ({alert['condition']} {alert['price']}); waking early."},
+                )
+                state.price_alert = None
+                return
+        stop_event.wait(min(AGENT_ALERT_POLL_SEC, remaining))
+
+
 def _agent_loop(
     state: "AppState",
     tracker: "DecisionTracker",
@@ -428,7 +497,7 @@ def _agent_loop(
             run_agent_cycle(client, model, symbol, state, tracker)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Agent cycle failed: {exc}"})
-        stop_event.wait(cycle_sec)
+        _wait_for_next_cycle(state, stop_event, cycle_sec)
     state.agent_running = False
     _log(state, {"type": "status", "text": "Agent stopped"})
 

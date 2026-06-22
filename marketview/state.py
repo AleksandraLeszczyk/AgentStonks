@@ -45,6 +45,7 @@ _DEFAULTS: dict[str, object] = {
     "agent_stop_event": None,
     "decision_tracker": None,
     "starting_budget": PAPER_STARTING_CASH,
+    "price_alert": None,
 }
 
 
@@ -86,6 +87,7 @@ class AppState:
         self.agent_stop_event: "threading.Event | None" = None
         self.decision_tracker: "DecisionTracker | None" = None
         self.starting_budget: float = PAPER_STARTING_CASH
+        self.price_alert: dict | None = None
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

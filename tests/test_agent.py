@@ -1,7 +1,16 @@
 import json
+import threading
 from types import SimpleNamespace
 
-from marketview.agent import _dispatch_tool, _tool_get_news, _tool_get_quote, _tool_get_volume_stats, run_agent_cycle
+from marketview.agent import (
+    _alert_triggered,
+    _dispatch_tool,
+    _tool_get_news,
+    _tool_get_quote,
+    _tool_get_volume_stats,
+    _wait_for_next_cycle,
+    run_agent_cycle,
+)
 from marketview.broker import Broker
 from marketview.decisions import DecisionTracker
 from marketview.state import AppState
@@ -146,3 +155,107 @@ class TestRunAgentCycle:
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
         assert snap["decisions"][0].price is None
+
+    def test_alert_decision_sets_state_price_alert_and_records_no_trade(self):
+        state = AppState()
+        state.symbol = "AAPL"
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c1",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "wait for breakout above resistance",
+                            "alert_price": 150.0,
+                            "alert_condition": "above",
+                        },
+                    )
+                ]
+            )
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+
+        snap = tracker.snapshot()
+        assert len(snap["decisions"]) == 1
+        decision = snap["decisions"][0]
+        assert decision.action == "alert"
+        assert decision.status == "noop"
+        assert decision.price is None
+        assert decision.alert_price == 150.0
+        assert decision.alert_condition == "above"
+        assert state.price_alert == {
+            "price": 150.0,
+            "condition": "above",
+            "reasoning": "wait for breakout above resistance",
+        }
+
+    def test_alert_with_missing_fields_falls_back_to_sleep(self):
+        state = AppState()
+        state.symbol = "AAPL"
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call("c1", "submit_decision", {"action": "alert", "reasoning": "no level chosen"})
+                ]
+            )
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+
+        snap = tracker.snapshot()
+        assert snap["decisions"][0].action == "sleep"
+        assert state.price_alert is None
+
+
+class TestAlertTrigger:
+    def test_alert_triggered_above(self):
+        assert _alert_triggered(151.0, {"price": 150.0, "condition": "above"}) is True
+        assert _alert_triggered(149.0, {"price": 150.0, "condition": "above"}) is False
+
+    def test_alert_triggered_below(self):
+        assert _alert_triggered(99.0, {"price": 100.0, "condition": "below"}) is True
+        assert _alert_triggered(101.0, {"price": 100.0, "condition": "below"}) is False
+
+    def test_wait_returns_early_when_alert_fires(self):
+        state = AppState()
+        state.last_price = 151.0
+        state.price_alert = {"price": 150.0, "condition": "above", "reasoning": "breakout watch"}
+        stop_event = threading.Event()
+
+        start = threading.Event()
+        finished = threading.Event()
+
+        def run():
+            start.set()
+            _wait_for_next_cycle(state, stop_event, cycle_sec=60)
+            finished.set()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert finished.is_set()
+        assert state.price_alert is None  # cleared once triggered
+        with state.lock:
+            log_types = [e["type"] for e in state.agent_log]
+        assert "status" in log_types
+
+    def test_wait_respects_stop_event_without_alert(self):
+        state = AppState()
+        stop_event = threading.Event()
+        stop_event.set()  # already stopped, should return immediately
+
+        _wait_for_next_cycle(state, stop_event, cycle_sec=60)  # should not hang

@@ -22,7 +22,7 @@ from .config import TRADE_FIXED_COST
 class Decision:
     ts: str
     symbol: str
-    action: str  # "buy" | "sell" | "sleep"
+    action: str  # "buy" | "sell" | "sleep" | "alert"
     requested_quantity: float
     filled_quantity: float
     price: Optional[float]
@@ -31,6 +31,8 @@ class Decision:
     cash_after: float
     position_after: float
     fee: float = 0.0
+    alert_price: Optional[float] = None
+    alert_condition: Optional[str] = None
 
 
 class DecisionTracker:
@@ -61,6 +63,28 @@ class DecisionTracker:
             status="noop",
             cash_after=self.cash,
             position_after=self.position,
+        )
+        with self.lock:
+            self.decisions.append(decision)
+        return decision
+
+    def record_alert(
+        self, symbol: str, alert_price: float, alert_condition: str, reasoning: str
+    ) -> Decision:
+        """Record a no-op cycle where the agent set a price alert instead of trading."""
+        decision = Decision(
+            ts=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            action="alert",
+            requested_quantity=0,
+            filled_quantity=0,
+            price=None,
+            reasoning=reasoning,
+            status="noop",
+            cash_after=self.cash,
+            position_after=self.position,
+            alert_price=alert_price,
+            alert_condition=alert_condition,
         )
         with self.lock:
             self.decisions.append(decision)
