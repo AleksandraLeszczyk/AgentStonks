@@ -3,6 +3,7 @@ import json
 import os
 import re
 from dataclasses import asdict
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -39,6 +40,7 @@ from .historical import (
 from .llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS
 from .news import score_news_impacts
 from .performance import compute_equity_curve, decision_markers, summarize
+from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_news, fetch_trades
 from .state import AppState
 from .stream import launch_stream, launch_stream_news
@@ -509,6 +511,113 @@ def _agent_performance_panel(symbol: str) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _build_agent_report_html(state: AppState, symbol: str) -> str:
+    sym = symbol.strip().upper() or state.symbol
+
+    with state.lock:
+        bars = list(state.bars)
+        trades = list(state.trades)
+        agent_log = list(state.agent_log)
+
+    tracker = state.decision_tracker
+    decisions = [asdict(d) for d in tracker.snapshot()["decisions"]] if tracker else []
+
+    live_fig = (
+        build_chart(
+            bars,
+            state.news,
+            trades,
+            sym,
+            SESSION_START,
+            ma_periods=state.ma_periods,
+            show_fib=state.show_fib,
+            show_7d_avg=state.show_7d_avg,
+            show_28d_avg=state.show_28d_avg,
+            show_1y_avg=state.show_1y_avg,
+            gaussian_max_components=state.gaussian_max_components,
+            show_gaussian_centers=state.show_gaussian_centers,
+            daily_bars=state.daily_bars,
+            vwap_style=state.vwap_style,
+            show_candle_body=state.show_candle_body,
+            show_percentile_body=state.show_percentile_body,
+            show_whiskers=state.show_whiskers,
+            decisions=tracker.trade_markers() if tracker else None,
+        )
+        if (sym and bars)
+        else None
+    )
+
+    historical_period_label = st.session_state.get("hist_period")
+    historical_fig = None
+    if sym and historical_period_label:
+        try:
+            days = HISTORICAL_PERIODS[historical_period_label]
+            ticker_close = fetch_close_series(sym, days)
+            spy_close = fetch_close_series(SPY_SYMBOL, days) if sym != SPY_SYMBOL else None
+            vix_close = fetch_close_series(VIX_SYMBOL, days)
+            dividends = fetch_dividends(sym, days)
+            earnings = fetch_earnings_dates(sym, days)
+            historical_fig = build_historical_chart(
+                ticker_close, spy_close, vix_close, sym, historical_period_label, dividends, earnings
+            )
+        except Exception:
+            historical_fig = None
+
+    performance_fig = None
+    performance_stats = None
+    if tracker:
+        points = compute_equity_curve(bars, decisions, state.starting_budget, SESSION_START)
+        markers = decision_markers(decisions, SESSION_START)
+        performance_stats = summarize(points, decisions, state.starting_budget)
+        performance_fig = build_performance_chart(points, markers, sym)
+
+    return build_report_html(
+        symbol=sym,
+        feed=state.feed,
+        timeframe=state.timeframe,
+        session_start=SESSION_START,
+        starting_budget=state.starting_budget,
+        trade_fixed_cost=TRADE_FIXED_COST,
+        llm_provider=state.llm_provider,
+        llm_model=state.llm_model,
+        agent_running=state.agent_running,
+        live_fig=live_fig,
+        historical_fig=historical_fig,
+        historical_period_label=historical_period_label,
+        performance_fig=performance_fig,
+        performance_stats=performance_stats,
+        decisions=decisions,
+        agent_log=agent_log,
+    )
+
+
+def _agent_report_section(symbol: str) -> None:
+    state = _get_state()
+    st.divider()
+    st.caption("Save everything about this run — charts, starting conditions, and the full decision history — to a single HTML file.")
+    if st.button("📄 Generate Report", key="agent_generate_report"):
+        with st.spinner("Building report…"):
+            try:
+                report_html = _build_agent_report_html(state, symbol)
+            except Exception as exc:
+                st.error(f"Failed to build report: {exc}")
+            else:
+                sym = symbol.strip().upper() or state.symbol or "agent"
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.session_state["agent_report_html"] = report_html
+                st.session_state["agent_report_name"] = f"{sym}_agent_report_{ts}.html"
+
+    report_html = st.session_state.get("agent_report_html")
+    if report_html:
+        st.download_button(
+            "💾 Save Report (.html)",
+            data=report_html,
+            file_name=st.session_state.get("agent_report_name", "agent_report.html"),
+            mime="text/html",
+            key="agent_report_download",
+        )
+
+
 def _agent_panel(symbol: str) -> None:
     state = _get_state()
     st.caption(
@@ -569,6 +678,7 @@ def _agent_panel(symbol: str) -> None:
 
     _agent_performance_panel(symbol)
     _agent_log_panel()
+    _agent_report_section(symbol)
 
 
 def build_ui() -> None:
