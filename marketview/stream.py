@@ -118,7 +118,12 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         on_close=on_close,
     )
     state.ws = ws
-    ws.run_forever(ping_interval=20, ping_timeout=10)
+    # reconnect=5: without this, any drop (ping/pong timeout, network blip,
+    # server-side close) ends run_forever for good and bars silently stop
+    # arriving -- nothing else in the UI depends on this socket, so there's
+    # no other signal that it died. ws.close() (Stop button) still ends the
+    # retry loop via keep_running.
+    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5)
 
 
 def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
@@ -195,7 +200,7 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
         on_close=on_close,
     )
     state.ws_news = ws
-    ws.run_forever(ping_interval=20, ping_timeout=10)
+    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5)
 
 
 def launch_stream_news(symbol: str, key: str, secret: str, state: AppState) -> None:
