@@ -317,14 +317,21 @@ def run_agent_cycle(
         assistant_msg: dict = {"role": "assistant", "content": msg.content}
         tool_calls = getattr(msg, "tool_calls", None) or []
         if tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
+            calls = []
+            for tc in tool_calls:
+                call = {
                     "id": tc.id,
                     "type": "function",
                     "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                 }
-                for tc in tool_calls
-            ]
+                # Gemini 3+ "thinking" models attach a thought_signature here that must be
+                # echoed back verbatim on the next turn, or the API rejects the request with
+                # "Function call ... is missing a thought_signature".
+                extra_content = getattr(tc, "extra_content", None)
+                if extra_content:
+                    call["extra_content"] = extra_content
+                calls.append(call)
+            assistant_msg["tool_calls"] = calls
         messages.append(assistant_msg)
 
         if not tool_calls:
