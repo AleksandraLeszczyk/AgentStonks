@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pandas as pd
 import yfinance as yf
@@ -48,3 +49,39 @@ def fetch_earnings_dates(symbol: str, days: int) -> pd.DataFrame:
         return pd.DataFrame()
     cutoff = pd.Timestamp.now(tz=earnings.index.tz) - pd.Timedelta(days=days)
     return earnings[earnings.index >= cutoff]
+
+
+def fetch_static_analysis(symbol: str) -> dict:
+    """Fetch the raw inputs (P/E, growth, dividend yield) for a simple static valuation estimate."""
+    try:
+        info = yf.Ticker(symbol).info
+    except Exception:
+        info = {}
+    growth_rate = info.get("earningsGrowth")
+    if growth_rate is None:
+        growth_rate = info.get("revenueGrowth")
+    return {
+        "pe_ratio": info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
+        "dividend_yield": info.get("trailingAnnualDividendYield"),
+        "growth_rate": growth_rate,
+    }
+
+
+def estimate_total_return(dividend_yield: Optional[float], growth_rate: Optional[float]) -> Optional[float]:
+    """Rough estimate of annual total return on the asset: dividend yield + earnings/revenue growth."""
+    if dividend_yield is None or growth_rate is None:
+        return None
+    return dividend_yield + growth_rate
+
+
+def estimate_dividend_return_10y(
+    dividend_yield: Optional[float], growth_rate: Optional[float], years: int = 10
+) -> Optional[float]:
+    """Cumulative dividends collected over `years`, as a fraction of the current price.
+
+    Assumes the dividend grows annually at `growth_rate` from today's yield.
+    """
+    if dividend_yield is None or growth_rate is None:
+        return None
+    return sum(dividend_yield * (1 + growth_rate) ** t for t in range(years))

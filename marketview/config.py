@@ -10,7 +10,6 @@ TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]
 FEEDS = ["iex", "sip"]
 
 # Trading agent
-AGENT_MODEL = "gemini-3.5-flash"
 AGENT_CYCLE_SEC = 60
 AGENT_LOG_POLL_SEC = 4
 AGENT_MAX_TOOL_ITERS = 8

@@ -1,13 +1,13 @@
 """
-News analysis pipeline using Alpaca, WorldNews API, and an LLM (Gemini via OpenAI-compat).
+News analysis pipeline using Alpaca, WorldNews API, and an LLM (Gemini,
+OpenAI, or Anthropic — see `marketview.llm`).
 
 This module is optional — only needed for LLM-based impact scoring.
-Required env vars: GEMINI_API_KEY, WORLD_NEWS_API_KEY
+Required env vars: one of GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY,
+plus WORLD_NEWS_API_KEY.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
 from datetime import datetime, timedelta
 from typing import Literal, Optional
@@ -15,6 +15,8 @@ from typing import Literal, Optional
 import pandas as pd
 import requests
 from pydantic import BaseModel, field_validator
+
+from .llm import DEFAULT_NEWS_MODELS, parse_structured
 
 
 ImpactLabel = Literal["positive", "negative", "neutral", "small", "unknown"]
@@ -150,30 +152,20 @@ _IMPACT_FORMAT = (
 )
 
 
-def estimate_impact_news(symbol: str, news: list[News]) -> list[News]:
-    """Score each news item for market impact using Gemini via OpenAI-compat API."""
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=os.environ["GEMINI_API_KEY"],
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
+def estimate_impact_news(symbol: str, news: list[News], provider: str, api_key: str) -> list[News]:
+    """Score each news item for market impact using the configured LLM provider."""
+    model = DEFAULT_NEWS_MODELS[provider]
     results = []
     for item in news:
-        completion = client.chat.completions.parse(
-            model="gemini-2.0-flash",
-            messages=[
-                {"role": "system", "content": _IMPACT_SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"What impact has this news on {symbol} stock? "
-                        f"The news: {item.title} {item.text}. {_IMPACT_FORMAT}"
-                    ),
-                },
-            ],
-            response_format=Impact,
+        impact = parse_structured(
+            provider,
+            api_key,
+            model,
+            _IMPACT_SYSTEM,
+            f"What impact has this news on {symbol} stock? "
+            f"The news: {item.title} {item.text}. {_IMPACT_FORMAT}",
+            Impact,
         )
-        impact = completion.choices[0].message.parsed
         results.append(item.model_copy(update={"impact": impact}))
     return results
 
@@ -185,29 +177,23 @@ _SELECTION_SYSTEM = (
 _SELECTION_FORMAT = r'Answer only as JSON: {"news": [{"title": str, "text": str}]}'
 
 
-def select_important_news(symbol: str, news: list[News], top_n: int = 10) -> list[News]:
+def select_important_news(
+    symbol: str, news: list[News], provider: str, api_key: str, top_n: int = 10
+) -> list[News]:
     """Use LLM to pick the most market-relevant articles from a larger list."""
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=os.environ["GEMINI_API_KEY"],
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
+    model = DEFAULT_NEWS_MODELS[provider]
     combined = " ".join(f"title: {i.title} text: {i.text}" for i in news)
-    completion = client.chat.completions.parse(
-        model="gemini-2.0-flash",
-        messages=[
-            {"role": "system", "content": _SELECTION_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    f"News: {combined}. Choose up to {top_n} most important pieces "
-                    f"that impact stock market symbol {symbol}. {_SELECTION_FORMAT}"
-                ),
-            },
-        ],
-        response_format=ListOfSelectedNews,
+    selected = parse_structured(
+        provider,
+        api_key,
+        model,
+        _SELECTION_SYSTEM,
+        f"News: {combined}. Choose up to {top_n} most important pieces "
+        f"that impact stock market symbol {symbol}. {_SELECTION_FORMAT}",
+        ListOfSelectedNews,
     )
-    selected = completion.choices[0].message.parsed
+    if selected is None:
+        return []
 
     # Re-attach original metadata (url, timestamp) by matching title + text
     news_index = {(i.title.lower(), i.text.lower()): i for i in news}
@@ -218,10 +204,12 @@ def select_important_news(symbol: str, news: list[News], top_n: int = 10) -> lis
     ]
 
 
-def get_most_important_news_week(keyword: str, symbol: str, worldnews_api_key: str) -> list[News]:
+def get_most_important_news_week(
+    keyword: str, symbol: str, worldnews_api_key: str, provider: str, api_key: str
+) -> list[News]:
     """Fetch a week of news by keyword, then filter to the most impactful ones."""
     last_week = get_last_week_news(keywords=keyword, worldnews_api_key=worldnews_api_key)
-    return select_important_news(symbol=symbol, news=last_week)
+    return select_important_news(symbol=symbol, news=last_week, provider=provider, api_key=api_key)
 
 
 _SCORE_SYSTEM = """\
@@ -242,47 +230,33 @@ Impact labels:
 """
 
 
-def score_news_impacts(symbol: str, news_items: list[dict], api_key: str) -> dict[str, str]:
+def score_news_impacts(
+    symbol: str, news_items: list[dict], provider: str, api_key: str
+) -> dict[str, str]:
     """Score all news items in a single LLM call. Returns {news_id: impact_label}."""
     if not news_items:
         return {}
 
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
-
+    model = DEFAULT_NEWS_MODELS[provider]
     numbered = "\n".join(
         f"{i}. Headline: {item.get('headline', '')} | "
         f"Summary: {_clean_text(item.get('summary') or item.get('content') or '')}"
         for i, item in enumerate(news_items)
     )
 
-    completion = client.chat.completions.parse(
-        model="gemini-2.0-flash",
-        messages=[
-            {"role": "system", "content": _SCORE_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    f"Symbol: {symbol}\n\n"
-                    f"News articles:\n{numbered}\n\n"
-                    f"Return a JSON object with key \"scores\" containing an array of "
-                    f"{{\"index\": <int>, \"impact\": <label>}} for each article."
-                ),
-            },
-        ],
-        response_format=_BatchImpact,
+    scored = parse_structured(
+        provider,
+        api_key,
+        model,
+        _SCORE_SYSTEM,
+        f"Symbol: {symbol}\n\n"
+        f"News articles:\n{numbered}\n\n"
+        f"Return a JSON object with key \"scores\" containing an array of "
+        f"{{\"index\": <int>, \"impact\": <label>}} for each article.",
+        _BatchImpact,
     )
-
-    scored = completion.choices[0].message.parsed
     if scored is None:
-        raw = completion.choices[0].message.content or ""
-        try:
-            scored = _BatchImpact.model_validate(json.loads(raw))
-        except Exception:
-            return {}
+        return {}
     result: dict[str, str] = {}
     for entry in scored.scores:
         if 0 <= entry.index < len(news_items):

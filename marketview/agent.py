@@ -20,7 +20,8 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from .config import AGENT_ALERT_POLL_SEC, AGENT_MAX_TOOL_ITERS, AGENT_MODEL
+from .config import AGENT_ALERT_POLL_SEC, AGENT_MAX_TOOL_ITERS
+from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
@@ -499,17 +500,13 @@ def _agent_loop(
     state: "AppState",
     tracker: "DecisionTracker",
     symbol: str,
-    gemini_api_key: str,
+    provider: str,
+    api_key: str,
     model: str,
     cycle_sec: int,
     stop_event: threading.Event,
 ) -> None:
-    from openai import OpenAI
-
-    client = OpenAI(
-        api_key=gemini_api_key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-    )
+    client = get_agent_client(provider, api_key)
     while not stop_event.is_set():
         try:
             run_agent_cycle(client, model, symbol, state, tracker)
@@ -524,18 +521,20 @@ def launch_agent(
     state: "AppState",
     tracker: "DecisionTracker",
     symbol: str,
-    gemini_api_key: str,
-    model: str = AGENT_MODEL,
+    api_key: str,
+    provider: str = "gemini",
+    model: "str | None" = None,
     cycle_sec: int = 60,
 ) -> None:
     """Stop any running agent for this state, then start a new background cycle loop."""
+    model = model or DEFAULT_AGENT_MODELS[provider]
     stop_agent(state)
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
     threading.Thread(
         target=_agent_loop,
-        args=(state, tracker, symbol, gemini_api_key, model, cycle_sec, stop_event),
+        args=(state, tracker, symbol, provider, api_key, model, cycle_sec, stop_event),
         daemon=True,
     ).start()
 

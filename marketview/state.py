@@ -46,6 +46,8 @@ _DEFAULTS: dict[str, object] = {
     "decision_tracker": None,
     "starting_budget": PAPER_STARTING_CASH,
     "price_alert": None,
+    "llm_provider": "gemini",
+    "llm_model": "",
 }
 
 
@@ -88,6 +90,8 @@ class AppState:
         self.decision_tracker: "DecisionTracker | None" = None
         self.starting_budget: float = PAPER_STARTING_CASH
         self.price_alert: dict | None = None
+        self.llm_provider: str = "gemini"
+        self.llm_model: str = ""
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

@@ -13,7 +13,6 @@ from .charts import build_chart, build_historical_chart, build_performance_chart
 from .config import (
     AGENT_CYCLE_SEC,
     AGENT_LOG_POLL_SEC,
-    AGENT_MODEL,
     CHART_POLL_SEC,
     FEEDS,
     MAX_BARS,
@@ -29,10 +28,14 @@ from .historical import (
     HISTORICAL_PERIODS,
     SPY_SYMBOL,
     VIX_SYMBOL,
+    estimate_dividend_return_10y,
+    estimate_total_return,
     fetch_close_series,
     fetch_dividends,
     fetch_earnings_dates,
+    fetch_static_analysis,
 )
+from .llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS
 from .news import score_news_impacts
 from .performance import compute_equity_curve, decision_markers, summarize
 from .rest import fetch_bars, fetch_daily_bars, fetch_news, fetch_trades
@@ -359,6 +362,27 @@ def _historical_panel(symbol: str) -> None:
 
     fig = build_historical_chart(ticker_close, spy_close, vix_close, sym, period_label, dividends, earnings)
     st.plotly_chart(fig, use_container_width=True)
+    _static_analysis_panel(sym)
+
+
+def _static_analysis_panel(symbol: str) -> None:
+    static = fetch_static_analysis(symbol)
+    pe_ratio = static["pe_ratio"]
+    dividend_yield = static["dividend_yield"]
+    growth_rate = static["growth_rate"]
+    total_return = estimate_total_return(dividend_yield, growth_rate)
+    dividend_return_10y = estimate_dividend_return_10y(dividend_yield, growth_rate)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("P/E (trailing)", f"{pe_ratio:.2f}" if pe_ratio is not None else "—")
+    col2.metric(
+        "Est. annual return (growth + div)",
+        f"{total_return * 100:.1f}%" if total_return is not None else "—",
+    )
+    col3.metric(
+        "Est. 10yr cumulative dividend return",
+        f"{dividend_return_10y * 100:.1f}%" if dividend_return_10y is not None else "—",
+    )
 
 
 def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
@@ -492,6 +516,10 @@ def _agent_panel(symbol: str) -> None:
         "No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
+    provider = state.llm_provider
+    model = state.llm_model
+    st.caption(f"LLM: **{provider}** ({model or DEFAULT_AGENT_MODELS[provider]}) — change in sidebar ▸ LLM.")
+
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
         "Starting budget ($)",
@@ -503,7 +531,8 @@ def _agent_panel(symbol: str) -> None:
     start_clicked = c2.button("▶ Start Agent", type="primary", use_container_width=True, key="agent_start")
     stop_clicked = c3.button("⏹ Stop Agent", use_container_width=True, key="agent_stop")
 
-    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    env_var = ENV_KEYS[provider]
+    llm_key = os.getenv(env_var, "")
 
     if start_clicked:
         sym = symbol.strip().upper() or state.symbol
@@ -511,13 +540,21 @@ def _agent_panel(symbol: str) -> None:
             has_bars = bool(state.bars)
         if not sym or not state.api_key or not has_bars:
             st.error("Start the Live stream for a symbol first (sidebar ▶ Start) so the agent has data to read.")
-        elif not gemini_key:
-            st.error("GEMINI_API_KEY is not set; the agent needs an LLM key to reason about decisions.")
+        elif not llm_key:
+            st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
         else:
             state.starting_budget = starting_budget
             state.decision_tracker = DecisionTracker(starting_cash=starting_budget, trade_cost=TRADE_FIXED_COST)
             state.agent_log = []
-            launch_agent(state, state.decision_tracker, sym, gemini_key, model=AGENT_MODEL, cycle_sec=AGENT_CYCLE_SEC)
+            launch_agent(
+                state,
+                state.decision_tracker,
+                sym,
+                llm_key,
+                provider=provider,
+                model=model or None,
+                cycle_sec=AGENT_CYCLE_SEC,
+            )
 
     if stop_clicked:
         stop_agent(state)
@@ -564,6 +601,23 @@ def build_ui() -> None:
                 placeholder="From env ALPACA_SECRET if blank",
             )
     state = _get_state()
+
+    with st.sidebar:
+        with st.expander("LLM"):
+            provider = st.selectbox(
+                "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="sidebar_llm_provider"
+            )
+            model = st.text_input(
+                "Model (optional)",
+                value=state.llm_model,
+                placeholder=f"Default: {DEFAULT_AGENT_MODELS[provider]}",
+                key="sidebar_llm_model",
+            )
+            state.llm_provider = provider
+            state.llm_model = model
+            env_var = ENV_KEYS[provider]
+            if not os.getenv(env_var):
+                st.caption(f"⚠️ {env_var} is not set.")
 
     tab_live, tab_historical, tab_agent = st.tabs(["📡 Live", "🗂️ Historical", "🤖 Agent"])
 
@@ -626,10 +680,11 @@ def build_ui() -> None:
                             state.trades.extend(historical_trades)
                         state.news = news
                         state.news_impacts = {}
-                        gemini_key = os.getenv("GEMINI_API_KEY", "")
-                        if gemini_key and news:
+                        llm_provider = state.llm_provider
+                        llm_key = os.getenv(ENV_KEYS[llm_provider], "")
+                        if llm_key and news:
                             try:
-                                state.news_impacts = score_news_impacts(sym, news, gemini_key)
+                                state.news_impacts = score_news_impacts(sym, news, llm_provider, llm_key)
                             except Exception as exc:
                                 state.status = f"News impact scoring failed: {exc}"
                         state.status = "Connecting WebSocket…"
