@@ -3,7 +3,7 @@ import json
 import os
 import re
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -13,6 +13,7 @@ from .agent import launch_agent, stop_agent
 from .charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
 from .config import (
     AGENT_CYCLE_SEC,
+    AGENT_EQUITY_HISTORY_MAXLEN,
     AGENT_LOG_POLL_SEC,
     AGENT_PERFORMANCE_POLL_SEC,
     CHART_POLL_SEC,
@@ -485,6 +486,32 @@ def _agent_log_panel() -> None:
     st.html(_agent_log_html(log[-50:]))
 
 
+def _record_live_equity_point(state: AppState, cash: float, position: float, live_price: float | None) -> None:
+    """Append a snapshot of the agent's current value, so the chart keeps advancing every
+    poll instead of waiting on a full bar to close (bars can lag a minute or more behind)."""
+    if live_price is None:
+        return
+    price = float(live_price)
+    with state.lock:
+        state.agent_equity_history.append(
+            {
+                "ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                "price": price,
+                "cash": cash,
+                "position": position,
+                "value": cash + position * price,
+            }
+        )
+        if len(state.agent_equity_history) > AGENT_EQUITY_HISTORY_MAXLEN:
+            state.agent_equity_history = state.agent_equity_history[-AGENT_EQUITY_HISTORY_MAXLEN:]
+
+
+def _merge_live_history(state: AppState, points: list[dict], agent_start: datetime) -> list[dict]:
+    with state.lock:
+        history = [h for h in state.agent_equity_history if pd.Timestamp(h["ts"]) > pd.Timestamp(agent_start)]
+    return sorted(points + history, key=lambda p: p["ts"])
+
+
 @st.fragment(run_every=AGENT_PERFORMANCE_POLL_SEC)
 def _agent_performance_panel(symbol: str) -> None:
     state = _get_state()
@@ -500,8 +527,11 @@ def _agent_performance_panel(symbol: str) -> None:
         live_price = state.last_price
 
     live_price = live_price or (bars[-1]["c"] if bars else None)
-    points = compute_equity_curve(bars, decisions, state.starting_budget, SESSION_START, live_price=live_price)
-    markers = decision_markers(decisions, SESSION_START)
+    agent_start = state.agent_start_time or SESSION_START
+    _record_live_equity_point(state, snap["cash"], snap["position"], live_price)
+    points = compute_equity_curve(bars, decisions, state.starting_budget, agent_start)
+    points = _merge_live_history(state, points, agent_start)
+    markers = decision_markers(decisions, agent_start)
     stats = summarize(points, decisions, state.starting_budget)
 
     c1, c2, c3 = st.columns(3)
@@ -520,7 +550,6 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
         bars = list(state.bars)
         trades = list(state.trades)
         agent_log = list(state.agent_log)
-        live_price = state.last_price
 
     tracker = state.decision_tracker
     decisions = [asdict(d) for d in tracker.snapshot()["decisions"]] if tracker else []
@@ -568,12 +597,11 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
 
     performance_fig = None
     performance_stats = None
+    agent_start = state.agent_start_time or SESSION_START
     if tracker:
-        report_live_price = live_price or (bars[-1]["c"] if bars else None)
-        points = compute_equity_curve(
-            bars, decisions, state.starting_budget, SESSION_START, live_price=report_live_price
-        )
-        markers = decision_markers(decisions, SESSION_START)
+        points = compute_equity_curve(bars, decisions, state.starting_budget, agent_start)
+        points = _merge_live_history(state, points, agent_start)
+        markers = decision_markers(decisions, agent_start)
         performance_stats = summarize(points, decisions, state.starting_budget)
         performance_fig = build_performance_chart(points, markers, sym)
 
@@ -581,7 +609,7 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
         symbol=sym,
         feed=state.feed,
         timeframe=state.timeframe,
-        session_start=SESSION_START,
+        session_start=agent_start,
         starting_budget=state.starting_budget,
         trade_fixed_cost=TRADE_FIXED_COST,
         llm_provider=state.llm_provider,
@@ -677,6 +705,8 @@ def _agent_panel(symbol: str) -> None:
             state.starting_budget = starting_budget
             state.decision_tracker = DecisionTracker(starting_cash=starting_budget, trade_cost=TRADE_FIXED_COST)
             state.agent_log = []
+            state.agent_start_time = datetime.now(tz=timezone.utc)
+            state.agent_equity_history = []
             launch_agent(
                 state,
                 state.decision_tracker,

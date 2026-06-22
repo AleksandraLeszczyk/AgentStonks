@@ -3,6 +3,8 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     import websocket
 
     from .decisions import DecisionTracker
@@ -45,6 +47,8 @@ _DEFAULTS: dict[str, object] = {
     "agent_stop_event": None,
     "decision_tracker": None,
     "starting_budget": PAPER_STARTING_CASH,
+    "agent_start_time": None,
+    "agent_equity_history": [],
     "price_alerts": [],
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
@@ -104,6 +108,8 @@ class AppState:
         self.agent_stop_event: "threading.Event | None" = None
         self.decision_tracker: "DecisionTracker | None" = None
         self.starting_budget: float = PAPER_STARTING_CASH
+        self.agent_start_time: "datetime | None" = None
+        self.agent_equity_history: list[dict] = []
         self.price_alerts: list[dict] = []
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()

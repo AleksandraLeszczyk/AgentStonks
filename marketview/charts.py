@@ -766,9 +766,10 @@ def build_performance_chart(
         go.Scatter(
             x=df["ts"],
             y=df["value"],
-            mode="lines",
+            mode="lines+markers",
             name="Portfolio value",
             line=dict(color=PALETTE["accent"], width=2),
+            marker=dict(size=4),
             hovertemplate="<b>%{x|%H:%M}</b><br>Value: $%{y:,.2f}<extra></extra>",
         )
     )
