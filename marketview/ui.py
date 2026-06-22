@@ -13,6 +13,7 @@ from .charts import build_chart, build_historical_chart, build_performance_chart
 from .config import (
     AGENT_CYCLE_SEC,
     AGENT_LOG_POLL_SEC,
+    AGENT_PERFORMANCE_POLL_SEC,
     CHART_POLL_SEC,
     FEEDS,
     MAX_BARS,
@@ -480,7 +481,7 @@ def _agent_log_panel() -> None:
     st.html(_agent_log_html(log[-50:]))
 
 
-@st.fragment(run_every=AGENT_LOG_POLL_SEC)
+@st.fragment(run_every=AGENT_PERFORMANCE_POLL_SEC)
 def _agent_performance_panel(symbol: str) -> None:
     state = _get_state()
     tracker = state.decision_tracker
