@@ -551,7 +551,6 @@ def build_ui() -> None:
         start_clicked = c1.button("▶ Start", type="primary", use_container_width=True)
         stop_clicked = c2.button("⏹ Stop", use_container_width=True)
         symbol = st.text_input("Symbol", value="AAPL", placeholder="AAPL, TSLA, MSFT…")
-        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
         with st.expander("Connection"):
             feed = st.selectbox("Feed", FEEDS, index=0)
             api_key = st.text_input(
@@ -566,83 +565,85 @@ def build_ui() -> None:
             )
     state = _get_state()
 
-    timeframe_changed = (
-        state.symbol
-        and state.api_key
-        and timeframe != state.timeframe
-        and not start_clicked
-        and not stop_clicked
-    )
-    if timeframe_changed:
-        with st.spinner(f"Reloading {state.symbol} at {timeframe}…"):
-            try:
-                historical_bars = fetch_bars(state.symbol, timeframe, MAX_BARS, state.api_key, state.api_secret, state.feed)
-            except Exception as exc:
-                st.error(f"Failed to reload bars: {exc}")
-            else:
-                state.timeframe = timeframe
-                with state.lock:
-                    state.bars.clear()
-                    state.bars.extend(historical_bars)
-                launch_stream(state.symbol, state.api_key, state.api_secret, state.feed, state, timeframe)
-
-    if start_clicked:
-        sym = symbol.strip().upper()
-        key = api_key.strip() or os.getenv("ALPACA_API_KEY", "")
-        secret = api_secret.strip() or os.getenv("ALPACA_SECRET", "")
-
-        if not sym:
-            st.error("Please enter a symbol.")
-        elif not key or not secret:
-            st.error("API key and secret are required.")
-        else:
-            with st.spinner(f"Loading history for {sym}…"):
-                try:
-                    historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
-                    historical_trades = fetch_trades(sym, key, secret, feed)
-                    news = fetch_news(sym, key, secret)
-                    daily_bars = fetch_daily_bars(sym, key, secret, feed)
-                except Exception as exc:
-                    st.error(f"Failed to load data: {exc}")
-                    state.status = f"Failed: {exc}"
-                else:
-                    state.symbol = sym
-                    state.feed = feed
-                    state.timeframe = timeframe
-                    state.api_key = key
-                    state.api_secret = secret
-                    state.daily_bars = daily_bars
-                    with state.lock:
-                        state.bars.clear()
-                        state.bars.extend(historical_bars)
-                        state.trades.clear()
-                        state.trades.extend(historical_trades)
-                    state.news = news
-                    state.news_impacts = {}
-                    gemini_key = os.getenv("GEMINI_API_KEY", "")
-                    if gemini_key and news:
-                        try:
-                            state.news_impacts = score_news_impacts(sym, news, gemini_key)
-                        except Exception as exc:
-                            state.status = f"News impact scoring failed: {exc}"
-                    state.status = "Connecting WebSocket…"
-                    launch_stream(sym, key, secret, feed, state, timeframe)
-                    launch_stream_news(sym, key, secret, state)
-
-    if stop_clicked:
-        if state.ws:
-            try:
-                state.ws.close()
-            except Exception:
-                pass
-        state.status = "Stopped"
-
     tab_live, tab_historical, tab_agent = st.tabs(["📡 Live", "🗂️ Historical", "🤖 Agent"])
 
     with tab_live:
         st.caption(
             "⚠️ Free Alpaca accounts: IEX feed available during US market hours (9:30–16:00 ET). "
         )
+        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
+
+        timeframe_changed = (
+            state.symbol
+            and state.api_key
+            and timeframe != state.timeframe
+            and not start_clicked
+            and not stop_clicked
+        )
+        if timeframe_changed:
+            with st.spinner(f"Reloading {state.symbol} at {timeframe}…"):
+                try:
+                    historical_bars = fetch_bars(state.symbol, timeframe, MAX_BARS, state.api_key, state.api_secret, state.feed)
+                except Exception as exc:
+                    st.error(f"Failed to reload bars: {exc}")
+                else:
+                    state.timeframe = timeframe
+                    with state.lock:
+                        state.bars.clear()
+                        state.bars.extend(historical_bars)
+                    launch_stream(state.symbol, state.api_key, state.api_secret, state.feed, state, timeframe)
+
+        if start_clicked:
+            sym = symbol.strip().upper()
+            key = api_key.strip() or os.getenv("ALPACA_API_KEY", "")
+            secret = api_secret.strip() or os.getenv("ALPACA_SECRET", "")
+
+            if not sym:
+                st.error("Please enter a symbol.")
+            elif not key or not secret:
+                st.error("API key and secret are required.")
+            else:
+                with st.spinner(f"Loading history for {sym}…"):
+                    try:
+                        historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
+                        historical_trades = fetch_trades(sym, key, secret, feed)
+                        news = fetch_news(sym, key, secret)
+                        daily_bars = fetch_daily_bars(sym, key, secret, feed)
+                    except Exception as exc:
+                        st.error(f"Failed to load data: {exc}")
+                        state.status = f"Failed: {exc}"
+                    else:
+                        state.symbol = sym
+                        state.feed = feed
+                        state.timeframe = timeframe
+                        state.api_key = key
+                        state.api_secret = secret
+                        state.daily_bars = daily_bars
+                        with state.lock:
+                            state.bars.clear()
+                            state.bars.extend(historical_bars)
+                            state.trades.clear()
+                            state.trades.extend(historical_trades)
+                        state.news = news
+                        state.news_impacts = {}
+                        gemini_key = os.getenv("GEMINI_API_KEY", "")
+                        if gemini_key and news:
+                            try:
+                                state.news_impacts = score_news_impacts(sym, news, gemini_key)
+                            except Exception as exc:
+                                state.status = f"News impact scoring failed: {exc}"
+                        state.status = "Connecting WebSocket…"
+                        launch_stream(sym, key, secret, feed, state, timeframe)
+                        launch_stream_news(sym, key, secret, state)
+
+        if stop_clicked:
+            if state.ws:
+                try:
+                    state.ws.close()
+                except Exception:
+                    pass
+            state.status = "Stopped"
+
         _live_panel()
 
     with tab_historical:
