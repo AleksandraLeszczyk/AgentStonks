@@ -6,8 +6,16 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from .charts import build_chart, empty_chart
+from .charts import build_chart, build_historical_chart, empty_chart
 from .config import CHART_POLL_SEC, FEEDS, MAX_BARS, PALETTE, POLL_SEC, SESSION_START, TIMEFRAMES
+from .historical import (
+    HISTORICAL_PERIODS,
+    SPY_SYMBOL,
+    VIX_SYMBOL,
+    fetch_close_series,
+    fetch_dividends,
+    fetch_earnings_dates,
+)
 from .news import score_news_impacts
 from .rest import fetch_bars, fetch_daily_bars, fetch_news, fetch_trades
 from .state import AppState
@@ -257,6 +265,30 @@ def _live_panel() -> None:
     _chart_panel()
 
 
+def _historical_panel(symbol: str) -> None:
+    period_label = st.selectbox("Period", list(HISTORICAL_PERIODS.keys()), index=3, key="hist_period")
+
+    sym = symbol.strip().upper()
+    if not sym:
+        st.plotly_chart(empty_chart("Enter a symbol in the sidebar"), use_container_width=True)
+        return
+
+    days = HISTORICAL_PERIODS[period_label]
+    with st.spinner(f"Loading historical data for {sym}…"):
+        try:
+            ticker_close = fetch_close_series(sym, days)
+            spy_close = fetch_close_series(SPY_SYMBOL, days) if sym != SPY_SYMBOL else None
+            vix_close = fetch_close_series(VIX_SYMBOL, days)
+            dividends = fetch_dividends(sym, days)
+            earnings = fetch_earnings_dates(sym, days)
+        except Exception as exc:
+            st.error(f"Failed to load historical data: {exc}")
+            return
+
+    fig = build_historical_chart(ticker_close, spy_close, vix_close, sym, period_label, dividends, earnings)
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def build_ui() -> None:
     st.set_page_config(
         page_title="Market Stream",
@@ -408,8 +440,13 @@ def build_ui() -> None:
                 pass
         state.status = "Stopped"
 
-    st.caption(
-        "⚠️ Free Alpaca accounts: IEX feed available during US market hours (9:30–16:00 ET). "
-    )
+    tab_live, tab_historical = st.tabs(["📡 Live", "🗂️ Historical"])
 
-    _live_panel()
+    with tab_live:
+        st.caption(
+            "⚠️ Free Alpaca accounts: IEX feed available during US market hours (9:30–16:00 ET). "
+        )
+        _live_panel()
+
+    with tab_historical:
+        _historical_panel(symbol)

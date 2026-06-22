@@ -707,3 +707,106 @@ def build_chart(
         height=520,
     )
     return fig
+
+
+def build_historical_chart(
+    ticker_close: pd.Series,
+    spy_close: pd.Series,
+    vix_close: pd.Series,
+    symbol: str,
+    period_label: str,
+    dividends: Optional[pd.Series] = None,
+    earnings: Optional[pd.DataFrame] = None,
+) -> go.Figure:
+    """Plot `symbol` and SPY as % change over the period, with VIX on a secondary axis.
+
+    Earnings and dividend dates for `symbol` are marked as vertical lines.
+    """
+    if ticker_close is None or ticker_close.empty:
+        return empty_chart(f"No historical data for {symbol}")
+
+    ticker_pct = (ticker_close / ticker_close.iloc[0] - 1.0) * 100
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=ticker_pct.index,
+            y=ticker_pct.values,
+            mode="lines",
+            name=symbol,
+            line=dict(color=PALETTE["accent"], width=2),
+        )
+    )
+
+    if spy_close is not None and not spy_close.empty:
+        spy_pct = (spy_close / spy_close.iloc[0] - 1.0) * 100
+        fig.add_trace(
+            go.Scatter(
+                x=spy_pct.index,
+                y=spy_pct.values,
+                mode="lines",
+                name="SPY",
+                line=dict(color=PALETTE["muted"], width=2, dash="dot"),
+            )
+        )
+
+    if vix_close is not None and not vix_close.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=vix_close.index,
+                y=vix_close.values,
+                mode="lines",
+                name="VIX",
+                line=dict(color=PALETTE["orange"], width=1.5),
+                yaxis="y2",
+            )
+        )
+
+    if earnings is not None and not earnings.empty:
+        for dt in earnings.index:
+            naive = (dt.tz_localize(None) if dt.tzinfo else dt).to_pydatetime()
+            fig.add_vline(x=naive, line=dict(color=PALETTE["accent"], width=1, dash="dash"))
+            fig.add_annotation(
+                xref="x", yref="paper", x=naive, y=1.0,
+                text="Earnings", font=dict(size=9, color=PALETTE["accent"]),
+                showarrow=False, yanchor="bottom",
+            )
+
+    if dividends is not None and not dividends.empty:
+        for dt in dividends.index:
+            naive = (dt.tz_localize(None) if dt.tzinfo else dt).to_pydatetime()
+            fig.add_vline(x=naive, line=dict(color=PALETTE["up"], width=1, dash="dash"))
+            fig.add_annotation(
+                xref="x", yref="paper", x=naive, y=0.0,
+                text="Dividend", font=dict(size=9, color=PALETTE["up"]),
+                showarrow=False, yanchor="top",
+            )
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=PALETTE["bg"],
+        plot_bgcolor=PALETTE["panel"],
+        font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
+        title=dict(
+            text=f"<b>{symbol}</b> vs <b>SPY</b> vs <b>VIX</b> — {period_label}",
+            font=dict(size=18),
+            x=0.02,
+        ),
+        xaxis=dict(showgrid=True, gridcolor=PALETTE["grid"]),
+        yaxis=dict(
+            title="% change",
+            showgrid=True,
+            gridcolor=PALETTE["grid"],
+            ticksuffix="%",
+        ),
+        yaxis2=dict(
+            title="VIX",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+        legend=dict(orientation="h", y=1.08, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=520,
+    )
+    return fig

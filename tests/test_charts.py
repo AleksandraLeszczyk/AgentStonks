@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
-from marketview.charts import build_chart, empty_chart
+from marketview.charts import build_chart, build_historical_chart, empty_chart
 
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
@@ -83,3 +83,42 @@ class TestBuildChart:
         fig = build_chart([old_bar], [], [], "AAPL", SESSION_START)
         texts = [a["text"] for a in fig.layout.annotations]
         assert any("Waiting" in t for t in texts)
+
+
+def _close_series(values: list[float], start: str = "2024-01-01") -> pd.Series:
+    idx = pd.date_range(start, periods=len(values), freq="D")
+    return pd.Series(values, index=idx)
+
+
+class TestBuildHistoricalChart:
+    def test_empty_ticker_returns_placeholder(self):
+        fig = build_historical_chart(pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year")
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("No historical data" in t for t in texts)
+
+    def test_returns_figure_with_data(self):
+        ticker = _close_series([100, 102, 105])
+        spy = _close_series([400, 404, 410])
+        vix = _close_series([15, 16, 14])
+        fig = build_historical_chart(ticker, spy, vix, "AAPL", "1 Year")
+        assert isinstance(fig, go.Figure)
+        names = [t.name for t in fig.data]
+        assert "AAPL" in names
+        assert "SPY" in names
+        assert "VIX" in names
+
+    def test_ticker_normalized_to_percentage(self):
+        ticker = _close_series([100, 110, 90])
+        fig = build_historical_chart(ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year")
+        ticker_trace = next(t for t in fig.data if t.name == "AAPL")
+        assert list(ticker_trace.y) == pytest.approx([0.0, 10.0, -10.0])
+
+    def test_earnings_and_dividends_add_vlines(self):
+        ticker = _close_series([100, 102, 105])
+        earnings = pd.DataFrame({"EPS Estimate": [1.5]}, index=pd.DatetimeIndex(["2024-01-02"]))
+        dividends = pd.Series([0.5], index=pd.DatetimeIndex(["2024-01-03"]))
+        fig = build_historical_chart(
+            ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year",
+            dividends=dividends, earnings=earnings,
+        )
+        assert len(fig.layout.shapes) == 2

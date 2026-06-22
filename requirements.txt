@@ -6,6 +6,8 @@ numpy>=1.24.0
 requests>=2.31.0
 websocket-client>=1.6.0
 python-dotenv>=1.0.0
+yfinance>=0.2.40
+lxml>=5.0.0
 
 # Testing
 pytest>=7.4.0
