@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from .agent import launch_agent, stop_agent
-from .charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
+from .charts import build_chart, build_gamma_chart, build_historical_chart, build_performance_chart, empty_chart
 from .config import (
     AGENT_CYCLE_SEC,
     AGENT_EQUITY_HISTORY_MAXLEN,
@@ -19,6 +19,8 @@ from .config import (
     CHART_POLL_SEC,
     FEEDS,
     MAX_BARS,
+    OPTIONS_POLL_SEC,
+    OPTIONS_WALL_HISTORY_MAXLEN,
     PAPER_STARTING_CASH,
     PALETTE,
     POLL_SEC,
@@ -40,11 +42,13 @@ from .historical import (
 )
 from .llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS
 from .news import fetch_news_with_fallback, score_news_impacts
+from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import AppState
 from .stream import launch_stream, launch_stream_news
+from .technical_analysis import get_put_call_walls_and_gamma
 
 
 def _get_state() -> AppState:
@@ -389,6 +393,79 @@ def _static_analysis_panel(symbol: str) -> None:
         "Est. 10yr cumulative dividend return",
         f"{dividend_return_10y * 100:.1f}%" if dividend_return_10y is not None else "—",
     )
+
+
+def _record_wall_snapshot(state: AppState, call_wall: float, put_wall: float) -> list[dict]:
+    """Append a {call_wall, put_wall} snapshot if it differs from the last one, so the
+    agent's trend read (rising/falling walls) reflects real shifts, not poll noise."""
+    with state.lock:
+        history = list(state.options_wall_history)
+        last = history[-1] if history else None
+        if last is None or last.get("call_wall") != call_wall or last.get("put_wall") != put_wall:
+            history.append(
+                {
+                    "ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "call_wall": call_wall,
+                    "put_wall": put_wall,
+                }
+            )
+            history = history[-OPTIONS_WALL_HISTORY_MAXLEN:]
+            state.options_wall_history = history
+        return history
+
+
+@st.fragment(run_every=OPTIONS_POLL_SEC)
+def _options_walls_panel(symbol: str) -> None:
+    """Independently fetches/refreshes the options chain (cached, on its own poll loop --
+    never triggered by the agent) and renders the Call Wall / Put Wall / gamma read.
+    The agent's get_put_call_walls tool only reads whatever this last stored on AppState."""
+    state = _get_state()
+    sym = symbol.strip().upper() or state.symbol
+    if not sym:
+        st.plotly_chart(empty_chart("Enter a symbol in the sidebar"), width='stretch')
+        return
+
+    with state.lock:
+        live_spot = state.last_price
+
+    try:
+        data = fetch_options_walls_data(sym, spot=live_spot)
+    except Exception as exc:
+        with state.lock:
+            data = state.options_chain
+        if not data:
+            st.error(f"Failed to fetch options chain for {sym}: {exc}")
+            return
+        st.warning(f"Using last successful options fetch for {sym} -- refresh failed: {exc}")
+    else:
+        with state.lock:
+            state.options_chain = data
+
+    with state.lock:
+        prior_history = list(state.options_wall_history)
+    analysis = get_put_call_walls_and_gamma(
+        strikes=data["strikes"],
+        calls_oi=data["calls_oi"],
+        puts_oi=data["puts_oi"],
+        calls_gamma_exposure=data["calls_gamma_exposure"],
+        puts_gamma_exposure=data["puts_gamma_exposure"],
+        spot=data["spot"],
+        wall_history=prior_history,
+    )
+    _record_wall_snapshot(state, analysis["call_wall"], analysis["put_wall"])
+
+    st.caption(f"Expiry {data['expiry']} · fetched {data['fetched_at']}")
+    fig = build_gamma_chart(data, analysis, sym)
+    st.plotly_chart(fig, width='stretch')
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Call Wall (resistance)", f"${analysis['call_wall']:.2f}", analysis["call_wall_trend"] or "")
+    c2.metric("Put Wall (support)", f"${analysis['put_wall']:.2f}", analysis["put_wall_trend"] or "")
+    c3.metric("Net gamma regime", analysis["gamma_regime"].split(" ")[0].capitalize())
+
+    st.caption(analysis["summary"])
+    for insight in analysis["insights"]:
+        st.markdown(f"- {insight}")
 
 
 def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
@@ -766,7 +843,9 @@ def build_ui() -> None:
             )
     state = _get_state()
 
-    tab_live, tab_historical, tab_agent = st.tabs(["📡 Live", "🗂️ Historical", "🤖 Agent"])
+    tab_live, tab_historical, tab_walls, tab_agent = st.tabs(
+        ["📡 Live", "🗂️ Historical", "🧱 Put/Call Walls", "🤖 Agent"]
+    )
 
     with tab_live:
         st.caption(
@@ -852,6 +931,9 @@ def build_ui() -> None:
 
     with tab_historical:
         _historical_panel(symbol)
+
+    with tab_walls:
+        _options_walls_panel(symbol)
 
     with tab_agent:
         _agent_panel(symbol)

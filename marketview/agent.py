@@ -51,7 +51,10 @@ backdrop is a tailwind. Let its actionable insights inform sizing and stops.
 2. CHECK INTRADAY CONFIRMATION. Call analyze_intraday_momentum and \
 analyze_volume. Look for whether short-term price action and volume confirm \
 or contradict the regime (e.g. a bullish regime with breaking-down intraday \
-price and weak volume is a warning sign, not a buy signal).
+price and weak volume is a warning sign, not a buy signal). If get_put_call_walls \
+has data, use the Call Wall/Put Wall as nearby resistance/support and the net \
+gamma regime to gauge whether a move toward a wall is likely to stall (positive \
+gamma) or accelerate through it (negative gamma).
 
 3. CHECK NEWS. Call get_news. Treat clearly negative news (or negative-for- \
 symbol competitor news) as a reason to be more conservative even in a \
@@ -172,6 +175,21 @@ TOOLS: list[dict] = [
                 "Analyze recent trade volume to gauge participation: relative volume vs the prior "
                 "window, on-balance-volume trend, and whether volume confirms or diverges from the "
                 "recent price move. Returns labeled values plus a one-line summary."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_put_call_walls",
+            "description": (
+                "Read the Call Wall (resistance, from peak call open interest) and Put Wall "
+                "(support, from peak put open interest) for the ticker, plus the net dealer-gamma "
+                "regime (positive = dampening, negative = amplifying) and whether those walls have "
+                "been rising/falling recently. Uses the options chain most recently fetched in the "
+                "background -- does not fetch fresh data itself. Returns labeled values, actionable "
+                "insights, and a one-line summary."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -300,6 +318,23 @@ def _tool_analyze_volume(state: "AppState") -> dict:
     return ta.analyze_volume(bars)
 
 
+def _tool_get_put_call_walls(state: "AppState") -> dict:
+    with state.lock:
+        data = state.options_chain
+        history = list(state.options_wall_history)
+    if not data:
+        return {"note": "no options chain data available yet"}
+    return ta.get_put_call_walls_and_gamma(
+        strikes=data["strikes"],
+        calls_oi=data["calls_oi"],
+        puts_oi=data["puts_oi"],
+        calls_gamma_exposure=data["calls_gamma_exposure"],
+        puts_gamma_exposure=data["puts_gamma_exposure"],
+        spot=data["spot"],
+        wall_history=history,
+    )
+
+
 def _tool_get_news(state: "AppState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 10), 30))
     with state.lock:
@@ -336,6 +371,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_daily_trend": lambda args, state, tracker: _tool_analyze_daily_trend(state, args.get("limit")),
     "analyze_market": lambda args, state, tracker: _tool_analyze_market(state),
     "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
+    "get_put_call_walls": lambda args, state, tracker: _tool_get_put_call_walls(state),
     "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),
     "get_position": lambda args, state, tracker: _tool_get_position(state, tracker),
 }

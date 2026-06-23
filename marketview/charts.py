@@ -839,6 +839,101 @@ def build_performance_chart(
     return fig
 
 
+def build_gamma_chart(data: dict, analysis: dict, symbol: str) -> go.Figure:
+    """Per-strike call/put open interest (mirrored bars) with net dealer-gamma exposure
+    overlaid, plus the spot price, call wall, put wall, and gamma flip level marked."""
+    strikes = data.get("strikes") or []
+    if not strikes:
+        return empty_chart(f"No options chain data for {symbol}")
+
+    calls_oi = data["calls_oi"]
+    puts_oi = data["puts_oi"]
+    net_gamma = [c + p for c, p in zip(data["calls_gamma_exposure"], data["puts_gamma_exposure"])]
+    spot = data["spot"]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(
+        go.Bar(
+            x=strikes,
+            y=calls_oi,
+            name="Call OI",
+            marker_color=PALETTE["up"],
+            opacity=0.75,
+            hovertemplate="<b>Strike %{x}</b><br>Call OI: %{y:,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=strikes,
+            y=[-v for v in puts_oi],
+            name="Put OI",
+            marker_color=PALETTE["down"],
+            opacity=0.75,
+            customdata=puts_oi,
+            hovertemplate="<b>Strike %{x}</b><br>Put OI: %{customdata:,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=strikes,
+            y=net_gamma,
+            name="Net gamma exposure",
+            mode="lines",
+            line=dict(color=PALETTE["accent"], width=2),
+            hovertemplate="<b>Strike %{x}</b><br>Net gamma: %{y:,.0f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    levels = (
+        ("call_wall", "Call Wall", PALETTE["up"]),
+        ("put_wall", "Put Wall", PALETTE["down"]),
+        ("gamma_flip", "Gamma Flip", PALETTE["orange"]),
+    )
+    for key, label, color in levels:
+        level = analysis.get(key)
+        if level is None:
+            continue
+        fig.add_vline(
+            x=level,
+            line=dict(color=color, width=1.5, dash="dash"),
+            annotation_text=f"{label} {level:.2f}",
+            annotation_font=dict(color=color, size=10),
+            annotation_position="top",
+        )
+
+    fig.add_vline(
+        x=spot,
+        line=dict(color=PALETTE["text"], width=1.5, dash="dot"),
+        annotation_text=f"Spot {spot:.2f}",
+        annotation_font=dict(color=PALETTE["text"], size=10),
+        annotation_position="bottom",
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=PALETTE["bg"],
+        plot_bgcolor=PALETTE["panel"],
+        font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
+        title=dict(
+            text=f"<b>{symbol}</b> put/call walls &amp; gamma — expiry {data.get('expiry', '')}",
+            font=dict(size=18),
+            x=0.02,
+        ),
+        barmode="relative",
+        xaxis=dict(title="Strike", showgrid=True, gridcolor=PALETTE["grid"]),
+        yaxis=dict(title="Open interest (puts mirrored)", showgrid=True, gridcolor=PALETTE["grid"]),
+        yaxis2=dict(title="Net gamma exposure ($/1%)", showgrid=False),
+        legend=dict(orientation="h", y=1.08, bgcolor="rgba(0,0,0,0)"),
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=520,
+    )
+    return fig
+
+
 def build_historical_chart(
     ticker_close: pd.Series,
     spy_close: pd.Series,

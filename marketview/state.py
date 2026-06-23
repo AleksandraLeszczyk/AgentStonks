@@ -55,6 +55,9 @@ _DEFAULTS: dict[str, object] = {
     "agent_wake_reason": None,
     "llm_provider": "gemini",
     "llm_model": "",
+    "options_chain": None,
+    "options_wall_history": [],
+    "options_status": "",
 }
 
 
@@ -116,6 +119,9 @@ class AppState:
         self.agent_wake_reason: str | None = None
         self.llm_provider: str = "gemini"
         self.llm_model: str = ""
+        self.options_chain: "dict | None" = None
+        self.options_wall_history: list[dict] = []
+        self.options_status: str = ""
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

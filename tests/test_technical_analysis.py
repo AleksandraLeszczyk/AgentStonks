@@ -6,6 +6,7 @@ from marketview.technical_analysis import (
     analyze_trend,
     analyze_volume,
     atr,
+    get_put_call_walls_and_gamma,
     obv_trend,
     rsi,
     sma,
@@ -189,3 +190,68 @@ class TestAnalyzeVolume:
         result = analyze_volume(bars)
         assert result["volume_trend"] == "decreasing"
         assert "diverging" in result["confirmation"]
+
+
+class TestGetPutCallWallsAndGamma:
+    def test_no_strikes_returns_note(self):
+        assert "note" in get_put_call_walls_and_gamma([], [], [], [], [], spot=100.0)
+
+    def test_identifies_call_wall_and_put_wall_from_peak_open_interest(self):
+        strikes = [90.0, 95.0, 100.0, 105.0, 110.0]
+        calls_oi = [100, 200, 300, 400, 1000]
+        puts_oi = [900, 300, 200, 100, 50]
+        gamma = [0.0] * 5
+        result = get_put_call_walls_and_gamma(strikes, calls_oi, puts_oi, gamma, gamma, spot=100.0)
+        assert result["call_wall"] == 110.0
+        assert result["put_wall"] == 90.0
+        assert result["in_range"] is True
+
+    def test_positive_net_gamma_is_dampening_regime(self):
+        strikes = [95.0, 100.0, 105.0]
+        calls_oi = [100, 100, 100]
+        puts_oi = [100, 100, 100]
+        calls_gamma = [10.0, 10.0, 10.0]
+        puts_gamma = [-1.0, -1.0, -1.0]
+        result = get_put_call_walls_and_gamma(strikes, calls_oi, puts_oi, calls_gamma, puts_gamma, spot=100.0)
+        assert result["net_gamma"] > 0
+        assert "positive" in result["gamma_regime"]
+
+    def test_negative_net_gamma_is_amplifying_regime(self):
+        strikes = [95.0, 100.0, 105.0]
+        calls_oi = [100, 100, 100]
+        puts_oi = [100, 100, 100]
+        calls_gamma = [1.0, 1.0, 1.0]
+        puts_gamma = [-10.0, -10.0, -10.0]
+        result = get_put_call_walls_and_gamma(strikes, calls_oi, puts_oi, calls_gamma, puts_gamma, spot=100.0)
+        assert result["net_gamma"] < 0
+        assert "negative" in result["gamma_regime"]
+
+    def test_gamma_flip_found_between_negative_and_positive_strikes(self):
+        strikes = [95.0, 100.0, 105.0]
+        calls_oi = puts_oi = [100, 100, 100]
+        calls_gamma = [0.0, 5.0, 20.0]
+        puts_gamma = [-10.0, 0.0, 0.0]
+        result = get_put_call_walls_and_gamma(strikes, calls_oi, puts_oi, calls_gamma, puts_gamma, spot=100.0)
+        assert result["gamma_flip"] is not None
+        assert 100.0 < result["gamma_flip"] < 105.0
+
+    def test_spot_above_call_wall_flags_breach(self):
+        strikes = [90.0, 95.0, 100.0]
+        calls_oi = [500, 100, 50]
+        puts_oi = [50, 100, 500]
+        gamma = [0.0] * 3
+        result = get_put_call_walls_and_gamma(strikes, calls_oi, puts_oi, gamma, gamma, spot=110.0)
+        assert result["in_range"] is False
+        assert any("above the call wall" in i for i in result["insights"])
+
+    def test_rising_call_wall_trend_detected_from_history(self):
+        strikes = [95.0, 100.0, 105.0]
+        calls_oi = [100, 100, 500]
+        puts_oi = [500, 100, 100]
+        gamma = [0.0] * 3
+        history = [{"call_wall": 95.0, "put_wall": 90.0}, {"call_wall": 100.0, "put_wall": 90.0}]
+        result = get_put_call_walls_and_gamma(
+            strikes, calls_oi, puts_oi, gamma, gamma, spot=100.0, wall_history=history
+        )
+        assert result["call_wall_trend"] == "rising"
+        assert any("rising" in i for i in result["insights"])
