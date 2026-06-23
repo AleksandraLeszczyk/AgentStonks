@@ -257,6 +257,7 @@ def _chart_panel() -> None:
     state = _get_state()
     with state.lock:
         bars = list(state.bars)
+        price_alerts = list(state.price_alerts)
 
     decisions = state.decision_tracker.trade_markers() if state.decision_tracker else None
 
@@ -280,6 +281,7 @@ def _chart_panel() -> None:
             show_percentile_body=state.show_percentile_body,
             show_whiskers=state.show_whiskers,
             decisions=decisions,
+            price_alerts=price_alerts,
         )
         if (state.symbol and bars)
         else empty_chart()

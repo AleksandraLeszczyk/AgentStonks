@@ -440,6 +440,31 @@ def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
         )
 
 
+def _add_price_alerts(price_alerts: list[dict], fig: go.Figure, x0: datetime, x1: datetime) -> None:
+    """Horizontal lines marking price levels the agent is waiting to wake up on."""
+    for alert in price_alerts:
+        level = alert.get("price")
+        condition = alert.get("condition")
+        if level is None:
+            continue
+        color = PALETTE["up"] if condition == "above" else PALETTE["down"]
+        fig.add_shape(
+            type="line",
+            x0=x0, x1=x1,
+            y0=level, y1=level,
+            line=dict(color=color, width=1.5, dash="dashdot"),
+            row=1, col=1,
+        )
+        fig.add_annotation(
+            xref="x", yref="y",
+            x=x1, y=level,
+            text=f" ⏰ {condition} {level:.2f}",
+            font=dict(color=color, size=10, family="monospace"),
+            showarrow=False,
+            xanchor="left",
+        )
+
+
 def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: datetime) -> None:
     """Plot filled agent buy/sell decisions as markers on the price chart."""
     if not decisions:
@@ -503,6 +528,7 @@ def build_chart(
     show_percentile_body: bool = False,
     show_whiskers: bool = True,
     decisions: Optional[list[dict]] = None,
+    price_alerts: Optional[list[dict]] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -706,6 +732,9 @@ def build_chart(
         _add_fibonacci_levels(df, fig)
 
     _add_decision_markers(decisions or [], fig, session_start)
+
+    if price_alerts:
+        _add_price_alerts(price_alerts, fig, df["t"].iloc[0], df["t"].iloc[-1])
 
     last = df.iloc[-1]
     color = PALETTE["up"] if last["c"] >= last["o"] else PALETTE["down"]

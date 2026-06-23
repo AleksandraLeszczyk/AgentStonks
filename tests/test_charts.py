@@ -104,6 +104,23 @@ class TestBuildChart:
         fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=None)
         assert isinstance(fig, go.Figure)
 
+    def test_price_alerts_plot_as_shapes(self):
+        alerts = [
+            {"price": 150.0, "condition": "above"},
+            {"price": 95.0, "condition": "below"},
+        ]
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, price_alerts=alerts)
+        shape_levels = [s.y0 for s in fig.layout.shapes]
+        assert 150.0 in shape_levels
+        assert 95.0 in shape_levels
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("above" in t and "150.00" in t for t in texts)
+        assert any("below" in t and "95.00" in t for t in texts)
+
+    def test_no_price_alerts_does_not_error(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, price_alerts=None)
+        assert isinstance(fig, go.Figure)
+
 
 class TestBuildPerformanceChart:
     def test_no_points_returns_placeholder(self):
