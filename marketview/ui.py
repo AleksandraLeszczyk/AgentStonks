@@ -285,8 +285,8 @@ def _chart_panel() -> None:
             show_7d_avg=state.show_7d_avg,
             show_28d_avg=state.show_28d_avg,
             show_1y_avg=state.show_1y_avg,
-            gaussian_max_components=state.gaussian_max_components,
-            show_gaussian_centers=state.show_gaussian_centers,
+            mixture_distribution=state.mixture_distribution,
+            mixture_max_components=state.mixture_max_components,
             daily_bars=state.daily_bars,
             vwap_style=state.vwap_style,
             show_candle_body=state.show_candle_body,
@@ -327,17 +327,13 @@ def _live_chart_controls() -> None:
             show_fib = st.checkbox("Fibonacci levels", value=False)
 
         st.markdown("**Price Profile Fit**")
-        fit_enabled = st.checkbox("Fit Gaussian mixture", value=False)
+        dist_choice = st.selectbox("Fit mixture", ["None", "Gaussian", "Cauchy"], index=0)
+        fit_enabled = dist_choice != "None"
         max_components = st.slider(
             "Components",
             min_value=1,
             max_value=5,
             value=1,
-            disabled=not fit_enabled,
-        )
-        show_gaussian_centers = st.checkbox(
-            "Show centers on candle chart",
-            value=False,
             disabled=not fit_enabled,
         )
 
@@ -348,8 +344,8 @@ def _live_chart_controls() -> None:
     state.show_whiskers = show_whiskers
     state.vwap_style = vwap_style
     state.show_fib = show_fib
-    state.gaussian_max_components = max_components if fit_enabled else 0
-    state.show_gaussian_centers = show_gaussian_centers if fit_enabled else False
+    state.mixture_distribution = dist_choice.lower() if fit_enabled else "none"
+    state.mixture_max_components = max_components if fit_enabled else 0
 
 
 def _live_panel() -> None:
@@ -707,8 +703,8 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
             show_7d_avg=state.show_7d_avg,
             show_28d_avg=state.show_28d_avg,
             show_1y_avg=state.show_1y_avg,
-            gaussian_max_components=state.gaussian_max_components,
-            show_gaussian_centers=state.show_gaussian_centers,
+            mixture_distribution=state.mixture_distribution,
+            mixture_max_components=state.mixture_max_components,
             daily_bars=state.daily_bars,
             vwap_style=state.vwap_style,
             show_candle_body=state.show_candle_body,

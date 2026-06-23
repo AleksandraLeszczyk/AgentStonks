@@ -33,7 +33,7 @@ def empty_chart(msg: str = "Enter a symbol and click Start") -> go.Figure:
     return fig
 
 
-_GAUSSIAN_COLORS = ["#e0e0e0", "#60a5fa", "#fb923c", "#a78bfa", "#34d399"]
+_MIXTURE_COLORS = ["#e0e0e0", "#60a5fa", "#fb923c", "#a78bfa", "#34d399"]
 
 
 def _gmm_em(
@@ -89,30 +89,100 @@ def _gmm_em(
     return mix, means, stds, density
 
 
-def _fit_gaussian_mixture(
+def _cmm_em(
+    centers: np.ndarray,
+    bin_weights: np.ndarray,
+    n: int,
+    seed: int,
+    max_iter: int = 300,
+    tol: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Weighted ECM for a 1-D n-component Cauchy mixture fitted directly to histogram
+    bins, using the t-distribution EM scheme (Peel & McLachlan) fixed at nu=1.
+    Returns (mixing_weights, locations, scales, mixture_density_per_bin).
+    """
+    rng = np.random.default_rng(seed)
+    total_w = bin_weights.sum()
+    cdf = np.cumsum(bin_weights) / total_w
+    q = rng.uniform(0, 1, n)
+    locs = centers[np.searchsorted(cdf, q)].astype(float)
+    w_norm = bin_weights / total_w
+    global_mean = float(np.dot(w_norm, centers))
+    global_std = float(np.sqrt(np.dot(w_norm, (centers - global_mean) ** 2)))
+    scales = np.full(n, max(global_std / n, 1e-6))
+    mix = np.ones(n) / n
+    log_lik = -np.inf
+    density = np.ones(len(centers))
+
+    for _ in range(max_iter):
+        # E-step
+        delta = np.column_stack([((centers - locs[k]) / scales[k]) ** 2 for k in range(n)])
+        comp_density = np.column_stack([
+            mix[k] / (np.pi * scales[k] * (1.0 + delta[:, k])) for k in range(n)
+        ])
+        density = comp_density.sum(axis=1)
+        density_safe = np.where(density == 0, 1e-300, density)
+        resp = comp_density / density_safe[:, None]
+        z = resp * bin_weights[:, None]
+        Nk = z.sum(axis=0)
+
+        # CM-step 1: update locations using nu=1 t-weights at the current scale
+        u = 2.0 / (1.0 + delta)
+        eff = z * u
+        locs = (eff * centers[:, None]).sum(axis=0) / np.maximum(eff.sum(axis=0), 1e-10)
+
+        # CM-step 2: recompute t-weights at the new locations, then update scales
+        delta = np.column_stack([((centers - locs[k]) / scales[k]) ** 2 for k in range(n)])
+        u = 2.0 / (1.0 + delta)
+        scales_sq = (z * u * (centers[:, None] - locs) ** 2).sum(axis=0) / np.maximum(Nk, 1e-10)
+        scales = np.maximum(np.sqrt(scales_sq), 1e-6)
+        mix = Nk / total_w
+
+        new_log_lik = float((bin_weights * np.log(density_safe)).sum())
+        if abs(new_log_lik - log_lik) < tol:
+            break
+        log_lik = new_log_lik
+
+    return mix, locs, scales, density
+
+
+_MIXTURE_EM = {"gaussian": _gmm_em, "cauchy": _cmm_em}
+
+
+def _mixture_pdf(x: np.ndarray, loc: float, scale: float, dist: str) -> np.ndarray:
+    if dist == "cauchy":
+        return 1.0 / (np.pi * scale * (1.0 + ((x - loc) / scale) ** 2))
+    return np.exp(-0.5 * ((x - loc) / scale) ** 2) / (scale * np.sqrt(2 * np.pi))
+
+
+def _fit_mixture(
     bin_centers: np.ndarray,
     weights: np.ndarray,
     n_components: int,
+    dist: str,
     n_init: int = 5,
 ) -> list[tuple[float, float, float]]:
     """
-    Fit exactly n_components Gaussians to a weighted histogram via EM (pure numpy).
-    Runs n_init random restarts and returns the best by weighted log-likelihood.
-    Returns a list of (mixing_weight, mean, std) tuples.
+    Fit exactly n_components Gaussian or Cauchy distributions to a weighted
+    histogram via EM (pure numpy). Runs n_init random restarts and returns
+    the best by weighted log-likelihood.
+    Returns a list of (mixing_weight, location, scale) tuples.
     """
     if weights.sum() == 0 or bin_centers.std() == 0:
         return []
 
+    em_fn = _MIXTURE_EM[dist]
     best_wll = -np.inf
     best_params: tuple = ()
     for init in range(n_init):
-        mix, mu, sigma, density = _gmm_em(bin_centers, weights, n_components, seed=init)
+        mix, loc, scale, density = em_fn(bin_centers, weights, n_components, seed=init)
         wll = float((weights * np.log(np.maximum(density, 1e-300))).sum())
         if wll > best_wll:
-            best_wll, best_params = wll, (mix, mu, sigma)
+            best_wll, best_params = wll, (mix, loc, scale)
 
-    mix, mu, sigma = best_params
-    return [(float(mix[i]), float(mu[i]), float(sigma[i])) for i in range(len(mix))]
+    mix, loc, scale = best_params
+    return [(float(mix[i]), float(loc[i]), float(scale[i])) for i in range(len(mix))]
 
 
 def _plot_price_distribution(
@@ -120,7 +190,8 @@ def _plot_price_distribution(
     fig: go.Figure,
     n_price_bins: int = 50,
     n_time_buckets: int = 20,
-    gaussian_max_components: int = 0,
+    mixture_distribution: str = "none",
+    mixture_max_components: int = 0,
 ) -> tuple[go.Figure, list[tuple[float, float, float]]]:
     """
     Add a horizontal volume-weighted price distribution histogram to col 2.
@@ -186,8 +257,9 @@ def _plot_price_distribution(
             col=2,
         )
 
+    fit_enabled = mixture_distribution in _MIXTURE_EM and mixture_max_components > 0
     components: list[tuple[float, float, float]] = []
-    if gaussian_max_components > 0:
+    if fit_enabled:
         total_per_bin = (
             agg.groupby("bin_idx")["s"]
             .sum()
@@ -196,15 +268,17 @@ def _plot_price_distribution(
         )
         total_vol = total_per_bin.sum()
         if total_vol > 0:
-            components = _fit_gaussian_mixture(bin_centers, total_per_bin, gaussian_max_components)
+            components = _fit_mixture(bin_centers, total_per_bin, mixture_max_components, mixture_distribution)
             if components:
                 price_smooth = np.linspace(price_min, price_max, 400)
                 scale = total_vol * bin_width
+                prefix = "C" if mixture_distribution == "cauchy" else "G"
+                loc_sym = "x₀" if mixture_distribution == "cauchy" else "μ"
+                scale_sym = "γ" if mixture_distribution == "cauchy" else "σ"
 
                 if len(components) > 1:
                     mixture_pdf = sum(
-                        w * np.exp(-0.5 * ((price_smooth - mu) / sigma) ** 2)
-                        / (sigma * np.sqrt(2 * np.pi))
+                        w * _mixture_pdf(price_smooth, mu, sigma, mixture_distribution)
                         for w, mu, sigma in components
                     )
                     fig.add_trace(
@@ -212,7 +286,7 @@ def _plot_price_distribution(
                             x=mixture_pdf * scale,
                             y=price_smooth,
                             mode="lines",
-                            name="GMM envelope",
+                            name=f"{prefix}MM envelope",
                             line=dict(color="#ffffff", width=2),
                             opacity=0.9,
                             hovertemplate=(
@@ -226,22 +300,18 @@ def _plot_price_distribution(
                     )
 
                 for i, (w, mu, sigma) in enumerate(components):
-                    pdf = (
-                        w
-                        * np.exp(-0.5 * ((price_smooth - mu) / sigma) ** 2)
-                        / (sigma * np.sqrt(2 * np.pi))
-                    )
-                    color = _GAUSSIAN_COLORS[i % len(_GAUSSIAN_COLORS)]
+                    pdf = w * _mixture_pdf(price_smooth, mu, sigma, mixture_distribution)
+                    color = _MIXTURE_COLORS[i % len(_MIXTURE_COLORS)]
                     fig.add_trace(
                         go.Scatter(
                             x=pdf * scale,
                             y=price_smooth,
                             mode="lines",
-                            name=f"G{i + 1}  μ={mu:.2f}  σ={sigma:.2f}",
+                            name=f"{prefix}{i + 1}  {loc_sym}={mu:.2f}  {scale_sym}={sigma:.2f}",
                             line=dict(color=color, width=1.5, dash="dot"),
                             opacity=0.85,
                             hovertemplate=(
-                                f"<b>G{i + 1}</b>  μ={mu:.2f}  σ={sigma:.2f}<br>"
+                                f"<b>{prefix}{i + 1}</b>  {loc_sym}={mu:.2f}  {scale_sym}={sigma:.2f}<br>"
                                 "<b>Price:</b> %{y:.4f}<br>"
                                 "<b>Fitted vol:</b> %{x:,.0f}"
                                 "<extra></extra>"
@@ -294,7 +364,7 @@ def _plot_price_distribution(
         bargroupgap=0,
         height=700,
     )
-    return fig, components if gaussian_max_components > 0 else []
+    return fig, components
 
 
 def _add_moving_averages(df: pd.DataFrame, fig: go.Figure, periods: list[int]) -> None:
@@ -520,8 +590,8 @@ def build_chart(
     show_7d_avg: bool = True,
     show_28d_avg: bool = True,
     show_1y_avg: bool = False,
-    gaussian_max_components: int = 0,
-    show_gaussian_centers: bool = False,
+    mixture_distribution: str = "none",
+    mixture_max_components: int = 0,
     daily_bars: Optional[list[dict]] = None,
     vwap_style: str = "hide",
     show_candle_body: bool = True,
@@ -557,12 +627,13 @@ def build_chart(
     )
 
     if not df_trades.empty:
-        fig, gmm_components = _plot_price_distribution(
+        fig, mixture_components = _plot_price_distribution(
             df_trades, fig,
-            gaussian_max_components=gaussian_max_components,
+            mixture_distribution=mixture_distribution,
+            mixture_max_components=mixture_max_components,
         )
     else:
-        gmm_components = []
+        mixture_components = []
 
     body_colors = [PALETTE["up"] if c >= o else PALETTE["down"] for c, o in zip(df["c"], df["o"])]
     body_base = [min(o, c) for o, c in zip(df["o"], df["c"])]
@@ -707,11 +778,12 @@ def build_chart(
         df_daily=df_daily,
     )
 
-    if show_gaussian_centers and gmm_components:
+    if mixture_components:
         x0 = df["t"].iloc[0]
         x1 = df["t"].iloc[-1]
-        for i, (_, mu, _) in enumerate(gmm_components):
-            color = _GAUSSIAN_COLORS[i % len(_GAUSSIAN_COLORS)]
+        prefix = "C" if mixture_distribution == "cauchy" else "G"
+        for i, (_, mu, _) in enumerate(mixture_components):
+            color = _MIXTURE_COLORS[i % len(_MIXTURE_COLORS)]
             fig.add_shape(
                 type="line",
                 x0=x0, x1=x1,
@@ -722,7 +794,7 @@ def build_chart(
             fig.add_annotation(
                 xref="x", yref="y",
                 x=x1, y=mu,
-                text=f" G{i + 1} {mu:.2f}",
+                text=f" {prefix}{i + 1} {mu:.2f}",
                 font=dict(color=color, size=10, family="monospace"),
                 showarrow=False,
                 xanchor="left",

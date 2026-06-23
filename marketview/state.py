@@ -30,8 +30,8 @@ _DEFAULTS: dict[str, object] = {
     "show_7d_avg": False,
     "show_28d_avg": False,
     "show_1y_avg": False,
-    "gaussian_max_components": 0,
-    "show_gaussian_centers": False,
+    "mixture_distribution": "none",
+    "mixture_max_components": 0,
     "vwap_style": "hide",
     "show_candle_body": True,
     "show_percentile_body": False,
@@ -94,8 +94,8 @@ class AppState:
         self.show_7d_avg: bool = False
         self.show_28d_avg: bool = False
         self.show_1y_avg: bool = False
-        self.gaussian_max_components: int = 0
-        self.show_gaussian_centers: bool = False
+        self.mixture_distribution: str = "none"
+        self.mixture_max_components: int = 0
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False
