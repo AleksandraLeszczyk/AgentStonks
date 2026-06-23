@@ -934,6 +934,97 @@ def build_gamma_chart(data: dict, analysis: dict, symbol: str) -> go.Figure:
     return fig
 
 
+def build_analysis_gauges(trend: dict, intraday: dict, market: dict) -> go.Figure:
+    """Three-gauge snapshot: daily-trend RSI, intraday momentum, and the VIX fear
+    gauge -- the headline number from each `technical_analysis` read, at a glance."""
+    fig = make_subplots(rows=1, cols=3, specs=[[{"type": "indicator"}] * 3])
+
+    rsi14 = trend.get("rsi_14")
+    fig.add_trace(
+        go.Indicator(
+            mode="gauge+number",
+            value=rsi14 if rsi14 is not None else 50,
+            number=dict(suffix="" if rsi14 is not None else " (n/a)", font=dict(color=PALETTE["text"])),
+            title=dict(
+                text=f"Trend RSI(14)<br><span style='font-size:11px;color:{PALETTE['muted']}'>"
+                f"{trend.get('regime', 'n/a')}</span>"
+            ),
+            gauge=dict(
+                axis=dict(range=[0, 100], tickcolor=PALETTE["muted"]),
+                bar=dict(color=PALETTE["accent"]),
+                bgcolor=PALETTE["panel"],
+                steps=[
+                    dict(range=[0, 30], color="rgba(239,83,80,0.35)"),
+                    dict(range=[30, 70], color="rgba(136,136,136,0.2)"),
+                    dict(range=[70, 100], color="rgba(239,83,80,0.35)"),
+                ],
+            ),
+        ),
+        row=1,
+        col=1,
+    )
+
+    pct_chg = intraday.get("pct_change_in_window") or 0.0
+    bound = max(2.0, abs(pct_chg) * 1.5)
+    fig.add_trace(
+        go.Indicator(
+            mode="gauge+number+delta",
+            value=pct_chg,
+            number=dict(suffix="%", font=dict(color=PALETTE["text"])),
+            delta=dict(reference=0, suffix="%"),
+            title=dict(
+                text="Intraday Momentum<br><span style='font-size:11px;color:"
+                f"{PALETTE['muted']}'>{(intraday.get('momentum_pattern') or 'n/a')[:40]}</span>"
+            ),
+            gauge=dict(
+                axis=dict(range=[-bound, bound], tickcolor=PALETTE["muted"]),
+                bar=dict(color=PALETTE["up"] if pct_chg >= 0 else PALETTE["down"]),
+                bgcolor=PALETTE["panel"],
+                steps=[
+                    dict(range=[-bound, 0], color="rgba(239,83,80,0.2)"),
+                    dict(range=[0, bound], color="rgba(38,198,162,0.2)"),
+                ],
+            ),
+        ),
+        row=1,
+        col=2,
+    )
+
+    vix = market.get("vix")
+    fig.add_trace(
+        go.Indicator(
+            mode="gauge+number",
+            value=vix if vix is not None else 20,
+            number=dict(suffix="" if vix is not None else " (n/a)", font=dict(color=PALETTE["text"])),
+            title=dict(
+                text=f"VIX<br><span style='font-size:11px;color:{PALETTE['muted']}'>"
+                f"{market.get('risk_environment', 'n/a')}</span>"
+            ),
+            gauge=dict(
+                axis=dict(range=[0, 40], tickcolor=PALETTE["muted"]),
+                bar=dict(color=PALETTE["orange"]),
+                bgcolor=PALETTE["panel"],
+                steps=[
+                    dict(range=[0, 17], color="rgba(38,198,162,0.25)"),
+                    dict(range=[17, 26], color="rgba(251,146,60,0.25)"),
+                    dict(range=[26, 40], color="rgba(239,83,80,0.3)"),
+                ],
+            ),
+        ),
+        row=1,
+        col=3,
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=PALETTE["bg"],
+        font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
+        margin=dict(l=20, r=20, t=70, b=10),
+        height=260,
+    )
+    return fig
+
+
 def build_historical_chart(
     ticker_close: pd.Series,
     spy_close: pd.Series,

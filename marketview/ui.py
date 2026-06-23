@@ -10,7 +10,14 @@ import pandas as pd
 import streamlit as st
 
 from .agent import launch_agent, stop_agent
-from .charts import build_chart, build_gamma_chart, build_historical_chart, build_performance_chart, empty_chart
+from .charts import (
+    build_analysis_gauges,
+    build_chart,
+    build_gamma_chart,
+    build_historical_chart,
+    build_performance_chart,
+    empty_chart,
+)
 from .config import (
     AGENT_CYCLE_SEC,
     AGENT_EQUITY_HISTORY_MAXLEN,
@@ -38,6 +45,7 @@ from .historical import (
     fetch_close_series,
     fetch_dividends,
     fetch_earnings_dates,
+    fetch_market_indicators,
     fetch_static_analysis,
 )
 from .llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS
@@ -48,7 +56,7 @@ from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import AppState
 from .stream import launch_stream, launch_stream_news
-from .technical_analysis import get_put_call_walls_and_gamma
+from .technical_analysis import analyze_intraday, analyze_market, analyze_trend, get_put_call_walls_and_gamma
 
 
 def _get_state() -> AppState:
@@ -393,6 +401,60 @@ def _static_analysis_panel(symbol: str) -> None:
         "Est. 10yr cumulative dividend return",
         f"{dividend_return_10y * 100:.1f}%" if dividend_return_10y is not None else "—",
     )
+
+
+@st.fragment(run_every=CHART_POLL_SEC)
+def _technical_analysis_panel(symbol: str) -> None:
+    """Visualizes the three human-readable reads from `technical_analysis`:
+    the daily trend regime, intraday momentum, and the broad market environment."""
+    state = _get_state()
+    sym = symbol.strip().upper() or state.symbol
+    with state.lock:
+        bars = list(state.bars)
+    daily_bars = state.daily_bars
+
+    if not sym or not bars:
+        st.info("Start the Live stream for a symbol first so there's data to analyze.")
+        return
+
+    trend = analyze_trend(daily_bars if daily_bars else bars)
+    intraday = analyze_intraday(bars)
+    try:
+        market_series = fetch_market_indicators()
+        market = analyze_market(market_series.get("vix"), market_series.get("spy"), market_series.get("vix3m"))
+    except Exception as exc:
+        market = {"note": f"market indicators unavailable: {exc}"}
+
+    st.plotly_chart(build_analysis_gauges(trend, intraday, market), width='stretch')
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**📈 Trend (daily)**")
+        if "note" in trend:
+            st.caption(trend["note"])
+        else:
+            st.metric(
+                "Regime",
+                f"{trend['regime'].capitalize()} ({trend['trend_strength']})",
+                f"{trend['pct_change_over_period']:+.1f}%",
+            )
+            st.caption(trend["summary"])
+    with c2:
+        st.markdown("**⚡ Intraday Momentum**")
+        if "note" in intraday:
+            st.caption(intraday["note"])
+        else:
+            st.metric("Window change", f"{intraday['pct_change_in_window']:+.2f}%", intraday["momentum_pattern"])
+            st.caption(intraday["summary"])
+    with c3:
+        st.markdown("**🌍 Market Environment**")
+        if "note" in market:
+            st.caption(market["note"])
+        else:
+            st.metric("Risk environment", market["risk_environment"].capitalize(), f"score {market['risk_score']:+d}")
+            st.caption(market["summary"])
+            for insight in market.get("insights", []):
+                st.markdown(f"- {insight}")
 
 
 def _record_wall_snapshot(state: AppState, call_wall: float, put_wall: float) -> list[dict]:
@@ -843,8 +905,8 @@ def build_ui() -> None:
             )
     state = _get_state()
 
-    tab_live, tab_historical, tab_walls, tab_agent = st.tabs(
-        ["📡 Live", "🗂️ Historical", "🧱 Put/Call Walls", "🤖 Agent"]
+    tab_live, tab_historical, tab_analysis, tab_walls, tab_agent = st.tabs(
+        ["📡 Live", "🗂️ Historical", "🔬 Technical Analysis", "🧱 Put/Call Walls", "🤖 Agent"]
     )
 
     with tab_live:
@@ -931,6 +993,9 @@ def build_ui() -> None:
 
     with tab_historical:
         _historical_panel(symbol)
+
+    with tab_analysis:
+        _technical_analysis_panel(symbol)
 
     with tab_walls:
         _options_walls_panel(symbol)
