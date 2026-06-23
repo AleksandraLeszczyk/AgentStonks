@@ -19,6 +19,7 @@ import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import technical_analysis as ta
 from .config import AGENT_MAX_TOOL_ITERS
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 from .state import alert_triggered
@@ -35,16 +36,16 @@ reason as if real capital is on the line.
 
 Work through this process every cycle:
 
-1. ESTABLISH THE REGIME. Call get_daily_bars first. Use the medium-term \
+1. ESTABLISH THE REGIME. Call analyze_daily_trend first. Use the medium-term \
 trend (price relative to its recent range, direction over the last 20-60 \
 days, and any acceleration/deceleration) to classify the regime as bullish, \
 bearish, or neutral/choppy. Don't skip this step -- it determines which \
 strategy applies below.
 
-2. CHECK INTRADAY CONFIRMATION. Call get_intraday_bars and get_volume_stats. \
-Look for whether short-term price action and volume confirm or contradict \
-the regime (e.g. a bullish regime with breaking-down intraday price and weak \
-volume is a warning sign, not a buy signal).
+2. CHECK INTRADAY CONFIRMATION. Call analyze_intraday_momentum and \
+analyze_volume. Look for whether short-term price action and volume confirm \
+or contradict the regime (e.g. a bullish regime with breaking-down intraday \
+price and weak volume is a warning sign, not a buy signal).
 
 3. CHECK NEWS. Call get_news. Treat clearly negative news (or negative-for- \
 symbol competitor news) as a reason to be more conservative even in a \
@@ -104,14 +105,18 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "get_intraday_bars",
-            "description": "Get recent intraday OHLCV bars for the ticker, most recent last.",
+            "name": "analyze_intraday_momentum",
+            "description": (
+                "Analyze recent intraday price action for the ticker: momentum pattern "
+                "(higher highs/lows vs lower highs/lows), position relative to session VWAP, "
+                "and ATR-based volatility. Returns labeled values plus a one-line summary."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "limit": {
                         "type": "integer",
-                        "description": "Number of most recent bars to return (default 50, max 300).",
+                        "description": "Number of most recent bars to analyze (default 50, max 300).",
                     }
                 },
                 "required": [],
@@ -121,10 +126,11 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "get_daily_bars",
+            "name": "analyze_daily_trend",
             "description": (
-                "Get daily OHLCV bars (up to ~1 year) for the ticker, used to establish the "
-                "medium-term trading regime (bullish/bearish/choppy)."
+                "Analyze daily bars (up to ~1 year) to establish the medium-term trading regime: "
+                "bullish/bearish/neutral with strength, moving-average alignment, RSI, and recent "
+                "support/resistance. Returns labeled values plus a one-line summary."
             ),
             "parameters": {
                 "type": "object",
@@ -141,8 +147,12 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "get_volume_stats",
-            "description": "Get recent trade volume statistics to gauge participation and momentum confirmation.",
+            "name": "analyze_volume",
+            "description": (
+                "Analyze recent trade volume to gauge participation: relative volume vs the prior "
+                "window, on-balance-volume trend, and whether volume confirms or diverges from the "
+                "recent price move. Returns labeled values plus a one-line summary."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -236,37 +246,29 @@ def _tool_get_quote(state: "AppState") -> dict:
         }
 
 
-def _tool_get_intraday_bars(state: "AppState", limit: object = None) -> dict:
+def _tool_analyze_intraday_momentum(state: "AppState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 50), 300))
     with state.lock:
         bars = list(state.bars)[-n:]
-    return {"bars": bars, "count": len(bars)}
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_intraday(bars)
 
 
-def _tool_get_daily_bars(state: "AppState", limit: object = None) -> dict:
+def _tool_analyze_daily_trend(state: "AppState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 60), 365))
     bars = list(state.daily_bars)[-n:]
-    return {"bars": bars, "count": len(bars)}
+    if not bars:
+        return {"note": "no daily bars available yet"}
+    return ta.analyze_trend(bars)
 
 
-def _tool_get_volume_stats(state: "AppState") -> dict:
+def _tool_analyze_volume(state: "AppState") -> dict:
     with state.lock:
         bars = list(state.bars)
     if not bars:
         return {"note": "no intraday bars available yet"}
-    volumes = [b.get("v", 0) for b in bars]
-    recent = volumes[-10:]
-    prior = volumes[-20:-10] if len(volumes) >= 20 else volumes[:-10]
-    recent_avg = sum(recent) / len(recent) if recent else 0
-    prior_avg = sum(prior) / len(prior) if prior else 0
-    trend = "increasing" if recent_avg > prior_avg else "decreasing" if recent_avg < prior_avg else "flat"
-    return {
-        "bar_count": len(volumes),
-        "total_volume": sum(volumes),
-        "recent_10bar_avg_volume": recent_avg,
-        "prior_10bar_avg_volume": prior_avg,
-        "volume_trend": trend,
-    }
+    return ta.analyze_volume(bars)
 
 
 def _tool_get_news(state: "AppState", limit: object = None) -> dict:
@@ -301,9 +303,9 @@ def _tool_get_position(state: "AppState", tracker: "DecisionTracker") -> dict:
 
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
-    "get_intraday_bars": lambda args, state, tracker: _tool_get_intraday_bars(state, args.get("limit")),
-    "get_daily_bars": lambda args, state, tracker: _tool_get_daily_bars(state, args.get("limit")),
-    "get_volume_stats": lambda args, state, tracker: _tool_get_volume_stats(state),
+    "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
+    "analyze_daily_trend": lambda args, state, tracker: _tool_analyze_daily_trend(state, args.get("limit")),
+    "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
     "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),
     "get_position": lambda args, state, tracker: _tool_get_position(state, tracker),
 }

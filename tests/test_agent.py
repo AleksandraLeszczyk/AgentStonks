@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 from marketview.agent import (
     _dispatch_tool,
+    _tool_analyze_volume,
     _tool_get_news,
     _tool_get_quote,
-    _tool_get_volume_stats,
     _wait_for_next_cycle,
     run_agent_cycle,
 )
@@ -56,9 +56,9 @@ class FakeClient:
 
 
 class TestToolHandlers:
-    def test_get_volume_stats_with_no_bars_returns_note(self):
+    def test_analyze_volume_with_no_bars_returns_note(self):
         state = AppState()
-        assert "note" in _tool_get_volume_stats(state)
+        assert "note" in _tool_analyze_volume(state)
 
     def test_get_quote_reads_state(self):
         state = AppState()
@@ -92,7 +92,7 @@ class TestRunAgentCycle:
         tracker = DecisionTracker(starting_cash=1000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
 
         responses = [
-            _response(tool_calls=[_tool_call("c1", "get_daily_bars", {"limit": 60})]),
+            _response(tool_calls=[_tool_call("c1", "analyze_daily_trend", {"limit": 60})]),
             _response(
                 tool_calls=[
                     _tool_call(
