@@ -579,11 +579,15 @@ def run_agent_cycle(
 
 
 def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
-    """Block for up to `cycle_sec` -- a real sleep, not a poll loop.
+    """Block until the next cycle is actually due.
 
-    Wakes early only if `state.agent_wake_event` is set, which the price/news
-    stream threads do directly the moment a price alert condition is met or
-    fresh news arrives -- never on a timer just to check state.
+    With no active alert, this is a plain `cycle_sec` timer (woken early only
+    by fresh news). With an active alert, the fixed timer is disabled --
+    the agent committed to "nothing changes until price reaches that level or
+    news arrives", so it should wait indefinitely for `state.agent_wake_event`
+    rather than also waking on the next scheduled tick. The price/news stream
+    threads set that event directly the moment a price alert condition is met
+    or fresh news arrives -- never on a timer just to check state.
     """
     state.agent_wake_event.clear()
     state.agent_wake_reason = None
@@ -607,7 +611,10 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
                 )
                 return
 
-    woke_early = state.agent_wake_event.wait(timeout=cycle_sec)
+    # An active alert means the agent should sleep until that condition
+    # fires or news arrives -- not get woken by the regular cycle timer too.
+    timeout = None if alerts else cycle_sec
+    woke_early = state.agent_wake_event.wait(timeout=timeout)
     if stop_event.is_set():
         return
     if woke_early and state.agent_wake_reason:
