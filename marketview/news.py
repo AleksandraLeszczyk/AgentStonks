@@ -17,6 +17,7 @@ import requests
 from pydantic import BaseModel, field_validator
 
 from .llm import DEFAULT_NEWS_MODELS, parse_structured
+from .rest import fetch_news as _fetch_alpaca_news
 
 
 ImpactLabel = Literal["positive", "negative", "neutral", "small", "unknown"]
@@ -138,6 +139,40 @@ def get_last_week_news(keywords: str, worldnews_api_key: str) -> list[News]:
             sentiment=row.sentiment,
         )
         for row in df.itertuples()
+    ]
+
+
+def fetch_news_with_fallback(
+    symbol: str,
+    alpaca_key: str,
+    alpaca_secret: str,
+    worldnews_api_key: str,
+    limit: int = 15,
+) -> list[dict]:
+    """Fetch news from Alpaca, falling back to WorldNews API on failure (e.g. rate limit).
+
+    Returns the same dict shape as `rest.fetch_news` (headline/summary/created_at/url/source)
+    regardless of which provider served the result, so callers don't need to branch.
+    """
+    try:
+        return _fetch_alpaca_news(symbol, alpaca_key, alpaca_secret, limit=limit)
+    except Exception as exc:
+        print(f"Alpaca news API error, falling back to WorldNews: {exc}")
+
+    if not worldnews_api_key:
+        return []
+
+    fallback = get_last_week_news(keywords=symbol, worldnews_api_key=worldnews_api_key)
+    return [
+        {
+            "id": f"worldnews-{symbol}-{i}",
+            "headline": item.title,
+            "summary": item.text,
+            "created_at": item.timestamp,
+            "url": item.url,
+            "source": "worldnewsapi",
+        }
+        for i, item in enumerate(fallback[:limit])
     ]
 
 

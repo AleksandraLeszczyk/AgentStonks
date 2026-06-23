@@ -39,10 +39,10 @@ from .historical import (
     fetch_static_analysis,
 )
 from .llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS
-from .news import score_news_impacts
+from .news import fetch_news_with_fallback, score_news_impacts
 from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
-from .rest import fetch_bars, fetch_daily_bars, fetch_news, fetch_trades
+from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import AppState
 from .stream import launch_stream, launch_stream_news
 
@@ -806,7 +806,9 @@ def build_ui() -> None:
                     try:
                         historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
                         historical_trades = fetch_trades(sym, key, secret, feed)
-                        news = fetch_news(sym, key, secret)
+                        news = fetch_news_with_fallback(
+                            sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
+                        )
                         daily_bars = fetch_daily_bars(sym, key, secret, feed)
                     except Exception as exc:
                         st.error(f"Failed to load data: {exc}")
