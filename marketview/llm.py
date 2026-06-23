@@ -20,13 +20,13 @@ PROVIDERS: tuple[str, ...] = ("gemini", "openai", "anthropic")
 
 DEFAULT_AGENT_MODELS: dict[str, str] = {
     "gemini": "gemini-3.5-flash",
-    "openai": "gpt-4.1-mini",
+    "openai": "gpt-5.4-mini",
     "anthropic": "claude-sonnet-4-6",
 }
 
 DEFAULT_NEWS_MODELS: dict[str, str] = {
     "gemini": "gemini-2.0-flash",
-    "openai": "gpt-4.1-mini",
+    "openai": "gpt-5.4-nano",
     "anthropic": "claude-haiku-4-5-20251001",
 }
 

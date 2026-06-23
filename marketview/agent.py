@@ -19,6 +19,7 @@ import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import historical
 from . import technical_analysis as ta
 from .config import AGENT_MAX_TOOL_ITERS
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
@@ -40,7 +41,12 @@ Work through this process every cycle:
 trend (price relative to its recent range, direction over the last 20-60 \
 days, and any acceleration/deceleration) to classify the regime as bullish, \
 bearish, or neutral/choppy. Don't skip this step -- it determines which \
-strategy applies below.
+strategy applies below. Then call analyze_market to read the broad-market \
+backdrop (VIX level/trend, VIX term structure, S&P 500 trend and drawdown). \
+A risk-off market (high or rising VIX, inverted term structure, S&P below its \
+200-day average or in a correction) is a reason to demand more conviction and \
+size smaller even when the ticker's own trend looks bullish; a risk-on \
+backdrop is a tailwind. Let its actionable insights inform sizing and stops.
 
 2. CHECK INTRADAY CONFIRMATION. Call analyze_intraday_momentum and \
 analyze_volume. Look for whether short-term price action and volume confirm \
@@ -142,6 +148,20 @@ TOOLS: list[dict] = [
                 },
                 "required": [],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_market",
+            "description": (
+                "Analyze broad-market conditions (independent of the ticker) using the best-known "
+                "regime gauges: the VIX fear level and its trend, the VIX term structure "
+                "(near-term vs 3-month implied vol), and the S&P 500's primary trend, drawdown, and "
+                "RSI. Returns a risk-on/neutral/risk-off classification, labeled markers, and a list "
+                "of actionable insights. Use it to set the overall risk backdrop before sizing trades."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -263,6 +283,15 @@ def _tool_analyze_daily_trend(state: "AppState", limit: object = None) -> dict:
     return ta.analyze_trend(bars)
 
 
+def _tool_analyze_market(state: "AppState") -> dict:
+    data = historical.fetch_market_indicators()
+    return ta.analyze_market(
+        vix_close=data.get("vix"),
+        spy_close=data.get("spy"),
+        vix3m_close=data.get("vix3m"),
+    )
+
+
 def _tool_analyze_volume(state: "AppState") -> dict:
     with state.lock:
         bars = list(state.bars)
@@ -305,6 +334,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
     "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
     "analyze_daily_trend": lambda args, state, tracker: _tool_analyze_daily_trend(state, args.get("limit")),
+    "analyze_market": lambda args, state, tracker: _tool_analyze_market(state),
     "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
     "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),
     "get_position": lambda args, state, tracker: _tool_get_position(state, tracker),

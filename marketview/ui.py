@@ -284,7 +284,7 @@ def _chart_panel() -> None:
         if (state.symbol and bars)
         else empty_chart()
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     st.html(_news_html(state.news, state.symbol, state.news_impacts))
 
 
@@ -349,7 +349,7 @@ def _historical_panel(symbol: str) -> None:
 
     sym = symbol.strip().upper()
     if not sym:
-        st.plotly_chart(empty_chart("Enter a symbol in the sidebar"), use_container_width=True)
+        st.plotly_chart(empty_chart("Enter a symbol in the sidebar"), width='stretch')
         return
 
     days = HISTORICAL_PERIODS[period_label]
@@ -365,7 +365,7 @@ def _historical_panel(symbol: str) -> None:
             return
 
     fig = build_historical_chart(ticker_close, spy_close, vix_close, sym, period_label, dividends, earnings)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     _static_analysis_panel(sym)
 
 
@@ -517,7 +517,7 @@ def _agent_performance_panel(symbol: str) -> None:
     state = _get_state()
     tracker = state.decision_tracker
     if not tracker:
-        st.plotly_chart(empty_chart("Start the agent to track performance"), use_container_width=True)
+        st.plotly_chart(empty_chart("Start the agent to track performance"), width='stretch')
         return
 
     snap = tracker.snapshot()
@@ -540,7 +540,7 @@ def _agent_performance_panel(symbol: str) -> None:
     c3.metric("Starting budget", f"${stats['starting_cash']:,.2f}")
 
     fig = build_performance_chart(points, markers, symbol or state.symbol)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def _build_agent_report_html(state: AppState, symbol: str) -> str:
@@ -687,8 +687,8 @@ def _agent_panel(symbol: str) -> None:
         step=100.0,
         key="agent_starting_budget",
     )
-    start_clicked = c2.button("▶ Start Agent", type="primary", use_container_width=True, key="agent_start")
-    stop_clicked = c3.button("⏹ Stop Agent", use_container_width=True, key="agent_stop")
+    start_clicked = c2.button("▶ Start Agent", type="primary", width='stretch', key="agent_start")
+    stop_clicked = c3.button("⏹ Stop Agent", width='stretch', key="agent_stop")
 
     env_var = ENV_KEYS[provider]
     llm_key = os.getenv(env_var, "")
@@ -747,8 +747,8 @@ def build_ui() -> None:
     with st.sidebar:
         st.header("Controls")
         c1, c2 = st.columns(2)
-        start_clicked = c1.button("▶ Start", type="primary", use_container_width=True)
-        stop_clicked = c2.button("⏹ Stop", use_container_width=True)
+        start_clicked = c1.button("▶ Start", type="primary", width='stretch')
+        stop_clicked = c2.button("⏹ Stop", width='stretch')
         symbol = st.text_input("Symbol", value="AAPL", placeholder="AAPL, TSLA, MSFT…")
         with st.expander("Connection"):
             feed = st.selectbox("Feed", FEEDS, index=0)

@@ -2,6 +2,7 @@ import pandas as pd
 
 from marketview.technical_analysis import (
     analyze_intraday,
+    analyze_market,
     analyze_trend,
     analyze_volume,
     atr,
@@ -119,6 +120,54 @@ class TestAnalyzeIntraday:
         bars = _make_bars(closes, vwaps=[99.0] * 10)
         result = analyze_intraday(bars)
         assert "above" in result["vwap_position"]
+
+
+class TestAnalyzeMarket:
+    def test_no_data_returns_note(self):
+        assert "note" in analyze_market(vix_close=None, spy_close=None)
+
+    def test_calm_vix_and_uptrending_spy_is_risk_on(self):
+        vix = pd.Series([13.0] * 10)
+        spy = pd.Series([300.0 + i for i in range(260)])  # steady uptrend, above 50/200d
+        result = analyze_market(vix_close=vix, spy_close=spy)
+        assert result["risk_environment"] == "risk-on"
+        assert result["risk_score"] > 0
+        assert result["vix_label"] == "low (calm)"
+        assert result["insights"]
+
+    def test_high_vix_and_falling_spy_is_risk_off(self):
+        vix = pd.Series([38.0] * 10)
+        spy = pd.Series([500.0 - i for i in range(260)])  # steady downtrend, below 50/200d
+        result = analyze_market(vix_close=vix, spy_close=spy)
+        assert result["risk_environment"] == "risk-off"
+        assert result["risk_score"] < 0
+        assert "extreme (panic)" in result["vix_label"]
+
+    def test_inverted_term_structure_flagged_as_backwardation(self):
+        vix = pd.Series([30.0] * 10)
+        vix3m = pd.Series([26.0] * 10)
+        result = analyze_market(vix_close=vix, vix3m_close=vix3m, spy_close=None)
+        assert result["vix_term_structure"] == "backwardation"
+        assert any("inverted" in i for i in result["insights"])
+
+    def test_contango_term_structure_when_vix3m_above_vix(self):
+        vix = pd.Series([18.0] * 10)
+        vix3m = pd.Series([20.0] * 10)
+        result = analyze_market(vix_close=vix, vix3m_close=vix3m, spy_close=None)
+        assert result["vix_term_structure"] == "contango"
+
+    def test_spy_drawdown_reported(self):
+        # Peak at 100, ends 15% lower -> correction territory.
+        spy = pd.Series([100.0] * 5 + [85.0])
+        result = analyze_market(vix_close=None, spy_close=spy)
+        assert result["spy_drawdown_from_high_pct"] == -15.0
+        assert any("correction" in i for i in result["insights"])
+
+    def test_rising_vix_adds_caution_insight(self):
+        vix = pd.Series([20.0, 21.0, 22.0, 24.0, 26.0, 28.0])  # +40% over 5 sessions
+        result = analyze_market(vix_close=vix, spy_close=None)
+        assert result["vix_5d_change_pct"] > 10
+        assert any("rising fast" in i for i in result["insights"])
 
 
 class TestAnalyzeVolume:

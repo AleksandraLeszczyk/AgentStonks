@@ -13,7 +13,13 @@ HISTORICAL_PERIODS: dict[str, int] = {
 }
 
 VIX_SYMBOL = "^VIX"
+VIX3M_SYMBOL = "^VIX3M"
 SPY_SYMBOL = "SPY"
+
+# Broad-market indicator series change slowly relative to the agent's cycle and
+# are identical for every ticker, so cache them briefly to avoid re-hitting
+# yfinance on each agent call.
+_market_cache: dict = {"ts": None, "data": None}
 
 
 def fetch_close_series(symbol: str, days: int) -> pd.Series:
@@ -28,6 +34,31 @@ def fetch_close_series(symbol: str, days: int) -> pd.Series:
         close = close.iloc[:, 0]
     close.index = pd.to_datetime(close.index)
     return close.dropna()
+
+
+def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
+    """Fetch the broad-market condition series (SPY, VIX, VIX3M) for `analyze_market`.
+
+    Returns a dict of {"spy", "vix", "vix3m"} -> daily close Series. A failed or
+    unavailable symbol yields an empty Series rather than raising, so one bad
+    feed never sinks the whole read. Results are cached for `ttl_sec` seconds.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _market_cache["data"]
+    cached_ts = _market_cache["ts"]
+    if cached is not None and cached_ts is not None and (now - cached_ts).total_seconds() < ttl_sec:
+        return cached
+
+    data: dict[str, pd.Series] = {}
+    for key, symbol in (("spy", SPY_SYMBOL), ("vix", VIX_SYMBOL), ("vix3m", VIX3M_SYMBOL)):
+        try:
+            data[key] = fetch_close_series(symbol, days)
+        except Exception:
+            data[key] = pd.Series(dtype=float)
+
+    _market_cache["ts"] = now
+    _market_cache["data"] = data
+    return data
 
 
 def fetch_dividends(symbol: str, days: int) -> pd.Series:
