@@ -10,10 +10,13 @@ reads whatever was fetched most recently from `AppState`.
 """
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timezone
 
 import yfinance as yf
+
+logger = logging.getLogger(__name__)
 
 RISK_FREE_RATE = 0.045
 CONTRACT_MULTIPLIER = 100
@@ -49,7 +52,7 @@ def _fetch_spot(ticker: "yf.Ticker") -> float:
         if price:
             return float(price)
     except Exception:
-        pass
+        logger.warning("yfinance fast_info lookup failed for %s; falling back to history", ticker.ticker, exc_info=True)
     hist = ticker.history(period="1d")
     if not hist.empty:
         return float(hist["Close"].iloc[-1])
@@ -79,9 +82,13 @@ def fetch_option_chain(
     """Fetch the options chain for `symbol` and compute open interest + dollar gamma
     exposure per strike. Raises on failure (no expirations, no chain data, etc.)."""
     ticker = yf.Ticker(symbol)
-    expirations = list(ticker.options)
-    chosen_expiry = expiry or _select_expiry(expirations, max_dte)
-    chain = ticker.option_chain(chosen_expiry)
+    try:
+        expirations = list(ticker.options)
+        chosen_expiry = expiry or _select_expiry(expirations, max_dte)
+        chain = ticker.option_chain(chosen_expiry)
+    except Exception:
+        logger.exception("yfinance option chain fetch failed for %s", symbol)
+        raise
     calls = chain.calls.set_index("strike")
     puts = chain.puts.set_index("strike")
 

@@ -1,8 +1,11 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
 import yfinance as yf
+
+logger = logging.getLogger(__name__)
 
 HISTORICAL_PERIODS: dict[str, int] = {
     "7 Days": 7,
@@ -26,8 +29,13 @@ def fetch_close_series(symbol: str, days: int) -> pd.Series:
     """Fetch daily close prices for `symbol` over the trailing `days`. Raises on failure."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
-    df = yf.download(symbol, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
+    try:
+        df = yf.download(symbol, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
+    except Exception:
+        logger.exception("yfinance download failed for %s (start=%s, end=%s)", symbol, start, end)
+        raise
     if df.empty:
+        logger.warning("yfinance returned no data for %s (start=%s, end=%s)", symbol, start, end)
         return pd.Series(dtype=float)
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
@@ -54,6 +62,7 @@ def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
         try:
             data[key] = fetch_close_series(symbol, days)
         except Exception:
+            logger.error("Market indicator fetch failed for %s (%s); using empty series", symbol, key)
             data[key] = pd.Series(dtype=float)
 
     _market_cache["ts"] = now
@@ -62,8 +71,12 @@ def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
 
 
 def fetch_dividends(symbol: str, days: int) -> pd.Series:
-    """Fetch dividend payouts for `symbol` over the trailing `days`."""
-    div = yf.Ticker(symbol).dividends
+    """Fetch dividend payouts for `symbol` over the trailing `days`. Raises on failure."""
+    try:
+        div = yf.Ticker(symbol).dividends
+    except Exception:
+        logger.exception("yfinance dividends lookup failed for %s", symbol)
+        raise
     if div.empty:
         return div
     cutoff = pd.Timestamp.now(tz=div.index.tz) - pd.Timedelta(days=days)
@@ -75,6 +88,7 @@ def fetch_earnings_dates(symbol: str, days: int) -> pd.DataFrame:
     try:
         earnings = yf.Ticker(symbol).get_earnings_dates(limit=20)
     except Exception:
+        logger.error("yfinance earnings dates lookup failed for %s", symbol, exc_info=True)
         return pd.DataFrame()
     if earnings is None or earnings.empty:
         return pd.DataFrame()
@@ -87,6 +101,7 @@ def fetch_static_analysis(symbol: str) -> dict:
     try:
         info = yf.Ticker(symbol).info
     except Exception:
+        logger.error("yfinance .info lookup failed for %s", symbol, exc_info=True)
         info = {}
     growth_rate = info.get("earningsGrowth")
     if growth_rate is None:
