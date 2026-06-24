@@ -62,7 +62,16 @@ from .technical_analysis import analyze_intraday, analyze_market, analyze_trend,
 def _get_state() -> AppState:
     if "app_state" not in st.session_state:
         st.session_state["app_state"] = AppState()
-    return st.session_state["app_state"]
+    state = st.session_state["app_state"]
+    # Streamlit's dev-mode autoreload reruns this script on every save but keeps
+    # the same AppState instance alive in session_state. If a field was added to
+    # AppState after this instance was constructed, the instance's __class__ (and
+    # therefore __getattr__) still points at the pre-edit definition, so reading
+    # the new field raises AttributeError instead of falling back to a default.
+    # Writing straight into __dict__ sidesteps the class entirely.
+    state.__dict__.setdefault("day_high", None)
+    state.__dict__.setdefault("day_low", None)
+    return state
 
 
 def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
@@ -181,6 +190,8 @@ def _quote_html(
     bid_size: float | None,
     ask: float | None,
     ask_size: float | None,
+    day_high: float | None,
+    day_low: float | None,
     symbol: str,
 ) -> str:
     if price is None and bid is None and ask is None:
@@ -222,8 +233,10 @@ def _quote_html(
             f'</div>'
         )
 
+    low_card = _side("Day Low", day_low, None, PALETTE["muted"])
     bid_card = _side("Bid", bid, bid_size, "#ef5350")
     ask_card = _side("Ask", ask, ask_size, "#26c6a2")
+    high_card = _side("Day High", day_high, None, PALETTE["muted"])
     spread_row = ""
     if bid is not None and ask is not None:
         spread = ask - bid
@@ -233,10 +246,10 @@ def _quote_html(
         )
 
     ba_row = ""
-    if bid_card or ask_card:
+    if bid_card or ask_card or low_card or high_card:
         ba_row = (
             f'<div style="display:flex;gap:10px;align-items:stretch;">'
-            f'{bid_card}{spread_row}{ask_card}'
+            f'{low_card}{bid_card}{spread_row}{ask_card}{high_card}'
             f'</div>'
         )
 
@@ -259,7 +272,11 @@ def _price_ticker() -> None:
             bid_size = state.bid_size
             ask_price = state.ask_price
             ask_size = state.ask_size
-        html = _quote_html(last_price, prev_close, bid_price, bid_size, ask_price, ask_size, state.symbol)
+            day_high = state.day_high
+            day_low = state.day_low
+        html = _quote_html(
+            last_price, prev_close, bid_price, bid_size, ask_price, ask_size, day_high, day_low, state.symbol
+        )
         if html:
             st.html(html)
 

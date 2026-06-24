@@ -42,6 +42,8 @@ _DEFAULTS: dict[str, object] = {
     "bid_size": None,
     "ask_price": None,
     "ask_size": None,
+    "day_high": None,
+    "day_low": None,
     "agent_log": [],
     "agent_running": False,
     "agent_stop_event": None,
@@ -106,6 +108,8 @@ class AppState:
         self.bid_size: float | None = None
         self.ask_price: float | None = None
         self.ask_size: float | None = None
+        self.day_high: float | None = None
+        self.day_low: float | None = None
         self.agent_log: list[dict] = []
         self.agent_running: bool = False
         self.agent_stop_event: "threading.Event | None" = None

@@ -67,6 +67,11 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                             last["v"] = new_v
                         else:
                             state.bars.append({**bar, "t": bucket})
+                with state.lock:
+                    if "h" in bar:
+                        state.day_high = max(state.day_high, bar["h"]) if state.day_high is not None else bar["h"]
+                    if "l" in bar:
+                        state.day_low = min(state.day_low, bar["l"]) if state.day_low is not None else bar["l"]
             elif t == "t" and msg.get("S") == symbol:
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
                 with state.lock:
@@ -138,6 +143,13 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
     with state.lock:
         if state.bars:
             state.prev_close = state.bars[-1].get("c")
+        if state.daily_bars:
+            today_bar = state.daily_bars[-1]
+            state.day_high = today_bar.get("h")
+            state.day_low = today_bar.get("l")
+        else:
+            state.day_high = None
+            state.day_low = None
         state.last_price = None
         state.bid_price = None
         state.bid_size = None
