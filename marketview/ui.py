@@ -48,7 +48,7 @@ from .historical import (
     fetch_market_indicators,
     fetch_static_analysis,
 )
-from .llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS
+from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS
 from .news import fetch_news_with_fallback, score_news_impacts
 from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
@@ -420,9 +420,26 @@ def _volume_alert_controls() -> None:
     state.volume_alert_multiplier = multiplier
 
 
+def _news_analysis_controls() -> None:
+    state = _get_state()
+    with st.expander("📰 News Analysis"):
+        provider = st.selectbox(
+            "Provider",
+            PROVIDERS,
+            index=PROVIDERS.index(state.news_llm_provider),
+            key="news_llm_provider_select",
+            help=f"Model used: {', '.join(f'{p}={m}' for p, m in DEFAULT_NEWS_MODELS.items())}",
+        )
+        state.news_llm_provider = provider
+        env_var = ENV_KEYS[provider]
+        if not os.getenv(env_var):
+            st.caption(f"⚠️ {env_var} is not set.")
+
+
 def _live_panel() -> None:
     _live_chart_controls()
     _volume_alert_controls()
+    _news_analysis_controls()
     _price_ticker()
     _chart_panel()
 
@@ -1052,11 +1069,11 @@ def build_ui() -> None:
                             state.trades.extend(historical_trades)
                         state.news = news
                         state.news_impacts = {}
-                        llm_provider = state.llm_provider
-                        llm_key = os.getenv(ENV_KEYS[llm_provider], "")
+                        news_llm_provider = state.news_llm_provider
+                        llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
                         if llm_key and news:
                             try:
-                                state.news_impacts = score_news_impacts(sym, news, llm_provider, llm_key)
+                                state.news_impacts = score_news_impacts(sym, news, news_llm_provider, llm_key)
                             except Exception as exc:
                                 state.status = f"News impact scoring failed: {exc}"
                         state.status = "Connecting WebSocket…"

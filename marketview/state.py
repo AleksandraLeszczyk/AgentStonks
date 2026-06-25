@@ -68,6 +68,7 @@ _DEFAULTS: dict[str, object] = {
     "llm_provider": "gemini",
     "llm_model": "",
     "llm_personality": "swing",
+    "news_llm_provider": "gemini",
     "options_chain": None,
     "options_wall_history": [],
     "options_status": "",
@@ -211,6 +212,7 @@ class AppState:
         self.llm_provider: str = "gemini"
         self.llm_model: str = ""
         self.llm_personality: str = "swing"
+        self.news_llm_provider: str = "gemini"
         self.options_chain: "dict | None" = None
         self.options_wall_history: list[dict] = []
         self.options_status: str = ""
