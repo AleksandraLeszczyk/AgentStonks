@@ -4,14 +4,13 @@ from types import SimpleNamespace
 
 from marketview.agent import (
     BREAKOUT_TOOLS,
+    MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
     _dispatch_tool,
-    _tool_analyze_consolidation,
     _tool_analyze_volume,
     _tool_breakout_trade_geometry,
     _tool_get_news,
     _tool_get_quote,
-    _tool_get_session_window,
     _wait_for_next_cycle,
     run_agent_cycle,
 )
@@ -88,34 +87,27 @@ class TestToolHandlers:
         result = _dispatch_tool("nonexistent", {}, state, tracker)
         assert "error" in result
 
-    def test_analyze_consolidation_with_no_bars_returns_note(self):
-        state = AppState()
-        assert "note" in _tool_analyze_consolidation(state)
-
-    def test_analyze_consolidation_reads_bars_from_state(self):
-        state = AppState()
-        for c in [90.0, 110.0] * 10:
-            state.bars.append({"o": c, "h": c + 10, "l": c - 10, "c": c, "v": 2000})
-        for c in [100.0] * 10:
-            state.bars.append({"o": c, "h": 100.5, "l": 99.5, "c": c, "v": 500})
-        result = _tool_analyze_consolidation(state, base_bars=10, prior_bars=20)
-        assert result["is_coiling"] is True
-
-    def test_get_session_window_uses_latest_bar_timestamp(self):
-        state = AppState()
-        state.bars.append({"o": 1, "h": 1, "l": 1, "c": 1, "v": 1, "t": "2024-07-15T13:35:00Z"})
-        result = _tool_get_session_window(state)
-        assert result["window"] == "opening_window"
-
     def test_breakout_trade_geometry_tool_computes_targets(self):
         state = AppState()
-        result = _tool_breakout_trade_geometry(state, entry=100.0, stop=98.0, base_height=4.0)
+        result = _tool_breakout_trade_geometry(state, entry=100.0, stop=98.0, atr=4.0)
         assert result["meets_min_reward_risk"] is True
 
     def test_breakout_personality_uses_breakout_tools(self):
         assert PERSONALITY_TOOLS["breakout"] is BREAKOUT_TOOLS
         names = {t["function"]["name"] for t in BREAKOUT_TOOLS}
-        assert {"analyze_consolidation", "get_session_window", "breakout_trade_geometry"} <= names
+        assert {"analyze_opening_range", "analyze_volume", "breakout_trade_geometry"} <= names
+        assert "analyze_daily_trend" not in names
+        assert "analyze_market" not in names
+        assert "get_put_call_walls" not in names
+
+    def test_momentum_personality_uses_momentum_tools(self):
+        assert PERSONALITY_TOOLS["momentum"] is MOMENTUM_TOOLS
+        names = {t["function"]["name"] for t in MOMENTUM_TOOLS}
+        assert {"analyze_intraday_momentum", "analyze_volume", "get_news", "get_quote"} <= names
+        assert "analyze_daily_trend" not in names
+        assert "analyze_market" not in names
+        assert "analyze_opening_range" not in names
+        assert "get_put_call_walls" not in names
 
 
 class TestRunAgentCycle:
