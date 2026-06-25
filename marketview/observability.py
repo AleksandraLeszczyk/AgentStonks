@@ -87,10 +87,16 @@ def observe(*, name: Optional[str] = None) -> Callable[[F], F]:
 
 
 def update_trace(**kwargs: Any) -> None:
-    """Attach name/metadata/input/output to the current trace, if any."""
+    """Attach name/metadata/input/output to the current trace, if any.
+
+    Langfuse v3 dropped ``update_current_trace`` in favor of updating the
+    current span/observation directly -- since :func:`observe` wraps the whole
+    agent cycle in one root span, updating "the current span" here is
+    equivalent to updating the trace.
+    """
     client = _client()
     if client is not None:
-        client.update_current_trace(**kwargs)
+        client.update_current_span(**kwargs)
 
 
 @contextmanager
