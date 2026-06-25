@@ -54,7 +54,7 @@ from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
-from .state import AppState
+from .state import AppState, current_volume_ratio
 from .stream import launch_stream, launch_stream_news
 from .technical_analysis import analyze_intraday, analyze_market, analyze_trend, get_put_call_walls_and_gamma
 
@@ -260,6 +260,33 @@ def _quote_html(
     )
 
 
+def _volume_alert_banner(state: AppState) -> None:
+    """Live relative-volume readout + a prominent banner once the alert fires."""
+    if not state.volume_alert_enabled:
+        return
+    with state.lock:
+        day_volume = state.day_volume
+        triggered = state.volume_alert_triggered
+        multiplier = state.volume_alert_multiplier
+    daily_bars = state.daily_bars
+    ratio, _ = current_volume_ratio(day_volume, daily_bars)
+    if ratio is None:
+        return
+    if triggered:
+        st.html(
+            f"<div style='background:{PALETTE['orange']};color:#1a1d27;"
+            "font-family:Inter,sans-serif;font-weight:600;border-radius:6px;"
+            "padding:8px 12px;margin:4px 0'>"
+            f"⚡ High volume: {ratio:.2f}× average daily volume "
+            f"(alert threshold {multiplier:.1f}×)</div>"
+        )
+    else:
+        st.caption(
+            f"📊 Relative volume: {ratio:.2f}× avg daily volume "
+            f"(alerts at {multiplier:.1f}×)"
+        )
+
+
 @st.fragment(run_every=POLL_SEC)
 def _price_ticker() -> None:
     state = _get_state()
@@ -279,6 +306,7 @@ def _price_ticker() -> None:
         )
         if html:
             st.html(html)
+        _volume_alert_banner(state)
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
@@ -365,8 +393,36 @@ def _live_chart_controls() -> None:
     state.mixture_max_components = max_components if fit_enabled else 0
 
 
+def _volume_alert_controls() -> None:
+    state = _get_state()
+    with st.expander("🔔 Volume Alert"):
+        st.caption(
+            "Alerts when today's cumulative volume exceeds a multiple of the "
+            "average daily volume (mean of the last 20 completed days; yesterday's "
+            "volume early on). Wakes the agent early when it fires. On by default."
+        )
+        c1, c2 = st.columns([1, 1.4])
+        enabled = c1.checkbox("Enabled", value=state.volume_alert_enabled, key="vol_alert_enabled")
+        multiplier = c2.number_input(
+            "× avg daily volume",
+            min_value=0.1,
+            value=float(state.volume_alert_multiplier),
+            step=0.1,
+            format="%.1f",
+            key="vol_alert_multiplier",
+        )
+    # Changing the threshold or re-enabling clears the one-shot latch so the
+    # alert can fire again under the new settings.
+    if enabled != state.volume_alert_enabled or multiplier != state.volume_alert_multiplier:
+        state.volume_alert_triggered = False
+        state.volume_alert_ratio = None
+    state.volume_alert_enabled = enabled
+    state.volume_alert_multiplier = multiplier
+
+
 def _live_panel() -> None:
     _live_chart_controls()
+    _volume_alert_controls()
     _price_ticker()
     _chart_panel()
 
@@ -813,7 +869,7 @@ def _agent_panel(symbol: str) -> None:
         "paper buy/sell/sleep calls on a fixed interval. Instead of sleeping blind, the agent "
         "can set a price alert (a low level, a high level, or both) to wake up early if the "
         "price crosses a level it's watching, "
-        "and it always wakes up early if fresh news breaks for the ticker. "
+        "and it always wakes up early if fresh news breaks or a high-volume alert fires for the ticker. "
         "No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )

@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from . import historical
+from . import observability as obs
 from . import technical_analysis as ta
 from .config import AGENT_MAX_TOOL_ITERS
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
@@ -416,6 +417,7 @@ def _preview(text: str, width: int = 200) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+@obs.observe(name="agent-cycle")
 def run_agent_cycle(
     client: Any,
     model: str,
@@ -424,7 +426,13 @@ def run_agent_cycle(
     tracker: "DecisionTracker",
     max_iters: int = AGENT_MAX_TOOL_ITERS,
 ) -> None:
-    """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision."""
+    """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision.
+
+    When Langfuse is configured, the whole cycle is one trace: every LLM turn
+    nests under it as a generation, so per-cycle latency, token usage, and cost
+    roll up automatically (see `marketview.observability`).
+    """
+    obs.update_trace(name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol})
     state.price_alerts = []
     messages: list[dict] = [
         {"role": "system", "content": AGENT_SYSTEM_PROMPT},
@@ -550,6 +558,9 @@ def run_agent_cycle(
                     }
                 )
                 decision_made = True
+                obs.update_trace(
+                    output={"action": decision.action, "regime": regime, "reasoning": reasoning}
+                )
             else:
                 result = _dispatch_tool(name, args, state, tracker)
                 result_content = json.dumps(result)
@@ -564,6 +575,7 @@ def run_agent_cycle(
         forced = tracker.record_sleep(
             symbol, "Max reasoning iterations reached without a finalized decision; defaulting to sleep."
         )
+        obs.update_trace(output={"action": forced.action, "regime": "unknown", "reasoning": forced.reasoning})
         _log(
             state,
             {
@@ -673,3 +685,6 @@ def stop_agent(state: "AppState") -> None:
     # Interrupt a blocked _wait_for_next_cycle immediately instead of letting
     # it sit until the timeout expires.
     state.agent_wake_event.set()
+    # Push any buffered traces from the cycle(s) that just ran to Langfuse
+    # before the background flusher would otherwise get to them.
+    obs.flush()

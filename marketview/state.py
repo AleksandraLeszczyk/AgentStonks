@@ -1,15 +1,20 @@
 import threading
 from collections import deque
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     import websocket
 
     from .decisions import DecisionTracker
 
-from .config import MAX_BARS, PAPER_STARTING_CASH
+from .config import (
+    MAX_BARS,
+    PAPER_STARTING_CASH,
+    VOLUME_ADV_MIN_DAYS,
+    VOLUME_ADV_WINDOW,
+    VOLUME_ALERT_DEFAULT_MULTIPLIER,
+)
 
 _DEFAULTS: dict[str, object] = {
     "bars": None,  # handled specially
@@ -44,6 +49,11 @@ _DEFAULTS: dict[str, object] = {
     "ask_size": None,
     "day_high": None,
     "day_low": None,
+    "day_volume": None,
+    "volume_alert_enabled": True,
+    "volume_alert_multiplier": VOLUME_ALERT_DEFAULT_MULTIPLIER,
+    "volume_alert_triggered": False,
+    "volume_alert_ratio": None,
     "agent_log": [],
     "agent_running": False,
     "agent_stop_event": None,
@@ -73,6 +83,77 @@ def alert_triggered(price: float, alert: dict) -> bool:
     if condition == "below":
         return price <= target
     return False
+
+
+def _daily_bar_date(bar: dict) -> str:
+    """Trading-day date (YYYY-MM-DD) of an Alpaca daily bar."""
+    return str(bar.get("t", ""))[:10]
+
+
+def _today_iso(today: "str | None" = None) -> str:
+    return today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def completed_daily_bars(daily_bars: list[dict], today: "str | None" = None) -> list[dict]:
+    """Daily bars strictly before today -- excludes today's still-forming bar."""
+    cutoff = _today_iso(today)
+    return [b for b in daily_bars if _daily_bar_date(b) and _daily_bar_date(b) < cutoff]
+
+
+def today_daily_volume(daily_bars: list[dict], today: "str | None" = None) -> float:
+    """Volume already printed on today's (partial) daily bar, or 0 if none yet.
+
+    Used to seed today's running volume when the stream starts mid-session, so
+    the alert sees the full day's accumulation rather than only bars that arrive
+    after connection.
+    """
+    cutoff = _today_iso(today)
+    for bar in reversed(daily_bars):
+        if _daily_bar_date(bar) == cutoff:
+            return float(bar.get("v") or 0.0)
+    return 0.0
+
+
+def average_daily_volume(
+    daily_bars: list[dict],
+    window: int = VOLUME_ADV_WINDOW,
+    min_days: int = VOLUME_ADV_MIN_DAYS,
+    today: "str | None" = None,
+) -> "float | None":
+    """Baseline daily volume for the high-volume alert.
+
+    Normally the mean of the last `window` completed daily volumes. When fewer
+    than `min_days` completed days are available (thin history / early session),
+    fall back to yesterday's single-day volume. Returns None when no completed
+    day with volume is available at all.
+    """
+    vols = [
+        float(bar.get("v") or 0.0)
+        for bar in completed_daily_bars(daily_bars, today)
+    ]
+    vols = [v for v in vols if v > 0]
+    if not vols:
+        return None
+    if len(vols) < min_days:
+        return vols[-1]  # yesterday's volume
+    recent = vols[-window:]
+    return sum(recent) / len(recent)
+
+
+def current_volume_ratio(
+    day_volume: "float | None",
+    daily_bars: list[dict],
+    today: "str | None" = None,
+) -> "tuple[float | None, float | None]":
+    """(ratio, baseline) of today's cumulative volume vs the ADV baseline.
+
+    `ratio` is None when there isn't enough data (no baseline, or no volume
+    accumulated yet) to compute it.
+    """
+    baseline = average_daily_volume(daily_bars, today=today)
+    if not baseline or day_volume is None:
+        return None, baseline
+    return day_volume / baseline, baseline
 
 
 class AppState:
@@ -110,6 +191,11 @@ class AppState:
         self.ask_size: float | None = None
         self.day_high: float | None = None
         self.day_low: float | None = None
+        self.day_volume: float | None = None
+        self.volume_alert_enabled: bool = True
+        self.volume_alert_multiplier: float = VOLUME_ALERT_DEFAULT_MULTIPLIER
+        self.volume_alert_triggered: bool = False
+        self.volume_alert_ratio: float | None = None
         self.agent_log: list[dict] = []
         self.agent_running: bool = False
         self.agent_stop_event: "threading.Event | None" = None

@@ -16,6 +16,7 @@ import pandas as pd
 import requests
 from pydantic import BaseModel, field_validator
 
+from . import observability as obs
 from .llm import DEFAULT_NEWS_MODELS, parse_structured
 from .rest import fetch_news as _fetch_alpaca_news
 
@@ -265,6 +266,7 @@ Impact labels:
 """
 
 
+@obs.observe(name="score-news-impacts")
 def score_news_impacts(
     symbol: str, news_items: list[dict], provider: str, api_key: str
 ) -> dict[str, str]:

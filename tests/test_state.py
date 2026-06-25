@@ -1,7 +1,17 @@
 import threading
 
-from marketview.config import MAX_BARS, PAPER_STARTING_CASH
-from marketview.state import AppState
+from marketview.config import MAX_BARS, PAPER_STARTING_CASH, VOLUME_ALERT_DEFAULT_MULTIPLIER
+from marketview.state import (
+    AppState,
+    average_daily_volume,
+    completed_daily_bars,
+    current_volume_ratio,
+    today_daily_volume,
+)
+
+
+def _daily(date: str, volume: float) -> dict:
+    return {"t": f"{date}T04:00:00Z", "v": volume}
 
 
 def test_initial_values():
@@ -46,3 +56,62 @@ def test_lock_is_reentrant_from_multiple_threads():
 
     assert not errors
     assert len(s.bars) == 50
+
+
+def test_volume_alert_defaults_on():
+    s = AppState()
+    assert s.volume_alert_enabled is True
+    assert s.volume_alert_multiplier == VOLUME_ALERT_DEFAULT_MULTIPLIER
+    assert s.volume_alert_triggered is False
+    assert s.day_volume is None
+
+
+def test_completed_daily_bars_excludes_today():
+    bars = [_daily("2026-06-23", 100), _daily("2026-06-24", 200), _daily("2026-06-25", 50)]
+    completed = completed_daily_bars(bars, today="2026-06-25")
+    assert [b["v"] for b in completed] == [100, 200]
+
+
+def test_today_daily_volume_uses_today_partial_bar():
+    bars = [_daily("2026-06-24", 200), _daily("2026-06-25", 50)]
+    assert today_daily_volume(bars, today="2026-06-25") == 50
+    # Latest bar isn't today (e.g. weekend / pre-open) -> nothing accumulated yet.
+    assert today_daily_volume([_daily("2026-06-24", 200)], today="2026-06-25") == 0.0
+
+
+def test_average_daily_volume_means_completed_days():
+    bars = [_daily(f"2026-05-{d:02d}", 100 * d) for d in range(1, 11)]  # 10 completed days
+    bars.append(_daily("2026-06-25", 999))  # today's partial bar, excluded
+    avg = average_daily_volume(bars, window=20, min_days=5, today="2026-06-25")
+    expected = sum(100 * d for d in range(1, 11)) / 10
+    assert avg == expected
+
+
+def test_average_daily_volume_window_caps_history():
+    bars = [_daily(f"2026-04-{d:02d}", d) for d in range(1, 26)]  # 25 completed days, vols 1..25
+    avg = average_daily_volume(bars, window=20, min_days=5, today="2026-06-25")
+    # Only the last 20 days (vols 6..25) count.
+    assert avg == sum(range(6, 26)) / 20
+
+
+def test_average_daily_volume_early_session_falls_back_to_yesterday():
+    bars = [_daily("2026-06-23", 100), _daily("2026-06-24", 300)]  # only 2 completed days
+    avg = average_daily_volume(bars, window=20, min_days=5, today="2026-06-25")
+    assert avg == 300  # yesterday's single-day volume
+
+
+def test_average_daily_volume_none_without_history():
+    assert average_daily_volume([_daily("2026-06-25", 50)], today="2026-06-25") is None
+
+
+def test_current_volume_ratio():
+    bars = [_daily(f"2026-05-{d:02d}", 1000) for d in range(1, 8)]  # ADV = 1000
+    ratio, baseline = current_volume_ratio(1700, bars, today="2026-06-25")
+    assert baseline == 1000
+    assert ratio == 1.7
+
+
+def test_current_volume_ratio_none_without_volume_or_baseline():
+    bars = [_daily(f"2026-05-{d:02d}", 1000) for d in range(1, 8)]
+    assert current_volume_ratio(None, bars, today="2026-06-25")[0] is None
+    assert current_volume_ratio(500, [], today="2026-06-25")[0] is None

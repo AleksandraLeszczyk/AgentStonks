@@ -7,7 +7,7 @@ from typing import Any
 import websocket
 
 from .config import BARS_STREAM_URL, NEWS_STREAM_URL
-from .state import AppState, alert_triggered
+from .state import AppState, alert_triggered, current_volume_ratio, today_daily_volume
 
 
 _TF_MINUTES: dict[str, int] = {
@@ -72,6 +72,28 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                         state.day_high = max(state.day_high, bar["h"]) if state.day_high is not None else bar["h"]
                     if "l" in bar:
                         state.day_low = min(state.day_low, bar["l"]) if state.day_low is not None else bar["l"]
+                    if "v" in bar:
+                        state.day_volume = (state.day_volume or 0.0) + float(bar["v"])
+                    day_volume = state.day_volume
+                    vol_enabled = state.volume_alert_enabled
+                    vol_multiplier = state.volume_alert_multiplier
+                    vol_triggered = state.volume_alert_triggered
+                    daily_bars = state.daily_bars
+
+                # High-volume alert: today's cumulative volume crossing
+                # multiplier x average daily volume. Latched (vol_triggered) so
+                # it fires once per session rather than on every later bar.
+                if vol_enabled and not vol_triggered and day_volume is not None:
+                    ratio, baseline = current_volume_ratio(day_volume, daily_bars)
+                    if ratio is not None and ratio >= vol_multiplier:
+                        state.volume_alert_triggered = True
+                        state.volume_alert_ratio = ratio
+                        state.agent_wake_reason = (
+                            f"High-volume alert: today's volume {day_volume:,.0f} is "
+                            f"{ratio:.2f}x average daily volume ({baseline:,.0f}), above "
+                            f"the {vol_multiplier:.2f}x threshold."
+                        )
+                        state.agent_wake_event.set()
             elif t == "t" and msg.get("S") == symbol:
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
                 with state.lock:
@@ -150,6 +172,12 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         else:
             state.day_high = None
             state.day_low = None
+        # Seed today's running volume from today's partial daily bar (0 if the
+        # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
+        # one-shot alert latch for the new session.
+        state.day_volume = today_daily_volume(state.daily_bars)
+        state.volume_alert_triggered = False
+        state.volume_alert_ratio = None
         state.last_price = None
         state.bid_price = None
         state.bid_size = None

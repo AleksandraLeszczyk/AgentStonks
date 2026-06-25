@@ -16,6 +16,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
+from . import observability as obs
+
 PROVIDERS: tuple[str, ...] = ("gemini", "openai", "anthropic")
 
 DEFAULT_AGENT_MODELS: dict[str, str] = {
@@ -107,20 +109,29 @@ class _AnthropicCompletions:
         if anthropic_tools:
             kwargs["tools"] = anthropic_tools
 
-        response = self._client.messages.create(**kwargs)
+        with obs.anthropic_generation(
+            name="anthropic-messages", model=model, input=anthropic_messages
+        ) as generation:
+            response = self._client.messages.create(**kwargs)
 
-        content_text: Optional[str] = None
-        tool_calls: list[SimpleNamespace] = []
-        for block in response.content:
-            if block.type == "text":
-                content_text = (content_text or "") + block.text
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    SimpleNamespace(
-                        id=block.id,
-                        function=SimpleNamespace(name=block.name, arguments=json.dumps(block.input)),
+            content_text: Optional[str] = None
+            tool_calls: list[SimpleNamespace] = []
+            for block in response.content:
+                if block.type == "text":
+                    content_text = (content_text or "") + block.text
+                elif block.type == "tool_use":
+                    tool_calls.append(
+                        SimpleNamespace(
+                            id=block.id,
+                            function=SimpleNamespace(name=block.name, arguments=json.dumps(block.input)),
+                        )
                     )
-                )
+
+            obs.record_anthropic_usage(
+                generation,
+                response,
+                {"content": content_text, "tool_calls": [tc.function.name for tc in tool_calls]},
+            )
 
         message = SimpleNamespace(content=content_text, tool_calls=tool_calls or None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
@@ -139,12 +150,10 @@ class AnthropicChatClient:
 def get_agent_client(provider: str, api_key: str) -> Any:
     """Return a chat client exposing `.chat.completions.create(...)` for the given provider."""
     if provider == "gemini":
-        from openai import OpenAI
-
+        OpenAI = obs.import_openai_class()
         return OpenAI(api_key=api_key, base_url=_GEMINI_BASE_URL)
     if provider == "openai":
-        from openai import OpenAI
-
+        OpenAI = obs.import_openai_class()
         return OpenAI(api_key=api_key)
     if provider == "anthropic":
         return AnthropicChatClient(api_key)
@@ -161,8 +170,7 @@ def parse_structured(
 ) -> Optional[BaseModel]:
     """Get a structured (schema-validated) response from any of the three providers."""
     if provider in ("gemini", "openai"):
-        from openai import OpenAI
-
+        OpenAI = obs.import_openai_class()
         base_url = _GEMINI_BASE_URL if provider == "gemini" else None
         client = OpenAI(api_key=api_key, base_url=base_url)
         completion = client.chat.completions.parse(
@@ -177,23 +185,31 @@ def parse_structured(
 
         client = anthropic.Anthropic(api_key=api_key)
         tool_name = "emit_result"
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            tools=[
-                {
-                    "name": tool_name,
-                    "description": "Emit the structured result.",
-                    "input_schema": response_model.model_json_schema(),
-                }
-            ],
-            tool_choice={"type": "tool", "name": tool_name},
-        )
-        for block in response.content:
-            if block.type == "tool_use":
-                return response_model.model_validate(block.input)
-        return None
+        with obs.anthropic_generation(
+            name="anthropic-structured", model=model, input=user
+        ) as generation:
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                tools=[
+                    {
+                        "name": tool_name,
+                        "description": "Emit the structured result.",
+                        "input_schema": response_model.model_json_schema(),
+                    }
+                ],
+                tool_choice={"type": "tool", "name": tool_name},
+            )
+            result = None
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = response_model.model_validate(block.input)
+                    break
+            obs.record_anthropic_usage(
+                generation, response, result.model_dump() if result is not None else None
+            )
+            return result
 
     raise ValueError(f"Unknown LLM provider: {provider!r}")

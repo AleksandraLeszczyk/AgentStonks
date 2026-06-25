@@ -11,6 +11,15 @@ OPTIONS_WALL_HISTORY_MAXLEN = 200
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]
 FEEDS = ["iex", "sip"]
 
+# High-volume alert: trigger when today's cumulative volume exceeds
+# VOLUME_ALERT_DEFAULT_MULTIPLIER x the average daily volume. The baseline is
+# the mean of the last VOLUME_ADV_WINDOW completed daily volumes; with fewer
+# than VOLUME_ADV_MIN_DAYS completed days (thin history / early session), it
+# falls back to yesterday's single-day volume.
+VOLUME_ALERT_DEFAULT_MULTIPLIER = 1.5
+VOLUME_ADV_WINDOW = 20
+VOLUME_ADV_MIN_DAYS = 5
+
 # Trading agent
 AGENT_CYCLE_SEC = 60
 AGENT_LOG_POLL_SEC = 4

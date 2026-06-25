@@ -19,3 +19,7 @@ openai>=1.0.0
 anthropic>=0.34.0
 worldnewsapi>=2.0.0
 pydantic>=2.0.0
+
+# Optional — LLM observability (marketview/observability.py). No-op unless
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (and optionally LANGFUSE_HOST) are set.
+langfuse>=3.0.0
