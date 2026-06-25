@@ -1,14 +1,17 @@
 import pandas as pd
 
 from marketview.technical_analysis import (
+    analyze_consolidation,
     analyze_intraday,
     analyze_market,
     analyze_trend,
     analyze_volume,
     atr,
+    breakout_trade_geometry,
     get_put_call_walls_and_gamma,
     obv_trend,
     rsi,
+    session_time_window,
     sma,
     support_resistance,
 )
@@ -255,3 +258,103 @@ class TestGetPutCallWallsAndGamma:
         )
         assert result["call_wall_trend"] == "rising"
         assert any("rising" in i for i in result["insights"])
+
+
+class TestAnalyzeConsolidation:
+    def test_not_enough_bars_returns_note(self):
+        bars = _make_bars([100.0, 101.0])
+        assert "note" in analyze_consolidation(bars)
+
+    def test_contracting_range_and_declining_volume_reads_as_coiling(self):
+        prior_closes = [90.0, 110.0] * 10  # wide swings -> wide prior range
+        prior_bars = _make_bars(prior_closes, highs=[c + 10 for c in prior_closes], lows=[c - 10 for c in prior_closes], volumes=[2000] * 20)
+        base_closes = [100.0] * 10  # tight range
+        base_bars = _make_bars(base_closes, highs=[100.5] * 10, lows=[99.5] * 10, volumes=[500] * 10)
+        result = analyze_consolidation(prior_bars + base_bars, base_bars=10, prior_bars=20)
+
+        assert result["base_high"] == 100.5
+        assert result["base_low"] == 99.5
+        assert result["base_height"] == 1.0
+        assert result["range_contraction_pct"] > 10
+        assert result["volume_trend_in_base"] == "declining"
+        assert result["is_coiling"] is True
+
+    def test_expanding_range_is_not_coiling(self):
+        prior_closes = [100.0] * 20
+        prior_bars = _make_bars(prior_closes, highs=[100.5] * 20, lows=[99.5] * 20, volumes=[500] * 20)
+        base_closes = [90.0, 110.0] * 5
+        base_bars = _make_bars(base_closes, highs=[c + 10 for c in base_closes], lows=[c - 10 for c in base_closes], volumes=[2000] * 10)
+        result = analyze_consolidation(prior_bars + base_bars, base_bars=10, prior_bars=20)
+
+        assert result["is_coiling"] is False
+
+    def test_counts_touches_at_resistance_and_support(self):
+        prior_bars = _make_bars([100.0] * 20, volumes=[1000] * 20)
+        highs = [100.5, 99.0, 100.5, 99.0, 100.5, 99.0, 99.0, 99.0, 99.0, 99.0]
+        lows = [99.5, 98.5, 99.5, 98.5, 99.5, 98.5, 98.5, 98.5, 98.5, 98.5]
+        base_bars = _make_bars([99.0] * 10, highs=highs, lows=lows, volumes=[1000] * 10)
+        result = analyze_consolidation(prior_bars + base_bars, base_bars=10, prior_bars=20)
+
+        assert result["touches_at_resistance"] == 3
+        assert result["well_tested"] is True
+
+
+class TestSessionTimeWindow:
+    def test_opening_window_is_favorable(self):
+        result = session_time_window("2024-07-15T13:35:00Z")  # 09:35 ET (EDT, UTC-4)
+        assert result["window"] == "opening_window"
+        assert result["favorable_for_breakouts"] is True
+
+    def test_midday_dead_zone_is_unfavorable(self):
+        result = session_time_window("2024-07-15T17:30:00Z")  # 13:30 ET
+        assert result["window"] == "midday_dead_zone"
+        assert result["favorable_for_breakouts"] is False
+
+    def test_power_hour_is_favorable(self):
+        result = session_time_window("2024-07-15T19:45:00Z")  # 15:45 ET
+        assert result["window"] == "power_hour"
+        assert result["favorable_for_breakouts"] is True
+
+    def test_outside_regular_hours_is_unfavorable(self):
+        result = session_time_window("2024-07-15T03:00:00Z")  # 23:00 ET prior day
+        assert result["window"] == "outside_regular_hours"
+        assert result["favorable_for_breakouts"] is False
+
+    def test_falls_back_to_now_when_no_timestamp_given(self):
+        result = session_time_window(None)
+        assert "et_time" in result
+        assert "window" in result
+
+
+class TestBreakoutTradeGeometry:
+    def test_non_positive_entry_or_stop_returns_note(self):
+        assert "note" in breakout_trade_geometry(entry=0, stop=10)
+
+    def test_stop_above_entry_returns_note(self):
+        assert "note" in breakout_trade_geometry(entry=100.0, stop=105.0)
+
+    def test_base_height_target_meets_min_reward_risk(self):
+        result = breakout_trade_geometry(entry=100.0, stop=98.0, base_height=4.0)
+        assert result["risk_per_share"] == 2.0
+        assert result["target1_base_height"] == 104.0
+        assert result["rr1_base_height"] == 2.0
+        assert result["target2_base_height"] == 108.0
+        assert result["rr2_base_height"] == 4.0
+        assert result["meets_min_reward_risk"] is True
+
+    def test_wide_stop_fails_min_reward_risk(self):
+        result = breakout_trade_geometry(entry=100.0, stop=90.0, base_height=5.0)
+        assert result["best_reward_risk_ratio"] == 1.0
+        assert result["meets_min_reward_risk"] is False
+
+    def test_atr_target_computed_alongside_base_height(self):
+        result = breakout_trade_geometry(entry=100.0, stop=99.0, base_height=2.0, atr=1.0)
+        assert result["target1_atr"] == 101.0
+        assert result["rr1_atr"] == 1.0
+        assert result["target2_atr"] == 102.0
+
+    def test_no_target_inputs_returns_no_targets(self):
+        result = breakout_trade_geometry(entry=100.0, stop=99.0)
+        assert result["best_reward_risk_ratio"] is None
+        assert result["meets_min_reward_risk"] is False
+        assert "cannot project a target" in result["summary"]

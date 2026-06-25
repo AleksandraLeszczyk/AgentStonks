@@ -3,10 +3,15 @@ import threading
 from types import SimpleNamespace
 
 from marketview.agent import (
+    BREAKOUT_TOOLS,
+    PERSONALITY_TOOLS,
     _dispatch_tool,
+    _tool_analyze_consolidation,
     _tool_analyze_volume,
+    _tool_breakout_trade_geometry,
     _tool_get_news,
     _tool_get_quote,
+    _tool_get_session_window,
     _wait_for_next_cycle,
     run_agent_cycle,
 )
@@ -41,11 +46,13 @@ class FakeClient:
     def __init__(self, responses: list):
         self._responses = list(responses)
         self.calls: list = []
+        self.tools_seen: list = []
         outer = self
 
         class _Completions:
             def create(self, model, messages, tools, tool_choice):
                 outer.calls.append(messages)
+                outer.tools_seen.append(tools)
                 return outer._responses.pop(0)
 
         class _Chat:
@@ -80,6 +87,35 @@ class TestToolHandlers:
         tracker = DecisionTracker()
         result = _dispatch_tool("nonexistent", {}, state, tracker)
         assert "error" in result
+
+    def test_analyze_consolidation_with_no_bars_returns_note(self):
+        state = AppState()
+        assert "note" in _tool_analyze_consolidation(state)
+
+    def test_analyze_consolidation_reads_bars_from_state(self):
+        state = AppState()
+        for c in [90.0, 110.0] * 10:
+            state.bars.append({"o": c, "h": c + 10, "l": c - 10, "c": c, "v": 2000})
+        for c in [100.0] * 10:
+            state.bars.append({"o": c, "h": 100.5, "l": 99.5, "c": c, "v": 500})
+        result = _tool_analyze_consolidation(state, base_bars=10, prior_bars=20)
+        assert result["is_coiling"] is True
+
+    def test_get_session_window_uses_latest_bar_timestamp(self):
+        state = AppState()
+        state.bars.append({"o": 1, "h": 1, "l": 1, "c": 1, "v": 1, "t": "2024-07-15T13:35:00Z"})
+        result = _tool_get_session_window(state)
+        assert result["window"] == "opening_window"
+
+    def test_breakout_trade_geometry_tool_computes_targets(self):
+        state = AppState()
+        result = _tool_breakout_trade_geometry(state, entry=100.0, stop=98.0, base_height=4.0)
+        assert result["meets_min_reward_risk"] is True
+
+    def test_breakout_personality_uses_breakout_tools(self):
+        assert PERSONALITY_TOOLS["breakout"] is BREAKOUT_TOOLS
+        names = {t["function"]["name"] for t in BREAKOUT_TOOLS}
+        assert {"analyze_consolidation", "get_session_window", "breakout_trade_geometry"} <= names
 
 
 class TestRunAgentCycle:
@@ -117,6 +153,24 @@ class TestRunAgentCycle:
             log_types = [e["type"] for e in state.agent_log]
         assert "tool_call" in log_types
         assert "decision" in log_types
+
+    def test_breakout_personality_passes_breakout_tools_to_client(self):
+        state = AppState()
+        state.symbol = "AAPL"
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(
+                tool_calls=[_tool_call("c1", "submit_decision", {"action": "sleep", "reasoning": "no setup yet"})]
+            )
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3, personality="breakout")
+
+        assert client.tools_seen[0] is BREAKOUT_TOOLS
 
     def test_forces_sleep_when_max_iters_reached_without_decision(self):
         state = AppState()

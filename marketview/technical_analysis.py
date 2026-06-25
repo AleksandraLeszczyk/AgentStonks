@@ -11,7 +11,12 @@ reason over directly.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import pandas as pd
+
+_ET = ZoneInfo("America/New_York")
 
 
 def _closes(bars: list[dict]) -> pd.Series:
@@ -685,5 +690,196 @@ def analyze_volume(bars: list[dict]) -> dict:
         "obv_trend": flow_trend,
         "price_pct_change_10bar": round(price_pct_change, 2),
         "confirmation": confirmation,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def analyze_consolidation(bars: list[dict], base_bars: int = 10, prior_bars: int = 20) -> dict:
+    """Tight-base / coiling read for breakout setups.
+
+    Splits the window into the candidate base (the most recent `base_bars`)
+    and the window before it, then checks the three things a breakout trader
+    wants before a level break is worth trusting: the base's range has
+    contracted vs what came before, volume inside the base is declining (not
+    rising), and the base's high/low have been tested more than once (more
+    touches = more energy coiled under the level). `base_height` (the base's
+    high minus low) is returned for projecting targets after a breakout.
+    """
+    if len(bars) < base_bars + 5:
+        return {"note": "not enough bars to assess a base/consolidation"}
+
+    base = bars[-base_bars:]
+    prior_window = (
+        bars[-(base_bars + prior_bars) : -base_bars] if len(bars) >= base_bars + prior_bars else bars[: -base_bars]
+    )
+
+    base_high = max(b["h"] for b in base)
+    base_low = min(b["l"] for b in base)
+    base_height = base_high - base_low
+    last_price = float(base[-1]["c"])
+    base_height_pct = (base_height / last_price * 100) if last_price else 0.0
+
+    prior_high = max(b["h"] for b in prior_window) if prior_window else base_high
+    prior_low = min(b["l"] for b in prior_window) if prior_window else base_low
+    prior_range = prior_high - prior_low
+    range_contraction_pct = ((prior_range - base_height) / prior_range * 100) if prior_range else 0.0
+
+    base_avg_volume = sum(b.get("v", 0) for b in base) / len(base)
+    prior_avg_volume = sum(b.get("v", 0) for b in prior_window) / len(prior_window) if prior_window else base_avg_volume
+    if prior_avg_volume:
+        if base_avg_volume < prior_avg_volume * 0.9:
+            volume_trend_in_base = "declining"
+        elif base_avg_volume > prior_avg_volume * 1.1:
+            volume_trend_in_base = "rising"
+        else:
+            volume_trend_in_base = "flat"
+    else:
+        volume_trend_in_base = "unknown"
+
+    touch_tolerance = max(base_height * 0.15, last_price * 0.001) if base_height else last_price * 0.001
+    touches_at_resistance = sum(1 for b in base if base_high - b["h"] <= touch_tolerance)
+    touches_at_support = sum(1 for b in base if b["l"] - base_low <= touch_tolerance)
+    well_tested = touches_at_resistance >= 2 or touches_at_support >= 2
+
+    is_coiling = range_contraction_pct > 10 and volume_trend_in_base in ("declining", "flat")
+
+    summary_parts = [
+        f"Base over the last {len(base)} bars: {base_low:.2f}-{base_high:.2f} "
+        f"(height {base_height:.2f}, {base_height_pct:.1f}% of price)."
+    ]
+    summary_parts.append(
+        f"Range has {'contracted' if range_contraction_pct > 0 else 'expanded'} "
+        f"{abs(range_contraction_pct):.0f}% vs the prior {len(prior_window)} bars, "
+        f"with {volume_trend_in_base} volume inside the base."
+    )
+    summary_parts.append(
+        f"Resistance tested {touches_at_resistance}x, support tested {touches_at_support}x "
+        f"({'well-tested level' if well_tested else 'not yet well-tested'})."
+    )
+    if is_coiling:
+        summary_parts.append("This reads as a genuine tight base/coil -- a break of either edge carries weight.")
+    else:
+        summary_parts.append("This does not yet read as a tight, coiling base -- be skeptical of a break either way.")
+
+    return {
+        "base_bars": len(base),
+        "base_high": round(base_high, 4),
+        "base_low": round(base_low, 4),
+        "base_height": round(base_height, 4),
+        "base_height_pct": round(base_height_pct, 2),
+        "range_contraction_pct": round(range_contraction_pct, 1),
+        "volume_trend_in_base": volume_trend_in_base,
+        "touches_at_resistance": touches_at_resistance,
+        "touches_at_support": touches_at_support,
+        "well_tested": well_tested,
+        "is_coiling": is_coiling,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def session_time_window(latest_bar_ts: "str | None" = None) -> dict:
+    """Classify the current point in the trading day for breakout timing discipline.
+
+    Breakouts in the first 90 minutes or the final hour of the regular session
+    are historically the most reliable; the 12:00-14:00 ET stretch is a
+    notorious fakeout zone. Uses the timestamp of the latest bar (Alpaca bars
+    are UTC ISO strings) when given, otherwise the current time.
+    """
+    if latest_bar_ts:
+        try:
+            dt = datetime.fromisoformat(latest_bar_ts.replace("Z", "+00:00"))
+        except ValueError:
+            dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    et = dt.astimezone(_ET)
+    minutes = et.hour * 60 + et.minute
+
+    open_ = 9 * 60 + 30
+    morning_end = 11 * 60
+    dead_start = 12 * 60
+    dead_end = 14 * 60
+    power_hour_start = 15 * 60
+    close_ = 16 * 60
+
+    if minutes < open_ or minutes >= close_:
+        window, favorable = "outside_regular_hours", False
+        note = "Outside the 9:30-16:00 ET regular session."
+    elif minutes < morning_end:
+        window, favorable = "opening_window", True
+        note = "First 90 minutes of the session -- historically the most reliable window for breakouts."
+    elif dead_start <= minutes < dead_end:
+        window, favorable = "midday_dead_zone", False
+        note = "12:00-14:00 ET dead zone -- breakouts here are notoriously prone to fakeouts; demand stronger confirmation or stand aside."
+    elif minutes >= power_hour_start:
+        window, favorable = "power_hour", True
+        note = "Final hour of the session -- a favorable window for breakouts."
+    else:
+        window, favorable = "other_session_hours", True
+        note = "Mid-morning/early-afternoon -- acceptable but not the highest-conviction window."
+
+    return {
+        "et_time": et.strftime("%H:%M"),
+        "window": window,
+        "favorable_for_breakouts": favorable,
+        "summary": f"{et.strftime('%H:%M')} ET -- {window.replace('_', ' ')}. {note}",
+    }
+
+
+def breakout_trade_geometry(
+    entry: float, stop: float, base_height: "float | None" = None, atr: "float | None" = None
+) -> dict:
+    """Mechanical entry/stop/target math for a long breakout trade.
+
+    Projects targets by adding 1x and 2x the base height (the classic
+    "measured move") and/or 1x and 2x ATR above entry, then expresses each as
+    a reward-to-risk multiple of the entry-to-stop distance. `meets_min_reward_risk`
+    flags whether the best available target clears the 2:1 minimum breakout
+    traders require before taking the trade.
+    """
+    if entry <= 0 or stop <= 0:
+        return {"note": "entry and stop must be positive prices"}
+    risk_per_share = entry - stop
+    if risk_per_share <= 0:
+        return {"note": "stop must be below entry for a long breakout setup"}
+
+    targets: dict[str, float] = {}
+    if base_height is not None and base_height > 0:
+        targets["target1_base_height"] = round(entry + base_height, 4)
+        targets["target2_base_height"] = round(entry + 2 * base_height, 4)
+    if atr is not None and atr > 0:
+        targets["target1_atr"] = round(entry + atr, 4)
+        targets["target2_atr"] = round(entry + 2 * atr, 4)
+
+    reward_risk: dict[str, float] = {}
+    for key, target in targets.items():
+        reward = target - entry
+        reward_risk[key.replace("target", "rr")] = round(reward / risk_per_share, 2)
+
+    best_rr = max(reward_risk.values()) if reward_risk else None
+    meets_min_rr = best_rr is not None and best_rr >= 2.0
+
+    summary_parts = [f"Risk per share {risk_per_share:.2f} (entry {entry:.2f}, stop {stop:.2f})."]
+    if targets:
+        labelled = ", ".join(
+            f"{k}={v:.2f} (R:R {reward_risk[k.replace('target', 'rr')]:.1f})" for k, v in targets.items()
+        )
+        summary_parts.append(labelled + ".")
+        summary_parts.append(
+            "Meets the 2:1 minimum reward-to-risk."
+            if meets_min_rr
+            else "Does NOT meet the 2:1 minimum reward-to-risk -- skip, or wait for a tighter stop/better entry."
+        )
+    else:
+        summary_parts.append("No base_height or atr given -- cannot project a target.")
+
+    return {
+        "risk_per_share": round(risk_per_share, 4),
+        **targets,
+        **reward_risk,
+        "best_reward_risk_ratio": best_rr,
+        "meets_min_reward_risk": meets_min_rr,
         "summary": " ".join(summary_parts),
     }

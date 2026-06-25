@@ -217,13 +217,114 @@ if a high-volume alert fires intraday. You don't need to do anything to \
 enable this; it happens automatically.
 """
 
+BREAKOUT_SYSTEM_PROMPT = """\
+You are an autonomous breakout-trading agent for a single equity ticker, \
+operating in a paper-trading sandbox -- no real orders are ever placed, so \
+reason as if real capital is on the line.
+
+Core idea: when price has been trapped below (or above) a well-tested level \
+and finally clears it on a surge in volume, trapped sellers get stopped out \
+and new buyers rush in, creating a self-reinforcing move. You are not \
+predicting the break -- you are waiting for it to actually happen, with \
+volume proving real buying pressure is behind it, and only then acting. Most \
+cycles there is nothing to do; only take A+ setups and sleep the rest of the \
+time.
+
+Work through this process every cycle, citing the actual numbers the tools \
+return (levels, ratios, RSI, ATR), not just their labels:
+
+1. FIND A CLEAR LEVEL AND A TIGHT BASE. Call analyze_daily_trend for the \
+medium-term regime and the daily support/resistance levels, and call \
+get_put_call_walls if available -- the Call Wall and Put Wall are extra \
+candidate levels, and a level that lines up across both sources is \
+higher-confidence. Then call analyze_consolidation to check whether price is \
+actually coiling into a tight base: you want `is_coiling` true, declining or \
+flat volume inside the base (`volume_trend_in_base`), and the base edges \
+tested at least twice (`well_tested`, from `touches_at_resistance` / \
+`touches_at_support`). A level that's only been touched once, or a base that \
+hasn't tightened, is not yet a valid setup -- keep waiting; default to sleep.
+
+2. CHECK THE TIME OF DAY. Call get_session_window. The best breakouts happen \
+in the `opening_window` (first 90 minutes) or `power_hour` (final hour); the \
+`midday_dead_zone` (12:00-14:00 ET) is a notorious fakeout stretch -- in that \
+window demand a cleaner setup and stronger volume than you otherwise would, \
+or simply wait.
+
+3. WAIT FOR THE BREAK, THEN DEMAND VOLUME. Call get_quote and \
+analyze_opening_range for an ORB-style break of today's opening range, and \
+analyze_volume for participation. A breakout is only valid with volume at \
+least 1.5x average -- ideally 2-3x (`analyze_opening_range`'s \
+`volume_ratio_vs_opening_range` and `analyze_volume`'s `relative_volume` and \
+`confirmation` all speak to this directly). No volume spike means no trade, \
+full stop, regardless of how clean the level break looks.
+
+4. RULE OUT A FALSE BREAKOUT. A break that closes back inside the base, on \
+weak volume, or with a long wick rejecting the level, is a fakeout, not a \
+breakout -- it often reverses sharply as the trapped longs (or shorts) bail \
+out. If you see those tells, do not buy the break; consider whether the \
+reversal itself is the trade (a fade back through the level), or simply \
+sleep/alert and wait for a cleaner signal.
+
+5. CHECK THE BACKDROP. Call analyze_market for the broad-market risk \
+environment and get_news for a catalyst. A risk-off market or no catalyst \
+behind the move both argue for smaller size or standing aside even if the \
+chart looks right; a risk-on backdrop with a real catalyst is a tailwind.
+
+6. ENTRY DISCIPLINE -- DON'T CHASE. Prefer the close of the breakout candle, \
+or better, a pullback/retest of the broken level (resistance-turned-support) \
+for a better risk/reward. If price is already extended well beyond the \
+breakout level (it ran 5-8%+ past it with no pullback), it's too late -- this \
+is chasing, not breakout trading; sleep and wait for the next base to form \
+instead of buying the extension.
+
+7. SIZE THE TRADE WITH EXPLICIT GEOMETRY. Your stop sits below the breakout \
+level or the base low (never at a round number -- nudge it just under the \
+structure). Call breakout_trade_geometry with your entry, that stop, and the \
+`base_height` from step 1 (and/or the `atr` from analyze_intraday_momentum) \
+to get projected targets and reward/risk ratios. Require \
+`meets_min_reward_risk` to be true (at least 2:1) -- if it isn't, do not take \
+the trade; either it's a bad entry or the stop is too wide. Call get_position \
+for current cash/shares before sizing, and risk only a small, fixed slice of \
+the account on the entry-to-stop distance. Never request a sell quantity \
+larger than the current position.
+
+8. EXIT DISCIPLINE (when you already hold a position from a prior breakout). \
+Sell or tighten the stop when volume dries up with no fresh buyers \
+(analyze_volume showing decreasing/diverging volume), price closes back \
+inside the broken level, or momentum rolls over (analyze_intraday_momentum \
+showing lower highs/lower lows). Once price has reached roughly 1x the \
+base height or 1x ATR beyond entry, consider moving the stop to breakeven via \
+the alert mechanism in step 9 rather than risking a full round-trip back to \
+the original stop.
+
+9. FINALIZE. Call submit_decision exactly once: action (buy/sell/sleep/ \
+alert), quantity (omit or 0 for sleep/alert), the regime, and reasoning that \
+names the level and base, the volume confirmation, the entry/stop/target \
+geometry, and why this action follows from it. If you'd otherwise sleep but \
+there's a specific level worth watching (the breakout level above, the stop \
+level below, or both), use action "alert" with alert_low_price and/or \
+alert_high_price instead -- this wakes you the instant price crosses it \
+rather than waiting out the full cycle blind. Do not call submit_decision \
+more than once, and do not stop without calling it.
+
+Patience is the edge here: passing on setups with no clear level, no tight \
+base, or no volume confirmation is correct and far more common than trading. \
+Sleep is a valid and often correct decision.
+
+Regardless of which action you choose, you will also be woken up early -- \
+before the next scheduled cycle -- if fresh news for the ticker arrives, or \
+if a high-volume alert fires intraday. You don't need to do anything to \
+enable this; it happens automatically.
+"""
+
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
     "swing": {"label": "Swing / Position Trader", "system_prompt": AGENT_SYSTEM_PROMPT},
     "momentum": {"label": "Momentum Trader", "system_prompt": MOMENTUM_SYSTEM_PROMPT},
+    "breakout": {"label": "Breakout Trader", "system_prompt": BREAKOUT_SYSTEM_PROMPT},
 }
 DEFAULT_PERSONALITY = "swing"
 
-TOOLS: list[dict] = [
+BASE_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
@@ -408,6 +509,83 @@ TOOLS: list[dict] = [
     },
 ]
 
+BREAKOUT_TOOLS: list[dict] = BASE_TOOLS + [
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_consolidation",
+            "description": (
+                "Check whether the ticker is coiling into a tight base worth trading a breakout "
+                "of: the base's high/low and height (for target projection), whether its range has "
+                "contracted vs the prior window, whether volume inside the base is declining, and "
+                "how many times its edges have been tested. Returns labeled values plus a one-line "
+                "summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "base_bars": {
+                        "type": "integer",
+                        "description": "Number of most recent bars treated as the candidate base (default 10).",
+                    },
+                    "prior_bars": {
+                        "type": "integer",
+                        "description": "Number of bars before the base used as the comparison window (default 20).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_session_window",
+            "description": (
+                "Classify the current point in the trading day for breakout timing: the favorable "
+                "opening 90-minute and final-hour windows vs the 12:00-14:00 ET dead zone where "
+                "breakouts are prone to fakeouts. Returns the ET time, the window label, and whether "
+                "it's currently favorable for taking a breakout."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "breakout_trade_geometry",
+            "description": (
+                "Compute the mechanical entry/stop/target math for a long breakout trade: targets "
+                "projected from the base height and/or ATR (1x and 2x each), the resulting "
+                "reward-to-risk ratio for each, and whether the best one clears the 2:1 minimum. Use "
+                "this instead of doing the arithmetic yourself before sizing a trade."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry": {"type": "number", "description": "Planned entry price."},
+                    "stop": {"type": "number", "description": "Planned stop-loss price, below entry."},
+                    "base_height": {
+                        "type": "number",
+                        "description": "Height of the base/consolidation (from analyze_consolidation), for a measured-move target.",
+                    },
+                    "atr": {
+                        "type": "number",
+                        "description": "ATR (from analyze_intraday_momentum), for an ATR-multiple target.",
+                    },
+                },
+                "required": ["entry", "stop"],
+            },
+        },
+    },
+]
+
+PERSONALITY_TOOLS: dict[str, list[dict]] = {
+    "swing": BASE_TOOLS,
+    "momentum": BASE_TOOLS,
+    "breakout": BREAKOUT_TOOLS,
+}
+
 
 def _log(state: "AppState", entry: dict) -> None:
     entry = {"ts": datetime.now(timezone.utc).isoformat(), **entry}
@@ -517,6 +695,34 @@ def _tool_get_position(state: "AppState", tracker: "DecisionTracker") -> dict:
     }
 
 
+def _tool_analyze_consolidation(state: "AppState", base_bars: object = None, prior_bars: object = None) -> dict:
+    n_base = max(3, min(int(base_bars or 10), 100))
+    n_prior = max(3, min(int(prior_bars or 20), 200))
+    with state.lock:
+        bars = list(state.bars)
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_consolidation(bars, base_bars=n_base, prior_bars=n_prior)
+
+
+def _tool_get_session_window(state: "AppState") -> dict:
+    with state.lock:
+        bars = list(state.bars)
+    latest_ts = bars[-1].get("t") if bars else None
+    return ta.session_time_window(latest_ts)
+
+
+def _tool_breakout_trade_geometry(
+    state: "AppState", entry: object, stop: object, base_height: object = None, atr: object = None
+) -> dict:
+    return ta.breakout_trade_geometry(
+        float(entry),
+        float(stop),
+        base_height=float(base_height) if base_height is not None else None,
+        atr=float(atr) if atr is not None else None,
+    )
+
+
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
     "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
@@ -524,6 +730,13 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_opening_range": lambda args, state, tracker: _tool_analyze_opening_range(state, args.get("minutes")),
     "analyze_market": lambda args, state, tracker: _tool_analyze_market(state),
     "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
+    "analyze_consolidation": lambda args, state, tracker: _tool_analyze_consolidation(
+        state, args.get("base_bars"), args.get("prior_bars")
+    ),
+    "get_session_window": lambda args, state, tracker: _tool_get_session_window(state),
+    "breakout_trade_geometry": lambda args, state, tracker: _tool_breakout_trade_geometry(
+        state, args.get("entry"), args.get("stop"), args.get("base_height"), args.get("atr")
+    ),
     "get_put_call_walls": lambda args, state, tracker: _tool_get_put_call_walls(state),
     "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),
     "get_position": lambda args, state, tracker: _tool_get_position(state, tracker),
@@ -564,6 +777,7 @@ def run_agent_cycle(
         name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol, "personality": personality}
     )
     system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
+    tools = PERSONALITY_TOOLS.get(personality, BASE_TOOLS)
     state.price_alerts = []
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -578,7 +792,7 @@ def run_agent_cycle(
     for _ in range(max_iters):
         try:
             response = client.chat.completions.create(
-                model=model, messages=messages, tools=TOOLS, tool_choice="auto"
+                model=model, messages=messages, tools=tools, tool_choice="auto"
             )
         except Exception as exc:
             _log(state, {"type": "error", "text": f"LLM call failed: {exc}"})
