@@ -54,6 +54,7 @@ def _base_kwargs(**overrides) -> dict:
         trade_fixed_cost=1.15,
         llm_provider="gemini",
         llm_model="",
+        llm_personality="Swing / Position Trader",
         agent_running=True,
         live_fig=None,
         historical_fig=None,

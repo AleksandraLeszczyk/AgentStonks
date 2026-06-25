@@ -128,6 +128,101 @@ happens automatically so a sleep/alert decision is never blind to breaking \
 news.
 """
 
+MOMENTUM_SYSTEM_PROMPT = """\
+You are an autonomous momentum-trading agent for a single equity ticker, \
+operating in a paper-trading sandbox -- no real orders are ever placed, so \
+reason as if real capital is on the line.
+
+Core idea: stocks in motion tend to stay in motion. You are not predicting a \
+new move -- you are jumping on a move already in progress, riding it, and \
+getting out before it reverses. Most of the day there is nothing to do; only \
+take A+ setups and sleep the rest of the time.
+
+Work through this process every cycle, citing the actual numbers the tools \
+return (levels, ratios, RSI, ATR), not just their labels:
+
+1. SCREEN FOR A MOMENTUM CONDITION. Call get_quote (price vs prior close -- a \
+5-20% gap is the sweet spot; bigger than that is often already parabolic and \
+late) and analyze_volume (relative volume -- you want it clearly elevated, \
+2x+ is the kind of move worth your attention; flat/declining volume means \
+there's no real participation behind the move). Call get_news to find the \
+catalyst -- earnings beat, upgrade, FDA news, M&A. A move with no catalyst \
+and no volume is noise, not momentum; default to sleep.
+
+2. IDENTIFY THE SETUP. Call analyze_intraday_momentum for the higher-highs/ \
+higher-lows pattern, VWAP position, and ATR-based volatility, and call \
+analyze_opening_range for the opening-range high/low and whether price has \
+broken out of it yet. Match what you see to one of:
+   - Bull flag: a sharp move (the flagpole) followed by a tight, low-volume \
+consolidation, then a fresh breakout on rising volume.
+   - VWAP reclaim: price dipped to/through session VWAP, found buyers, and is \
+reclaiming it -- analyze_intraday_momentum's vwap_position tells you which \
+side of VWAP price is on right now.
+   - Opening Range Breakout (ORB): analyze_opening_range's `status` tells you \
+directly whether price is still inside the range, or has broken out above/ \
+below it.
+   If none of these are present, there is no trade -- sleep.
+
+3. CHECK THE BACKDROP. Call analyze_market for the broad-market risk \
+environment and analyze_daily_trend for the ticker's own medium-term regime. \
+A risk-off market or a ticker fighting its own daily downtrend means you \
+need a cleaner setup and smaller size to justify a long; a risk-on backdrop \
+aligned with the daily trend is a tailwind. If get_put_call_walls has data, \
+treat the Call Wall as a likely point of stalling for a long and the Put \
+Wall as support to lean on.
+
+4. ENTRY DISCIPLINE. Never chase. Require: a recognizable setup from step 2, \
+a clear breakout level (the flag's high, VWAP, or the opening-range \
+high/low), and volume confirmation of at least 1.5x average on the breakout \
+-- analyze_opening_range's `volume_ratio_vs_opening_range` and \
+analyze_volume's `relative_volume` both speak to this directly. Know your \
+stop before you size the trade: for a bull flag or ORB, the stop sits just \
+below the consolidation/range low; for a VWAP reclaim, just below VWAP.
+
+5. SIZE THE TRADE. Call get_position for current cash and share count. Risk \
+a small, fixed slice of the account on the distance between entry and your \
+stop -- momentum trades move fast and wrong setups should cost little. Wider \
+ATR (from analyze_intraday_momentum) means a wider stop, which means a \
+smaller share count for the same dollar risk. Never request a sell quantity \
+larger than the current position.
+
+6. EXIT DISCIPLINE (when you already hold a position). Sell or tighten the \
+stop when: volume dries up (analyze_volume showing decreasing/diverging \
+volume) with no fresh buyers, price breaks back below VWAP, intraday \
+momentum has rolled into lower-highs/lower-lows or a reversal candle near \
+resistance, or it's drifted into the 12:00-14:00 dead zone without strength \
+(check the bar timestamps) -- unless the stock is exceptionally strong. Once \
+the position is up roughly 1R (one stop-distance) move your effective stop \
+to breakeven via the alert mechanism in step 7, and otherwise let winners \
+run rather than booking small gains out of fear. Cut losers immediately if \
+the setup fails -- don't wait to see.
+
+7. FINALIZE. Call submit_decision exactly once: action (buy/sell/sleep/ \
+alert), quantity (omit or 0 for sleep/alert), the regime, and reasoning that \
+names the setup, the breakout/stop levels, and the volume confirmation you \
+used. If you'd otherwise sleep but there's a specific trigger level worth \
+watching (a breakout level above, a stop level below, or both), use action \
+"alert" with alert_low_price and/or alert_high_price instead -- this wakes \
+you the instant price crosses it rather than waiting out the full cycle \
+blind. Do not call submit_decision more than once, and do not stop without \
+calling it.
+
+Emotional discipline matters more than any single setup: sitting on your \
+hands through a quiet, no-edge stretch is correct and far more common than \
+trading. Sleep is a valid and often correct decision.
+
+Regardless of which action you choose, you will also be woken up early -- \
+before the next scheduled cycle -- if fresh news for the ticker arrives, or \
+if a high-volume alert fires intraday. You don't need to do anything to \
+enable this; it happens automatically.
+"""
+
+AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
+    "swing": {"label": "Swing / Position Trader", "system_prompt": AGENT_SYSTEM_PROMPT},
+    "momentum": {"label": "Momentum Trader", "system_prompt": MOMENTUM_SYSTEM_PROMPT},
+}
+DEFAULT_PERSONALITY = "swing"
+
 TOOLS: list[dict] = [
     {
         "type": "function",
@@ -203,6 +298,28 @@ TOOLS: list[dict] = [
                 "recent price move. Returns labeled values plus a one-line summary."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_opening_range",
+            "description": (
+                "Analyze today's Opening Range Breakout (ORB) setup: the high/low set by the "
+                "first N minutes of today's session, whether price has since broken out above "
+                "or below that range, and whether recent volume confirms the breakout. Returns "
+                "labeled values plus a one-line summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minutes": {
+                        "type": "integer",
+                        "description": "Length of the opening range in minutes (default 15).",
+                    }
+                },
+                "required": [],
+            },
         },
     },
     {
@@ -327,6 +444,15 @@ def _tool_analyze_daily_trend(state: "AppState", limit: object = None) -> dict:
     return ta.analyze_trend(bars)
 
 
+def _tool_analyze_opening_range(state: "AppState", minutes: object = None) -> dict:
+    n = max(1, min(int(minutes or 15), 120))
+    with state.lock:
+        bars = list(state.bars)
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_opening_range(bars, minutes=n)
+
+
 def _tool_analyze_market(state: "AppState") -> dict:
     data = historical.fetch_market_indicators()
     return ta.analyze_market(
@@ -395,6 +521,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
     "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
     "analyze_daily_trend": lambda args, state, tracker: _tool_analyze_daily_trend(state, args.get("limit")),
+    "analyze_opening_range": lambda args, state, tracker: _tool_analyze_opening_range(state, args.get("minutes")),
     "analyze_market": lambda args, state, tracker: _tool_analyze_market(state),
     "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
     "get_put_call_walls": lambda args, state, tracker: _tool_get_put_call_walls(state),
@@ -425,6 +552,7 @@ def run_agent_cycle(
     state: "AppState",
     tracker: "DecisionTracker",
     max_iters: int = AGENT_MAX_TOOL_ITERS,
+    personality: str = DEFAULT_PERSONALITY,
 ) -> None:
     """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision.
 
@@ -432,10 +560,13 @@ def run_agent_cycle(
     nests under it as a generation, so per-cycle latency, token usage, and cost
     roll up automatically (see `marketview.observability`).
     """
-    obs.update_trace(name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol})
+    obs.update_trace(
+        name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol, "personality": personality}
+    )
+    system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
     state.price_alerts = []
     messages: list[dict] = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": f"Ticker: {symbol}. Run your analysis process and finish by calling submit_decision.",
@@ -644,11 +775,12 @@ def _agent_loop(
     model: str,
     cycle_sec: int,
     stop_event: threading.Event,
+    personality: str = DEFAULT_PERSONALITY,
 ) -> None:
     client = get_agent_client(provider, api_key)
     while not stop_event.is_set():
         try:
-            run_agent_cycle(client, model, symbol, state, tracker)
+            run_agent_cycle(client, model, symbol, state, tracker, personality=personality)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Agent cycle failed: {exc}"})
         _wait_for_next_cycle(state, stop_event, cycle_sec)
@@ -664,6 +796,7 @@ def launch_agent(
     provider: str = "gemini",
     model: "str | None" = None,
     cycle_sec: int = 60,
+    personality: str = DEFAULT_PERSONALITY,
 ) -> None:
     """Stop any running agent for this state, then start a new background cycle loop."""
     model = model or DEFAULT_AGENT_MODELS[provider]
@@ -673,7 +806,7 @@ def launch_agent(
     state.agent_running = True
     threading.Thread(
         target=_agent_loop,
-        args=(state, tracker, symbol, provider, api_key, model, cycle_sec, stop_event),
+        args=(state, tracker, symbol, provider, api_key, model, cycle_sec, stop_event, personality),
         daemon=True,
     ).start()
 

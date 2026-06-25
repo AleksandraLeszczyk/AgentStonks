@@ -67,6 +67,7 @@ _DEFAULTS: dict[str, object] = {
     "agent_wake_reason": None,
     "llm_provider": "gemini",
     "llm_model": "",
+    "llm_personality": "swing",
     "options_chain": None,
     "options_wall_history": [],
     "options_status": "",
@@ -209,6 +210,7 @@ class AppState:
         self.agent_wake_reason: str | None = None
         self.llm_provider: str = "gemini"
         self.llm_model: str = ""
+        self.llm_personality: str = "swing"
         self.options_chain: "dict | None" = None
         self.options_wall_history: list[dict] = []
         self.options_status: str = ""

@@ -233,6 +233,67 @@ def analyze_intraday(bars: list[dict]) -> dict:
     }
 
 
+def analyze_opening_range(bars: list[dict], minutes: int = 15) -> dict:
+    """Opening Range Breakout (ORB) read: the high/low set by the first `minutes`
+    of today's bars, and whether price has since broken out of that range.
+
+    Assumes 1-minute bars and that the earliest bar for today's date is the
+    first bar of the session (true if streaming started at/near the open).
+    """
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+
+    today = str(bars[-1].get("t", ""))[:10]
+    day_bars = [b for b in bars if str(b.get("t", ""))[:10] == today]
+    if len(day_bars) < 2:
+        return {"note": "not enough bars in today's session yet to establish an opening range"}
+
+    opening_bars = day_bars[: max(1, minutes)]
+    or_high = max(b["h"] for b in opening_bars)
+    or_low = min(b["l"] for b in opening_bars)
+    price = float(day_bars[-1]["c"])
+
+    if len(opening_bars) < minutes:
+        status = "still forming"
+    elif price > or_high:
+        status = "broken out above"
+    elif price < or_low:
+        status = "broken out below"
+    else:
+        status = "inside_range"
+
+    opening_avg_volume = sum(b.get("v", 0) for b in opening_bars) / len(opening_bars)
+    breakout_bars = day_bars[len(opening_bars) :][-3:]
+    breakout_avg_volume = (
+        sum(b.get("v", 0) for b in breakout_bars) / len(breakout_bars) if breakout_bars else None
+    )
+    volume_ratio = (
+        breakout_avg_volume / opening_avg_volume
+        if breakout_avg_volume is not None and opening_avg_volume
+        else None
+    )
+
+    summary_parts = [
+        f"Opening range (first {len(opening_bars)} min): {or_low:.2f}-{or_high:.2f}. "
+        f"Price {price:.2f} is {status.replace('_', ' ')}."
+    ]
+    if volume_ratio is not None:
+        summary_parts.append(
+            f"Recent volume is {volume_ratio:.1f}x the opening-range average"
+            f" ({'confirms' if volume_ratio >= 1.5 else 'does not confirm'} a breakout)."
+        )
+
+    return {
+        "opening_range_minutes": len(opening_bars),
+        "opening_range_high": round(or_high, 4),
+        "opening_range_low": round(or_low, 4),
+        "current_price": round(price, 4),
+        "status": status,
+        "volume_ratio_vs_opening_range": round(volume_ratio, 2) if volume_ratio is not None else None,
+        "summary": " ".join(summary_parts),
+    }
+
+
 def _vix_label(value: float) -> str:
     if value < 13:
         return "very low (complacent)"

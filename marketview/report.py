@@ -206,6 +206,7 @@ def build_report_html(
     trade_fixed_cost: float,
     llm_provider: str,
     llm_model: str,
+    llm_personality: str,
     agent_running: bool,
     live_fig: Optional[go.Figure],
     historical_fig: Optional[go.Figure],
@@ -226,6 +227,7 @@ def build_report_html(
         "Fee per trade": f"${trade_fixed_cost:.2f}",
         "LLM provider": llm_provider,
         "LLM model": llm_model or "(default)",
+        "Agent personality": llm_personality,
         "Agent status": "running" if agent_running else "stopped",
     }
 

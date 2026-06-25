@@ -9,7 +9,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from .agent import launch_agent, stop_agent
+from .agent import AGENT_PERSONALITIES, DEFAULT_PERSONALITY, launch_agent, stop_agent
 from .charts import (
     build_analysis_gauges,
     build_chart,
@@ -824,6 +824,7 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
         trade_fixed_cost=TRADE_FIXED_COST,
         llm_provider=state.llm_provider,
         llm_model=state.llm_model,
+        llm_personality=AGENT_PERSONALITIES.get(state.llm_personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["label"],
         agent_running=state.agent_running,
         live_fig=live_fig,
         historical_fig=historical_fig,
@@ -874,6 +875,17 @@ def _agent_panel(symbol: str) -> None:
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
     with st.expander("LLM", expanded=True):
+        personality_keys = list(AGENT_PERSONALITIES.keys())
+        personality = st.selectbox(
+            "Personality",
+            personality_keys,
+            index=personality_keys.index(state.llm_personality)
+            if state.llm_personality in personality_keys
+            else personality_keys.index(DEFAULT_PERSONALITY),
+            format_func=lambda k: AGENT_PERSONALITIES[k]["label"],
+            key="agent_llm_personality",
+        )
+        state.llm_personality = personality
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
         )
@@ -925,6 +937,7 @@ def _agent_panel(symbol: str) -> None:
                 provider=provider,
                 model=model or None,
                 cycle_sec=AGENT_CYCLE_SEC,
+                personality=personality,
             )
 
     if stop_clicked:
