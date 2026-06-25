@@ -1,4 +1,6 @@
 import json
+import logging
+import socket
 import threading
 import time
 from datetime import datetime
@@ -9,10 +11,30 @@ import websocket
 from .config import BARS_STREAM_URL, NEWS_STREAM_URL
 from .state import AppState, alert_triggered, current_volume_ratio, today_daily_volume
 
+logger = logging.getLogger(__name__)
+
 
 _TF_MINUTES: dict[str, int] = {
     "1Min": 1, "5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60, "1Day": 1440,
 }
+
+
+def _keepalive_sockopt() -> list[tuple]:
+    """TCP keepalive options so a silently-dead connection (NAT/proxy idle
+    timeout dropping the TCP session without a FIN/close frame) is detected
+    and torn down in seconds rather than leaving the stream hung until the
+    next read happens to fail. Names differ by OS -- Linux exposes
+    TCP_KEEPIDLE, macOS exposes TCP_KEEPALIVE instead -- so probe for both.
+    """
+    opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    idle_opt = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
+    if idle_opt is not None:
+        opts.append((socket.IPPROTO_TCP, idle_opt, 30))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10))
+    if hasattr(socket, "TCP_KEEPCNT"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3))
+    return opts
 
 
 def _floor_ts(ts: str, minutes: int) -> str:
@@ -131,9 +153,11 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 state.status = f"Stream error: {msg.get('msg')}"
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
+        logger.warning("Bars stream error for %s: %s", symbol, err)
         state.status = f"WS error: {err}"
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
+        logger.info("Bars stream closed for %s, reconnecting…", symbol)
         if state.status.startswith("✅"):
             state.status = "Stream closed"
 
@@ -150,7 +174,15 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
     # arriving -- nothing else in the UI depends on this socket, so there's
     # no other signal that it died. ws.close() (Stop button) still ends the
     # retry loop via keep_running.
-    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5)
+    #
+    # sockopt enables TCP keepalive: the most common cause of repeated
+    # "Connection to remote host was lost." drops is a NAT/proxy/load-balancer
+    # between this process and Alpaca silently killing an idle TCP session --
+    # neither side sends a close frame, so the app only notices on the next
+    # read, which raises immediately. Keepalive probes generate traffic so
+    # the OS detects and recovers (or reports) a dead socket within ~30-50s
+    # instead of leaving it to rot.
+    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
 def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
@@ -226,9 +258,11 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
                 state.status = f"News stream error: {msg.get('msg')}"
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
+        logger.warning("News stream error for %s: %s", symbol, err)
         state.status = f"WS error: {err}"
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
+        logger.info("News stream closed for %s, reconnecting…", symbol)
         if state.status.startswith("✅"):
             state.status = "Stream closed"
 
@@ -240,7 +274,7 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
         on_close=on_close,
     )
     state.ws_news = ws
-    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5)
+    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
 def launch_stream_news(symbol: str, key: str, secret: str, state: AppState) -> None:
