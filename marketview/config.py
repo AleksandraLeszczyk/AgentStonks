@@ -6,6 +6,14 @@ NEWS_STREAM_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
 MAX_BARS = 300
 POLL_SEC = 3
 CHART_POLL_SEC = 30
+
+# REST-polling fallback for bars/trades and news, used only while the
+# corresponding WebSocket stream is not connected (e.g. Alpaca's
+# "connection limit exceeded" rejecting a second concurrent stream on the
+# same API key/feed). REST calls aren't subject to that per-key streaming
+# connection cap, so they keep working even while the socket is stuck.
+FALLBACK_POLL_SEC = 15
+NEWS_FALLBACK_POLL_SEC = 60
 OPTIONS_POLL_SEC = 60
 OPTIONS_WALL_HISTORY_MAXLEN = 200
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]

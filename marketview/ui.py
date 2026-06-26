@@ -291,6 +291,8 @@ def _volume_alert_banner(state: AppState) -> None:
 def _price_ticker() -> None:
     state = _get_state()
     st.caption(f"Status: {state.status}")
+    if state.news_status not in ("Idle", state.status):
+        st.caption(f"News: {state.news_status}")
     if state.symbol:
         with state.lock:
             last_price = state.last_price
@@ -1078,15 +1080,25 @@ def build_ui() -> None:
                                 state.status = f"News impact scoring failed: {exc}"
                         state.status = "Connecting WebSocket…"
                         launch_stream(sym, key, secret, feed, state, timeframe)
-                        launch_stream_news(sym, key, secret, state)
+                        launch_stream_news(sym, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""))
 
         if stop_clicked:
+            if state.bars_fallback_stop_event:
+                state.bars_fallback_stop_event.set()
+            if state.news_fallback_stop_event:
+                state.news_fallback_stop_event.set()
             if state.ws:
                 try:
                     state.ws.close()
                 except Exception:
                     pass
+            if state.ws_news:
+                try:
+                    state.ws_news.close()
+                except Exception:
+                    pass
             state.status = "Stopped"
+            state.news_status = "Stopped"
 
         _live_panel()
 

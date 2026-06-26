@@ -44,6 +44,40 @@ def fetch_close_series(symbol: str, days: int) -> pd.Series:
     return close.dropna()
 
 
+def fetch_intraday_bars(symbol: str, interval: str = "1m") -> list[dict]:
+    """Today's intraday bars from yfinance -- last-resort price fallback when both
+    Alpaca's stream and REST API are unavailable. No API key required, but quotes
+    are delayed (typically ~15 minutes) rather than real-time.
+
+    Returns bars in the same {"t","o","h","l","c","v"} shape as Alpaca's REST/stream
+    bars (UTC ISO timestamps) so callers don't need to branch on the source.
+    """
+    try:
+        df = yf.download(symbol, period="1d", interval=interval, auto_adjust=False, progress=False)
+    except Exception:
+        logger.exception("yfinance intraday download failed for %s", symbol)
+        raise
+    if df.empty:
+        return []
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize("America/New_York")
+    idx = idx.tz_convert("UTC")
+    return [
+        {
+            "t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "o": float(row.Open),
+            "h": float(row.High),
+            "l": float(row.Low),
+            "c": float(row.Close),
+            "v": float(row.Volume),
+        }
+        for ts, row in zip(idx, df.itertuples(index=False))
+    ]
+
+
 def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
     """Fetch the broad-market condition series (SPY, VIX, VIX3M) for `analyze_market`.
 

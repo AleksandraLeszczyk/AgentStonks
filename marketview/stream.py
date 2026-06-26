@@ -8,8 +8,11 @@ from typing import Any
 
 import websocket
 
-from .config import BARS_STREAM_URL, NEWS_STREAM_URL
-from .state import AppState, alert_triggered, current_volume_ratio, today_daily_volume
+from .config import BARS_STREAM_URL, FALLBACK_POLL_SEC, MAX_BARS, NEWS_FALLBACK_POLL_SEC, NEWS_STREAM_URL
+from .historical import fetch_intraday_bars
+from .news import fetch_news_with_fallback
+from .rest import fetch_bars, fetch_trades
+from .state import AppState, alert_triggered, current_volume_ratio, today_daily_bar, today_daily_volume
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 )
             elif t == "subscription":
                 state.status = f"✅ Streaming {symbol} ({feed.upper()})"
+                state.bars_connected = True
             elif t == "b" and msg.get("S") == symbol:
                 bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v", "vw") if k in msg}
                 if tf_minutes == 1:
@@ -141,23 +145,30 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                         )
                         state.agent_wake_event.set()
             elif t == "q" and msg.get("S") == symbol:
-                if "bp" in msg:
-                    state.bid_price = float(msg["bp"])
-                if "bs" in msg:
-                    state.bid_size = float(msg["bs"])
-                if "ap" in msg:
-                    state.ask_price = float(msg["ap"])
-                if "as" in msg:
-                    state.ask_size = float(msg["as"])
+                # Single lock acquisition so readers (e.g. the UI's quote
+                # snapshot) never see a torn mix of this tick's bid with the
+                # previous tick's ask, or vice versa.
+                with state.lock:
+                    if "bp" in msg:
+                        state.bid_price = float(msg["bp"])
+                    if "bs" in msg:
+                        state.bid_size = float(msg["bs"])
+                    if "ap" in msg:
+                        state.ask_price = float(msg["ap"])
+                    if "as" in msg:
+                        state.ask_size = float(msg["as"])
             elif t == "error":
                 state.status = f"Stream error: {msg.get('msg')}"
+                state.bars_connected = False
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
         logger.warning("Bars stream error for %s: %s", symbol, err)
         state.status = f"WS error: {err}"
+        state.bars_connected = False
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
         logger.info("Bars stream closed for %s, reconnecting…", symbol)
+        state.bars_connected = False
         if state.status.startswith("✅"):
             state.status = "Stream closed"
 
@@ -185,25 +196,72 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
     ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
+def _fallback_bars_loop(
+    symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str, stop_event: threading.Event
+) -> None:
+    """REST-polling fallback that keeps prices flowing while the bars/trades WS isn't
+    connected. Alpaca's per-key streaming connection limit doesn't apply to REST calls,
+    so this keeps working even while `_start_stream` is stuck retrying a rejected socket
+    (e.g. another session/tab holding the one streaming slot Alpaca allows per key).
+
+    Falls back further to yfinance (no API key, delayed quotes) if Alpaca's REST API
+    itself is also unavailable.
+    """
+    while not stop_event.wait(FALLBACK_POLL_SEC):
+        if state.bars_connected:
+            continue
+        try:
+            bars = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
+            source = "Alpaca REST"
+        except Exception as exc:
+            logger.warning("Bars REST fallback failed for %s, trying yfinance: %s", symbol, exc)
+            try:
+                bars = fetch_intraday_bars(symbol)
+                source = "yfinance (delayed)"
+            except Exception as exc2:
+                logger.warning("yfinance fallback also failed for %s: %s", symbol, exc2)
+                continue
+        if not bars:
+            continue
+
+        last_price = bars[-1].get("c")
+        try:
+            latest_trade = fetch_trades(symbol, key, secret, feed, lookback_hours=1)
+            if latest_trade:
+                last_price = latest_trade[-1].get("p", last_price)
+        except Exception:
+            pass  # last bar's close is still a reasonable last_price
+
+        with state.lock:
+            state.bars.clear()
+            state.bars.extend(bars[-MAX_BARS:])
+            state.last_price = last_price
+            state.day_high = max(b["h"] for b in bars if "h" in b)
+            state.day_low = min(b["l"] for b in bars if "l" in b)
+            state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
+        state.status = f"⚠️ Fallback: polling {symbol} via {source} (stream down)"
+
+
 def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
-    """Close any existing bars/trades stream and start a new background thread."""
+    """Close any existing bars/trades stream and start a new background thread, plus a
+    REST-polling fallback that activates whenever the WS stream isn't connected."""
     if state.ws:
         try:
             state.ws.close()
         except Exception:
             pass
         time.sleep(0.5)
+    if state.bars_fallback_stop_event:
+        state.bars_fallback_stop_event.set()
+
+    state.bars_connected = False
 
     with state.lock:
         if state.bars:
             state.prev_close = state.bars[-1].get("c")
-        if state.daily_bars:
-            today_bar = state.daily_bars[-1]
-            state.day_high = today_bar.get("h")
-            state.day_low = today_bar.get("l")
-        else:
-            state.day_high = None
-            state.day_low = None
+        today_bar = today_daily_bar(state.daily_bars)
+        state.day_high = today_bar.get("h") if today_bar else None
+        state.day_low = today_bar.get("l") if today_bar else None
         # Seed today's running volume from today's partial daily bar (0 if the
         # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
         # one-shot alert latch for the new session.
@@ -216,8 +274,14 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         state.ask_price = None
         state.ask_size = None
 
+    stop_event = threading.Event()
+    state.bars_fallback_stop_event = stop_event
+
     threading.Thread(
         target=_start_stream, args=(symbol, key, secret, feed, state, timeframe), daemon=True
+    ).start()
+    threading.Thread(
+        target=_fallback_bars_loop, args=(symbol, key, secret, feed, state, timeframe, stop_event), daemon=True
     ).start()
 
 
@@ -236,10 +300,13 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
         for msg in messages:
             t = msg.get("T")
             if t == "connected":
-                state.status = "Connected – authenticating…"
+                state.news_status = "Connected – authenticating…"
             elif t == "success" and msg.get("msg") == "authenticated":
-                state.status = "Authenticated – subscribing to news…"
+                state.news_status = "Authenticated – subscribing to news…"
                 ws.send(json.dumps({"action": "subscribe", "news": [symbol]}))
+            elif t == "subscription":
+                state.news_status = f"✅ Streaming news ({symbol})"
+                state.news_connected = True
             elif t == "n" and msg.get("S") == symbol:
                 article = {
                     k: msg[k]
@@ -255,16 +322,19 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
                 state.agent_wake_reason = text
                 state.agent_wake_event.set()
             elif t == "error":
-                state.status = f"News stream error: {msg.get('msg')}"
+                state.news_status = f"News stream error: {msg.get('msg')}"
+                state.news_connected = False
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
         logger.warning("News stream error for %s: %s", symbol, err)
-        state.status = f"WS error: {err}"
+        state.news_status = f"WS error: {err}"
+        state.news_connected = False
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
         logger.info("News stream closed for %s, reconnecting…", symbol)
-        if state.status.startswith("✅"):
-            state.status = "Stream closed"
+        state.news_connected = False
+        if state.news_status.startswith("✅"):
+            state.news_status = "Stream closed"
 
     ws = websocket.WebSocketApp(
         NEWS_STREAM_URL,
@@ -277,15 +347,55 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
     ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
-def launch_stream_news(symbol: str, key: str, secret: str, state: AppState) -> None:
-    """Close any existing news stream and start a new background thread."""
+def _fallback_news_loop(
+    symbol: str, key: str, secret: str, worldnews_key: str, state: AppState, stop_event: threading.Event
+) -> None:
+    """REST-polling fallback that keeps news flowing while the news WS isn't connected.
+
+    Alpaca's per-key streaming connection limit doesn't apply to REST calls, so this
+    keeps working even while `_start_stream_news` is stuck retrying a rejected socket.
+    """
+    while not stop_event.wait(NEWS_FALLBACK_POLL_SEC):
+        if state.news_connected:
+            continue
+        try:
+            fresh = fetch_news_with_fallback(symbol, key, secret, worldnews_key)
+        except Exception as exc:
+            logger.warning("News fallback poll failed for %s: %s", symbol, exc)
+            continue
+        with state.lock:
+            seen = {a.get("id") for a in state.news}
+            new_articles = [a for a in fresh if a.get("id") not in seen]
+            state.news.extend(new_articles)
+        if new_articles:
+            state.news_status = f"⚠️ Fallback polling news for {symbol} (stream down)"
+            headline = new_articles[0].get("headline", "")
+            text = "Fresh news arrived for the ticker (via fallback poll)."
+            if headline:
+                text += f" Latest: {headline}"
+            state.agent_wake_reason = text
+            state.agent_wake_event.set()
+
+
+def launch_stream_news(symbol: str, key: str, secret: str, state: AppState, worldnews_key: str = "") -> None:
+    """Close any existing news stream and start a new background thread, plus a
+    REST-polling fallback that activates whenever the WS stream isn't connected."""
     if state.ws_news:
         try:
             state.ws_news.close()
         except Exception:
             pass
         time.sleep(0.5)
+    if state.news_fallback_stop_event:
+        state.news_fallback_stop_event.set()
+
+    state.news_connected = False
+    stop_event = threading.Event()
+    state.news_fallback_stop_event = stop_event
 
     threading.Thread(
         target=_start_stream_news, args=(symbol, key, secret, state), daemon=True
+    ).start()
+    threading.Thread(
+        target=_fallback_news_loop, args=(symbol, key, secret, worldnews_key, state, stop_event), daemon=True
     ).start()

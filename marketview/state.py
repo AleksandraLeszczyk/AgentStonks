@@ -27,8 +27,13 @@ _DEFAULTS: dict[str, object] = {
     "api_key": "",
     "api_secret": "",
     "status": "Idle",
+    "news_status": "Idle",
+    "bars_connected": False,
+    "news_connected": False,
     "ws": None,
     "ws_news": None,
+    "bars_fallback_stop_event": None,
+    "news_fallback_stop_event": None,
     "timeframe": "1Min",
     "ma_periods": [],
     "show_fib": False,
@@ -116,6 +121,16 @@ def today_daily_volume(daily_bars: list[dict], today: "str | None" = None) -> fl
     return 0.0
 
 
+def today_daily_bar(daily_bars: list[dict], today: "str | None" = None) -> "dict | None":
+    """Today's still-forming daily bar, or None if the latest daily bar isn't today's
+    (e.g. pre-open/weekend, or a lagging feed that hasn't published today's bar yet).
+    """
+    if not daily_bars:
+        return None
+    bar = daily_bars[-1]
+    return bar if _daily_bar_date(bar) == _today_iso(today) else None
+
+
 def average_daily_volume(
     daily_bars: list[dict],
     window: int = VOLUME_ADV_WINDOW,
@@ -170,8 +185,13 @@ class AppState:
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"
+        self.news_status: str = "Idle"
+        self.bars_connected: bool = False
+        self.news_connected: bool = False
         self.ws: "websocket.WebSocketApp | None" = None
         self.ws_news: "websocket.WebSocketApp | None" = None
+        self.bars_fallback_stop_event: "threading.Event | None" = None
+        self.news_fallback_stop_event: "threading.Event | None" = None
         self.lock = threading.Lock()
         self.timeframe: str = "1Min"
         self.ma_periods: list[int] = []

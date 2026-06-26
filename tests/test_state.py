@@ -6,6 +6,7 @@ from marketview.state import (
     average_daily_volume,
     completed_daily_bars,
     current_volume_ratio,
+    today_daily_bar,
     today_daily_volume,
 )
 
@@ -77,6 +78,22 @@ def test_today_daily_volume_uses_today_partial_bar():
     assert today_daily_volume(bars, today="2026-06-25") == 50
     # Latest bar isn't today (e.g. weekend / pre-open) -> nothing accumulated yet.
     assert today_daily_volume([_daily("2026-06-24", 200)], today="2026-06-25") == 0.0
+
+
+def test_today_daily_bar_returns_latest_bar_when_dated_today():
+    bars = [
+        {"t": "2026-06-24T04:00:00Z", "h": 152.30, "l": 148.10},
+        {"t": "2026-06-25T04:00:00Z", "h": 146.00, "l": 144.50},
+    ]
+    assert today_daily_bar(bars, today="2026-06-25") == bars[-1]
+
+
+def test_today_daily_bar_none_when_latest_bar_is_stale():
+    # Latest daily bar is yesterday's (e.g. pre-open, weekend, or a lagging
+    # feed) -- must not be mistaken for today's range.
+    bars = [{"t": "2026-06-24T04:00:00Z", "h": 152.30, "l": 148.10}]
+    assert today_daily_bar(bars, today="2026-06-25") is None
+    assert today_daily_bar([], today="2026-06-25") is None
 
 
 def test_average_daily_volume_means_completed_days():
