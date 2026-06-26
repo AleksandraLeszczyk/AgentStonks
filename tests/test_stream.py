@@ -1,0 +1,93 @@
+from marketview import stream
+from marketview.state import AppState
+
+
+class _StopAfter:
+    """Fake stop_event that lets the fallback loop body run `n` times, then ends it.
+
+    Mirrors threading.Event's `.wait()` interface (the only method the loops use):
+    returns False (don't stop) for the first `n` calls, True (stop) after that.
+    """
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.calls = 0
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.calls += 1
+        return self.calls > self.n
+
+
+def test_fallback_bars_loop_updates_state_from_rest_when_disconnected(monkeypatch):
+    state = AppState()
+    state.bars_connected = False
+    bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
+
+    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
+
+    stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(1))
+
+    assert list(state.bars) == bars
+    assert state.last_price == 1.6
+    assert state.day_high == 2
+    assert state.day_low == 0.5
+    assert state.day_volume == 100
+    assert "Fallback" in state.status
+    assert "Alpaca REST" in state.status
+
+
+def test_fallback_bars_loop_skips_polling_when_stream_connected(monkeypatch):
+    state = AppState()
+    state.bars_connected = True
+    state.status = "✅ Streaming AAPL (IEX)"
+    called = []
+    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: called.append(1))
+
+    stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(2))
+
+    assert called == []
+    assert state.status == "✅ Streaming AAPL (IEX)"
+
+
+def test_fallback_bars_loop_falls_back_to_yfinance_when_rest_fails(monkeypatch):
+    state = AppState()
+    state.bars_connected = False
+    bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
+
+    def _raise(*a, **k):
+        raise RuntimeError("Alpaca down")
+
+    monkeypatch.setattr(stream, "fetch_bars", _raise)
+    monkeypatch.setattr(stream, "fetch_intraday_bars", lambda *a, **k: bars)
+
+    stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(1))
+
+    assert list(state.bars) == bars
+    assert "yfinance" in state.status
+
+
+def test_fallback_news_loop_appends_new_articles_when_disconnected(monkeypatch):
+    state = AppState()
+    state.news_connected = False
+    state.news = [{"id": "1", "headline": "old"}]
+    fresh = [{"id": "1", "headline": "old"}, {"id": "2", "headline": "new"}]
+
+    monkeypatch.setattr(stream, "fetch_news_with_fallback", lambda *a, **k: fresh)
+
+    stream._fallback_news_loop("AAPL", "k", "s", "wn-key", state, _StopAfter(1))
+
+    assert [a["id"] for a in state.news] == ["1", "2"]
+    assert state.agent_wake_event.is_set()
+    assert "Fallback" in state.news_status
+
+
+def test_fallback_news_loop_skips_polling_when_stream_connected(monkeypatch):
+    state = AppState()
+    state.news_connected = True
+    called = []
+    monkeypatch.setattr(stream, "fetch_news_with_fallback", lambda *a, **k: called.append(1))
+
+    stream._fallback_news_loop("AAPL", "k", "s", "wn-key", state, _StopAfter(2))
+
+    assert called == []
