@@ -700,6 +700,63 @@ _TOOL_SUBMIT_DECISION = {
     },
 }
 
+# Only exposed to a strategy agent while it runs UNDER the Automatic orchestrator.
+# It lets the strategy relinquish control instead of idling on alerts when the
+# regime that suits it has faded -- the orchestrator then re-assesses and may
+# activate a better-fitting strategy.
+AUTOMATIC_MODE_ADDENDUM = """
+
+--- AUTOMATIC MODE ---
+You are running under an Automatic orchestrator that activated you because current \
+market conditions favor your strategy. Keep control and trade normally -- exactly \
+as described above -- for as long as your edge is plausibly present, including \
+standing aside with an alert through ordinary quiet stretches.
+
+But you also have one extra option: stand_down. Call it INSTEAD of submit_decision \
+when you judge that the conditions your strategy depends on have genuinely faded \
+and your setup is unlikely to appear in the near future -- e.g. a breakout agent in \
+a dead, rangebound tape, a mean-reversion agent once a strong trend has taken hold, \
+or a momentum agent after the move and its volume have died. Standing down hands \
+control back to the orchestrator with your reasoning, so it can re-assess the regime \
+and activate a strategy better suited to it.
+
+Judgement: a single slow cycle is NOT a reason to stand down -- that is what a \
+normal alert-and-wait is for. Stand down only when the regime itself no longer fits \
+your strategy. Standing down does NOT close any open position; if you want to be \
+flat before relinquishing, sell first on this cycle and stand down on a later one.
+"""
+
+_TOOL_STAND_DOWN = {
+    "type": "function",
+    "function": {
+        "name": "stand_down",
+        "description": (
+            "Relinquish control back to the Automatic orchestrator because the market "
+            "regime no longer fits your strategy and your setup is unlikely to appear "
+            "soon. Available only in Automatic mode. Use this INSTEAD of submit_decision "
+            "to end the cycle when standing aside on an alert would just be idling in the "
+            "wrong regime. Does not close open positions."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": (
+                        "Why your strategy's edge is absent now and unlikely to return soon -- "
+                        "cite the regime read (trend/range/volatility/volume) that no longer fits."
+                    ),
+                },
+                "expected_quiet_minutes": {
+                    "type": "number",
+                    "description": "Rough estimate of how long the drought for your setup is likely to last, in minutes.",
+                },
+            },
+            "required": ["reasoning"],
+        },
+    },
+}
+
 _TOOL_ANALYZE_VWAP_BANDS = {
     "type": "function",
     "function": {
@@ -1168,18 +1225,28 @@ def run_agent_cycle(
     tracker: "DecisionTracker",
     max_iters: int = AGENT_MAX_TOOL_ITERS,
     personality: str = DEFAULT_PERSONALITY,
-) -> None:
+    under_automatic: bool = False,
+) -> str:
     """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision.
 
     When Langfuse is configured, the whole cycle is one trace: every LLM turn
     nests under it as a generation, so per-cycle latency, token usage, and cost
     roll up automatically (see `marketview.observability`).
+
+    When `under_automatic` is True the strategy is running under the Automatic
+    orchestrator: it also gets a `stand_down` tool to relinquish control when the
+    regime no longer fits it. Returns "stand_down" in that case (so the
+    orchestrator can re-assess and pick another strategy), or "decided" when the
+    cycle finalized with a normal buy/sell/alert (or the forced-sleep fallback).
     """
     obs.update_trace(
         name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol, "personality": personality}
     )
     system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
     tools = PERSONALITY_TOOLS.get(personality, BASE_TOOLS)
+    if under_automatic:
+        system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM
+        tools = [*tools, _TOOL_STAND_DOWN]
     state.alerts = []
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -1191,6 +1258,7 @@ def run_agent_cycle(
     _log(state, {"type": "cycle_start", "text": f"Starting analysis cycle for {symbol}"})
 
     decision_made = False
+    stood_down = False
     for _ in range(max_iters):
         try:
             response = client.chat.completions.create(
@@ -1236,6 +1304,26 @@ def run_agent_cycle(
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+
+            if name == "stand_down" and under_automatic:
+                reasoning = args.get("reasoning", "")
+                quiet = args.get("expected_quiet_minutes")
+                _log(
+                    state,
+                    {
+                        "type": "stand_down",
+                        "personality": personality,
+                        "reasoning": reasoning,
+                        "expected_quiet_minutes": quiet,
+                    },
+                )
+                obs.update_trace(output={"action": "stand_down", "reasoning": reasoning})
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"status": "relinquished"})}
+                )
+                stood_down = True
+                decision_made = True
+                break
 
             if name == "submit_decision":
                 action = args.get("action", "")
@@ -1333,6 +1421,9 @@ def run_agent_cycle(
         if decision_made:
             break
 
+    if stood_down:
+        return "stand_down"
+
     if not decision_made:
         forced = tracker.record_sleep(
             symbol, "Max reasoning iterations reached without a finalized decision; defaulting to sleep."
@@ -1350,6 +1441,8 @@ def run_agent_cycle(
                 "regime": "unknown",
             },
         )
+
+    return "decided"
 
 
 def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:

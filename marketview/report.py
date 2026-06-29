@@ -181,6 +181,25 @@ def _agent_log_html(log: list[dict]) -> str:
             color = PALETTE["accent"]
             result = html.escape(entry.get("result_preview", ""))
             body = f"<div>{result}</div>"
+        elif etype == "regime_select":
+            label = "REGIME → STRATEGY"
+            color = PALETTE.get("orange", PALETTE["accent"])
+            strat = html.escape(str(entry.get("label", entry.get("strategy", ""))))
+            regime = html.escape(str(entry.get("regime", "unknown")))
+            reasoning = html.escape(entry.get("reasoning", ""))
+            body = (
+                f"<div>Activated <b>{strat}</b> · Regime: <b>{regime}</b></div>"
+                f"<div style='color:{PALETTE['muted']}'>{reasoning}</div>"
+            )
+        elif etype == "stand_down":
+            label = "STAND DOWN"
+            color = PALETTE.get("orange", PALETTE["accent"])
+            reasoning = html.escape(entry.get("reasoning", ""))
+            strat = html.escape(str(entry.get("personality", "")))
+            body = (
+                f"<div><b>{strat}</b> relinquished control to Automatic</div>"
+                f"<div style='color:{PALETTE['muted']}'>{reasoning}</div>"
+            )
         else:
             color = PALETTE["down"] if etype == "error" else PALETTE["text"]
             body = f"<div>{html.escape(entry.get('text', ''))}</div>"

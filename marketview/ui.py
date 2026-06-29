@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from .agent import AGENT_PERSONALITIES, DEFAULT_PERSONALITY, launch_agent, stop_agent
+from .automatic import AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
     build_analysis_gauges,
     build_chart,
@@ -81,6 +82,14 @@ def _get_state() -> AppState:
     state.__dict__.setdefault("day_high", None)
     state.__dict__.setdefault("day_low", None)
     return state
+
+
+def _personality_label(key: str) -> str:
+    """Display label for a personality key, including the Automatic orchestrator."""
+    if key == AUTOMATIC_KEY:
+        return AUTOMATIC_LABEL
+    entry = AGENT_PERSONALITIES.get(key) or AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
+    return entry["label"]
 
 
 def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
@@ -357,7 +366,6 @@ def _chart_panel() -> None:
         else empty_chart()
     )
     st.plotly_chart(fig, width='stretch')
-    st.html(_news_html(state.news, state.symbol, state.news_impacts))
 
 
 def _live_chart_controls() -> None:
@@ -433,26 +441,48 @@ def _volume_alert_controls() -> None:
     state.volume_alert_multiplier = multiplier
 
 
-def _news_analysis_controls() -> None:
+def _news_analysis_controls(symbol: str) -> None:
     state = _get_state()
-    with st.expander("📰 News Analysis"):
-        provider = st.selectbox(
-            "Provider",
-            PROVIDERS,
-            index=PROVIDERS.index(state.news_llm_provider),
-            key="news_llm_provider_select",
-            help=f"Model used: {', '.join(f'{p}={m}' for p, m in DEFAULT_NEWS_MODELS.items())}",
-        )
-        state.news_llm_provider = provider
-        env_var = ENV_KEYS[provider]
-        if not os.getenv(env_var):
-            st.caption(f"⚠️ {env_var} is not set.")
+    provider = st.selectbox(
+        "Provider",
+        PROVIDERS,
+        index=PROVIDERS.index(state.news_llm_provider),
+        key="news_llm_provider_select",
+        help=f"Model used: {', '.join(f'{p}={m}' for p, m in DEFAULT_NEWS_MODELS.items())}",
+    )
+    state.news_llm_provider = provider
+    env_var = ENV_KEYS[provider]
+    llm_key = os.getenv(env_var, "")
+    if not llm_key:
+        st.caption(f"⚠️ {env_var} is not set.")
+
+    analyze_clicked = st.button("🔍 Analyze News", key="news_analyze_btn")
+    if analyze_clicked:
+        sym = symbol.strip().upper() or state.symbol
+        if not state.news:
+            st.warning("No news loaded yet. Start the Live stream for a symbol first.")
+        elif not llm_key:
+            st.error(f"{env_var} is not set; news analysis needs an LLM key.")
+        else:
+            with st.spinner("Scoring news impact…"):
+                try:
+                    state.news_impacts = score_news_impacts(sym, state.news, provider, llm_key)
+                except Exception as exc:
+                    st.error(f"News impact scoring failed: {exc}")
+
+
+@st.fragment(run_every=CHART_POLL_SEC)
+def _news_panel(symbol: str) -> None:
+    state = _get_state()
+    if state.news_status not in ("Idle", state.status):
+        st.caption(f"News: {state.news_status}")
+    _news_analysis_controls(symbol)
+    st.html(_news_html(state.news, state.symbol, state.news_impacts))
 
 
 def _live_panel() -> None:
     _live_chart_controls()
     _volume_alert_controls()
-    _news_analysis_controls()
     _price_ticker()
     _chart_panel()
 
@@ -689,6 +719,10 @@ def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
         if action == "alert":
             return "⏰", PALETTE["accent"], "ALERT"
         return "💤", PALETTE["muted"], "SLEEP"
+    if etype == "regime_select":
+        return "🤖", PALETTE["orange"], "REGIME → STRATEGY"
+    if etype == "stand_down":
+        return "🛑", PALETTE["orange"], "STAND DOWN"
     if etype == "tool_call":
         return "🛠️", PALETTE["accent"], str(entry.get("name", "tool"))
     if etype == "analysis":
@@ -725,6 +759,23 @@ def _agent_entry_body(entry: dict) -> str:
         args_html = f"<div style='color:{PALETTE['muted']}'>args: {html.escape(json.dumps(args))}</div>" if args else ""
         result = html.escape(entry.get("result_preview", ""))
         return f"{args_html}<div>{result}</div>"
+    if etype == "regime_select":
+        label = html.escape(str(entry.get("label", entry.get("strategy", ""))))
+        regime = html.escape(str(entry.get("regime", "unknown")))
+        reasoning = html.escape(entry.get("reasoning", ""))
+        return (
+            f"<div>Activated <b>{label}</b> · Regime: <b>{regime}</b></div>"
+            f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
+        )
+    if etype == "stand_down":
+        label = html.escape(_personality_label(str(entry.get("personality", ""))))
+        quiet = entry.get("expected_quiet_minutes")
+        quiet_str = f" · ~{quiet:g} min quiet expected" if isinstance(quiet, (int, float)) else ""
+        reasoning = html.escape(entry.get("reasoning", ""))
+        return (
+            f"<div><b>{label}</b> relinquished control{quiet_str}</div>"
+            f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
+        )
     if etype in ("analysis", "error", "status", "cycle_start", "news_alert"):
         return f"<div>{html.escape(entry.get('text', ''))}</div>"
     return ""
@@ -902,7 +953,7 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
         trade_fixed_cost=TRADE_FIXED_COST,
         llm_provider=state.llm_provider,
         llm_model=state.llm_model,
-        llm_personality=AGENT_PERSONALITIES.get(state.llm_personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["label"],
+        llm_personality=_personality_label(state.llm_personality),
         agent_running=state.agent_running,
         live_fig=live_fig,
         historical_fig=historical_fig,
@@ -953,17 +1004,25 @@ def _agent_panel(symbol: str) -> None:
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
     with st.expander("LLM", expanded=True):
-        personality_keys = list(AGENT_PERSONALITIES.keys())
+        # Automatic first: it's the regime-adaptive orchestrator that picks and
+        # switches between the individual strategies on its own.
+        personality_keys = [AUTOMATIC_KEY, *AGENT_PERSONALITIES.keys()]
         personality = st.selectbox(
             "Personality",
             personality_keys,
             index=personality_keys.index(state.llm_personality)
             if state.llm_personality in personality_keys
             else personality_keys.index(DEFAULT_PERSONALITY),
-            format_func=lambda k: AGENT_PERSONALITIES[k]["label"],
+            format_func=_personality_label,
             key="agent_llm_personality",
         )
         state.llm_personality = personality
+        if personality == AUTOMATIC_KEY:
+            st.caption(
+                "🤖 Automatic detects the market regime and activates the best-fitting "
+                "strategy. That strategy trades until it sees no opportunities in the near "
+                "term and stands down, waking Automatic to re-assess and switch."
+            )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
         )
@@ -1007,16 +1066,27 @@ def _agent_panel(symbol: str) -> None:
             state.agent_log = []
             state.agent_start_time = datetime.now(tz=timezone.utc)
             state.agent_equity_history = []
-            launch_agent(
-                state,
-                state.decision_tracker,
-                sym,
-                llm_key,
-                provider=provider,
-                model=model or None,
-                cycle_sec=AGENT_CYCLE_SEC,
-                personality=personality,
-            )
+            if personality == AUTOMATIC_KEY:
+                launch_automatic(
+                    state,
+                    state.decision_tracker,
+                    sym,
+                    llm_key,
+                    provider=provider,
+                    model=model or None,
+                    cycle_sec=AGENT_CYCLE_SEC,
+                )
+            else:
+                launch_agent(
+                    state,
+                    state.decision_tracker,
+                    sym,
+                    llm_key,
+                    provider=provider,
+                    model=model or None,
+                    cycle_sec=AGENT_CYCLE_SEC,
+                    personality=personality,
+                )
 
     if stop_clicked:
         stop_agent(state)
@@ -1024,6 +1094,13 @@ def _agent_panel(symbol: str) -> None:
     status = "🟢 running" if state.agent_running else "⚪ idle"
     watching = f" — watching {state.symbol}" if state.agent_running and state.symbol else ""
     st.caption(f"Status: {status}{watching}")
+    if state.agent_running and state.llm_personality == AUTOMATIC_KEY:
+        active = state.automatic_active_strategy
+        if active:
+            regime = f" [{state.automatic_regime}]" if state.automatic_regime else ""
+            st.caption(f"🤖 Automatic → active strategy: {_personality_label(active)}{regime}")
+        else:
+            st.caption("🤖 Automatic → assessing market regime…")
 
     _agent_performance_panel(symbol)
     _agent_log_panel()
@@ -1065,8 +1142,8 @@ def build_ui() -> None:
             )
     state = _get_state()
 
-    tab_live, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
-        ["📡 Live", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
+    tab_live, tab_news, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
+        ["📡 Live", "📰 News", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
     )
 
     with tab_live:
@@ -1160,6 +1237,9 @@ def build_ui() -> None:
             state.news_status = "Stopped"
 
         _live_panel()
+
+    with tab_news:
+        _news_panel(symbol)
 
     with tab_historical:
         _historical_panel(symbol)

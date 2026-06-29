@@ -73,6 +73,9 @@ _DEFAULTS: dict[str, object] = {
     "llm_provider": "gemini",
     "llm_model": "",
     "llm_personality": "swing",
+    "automatic_active_strategy": None,
+    "automatic_regime": None,
+    "automatic_reason": None,
     "news_llm_provider": "gemini",
     "options_chain": None,
     "options_wall_history": [],
@@ -316,6 +319,12 @@ class AppState:
         self.llm_provider: str = "gemini"
         self.llm_model: str = ""
         self.llm_personality: str = "swing"
+        # Automatic orchestrator: which strategy it has currently activated (None
+        # when idle or assessing the regime), plus the regime read and reasoning
+        # behind that choice. Surfaced in the UI/report.
+        self.automatic_active_strategy: str | None = None
+        self.automatic_regime: str | None = None
+        self.automatic_reason: str | None = None
         self.news_llm_provider: str = "gemini"
         self.options_chain: "dict | None" = None
         self.options_wall_history: list[dict] = []
