@@ -302,10 +302,188 @@ ticker arrives. That interrupt is automatic and cannot be turned off, so an \
 alert wait is never blind to breaking news.
 """
 
+REVERSAL_SYSTEM_PROMPT = """\
+You are an autonomous VWAP mean-reversion agent for a single equity ticker, \
+operating in a paper-trading sandbox -- no real orders are ever placed, so \
+reason as if real capital is on the line.
+
+Core idea: in a ranging session price oscillates around the Volume Weighted \
+Average Price (VWAP), the benchmark institutions execute against. When price \
+stretches an extreme distance from VWAP without a trend behind it, it tends to \
+snap back. You fade those stretches back toward VWAP -- but ONLY once you have \
+confirmed the session is actually ranging, because in a trending tape VWAP \
+becomes a trend line, not a mean, and fading it bleeds. Most cycles there is \
+nothing to do; only take A+ setups and stand aside (with an alert) otherwise.
+
+This account is long-only -- it cannot short. So you trade the long side of \
+the reversion (buy stretches BELOW VWAP) and, when price is stretched ABOVE \
+VWAP, you either trim/exit an existing long into that strength or stand aside; \
+you never open a short.
+
+Work through this process every cycle, citing the actual numbers the tools \
+return (VWAP, the band levels, z-score, ADX, std dev), not just their labels:
+
+1. CONFIRM THE REGIME IS RANGING. Call analyze_vwap_bands. The `adx` reading \
+is the gate: below 20 (`is_ranging` true) the session is rangebound and \
+fading stretches is valid; 20-25 is a developing trend (demand more \
+confirmation, smaller size); 25+ means a real trend is under way -- VWAP is a \
+trend line now, do NOT fade it. If `signal` is 'no_setup_trending', stand \
+aside with an alert no matter how stretched price looks.
+
+2. REQUIRE A REAL STRETCH. A setup needs price at least `num_std` (default 2) \
+standard deviations from VWAP -- read the signed `z_score` and the 2σ/3σ band \
+levels. A long setup is price at/below the lower 2σ band (z <= -2); anything \
+shallower than that is not stretched enough to fade. The reversion target is \
+always VWAP itself.
+
+3. PREFER A REJECTION CANDLE AT THE BAND. The highest-quality fades come with \
+a `rejection_candle` at the band -- a bullish rejection (long lower wick, \
+buyers stepping in) at the lower band for a long. Without one, the stretch may \
+still be extending; demand a cleaner signal or smaller size. Call \
+analyze_volume too: a reversion is more trustworthy when the move INTO the \
+extreme came on fading/diverging volume (exhaustion) rather than surging \
+volume (which can signal a genuine breakout, not an overshoot).
+
+4. MIND THE CLOCK. This edge lives in the quiet middle of the session. The \
+first and last hour of regular trading (roughly before 10:30 and after 15:00 \
+ET) are where directional moves dominate and ranges break -- check the latest \
+bar's timestamp, and in those windows demand more confirmation or simply wait. \
+Large-cap names on quiet news days are the ideal hunting ground.
+
+5. CHECK NEWS. Call get_news. A fresh catalyst (earnings, guidance, upgrade, \
+macro) is exactly what turns a range into a trend and blows through VWAP \
+bands -- if clearly market-moving news is driving the stretch, do not fade it; \
+stand aside.
+
+6. SIZE THE TRADE. For a long, your entry is at/near the lower band and your \
+stop sits one std dev beyond it (below the 3σ band). Call \
+vwap_reversion_geometry with the entry, the VWAP, and the 1σ `std_dev` to get \
+the stop and the reward/risk -- require `meets_min_reward_risk` (at least \
+1.5:1; mean-reversion runs a tighter R:R than breakouts but a higher win rate \
+compensates). Then call get_position for current cash and share count and risk \
+only a small, fixed slice of the account on the entry-to-stop distance. Never \
+request a sell quantity larger than the current position.
+
+7. MANAGING / EXITING A LONG. Your target is VWAP -- take profit as price \
+reverts there (a 'short_setup' or z back near 0 means the reversion has played \
+out; trim or exit). Cut the trade if price closes beyond the 3σ stop, or if \
+ADX starts climbing through 25 (the range is becoming a trend and the thesis \
+is broken) -- don't wait for the full stop in that case.
+
+8. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
+quantity (omit or 0 for alert), the regime, and reasoning that names the \
+VWAP/band levels, the z-score, the ADX range confirmation, and the \
+entry/stop/target geometry. Treat a ranging market as `neutral`. When you're \
+not taking a trade, there is no do-nothing action -- finalize with action \
+"alert" and an `alerts` array naming the trigger(s) worth watching. Each entry \
+names a continuously-updated field (above/below a value) and the first to fire \
+wakes you the instant it happens rather than waiting out the full cycle blind. \
+For a forming reversion that is typically last_price reaching down to the \
+lower band you want to buy (below) and/or back up to VWAP where you'd take \
+profit (above); ground those levels in the band/VWAP numbers the tools gave \
+you, not an arbitrary distance. Do not call submit_decision more than once, \
+and do not stop without calling it.
+
+Discipline is the edge here: the regime filter is everything -- fading a trend \
+because it "looks" overextended is how this strategy loses. Standing aside \
+(with an alert) when ADX isn't clearly below 20 is correct and far more common \
+than trading.
+
+Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
+which action you chose or what alerts you set -- the moment fresh news for the \
+ticker arrives. That interrupt is automatic and cannot be turned off, so an \
+alert wait is never blind to breaking news.
+"""
+
+SMART_MONEY_SYSTEM_PROMPT = """\
+You are an autonomous Smart Money Concepts (SMC) trading agent for a single \
+equity ticker, operating in a paper-trading sandbox -- no real orders are ever \
+placed, so reason as if real capital is on the line.
+
+Core idea: institutions cannot enter a large position at one price without \
+moving the market against themselves, so they accumulate inside a zone -- an \
+ORDER BLOCK -- then drive price away from it, leaving that zone as unfinished \
+business they defend on a return. Your edge is to wait for price to RETURN to a \
+higher-timeframe bullish order block during the intraday session and enter only \
+once intraday price action CONFIRMS the zone is holding. This is the highest- \
+edge, most consistent setup across market conditions -- but only when executed \
+with discipline. Most cycles there is nothing to do; only take A+/B setups and \
+stand aside (with an alert) the rest of the time. This account is long-only, so \
+you trade returns into bullish demand and never short.
+
+Work through this process every cycle, citing the actual numbers the tools \
+return (block boundaries, FVG levels, R:R, regime), not just their labels:
+
+1. ESTABLISH HIGHER-TIMEFRAME STRUCTURE. Call analyze_daily_trend for the \
+medium-term regime and analyze_order_blocks for the institutional zones on the \
+daily timeframe. You are hunting a bullish demand block at or just below price \
+in a non-bearish regime -- a fresh, UNMITIGATED block is higher quality than \
+one already tested. If there is no bullish demand block at/below price, or the \
+daily regime is bearish, there is no setup -- stand aside with an alert.
+
+2. CHECK THE RETURN + INTRADAY CONFIRMATION. Call analyze_smart_money_setup -- \
+the composite read that ties the daily demand block to today's price action. A \
+tradeable return needs price actually INSIDE the block (`price_in_order_block`) \
+plus at least one intraday confirmation: a bullish `rejection_candle` at the \
+zone, a bullish `fvg_fill` (price tapped and held a fair value gap -- drill in \
+with analyze_fair_value_gaps), or a `breaker` (intraday break of structure, old \
+resistance reclaimed as support). No confirmation means the zone may still fail \
+-- treat it as `watching`, not a buy. Call analyze_volume too: a return into \
+demand on fading/diverging volume (sellers exhausting) is more trustworthy than \
+one on surging volume (which can mean the zone is about to break).
+
+3. CHECK NEWS. Call get_news. A fresh negative catalyst is exactly what turns a \
+demand block into a failed level -- if clearly negative news is driving price \
+into the zone, do not buy the return; stand aside.
+
+4. CONFIRM THE GEOMETRY. The stop sits JUST BEYOND the order block (below its \
+low); the target is the next opposing structural level (the nearest bearish \
+supply block above, or recent structural high). Call smart_money_trade_geometry \
+with your entry (inside the block), that stop, and the target to verify the \
+reward-to-risk. Require `meets_min_reward_risk` to be true -- this setup demands \
+at least 3:1 (it typically runs 3:1 to 5:1). If it doesn't clear 3:1, the entry \
+is too high in the block or the target is too close -- wait for a deeper return \
+rather than forcing it.
+
+5. SIZE THE TRADE. Call get_position for current cash and share count, then risk \
+only a small, fixed slice of the account on the entry-to-stop distance. A wider \
+block means a wider stop, which means fewer shares for the same dollar risk. \
+Never request a sell quantity larger than the current position. When you already \
+hold a position, manage it: trim/exit into the structural target, and cut the \
+trade if price closes decisively beyond the block low (the zone has failed -- \
+the thesis is broken; don't hope).
+
+6. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
+quantity (omit or 0 for alert), the regime, and reasoning that names the order \
+block boundaries, the specific intraday confirmation, and the entry/stop/target \
+geometry with its R:R. When you're not taking a trade, there is no do-nothing \
+action -- finalize with action "alert" and an `alerts` array naming the \
+trigger(s) worth watching. Each entry names a continuously-updated field \
+(above/below a value) and the first to fire wakes you the instant it happens \
+rather than waiting out the full cycle blind. For a forming SMC setup that is \
+typically last_price reaching DOWN into the block's high (where you want to \
+start watching for confirmation) and last_price below the block's low (your \
+invalidation/stop level); ground those levels in the block boundaries the tools \
+gave you, not an arbitrary distance. Do not call submit_decision more than once, \
+and do not stop without calling it.
+
+Patience and discipline are the entire edge here: passing on a zone with no \
+confirmation, or one whose target doesn't clear 3:1, is correct and far more \
+common than trading. Standing aside (with an alert) is a valid and often correct \
+decision.
+
+Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
+which action you chose or what alerts you set -- the moment fresh news for the \
+ticker arrives. That interrupt is automatic and cannot be turned off, so an \
+alert wait is never blind to breaking news.
+"""
+
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
     "swing": {"label": "Swing / Position Trader", "system_prompt": AGENT_SYSTEM_PROMPT},
     "momentum": {"label": "Momentum Trader", "system_prompt": MOMENTUM_SYSTEM_PROMPT},
     "breakout": {"label": "Breakout Trader", "system_prompt": BREAKOUT_SYSTEM_PROMPT},
+    "reversal": {"label": "VWAP Mean-Reversion Trader", "system_prompt": REVERSAL_SYSTEM_PROMPT},
+    "smart_money": {"label": "Smart Money (Highest-Edge)", "system_prompt": SMART_MONEY_SYSTEM_PROMPT},
 }
 DEFAULT_PERSONALITY = "swing"
 
@@ -522,6 +700,64 @@ _TOOL_SUBMIT_DECISION = {
     },
 }
 
+_TOOL_ANALYZE_VWAP_BANDS = {
+    "type": "function",
+    "function": {
+        "name": "analyze_vwap_bands",
+        "description": (
+            "Analyze today's session VWAP and its volume-weighted standard-deviation bands for "
+            "a mean-reversion read: the VWAP, the 1/2/3-sigma bands, price's signed z-score "
+            "(how many std devs it sits from VWAP), the ADX trend-strength reading and whether "
+            "it confirms a range (below 20), and whether the latest bar is a rejection candle. "
+            "The `signal` is 'long_setup' (oversold >= trigger sigma below VWAP in a confirmed "
+            "range), 'short_setup' (overbought above VWAP), 'no_setup_trending' (stretched but "
+            "ADX shows a trend -- do not fade), or 'no_setup'. Returns labeled values plus a "
+            "one-line summary."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "num_std": {
+                    "type": "number",
+                    "description": "Std-dev stretch that triggers a setup (default 2.0).",
+                }
+            },
+            "required": [],
+        },
+    },
+}
+
+_TOOL_VWAP_REVERSION_GEOMETRY = {
+    "type": "function",
+    "function": {
+        "name": "vwap_reversion_geometry",
+        "description": (
+            "Compute the mechanical entry/stop/target math for a VWAP mean-reversion trade. "
+            "Target is always VWAP; the stop sits one standard deviation beyond entry (past the "
+            "next band). Returns the reward-to-risk ratio and whether it clears the 1.5:1 "
+            "mean-reversion minimum. Use this instead of doing the arithmetic yourself before "
+            "sizing a trade."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entry": {"type": "number", "description": "Planned entry price (at/near the band)."},
+                "vwap": {"type": "number", "description": "Session VWAP -- the reversion target."},
+                "std_dev": {
+                    "type": "number",
+                    "description": "One standard deviation (the 1σ value from analyze_vwap_bands).",
+                },
+                "side": {
+                    "type": "string",
+                    "enum": ["long", "short"],
+                    "description": "'long' for a stretch below VWAP, 'short' for a stretch above.",
+                },
+            },
+            "required": ["entry", "vwap", "std_dev"],
+        },
+    },
+}
+
 _TOOL_BREAKOUT_TRADE_GEOMETRY = {
     "type": "function",
     "function": {
@@ -543,6 +779,87 @@ _TOOL_BREAKOUT_TRADE_GEOMETRY = {
                 },
             },
             "required": ["entry", "stop"],
+        },
+    },
+}
+
+_TOOL_ANALYZE_ORDER_BLOCKS = {
+    "type": "function",
+    "function": {
+        "name": "analyze_order_blocks",
+        "description": (
+            "Locate institutional order blocks on the daily (higher) timeframe: bullish demand "
+            "zones (the last down candle before an up-move that broke structure) and bearish supply "
+            "zones (the mirror). Returns every block with its high/low boundaries, whether it has "
+            "been mitigated (already revisited), and how many bars ago it formed, plus the nearest "
+            "bullish demand block at/below price (a candidate entry on a return) and the nearest "
+            "bearish supply block above (a candidate target). Labeled values plus a one-line summary."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_TOOL_ANALYZE_FAIR_VALUE_GAPS = {
+    "type": "function",
+    "function": {
+        "name": "analyze_fair_value_gaps",
+        "description": (
+            "Locate fair value gaps (FVGs) -- three-candle price imbalances -- in recent intraday "
+            "bars. Returns each gap's boundaries and whether it has been filled, plus the nearest "
+            "bullish FVG at/below price (a support imbalance price may be filling now). A held fill "
+            "of a bullish FVG is one of the intraday confirmations for a Smart Money long entry. "
+            "Labeled values plus a one-line summary."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of most recent intraday bars to scan (default 50, max 300).",
+                }
+            },
+            "required": [],
+        },
+    },
+}
+
+_TOOL_ANALYZE_SMART_MONEY_SETUP = {
+    "type": "function",
+    "function": {
+        "name": "analyze_smart_money_setup",
+        "description": (
+            "The composite Smart Money read: ties a higher-timeframe bullish demand order block "
+            "(daily) to today's intraday price action. Returns the demand block being watched, "
+            "whether price is inside it, which intraday confirmations are present (bullish "
+            "rejection candle, filled bullish FVG, or intraday break-of-structure/breaker), the "
+            "suggested entry/stop (just beyond the block)/structural target, the reward-to-risk to "
+            "that target, and a `signal`: 'long_setup' (return into demand, confirmed, clears 3:1), "
+            "'watching' (valid block but not all conditions met), or 'no_setup'. Plus a `quality` "
+            "grade and a one-line summary."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_TOOL_SMART_MONEY_GEOMETRY = {
+    "type": "function",
+    "function": {
+        "name": "smart_money_trade_geometry",
+        "description": (
+            "Compute the mechanical entry/stop/target math for a long Smart Money setup: entry at "
+            "the demand block on a return, stop just beyond the block, target at the next opposing "
+            "structural level. Returns the reward-to-risk ratio and whether it clears the 3:1 "
+            "minimum this setup demands (it typically runs 3:1 to 5:1). Use this instead of doing "
+            "the arithmetic yourself before sizing a trade."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entry": {"type": "number", "description": "Planned entry price, inside the order block."},
+                "stop": {"type": "number", "description": "Planned stop-loss price, just beyond (below) the block."},
+                "target": {"type": "number", "description": "Target price -- the next opposing structural level above entry."},
+            },
+            "required": ["entry", "stop", "target"],
         },
     },
 }
@@ -585,10 +902,42 @@ BREAKOUT_TOOLS: list[dict] = [
     _TOOL_SUBMIT_DECISION,
 ]
 
+# VWAP mean-reversion trader: session VWAP bands + ADX regime gate + volume
+# (exhaustion vs breakout) + reversion geometry + news + price. No daily trend
+# or options positioning -- this is a fast intraday, regime-gated fade.
+REVERSAL_TOOLS: list[dict] = [
+    _TOOL_GET_QUOTE,
+    _TOOL_ANALYZE_VWAP_BANDS,
+    _TOOL_ANALYZE_VOLUME,
+    _TOOL_VWAP_REVERSION_GEOMETRY,
+    _TOOL_GET_NEWS,
+    _TOOL_GET_POSITION,
+    _TOOL_SUBMIT_DECISION,
+]
+
+# Smart Money (highest-edge): higher-timeframe daily structure (trend + order
+# blocks) + intraday confirmation (the composite read + FVG drill-in) + volume +
+# SMC geometry + news + price. The composite tool does the heavy lifting; the
+# order-block / FVG tools let the agent drill into the structure behind it.
+SMART_MONEY_TOOLS: list[dict] = [
+    _TOOL_GET_QUOTE,
+    _TOOL_ANALYZE_DAILY_TREND,
+    _TOOL_ANALYZE_ORDER_BLOCKS,
+    _TOOL_ANALYZE_SMART_MONEY_SETUP,
+    _TOOL_ANALYZE_FAIR_VALUE_GAPS,
+    _TOOL_ANALYZE_VOLUME,
+    _TOOL_SMART_MONEY_GEOMETRY,
+    _TOOL_GET_NEWS,
+    _TOOL_GET_POSITION,
+    _TOOL_SUBMIT_DECISION,
+]
+
 PERSONALITY_TOOLS: dict[str, list[dict]] = {
     "swing": BASE_TOOLS,
     "momentum": MOMENTUM_TOOLS,
     "breakout": BREAKOUT_TOOLS,
+    "reversal": REVERSAL_TOOLS,
+    "smart_money": SMART_MONEY_TOOLS,
 }
 
 
@@ -708,6 +1057,58 @@ def _tool_breakout_trade_geometry(state: "AppState", entry: object, stop: object
     )
 
 
+def _tool_analyze_vwap_bands(state: "AppState", num_std: object = None) -> dict:
+    with state.lock:
+        bars = list(state.bars)
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_vwap_bands(bars, num_std=float(num_std) if num_std is not None else 2.0)
+
+
+def _tool_vwap_reversion_geometry(
+    state: "AppState", entry: object, vwap: object, std_dev: object, side: object = None
+) -> dict:
+    return ta.vwap_reversion_geometry(
+        float(entry),
+        float(vwap),
+        float(std_dev),
+        side=str(side) if side is not None else "long",
+    )
+
+
+def _tool_analyze_order_blocks(state: "AppState") -> dict:
+    bars = list(state.daily_bars)
+    if not bars:
+        return {"note": "no daily bars available yet"}
+    with state.lock:
+        spot = state.last_price
+    return ta.analyze_order_blocks(bars, spot=spot)
+
+
+def _tool_analyze_fair_value_gaps(state: "AppState", limit: object = None) -> dict:
+    n = max(1, min(int(limit or 50), 300))
+    with state.lock:
+        bars = list(state.bars)[-n:]
+        spot = state.last_price
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_fair_value_gaps(bars, spot=spot)
+
+
+def _tool_analyze_smart_money_setup(state: "AppState") -> dict:
+    daily = list(state.daily_bars)
+    if not daily:
+        return {"note": "no daily bars available yet"}
+    with state.lock:
+        intraday = list(state.bars)
+        spot = state.last_price
+    return ta.analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
+
+
+def _tool_smart_money_trade_geometry(state: "AppState", entry: object, stop: object, target: object) -> dict:
+    return ta.smart_money_trade_geometry(float(entry), float(stop), float(target))
+
+
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
     "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
@@ -717,6 +1118,16 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
     "breakout_trade_geometry": lambda args, state, tracker: _tool_breakout_trade_geometry(
         state, args.get("entry"), args.get("stop"), args.get("atr")
+    ),
+    "analyze_vwap_bands": lambda args, state, tracker: _tool_analyze_vwap_bands(state, args.get("num_std")),
+    "vwap_reversion_geometry": lambda args, state, tracker: _tool_vwap_reversion_geometry(
+        state, args.get("entry"), args.get("vwap"), args.get("std_dev"), args.get("side")
+    ),
+    "analyze_order_blocks": lambda args, state, tracker: _tool_analyze_order_blocks(state),
+    "analyze_fair_value_gaps": lambda args, state, tracker: _tool_analyze_fair_value_gaps(state, args.get("limit")),
+    "analyze_smart_money_setup": lambda args, state, tracker: _tool_analyze_smart_money_setup(state),
+    "smart_money_trade_geometry": lambda args, state, tracker: _tool_smart_money_trade_geometry(
+        state, args.get("entry"), args.get("stop"), args.get("target")
     ),
     "get_put_call_walls": lambda args, state, tracker: _tool_get_put_call_walls(state),
     "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),

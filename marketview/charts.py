@@ -1013,6 +1013,123 @@ def build_gamma_chart(data: dict, analysis: dict, symbol: str) -> go.Figure:
     return fig
 
 
+def build_smart_money_chart(bars: list[dict], analysis: dict, symbol: str) -> go.Figure:
+    """Smart Money Concepts overlay: candlesticks with the detected order blocks and
+    fair value gaps drawn as shaded zones, plus the suggested entry/stop/target lines.
+
+    Bullish (demand) zones are shaded green, bearish (supply) zones red. The order
+    block the agent is actually watching (`analysis['order_block']`) is highlighted,
+    its target supply zone marked, and the entry/stop/target geometry drawn as
+    horizontal lines so a setup reads at a glance.
+    """
+    if not bars:
+        return empty_chart(f"No data for {symbol}")
+
+    df = pd.DataFrame(bars)
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.sort_values("t").reset_index(drop=True)
+    x0, x1 = df["t"].iloc[0], df["t"].iloc[-1]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=df["t"],
+            open=df["o"],
+            high=df["h"],
+            low=df["l"],
+            close=df["c"],
+            name=symbol,
+            increasing_line_color=PALETTE["up"],
+            decreasing_line_color=PALETTE["down"],
+            showlegend=False,
+        )
+    )
+
+    def _index_to_x(idx: "int | None"):
+        if idx is None or idx < 0 or idx >= len(df):
+            return x0
+        return df["t"].iloc[idx]
+
+    watched = analysis.get("order_block")
+    watched_idx = watched.get("index") if watched else None
+
+    # All detected order blocks as shaded zones; the watched one drawn brighter.
+    for blk in (analysis.get("order_blocks") or []):
+        is_bull = blk.get("type") == "bullish"
+        base_color = PALETTE["up"] if is_bull else PALETTE["down"]
+        watched_block = watched is not None and blk.get("index") == watched_idx
+        fig.add_shape(
+            type="rect",
+            xref="x", yref="y",
+            x0=_index_to_x(blk.get("index")), x1=x1,
+            y0=blk["bottom"], y1=blk["top"],
+            fillcolor=base_color,
+            opacity=0.30 if watched_block else 0.12,
+            line=dict(color=base_color, width=1.5 if watched_block else 0),
+            layer="below",
+        )
+        fig.add_annotation(
+            xref="x", yref="y", x=x1, y=blk["top"],
+            text=f" {'Demand' if is_bull else 'Supply'} OB {blk['bottom']:.2f}-{blk['top']:.2f}",
+            font=dict(color=base_color, size=9, family="monospace"),
+            showarrow=False, xanchor="left",
+        )
+
+    # Fair value gaps (intraday-derived) as thin amber zones.
+    for gap in (analysis.get("fair_value_gaps") or []):
+        if gap.get("filled"):
+            continue
+        fig.add_shape(
+            type="rect",
+            xref="x", yref="y",
+            x0=_index_to_x(gap.get("index")), x1=x1,
+            y0=gap["bottom"], y1=gap["top"],
+            fillcolor=PALETTE["orange"], opacity=0.15,
+            line=dict(width=0), layer="below",
+        )
+
+    # Entry / stop / target geometry.
+    levels = (
+        ("suggested_entry", "Entry", PALETTE["accent"], "dash"),
+        ("suggested_stop", "Stop", PALETTE["down"], "dot"),
+        ("structural_target", "Target", PALETTE["up"], "dot"),
+    )
+    for key, label, color, dash in levels:
+        level = analysis.get(key)
+        if level is None:
+            continue
+        fig.add_shape(
+            type="line", xref="x", yref="y",
+            x0=x0, x1=x1, y0=level, y1=level,
+            line=dict(color=color, width=1.5, dash=dash),
+        )
+        fig.add_annotation(
+            xref="x", yref="y", x=x0, y=level,
+            text=f"{label} {level:.2f} ",
+            font=dict(color=color, size=10, family="monospace"),
+            showarrow=False, xanchor="right",
+        )
+
+    signal = analysis.get("signal", "")
+    quality = analysis.get("quality", "")
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=PALETTE["bg"],
+        plot_bgcolor=PALETTE["panel"],
+        font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
+        title=dict(
+            text=f"<b>{symbol}</b> Smart Money setup — <span style='color:{PALETTE['accent']}'>"
+            f"{signal.replace('_', ' ')} ({quality})</span>",
+            font=dict(size=18), x=0.02,
+        ),
+        xaxis=dict(showgrid=True, gridcolor=PALETTE["grid"], rangeslider=dict(visible=False)),
+        yaxis=dict(showgrid=True, gridcolor=PALETTE["grid"], tickfont=dict(size=11)),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=520,
+    )
+    return fig
+
+
 def build_analysis_gauges(trend: dict, intraday: dict, market: dict) -> go.Figure:
     """Three-gauge snapshot: daily-trend RSI, intraday momentum, and the VIX fear
     gauge -- the headline number from each `technical_analysis` read, at a glance."""

@@ -32,10 +32,12 @@ Real-time market data dashboard built with Streamlit and the Alpaca streaming AP
 
 ### Agent tab
 - **LLM paper-trading agent** — runs on a fixed cycle, reads already-fetched ticker data (bars, quotes, volume stats, news, options walls, position) via tool calls, and reasons about a trading regime and strategy
-- **Agent personalities** — Swing/Position, Momentum, and Breakout traders, each with its own system prompt, decision playbook, and tool set:
+- **Agent personalities** — Swing/Position, Momentum, Breakout, VWAP Mean-Reversion, and Smart Money traders, each with its own system prompt, decision playbook, and tool set:
   - *Swing* — daily trend + market regime first, then intraday/volume confirmation and put/call walls as support/resistance
   - *Momentum* — screens for gap + relative-volume + news catalyst, trades bull flags and VWAP reclaims
   - *Breakout* — waits for a volume-confirmed opening-range break, sizes via ATR-based `breakout_trade_geometry` targets requiring a minimum 2:1 reward/risk
+  - *VWAP Mean-Reversion* — gates on an ADX-confirmed range (below 20), fades 2σ stretches from session VWAP back to the mean via `analyze_vwap_bands` + `vwap_reversion_geometry` (target VWAP, stop one σ beyond entry, minimum 1.5:1 reward/risk), preferring rejection candles at the bands; long-only, so it trims/exits into upside stretches rather than shorting
+  - *Smart Money (Highest-Edge)* — the composite institutional setup: identifies higher-timeframe bullish **order blocks** (`analyze_order_blocks`) and enters only when price *returns* into a demand zone during the session with intraday confirmation — a rejection candle, a filled **fair value gap** (`analyze_fair_value_gaps`), or a breaker/break-of-structure — via the composite `analyze_smart_money_setup` read. Stop sits just beyond the block; target is the next opposing structural level, sized with `smart_money_trade_geometry` to a minimum 3:1 (typically 3:1–5:1) reward/risk; long-only. The **🏦 Smart Money** tab draws the order blocks as demand/supply zones over daily candles with the entry/stop/target geometry overlaid
 - **Provider-agnostic** — works with Gemini, OpenAI, or Anthropic, via a unified chat-completions client
 - **Smart wake-ups** — when it doesn't want to trade, the agent sets condition alerts on any continuously-updated value (price, bid/ask, spread, day high/low, volume, relative volume, portfolio value) to wake early the moment one is crossed, and always wakes early on fresh news for the ticker regardless of any alerts set — there is no idle "do nothing" decision
 - **Independent fill pricing** — decisions (buy/sell/alert) are handed to a separate decision tracker that fetches its own fill price, so the agent never picks the price its own trade is recorded at
@@ -89,9 +91,11 @@ marketview/
   stream.py     — WebSocket streaming threads for bars/trades and news
   historical.py — yfinance-based historical prices, dividends, earnings dates, static analysis
   technical_analysis.py — trend/intraday/market-regime reads, volume & consolidation analysis,
-                  opening-range breakout geometry, put/call wall + gamma exposure analysis
+                  opening-range breakout geometry, VWAP std-dev bands + ADX + reversion geometry,
+                  put/call wall + gamma exposure analysis, Smart Money order blocks / fair value
+                  gaps / composite setup + geometry
   options.py    — yfinance options chain fetching (open interest, Black-Scholes gamma per strike)
-  charts.py     — Plotly chart builders (candlestick + volume profile, gamma, performance, historical)
+  charts.py     — Plotly chart builders (candlestick + volume profile, gamma, Smart Money zones, performance, historical)
   news.py       — optional LLM pipeline for news impact scoring (Alpaca + WorldNews sources)
   llm.py        — unified chat-completions client over Gemini, OpenAI, and Anthropic
   observability.py — optional Langfuse tracing for the LLM pipeline (no-op if unconfigured)

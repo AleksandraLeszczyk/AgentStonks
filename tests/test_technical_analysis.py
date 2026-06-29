@@ -1,19 +1,28 @@
 import pandas as pd
 
 from marketview.technical_analysis import (
+    adx,
     analyze_consolidation,
+    analyze_fair_value_gaps,
     analyze_intraday,
     analyze_market,
+    analyze_order_blocks,
+    analyze_smart_money_setup,
     analyze_trend,
     analyze_volume,
+    analyze_vwap_bands,
     atr,
     breakout_trade_geometry,
+    find_fair_value_gaps,
+    find_order_blocks,
     get_put_call_walls_and_gamma,
     obv_trend,
     rsi,
     session_time_window,
+    smart_money_trade_geometry,
     sma,
     support_resistance,
+    vwap_reversion_geometry,
 )
 
 
@@ -326,6 +335,86 @@ class TestSessionTimeWindow:
         assert "window" in result
 
 
+def _osc_bars(n=40, center=100.0, amp=1.0, vol=1000):
+    """Choppy, alternating bars -- a ranging tape (balanced +DI/-DI, low ADX)."""
+    bars = []
+    for i in range(n):
+        c = center + (amp if i % 2 == 0 else -amp)
+        bars.append({"o": c, "h": c + 0.3, "l": c - 0.3, "c": c, "v": vol})
+    return bars
+
+
+class TestADX:
+    def test_returns_none_when_not_enough_bars(self):
+        assert adx(_make_bars([100.0] * 10), period=14) is None
+
+    def test_strong_uptrend_reads_as_trending(self):
+        closes = [100.0 + i for i in range(40)]
+        assert adx(_make_bars(closes), period=14) >= 25
+
+    def test_choppy_range_reads_as_non_trending(self):
+        # Balanced up/down movement -> +DI and -DI cancel -> low ADX.
+        assert adx(_osc_bars(40), period=14) < 25
+
+
+class TestAnalyzeVwapBands:
+    def test_not_enough_bars_returns_note(self):
+        assert "note" in analyze_vwap_bands(_make_bars([100.0, 101.0]))
+
+    def test_bands_are_ordered_around_vwap(self):
+        result = analyze_vwap_bands(_osc_bars(40))
+        assert result["lower_band_3sd"] < result["lower_band_2sd"] < result["lower_band_1sd"]
+        assert result["lower_band_1sd"] < result["vwap"] < result["upper_band_1sd"]
+        assert result["upper_band_1sd"] < result["upper_band_2sd"] < result["upper_band_3sd"]
+
+    def test_oversold_stretch_in_range_is_long_setup(self):
+        bars = _osc_bars(40)
+        # A deep dip on the final bar with a long lower wick (bullish rejection).
+        bars.append({"o": 97.0, "h": 97.2, "l": 95.5, "c": 97.0, "v": 1000})
+        result = analyze_vwap_bands(bars, num_std=2.0)
+        assert result["z_score"] <= -2.0
+        assert result["is_ranging"] is True
+        assert result["signal"] == "long_setup"
+        assert result["rejection_candle"] == "bullish_rejection"
+
+    def test_strong_trend_is_not_a_fade_setup(self):
+        closes = [100.0 + i for i in range(40)]
+        result = analyze_vwap_bands(_make_bars(closes), num_std=2.0)
+        assert result["is_ranging"] is False
+        assert result["signal"] in ("no_setup", "no_setup_trending")
+
+
+class TestVwapReversionGeometry:
+    def test_non_positive_inputs_return_note(self):
+        assert "note" in vwap_reversion_geometry(entry=0, vwap=100.0, std_dev=1.0)
+
+    def test_long_entry_must_be_below_vwap(self):
+        assert "note" in vwap_reversion_geometry(entry=101.0, vwap=100.0, std_dev=1.0, side="long")
+
+    def test_long_reversion_geometry_and_reward_risk(self):
+        # Entry 2sd below VWAP, stop 1sd further down, target VWAP -> 2:1.
+        result = vwap_reversion_geometry(entry=98.0, vwap=100.0, std_dev=1.0, side="long")
+        assert result["stop"] == 97.0
+        assert result["target"] == 100.0
+        assert result["risk_per_share"] == 1.0
+        assert result["reward_per_share"] == 2.0
+        assert result["reward_risk_ratio"] == 2.0
+        assert result["meets_min_reward_risk"] is True
+
+    def test_shallow_stretch_fails_min_reward_risk(self):
+        # Entry only 1sd below VWAP -> reward == risk -> 1:1, below the 1.5 minimum.
+        result = vwap_reversion_geometry(entry=99.0, vwap=100.0, std_dev=1.0, side="long")
+        assert result["reward_risk_ratio"] == 1.0
+        assert result["meets_min_reward_risk"] is False
+
+    def test_short_reversion_geometry(self):
+        result = vwap_reversion_geometry(entry=102.0, vwap=100.0, std_dev=1.0, side="short")
+        assert result["stop"] == 103.0
+        assert result["risk_per_share"] == 1.0
+        assert result["reward_per_share"] == 2.0
+        assert result["meets_min_reward_risk"] is True
+
+
 class TestBreakoutTradeGeometry:
     def test_non_positive_entry_or_stop_returns_note(self):
         assert "note" in breakout_trade_geometry(entry=0, stop=10)
@@ -358,3 +447,116 @@ class TestBreakoutTradeGeometry:
         assert result["best_reward_risk_ratio"] is None
         assert result["meets_min_reward_risk"] is False
         assert "cannot project a target" in result["summary"]
+
+
+def _ohlc(o, h, l, c, v=1000):
+    return {"o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+# A daily series with one clean bullish order block at index 8: a bearish candle
+# (the zone 98.5-101.5) followed by a three-bar up impulse that takes out the
+# prior swing high (a bullish break of structure), then a return back into the zone.
+def _smart_money_daily_bars():
+    bars = [_ohlc(100, 100.5, 99.5, 100) for _ in range(8)]
+    bars.append(_ohlc(101, 101.5, 98.5, 99))      # 8: bearish order block
+    bars.append(_ohlc(99.2, 104.5, 99.0, 104))    # 9: impulse up...
+    bars.append(_ohlc(104, 107.5, 103.5, 107))    # 10
+    bars.append(_ohlc(107, 110.5, 106.5, 110))    # 11 (breaks structure)
+    bars.append(_ohlc(109, 109.5, 105.5, 106))    # 12: return down...
+    bars.append(_ohlc(106, 106.5, 102.5, 103))    # 13
+    bars.append(_ohlc(103, 103.5, 100.5, 101))    # 14
+    bars.append(_ohlc(101, 101.5, 99.5, 100))     # 15: back into the zone
+    bars.append(_ohlc(100, 100.8, 99.2, 100))     # 16
+    bars.append(_ohlc(100, 100.6, 99.4, 100))     # 17
+    return bars
+
+
+class TestOrderBlocks:
+    def test_detects_bullish_order_block_at_displacement(self):
+        result = find_order_blocks(_smart_money_daily_bars())
+        bull = [b for b in result["order_blocks"] if b["type"] == "bullish"]
+        assert len(bull) == 1
+        block = bull[0]
+        assert block["index"] == 8
+        assert block["bottom"] == 98.5
+        assert block["top"] == 101.5
+
+    def test_block_marked_mitigated_after_price_returns(self):
+        block = [b for b in find_order_blocks(_smart_money_daily_bars())["order_blocks"] if b["type"] == "bullish"][0]
+        assert block["mitigated"] is True  # price returned into the zone after the impulse
+
+    def test_not_enough_bars_returns_note(self):
+        assert "note" in find_order_blocks(_make_bars([100.0, 101.0, 102.0]))
+
+    def test_analyze_order_blocks_finds_nearest_demand(self):
+        result = analyze_order_blocks(_smart_money_daily_bars(), spot=100.0)
+        demand = result["nearest_bullish_ob"]
+        assert demand is not None
+        assert demand["bottom"] == 98.5 and demand["top"] == 101.5
+
+
+class TestFairValueGaps:
+    def test_detects_bullish_gap(self):
+        # Middle bar gaps up: bar3 low (102) is above bar1 high (100).
+        bars = [_ohlc(99, 100, 98, 99), _ohlc(100, 103, 100, 102.5), _ohlc(103, 104, 102, 103.5)]
+        gaps = find_fair_value_gaps(bars)["fair_value_gaps"]
+        assert len(gaps) == 1
+        assert gaps[0]["type"] == "bullish"
+        assert gaps[0]["bottom"] == 100.0 and gaps[0]["top"] == 102.0
+        assert gaps[0]["filled"] is False
+
+    def test_gap_marked_filled_when_price_returns(self):
+        bars = [
+            _ohlc(99, 100, 98, 99),
+            _ohlc(100, 103, 100, 102.5),
+            _ohlc(103, 104, 102, 103.5),
+            _ohlc(103, 103.5, 101, 101.5),  # trades back down into the 100-102 gap
+        ]
+        gaps = find_fair_value_gaps(bars)["fair_value_gaps"]
+        assert gaps[0]["filled"] is True
+
+    def test_analyze_fair_value_gaps_not_enough_bars(self):
+        assert "note" in analyze_fair_value_gaps([_ohlc(100, 101, 99, 100)])
+
+
+class TestSmartMoneyTradeGeometry:
+    def test_meets_three_to_one(self):
+        result = smart_money_trade_geometry(entry=100.0, stop=98.0, target=107.0)
+        assert result["risk_per_share"] == 2.0
+        assert result["reward_per_share"] == 7.0
+        assert result["reward_risk_ratio"] == 3.5
+        assert result["meets_min_reward_risk"] is True
+
+    def test_below_minimum_reward_risk(self):
+        result = smart_money_trade_geometry(entry=100.0, stop=98.0, target=104.0)
+        assert result["reward_risk_ratio"] == 2.0
+        assert result["meets_min_reward_risk"] is False
+
+    def test_invalid_ordering_returns_note(self):
+        assert "note" in smart_money_trade_geometry(entry=100.0, stop=101.0, target=105.0)
+
+
+class TestSmartMoneySetup:
+    def test_long_setup_on_confirmed_return_into_demand(self):
+        daily = _smart_money_daily_bars()
+        # Last intraday bar is a bullish rejection candle (long lower wick, small body).
+        intraday = [_ohlc(100, 100.2, 99.8, 100) for _ in range(5)]
+        intraday.append(_ohlc(100.0, 100.3, 99.0, 100.2))
+        result = analyze_smart_money_setup(daily, intraday_bars=intraday, spot=100.0)
+        assert result["signal"] == "long_setup"
+        assert result["price_in_order_block"] is True
+        assert "rejection_candle" in result["intraday_confirmation"]
+        assert result["order_block"]["bottom"] == 98.5
+        assert result["meets_min_reward_risk"] is True
+
+    def test_watching_when_price_not_in_block(self):
+        daily = _smart_money_daily_bars()
+        result = analyze_smart_money_setup(daily, intraday_bars=None, spot=108.0)
+        assert result["signal"] == "watching"
+        assert result["price_in_order_block"] is False
+        assert result["order_block"] is not None
+
+    def test_no_setup_without_enough_daily_bars(self):
+        result = analyze_smart_money_setup(_make_bars([100.0, 101.0, 102.0]))
+        assert result["signal"] == "no_setup"
+        assert "note" in result

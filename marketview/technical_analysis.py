@@ -70,6 +70,48 @@ def atr(bars: list[dict], period: int = 14) -> "float | None":
     return float(value) if pd.notna(value) else None
 
 
+def adx(bars: list[dict], period: int = 14) -> "float | None":
+    """Wilder's Average Directional Index over the trailing bars.
+
+    ADX measures *trend strength* irrespective of direction. A reading below
+    ~20 marks a rangebound, non-trending tape -- the regime VWAP mean-reversion
+    needs, where price oscillates around VWAP. Above ~25 a real trend is under
+    way and VWAP becomes a trend line rather than a mean, so fading stretches
+    away from it stops working. Uses simple rolling means for the directional
+    smoothing, matching this module's ATR convention.
+    """
+    if len(bars) < 2 * period:
+        return None
+    df = pd.DataFrame(bars)
+    high, low, close = df["h"], df["l"], df["c"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+
+    atr_ = true_range.rolling(period).mean()
+    plus_di = 100 * plus_dm.rolling(period).mean() / atr_
+    minus_di = 100 * minus_dm.rolling(period).mean() / atr_
+    di_sum = (plus_di + minus_di).replace(0, pd.NA)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    value = dx.rolling(period).mean().iloc[-1]
+    return float(value) if pd.notna(value) else None
+
+
+def _adx_label(value: float) -> str:
+    if value < 20:
+        return "ranging (no trend)"
+    if value < 25:
+        return "weak / developing trend"
+    return "trending"
+
+
 def obv_trend(bars: list[dict], window: int = 10) -> "str | None":
     """Direction of on-balance volume over the trailing `window` bars."""
     if len(bars) < window + 1:
@@ -234,6 +276,146 @@ def analyze_intraday(bars: list[dict]) -> dict:
         "vwap_position": vwap_note,
         "atr": atr_value,
         "volatility_pct_of_price": round(volatility_pct, 2) if volatility_pct is not None else None,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def _session_bars(bars: list[dict]) -> list[dict]:
+    """The subset of bars belonging to the latest bar's calendar day.
+
+    VWAP is session-anchored -- it resets each trading day -- so the bands are
+    only meaningful over today's bars. Falls back to all bars when timestamps
+    are missing (e.g. synthetic/test bars) so the math still runs.
+    """
+    today = str(bars[-1].get("t", ""))[:10]
+    if not today:
+        return bars
+    day_bars = [b for b in bars if str(b.get("t", ""))[:10] == today]
+    return day_bars or bars
+
+
+def _rejection_candle(bar: dict) -> "str | None":
+    """Classify a bar as a bullish/bearish rejection (long-tail) candle.
+
+    A long lower wick with a close in the upper part of the range is buyers
+    rejecting lower prices (bullish); a long upper wick with a close in the
+    lower part is sellers rejecting higher prices (bearish). These are the
+    confirmation candles a mean-reversion trader wants to see right at a band.
+    """
+    o, h, l, c = float(bar["o"]), float(bar["h"]), float(bar["l"]), float(bar["c"])
+    rng = h - l
+    if rng <= 0:
+        return None
+    body = abs(c - o)
+    lower_wick = min(o, c) - l
+    upper_wick = h - max(o, c)
+    # A genuine rejection: one tail dominates the bar and the body is small.
+    if lower_wick >= rng * 0.5 and lower_wick > body and upper_wick < lower_wick:
+        return "bullish_rejection"
+    if upper_wick >= rng * 0.5 and upper_wick > body and lower_wick < upper_wick:
+        return "bearish_rejection"
+    return None
+
+
+def analyze_vwap_bands(bars: list[dict], num_std: float = 2.0) -> dict:
+    """VWAP mean-reversion read: session VWAP, standard-deviation bands, and the
+    ranging-vs-trending regime that decides whether fading a stretch is valid.
+
+    Computes the session-anchored VWAP and the volume-weighted standard
+    deviation of price around it, then expresses where price sits as a signed
+    z-score (number of std devs from VWAP). A setup only exists when ADX
+    confirms a range (below 20) AND price has stretched at least `num_std`
+    std devs from VWAP -- long below, short above -- ideally with a rejection
+    candle at the band. In a trending tape (ADX rising through 25) VWAP is a
+    trend line, not a mean, and stretches are not faded.
+    """
+    if len(bars) < 5:
+        return {"note": "not enough bars for VWAP band analysis"}
+
+    session = _session_bars(bars)
+    if len(session) < 5:
+        return {"note": "not enough bars in today's session yet for VWAP bands"}
+
+    df = pd.DataFrame(session)
+    typical = (df["h"] + df["l"] + df["c"]) / 3.0
+    vol = df["v"].astype(float)
+    cum_vol = vol.cumsum()
+    if cum_vol.iloc[-1] <= 0:
+        return {"note": "no traded volume in session bars; cannot compute VWAP"}
+
+    vwap_series = (typical * vol).cumsum() / cum_vol
+    variance = ((typical - vwap_series) ** 2 * vol).cumsum() / cum_vol
+    std = float(variance.iloc[-1]) ** 0.5
+    vwap = float(vwap_series.iloc[-1])
+    price = float(df["c"].iloc[-1])
+
+    z = (price - vwap) / std if std > 0 else 0.0
+
+    adx_value = adx(session, period=min(14, len(session) // 2))
+    is_ranging = adx_value is not None and adx_value < 20
+    rejection = _rejection_candle(session[-1])
+
+    if is_ranging and z <= -num_std:
+        signal = "long_setup"
+    elif is_ranging and z >= num_std:
+        signal = "short_setup"
+    elif adx_value is not None and adx_value >= 25 and abs(z) >= num_std:
+        # Stretched, but the tape is trending -- this is exactly the failure mode
+        # where VWAP becomes a trend line and fading it bleeds.
+        signal = "no_setup_trending"
+    else:
+        signal = "no_setup"
+
+    def _bands(k: float) -> "tuple[float, float]":
+        return round(vwap + k * std, 4), round(vwap - k * std, 4)
+
+    upper1, lower1 = _bands(1.0)
+    upper2, lower2 = _bands(2.0)
+    upper3, lower3 = _bands(3.0)
+
+    summary_parts = [
+        f"Price {price:.2f} is {abs(z):.1f} std devs "
+        f"{'above' if z >= 0 else 'below'} session VWAP {vwap:.2f} (1σ={std:.3f}).",
+    ]
+    if adx_value is not None:
+        summary_parts.append(f"ADX {adx_value:.0f} -- {_adx_label(adx_value)}.")
+    else:
+        summary_parts.append("ADX unavailable (too few bars) -- range not confirmed.")
+    if signal == "long_setup":
+        summary_parts.append(
+            f"Long mean-reversion setup: oversold ≥{num_std}σ below VWAP in a confirmed range, "
+            f"target VWAP {vwap:.2f}, stop below {lower3:.2f}."
+        )
+    elif signal == "short_setup":
+        summary_parts.append(
+            f"Short mean-reversion setup: overbought ≥{num_std}σ above VWAP in a confirmed range, "
+            f"target VWAP {vwap:.2f} (long-only accounts trim/exit here rather than short)."
+        )
+    elif signal == "no_setup_trending":
+        summary_parts.append("Stretched from VWAP but ADX shows a trend -- do not fade; VWAP is acting as a trend line.")
+    else:
+        summary_parts.append("No setup: price is not stretched far enough from VWAP, or the range is unconfirmed.")
+    if rejection:
+        summary_parts.append(f"Latest bar is a {rejection.replace('_', ' ')} candle.")
+
+    return {
+        "vwap": round(vwap, 4),
+        "price": round(price, 4),
+        "std_dev": round(std, 4),
+        "z_score": round(z, 2),
+        "num_std_trigger": num_std,
+        "upper_band_1sd": upper1,
+        "lower_band_1sd": lower1,
+        "upper_band_2sd": upper2,
+        "lower_band_2sd": lower2,
+        "upper_band_3sd": upper3,
+        "lower_band_3sd": lower3,
+        "adx": round(adx_value, 1) if adx_value is not None else None,
+        "adx_label": _adx_label(adx_value) if adx_value is not None else None,
+        "is_ranging": is_ranging,
+        "rejection_candle": rejection,
+        "signal": signal,
+        "session_bars": len(session),
         "summary": " ".join(summary_parts),
     }
 
@@ -881,5 +1063,436 @@ def breakout_trade_geometry(
         **reward_risk,
         "best_reward_risk_ratio": best_rr,
         "meets_min_reward_risk": meets_min_rr,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def vwap_reversion_geometry(
+    entry: float,
+    vwap: float,
+    std_dev: float,
+    side: str = "long",
+    min_reward_risk: float = 1.5,
+) -> dict:
+    """Mechanical entry/stop/target math for a VWAP mean-reversion trade.
+
+    The target is always VWAP (the mean price is expected to revert to). The
+    stop sits one standard deviation beyond the entry -- i.e. past the next
+    band -- so a long entered near the -2σ band stops out below -3σ, a short
+    entered near +2σ stops out above +3σ. Returns the reward-to-risk ratio and
+    whether it clears the mean-reversion minimum (1.5:1 by default; these are
+    tighter-R:R, higher-win-rate trades than breakouts).
+    """
+    if entry <= 0 or vwap <= 0 or std_dev <= 0:
+        return {"note": "entry, vwap, and std_dev must be positive"}
+    side = side.lower()
+    if side not in ("long", "short"):
+        return {"note": "side must be 'long' or 'short'"}
+
+    if side == "long":
+        if entry >= vwap:
+            return {"note": "for a long reversion, entry must be below VWAP (price stretched down to the band)"}
+        stop = entry - std_dev
+        target = vwap
+        reward = target - entry
+        risk = entry - stop
+    else:  # short
+        if entry <= vwap:
+            return {"note": "for a short reversion, entry must be above VWAP (price stretched up to the band)"}
+        stop = entry + std_dev
+        target = vwap
+        reward = entry - target
+        risk = stop - entry
+
+    reward_risk = reward / risk if risk > 0 else None
+    meets_min_rr = reward_risk is not None and reward_risk >= min_reward_risk
+
+    summary = (
+        f"{side.capitalize()} reversion: entry {entry:.2f}, stop {stop:.2f} "
+        f"(1σ={std_dev:.3f} beyond entry), target VWAP {target:.2f}. "
+        f"Reward/risk {reward_risk:.2f}:1. "
+        + (
+            f"Meets the {min_reward_risk:.1f}:1 minimum."
+            if meets_min_rr
+            else f"Below the {min_reward_risk:.1f}:1 minimum -- skip or wait for a deeper stretch / closer entry."
+        )
+    )
+
+    return {
+        "side": side,
+        "entry": round(entry, 4),
+        "stop": round(stop, 4),
+        "target": round(target, 4),
+        "risk_per_share": round(risk, 4),
+        "reward_per_share": round(reward, 4),
+        "reward_risk_ratio": round(reward_risk, 2) if reward_risk is not None else None,
+        "meets_min_reward_risk": meets_min_rr,
+        "summary": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Smart Money Concepts (SMC): order blocks, fair value gaps, and the composite
+# institutional setup that combines a higher-timeframe demand zone with an
+# intraday confirmation signal (rejection candle, FVG fill, or breaker/BOS).
+# ---------------------------------------------------------------------------
+
+
+def _order_block(bars: list[dict], i: int, kind: str, highs: list[float], lows: list[float]) -> dict:
+    """One order-block zone descriptor anchored on the origin candle at index `i`.
+
+    The zone is the full high-low range of that candle -- the price band
+    institutions are presumed to defend on a return.
+    """
+    top = highs[i]
+    bottom = lows[i]
+    return {
+        "type": kind,
+        "index": i,
+        "top": round(top, 4),
+        "bottom": round(bottom, 4),
+        "mid": round((top + bottom) / 2.0, 4),
+        "timestamp": bars[i].get("t"),
+    }
+
+
+def find_order_blocks(bars: list[dict], swing: int = 5, lookahead: int = 3, max_blocks: int = 6) -> dict:
+    """Locate institutional order blocks: the last opposing candle before a
+    displacement move that breaks structure.
+
+    A *bullish* order block is the last down-close candle before an up-move that
+    takes out the prior `swing`-bar high (a bullish break of structure) -- the
+    footprint of institutions absorbing supply before driving price up, and a
+    zone they tend to defend on a return. A *bearish* order block is the mirror:
+    the last up-close candle before a down-move that breaks the prior swing low.
+    Each block's zone is the full high-low range of its origin candle. A block is
+    "mitigated" once price has traded back into its zone after forming (its first
+    defence has already been tested), which makes a *fresh, unmitigated* block the
+    higher-quality one to trade a return into.
+    """
+    n = len(bars)
+    if n < swing + lookahead + 1:
+        return {"note": "not enough bars to locate order blocks", "order_blocks": []}
+
+    o = [float(b["o"]) for b in bars]
+    h = [float(b["h"]) for b in bars]
+    l = [float(b["l"]) for b in bars]
+    c = [float(b["c"]) for b in bars]
+
+    blocks: list[dict] = []
+    for i in range(swing, n - lookahead):
+        swing_high = max(h[i - swing : i])
+        swing_low = min(l[i - swing : i])
+        impulse_high = max(h[i + 1 : i + 1 + lookahead])
+        impulse_low = min(l[i + 1 : i + 1 + lookahead])
+        if c[i] < o[i] and impulse_high > swing_high:
+            blocks.append(_order_block(bars, i, "bullish", h, l))
+        elif c[i] > o[i] and impulse_low < swing_low:
+            blocks.append(_order_block(bars, i, "bearish", h, l))
+
+    for blk in blocks:
+        idx = blk["index"]
+        # Mitigated if any bar *after* the displacement window traded back into the zone.
+        blk["mitigated"] = any(
+            l[j] <= blk["top"] and h[j] >= blk["bottom"] for j in range(idx + lookahead + 1, n)
+        )
+        blk["bars_ago"] = n - 1 - idx
+
+    return {"order_blocks": blocks[-max_blocks:], "bar_count": n}
+
+
+def _nearest_bullish_demand(blocks: list[dict], spot: float) -> "dict | None":
+    """The bullish order block closest below (or containing) `spot` -- the demand
+    zone price would return *down* into. Highest such zone wins (nearest support)."""
+    candidates = [b for b in blocks if b["type"] == "bullish" and b["bottom"] <= spot]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda b: b["top"])
+
+
+def _nearest_bearish_supply(blocks: list[dict], spot: float) -> "dict | None":
+    """The bearish order block closest above `spot` -- the supply zone that makes
+    a natural upside target. Lowest such zone wins (nearest overhead resistance)."""
+    candidates = [b for b in blocks if b["type"] == "bearish" and b["top"] >= spot]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda b: b["bottom"])
+
+
+def analyze_order_blocks(bars: list[dict], spot: "float | None" = None) -> dict:
+    """Order-block read: every detected block plus the nearest bullish demand zone
+    at/below price and the nearest bearish supply zone above it.
+
+    The demand zone is the candidate entry on a return; the supply zone is a
+    natural structural target. Returns labeled values plus a one-line summary.
+    """
+    found = find_order_blocks(bars)
+    if "note" in found:
+        return found
+    blocks = found["order_blocks"]
+    if spot is None:
+        spot = float(bars[-1]["c"])
+
+    demand = _nearest_bullish_demand(blocks, spot)
+    supply = _nearest_bearish_supply(blocks, spot)
+
+    summary_parts = [f"Found {len(blocks)} order block(s) over {found['bar_count']} bars; spot {spot:.2f}."]
+    if demand is not None:
+        state = "unmitigated" if not demand["mitigated"] else "mitigated"
+        summary_parts.append(
+            f"Nearest bullish demand block {demand['bottom']:.2f}-{demand['top']:.2f} "
+            f"({state}, {demand['bars_ago']} bars ago)."
+        )
+    else:
+        summary_parts.append("No bullish demand block at/below price.")
+    if supply is not None:
+        summary_parts.append(f"Nearest bearish supply block {supply['bottom']:.2f}-{supply['top']:.2f} (target).")
+
+    return {
+        "spot": round(spot, 4),
+        "order_blocks": blocks,
+        "nearest_bullish_ob": demand,
+        "nearest_bearish_ob": supply,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def find_fair_value_gaps(bars: list[dict], max_gaps: int = 6) -> dict:
+    """Locate fair value gaps (FVGs): three-candle price imbalances institutions
+    tend to revisit.
+
+    A *bullish* FVG forms when a strong up-candle leaves a gap between the high of
+    the candle before it and the low of the candle after it (`low[i+1] > high[i-1]`);
+    the gap zone `(high[i-1], low[i+1])` is an unfilled imbalance that often acts as
+    support on a pullback. A *bearish* FVG is the mirror (`high[i+1] < low[i-1]`).
+    A gap is "filled" once a later bar trades back through the zone.
+    """
+    n = len(bars)
+    if n < 3:
+        return {"note": "not enough bars to locate fair value gaps", "fair_value_gaps": []}
+
+    h = [float(b["h"]) for b in bars]
+    l = [float(b["l"]) for b in bars]
+
+    gaps: list[dict] = []
+    for i in range(1, n - 1):
+        if l[i + 1] > h[i - 1]:
+            gaps.append({"type": "bullish", "index": i, "bottom": round(h[i - 1], 4), "top": round(l[i + 1], 4)})
+        elif h[i + 1] < l[i - 1]:
+            gaps.append({"type": "bearish", "index": i, "bottom": round(h[i + 1], 4), "top": round(l[i - 1], 4)})
+
+    for g in gaps:
+        idx = g["index"]
+        g["filled"] = any(l[j] <= g["top"] and h[j] >= g["bottom"] for j in range(idx + 2, n))
+        g["bars_ago"] = n - 1 - idx
+
+    return {"fair_value_gaps": gaps[-max_gaps:], "bar_count": n}
+
+
+def analyze_fair_value_gaps(bars: list[dict], spot: "float | None" = None) -> dict:
+    """Fair-value-gap read: detected gaps plus the nearest bullish FVG at/below
+    price (a support imbalance price may be filling now). Returns a one-line summary."""
+    found = find_fair_value_gaps(bars)
+    if "note" in found:
+        return found
+    gaps = found["fair_value_gaps"]
+    if spot is None:
+        spot = float(bars[-1]["c"])
+
+    bullish_below = [g for g in gaps if g["type"] == "bullish" and g["bottom"] <= spot * 1.001]
+    nearest = max(bullish_below, key=lambda g: g["top"]) if bullish_below else None
+
+    summary_parts = [f"Found {len(gaps)} fair value gap(s); spot {spot:.2f}."]
+    if nearest is not None:
+        state = "filled" if nearest["filled"] else "unfilled"
+        summary_parts.append(f"Nearest bullish FVG {nearest['bottom']:.2f}-{nearest['top']:.2f} ({state}).")
+    else:
+        summary_parts.append("No bullish FVG at/below price.")
+
+    return {
+        "spot": round(spot, 4),
+        "fair_value_gaps": gaps,
+        "nearest_bullish_fvg": nearest,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def _intraday_break_of_structure(bars: list[dict], swing: int = 5) -> bool:
+    """Whether intraday price has made a bullish break of structure and is holding it:
+    the recent `swing` bars took out the prior `swing`-bar high and price still sits
+    above that broken level. This is the lightweight 'breaker / structure flip'
+    confirmation -- old resistance reclaimed as support."""
+    if len(bars) < 2 * swing:
+        return False
+    h = [float(b["h"]) for b in bars]
+    c = [float(b["c"]) for b in bars]
+    prior_high = max(h[-2 * swing : -swing])
+    recent_high = max(h[-swing:])
+    return recent_high > prior_high and c[-1] > prior_high
+
+
+def smart_money_trade_geometry(
+    entry: float, stop: float, target: float, min_reward_risk: float = 3.0
+) -> dict:
+    """Mechanical entry/stop/target math for a long Smart Money setup.
+
+    Entry is at the higher-timeframe demand (order block) on a return, the stop
+    sits just beyond the block, and the target is the next opposing structural
+    level. `meets_min_reward_risk` flags whether the reward-to-risk clears the
+    3:1 minimum the Smart Money setup demands (it typically runs 3:1 to 5:1).
+    """
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return {"note": "entry, stop, and target must be positive prices"}
+    if not (stop < entry < target):
+        return {"note": "a long smart-money setup needs stop < entry < target"}
+
+    risk = entry - stop
+    reward = target - entry
+    reward_risk = reward / risk if risk > 0 else None
+    meets_min_rr = reward_risk is not None and reward_risk >= min_reward_risk
+
+    summary = (
+        f"Long smart-money setup: entry {entry:.2f}, stop {stop:.2f} (just beyond the block), "
+        f"target {target:.2f}. Reward/risk {reward_risk:.2f}:1. "
+        + (
+            f"Meets the {min_reward_risk:.0f}:1 minimum."
+            if meets_min_rr
+            else f"Below the {min_reward_risk:.0f}:1 minimum -- skip, or wait for a deeper return into the block."
+        )
+    )
+
+    return {
+        "entry": round(entry, 4),
+        "stop": round(stop, 4),
+        "target": round(target, 4),
+        "risk_per_share": round(risk, 4),
+        "reward_per_share": round(reward, 4),
+        "reward_risk_ratio": round(reward_risk, 2) if reward_risk is not None else None,
+        "meets_min_reward_risk": meets_min_rr,
+        "summary": summary,
+    }
+
+
+def analyze_smart_money_setup(
+    daily_bars: list[dict],
+    intraday_bars: "list[dict] | None" = None,
+    spot: "float | None" = None,
+    min_reward_risk: float = 3.0,
+    stop_buffer: float = 0.1,
+) -> dict:
+    """The composite Smart Money setup: a higher-timeframe bullish order block that
+    price is returning into, confirmed by an intraday signal.
+
+    Combines the higher-timeframe structure (daily order blocks + trend regime)
+    with intraday confirmation (a bullish rejection candle, a bullish FVG that price
+    has filled, or an intraday break-of-structure/breaker). A `long_setup` requires
+    all of: a bullish demand block at/below price, a non-bearish daily regime, price
+    actually inside that block, at least one intraday confirmation, and a target
+    (the next opposing structural level) that clears the 3:1 reward-to-risk minimum.
+    Anything short of that with a valid block reads as `watching`; no qualifying
+    block at all is `no_setup`.
+    """
+    if not daily_bars or len(daily_bars) < 8:
+        return {"note": "not enough daily bars for a smart-money structural read", "signal": "no_setup"}
+
+    if spot is None:
+        ref = intraday_bars if intraday_bars else daily_bars
+        spot = float(ref[-1]["c"])
+
+    ob = analyze_order_blocks(daily_bars, spot=spot)
+    demand = ob.get("nearest_bullish_ob")
+    supply = ob.get("nearest_bearish_ob")
+    regime = analyze_trend(daily_bars).get("regime", "neutral")
+
+    price_in_ob = demand is not None and demand["bottom"] <= spot <= demand["top"]
+
+    # Intraday confirmation signals (any one qualifies; more = higher quality).
+    confirmations: list[str] = []
+    nearest_fvg = None
+    if intraday_bars and len(intraday_bars) >= 3:
+        if _rejection_candle(intraday_bars[-1]) == "bullish_rejection":
+            confirmations.append("rejection_candle")
+        fvg = analyze_fair_value_gaps(intraday_bars, spot=spot)
+        nearest_fvg = fvg.get("nearest_bullish_fvg")
+        if nearest_fvg is not None and nearest_fvg.get("filled"):
+            confirmations.append("fvg_fill")
+        if _intraday_break_of_structure(intraday_bars):
+            confirmations.append("breaker")
+
+    # Entry, stop, and target geometry.
+    entry = round(spot if price_in_ob else (demand["top"] if demand else spot), 4)
+    suggested_stop = None
+    structural_target = None
+    geometry = None
+    if demand is not None:
+        zone_height = demand["top"] - demand["bottom"]
+        suggested_stop = round(demand["bottom"] - stop_buffer * max(zone_height, entry * 0.001), 4)
+        if supply is not None and supply["bottom"] > entry:
+            structural_target = supply["bottom"]
+        else:
+            recent_high = max(b["h"] for b in daily_bars[-20:])
+            structural_target = round(recent_high, 4) if recent_high > entry else None
+        if structural_target is not None:
+            geometry = smart_money_trade_geometry(entry, suggested_stop, structural_target, min_reward_risk)
+
+    meets_rr = bool(geometry and geometry.get("meets_min_reward_risk"))
+
+    if demand is None or regime == "bearish":
+        signal = "no_setup"
+    elif price_in_ob and confirmations and meets_rr:
+        signal = "long_setup"
+    else:
+        signal = "watching"
+
+    if signal == "long_setup" and len(confirmations) >= 2 and regime == "bullish" and (
+        geometry and geometry["reward_risk_ratio"] >= 4.0
+    ):
+        quality = "A+"
+    elif signal == "long_setup":
+        quality = "B"
+    else:
+        quality = "C"
+
+    summary_parts = [f"HTF regime {regime}; spot {spot:.2f}."]
+    if demand is not None:
+        loc = "inside" if price_in_ob else ("above" if spot > demand["top"] else "below")
+        summary_parts.append(
+            f"Bullish demand block {demand['bottom']:.2f}-{demand['top']:.2f} "
+            f"({'unmitigated' if not demand['mitigated'] else 'mitigated'}); price is {loc} it."
+        )
+    else:
+        summary_parts.append("No bullish demand block at/below price.")
+    summary_parts.append(
+        f"Intraday confirmation: {', '.join(confirmations) if confirmations else 'none'}."
+    )
+    if geometry is not None and "reward_risk_ratio" in geometry:
+        summary_parts.append(
+            f"Geometry entry {entry:.2f} / stop {suggested_stop:.2f} / target {structural_target:.2f} "
+            f"= {geometry['reward_risk_ratio']:.1f}:1."
+        )
+    summary_parts.append(
+        {
+            "long_setup": f"LONG setup ({quality}): return into demand with confirmation and ≥{min_reward_risk:.0f}:1 target.",
+            "watching": "Watching: a valid demand block exists but price/confirmation/RR isn't all there yet.",
+            "no_setup": "No setup: no bullish demand block at/below price, or the daily regime is bearish.",
+        }[signal]
+    )
+
+    return {
+        "signal": signal,
+        "quality": quality,
+        "htf_regime": regime,
+        "spot": round(spot, 4),
+        "order_block": demand,
+        "supply_block": supply,
+        "price_in_order_block": price_in_ob,
+        "intraday_confirmation": confirmations,
+        "confirmed": bool(confirmations),
+        "nearest_bullish_fvg": nearest_fvg,
+        "suggested_entry": entry if demand is not None else None,
+        "suggested_stop": suggested_stop,
+        "structural_target": structural_target,
+        "reward_risk_to_target": geometry["reward_risk_ratio"] if geometry and "reward_risk_ratio" in geometry else None,
+        "meets_min_reward_risk": meets_rr,
         "summary": " ".join(summary_parts),
     }

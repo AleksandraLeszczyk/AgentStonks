@@ -16,6 +16,7 @@ from .charts import (
     build_gamma_chart,
     build_historical_chart,
     build_performance_chart,
+    build_smart_money_chart,
     empty_chart,
 )
 from .config import (
@@ -56,7 +57,15 @@ from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import PRICE_AXIS_ALERT_FIELDS, AppState, current_volume_ratio, format_alert
 from .stream import launch_stream, launch_stream_news
-from .technical_analysis import analyze_intraday, analyze_market, analyze_trend, get_put_call_walls_and_gamma
+from .technical_analysis import (
+    analyze_fair_value_gaps,
+    analyze_intraday,
+    analyze_market,
+    analyze_order_blocks,
+    analyze_smart_money_setup,
+    analyze_trend,
+    get_put_call_walls_and_gamma,
+)
 
 
 def _get_state() -> AppState:
@@ -547,6 +556,54 @@ def _technical_analysis_panel(symbol: str) -> None:
                 st.markdown(f"- {insight}")
 
 
+@st.fragment(run_every=CHART_POLL_SEC)
+def _smart_money_panel(symbol: str) -> None:
+    """Visualizes the Smart Money Concepts setup: higher-timeframe daily order blocks
+    drawn as demand/supply zones over the candles, with the suggested entry/stop/target
+    geometry -- the same composite read the `smart_money` agent personality trades
+    from, with the intraday confirmation reported alongside."""
+    state = _get_state()
+    sym = symbol.strip().upper() or state.symbol
+    with state.lock:
+        intraday = list(state.bars)
+        spot = state.last_price
+    daily = state.daily_bars
+
+    if not sym or not daily:
+        st.info("Start the Live stream for a symbol first so there's daily structure to analyze.")
+        return
+
+    setup = analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
+    blocks = analyze_order_blocks(daily, spot=spot).get("order_blocks", [])
+
+    # The chart renders daily candles, so only the daily order blocks (whose indices
+    # map to that x-axis) are drawn as zones. Intraday FVGs drive the agent's
+    # confirmation read but have no position on a daily chart, so they're left off.
+    chart_analysis = {**setup, "order_blocks": blocks, "fair_value_gaps": []}
+    st.plotly_chart(build_smart_money_chart(daily, chart_analysis, sym), width="stretch")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Signal", setup.get("signal", "n/a").replace("_", " "), setup.get("quality", ""))
+    rr = setup.get("reward_risk_to_target")
+    c2.metric("Reward : Risk", f"{rr:.1f}:1" if rr is not None else "n/a")
+    confs = setup.get("intraday_confirmation") or []
+    c3.metric("Intraday confirmation", ", ".join(confs) if confs else "none")
+
+    st.caption(setup.get("summary", ""))
+
+    ob = setup.get("order_block")
+    if ob is not None:
+        e, s, t = setup.get("suggested_entry"), setup.get("suggested_stop"), setup.get("structural_target")
+        st.markdown(
+            f"- **Demand order block:** {ob['bottom']:.2f}–{ob['top']:.2f} "
+            f"({'unmitigated' if not ob['mitigated'] else 'mitigated'}, {ob['bars_ago']} bars ago)"
+        )
+        if e is not None and s is not None and t is not None:
+            st.markdown(f"- **Geometry:** entry {e:.2f} · stop {s:.2f} · target {t:.2f}")
+    if "note" in setup and setup.get("order_block") is None:
+        st.caption(setup["note"])
+
+
 def _record_wall_snapshot(state: AppState, call_wall: float, put_wall: float) -> list[dict]:
     """Append a {call_wall, put_wall} snapshot if it differs from the last one, so the
     agent's trend read (rising/falling walls) reflects real shifts, not poll noise."""
@@ -1008,8 +1065,8 @@ def build_ui() -> None:
             )
     state = _get_state()
 
-    tab_live, tab_historical, tab_analysis, tab_walls, tab_agent = st.tabs(
-        ["📡 Live", "🗂️ Historical", "🔬 Technical Analysis", "🧱 Put/Call Walls", "🤖 Agent"]
+    tab_live, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
+        ["📡 Live", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
     )
 
     with tab_live:
@@ -1109,6 +1166,9 @@ def build_ui() -> None:
 
     with tab_analysis:
         _technical_analysis_panel(symbol)
+
+    with tab_smart_money:
+        _smart_money_panel(symbol)
 
     with tab_walls:
         _options_walls_panel(symbol)
