@@ -131,3 +131,55 @@ def test_fallback_news_loop_skips_polling_when_stream_connected(monkeypatch):
     stream._fallback_news_loop("AAPL", "k", "s", "wn-key", state, _StopAfter(2))
 
     assert called == []
+
+
+def test_fire_due_alerts_wakes_on_price_field():
+    state = AppState()
+    state.last_price = 151.0
+    state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
+
+    stream._fire_due_alerts(state)
+
+    assert state.alerts == []  # cleared once fired
+    assert state.agent_wake_event.is_set()
+    assert "last_price above 150" in state.agent_wake_reason
+
+
+def test_fire_due_alerts_wakes_on_non_price_field():
+    """Alerts on continuously-updated, non-price fields (here cumulative day volume)
+    fire too -- not just price levels."""
+    state = AppState()
+    state.day_volume = 6_000_000
+    state.alerts = [{"field": "day_volume", "condition": "above", "value": 5_000_000}]
+
+    stream._fire_due_alerts(state)
+
+    assert state.alerts == []
+    assert state.agent_wake_event.is_set()
+
+
+def test_fire_due_alerts_does_not_wake_when_unmet():
+    state = AppState()
+    state.last_price = 149.0
+    state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
+
+    stream._fire_due_alerts(state)
+
+    assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+    assert not state.agent_wake_event.is_set()
+
+
+def test_fallback_bars_loop_fires_volume_alert(monkeypatch):
+    """A day_volume alert fires from the REST fallback path, not just the live stream."""
+    state = AppState()
+    state.bars_connected = False
+    state.alerts = [{"field": "day_volume", "condition": "above", "value": 50.0}]
+    bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
+
+    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
+
+    stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(1))
+
+    assert state.alerts == []
+    assert state.agent_wake_event.is_set()

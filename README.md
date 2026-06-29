@@ -37,7 +37,7 @@ Real-time market data dashboard built with Streamlit and the Alpaca streaming AP
   - *Momentum* — screens for gap + relative-volume + news catalyst, trades bull flags and VWAP reclaims
   - *Breakout* — waits for a volume-confirmed opening-range break, sizes via ATR-based `breakout_trade_geometry` targets requiring a minimum 2:1 reward/risk
 - **Provider-agnostic** — works with Gemini, OpenAI, or Anthropic, via a unified chat-completions client
-- **Smart wake-ups** — instead of sleeping blind between cycles, the agent can set a price alert (low, high, or both) to wake early if price crosses a watched level, and always wakes early on fresh news for the ticker
+- **Smart wake-ups** — instead of sleeping blind between cycles, the agent can set condition alerts on any continuously-updated value (price, bid/ask, spread, day high/low, volume, relative volume, portfolio value) to wake early the moment one is crossed, and always wakes early on fresh news for the ticker regardless of any alerts set
 - **Independent fill pricing** — decisions (buy/sell/sleep/alert) are handed to a separate decision tracker that fetches its own fill price, so the agent never picks the price its own trade is recorded at
 - **Paper broker only** — no real orders are ever placed; each filled buy/sell costs a fixed simulated fee
 - **Equity curve & performance summary** — replays recorded decisions against streamed bars to reconstruct portfolio value over time

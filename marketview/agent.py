@@ -24,7 +24,7 @@ from . import observability as obs
 from . import technical_analysis as ta
 from .config import AGENT_MAX_TOOL_ITERS
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
-from .state import alert_triggered
+from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
@@ -107,25 +107,29 @@ resistance, RSI, ATR, or wall levels you used, not just the regime label. Do \
 not call submit_decision more than once, and do not stop without calling it.
 
 Be decisive but not reckless: sleep is a valid and often correct decision. \
-If you'd otherwise sleep but there's a specific price level (or a bracket of \
-two -- a downside level and an upside level, e.g. a stop-loss below and a \
-breakout level above) that would change your mind before the next scheduled \
-cycle, use action "alert" instead of "sleep" and set alert_low_price (wakes \
-you when price falls to/below it) and/or alert_high_price (wakes you when \
-price rises to/above it). Ground these levels in what the tools already gave \
-you -- the daily support/resistance, the call/put walls, or a recent \
-intraday swing high/low -- rather than picking an arbitrary distance from the \
-current price. Set just one for a single level, or both to watch a range \
-from both sides in one cycle. This wakes you up early -- as soon as either \
-level is crossed -- instead of waiting out the full fixed cycle interval \
-blind to what happens in between. Use plain "sleep" when no specific level \
-is worth watching.
+If you'd otherwise sleep but there's a specific, observable condition that \
+would change your mind before the next scheduled cycle, use action "alert" \
+instead of "sleep" and pass an `alerts` array of one or more conditions to \
+watch. Each condition names a continuously-updated live field, a direction \
+("above" = reaches/exceeds, "below" = reaches/falls to), and a value. You are \
+not limited to price: you can watch last_price, bid_price/ask_price, the \
+bid/ask spread, day_high/day_low, cumulative day_volume, the volume_ratio \
+(today's volume vs its average), or your own portfolio_value -- whichever \
+actually captures what would change your decision. Common uses: a stop-loss \
+below and a breakout level above on last_price (a two-sided bracket), or a \
+last_price level paired with a volume_ratio threshold so you only re-engage on \
+a move that has real participation behind it. Ground price levels in what the \
+tools already gave you -- the daily support/resistance, the call/put walls, or \
+a recent intraday swing high/low -- rather than an arbitrary distance from the \
+current price. The first condition to trigger wakes you immediately, instead of \
+waiting out the full fixed cycle interval blind to what happens in between. Use \
+plain "sleep" only when nothing specific is worth watching.
 
-Regardless of which action you choose, you will also be woken up early -- \
-before the next scheduled cycle -- if fresh news for the ticker arrives \
-while you're waiting. You don't need to do anything to enable this; it \
-happens automatically so a sleep/alert decision is never blind to breaking \
-news.
+Separately and unconditionally, you are ALWAYS woken up early -- before the \
+next scheduled cycle, and regardless of which action you chose or what alerts \
+you did or didn't set -- the moment fresh news for the ticker arrives. You \
+don't need to (and can't) configure this; breaking news always interrupts a \
+sleep or alert wait, so a decision is never blind to it.
 """
 
 MOMENTUM_SYSTEM_PROMPT = """\
@@ -187,21 +191,23 @@ the setup fails -- don't wait to see.
 6. FINALIZE. Call submit_decision exactly once: action (buy/sell/sleep/ \
 alert), quantity (omit or 0 for sleep/alert), the regime, and reasoning that \
 names the setup, the breakout/stop levels, and the volume confirmation you \
-used. If you'd otherwise sleep but there's a specific trigger level worth \
-watching (a breakout level above, a stop level below, or both), use action \
-"alert" with alert_low_price and/or alert_high_price instead -- this wakes \
-you the instant price crosses it rather than waiting out the full cycle \
-blind. Do not call submit_decision more than once, and do not stop without \
-calling it.
+used. If you'd otherwise sleep but there's a specific trigger worth watching, \
+use action "alert" with an `alerts` array instead -- each entry names a \
+continuously-updated field (above/below a value) and the first to fire wakes \
+you the instant it happens rather than waiting out the full cycle blind. For \
+momentum that usually means last_price above a breakout level and/or below a \
+stop, but you can also watch volume_ratio above a threshold to wake only when \
+participation actually surges, or the bid/ask spread to gauge liquidity. Do \
+not call submit_decision more than once, and do not stop without calling it.
 
 Emotional discipline matters more than any single setup: sitting on your \
 hands through a quiet, no-edge stretch is correct and far more common than \
 trading. Sleep is a valid and often correct decision.
 
-Regardless of which action you choose, you will also be woken up early -- \
-before the next scheduled cycle -- if fresh news for the ticker arrives, or \
-if a high-volume alert fires intraday. You don't need to do anything to \
-enable this; it happens automatically.
+Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
+which action you chose or what alerts you set -- the moment fresh news for the \
+ticker arrives. That interrupt is automatic and cannot be turned off, so a \
+sleep or alert wait is never blind to breaking news.
 """
 
 BREAKOUT_SYSTEM_PROMPT = """\
@@ -274,20 +280,23 @@ in step 8 rather than risking a full round-trip back to the original stop.
 alert), quantity (omit or 0 for sleep/alert), the regime, and reasoning that \
 names the range level, the volume confirmation, the entry/stop/target \
 geometry, and why this action follows from it. If you'd otherwise sleep but \
-there's a specific level worth watching (the range high above, the range low \
-below, or both), use action "alert" with alert_low_price and/or \
-alert_high_price instead -- this wakes you the instant price crosses it \
-rather than waiting out the full cycle blind. Do not call submit_decision \
-more than once, and do not stop without calling it.
+there's a specific condition worth watching, use action "alert" with an \
+`alerts` array instead -- each entry names a continuously-updated field \
+(above/below a value) and the first to fire wakes you the instant it happens \
+rather than waiting out the full cycle blind. For a forming breakout that is \
+typically last_price above the range high and/or below the range low, ideally \
+paired with volume_ratio above your confirmation threshold so you wake on a \
+break that volume is actually behind, not a quiet drift through the level. Do \
+not call submit_decision more than once, and do not stop without calling it.
 
 Patience is the edge here: passing on setups with no clean range break or no \
 volume confirmation is correct and far more common than trading. Sleep is a \
 valid and often correct decision.
 
-Regardless of which action you choose, you will also be woken up early -- \
-before the next scheduled cycle -- if fresh news for the ticker arrives, or \
-if a high-volume alert fires intraday. You don't need to do anything to \
-enable this; it happens automatically.
+Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
+which action you chose or what alerts you set -- the moment fresh news for the \
+ticker arrives. That interrupt is automatic and cannot be turned off, so a \
+sleep or alert wait is never blind to breaking news.
 """
 
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
@@ -442,6 +451,10 @@ _TOOL_GET_POSITION = {
     },
 }
 
+# Bullet list of every watchable field, injected into the alert tool description
+# so the model always sees the current, authoritative set.
+_ALERT_FIELDS_DOC = "; ".join(f"'{name}' ({desc})" for name, desc in ALERTABLE_FIELDS.items())
+
 _TOOL_SUBMIT_DECISION = {
     "type": "function",
     "function": {
@@ -467,19 +480,37 @@ _TOOL_SUBMIT_DECISION = {
                     "type": "string",
                     "description": "Concise justification covering regime, strategy, and why this action follows from it.",
                 },
-                "alert_low_price": {
-                    "type": "number",
+                "alerts": {
+                    "type": "array",
                     "description": (
-                        "When action is 'alert': wake the agent early if price falls to or "
-                        "below this level. Optional -- set this, alert_high_price, or both."
+                        "When action is 'alert': one or more conditions on continuously-updated "
+                        "live data that should wake you early -- the instant any one is met -- "
+                        "instead of sleeping out the full cycle. Each condition watches one "
+                        "field, with 'above' meaning the field reaches or exceeds the value and "
+                        "'below' meaning it reaches or falls to the value. Provide several to "
+                        "watch a range or multiple signals at once; the first to trigger wakes "
+                        f"you. Watchable fields: {_ALERT_FIELDS_DOC}."
                     ),
-                },
-                "alert_high_price": {
-                    "type": "number",
-                    "description": (
-                        "When action is 'alert': wake the agent early if price rises to or "
-                        "above this level. Optional -- set this, alert_low_price, or both."
-                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "field": {
+                                "type": "string",
+                                "enum": list(ALERTABLE_FIELDS.keys()),
+                                "description": "Which live state field to watch.",
+                            },
+                            "condition": {
+                                "type": "string",
+                                "enum": ["above", "below"],
+                                "description": "'above' = field >= value; 'below' = field <= value.",
+                            },
+                            "value": {
+                                "type": "number",
+                                "description": "Threshold the field is compared against.",
+                            },
+                        },
+                        "required": ["field", "condition", "value"],
+                    },
                 },
             },
             "required": ["action", "reasoning"],
@@ -724,7 +755,7 @@ def run_agent_cycle(
     )
     system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
     tools = PERSONALITY_TOOLS.get(personality, BASE_TOOLS)
-    state.price_alerts = []
+    state.alerts = []
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {
@@ -786,19 +817,16 @@ def run_agent_cycle(
                 quantity = float(args.get("quantity") or 0)
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
-                alert_low_price = args.get("alert_low_price")
-                alert_high_price = args.get("alert_high_price")
-                alerts = []
-                if alert_low_price is not None:
-                    alerts.append({"price": float(alert_low_price), "condition": "below"})
-                if alert_high_price is not None:
-                    alerts.append({"price": float(alert_high_price), "condition": "above"})
+                # Validate each requested condition against the watchable-field
+                # registry; silently drop malformed specs so one bad entry
+                # doesn't sink a valid bracket.
+                alerts = [a for a in (normalize_alert(r) for r in (args.get("alerts") or [])) if a is not None]
 
                 if action == "alert" and not alerts:
                     # Some models (small/cheap ones especially) pick action="alert" but
-                    # forget the optional price fields. Reject and let the model retry
-                    # instead of silently demoting to sleep -- it never sees that
-                    # happen otherwise, so it can't course-correct.
+                    # forget the conditions, or name a field that isn't watchable. Reject
+                    # and let the model retry instead of silently demoting to sleep -- it
+                    # never sees that happen otherwise, so it can't course-correct.
                     messages.append(
                         {
                             "role": "tool",
@@ -806,10 +834,12 @@ def run_agent_cycle(
                             "content": json.dumps(
                                 {
                                     "error": (
-                                        "action 'alert' requires alert_low_price and/or "
-                                        "alert_high_price. Call submit_decision again with at "
-                                        "least one price level, or use action 'sleep' if no "
-                                        "level is worth watching."
+                                        "action 'alert' requires a non-empty 'alerts' array, each "
+                                        "entry having field (one of: "
+                                        f"{', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
+                                        "'below'), and a numeric value. Call submit_decision again "
+                                        "with at least one valid condition, or use action 'sleep' "
+                                        "if nothing is worth watching."
                                     )
                                 }
                             ),
@@ -823,7 +853,7 @@ def run_agent_cycle(
                     )
                 elif action == "alert":
                     decision = tracker.record_alert(symbol, alerts, reasoning)
-                    state.price_alerts = alerts
+                    state.alerts = alerts
                 else:
                     decision = tracker.record_sleep(symbol, reasoning)
                 _log(
@@ -897,22 +927,19 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
     if stop_event.is_set():
         return
 
-    # The stream only signals on the *next* tick, so an alert level that's
-    # already satisfied by the current price (the instant it's set) would
-    # otherwise wait for a tick that may not come. Catch that once, up front.
-    alerts = state.price_alerts
+    # The stream only signals on the *next* tick, so an alert condition that's
+    # already satisfied the instant it's set would otherwise wait for a tick
+    # that may not come. Catch that once, up front.
+    alerts = state.alerts
     if alerts:
-        with state.lock:
-            price = state.last_price
-        if price is not None:
-            hit = next((a for a in alerts if alert_triggered(price, a)), None)
-            if hit is not None:
-                state.price_alerts = []
-                _log(
-                    state,
-                    {"type": "status", "text": f"Price alert hit at {price} ({hit['condition']} {hit['price']}); waking early."},
-                )
-                return
+        hit = next((a for a in alerts if alert_triggered(state, a)), None)
+        if hit is not None:
+            state.alerts = []
+            _log(
+                state,
+                {"type": "status", "text": f"Alert already met: {format_alert(hit)}; waking early."},
+            )
+            return
 
     # An active alert means the agent should sleep until that condition
     # fires or news arrives -- not get woken by the regular cycle timer too.

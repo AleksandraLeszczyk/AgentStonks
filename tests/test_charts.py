@@ -106,8 +106,8 @@ class TestBuildChart:
 
     def test_price_alerts_plot_as_shapes(self):
         alerts = [
-            {"price": 150.0, "condition": "above"},
-            {"price": 95.0, "condition": "below"},
+            {"field": "last_price", "condition": "above", "value": 150.0},
+            {"field": "day_low", "condition": "below", "value": 95.0},
         ]
         fig = build_chart(BARS, [], [], "AAPL", SESSION_START, price_alerts=alerts)
         shape_levels = [s.y0 for s in fig.layout.shapes]

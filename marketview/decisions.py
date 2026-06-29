@@ -68,10 +68,11 @@ class DecisionTracker:
         return decision
 
     def record_alert(self, symbol: str, alerts: list[dict], reasoning: str) -> Decision:
-        """Record a no-op cycle where the agent set one or two price alerts instead of trading.
+        """Record a no-op cycle where the agent set one or more condition alerts instead of trading.
 
-        `alerts` holds 1-2 entries shaped like {"price": float, "condition": "above" | "below"}
-        -- typically a low (below) and/or high (above) level to wake the agent early on.
+        Each entry is shaped {"field": str, "condition": "above" | "below", "value": float},
+        watching a continuously-updated state field (price, bid/ask, spread, day volume,
+        volume ratio, portfolio value, ...) to wake the agent early when it crosses the value.
         """
         decision = Decision(
             ts=datetime.now(timezone.utc).isoformat(),

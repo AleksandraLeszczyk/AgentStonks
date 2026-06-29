@@ -12,9 +12,36 @@ from .config import BARS_STREAM_URL, FALLBACK_POLL_SEC, MAX_BARS, NEWS_FALLBACK_
 from .historical import fetch_intraday_bars
 from .news import fetch_news_with_fallback
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
-from .state import AppState, alert_triggered, current_volume_ratio, today_daily_bar, today_daily_volume
+from .state import (
+    AppState,
+    alert_field_value,
+    alert_triggered,
+    current_volume_ratio,
+    format_alert,
+    today_daily_bar,
+    today_daily_volume,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _fire_due_alerts(state: AppState) -> None:
+    """Check every pending condition alert against the current state and, if any
+    is met, clear the set and wake the agent early. Called after each kind of
+    tick (bars, trades, quotes) so an alert on any continuously-updated field --
+    price, bid/ask, spread, day volume, volume ratio, portfolio value -- fires as
+    soon as its field crosses the threshold, regardless of which tick moved it.
+    """
+    alerts = state.alerts
+    if not alerts:
+        return
+    hit = next((a for a in alerts if alert_triggered(state, a)), None)
+    if hit is not None:
+        state.alerts = []
+        value = alert_field_value(state, hit.get("field"))
+        value_str = f"{value:,.4f}" if isinstance(value, (int, float)) else "n/a"
+        state.agent_wake_reason = f"Alert hit: {format_alert(hit)} (now {value_str})."
+        state.agent_wake_event.set()
 
 
 _TF_MINUTES: dict[str, int] = {
@@ -120,6 +147,10 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                             f"the {vol_multiplier:.2f}x threshold."
                         )
                         state.agent_wake_event.set()
+
+                # Generic condition alerts: a bar moves day_high/day_low/day_volume
+                # (and the derived volume_ratio), so re-check after every bar.
+                _fire_due_alerts(state)
             elif t == "t" and msg.get("S") == symbol:
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
                 with state.lock:
@@ -127,7 +158,6 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     if "p" in msg:
                         state.last_price = float(msg["p"])
                     price = state.last_price
-                    alerts = state.price_alerts
                     tracker = state.decision_tracker
 
                 # Keep portfolio value marked-to-market independently of the
@@ -136,14 +166,8 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     snap = tracker.snapshot()
                     state.portfolio_value = snap["cash"] + snap["position"] * price
 
-                if price is not None and alerts:
-                    hit = next((a for a in alerts if alert_triggered(price, a)), None)
-                    if hit is not None:
-                        state.price_alerts = []
-                        state.agent_wake_reason = (
-                            f"Price alert hit at {price} ({hit['condition']} {hit['price']})."
-                        )
-                        state.agent_wake_event.set()
+                # A trade moves last_price and portfolio_value -- re-check alerts.
+                _fire_due_alerts(state)
             elif t == "q" and msg.get("S") == symbol:
                 # Single lock acquisition so readers (e.g. the UI's quote
                 # snapshot) never see a torn mix of this tick's bid with the
@@ -157,6 +181,9 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                         state.ask_price = float(msg["ap"])
                     if "as" in msg:
                         state.ask_size = float(msg["as"])
+
+                # A quote moves bid/ask price+size and the derived spread.
+                _fire_due_alerts(state)
             elif t == "error":
                 state.status = f"Stream error: {msg.get('msg')}"
                 state.bars_connected = False
@@ -255,6 +282,8 @@ def _fallback_bars_loop(
                 if "as" in quote:
                     state.ask_size = float(quote["as"])
         state.status = f"⚠️ Fallback: polling {symbol} via {source} (stream down)"
+        # Keep alerts live even when the WS is down and prices come from REST.
+        _fire_due_alerts(state)
 
 
 def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:

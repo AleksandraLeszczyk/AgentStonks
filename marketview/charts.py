@@ -511,12 +511,19 @@ def _add_fibonacci_levels(df: pd.DataFrame, fig: go.Figure) -> None:
 
 
 def _add_price_alerts(price_alerts: list[dict], fig: go.Figure, x0: datetime, x1: datetime) -> None:
-    """Horizontal lines marking price levels the agent is waiting to wake up on."""
+    """Horizontal lines marking price-axis levels the agent is waiting to wake up on.
+
+    Expects condition alerts shaped {"field", "condition", "value"} whose field
+    lives on the price axis (price/bid/ask/day high/low); other alert fields
+    (volume, spread, portfolio value) have no price level and are filtered out
+    by the caller.
+    """
     for alert in price_alerts:
-        level = alert.get("price")
+        level = alert.get("value")
         condition = alert.get("condition")
         if level is None:
             continue
+        field = alert.get("field", "price")
         color = PALETTE["up"] if condition == "above" else PALETTE["down"]
         fig.add_shape(
             type="line",
@@ -528,7 +535,7 @@ def _add_price_alerts(price_alerts: list[dict], fig: go.Figure, x0: datetime, x1
         fig.add_annotation(
             xref="x", yref="y",
             x=x1, y=level,
-            text=f" ⏰ {condition} {level:.2f}",
+            text=f" ⏰ {field} {condition} {level:.2f}",
             font=dict(color=color, size=10, family="monospace"),
             showarrow=False,
             xanchor="left",

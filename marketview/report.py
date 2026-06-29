@@ -13,6 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from .config import PALETTE
+from .state import format_alert
 
 _CSS = f"""
 body {{
@@ -131,7 +132,7 @@ def _decisions_table_html(decisions: list[dict]) -> str:
         reasoning = html.escape(d.get("reasoning", ""))
         if d.get("action") == "alert" and d.get("alerts"):
             reasoning += " " + " · ".join(
-                f"[wake {a.get('condition')} ${a.get('price'):,.4f}]" for a in d["alerts"]
+                f"[wake when {html.escape(format_alert(a))}]" for a in d["alerts"]
             )
         try:
             ts_fmt = pd.to_datetime(d.get("ts", "")).strftime("%Y-%m-%d %H:%M:%S")

@@ -26,7 +26,7 @@ ALERT_DECISION = {
     "cash_after": 98500.0,
     "position_after": 10.0,
     "reasoning": "Watching for breakout",
-    "alerts": [{"price": 160.0, "condition": "above"}],
+    "alerts": [{"field": "last_price", "condition": "above", "value": 160.0}],
 }
 
 LOG = [
@@ -93,7 +93,7 @@ class TestBuildReportHtml:
 
     def test_renders_alert_decision_with_levels(self):
         result = build_report_html(**_base_kwargs(decisions=[ALERT_DECISION]))
-        assert "wake above $160.0000" in result
+        assert "wake when last_price above 160" in result
 
     def test_renders_agent_log_entries(self):
         result = build_report_html(**_base_kwargs(agent_log=LOG))

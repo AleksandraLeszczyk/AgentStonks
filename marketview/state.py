@@ -66,7 +66,7 @@ _DEFAULTS: dict[str, object] = {
     "starting_budget": PAPER_STARTING_CASH,
     "agent_start_time": None,
     "agent_equity_history": [],
-    "price_alerts": [],
+    "alerts": [],
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
@@ -80,16 +80,97 @@ _DEFAULTS: dict[str, object] = {
 }
 
 
-def alert_triggered(price: float, alert: dict) -> bool:
-    target = alert.get("price")
-    condition = alert.get("condition")
-    if target is None:
+# Continuously-updated state fields the agent can attach a condition alert to.
+# Every entry is refreshed on the live price/quote stream (and the REST
+# fallback), so an alert on any of them can fire between scheduled cycles. The
+# value is a human description used in tool schemas and the UI. `spread` and
+# `volume_ratio` are derived (see `alert_field_value`) rather than stored
+# directly, but update just as continuously as their inputs.
+ALERTABLE_FIELDS: dict[str, str] = {
+    "last_price": "Latest traded price",
+    "bid_price": "Best (highest) bid price",
+    "ask_price": "Best (lowest) ask price",
+    "bid_size": "Shares offered at the best bid",
+    "ask_size": "Shares offered at the best ask",
+    "spread": "Ask price minus bid price (absolute, same units as price)",
+    "day_high": "Highest price so far in today's session",
+    "day_low": "Lowest price so far in today's session",
+    "day_volume": "Cumulative shares traded so far today",
+    "volume_ratio": "Today's cumulative volume divided by average daily volume",
+    "portfolio_value": "Paper portfolio value (cash + position marked to last price)",
+}
+
+# Subset of alertable fields that live on the price axis, so a triggered/pending
+# alert on them can be drawn as a horizontal line on the price chart.
+PRICE_AXIS_ALERT_FIELDS: frozenset[str] = frozenset(
+    {"last_price", "bid_price", "ask_price", "day_high", "day_low"}
+)
+
+
+def alert_field_value(state: "AppState", field: "str | None") -> "float | None":
+    """Current numeric value of a continuously-updated alertable field, or None
+    if it isn't available yet (no data, or an input field is unset)."""
+    if field == "spread":
+        if state.ask_price is None or state.bid_price is None:
+            return None
+        return state.ask_price - state.bid_price
+    if field == "volume_ratio":
+        ratio, _ = current_volume_ratio(state.day_volume, state.daily_bars)
+        return ratio
+    if field not in ALERTABLE_FIELDS:
+        return None
+    value = getattr(state, field, None)
+    return float(value) if value is not None else None
+
+
+def compare(value: "float | None", condition: "str | None", target: "float | None") -> bool:
+    """Whether `value` satisfies `condition` ('above' = >=, 'below' = <=) vs `target`."""
+    if value is None or target is None:
         return False
     if condition == "above":
-        return price >= target
+        return value >= target
     if condition == "below":
-        return price <= target
+        return value <= target
     return False
+
+
+def alert_triggered(state: "AppState", alert: dict) -> bool:
+    """Whether a generic condition alert's watched field currently meets its threshold.
+
+    `alert` is shaped {"field": <ALERTABLE_FIELDS key>, "condition": "above"|"below",
+    "value": <threshold>}.
+    """
+    value = alert_field_value(state, alert.get("field"))
+    return compare(value, alert.get("condition"), alert.get("value"))
+
+
+def normalize_alert(raw: object) -> "dict | None":
+    """Validate one alert spec (e.g. from the LLM) and return a clean
+    {field, condition, value} dict, or None if it isn't a valid, watchable alert."""
+    if not isinstance(raw, dict):
+        return None
+    field = raw.get("field")
+    condition = raw.get("condition")
+    if field not in ALERTABLE_FIELDS or condition not in ("above", "below"):
+        return None
+    try:
+        value = float(raw.get("value"))
+    except (TypeError, ValueError):
+        return None
+    return {"field": field, "condition": condition, "value": value}
+
+
+def format_alert(alert: dict) -> str:
+    """One-line human-readable description of a condition alert, e.g.
+    'last_price above 150' or 'day_volume above 5,000,000'."""
+    field = alert.get("field", "?")
+    condition = alert.get("condition", "?")
+    value = alert.get("value")
+    if isinstance(value, (int, float)):
+        value_str = f"{value:,.0f}" if abs(value) >= 1000 else f"{value:,.4f}".rstrip("0").rstrip(".")
+    else:
+        value_str = str(value)
+    return f"{field} {condition} {value_str}"
 
 
 def _daily_bar_date(bar: dict) -> str:
@@ -225,7 +306,10 @@ class AppState:
         self.starting_budget: float = PAPER_STARTING_CASH
         self.agent_start_time: "datetime | None" = None
         self.agent_equity_history: list[dict] = []
-        self.price_alerts: list[dict] = []
+        # Pending condition alerts: each {field, condition, value} watching a
+        # continuously-updated state field (see ALERTABLE_FIELDS). Cleared once
+        # any one fires.
+        self.alerts: list[dict] = []
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()
         self.agent_wake_reason: str | None = None

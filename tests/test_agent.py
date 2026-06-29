@@ -201,7 +201,7 @@ class TestRunAgentCycle:
         assert snap["decisions"][0].action == "sleep"
         assert snap["decisions"][0].price is None
 
-    def test_alert_decision_sets_state_price_alert_and_records_no_trade(self):
+    def test_alert_decision_sets_state_alert_and_records_no_trade(self):
         state = AppState()
         state.symbol = "AAPL"
         state.api_key = "k"
@@ -217,7 +217,7 @@ class TestRunAgentCycle:
                         {
                             "action": "alert",
                             "reasoning": "wait for breakout above resistance",
-                            "alert_high_price": 150.0,
+                            "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
                         },
                     )
                 ]
@@ -233,10 +233,10 @@ class TestRunAgentCycle:
         assert decision.action == "alert"
         assert decision.status == "noop"
         assert decision.price is None
-        assert decision.alerts == [{"price": 150.0, "condition": "above"}]
-        assert state.price_alerts == [{"price": 150.0, "condition": "above"}]
+        assert decision.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+        assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
 
-    def test_alert_decision_supports_both_low_and_high_levels(self):
+    def test_alert_decision_supports_multiple_conditions_across_fields(self):
         state = AppState()
         state.symbol = "AAPL"
         state.api_key = "k"
@@ -251,9 +251,11 @@ class TestRunAgentCycle:
                         "submit_decision",
                         {
                             "action": "alert",
-                            "reasoning": "watching a breakout above resistance or a breakdown below support",
-                            "alert_low_price": 95.0,
-                            "alert_high_price": 150.0,
+                            "reasoning": "watch a breakdown below support or a real volume surge",
+                            "alerts": [
+                                {"field": "last_price", "condition": "below", "value": 95.0},
+                                {"field": "volume_ratio", "condition": "above", "value": 2.0},
+                            ],
                         },
                     )
                 ]
@@ -267,13 +269,13 @@ class TestRunAgentCycle:
         decision = snap["decisions"][0]
         assert decision.action == "alert"
         assert decision.alerts == [
-            {"price": 95.0, "condition": "below"},
-            {"price": 150.0, "condition": "above"},
+            {"field": "last_price", "condition": "below", "value": 95.0},
+            {"field": "volume_ratio", "condition": "above", "value": 2.0},
         ]
-        assert state.price_alerts == decision.alerts
+        assert state.alerts == decision.alerts
 
     def test_alert_with_missing_fields_is_rejected_and_retried(self):
-        """An incomplete alert call (no price levels) must not be silently downgraded to
+        """An incomplete alert call (no conditions) must not be silently downgraded to
         sleep -- the model gets an error back and a chance to correct itself, since it
         otherwise has no way to know its alert was dropped."""
         state = AppState()
@@ -296,7 +298,7 @@ class TestRunAgentCycle:
                         {
                             "action": "alert",
                             "reasoning": "watching for a breakout above resistance",
-                            "alert_high_price": 150.0,
+                            "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
                         },
                     )
                 ]
@@ -309,13 +311,50 @@ class TestRunAgentCycle:
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "alert"
-        assert snap["decisions"][0].alerts == [{"price": 150.0, "condition": "above"}]
-        assert state.price_alerts == [{"price": 150.0, "condition": "above"}]
+        assert snap["decisions"][0].alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+        assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
 
         # the rejected first attempt must have been surfaced back to the model as a tool result
         first_call_messages = client.calls[1]
         tool_results = [m["content"] for m in first_call_messages if m.get("role") == "tool"]
-        assert any("requires alert_low_price" in c for c in tool_results)
+        assert any("requires a non-empty 'alerts' array" in c for c in tool_results)
+
+    def test_alert_with_invalid_field_is_rejected(self):
+        """A condition naming a field that isn't continuously tracked is dropped, so an
+        otherwise-empty alert is rejected rather than silently watching nothing."""
+        state = AppState()
+        state.symbol = "AAPL"
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c1",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "bad field",
+                            "alerts": [{"field": "rsi", "condition": "above", "value": 70}],
+                        },
+                    )
+                ]
+            ),
+            _response(
+                tool_calls=[
+                    _tool_call("c2", "submit_decision", {"action": "sleep", "reasoning": "stand aside"})
+                ]
+            ),
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
+
+        snap = tracker.snapshot()
+        assert snap["decisions"][0].action == "sleep"
+        assert state.alerts == []
 
     def test_alert_with_missing_fields_falls_back_to_sleep_if_never_corrected(self):
         state = AppState()
@@ -339,22 +378,36 @@ class TestRunAgentCycle:
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
-        assert state.price_alerts == []
+        assert state.alerts == []
 
 
 class TestAlertTrigger:
     def test_alert_triggered_above(self):
-        assert alert_triggered(151.0, {"price": 150.0, "condition": "above"}) is True
-        assert alert_triggered(149.0, {"price": 150.0, "condition": "above"}) is False
+        state = AppState()
+        state.last_price = 151.0
+        assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is True
+        state.last_price = 149.0
+        assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is False
 
     def test_alert_triggered_below(self):
-        assert alert_triggered(99.0, {"price": 100.0, "condition": "below"}) is True
-        assert alert_triggered(101.0, {"price": 100.0, "condition": "below"}) is False
+        state = AppState()
+        state.last_price = 99.0
+        assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is True
+        state.last_price = 101.0
+        assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is False
+
+    def test_alert_triggered_on_non_price_field(self):
+        state = AppState()
+        state.day_volume = 6_000_000
+        assert alert_triggered(state, {"field": "day_volume", "condition": "above", "value": 5_000_000}) is True
+        state.bid_price, state.ask_price = 10.0, 10.05
+        assert alert_triggered(state, {"field": "spread", "condition": "above", "value": 0.04}) is True
+        assert alert_triggered(state, {"field": "spread", "condition": "below", "value": 0.04}) is False
 
     def test_wait_returns_early_when_alert_fires(self):
         state = AppState()
         state.last_price = 151.0
-        state.price_alerts = [{"price": 150.0, "condition": "above"}]
+        state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
         stop_event = threading.Event()
 
         start = threading.Event()
@@ -370,7 +423,7 @@ class TestAlertTrigger:
         thread.join(timeout=5)
 
         assert finished.is_set()
-        assert state.price_alerts == []  # cleared once triggered
+        assert state.alerts == []  # cleared once triggered
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types
@@ -378,9 +431,9 @@ class TestAlertTrigger:
     def test_wait_returns_early_when_low_side_of_bracket_fires(self):
         state = AppState()
         state.last_price = 94.0
-        state.price_alerts = [
-            {"price": 95.0, "condition": "below"},
-            {"price": 150.0, "condition": "above"},
+        state.alerts = [
+            {"field": "last_price", "condition": "below", "value": 95.0},
+            {"field": "last_price", "condition": "above", "value": 150.0},
         ]
         stop_event = threading.Event()
 
@@ -397,7 +450,7 @@ class TestAlertTrigger:
         thread.join(timeout=5)
 
         assert finished.is_set()
-        assert state.price_alerts == []  # both levels cleared once either fires
+        assert state.alerts == []  # both levels cleared once either fires
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types
