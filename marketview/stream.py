@@ -11,7 +11,7 @@ import websocket
 from .config import BARS_STREAM_URL, FALLBACK_POLL_SEC, MAX_BARS, NEWS_FALLBACK_POLL_SEC, NEWS_STREAM_URL
 from .historical import fetch_intraday_bars
 from .news import fetch_news_with_fallback
-from .rest import fetch_bars, fetch_trades
+from .rest import fetch_bars, fetch_latest_quote, fetch_trades
 from .state import AppState, alert_triggered, current_volume_ratio, today_daily_bar, today_daily_volume
 
 logger = logging.getLogger(__name__)
@@ -232,6 +232,12 @@ def _fallback_bars_loop(
         except Exception:
             pass  # last bar's close is still a reasonable last_price
 
+        quote = None
+        try:
+            quote = fetch_latest_quote(symbol, key, secret, feed)
+        except Exception:
+            pass  # bid/ask just won't refresh this cycle -- stays at its last known value
+
         with state.lock:
             state.bars.clear()
             state.bars.extend(bars[-MAX_BARS:])
@@ -239,6 +245,15 @@ def _fallback_bars_loop(
             state.day_high = max(b["h"] for b in bars if "h" in b)
             state.day_low = min(b["l"] for b in bars if "l" in b)
             state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
+            if quote:
+                if "bp" in quote:
+                    state.bid_price = float(quote["bp"])
+                if "bs" in quote:
+                    state.bid_size = float(quote["bs"])
+                if "ap" in quote:
+                    state.ask_price = float(quote["ap"])
+                if "as" in quote:
+                    state.ask_size = float(quote["as"])
         state.status = f"⚠️ Fallback: polling {symbol} via {source} (stream down)"
 
 

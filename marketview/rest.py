@@ -108,6 +108,23 @@ def fetch_latest_trade(
     return r.json().get("trade", {})
 
 
+def fetch_latest_quote(
+    symbol: str,
+    key: str,
+    secret: str,
+    feed: str = "iex",
+) -> dict:
+    """Fetch the single most recent NBBO quote for a symbol. Raises on HTTP error."""
+    r = requests.get(
+        f"{DATA_REST}/v2/stocks/{symbol}/quotes/latest",
+        headers=_headers(key, secret),
+        params=dict(feed=feed),
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json().get("quote", {})
+
+
 def fetch_news(
     symbol: str,
     key: str,

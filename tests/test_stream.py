@@ -37,6 +37,46 @@ def test_fallback_bars_loop_updates_state_from_rest_when_disconnected(monkeypatc
     assert "Alpaca REST" in state.status
 
 
+def test_fallback_bars_loop_refreshes_quote_when_disconnected(monkeypatch):
+    state = AppState()
+    state.bars_connected = False
+    bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
+
+    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
+    monkeypatch.setattr(
+        stream, "fetch_latest_quote", lambda *a, **k: {"bp": 1.55, "bs": 10, "ap": 1.57, "as": 20}
+    )
+
+    stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(1))
+
+    assert state.bid_price == 1.55
+    assert state.bid_size == 10
+    assert state.ask_price == 1.57
+    assert state.ask_size == 20
+
+
+def test_fallback_bars_loop_keeps_last_quote_when_quote_fetch_fails(monkeypatch):
+    state = AppState()
+    state.bars_connected = False
+    state.bid_price = 1.5
+    state.ask_price = 1.6
+    bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
+
+    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
+
+    def _raise(*a, **k):
+        raise RuntimeError("quotes endpoint down")
+
+    monkeypatch.setattr(stream, "fetch_latest_quote", _raise)
+
+    stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(1))
+
+    assert state.bid_price == 1.5
+    assert state.ask_price == 1.6
+
+
 def test_fallback_bars_loop_skips_polling_when_stream_connected(monkeypatch):
     state = AppState()
     state.bars_connected = True
