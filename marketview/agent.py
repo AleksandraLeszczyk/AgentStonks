@@ -4,7 +4,7 @@ LLM trading agent.
 The agent reads data that the app has already fetched (intraday bars, daily
 bars, news, quotes — all living on `AppState`) via tool calls, reasons about
 the trading regime and a fitting strategy, then finalizes each cycle with
-exactly one `submit_decision` tool call (buy / sell / sleep). The decision is
+exactly one `submit_decision` tool call (buy / sell / alert). The decision is
 handed to a `DecisionTracker`, which independently fetches the fill price —
 the agent never gets to pick its own fill price.
 
@@ -85,10 +85,10 @@ the level beyond which the move likely needs fresh conviction.
    - Bearish + confirming volume -> defensive: avoid new buys, consider \
 selling existing exposure.
    - Neutral/choppy or conflicting signals -> mean-reversion or stand aside: \
-prefer sleep unless there is a clear, well-confirmed edge.
-   When signals conflict or conviction is low, the correct decision is \
-sleep. Trading is optional; capital preservation matters more than being in \
-a position.
+don't force a trade unless there is a clear, well-confirmed edge.
+   When signals conflict or conviction is low, the correct decision is to \
+stand aside and set an alert rather than trade. Trading is optional; capital \
+preservation matters more than being in a position.
 
 5. SIZE THE TRADE. Call get_position to see current cash and share count \
 before deciding quantity. Never request a sell quantity larger than the \
@@ -100,36 +100,37 @@ a risk-off market both argue for a smaller, not larger, position for the \
 same conviction level.
 
 6. FINALIZE. Call submit_decision exactly once, with the regime you \
-established, the action (buy/sell/sleep/alert), a quantity (omit or 0 for \
-sleep/alert), and reasoning that ties together the regime, the strategy, \
+established, the action (buy/sell/alert), a quantity (omit or 0 for \
+alert), and reasoning that ties together the regime, the strategy, \
 and why this specific action follows from it -- reference the actual support/ \
 resistance, RSI, ATR, or wall levels you used, not just the regime label. Do \
 not call submit_decision more than once, and do not stop without calling it.
 
-Be decisive but not reckless: sleep is a valid and often correct decision. \
-If you'd otherwise sleep but there's a specific, observable condition that \
-would change your mind before the next scheduled cycle, use action "alert" \
-instead of "sleep" and pass an `alerts` array of one or more conditions to \
-watch. Each condition names a continuously-updated live field, a direction \
-("above" = reaches/exceeds, "below" = reaches/falls to), and a value. You are \
-not limited to price: you can watch last_price, bid_price/ask_price, the \
-bid/ask spread, day_high/day_low, cumulative day_volume, the volume_ratio \
-(today's volume vs its average), or your own portfolio_value -- whichever \
-actually captures what would change your decision. Common uses: a stop-loss \
-below and a breakout level above on last_price (a two-sided bracket), or a \
-last_price level paired with a volume_ratio threshold so you only re-engage on \
-a move that has real participation behind it. Ground price levels in what the \
-tools already gave you -- the daily support/resistance, the call/put walls, or \
-a recent intraday swing high/low -- rather than an arbitrary distance from the \
-current price. The first condition to trigger wakes you immediately, instead of \
-waiting out the full fixed cycle interval blind to what happens in between. Use \
-plain "sleep" only when nothing specific is worth watching.
+Be decisive but not reckless: standing aside is a valid and often correct \
+outcome. When you don't want to buy or sell, you do not simply do nothing -- \
+there is no "sleep" or do-nothing action. Instead finalize with action \
+"alert" and pass an `alerts` array of one or more conditions that would change \
+your mind before the next scheduled cycle. Each condition names a \
+continuously-updated live field, a direction ("above" = reaches/exceeds, \
+"below" = reaches/falls to), and a value. You are not limited to price: you \
+can watch last_price, bid_price/ask_price, the bid/ask spread, day_high/ \
+day_low, cumulative day_volume, the volume_ratio (today's volume vs its \
+average), or your own portfolio_value -- whichever actually captures what \
+would change your decision. Common uses: a stop-loss below and a breakout \
+level above on last_price (a two-sided bracket), or a last_price level paired \
+with a volume_ratio threshold so you only re-engage on a move that has real \
+participation behind it. Ground price levels in what the tools already gave \
+you -- the daily support/resistance, the call/put walls, or a recent intraday \
+swing high/low -- rather than an arbitrary distance from the current price. \
+The first condition to trigger wakes you immediately, instead of waiting out \
+the full fixed cycle interval blind to what happens in between. Always name at \
+least one condition worth watching -- if a trade isn't warranted, an alert is.
 
 Separately and unconditionally, you are ALWAYS woken up early -- before the \
 next scheduled cycle, and regardless of which action you chose or what alerts \
 you did or didn't set -- the moment fresh news for the ticker arrives. You \
-don't need to (and can't) configure this; breaking news always interrupts a \
-sleep or alert wait, so a decision is never blind to it.
+don't need to (and can't) configure this; breaking news always interrupts an \
+alert wait, so a decision is never blind to it.
 """
 
 MOMENTUM_SYSTEM_PROMPT = """\
@@ -140,7 +141,7 @@ reason as if real capital is on the line.
 Core idea: stocks in motion tend to stay in motion. You are not predicting a \
 new move -- you are jumping on a move already in progress, riding it, and \
 getting out before it reverses. Most of the day there is nothing to do; only \
-take A+ setups and sleep the rest of the time.
+take A+ setups and stand aside (with an alert) the rest of the time.
 
 Work through this process every cycle, citing the actual numbers the tools \
 return (levels, ratios, RSI, ATR), not just their labels:
@@ -151,7 +152,7 @@ late) and analyze_volume (relative volume -- you want it clearly elevated, \
 2x+ is the kind of move worth your attention; flat/declining volume means \
 there's no real participation behind the move). Call get_news to find the \
 catalyst -- earnings beat, upgrade, FDA news, M&A. A move with no catalyst \
-and no volume is noise, not momentum; default to sleep.
+and no volume is noise, not momentum; default to standing aside with an alert.
 
 2. IDENTIFY THE SETUP. Call analyze_intraday_momentum for the higher-highs/ \
 higher-lows pattern, VWAP position, and ATR-based volatility. Match what you \
@@ -161,7 +162,7 @@ consolidation, then a fresh breakout on rising volume.
    - VWAP reclaim: price dipped to/through session VWAP, found buyers, and is \
 reclaiming it -- analyze_intraday_momentum's vwap_position tells you which \
 side of VWAP price is on right now.
-   If neither is present, there is no trade -- sleep.
+   If neither is present, there is no trade -- stand aside with an alert.
 
 3. ENTRY DISCIPLINE. Never chase. Require: a recognizable setup from step 2, \
 a clear breakout/reclaim level (the flag's high, or VWAP), and volume \
@@ -188,13 +189,14 @@ to breakeven via the alert mechanism in step 6, and otherwise let winners \
 run rather than booking small gains out of fear. Cut losers immediately if \
 the setup fails -- don't wait to see.
 
-6. FINALIZE. Call submit_decision exactly once: action (buy/sell/sleep/ \
-alert), quantity (omit or 0 for sleep/alert), the regime, and reasoning that \
-names the setup, the breakout/stop levels, and the volume confirmation you \
-used. If you'd otherwise sleep but there's a specific trigger worth watching, \
-use action "alert" with an `alerts` array instead -- each entry names a \
-continuously-updated field (above/below a value) and the first to fire wakes \
-you the instant it happens rather than waiting out the full cycle blind. For \
+6. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
+quantity (omit or 0 for alert), the regime, and reasoning that names the \
+setup, the breakout/stop levels, and the volume confirmation you used. When \
+you're not taking a trade, there is no do-nothing action -- finalize with \
+action "alert" and an `alerts` array naming the trigger(s) worth watching. \
+Each entry names a continuously-updated field (above/below a value) and the \
+first to fire wakes you the instant it happens rather than waiting out the \
+full cycle blind. For \
 momentum that usually means last_price above a breakout level and/or below a \
 stop, but you can also watch volume_ratio above a threshold to wake only when \
 participation actually surges, or the bid/ask spread to gauge liquidity. Do \
@@ -202,12 +204,12 @@ not call submit_decision more than once, and do not stop without calling it.
 
 Emotional discipline matters more than any single setup: sitting on your \
 hands through a quiet, no-edge stretch is correct and far more common than \
-trading. Sleep is a valid and often correct decision.
+trading. Standing aside (with an alert) is a valid and often correct decision.
 
 Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
 which action you chose or what alerts you set -- the moment fresh news for the \
-ticker arrives. That interrupt is automatic and cannot be turned off, so a \
-sleep or alert wait is never blind to breaking news.
+ticker arrives. That interrupt is automatic and cannot be turned off, so an \
+alert wait is never blind to breaking news.
 """
 
 BREAKOUT_SYSTEM_PROMPT = """\
@@ -220,8 +222,8 @@ and when price finally clears it on a surge in volume, trapped sellers get \
 stopped out and new buyers rush in, creating a self-reinforcing move. You are \
 not predicting the break -- you are waiting for it to actually happen, with \
 volume proving real buying pressure is behind it, and only then acting. Most \
-cycles there is nothing to do; only take A+ setups and sleep the rest of the \
-time.
+cycles there is nothing to do; only take A+ setups and stand aside (with an \
+alert) the rest of the time.
 
 Work through this process every cycle, citing the actual numbers the tools \
 return (levels, ratios, ATR), not just their labels:
@@ -243,7 +245,7 @@ weak volume, or with a long wick rejecting the level, is a fakeout, not a \
 breakout -- it often reverses sharply as the trapped longs (or shorts) bail \
 out. If you see those tells, do not buy the break; consider whether the \
 reversal itself is the trade (a fade back through the level), or simply \
-sleep/alert and wait for a cleaner signal.
+set an alert and wait for a cleaner signal.
 
 4. CHECK FOR A CATALYST. Call get_news. A breakout with a real catalyst \
 behind it (earnings, guidance, upgrade, macro data) is more likely to follow \
@@ -254,8 +256,8 @@ there's no catalyst.
 better, a pullback/retest of the range high/low (resistance-turned-support) \
 for a better risk/reward. If price is already extended well beyond the range \
 (it ran 5-8%+ past it with no pullback), it's too late -- this is chasing, \
-not breakout trading; sleep and wait for the next range to form instead of \
-buying the extension.
+not breakout trading; stand aside with an alert and wait for the next range to \
+form instead of buying the extension.
 
 6. SIZE THE TRADE WITH ATR-BASED TARGETS. Your stop sits just below the \
 opening-range low (never at a round number -- nudge it just under the \
@@ -276,27 +278,28 @@ showing lower highs/lower lows). Once price has reached roughly 1x ATR \
 beyond entry, consider moving the stop to breakeven via the alert mechanism \
 in step 8 rather than risking a full round-trip back to the original stop.
 
-8. FINALIZE. Call submit_decision exactly once: action (buy/sell/sleep/ \
-alert), quantity (omit or 0 for sleep/alert), the regime, and reasoning that \
-names the range level, the volume confirmation, the entry/stop/target \
-geometry, and why this action follows from it. If you'd otherwise sleep but \
-there's a specific condition worth watching, use action "alert" with an \
-`alerts` array instead -- each entry names a continuously-updated field \
-(above/below a value) and the first to fire wakes you the instant it happens \
-rather than waiting out the full cycle blind. For a forming breakout that is \
+8. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
+quantity (omit or 0 for alert), the regime, and reasoning that names the \
+range level, the volume confirmation, the entry/stop/target geometry, and why \
+this action follows from it. When you're not taking a trade, there is no \
+do-nothing action -- finalize with action "alert" and an `alerts` array \
+naming the condition(s) worth watching. Each entry names a \
+continuously-updated field (above/below a value) and the first to fire wakes \
+you the instant it happens rather than waiting out the full cycle blind. For a \
+forming breakout that is \
 typically last_price above the range high and/or below the range low, ideally \
 paired with volume_ratio above your confirmation threshold so you wake on a \
 break that volume is actually behind, not a quiet drift through the level. Do \
 not call submit_decision more than once, and do not stop without calling it.
 
 Patience is the edge here: passing on setups with no clean range break or no \
-volume confirmation is correct and far more common than trading. Sleep is a \
-valid and often correct decision.
+volume confirmation is correct and far more common than trading. Standing \
+aside (with an alert) is a valid and often correct decision.
 
 Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
 which action you chose or what alerts you set -- the moment fresh news for the \
-ticker arrives. That interrupt is automatic and cannot be turned off, so a \
-sleep or alert wait is never blind to breaking news.
+ticker arrives. That interrupt is automatic and cannot be turned off, so an \
+alert wait is never blind to breaking news.
 """
 
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
@@ -460,16 +463,17 @@ _TOOL_SUBMIT_DECISION = {
     "function": {
         "name": "submit_decision",
         "description": (
-            "Finalize this trading cycle with exactly one decision: buy, sell, sleep, or "
-            "alert. Must be called exactly once, after analysis is complete."
+            "Finalize this trading cycle with exactly one decision: buy, sell, or "
+            "alert. Must be called exactly once, after analysis is complete. When you "
+            "don't want to trade, use 'alert' -- there is no do-nothing action."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["buy", "sell", "sleep", "alert"]},
+                "action": {"type": "string", "enum": ["buy", "sell", "alert"]},
                 "quantity": {
                     "type": "number",
-                    "description": "Shares to buy/sell. Ignored for sleep/alert. Must be > 0 for buy/sell.",
+                    "description": "Shares to buy/sell. Ignored for alert. Must be > 0 for buy/sell.",
                 },
                 "regime": {
                     "type": "string",
@@ -734,6 +738,16 @@ def _preview(text: str, width: int = 200) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
+    """Hand a malformed submit_decision back to the model as a tool error so it can
+    retry. Used for the cases that have no valid resting state -- an empty alert, a
+    zero-quantity trade, or an unrecognized action -- since there is no longer a
+    do-nothing decision to silently fall back to."""
+    messages.append(
+        {"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"error": error})}
+    )
+
+
 @obs.observe(name="agent-cycle")
 def run_agent_cycle(
     client: Any,
@@ -813,7 +827,7 @@ def run_agent_cycle(
                 args = {}
 
             if name == "submit_decision":
-                action = args.get("action", "sleep")
+                action = args.get("action", "")
                 quantity = float(args.get("quantity") or 0)
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
@@ -825,29 +839,35 @@ def run_agent_cycle(
                 if action == "alert" and not alerts:
                     # Some models (small/cheap ones especially) pick action="alert" but
                     # forget the conditions, or name a field that isn't watchable. Reject
-                    # and let the model retry instead of silently demoting to sleep -- it
+                    # and let the model retry instead of silently recording a no-op -- it
                     # never sees that happen otherwise, so it can't course-correct.
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": json.dumps(
-                                {
-                                    "error": (
-                                        "action 'alert' requires a non-empty 'alerts' array, each "
-                                        "entry having field (one of: "
-                                        f"{', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
-                                        "'below'), and a numeric value. Call submit_decision again "
-                                        "with at least one valid condition, or use action 'sleep' "
-                                        "if nothing is worth watching."
-                                    )
-                                }
-                            ),
-                        }
+                    _reject(
+                        messages,
+                        tc.id,
+                        "action 'alert' requires a non-empty 'alerts' array, each "
+                        "entry having field (one of: "
+                        f"{', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
+                        "'below'), and a numeric value. Call submit_decision again "
+                        "with at least one valid condition. Standing aside always "
+                        "means setting an alert -- there is no do-nothing action.",
                     )
                     continue
 
-                if action in ("buy", "sell") and quantity > 0:
+                if action in ("buy", "sell") and quantity <= 0:
+                    # A trade with no size is not a trade. Don't silently record a
+                    # no-op -- make the model either commit to a size or stand aside
+                    # explicitly with an alert.
+                    _reject(
+                        messages,
+                        tc.id,
+                        f"action '{action}' requires a quantity greater than 0. Call "
+                        "submit_decision again with a positive quantity, or use action "
+                        "'alert' with one or more conditions to watch if you don't want "
+                        "to trade right now.",
+                    )
+                    continue
+
+                if action in ("buy", "sell"):
                     decision = tracker.record_trade(
                         symbol, action, quantity, reasoning, state.api_key, state.api_secret, state.feed
                     )
@@ -855,7 +875,17 @@ def run_agent_cycle(
                     decision = tracker.record_alert(symbol, alerts, reasoning)
                     state.alerts = alerts
                 else:
-                    decision = tracker.record_sleep(symbol, reasoning)
+                    # Unknown / removed action (e.g. a model still reaching for the old
+                    # "sleep"). There is no do-nothing path: reject and retry.
+                    _reject(
+                        messages,
+                        tc.id,
+                        "action must be one of 'buy', 'sell', or 'alert'. To stand aside "
+                        "without trading, use action 'alert' with one or more conditions "
+                        "to watch -- there is no 'sleep' or do-nothing action. Call "
+                        "submit_decision again.",
+                    )
+                    continue
                 _log(
                     state,
                     {

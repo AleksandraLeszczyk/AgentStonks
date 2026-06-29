@@ -22,7 +22,7 @@ from .config import TRADE_FIXED_COST
 class Decision:
     ts: str
     symbol: str
-    action: str  # "buy" | "sell" | "sleep" | "alert"
+    action: str  # "buy" | "sell" | "alert"; "sleep" only as an internal no-op fallback
     requested_quantity: float
     filled_quantity: float
     price: Optional[float]
@@ -51,6 +51,9 @@ class DecisionTracker:
         self.decisions: list[Decision] = []
 
     def record_sleep(self, symbol: str, reasoning: str) -> Decision:
+        """Record an internal no-op cycle. The agent can no longer *choose* to sleep --
+        when it doesn't want to trade it must set an alert -- so this now only backs the
+        forced fallback when a cycle ends without any finalized decision."""
         decision = Decision(
             ts=datetime.now(timezone.utc).isoformat(),
             symbol=symbol,

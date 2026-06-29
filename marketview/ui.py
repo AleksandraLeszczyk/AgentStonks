@@ -888,8 +888,8 @@ def _agent_panel(symbol: str) -> None:
     state = _get_state()
     st.caption(
         "Runs an LLM research agent that reads already-fetched ticker data and makes "
-        "paper buy/sell/sleep calls on a fixed interval. Instead of sleeping blind, the agent "
-        "can set condition alerts on any continuously-updated value -- price, bid/ask, spread, "
+        "paper buy/sell/alert calls on a fixed interval. When it doesn't want to trade, the agent "
+        "sets condition alerts on any continuously-updated value -- price, bid/ask, spread, "
         "day high/low, volume, relative volume, or portfolio value -- to wake up early the moment "
         "one is crossed, and it always wakes up early when fresh news breaks for the ticker. "
         "No real orders are ever placed. "

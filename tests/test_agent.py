@@ -155,7 +155,17 @@ class TestRunAgentCycle:
 
         responses = [
             _response(
-                tool_calls=[_tool_call("c1", "submit_decision", {"action": "sleep", "reasoning": "no setup yet"})]
+                tool_calls=[
+                    _tool_call(
+                        "c1",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "no setup yet, watch the opening-range high",
+                            "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                        },
+                    )
+                ]
             )
         ]
         client = FakeClient(responses)
@@ -180,7 +190,10 @@ class TestRunAgentCycle:
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
 
-    def test_sleep_decision_from_model_records_no_price(self):
+    def test_removed_sleep_action_is_rejected_and_retried(self):
+        """The agent can no longer choose to sleep. A model that still reaches for the
+        old "sleep" action gets an error back and must finalize with a real decision --
+        here it corrects to an alert."""
         state = AppState()
         state.symbol = "AAPL"
         state.api_key = "k"
@@ -190,7 +203,20 @@ class TestRunAgentCycle:
         responses = [
             _response(
                 tool_calls=[_tool_call("c1", "submit_decision", {"action": "sleep", "reasoning": "no clear edge"})]
-            )
+            ),
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c2",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "stand aside until price reclaims resistance",
+                            "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                        },
+                    )
+                ]
+            ),
         ]
         client = FakeClient(responses)
 
@@ -198,8 +224,13 @@ class TestRunAgentCycle:
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
-        assert snap["decisions"][0].action == "sleep"
-        assert snap["decisions"][0].price is None
+        assert snap["decisions"][0].action == "alert"
+        assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+
+        # the rejected "sleep" attempt must have been surfaced back to the model
+        second_call_messages = client.calls[1]
+        tool_results = [m["content"] for m in second_call_messages if m.get("role") == "tool"]
+        assert any("'buy', 'sell', or 'alert'" in c for c in tool_results)
 
     def test_alert_decision_sets_state_alert_and_records_no_trade(self):
         state = AppState()
@@ -321,7 +352,8 @@ class TestRunAgentCycle:
 
     def test_alert_with_invalid_field_is_rejected(self):
         """A condition naming a field that isn't continuously tracked is dropped, so an
-        otherwise-empty alert is rejected rather than silently watching nothing."""
+        otherwise-empty alert is rejected rather than silently watching nothing. The model
+        then corrects to a valid, watchable condition."""
         state = AppState()
         state.symbol = "AAPL"
         state.api_key = "k"
@@ -344,7 +376,15 @@ class TestRunAgentCycle:
             ),
             _response(
                 tool_calls=[
-                    _tool_call("c2", "submit_decision", {"action": "sleep", "reasoning": "stand aside"})
+                    _tool_call(
+                        "c2",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "stand aside until a real breakdown",
+                            "alerts": [{"field": "last_price", "condition": "below", "value": 95.0}],
+                        },
+                    )
                 ]
             ),
         ]
@@ -353,8 +393,8 @@ class TestRunAgentCycle:
         run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
-        assert snap["decisions"][0].action == "sleep"
-        assert state.alerts == []
+        assert snap["decisions"][0].action == "alert"
+        assert state.alerts == [{"field": "last_price", "condition": "below", "value": 95.0}]
 
     def test_alert_with_missing_fields_falls_back_to_sleep_if_never_corrected(self):
         state = AppState()
