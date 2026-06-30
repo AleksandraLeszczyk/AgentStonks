@@ -52,6 +52,7 @@ from .historical import (
 )
 from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS
 from .news import fetch_news_with_fallback, score_news_impacts
+from .premarket import DEFAULT_PREMARKET_MODELS, PremarketBriefing, generate_premarket_analysis
 from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
@@ -1107,6 +1108,188 @@ def _agent_panel(symbol: str) -> None:
     _agent_report_section(symbol)
 
 
+_BIAS_STYLE: dict[str, dict[str, str]] = {
+    "bullish":  {"color": "#26c6a2", "bg": "#0d2b24", "border": "#1a4a3d", "icon": "▲"},
+    "bearish":  {"color": "#ef5350", "bg": "#2b0d0d", "border": "#4a1a1a", "icon": "▼"},
+    "neutral":  {"color": "#888888", "bg": "#1e1e2e", "border": "#2a2d3a", "icon": "→"},
+}
+
+_CONF_COLOR: dict[str, str] = {"high": "#26c6a2", "medium": "#fb923c", "low": "#888888"}
+
+_IMPACT_ICON: dict[str, str] = {"positive": "↑", "negative": "↓", "neutral": "→"}
+
+
+def _premarket_briefing_html(briefing: PremarketBriefing, symbol: str) -> str:
+    bias = briefing.overall_bias
+    b = _BIAS_STYLE.get(bias, _BIAS_STYLE["neutral"])
+    conf_color = _CONF_COLOR.get(briefing.confidence, "#888")
+
+    # Header
+    header = (
+        f'<div style="background:{b["bg"]};border:1px solid {b["border"]};border-radius:10px;'
+        f'padding:14px 18px;margin-bottom:12px;font-family:Inter,sans-serif;">'
+        f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">'
+        f'<span style="font-size:22px;font-weight:800;color:{b["color"]};letter-spacing:-0.5px;">'
+        f'{b["icon"]} {bias.upper()}</span>'
+        f'<span style="font-size:11px;font-weight:600;color:{conf_color};'
+        f'border:1px solid {conf_color};border-radius:10px;padding:2px 8px;">'
+        f'{briefing.confidence.upper()} CONFIDENCE</span>'
+        f'<span style="font-size:11px;color:{PALETTE["muted"]};margin-left:auto;">{symbol}</span>'
+        f'</div>'
+        f'<p style="margin:0;color:{PALETTE["text"]};font-size:13px;line-height:1.6;">'
+        f'{html.escape(briefing.summary)}</p>'
+        f'</div>'
+    )
+
+    # Macro
+    macro = (
+        f'<div style="background:{PALETTE["panel"]};border:1px solid {PALETTE["grid"]};'
+        f'border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px;'
+        f'color:{PALETTE["muted"]};font-family:Inter,sans-serif;">'
+        f'🌍 {html.escape(briefing.macro_context)}</div>'
+    )
+
+    # Catalysts
+    catalyst_cards = []
+    for c in briefing.catalysts:
+        imp = c.impact
+        imp_color = _IMPACT_STYLE.get(imp, _IMPACT_STYLE["unknown"])
+        icon = _IMPACT_ICON.get(imp, "→")
+        catalyst_cards.append(
+            f'<div style="background:{imp_color["bg"]};border:1px solid {imp_color["border"]};'
+            f'border-radius:8px;padding:10px 12px;font-family:Inter,sans-serif;">'
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
+            f'<span style="color:{imp_color["text"]};font-weight:700;font-size:12px;">{icon}</span>'
+            f'<span style="color:{PALETTE["text"]};font-weight:600;font-size:12px;">'
+            f'{html.escape(c.headline)}</span>'
+            f'</div>'
+            f'<div style="font-size:11px;color:{PALETTE["muted"]};line-height:1.4;">'
+            f'{html.escape(c.relevance)}</div>'
+            f'</div>'
+        )
+    catalysts_section = (
+        f'<div style="margin-bottom:12px;">'
+        f'<div style="font-size:12px;font-weight:700;color:{PALETTE["muted"]};'
+        f'letter-spacing:0.06em;text-transform:uppercase;margin-bottom:6px;">Key Catalysts</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px;">'
+        f"{''.join(catalyst_cards)}"
+        f'</div></div>'
+    ) if catalyst_cards else ""
+
+    # Technical levels
+    level_rows = ""
+    for lvl in briefing.technical_levels:
+        role_color = "#26c6a2" if "support" in lvl.role.lower() else "#ef5350" if "resist" in lvl.role.lower() else PALETTE["accent"]
+        level_rows += (
+            f'<tr>'
+            f'<td style="padding:5px 10px;font-weight:700;color:{role_color};">${lvl.level:.2f}</td>'
+            f'<td style="padding:5px 10px;color:{PALETTE["muted"]};text-transform:capitalize;">{html.escape(lvl.role)}</td>'
+            f'<td style="padding:5px 10px;color:{PALETTE["text"]};">{html.escape(lvl.note)}</td>'
+            f'</tr>'
+        )
+    levels_section = (
+        f'<div style="margin-bottom:12px;">'
+        f'<div style="font-size:12px;font-weight:700;color:{PALETTE["muted"]};'
+        f'letter-spacing:0.06em;text-transform:uppercase;margin-bottom:6px;">Technical Levels</div>'
+        f'<table style="width:100%;border-collapse:collapse;font-family:Inter,monospace;font-size:12px;'
+        f'background:{PALETTE["panel"]};border-radius:8px;overflow:hidden;">'
+        f'{level_rows}</table></div>'
+    ) if level_rows else ""
+
+    # Risk factors + watch list side by side
+    def _bullet_list(items: list[str], title: str, icon: str = "⚠️") -> str:
+        if not items:
+            return ""
+        lis = "".join(
+            f'<li style="margin-bottom:4px;line-height:1.4;">{html.escape(r)}</li>'
+            for r in items
+        )
+        return (
+            f'<div style="flex:1;background:{PALETTE["panel"]};border:1px solid {PALETTE["grid"]};'
+            f'border-radius:8px;padding:10px 14px;font-family:Inter,sans-serif;">'
+            f'<div style="font-size:12px;font-weight:700;color:{PALETTE["muted"]};'
+            f'letter-spacing:0.06em;text-transform:uppercase;margin-bottom:6px;">{icon} {title}</div>'
+            f'<ul style="margin:0;padding-left:16px;font-size:12px;color:{PALETTE["text"]};">{lis}</ul>'
+            f'</div>'
+        )
+
+    risks = _bullet_list(briefing.risk_factors, "Risk Factors", "⚠️")
+    watch = _bullet_list(briefing.key_levels_to_watch, "Watch During Session", "👁️")
+    bottom_row = (
+        f'<div style="display:flex;gap:10px;margin-bottom:12px;">{risks}{watch}</div>'
+        if (risks or watch) else ""
+    )
+
+    return (
+        f'<div style="font-family:Inter,sans-serif;padding:4px 0 16px;">'
+        f'<h3 style="color:{PALETTE["text"]};font-size:14px;margin:0 0 10px 0">'
+        f'🌅 Pre-Market Briefing · <b style="color:{PALETTE["accent"]}">{symbol}</b>'
+        f'</h3>'
+        f'{header}{macro}{catalysts_section}{levels_section}{bottom_row}'
+        f'</div>'
+    )
+
+
+def _premarket_panel(symbol: str) -> None:
+    state = _get_state()
+    sym = symbol.strip().upper() or state.symbol
+
+    st.caption(
+        "Synthesizes recent news, historical price action, macro indicators, and fundamentals into "
+        "a structured morning briefing. Works any time — no live stream needed."
+    )
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        provider = st.selectbox(
+            "Provider",
+            PROVIDERS,
+            index=PROVIDERS.index(state.news_llm_provider),
+            key="premarket_provider",
+            help=f"Model: {', '.join(f'{p}={m}' for p, m in DEFAULT_PREMARKET_MODELS.items())}",
+        )
+        state.news_llm_provider = provider
+        env_var = ENV_KEYS[provider]
+        llm_key = os.getenv(env_var, "")
+        if not llm_key:
+            st.caption(f"⚠️ {env_var} is not set.")
+        model_override = st.text_input(
+            "Model override",
+            value="",
+            placeholder=DEFAULT_PREMARKET_MODELS.get(provider, ""),
+            key="premarket_model",
+        )
+    with c2:
+        if not sym:
+            st.info("Enter a symbol in the sidebar first.")
+        else:
+            generate_clicked = st.button("🌅 Generate Pre-Market Analysis", key="premarket_generate", type="primary")
+            if generate_clicked:
+                if not llm_key:
+                    st.error(f"{env_var} is not set.")
+                else:
+                    with st.spinner(f"Generating pre-market briefing for {sym}…"):
+                        try:
+                            briefing = generate_premarket_analysis(
+                                symbol=sym,
+                                provider=provider,
+                                api_key=llm_key,
+                                alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
+                                alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
+                                worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
+                                model=model_override.strip() or None,
+                            )
+                            st.session_state["premarket_briefing"] = briefing
+                            st.session_state["premarket_symbol"] = sym
+                        except Exception as exc:
+                            st.error(f"Pre-market analysis failed: {exc}")
+
+    briefing: Optional[PremarketBriefing] = st.session_state.get("premarket_briefing")
+    cached_sym: str = st.session_state.get("premarket_symbol", "")
+    if briefing is not None and cached_sym:
+        st.html(_premarket_briefing_html(briefing, cached_sym))
+
+
 def build_ui() -> None:
     st.set_page_config(
         page_title="Market Stream",
@@ -1142,8 +1325,8 @@ def build_ui() -> None:
             )
     state = _get_state()
 
-    tab_live, tab_news, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
-        ["📡 Live", "📰 News", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
+    tab_live, tab_news, tab_premarket, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
+        ["📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
     )
 
     with tab_live:
@@ -1240,6 +1423,9 @@ def build_ui() -> None:
 
     with tab_news:
         _news_panel(symbol)
+
+    with tab_premarket:
+        _premarket_panel(symbol)
 
     with tab_historical:
         _historical_panel(symbol)
