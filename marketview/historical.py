@@ -132,19 +132,35 @@ def fetch_earnings_dates(symbol: str, days: int) -> pd.DataFrame:
 
 def fetch_static_analysis(symbol: str) -> dict:
     """Fetch the raw inputs (P/E, growth, dividend yield) for a simple static valuation estimate."""
+    ticker = yf.Ticker(symbol)
     try:
-        info = yf.Ticker(symbol).info
+        info = ticker.info
+        growth_rate = info.get("earningsGrowth") or info.get("revenueGrowth")
+        return {
+            "pe_ratio": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "dividend_yield": info.get("trailingAnnualDividendYield"),
+            "growth_rate": growth_rate,
+        }
     except Exception:
-        logger.error("yfinance .info lookup failed for %s", symbol, exc_info=True)
-        info = {}
-    growth_rate = info.get("earningsGrowth")
-    if growth_rate is None:
-        growth_rate = info.get("revenueGrowth")
+        # Yahoo Finance periodically restricts the quoteSummary endpoint; fall back
+        # to computing dividend yield from the chart endpoint (less restricted).
+        logger.warning("yfinance .info unavailable for %s; falling back to fast_info", symbol, exc_info=True)
+
+    dividend_yield = None
+    try:
+        last_price = ticker.fast_info.last_price
+        annual_div = float(ticker.dividends.last("365D").sum())
+        if last_price and annual_div:
+            dividend_yield = annual_div / last_price
+    except Exception:
+        pass
+
     return {
-        "pe_ratio": info.get("trailingPE"),
-        "forward_pe": info.get("forwardPE"),
-        "dividend_yield": info.get("trailingAnnualDividendYield"),
-        "growth_rate": growth_rate,
+        "pe_ratio": None,
+        "forward_pe": None,
+        "dividend_yield": dividend_yield,
+        "growth_rate": None,
     }
 
 
