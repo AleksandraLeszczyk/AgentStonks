@@ -134,8 +134,10 @@ def test_fallback_news_loop_skips_polling_when_stream_connected(monkeypatch):
 
 
 def test_fire_due_alerts_wakes_on_price_field():
+    import time
     state = AppState()
     state.last_price = 151.0
+    state.recent_prices.append((time.monotonic(), 151.0))
     state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
 
     stream._fire_due_alerts(state)
@@ -159,8 +161,45 @@ def test_fire_due_alerts_wakes_on_non_price_field():
 
 
 def test_fire_due_alerts_does_not_wake_when_unmet():
+    import time
     state = AppState()
     state.last_price = 149.0
+    state.recent_prices.append((time.monotonic(), 149.0))
+    state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
+
+    stream._fire_due_alerts(state)
+
+    assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+    assert not state.agent_wake_event.is_set()
+
+
+def test_fire_due_alerts_wakes_on_prior_price_in_window():
+    """A last_price alert fires if any price within the last minute crossed the
+    threshold, even if the current last_price has since reverted below it."""
+    import time
+    state = AppState()
+    now = time.monotonic()
+    # Spike to 152 happened 30 s ago; current price is back at 148.
+    state.recent_prices.append((now - 30, 152.0))
+    state.recent_prices.append((now, 148.0))
+    state.last_price = 148.0
+    state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
+
+    stream._fire_due_alerts(state)
+
+    assert state.alerts == []
+    assert state.agent_wake_event.is_set()
+
+
+def test_fire_due_alerts_ignores_stale_price_outside_window():
+    """Prices older than 60 s do not satisfy a last_price alert."""
+    import time
+    state = AppState()
+    now = time.monotonic()
+    # Spike happened 90 s ago -- outside the 60 s window.
+    state.recent_prices.append((now - 90, 155.0))
+    state.recent_prices.append((now, 148.0))
+    state.last_price = 148.0
     state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
 
     stream._fire_due_alerts(state)

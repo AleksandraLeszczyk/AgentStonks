@@ -157,6 +157,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     state.trades.append(trade)
                     if "p" in msg:
                         state.last_price = float(msg["p"])
+                        state.recent_prices.append((time.monotonic(), state.last_price))
                     price = state.last_price
                     tracker = state.decision_tracker
 
@@ -269,6 +270,8 @@ def _fallback_bars_loop(
             state.bars.clear()
             state.bars.extend(bars[-MAX_BARS:])
             state.last_price = last_price
+            if last_price is not None:
+                state.recent_prices.append((time.monotonic(), float(last_price)))
             last_bar = bars[-1] if bars else {}
             state.previous_minute_high = last_bar.get("h")
             state.previous_minute_low = last_bar.get("l")

@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -67,6 +68,7 @@ _DEFAULTS: dict[str, object] = {
     "agent_start_time": None,
     "agent_equity_history": [],
     "alerts": [],
+    "recent_prices": None,  # handled specially (deque of (monotonic_ts, price))
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
@@ -137,14 +139,31 @@ def compare(value: "float | None", condition: "str | None", target: "float | Non
     return False
 
 
+_PRICE_WINDOW_SEC = 60
+
+
 def alert_triggered(state: "AppState", alert: dict) -> bool:
     """Whether a generic condition alert's watched field currently meets its threshold.
 
     `alert` is shaped {"field": <ALERTABLE_FIELDS key>, "condition": "above"|"below",
     "value": <threshold>}.
+
+    For last_price, any trade price recorded within the last minute counts — not
+    only the single most-recent tick. This prevents a fast wick from being missed
+    when the alert check runs slightly after the price reverted.
     """
-    value = alert_field_value(state, alert.get("field"))
-    return compare(value, alert.get("condition"), alert.get("value"))
+    field = alert.get("field")
+    condition = alert.get("condition")
+    threshold = alert.get("value")
+    if field == "last_price":
+        cutoff = time.monotonic() - _PRICE_WINDOW_SEC
+        return any(
+            compare(price, condition, threshold)
+            for ts, price in state.recent_prices
+            if ts >= cutoff
+        )
+    value = alert_field_value(state, field)
+    return compare(value, condition, threshold)
 
 
 def normalize_alert(raw: object) -> "dict | None":
@@ -313,6 +332,10 @@ class AppState:
         # continuously-updated state field (see ALERTABLE_FIELDS). Cleared once
         # any one fires.
         self.alerts: list[dict] = []
+        # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
+        # last ~minute. Used by last_price alerts to check any price in the window,
+        # not only the single most-recent tick.
+        self.recent_prices: deque = deque(maxlen=500)
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()
         self.agent_wake_reason: str | None = None
@@ -336,6 +359,8 @@ class AppState:
             raise AttributeError(f"'AppState' object has no attribute '{name}'")
         if name == "bars":
             value: object = deque(maxlen=MAX_BARS)
+        elif name == "recent_prices":
+            value = deque(maxlen=500)
         elif name == "lock":
             value = threading.Lock()
         elif name == "agent_wake_event":
