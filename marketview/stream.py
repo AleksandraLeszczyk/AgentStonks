@@ -122,9 +122,9 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                             state.bars.append({**bar, "t": bucket})
                 with state.lock:
                     if "h" in bar:
-                        state.day_high = max(state.day_high, bar["h"]) if state.day_high is not None else bar["h"]
+                        state.previous_minute_high = bar["h"]
                     if "l" in bar:
-                        state.day_low = min(state.day_low, bar["l"]) if state.day_low is not None else bar["l"]
+                        state.previous_minute_low = bar["l"]
                     if "v" in bar:
                         state.day_volume = (state.day_volume or 0.0) + float(bar["v"])
                     day_volume = state.day_volume
@@ -148,7 +148,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                         )
                         state.agent_wake_event.set()
 
-                # Generic condition alerts: a bar moves day_high/day_low/day_volume
+                # Generic condition alerts: a bar moves previous_minute_high/low/day_volume
                 # (and the derived volume_ratio), so re-check after every bar.
                 _fire_due_alerts(state)
             elif t == "t" and msg.get("S") == symbol:
@@ -269,8 +269,9 @@ def _fallback_bars_loop(
             state.bars.clear()
             state.bars.extend(bars[-MAX_BARS:])
             state.last_price = last_price
-            state.day_high = max(b["h"] for b in bars if "h" in b)
-            state.day_low = min(b["l"] for b in bars if "l" in b)
+            last_bar = bars[-1] if bars else {}
+            state.previous_minute_high = last_bar.get("h")
+            state.previous_minute_low = last_bar.get("l")
             state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
             if quote:
                 if "bp" in quote:
@@ -304,8 +305,9 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         if state.bars:
             state.prev_close = state.bars[-1].get("c")
         today_bar = today_daily_bar(state.daily_bars)
-        state.day_high = today_bar.get("h") if today_bar else None
-        state.day_low = today_bar.get("l") if today_bar else None
+        last_bar = state.bars[-1] if state.bars else None
+        state.previous_minute_high = last_bar.get("h") if last_bar else None
+        state.previous_minute_low = last_bar.get("l") if last_bar else None
         # Seed today's running volume from today's partial daily bar (0 if the
         # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
         # one-shot alert latch for the new session.

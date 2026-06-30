@@ -80,8 +80,8 @@ def _get_state() -> AppState:
     # therefore __getattr__) still points at the pre-edit definition, so reading
     # the new field raises AttributeError instead of falling back to a default.
     # Writing straight into __dict__ sidesteps the class entirely.
-    state.__dict__.setdefault("day_high", None)
-    state.__dict__.setdefault("day_low", None)
+    state.__dict__.setdefault("previous_minute_high", None)
+    state.__dict__.setdefault("previous_minute_low", None)
     return state
 
 
@@ -209,8 +209,8 @@ def _quote_html(
     bid_size: float | None,
     ask: float | None,
     ask_size: float | None,
-    day_high: float | None,
-    day_low: float | None,
+    previous_minute_high: float | None,
+    previous_minute_low: float | None,
     symbol: str,
 ) -> str:
     if price is None and bid is None and ask is None:
@@ -252,10 +252,10 @@ def _quote_html(
             f'</div>'
         )
 
-    low_card = _side("Day Low", day_low, None, PALETTE["muted"])
+    low_card = _side("Prev Min Low", previous_minute_low, None, PALETTE["muted"])
     bid_card = _side("Bid", bid, bid_size, "#ef5350")
     ask_card = _side("Ask", ask, ask_size, "#26c6a2")
-    high_card = _side("Day High", day_high, None, PALETTE["muted"])
+    high_card = _side("Prev Min High", previous_minute_high, None, PALETTE["muted"])
     spread_row = ""
     if bid is not None and ask is not None:
         spread = ask - bid
@@ -320,10 +320,10 @@ def _price_ticker() -> None:
             bid_size = state.bid_size
             ask_price = state.ask_price
             ask_size = state.ask_size
-            day_high = state.day_high
-            day_low = state.day_low
+            previous_minute_high = state.previous_minute_high
+            previous_minute_low = state.previous_minute_low
         html = _quote_html(
-            last_price, prev_close, bid_price, bid_size, ask_price, ask_size, day_high, day_low, state.symbol
+            last_price, prev_close, bid_price, bid_size, ask_price, ask_size, previous_minute_high, previous_minute_low, state.symbol
         )
         if html:
             st.html(html)

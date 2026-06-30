@@ -113,8 +113,8 @@ there is no "sleep" or do-nothing action. Instead finalize with action \
 your mind before the next scheduled cycle. Each condition names a \
 continuously-updated live field, a direction ("above" = reaches/exceeds, \
 "below" = reaches/falls to), and a value. You are not limited to price: you \
-can watch last_price, bid_price/ask_price, the bid/ask spread, day_high/ \
-day_low, cumulative day_volume, the volume_ratio (today's volume vs its \
+can watch last_price, bid_price/ask_price, the bid/ask spread, previous_minute_high/ \
+previous_minute_low, cumulative day_volume, the volume_ratio (today's volume vs its \
 average), or your own portfolio_value -- whichever actually captures what \
 would change your decision. Common uses: a stop-loss below and a breakout \
 level above on last_price (a two-sided bracket), or a last_price level paired \

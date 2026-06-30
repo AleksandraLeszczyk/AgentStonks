@@ -52,8 +52,8 @@ _DEFAULTS: dict[str, object] = {
     "bid_size": None,
     "ask_price": None,
     "ask_size": None,
-    "day_high": None,
-    "day_low": None,
+    "previous_minute_high": None,
+    "previous_minute_low": None,
     "day_volume": None,
     "volume_alert_enabled": True,
     "volume_alert_multiplier": VOLUME_ALERT_DEFAULT_MULTIPLIER,
@@ -96,8 +96,8 @@ ALERTABLE_FIELDS: dict[str, str] = {
     "bid_size": "Shares offered at the best bid",
     "ask_size": "Shares offered at the best ask",
     "spread": "Ask price minus bid price (absolute, same units as price)",
-    "day_high": "Highest price so far in today's session",
-    "day_low": "Lowest price so far in today's session",
+    "previous_minute_high": "High of the last completed 1-minute bar",
+    "previous_minute_low": "Low of the last completed 1-minute bar",
     "day_volume": "Cumulative shares traded so far today",
     "volume_ratio": "Today's cumulative volume divided by average daily volume",
     "portfolio_value": "Paper portfolio value (cash + position marked to last price)",
@@ -106,7 +106,7 @@ ALERTABLE_FIELDS: dict[str, str] = {
 # Subset of alertable fields that live on the price axis, so a triggered/pending
 # alert on them can be drawn as a horizontal line on the price chart.
 PRICE_AXIS_ALERT_FIELDS: frozenset[str] = frozenset(
-    {"last_price", "bid_price", "ask_price", "day_high", "day_low"}
+    {"last_price", "bid_price", "ask_price", "previous_minute_high", "previous_minute_low"}
 )
 
 
@@ -295,8 +295,8 @@ class AppState:
         self.bid_size: float | None = None
         self.ask_price: float | None = None
         self.ask_size: float | None = None
-        self.day_high: float | None = None
-        self.day_low: float | None = None
+        self.previous_minute_high: float | None = None
+        self.previous_minute_low: float | None = None
         self.day_volume: float | None = None
         self.volume_alert_enabled: bool = True
         self.volume_alert_multiplier: float = VOLUME_ALERT_DEFAULT_MULTIPLIER
