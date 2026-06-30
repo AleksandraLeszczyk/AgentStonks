@@ -171,13 +171,13 @@ class TestRunRegimeCycle:
             _response(tool_calls=[_tool_call("c1", "select_strategy", {"strategy": "scalping", "reasoning": "x"})]),
             _response(
                 tool_calls=[
-                    _tool_call("c2", "select_strategy", {"strategy": "swing", "regime": "ranging", "reasoning": "mixed"})
+                    _tool_call("c2", "select_strategy", {"strategy": "momentum", "regime": "ranging", "reasoning": "mixed"})
                 ]
             ),
         ]
         client = FakeClient(responses)
         selection = run_regime_cycle(client, "m", "AAPL", state, tracker, max_iters=5)
-        assert selection["strategy"] == "swing"
+        assert selection["strategy"] == "momentum"
         # the rejected attempt was surfaced back to the model
         second_call = client.calls[1]
         tool_results = [m["content"] for m in second_call if m.get("role") == "tool"]
@@ -195,7 +195,7 @@ class TestRunRegimeCycle:
         # Orchestrator can pick any tradeable personality, and automatic is not
         # itself selectable.
         assert AUTOMATIC_KEY not in SELECTABLE_STRATEGIES
-        assert "swing" in SELECTABLE_STRATEGIES
+        assert "momentum" in SELECTABLE_STRATEGIES
         assert "smart_money" in SELECTABLE_STRATEGIES
         enum = _TOOL_STAND_DOWN["function"]["parameters"]["properties"]["reasoning"]
         assert enum["type"] == "string"

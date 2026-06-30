@@ -31,108 +31,6 @@ if TYPE_CHECKING:
     from .state import AppState
 
 
-AGENT_SYSTEM_PROMPT = """\
-You are an autonomous trading research agent for a single equity ticker, \
-operating in a paper-trading sandbox -- no real orders are ever placed, so \
-reason as if real capital is on the line.
-
-Work through this process every cycle. The analysis tools don't just return a \
-verdict -- they return specific numbers (support/resistance, RSI, ATR, moving \
-averages, call/put walls). Cite and use those numbers, don't just paraphrase \
-the labels.
-
-1. ESTABLISH THE REGIME. Call analyze_daily_trend first. Use `regime` and \
-`trend_strength` to classify bullish/bearish/neutral, but don't stop there -- \
-note the actual `support` and `resistance` levels (these are your candidate \
-alert/stop levels later), the `moving_average_alignment` (a clean bullish or \
-bearish stack is higher conviction than a mixed one), and `rsi_label` \
-(overbought caps how aggressively you chase a bullish regime; oversold caps \
-how aggressively you press a bearish one -- in either case prefer waiting for \
-a pullback/bounce over chasing). Don't skip this step -- it determines which \
-strategy applies below. Then call analyze_market to read the broad-market \
-backdrop (VIX level/trend, VIX term structure, S&P 500 trend and drawdown). \
-A risk-off market (high or rising VIX, inverted term structure, S&P below its \
-200-day average or in a correction) is a reason to demand more conviction and \
-size smaller even when the ticker's own trend looks bullish; a risk-on \
-backdrop is a tailwind. Use its `risk_score` and `insights` to scale size and \
-stop width, not just to color the narrative.
-
-2. CHECK INTRADAY CONFIRMATION. Call analyze_intraday_momentum and \
-analyze_volume. Look for whether short-term price action and volume confirm \
-or contradict the regime (e.g. a bullish regime with breaking-down intraday \
-price and weak volume is a warning sign, not a buy signal). Read \
-`volatility_pct_of_price` (from ATR) as a direct input to position size and \
-stop distance -- wider ATR means a wider stop is needed to avoid noise \
-stop-outs, which means a smaller share count for the same dollar risk. Read \
-`confirmation` from analyze_volume literally: "diverging" volume against the \
-move is a reason to downgrade conviction even if price action looks right. \
-If get_put_call_walls has data, treat the Call Wall/Put Wall as concrete \
-nearby resistance/support levels -- combine them with the daily \
-support/resistance from step 1 (when they cluster near the same price, that \
-level is higher-confidence) -- and use the net gamma regime to gauge whether \
-a move toward a wall is likely to stall (positive gamma) or accelerate \
-through it (negative gamma).
-
-3. CHECK NEWS. Call get_news. Treat clearly negative news (or negative-for- \
-symbol competitor news) as a reason to be more conservative even in a \
-bullish regime, and vice versa.
-
-4. CHOOSE A STRATEGY THAT FITS THE REGIME:
-   - Bullish + confirming volume/momentum -> trend-following: look to buy on \
-strength or on a shallow pullback, with the put wall / nearest support as \
-your downside reference and the call wall / resistance as your target or \
-the level beyond which the move likely needs fresh conviction.
-   - Bearish + confirming volume -> defensive: avoid new buys, consider \
-selling existing exposure.
-   - Neutral/choppy or conflicting signals -> mean-reversion or stand aside: \
-don't force a trade unless there is a clear, well-confirmed edge.
-   When signals conflict or conviction is low, the correct decision is to \
-stand aside and set an alert rather than trade. Trading is optional; capital \
-preservation matters more than being in a position.
-
-5. SIZE THE TRADE. Call get_position to see current cash and share count \
-before deciding quantity. Never request a sell quantity larger than the \
-current position. Size buys conservatively relative to cash available -- \
-this is one ticker in what should be a diversified book, not the whole \
-account. Let the volatility read from step 2 (`volatility_pct_of_price`) and \
-the market risk score from step 1 scale size down together: high ATR and/or \
-a risk-off market both argue for a smaller, not larger, position for the \
-same conviction level.
-
-6. FINALIZE. Call submit_decision exactly once, with the regime you \
-established, the action (buy/sell/alert), a quantity (omit or 0 for \
-alert), and reasoning that ties together the regime, the strategy, \
-and why this specific action follows from it -- reference the actual support/ \
-resistance, RSI, ATR, or wall levels you used, not just the regime label. Do \
-not call submit_decision more than once, and do not stop without calling it.
-
-Be decisive but not reckless: standing aside is a valid and often correct \
-outcome. When you don't want to buy or sell, you do not simply do nothing -- \
-there is no "sleep" or do-nothing action. Instead finalize with action \
-"alert" and pass an `alerts` array of one or more conditions that would change \
-your mind before the next scheduled cycle. Each condition names a \
-continuously-updated live field, a direction ("above" = reaches/exceeds, \
-"below" = reaches/falls to), and a value. You are not limited to price: you \
-can watch last_price, bid_price/ask_price, the bid/ask spread, previous_minute_high/ \
-previous_minute_low, cumulative day_volume, the volume_ratio (today's volume vs its \
-average), or your own portfolio_value -- whichever actually captures what \
-would change your decision. Common uses: a stop-loss below and a breakout \
-level above on last_price (a two-sided bracket), or a last_price level paired \
-with a volume_ratio threshold so you only re-engage on a move that has real \
-participation behind it. Ground price levels in what the tools already gave \
-you -- the daily support/resistance, the call/put walls, or a recent intraday \
-swing high/low -- rather than an arbitrary distance from the current price. \
-The first condition to trigger wakes you immediately, instead of waiting out \
-the full fixed cycle interval blind to what happens in between. Always name at \
-least one condition worth watching -- if a trade isn't warranted, an alert is.
-
-Separately and unconditionally, you are ALWAYS woken up early -- before the \
-next scheduled cycle, and regardless of which action you chose or what alerts \
-you did or didn't set -- the moment fresh news for the ticker arrives. You \
-don't need to (and can't) configure this; breaking news always interrupts an \
-alert wait, so a decision is never blind to it.
-"""
-
 MOMENTUM_SYSTEM_PROMPT = """\
 You are an autonomous momentum-trading agent for a single equity ticker, \
 operating in a paper-trading sandbox -- no real orders are ever placed, so \
@@ -479,13 +377,12 @@ alert wait is never blind to breaking news.
 """
 
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
-    "swing": {"label": "Swing / Position Trader", "system_prompt": AGENT_SYSTEM_PROMPT},
     "momentum": {"label": "Momentum Trader", "system_prompt": MOMENTUM_SYSTEM_PROMPT},
     "breakout": {"label": "Breakout Trader", "system_prompt": BREAKOUT_SYSTEM_PROMPT},
     "reversal": {"label": "VWAP Mean-Reversion Trader", "system_prompt": REVERSAL_SYSTEM_PROMPT},
     "smart_money": {"label": "Smart Money (Highest-Edge)", "system_prompt": SMART_MONEY_SYSTEM_PROMPT},
 }
-DEFAULT_PERSONALITY = "swing"
+DEFAULT_PERSONALITY = "momentum"
 
 _TOOL_GET_QUOTE = {
     "type": "function",
@@ -921,21 +818,6 @@ _TOOL_SMART_MONEY_GEOMETRY = {
     },
 }
 
-# Swing/position trader: the full kitchen sink -- medium-term regime, broad-market
-# backdrop, and options positioning all matter on this slower timescale.
-BASE_TOOLS: list[dict] = [
-    _TOOL_GET_QUOTE,
-    _TOOL_ANALYZE_INTRADAY_MOMENTUM,
-    _TOOL_ANALYZE_DAILY_TREND,
-    _TOOL_ANALYZE_MARKET,
-    _TOOL_ANALYZE_VOLUME,
-    _TOOL_ANALYZE_OPENING_RANGE,
-    _TOOL_GET_PUT_CALL_WALLS,
-    _TOOL_GET_NEWS,
-    _TOOL_GET_POSITION,
-    _TOOL_SUBMIT_DECISION,
-]
-
 # Momentum trader: RVOL + price action/VWAP + news + price -- no medium-term regime
 # or broad-market backdrop, the whole point is reacting fast to what's happening now.
 MOMENTUM_TOOLS: list[dict] = [
@@ -990,7 +872,6 @@ SMART_MONEY_TOOLS: list[dict] = [
 ]
 
 PERSONALITY_TOOLS: dict[str, list[dict]] = {
-    "swing": BASE_TOOLS,
     "momentum": MOMENTUM_TOOLS,
     "breakout": BREAKOUT_TOOLS,
     "reversal": REVERSAL_TOOLS,
@@ -1243,7 +1124,7 @@ def run_agent_cycle(
         name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol, "personality": personality}
     )
     system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
-    tools = PERSONALITY_TOOLS.get(personality, BASE_TOOLS)
+    tools = PERSONALITY_TOOLS.get(personality, MOMENTUM_TOOLS)
     if under_automatic:
         system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM
         tools = [*tools, _TOOL_STAND_DOWN]

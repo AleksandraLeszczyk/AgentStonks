@@ -108,11 +108,8 @@ tape) where price is stretched from VWAP. Best in the quiet middle of the \
 session with no trend. Do NOT pick this when ADX shows a real trend.
    - smart_money -> price is returning to a higher-timeframe bullish demand \
 order block in a non-bearish regime -- the highest-edge, most all-conditions \
-setup when such a zone exists at/below price.
-   - swing -> the generalist for medium-term positioning when no single \
-intraday edge dominates: a clean daily trend you'd ride over days, or genuinely \
-mixed signals where a slower, broader read (including options positioning) fits \
-best. A reasonable default when nothing sharper is present.
+setup when such a zone exists at/below price. When none of the above fits \
+cleanly, default to momentum as the broadest-purpose intraday read.
 
 5. FINALIZE. Call select_strategy exactly once with: the chosen strategy, the \
 headline regime (one of: {", ".join(REGIMES)}), and reasoning that ties the \
