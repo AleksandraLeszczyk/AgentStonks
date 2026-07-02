@@ -80,9 +80,10 @@ NEWS_IMPACT_COLORS: dict[str, str] = {
     "unknown":  "#555",
 }
 
-# News dots on the Live chart sit this far above the high of the minute bar
-# containing the article's timestamp.
-NEWS_MARKER_PRICE_OFFSET = 0.1
+# News dots on the Live chart sit above the high of the minute bar containing
+# the article's timestamp, offset by this fraction of the session's price range
+# so the spacing looks right at any price scale.
+NEWS_MARKER_OFFSET_FRAC = 0.04
 
 MA_COLORS: dict[int, str] = {
     5:  "#60a5fa",  # blue

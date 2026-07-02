@@ -12,7 +12,7 @@ from .config import (
     FIB_LEVELS,
     MA_COLORS,
     NEWS_IMPACT_COLORS,
-    NEWS_MARKER_PRICE_OFFSET,
+    NEWS_MARKER_OFFSET_FRAC,
     PALETTE,
 )
 
@@ -835,7 +835,11 @@ def build_chart(
         )
         bar_idx = np.searchsorted(df["t"].values, news_t.values, side="right") - 1
         bar_idx = np.clip(bar_idx, 0, len(df) - 1)
-        news_y = df["h"].to_numpy()[bar_idx] + NEWS_MARKER_PRICE_OFFSET
+        price_range = float(df["h"].max() - df["l"].min())
+        # Fall back to a fraction of the price itself when the session range is
+        # flat (single bar / pre-open), so the dot still clears the candle.
+        offset = price_range * NEWS_MARKER_OFFSET_FRAC or float(df["h"].max()) * 0.001
+        news_y = df["h"].to_numpy()[bar_idx] + offset
 
         fig.add_trace(
             go.Scatter(
