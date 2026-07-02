@@ -52,7 +52,7 @@ def _base_kwargs(**overrides) -> dict:
         session_start=SESSION_START,
         starting_budget=100_000.0,
         trade_fixed_cost=1.15,
-        llm_provider="gemini",
+        llm_provider="openai",
         llm_model="",
         llm_personality="Swing / Position Trader",
         agent_running=True,

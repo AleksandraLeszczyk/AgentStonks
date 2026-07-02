@@ -375,7 +375,7 @@ def launch_automatic(
     tracker: DecisionTracker,
     symbol: str,
     api_key: str,
-    provider: str = "gemini",
+    provider: str = "openai",
     model: "str | None" = None,
     cycle_sec: int = AGENT_CYCLE_SEC,
 ) -> None:

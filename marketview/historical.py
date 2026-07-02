@@ -164,6 +164,132 @@ def fetch_static_analysis(symbol: str) -> dict:
     }
 
 
+SMART_MONEY_TTL_SEC = 6 * 3600
+_smart_money_cache: dict = {}
+
+
+def _net_insider_shares(purchases) -> "dict | None":
+    """Parse yfinance `insider_purchases` (a 6-month buy/sell summary) into a net
+    direction. The frame indexes rows like 'Total Shares Purchased' / 'Sold' /
+    'Net Shares Purchased (Sold)' against a single value column."""
+    try:
+        frame = purchases
+        if frame is None or getattr(frame, "empty", True):
+            return None
+        rows = {str(k).strip().lower(): v for k, v in frame.iloc[:, 0].items()}
+        bought = rows.get("total shares purchased")
+        sold = rows.get("total shares sold")
+        net = rows.get("net shares purchased (sold)")
+        if net is None and bought is not None and sold is not None:
+            net = float(bought) - float(sold)
+        if net is None:
+            return None
+        net = float(net)
+        return {
+            "net_shares_6mo": int(net),
+            "bought_6mo": int(bought) if bought is not None else None,
+            "sold_6mo": int(sold) if sold is not None else None,
+            "direction": "buying" if net > 0 else ("selling" if net < 0 else "flat"),
+        }
+    except Exception:
+        logger.warning("Could not parse insider purchases", exc_info=True)
+        return None
+
+
+def fetch_smart_money_flow(symbol: str) -> dict:
+    """The institutional 'smart money' footprint for `symbol` from free yfinance data.
+
+    Pulls three slow-moving but high-signal disclosures Yahoo aggregates from SEC
+    filings: aggregate ownership breakdown (% held by insiders vs institutions),
+    net insider buying/selling over the trailing 6 months (Form 4), and the
+    largest institutional holders with their quarter-over-quarter share changes
+    (13F). These are quarterly/Form-4 cadence -- not intraday signals -- so the
+    result is cached for several hours. A net insider/institutional accumulation
+    behind a bullish demand block corroborates the technical Smart Money read;
+    distribution is a caution flag. Never raises -- missing fields come back None.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _smart_money_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < SMART_MONEY_TTL_SEC:
+        return cached["data"]
+
+    ticker = yf.Ticker(symbol)
+    result: dict = {
+        "symbol": symbol,
+        "insiders_pct_held": None,
+        "institutions_pct_held": None,
+        "institutions_count": None,
+        "insider_flow": None,
+        "top_institutional_holders": [],
+        "institutional_net_pct_change": None,
+    }
+
+    try:
+        mh = ticker.major_holders
+        if mh is not None and not mh.empty:
+            col = mh.iloc[:, 0]
+            for label, value in col.items():
+                key = str(label).strip().lower()
+                try:
+                    val = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if key == "insiderspercentheld":
+                    result["insiders_pct_held"] = round(val, 4)
+                elif key == "institutionspercentheld":
+                    result["institutions_pct_held"] = round(val, 4)
+                elif key == "institutionscount":
+                    result["institutions_count"] = int(val)
+    except Exception:
+        logger.warning("yfinance major_holders unavailable for %s", symbol, exc_info=True)
+
+    try:
+        result["insider_flow"] = _net_insider_shares(ticker.insider_purchases)
+    except Exception:
+        logger.warning("yfinance insider_purchases unavailable for %s", symbol, exc_info=True)
+
+    try:
+        inst = ticker.institutional_holders
+        if inst is not None and not inst.empty:
+            net_change = 0.0
+            for _, row in inst.head(10).iterrows():
+                pct_change = row.get("pctChange")
+                if pct_change is not None and pd.notna(pct_change):
+                    net_change += float(pct_change)
+                result["top_institutional_holders"].append({
+                    "holder": str(row.get("Holder", "")),
+                    "shares": int(row["Shares"]) if pd.notna(row.get("Shares")) else None,
+                    "pct_held": round(float(row["pctHeld"]), 4) if pd.notna(row.get("pctHeld")) else None,
+                    "pct_change": round(float(pct_change), 4) if pct_change is not None and pd.notna(pct_change) else None,
+                })
+            result["top_institutional_holders"] = result["top_institutional_holders"][:5]
+            result["institutional_net_pct_change"] = round(net_change, 4)
+    except Exception:
+        logger.warning("yfinance institutional_holders unavailable for %s", symbol, exc_info=True)
+
+    result["summary"] = _summarize_smart_money_flow(result)
+    _smart_money_cache[symbol] = {"ts": now, "data": result}
+    return result
+
+
+def _summarize_smart_money_flow(flow: dict) -> str:
+    parts: list[str] = []
+    inst_pct = flow.get("institutions_pct_held")
+    ins_pct = flow.get("insiders_pct_held")
+    if inst_pct is not None:
+        parts.append(f"Institutions hold {inst_pct * 100:.1f}%" + (f" across {flow['institutions_count']} holders" if flow.get("institutions_count") else "") + ".")
+    if ins_pct is not None:
+        parts.append(f"Insiders hold {ins_pct * 100:.1f}%.")
+    insider = flow.get("insider_flow")
+    if insider:
+        parts.append(f"Insiders net {insider['direction']} {abs(insider['net_shares_6mo']):,} shares over 6mo (Form 4).")
+    net = flow.get("institutional_net_pct_change")
+    if net is not None:
+        lean = "accumulating" if net > 0 else ("distributing" if net < 0 else "flat")
+        parts.append(f"Top institutions {lean} (net {net * 100:+.1f}% q/q, 13F).")
+    return " ".join(parts) if parts else "No institutional ownership data available."
+
+
 def estimate_total_return(dividend_yield: Optional[float], growth_rate: Optional[float]) -> Optional[float]:
     """Rough estimate of annual total return on the asset: dividend yield + earnings/revenue growth."""
     if dividend_yield is None or growth_rate is None:

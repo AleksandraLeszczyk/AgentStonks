@@ -24,8 +24,8 @@ from .news import fetch_news_with_fallback, get_last_week_news
 
 
 DEFAULT_PREMARKET_MODELS: dict[str, str] = {
-    "gemini": "gemini-2.5-flash",
-    "openai": "gpt-4.1-mini",
+    "gemini": "gemini-3.5-flash",
+    "openai": "gpt-5.4-mini",
     "anthropic": "claude-sonnet-4-6",
 }
 

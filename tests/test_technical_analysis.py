@@ -5,8 +5,10 @@ from marketview.technical_analysis import (
     analyze_consolidation,
     analyze_fair_value_gaps,
     analyze_intraday,
+    analyze_liquidity,
     analyze_market,
     analyze_order_blocks,
+    analyze_premium_discount,
     analyze_smart_money_setup,
     analyze_trend,
     analyze_volume,
@@ -560,3 +562,58 @@ class TestSmartMoneySetup:
         result = analyze_smart_money_setup(_make_bars([100.0, 101.0, 102.0]))
         assert result["signal"] == "no_setup"
         assert "note" in result
+
+
+class TestPremiumDiscount:
+    def test_not_enough_bars_returns_note(self):
+        assert "note" in analyze_premium_discount(_make_bars([100.0, 101.0]))
+
+    def test_price_below_midpoint_is_discount(self):
+        # Range 90..110 (eq 100); spot 92 sits clearly in the discount half.
+        bars = _make_bars([100.0] * 19 + [92.0], highs=[110.0] * 20, lows=[90.0] * 20)
+        result = analyze_premium_discount(bars, spot=92.0)
+        assert result["zone"] == "discount"
+        assert result["in_discount"] is True
+        assert result["equilibrium"] == 100.0
+
+    def test_price_above_midpoint_is_premium(self):
+        bars = _make_bars([100.0] * 19 + [108.0], highs=[110.0] * 20, lows=[90.0] * 20)
+        result = analyze_premium_discount(bars, spot=108.0)
+        assert result["zone"] == "premium"
+        assert result["in_discount"] is False
+
+    def test_ote_zone_is_deep_discount(self):
+        bars = _make_bars([100.0] * 19 + [95.0], highs=[110.0] * 20, lows=[90.0] * 20)
+        result = analyze_premium_discount(bars, spot=95.0)
+        # OTE = 0.618-0.79 retrace from high: 110 - 0.79*20=94.2 .. 110-0.618*20=97.64
+        assert result["ote_zone"]["bottom"] == 94.2
+        assert result["in_ote_zone"] is True
+
+
+class TestLiquidity:
+    def test_not_enough_bars_returns_note(self):
+        assert "note" in analyze_liquidity(_make_bars([100.0, 101.0]))
+
+    def test_detects_buy_and_sell_side_pools(self):
+        # A clean zig-zag creates swing highs (BSL) and swing lows (SSL).
+        closes = [100, 104, 100, 104, 100, 104, 100, 104, 100, 102]
+        result = analyze_liquidity(_make_bars([float(c) for c in closes]), swing=1, spot=102.0)
+        assert result["buy_side_liquidity"]
+        assert result["sell_side_liquidity"]
+
+    def test_detects_bullish_sweep_of_sell_side_liquidity(self):
+        # Form a swing low at ~99, then a later bar undercuts it and closes back above.
+        closes = [105.0, 100.0, 105.0, 104.0, 103.0, 106.0]
+        lows = [104.0, 99.0, 104.0, 103.0, 97.0, 105.0]  # bar idx4 pierces the 99 swing low
+        highs = [c + 0.5 for c in closes]
+        result = analyze_liquidity(_make_bars(closes, highs=highs, lows=lows), swing=1, recent=4, spot=106.0)
+        assert result["recent_sweep"] is not None
+        assert result["recent_sweep"]["type"] == "bullish"
+        assert result["bullish_sweep"] is True
+
+    def test_clusters_equal_highs_into_one_pool(self):
+        # Two near-equal swing highs at ~104 should merge into a single equal-highs pool.
+        closes = [100, 104, 100, 104.05, 100, 102]
+        result = analyze_liquidity(_make_bars([float(c) for c in closes]), swing=1, spot=102.0)
+        equal_pools = [p for p in result["buy_side_liquidity"] if p["equal"]]
+        assert equal_pools

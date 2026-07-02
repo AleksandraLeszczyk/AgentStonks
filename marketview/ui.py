@@ -48,6 +48,7 @@ from .historical import (
     fetch_dividends,
     fetch_earnings_dates,
     fetch_market_indicators,
+    fetch_smart_money_flow,
     fetch_static_analysis,
 )
 from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS
@@ -62,8 +63,10 @@ from .stream import launch_stream, launch_stream_news
 from .technical_analysis import (
     analyze_fair_value_gaps,
     analyze_intraday,
+    analyze_liquidity,
     analyze_market,
     analyze_order_blocks,
+    analyze_premium_discount,
     analyze_smart_money_setup,
     analyze_trend,
     get_put_call_walls_and_gamma,
@@ -606,21 +609,38 @@ def _smart_money_panel(symbol: str) -> None:
 
     setup = analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
     blocks = analyze_order_blocks(daily, spot=spot).get("order_blocks", [])
+    pd_read = analyze_premium_discount(daily, spot=spot)
+    liquidity = analyze_liquidity(intraday, spot=spot) if intraday else {}
 
     # The chart renders daily candles, so only the daily order blocks (whose indices
     # map to that x-axis) are drawn as zones. Intraday FVGs drive the agent's
     # confirmation read but have no position on a daily chart, so they're left off.
-    chart_analysis = {**setup, "order_blocks": blocks, "fair_value_gaps": []}
+    # Premium/discount (daily) and the nearest liquidity pools overlay as levels.
+    chart_analysis = {
+        **setup,
+        "order_blocks": blocks,
+        "fair_value_gaps": [],
+        "premium_discount": pd_read,
+        "liquidity": liquidity,
+    }
     st.plotly_chart(build_smart_money_chart(daily, chart_analysis, sym), width="stretch")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Signal", setup.get("signal", "n/a").replace("_", " "), setup.get("quality", ""))
     rr = setup.get("reward_risk_to_target")
     c2.metric("Reward : Risk", f"{rr:.1f}:1" if rr is not None else "n/a")
+    c3.metric("Range zone", (setup.get("premium_discount_zone") or "n/a").title())
     confs = setup.get("intraday_confirmation") or []
-    c3.metric("Intraday confirmation", ", ".join(confs) if confs else "none")
+    c4.metric("Intraday confirmation", ", ".join(confs) if confs else "none")
 
     st.caption(setup.get("summary", ""))
+
+    sweep = setup.get("recent_sweep")
+    if sweep is not None:
+        st.markdown(
+            f"- **Liquidity sweep:** {sweep['type']} stop-run of {sweep['level']:.2f} "
+            f"({sweep['bars_ago']} bars ago)"
+        )
 
     ob = setup.get("order_block")
     if ob is not None:
@@ -633,6 +653,32 @@ def _smart_money_panel(symbol: str) -> None:
             st.markdown(f"- **Geometry:** entry {e:.2f} · stop {s:.2f} · target {t:.2f}")
     if "note" in setup and setup.get("order_block") is None:
         st.caption(setup["note"])
+
+    with st.expander("🏦 Institutional footprint (insiders · 13F)", expanded=False):
+        try:
+            flow = fetch_smart_money_flow(sym)
+        except Exception:
+            flow = None
+        if not flow:
+            st.caption("Institutional ownership data unavailable.")
+        else:
+            st.caption(flow.get("summary", ""))
+            f1, f2, f3 = st.columns(3)
+            inst_pct = flow.get("institutions_pct_held")
+            ins_pct = flow.get("insiders_pct_held")
+            f1.metric("Institutions", f"{inst_pct * 100:.1f}%" if inst_pct is not None else "n/a")
+            f2.metric("Insiders", f"{ins_pct * 100:.1f}%" if ins_pct is not None else "n/a")
+            insider = flow.get("insider_flow")
+            f3.metric(
+                "Insider 6mo",
+                insider["direction"].title() if insider else "n/a",
+                f"{insider['net_shares_6mo']:+,}" if insider else None,
+            )
+            for h in (flow.get("top_institutional_holders") or [])[:5]:
+                chg = h.get("pct_change")
+                chg_str = f" ({chg * 100:+.1f}% q/q)" if chg is not None else ""
+                held = f"{h['pct_held'] * 100:.2f}%" if h.get("pct_held") is not None else "n/a"
+                st.markdown(f"- **{h['holder']}** — {held}{chg_str}")
 
 
 def _record_wall_snapshot(state: AppState, call_wall: float, put_wall: float) -> list[dict]:

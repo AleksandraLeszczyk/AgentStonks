@@ -317,22 +317,37 @@ medium-term regime and analyze_order_blocks for the institutional zones on the \
 daily timeframe. You are hunting a bullish demand block at or just below price \
 in a non-bearish regime -- a fresh, UNMITIGATED block is higher quality than \
 one already tested. If there is no bullish demand block at/below price, or the \
-daily regime is bearish, there is no setup -- stand aside with an alert.
+daily regime is bearish, there is no setup -- stand aside with an alert. Then \
+call analyze_premium_discount: Smart Money buys in DISCOUNT (below the dealing-\
+range equilibrium) and sells in premium. A demand block that also sits in \
+discount -- best of all, inside the deep-discount OTE zone -- is the highest- \
+quality long; the same block in premium is one to discount or pass.
 
 2. CHECK THE RETURN + INTRADAY CONFIRMATION. Call analyze_smart_money_setup -- \
-the composite read that ties the daily demand block to today's price action. A \
-tradeable return needs price actually INSIDE the block (`price_in_order_block`) \
-plus at least one intraday confirmation: a bullish `rejection_candle` at the \
-zone, a bullish `fvg_fill` (price tapped and held a fair value gap -- drill in \
-with analyze_fair_value_gaps), or a `breaker` (intraday break of structure, old \
-resistance reclaimed as support). No confirmation means the zone may still fail \
--- treat it as `watching`, not a buy. Call analyze_volume too: a return into \
-demand on fading/diverging volume (sellers exhausting) is more trustworthy than \
-one on surging volume (which can mean the zone is about to break).
+the composite read that ties the daily demand block, the premium/discount zone, \
+and today's price action together. A tradeable return needs price actually \
+INSIDE the block (`price_in_order_block`) plus at least one intraday \
+confirmation: a bullish `rejection_candle` at the zone, a bullish `fvg_fill` \
+(price tapped and held a fair value gap -- drill in with analyze_fair_value_gaps), \
+a `breaker` (intraday break of structure, old resistance reclaimed as support), \
+or a `liquidity_sweep`. Call analyze_liquidity for that last one: institutions \
+run stops before reversing, so a bullish sweep (price undercut a prior swing low \
+-- sell-side liquidity -- then closed back above it) is the highest-conviction \
+confirmation, and the nearest buy-side liquidity pool above is a natural target. \
+No confirmation means the zone may still fail -- treat it as `watching`, not a \
+buy. Call analyze_volume too: a return into demand on fading/diverging volume \
+(sellers exhausting) is more trustworthy than one on surging volume (which can \
+mean the zone is about to break).
 
-3. CHECK NEWS. Call get_news. A fresh negative catalyst is exactly what turns a \
-demand block into a failed level -- if clearly negative news is driving price \
-into the zone, do not buy the return; stand aside.
+3. CHECK NEWS AND THE INSTITUTIONAL FOOTPRINT. Call get_news: a fresh negative \
+catalyst is exactly what turns a demand block into a failed level -- if clearly \
+negative news is driving price into the zone, do not buy the return; stand \
+aside. Call get_smart_money_flow for the slower-moving ownership picture: net \
+insider buying and institutional accumulation (rising 13F stakes) behind a \
+demand block corroborate the long; heavy insider selling or institutional \
+distribution is a caution flag that argues for a smaller size or a pass. It is \
+context, not a trigger -- never trade on it alone, and never let it override \
+clearly negative breaking news.
 
 4. CONFIRM THE GEOMETRY. The stop sits JUST BEYOND the order block (below its \
 low); the target is the next opposing structural level (the nearest bearish \
@@ -818,6 +833,59 @@ _TOOL_SMART_MONEY_GEOMETRY = {
     },
 }
 
+_TOOL_ANALYZE_LIQUIDITY = {
+    "type": "function",
+    "function": {
+        "name": "analyze_liquidity",
+        "description": (
+            "Map resting liquidity and recent stop-runs on the intraday timeframe -- the core "
+            "Smart Money 'stop hunt' read. Returns buy-side liquidity pools above price (clustered "
+            "swing highs where buy stops rest) and sell-side pools below (swing lows where sell "
+            "stops rest), the nearest of each to price, and whether a recent liquidity SWEEP "
+            "occurred: price piercing a prior swing level then closing back through it. A bullish "
+            "sweep (a swing low undercut and reclaimed -- a stop-run below support that reversed) "
+            "is one of the strongest intraday confirmations for a long off a demand block. Labeled "
+            "values plus a one-line summary."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_TOOL_ANALYZE_PREMIUM_DISCOUNT = {
+    "type": "function",
+    "function": {
+        "name": "analyze_premium_discount",
+        "description": (
+            "Locate price within the recent daily dealing range: the range high/low, its midpoint "
+            "(equilibrium), and whether price sits in the DISCOUNT half (cheap, below equilibrium -- "
+            "where Smart Money buys), the PREMIUM half (expensive, above it -- where Smart Money "
+            "sells), or at equilibrium. Also returns the deep-discount OTE (optimal trade entry) "
+            "zone, the 0.618-0.79 retracement down from the high. A long off a demand block that is "
+            "ALSO in discount is higher quality than the same block in premium. Labeled values plus "
+            "a one-line summary."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+_TOOL_GET_SMART_MONEY_FLOW = {
+    "type": "function",
+    "function": {
+        "name": "get_smart_money_flow",
+        "description": (
+            "The institutional 'smart money' ownership footprint for the ticker, from free SEC-"
+            "derived disclosures: the percentage of shares held by insiders vs institutions, net "
+            "insider buying/selling over the trailing 6 months (Form 4), and the largest "
+            "institutional holders with their quarter-over-quarter share changes (13F). This is "
+            "slow-moving (quarterly/Form-4 cadence), not an intraday timing signal -- use it as "
+            "corroboration: net insider/institutional ACCUMULATION behind a bullish demand block "
+            "strengthens the long thesis; DISTRIBUTION is a caution flag. Labeled values plus a "
+            "one-line summary."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 # Momentum trader: RVOL + price action/VWAP + news + price -- no medium-term regime
 # or broad-market backdrop, the whole point is reacting fast to what's happening now.
 MOMENTUM_TOOLS: list[dict] = [
@@ -862,9 +930,12 @@ SMART_MONEY_TOOLS: list[dict] = [
     _TOOL_GET_QUOTE,
     _TOOL_ANALYZE_DAILY_TREND,
     _TOOL_ANALYZE_ORDER_BLOCKS,
+    _TOOL_ANALYZE_PREMIUM_DISCOUNT,
     _TOOL_ANALYZE_SMART_MONEY_SETUP,
     _TOOL_ANALYZE_FAIR_VALUE_GAPS,
+    _TOOL_ANALYZE_LIQUIDITY,
     _TOOL_ANALYZE_VOLUME,
+    _TOOL_GET_SMART_MONEY_FLOW,
     _TOOL_SMART_MONEY_GEOMETRY,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
@@ -1047,6 +1118,31 @@ def _tool_smart_money_trade_geometry(state: "AppState", entry: object, stop: obj
     return ta.smart_money_trade_geometry(float(entry), float(stop), float(target))
 
 
+def _tool_analyze_liquidity(state: "AppState") -> dict:
+    with state.lock:
+        bars = list(state.bars)
+        spot = state.last_price
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_liquidity(bars, spot=spot)
+
+
+def _tool_analyze_premium_discount(state: "AppState") -> dict:
+    daily = list(state.daily_bars)
+    if not daily:
+        return {"note": "no daily bars available yet"}
+    with state.lock:
+        spot = state.last_price
+    return ta.analyze_premium_discount(daily, spot=spot)
+
+
+def _tool_get_smart_money_flow(state: "AppState") -> dict:
+    symbol = state.symbol
+    if not symbol:
+        return {"note": "no symbol set"}
+    return historical.fetch_smart_money_flow(symbol)
+
+
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
     "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
@@ -1064,6 +1160,9 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_order_blocks": lambda args, state, tracker: _tool_analyze_order_blocks(state),
     "analyze_fair_value_gaps": lambda args, state, tracker: _tool_analyze_fair_value_gaps(state, args.get("limit")),
     "analyze_smart_money_setup": lambda args, state, tracker: _tool_analyze_smart_money_setup(state),
+    "analyze_liquidity": lambda args, state, tracker: _tool_analyze_liquidity(state),
+    "analyze_premium_discount": lambda args, state, tracker: _tool_analyze_premium_discount(state),
+    "get_smart_money_flow": lambda args, state, tracker: _tool_get_smart_money_flow(state),
     "smart_money_trade_geometry": lambda args, state, tracker: _tool_smart_money_trade_geometry(
         state, args.get("entry"), args.get("stop"), args.get("target")
     ),
@@ -1395,7 +1494,7 @@ def launch_agent(
     tracker: "DecisionTracker",
     symbol: str,
     api_key: str,
-    provider: str = "gemini",
+    provider: str = "openai",
     model: "str | None" = None,
     cycle_sec: int = 60,
     personality: str = DEFAULT_PERSONALITY,

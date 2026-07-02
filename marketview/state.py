@@ -72,13 +72,13 @@ _DEFAULTS: dict[str, object] = {
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
-    "llm_provider": "gemini",
+    "llm_provider": "openai",
     "llm_model": "",
     "llm_personality": "swing",
     "automatic_active_strategy": None,
     "automatic_regime": None,
     "automatic_reason": None,
-    "news_llm_provider": "gemini",
+    "news_llm_provider": "openai",
     "options_chain": None,
     "options_wall_history": [],
     "options_status": "",
@@ -339,7 +339,7 @@ class AppState:
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()
         self.agent_wake_reason: str | None = None
-        self.llm_provider: str = "gemini"
+        self.llm_provider: str = "openai"
         self.llm_model: str = ""
         self.llm_personality: str = "swing"
         # Automatic orchestrator: which strategy it has currently activated (None
@@ -348,7 +348,7 @@ class AppState:
         self.automatic_active_strategy: str | None = None
         self.automatic_regime: str | None = None
         self.automatic_reason: str | None = None
-        self.news_llm_provider: str = "gemini"
+        self.news_llm_provider: str = "openai"
         self.options_chain: "dict | None" = None
         self.options_wall_history: list[dict] = []
         self.options_status: str = ""

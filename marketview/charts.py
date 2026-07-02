@@ -1088,6 +1088,46 @@ def build_smart_money_chart(bars: list[dict], analysis: dict, symbol: str) -> go
             line=dict(width=0), layer="below",
         )
 
+    # Premium / discount: equilibrium line with the discount half shaded faintly
+    # green (where Smart Money buys). Drawn below the candles.
+    pd_read = analysis.get("premium_discount") or {}
+    eq = pd_read.get("equilibrium")
+    r_lo, r_hi = pd_read.get("range_low"), pd_read.get("range_high")
+    if eq is not None and r_lo is not None:
+        fig.add_shape(
+            type="rect", xref="x", yref="y",
+            x0=x0, x1=x1, y0=r_lo, y1=eq,
+            fillcolor=PALETTE["up"], opacity=0.05, line=dict(width=0), layer="below",
+        )
+        fig.add_shape(
+            type="line", xref="x", yref="y", x0=x0, x1=x1, y0=eq, y1=eq,
+            line=dict(color=PALETTE["muted"], width=1, dash="dashdot"),
+        )
+        fig.add_annotation(
+            xref="x", yref="y", x=x1, y=eq,
+            text=f" Equilibrium {eq:.2f} ({pd_read.get('zone', '')})",
+            font=dict(color=PALETTE["muted"], size=9, family="monospace"),
+            showarrow=False, xanchor="left",
+        )
+
+    # Liquidity pools: nearest buy-side (overhead, a target) and sell-side (below,
+    # resting stops) as thin violet dotted lines.
+    liq = analysis.get("liquidity") or {}
+    for pool_key, tag in (("nearest_bsl_above", "BSL"), ("nearest_ssl_below", "SSL")):
+        pool = liq.get(pool_key)
+        if not pool:
+            continue
+        label = f"{tag}{' (equal)' if pool.get('equal') else ''} {pool['price']:.2f}"
+        fig.add_shape(
+            type="line", xref="x", yref="y", x0=x0, x1=x1, y0=pool["price"], y1=pool["price"],
+            line=dict(color="#a78bfa", width=1, dash="dot"),
+        )
+        fig.add_annotation(
+            xref="x", yref="y", x=x0, y=pool["price"], text=f"{label} ",
+            font=dict(color="#a78bfa", size=9, family="monospace"),
+            showarrow=False, xanchor="right",
+        )
+
     # Entry / stop / target geometry.
     levels = (
         ("suggested_entry", "Entry", PALETTE["accent"], "dash"),

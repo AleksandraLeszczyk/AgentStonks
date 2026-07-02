@@ -1373,6 +1373,181 @@ def smart_money_trade_geometry(
     }
 
 
+def analyze_premium_discount(
+    bars: list[dict], lookback: int = 20, spot: "float | None" = None
+) -> dict:
+    """Premium / discount read over the recent dealing range.
+
+    Smart Money buys in *discount* (below the range midpoint, "equilibrium") and
+    sells in *premium* (above it). The dealing range is the highest high and
+    lowest low over the last `lookback` bars; its midpoint is equilibrium. A
+    return into a bullish demand block that *also* sits in discount is a
+    higher-quality long than the same block sitting in premium -- price is cheap
+    relative to where institutions accumulated. The deep-discount "OTE" zone is
+    the 0.618-0.79 retracement down from the range high, where institutional
+    longs are statistically filled.
+    """
+    if not bars or len(bars) < 3:
+        return {"note": "not enough bars for a premium/discount read"}
+
+    window = bars[-lookback:] if len(bars) >= lookback else bars
+    range_high = max(float(b["h"]) for b in window)
+    range_low = min(float(b["l"]) for b in window)
+    rng = range_high - range_low
+    if rng <= 0:
+        return {"note": "flat dealing range; premium/discount undefined"}
+
+    if spot is None:
+        spot = float(bars[-1]["c"])
+    equilibrium = (range_high + range_low) / 2.0
+    # 0.0 = range low, 1.0 = range high.
+    position = (spot - range_low) / rng
+
+    if position < 0.45:
+        zone = "discount"
+    elif position > 0.55:
+        zone = "premium"
+    else:
+        zone = "equilibrium"
+
+    # Optimal Trade Entry: the 0.618-0.79 retracement down from the high.
+    ote_top = round(range_high - 0.618 * rng, 4)
+    ote_bottom = round(range_high - 0.79 * rng, 4)
+    in_ote = ote_bottom <= spot <= ote_top
+
+    summary = (
+        f"Dealing range {range_low:.2f}-{range_high:.2f}, equilibrium {equilibrium:.2f}; "
+        f"spot {spot:.2f} is in the {zone} zone ({position * 100:.0f}% of range). "
+        + (
+            "Inside the deep-discount OTE zone -- prime institutional long area."
+            if in_ote
+            else ("Below equilibrium -- favourable for longs." if zone == "discount"
+                  else "At/above equilibrium -- longs are buying retail-expensive prices.")
+        )
+    )
+
+    return {
+        "spot": round(spot, 4),
+        "range_high": round(range_high, 4),
+        "range_low": round(range_low, 4),
+        "equilibrium": round(equilibrium, 4),
+        "range_position": round(position, 3),
+        "zone": zone,
+        "in_discount": zone == "discount",
+        "ote_zone": {"bottom": ote_bottom, "top": ote_top},
+        "in_ote_zone": in_ote,
+        "summary": summary,
+    }
+
+
+def _cluster_levels(levels: list[float], tol_pct: float) -> list[dict]:
+    """Group near-equal price levels into liquidity pools.
+
+    Levels within `tol_pct` of a running cluster anchor are merged; a pool with
+    two or more members is an *equal-highs/lows* cluster -- a stronger resting
+    pool of liquidity (more stops bunched at one price)."""
+    pools: list[dict] = []
+    for price in sorted(levels):
+        if pools and price <= pools[-1]["anchor"] * (1 + tol_pct):
+            pool = pools[-1]
+            pool["members"].append(price)
+            pool["price"] = sum(pool["members"]) / len(pool["members"])
+        else:
+            pools.append({"anchor": price, "price": price, "members": [price]})
+    return [
+        {"price": round(p["price"], 4), "count": len(p["members"]), "equal": len(p["members"]) >= 2}
+        for p in pools
+    ]
+
+
+def analyze_liquidity(
+    bars: list[dict], swing: int = 3, tol_pct: float = 0.0015, recent: int = 5, spot: "float | None" = None
+) -> dict:
+    """Liquidity pools and recent sweeps -- the core Smart Money 'stop hunt' read.
+
+    Liquidity rests where retail stops cluster: just above swing highs (buy-side
+    liquidity, BSL) and just below swing lows (sell-side liquidity, SSL).
+    Institutions push price through these pools to fill large orders, then
+    reverse -- a *liquidity sweep* / stop run. A bullish SSL sweep (price
+    undercuts a prior swing low then closes back above it) is exactly the trap
+    that precedes an institutional markup, and one of the strongest
+    confirmations for a long off a demand block. Near-equal highs/lows within
+    `tol_pct` are merged into a single, stronger resting-liquidity pool.
+    """
+    n = len(bars)
+    if n < 2 * swing + 2:
+        return {"note": "not enough bars to locate liquidity", "buy_side_liquidity": [], "sell_side_liquidity": []}
+
+    h = [float(b["h"]) for b in bars]
+    l = [float(b["l"]) for b in bars]
+    c = [float(b["c"]) for b in bars]
+
+    swing_highs: list[tuple[int, float]] = []
+    swing_lows: list[tuple[int, float]] = []
+    for i in range(swing, n - swing):
+        if h[i] == max(h[i - swing : i + swing + 1]):
+            swing_highs.append((i, h[i]))
+        if l[i] == min(l[i - swing : i + swing + 1]):
+            swing_lows.append((i, l[i]))
+
+    if spot is None:
+        spot = float(bars[-1]["c"])
+
+    bsl = _cluster_levels([p for _, p in swing_highs], tol_pct)  # buy-side (above)
+    ssl = _cluster_levels([p for _, p in swing_lows], tol_pct)  # sell-side (below)
+
+    bsl_above = [pool for pool in bsl if pool["price"] >= spot]
+    ssl_below = [pool for pool in ssl if pool["price"] <= spot]
+    nearest_bsl = min(bsl_above, key=lambda p: p["price"]) if bsl_above else None
+    nearest_ssl = max(ssl_below, key=lambda p: p["price"]) if ssl_below else None
+
+    # Recent sweep: a bar in the last `recent` that pierced a *prior* swing level
+    # and closed back on the other side of it (the reversal that defines a sweep).
+    recent_sweep: "dict | None" = None
+    for j in range(max(swing, n - recent), n):
+        prior_lows = [pl for k, pl in swing_lows if k <= j - 1]
+        for pl in prior_lows:
+            if l[j] < pl and c[j] > pl:
+                recent_sweep = {"type": "bullish", "level": round(pl, 4), "bars_ago": n - 1 - j}
+                break
+        if recent_sweep is not None:
+            continue
+        prior_highs = [ph for k, ph in swing_highs if k <= j - 1]
+        for ph in prior_highs:
+            if h[j] > ph and c[j] < ph:
+                recent_sweep = {"type": "bearish", "level": round(ph, 4), "bars_ago": n - 1 - j}
+                break
+
+    bullish_sweep = recent_sweep is not None and recent_sweep["type"] == "bullish"
+
+    parts = [f"{len(bsl)} buy-side and {len(ssl)} sell-side liquidity pool(s); spot {spot:.2f}."]
+    if nearest_bsl is not None:
+        eq = " (equal highs)" if nearest_bsl["equal"] else ""
+        parts.append(f"Nearest overhead BSL {nearest_bsl['price']:.2f}{eq} -- liquidity/target above.")
+    if nearest_ssl is not None:
+        eq = " (equal lows)" if nearest_ssl["equal"] else ""
+        parts.append(f"Nearest SSL {nearest_ssl['price']:.2f}{eq} below -- stops resting there.")
+    if recent_sweep is not None:
+        parts.append(
+            f"Recent {recent_sweep['type']} sweep of {recent_sweep['level']:.2f} "
+            f"({recent_sweep['bars_ago']} bars ago)"
+            + (" -- bullish stop-run, supports a long." if bullish_sweep else ".")
+        )
+    else:
+        parts.append("No recent sweep.")
+
+    return {
+        "spot": round(spot, 4),
+        "buy_side_liquidity": bsl,
+        "sell_side_liquidity": ssl,
+        "nearest_bsl_above": nearest_bsl,
+        "nearest_ssl_below": nearest_ssl,
+        "recent_sweep": recent_sweep,
+        "bullish_sweep": bullish_sweep,
+        "summary": " ".join(parts),
+    }
+
+
 def analyze_smart_money_setup(
     daily_bars: list[dict],
     intraday_bars: "list[dict] | None" = None,
@@ -1406,9 +1581,14 @@ def analyze_smart_money_setup(
 
     price_in_ob = demand is not None and demand["bottom"] <= spot <= demand["top"]
 
+    # Premium/discount context: smart money buys discount (below equilibrium).
+    pd_read = analyze_premium_discount(daily_bars, spot=spot)
+    in_discount = bool(pd_read.get("in_discount"))
+
     # Intraday confirmation signals (any one qualifies; more = higher quality).
     confirmations: list[str] = []
     nearest_fvg = None
+    liquidity = None
     if intraday_bars and len(intraday_bars) >= 3:
         if _rejection_candle(intraday_bars[-1]) == "bullish_rejection":
             confirmations.append("rejection_candle")
@@ -1418,6 +1598,9 @@ def analyze_smart_money_setup(
             confirmations.append("fvg_fill")
         if _intraday_break_of_structure(intraday_bars):
             confirmations.append("breaker")
+        liquidity = analyze_liquidity(intraday_bars, spot=spot)
+        if liquidity.get("bullish_sweep"):
+            confirmations.append("liquidity_sweep")
 
     # Entry, stop, and target geometry.
     entry = round(spot if price_in_ob else (demand["top"] if demand else spot), 4)
@@ -1444,7 +1627,7 @@ def analyze_smart_money_setup(
     else:
         signal = "watching"
 
-    if signal == "long_setup" and len(confirmations) >= 2 and regime == "bullish" and (
+    if signal == "long_setup" and len(confirmations) >= 2 and regime == "bullish" and in_discount and (
         geometry and geometry["reward_risk_ratio"] >= 4.0
     ):
         quality = "A+"
@@ -1462,6 +1645,7 @@ def analyze_smart_money_setup(
         )
     else:
         summary_parts.append("No bullish demand block at/below price.")
+    summary_parts.append(f"Price in {pd_read.get('zone', 'n/a')} zone (eq {pd_read.get('equilibrium', float('nan')):.2f}).")
     summary_parts.append(
         f"Intraday confirmation: {', '.join(confirmations) if confirmations else 'none'}."
     )
@@ -1486,8 +1670,12 @@ def analyze_smart_money_setup(
         "order_block": demand,
         "supply_block": supply,
         "price_in_order_block": price_in_ob,
+        "premium_discount_zone": pd_read.get("zone"),
+        "in_discount": in_discount,
+        "equilibrium": pd_read.get("equilibrium"),
         "intraday_confirmation": confirmations,
         "confirmed": bool(confirmations),
+        "recent_sweep": liquidity.get("recent_sweep") if liquidity else None,
         "nearest_bullish_fvg": nearest_fvg,
         "suggested_entry": entry if demand is not None else None,
         "suggested_stop": suggested_stop,
