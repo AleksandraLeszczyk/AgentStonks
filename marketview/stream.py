@@ -8,7 +8,14 @@ from typing import Any
 
 import websocket
 
-from .config import BARS_STREAM_URL, FALLBACK_POLL_SEC, MAX_BARS, NEWS_FALLBACK_POLL_SEC, NEWS_STREAM_URL
+from .config import (
+    BACKFILL_POLL_SEC,
+    BARS_STREAM_URL,
+    FALLBACK_POLL_SEC,
+    MAX_BARS,
+    NEWS_FALLBACK_POLL_SEC,
+    NEWS_STREAM_URL,
+)
 from .historical import fetch_intraday_bars
 from .news import fetch_news_with_fallback
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
@@ -91,12 +98,88 @@ def _keepalive_sockopt() -> list[tuple]:
 
 
 def _floor_ts(ts: str, minutes: int) -> str:
-    """Floor an ISO timestamp to the nearest N-minute bucket."""
+    """Floor an ISO timestamp to the nearest N-minute bucket.
+
+    Emits the same 'Z'-suffixed RFC-3339 format Alpaca uses for bar timestamps,
+    so a bucket built here compares equal to a REST bar for the same period
+    (isoformat()'s '+00:00' suffix broke that, duplicating buckets after a
+    fallback refresh).
+    """
     dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     total = dt.hour * 60 + dt.minute
     floored = (total // minutes) * minutes
     dt = dt.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
-    return dt.isoformat()
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _bar_ts_key(ts: object) -> str:
+    """Normalize a bar timestamp for cross-source comparison ('Z' vs '+00:00')."""
+    return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).isoformat()
+
+
+def merge_missing_bars(state: AppState, fetched: list[dict]) -> int:
+    """Insert fetched bars whose timestamps are absent from state.bars.
+
+    On a timestamp collision the existing (streamed) bar always wins, so a
+    live in-progress bar is never clobbered by an older REST snapshot.
+    Returns the number of bars added.
+    """
+    if not fetched:
+        return 0
+    with state.lock:
+        have = {_bar_ts_key(b["t"]) for b in state.bars if "t" in b}
+        missing = [b for b in fetched if "t" in b and _bar_ts_key(b["t"]) not in have]
+        if not missing:
+            return 0
+        merged = sorted(list(state.bars) + missing, key=lambda b: _bar_ts_key(b["t"]))
+        state.bars.clear()
+        state.bars.extend(merged[-MAX_BARS:])
+    return len(missing)
+
+
+# yfinance equivalents of Alpaca timeframes, for the secondary backfill source.
+_YF_INTERVALS: dict[str, str] = {
+    "1Min": "1m", "5Min": "5m", "15Min": "15m", "30Min": "30m", "1Hour": "60m",
+}
+
+
+def backfill_bars(
+    symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str
+) -> tuple[int, str]:
+    """Repair holes in the live bar series from a slower-but-complete source.
+
+    The WS stream never re-delivers bars that closed while the socket was down,
+    and on the IEX feed a minute without an IEX trade produces no bar at all --
+    both leave permanent gaps in state.bars. Primary source is Alpaca REST
+    (same feed as the stream, so volumes stay comparable); if that fails,
+    delayed consolidated yfinance bars are used where the timeframe has an
+    equivalent. Only missing timestamps are inserted -- streamed bars are never
+    overwritten. Returns (bars_added, source_name).
+    """
+    try:
+        fetched = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
+        source = "Alpaca REST"
+    except Exception as exc:
+        yf_interval = _YF_INTERVALS.get(timeframe)
+        if yf_interval is None:
+            raise
+        logger.warning("Backfill via Alpaca REST failed for %s, trying yfinance: %s", symbol, exc)
+        fetched = fetch_intraday_bars(symbol, interval=yf_interval)
+        source = "yfinance (delayed)"
+    return merge_missing_bars(state, fetched), source
+
+
+def _backfill_quietly(
+    symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str
+) -> None:
+    """backfill_bars wrapped for background use: log instead of raising."""
+    try:
+        added, source = backfill_bars(symbol, key, secret, feed, state, timeframe)
+    except Exception as exc:
+        logger.warning("Bar backfill failed for %s: %s", symbol, exc)
+        return
+    if added:
+        logger.info("Backfilled %d missing %s bar(s) for %s via %s", added, timeframe, symbol, source)
 
 
 def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
@@ -124,6 +207,14 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
             elif t == "subscription":
                 state.status = f"✅ Streaming {symbol} ({feed.upper()})"
                 state.bars_connected = True
+                # This also fires on every reconnect. The stream only pushes
+                # bars from now on -- anything that closed while the socket was
+                # down is gone unless fetched again, so repair the hole now.
+                threading.Thread(
+                    target=_backfill_quietly,
+                    args=(symbol, key, secret, feed, state, timeframe),
+                    daemon=True,
+                ).start()
             elif t == "b" and msg.get("S") == symbol:
                 bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v", "vw") if k in msg}
                 if tf_minutes == 1:
@@ -250,9 +341,18 @@ def _fallback_bars_loop(
 
     Falls back further to yfinance (no API key, delayed quotes) if Alpaca's REST API
     itself is also unavailable.
+
+    While the WS *is* connected this loop instead runs a periodic backfill
+    (every BACKFILL_POLL_SEC) that merges only-missing bars, repairing holes
+    left by reconnects and by feed minutes without any trade.
     """
+    last_backfill = 0.0
     while not stop_event.wait(FALLBACK_POLL_SEC):
         if state.bars_connected:
+            now = time.monotonic()
+            if now - last_backfill >= BACKFILL_POLL_SEC:
+                last_backfill = now
+                _backfill_quietly(symbol, key, secret, feed, state, timeframe)
             continue
         try:
             bars = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)

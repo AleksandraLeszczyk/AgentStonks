@@ -186,3 +186,57 @@ class TestBuildHistoricalChart:
             dividends=dividends, earnings=earnings,
         )
         assert len(fig.layout.shapes) == 2
+
+
+class TestFillIntradayGaps:
+    GAPPY_BARS = [
+        {"t": "2024-01-15T14:00:00Z", "o": 100.0, "h": 102.0, "l": 99.0, "c": 101.0, "v": 5000},
+        {"t": "2024-01-15T14:01:00Z", "o": 101.0, "h": 103.0, "l": 100.5, "c": 102.0, "v": 3000},
+        # 14:02 and 14:03 missing (no trades on the feed)
+        {"t": "2024-01-15T14:04:00Z", "o": 102.0, "h": 102.5, "l": 101.0, "c": 101.5, "v": 2000},
+    ]
+
+    def _df(self, bars):
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"], utc=True)
+        return df.sort_values("t").reset_index(drop=True)
+
+    def test_fills_missing_buckets_with_flat_zero_volume_bars(self):
+        from marketview.charts import _fill_intraday_gaps
+
+        filled = _fill_intraday_gaps(self._df(self.GAPPY_BARS))
+        assert len(filled) == 5
+        synth = filled[filled["synthetic"]]
+        assert list(synth["t"].dt.strftime("%H:%M")) == ["14:02", "14:03"]
+        # Flat at the previous close, zero volume
+        assert (synth["o"] == 102.0).all()
+        assert (synth["c"] == 102.0).all()
+        assert (synth["v"] == 0).all()
+        # Real bars untouched
+        assert filled[~filled["synthetic"]]["v"].tolist() == [5000, 3000, 2000]
+
+    def test_does_not_fill_across_days(self):
+        from marketview.charts import _fill_intraday_gaps
+
+        bars = self.GAPPY_BARS + [
+            {"t": "2024-01-16T14:00:00Z", "o": 103.0, "h": 104.0, "l": 102.0, "c": 103.5, "v": 1000},
+        ]
+        filled = _fill_intraday_gaps(self._df(bars))
+        # Only the two intraday holes are filled -- not the overnight gap.
+        assert int(filled["synthetic"].sum()) == 2
+
+    def test_build_chart_with_fill_gaps_adds_no_trades_markers(self):
+        fig = build_chart(self.GAPPY_BARS, [], [], "AAPL", SESSION_START, fill_gaps=True)
+        names = [tr.name for tr in fig.data]
+        assert "No trades" in names
+
+    def test_build_chart_without_fill_gaps_has_no_markers(self):
+        fig = build_chart(self.GAPPY_BARS, [], [], "AAPL", SESSION_START, fill_gaps=False)
+        names = [tr.name for tr in fig.data]
+        assert "No trades" not in names
+
+    def test_build_chart_dedupes_mixed_timestamp_formats(self):
+        # Same bucket delivered twice: REST 'Z' format and stream '+00:00' format.
+        dup = dict(self.GAPPY_BARS[1], t="2024-01-15T14:01:00+00:00", c=999.0)
+        fig = build_chart(self.GAPPY_BARS + [dup], [], [], "AAPL", SESSION_START)
+        assert isinstance(fig, go.Figure)

@@ -7,7 +7,14 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from .config import AVG_LINE_COLORS, FIB_LEVELS, MA_COLORS, PALETTE
+from .config import (
+    AVG_LINE_COLORS,
+    FIB_LEVELS,
+    MA_COLORS,
+    NEWS_IMPACT_COLORS,
+    NEWS_MARKER_PRICE_OFFSET,
+    PALETTE,
+)
 
 
 def empty_chart(msg: str = "Enter a symbol and click Start") -> go.Figure:
@@ -579,6 +586,37 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
         )
 
 
+def _fill_intraday_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """Insert synthetic flat bars (o=h=l=c=prev close, v=0) at missing buckets.
+
+    A feed only prints a bar for periods in which it saw at least one trade
+    (on IEX that's a small slice of consolidated volume), so thin symbols
+    leave holes in the candle/volume series. The grid step is the smallest
+    observed bar spacing, applied per calendar day so overnight/weekend gaps
+    are never filled. Synthetic rows are flagged in a 'synthetic' column.
+    """
+    if len(df) < 3:
+        return df
+    step = df["t"].diff().dropna().min()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        return df
+
+    days = []
+    for _, day_df in df.groupby(df["t"].dt.date, sort=True):
+        idx = pd.DatetimeIndex(day_df["t"])
+        grid = pd.date_range(idx[0], idx[-1], freq=step)
+        gridded = day_df.set_index("t").reindex(idx.union(grid))
+        synth = gridded["c"].isna()
+        gridded["c"] = gridded["c"].ffill()
+        for col in ("o", "h", "l", "vw"):
+            if col in gridded.columns:
+                gridded.loc[synth, col] = gridded.loc[synth, "c"]
+        gridded["v"] = gridded["v"].fillna(0.0)
+        gridded["synthetic"] = synth
+        days.append(gridded)
+    return pd.concat(days).rename_axis("t").reset_index()
+
+
 def _bar_width_ms(df: pd.DataFrame) -> float:
     if len(df) < 2:
         return 60_000
@@ -606,16 +644,24 @@ def build_chart(
     show_whiskers: bool = True,
     decisions: Optional[list[dict]] = None,
     price_alerts: Optional[list[dict]] = None,
+    news_impacts: Optional[dict] = None,
+    fill_gaps: bool = False,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
 
     df_all = pd.DataFrame(bars)
     df_all["t"] = pd.to_datetime(df_all["t"], utc=True)
-    df_all = df_all.sort_values("t").reset_index(drop=True)
+    df_all = (
+        df_all.sort_values("t")
+        .drop_duplicates(subset="t", keep="last")
+        .reset_index(drop=True)
+    )
     df = df_all[df_all["t"] > session_start].reset_index(drop=True)
     if df.empty:
         return empty_chart("Waiting for data…")
+    if fill_gaps:
+        df = _fill_intraday_gaps(df)
 
     df_trades = pd.DataFrame.from_records(trades) if trades else pd.DataFrame(columns=["p", "s", "t"])
     if not df_trades.empty:
@@ -724,6 +770,28 @@ def build_chart(
                     col=1,
                 )
 
+    if "synthetic" in df.columns and df["synthetic"].any():
+        # Gap-filled buckets: a zero-range candle body renders as nothing, so
+        # mark them as muted flat ticks at the carried-forward close instead.
+        sdf = df[df["synthetic"]]
+        fig.add_trace(
+            go.Scatter(
+                x=sdf["t"],
+                y=sdf["c"],
+                mode="markers",
+                marker=dict(
+                    symbol="line-ew",
+                    size=7,
+                    line=dict(color=PALETTE["muted"], width=1),
+                ),
+                name="No trades",
+                showlegend=False,
+                hovertemplate="<b>No trades</b> — last %{y:.4f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
     vol_colors = [
         PALETTE["up"] if c >= o else PALETTE["down"]
         for c, o in zip(df["c"], df["o"])
@@ -747,22 +815,52 @@ def build_chart(
         df_news = df_news[df_news["created_at"] > session_start]
 
     if not df_news.empty:
-        price_ref = df_trades["p"].max() if not df_trades.empty else df["h"].max()
+        impacts = news_impacts or {}
+        if "id" in df_news.columns:
+            impact_labels = [
+                impacts.get(str(news_id), "unknown") for news_id in df_news["id"]
+            ]
+        else:
+            impact_labels = ["unknown"] * len(df_news)
+        impact_colors = [
+            NEWS_IMPACT_COLORS.get(label, NEWS_IMPACT_COLORS["unknown"])
+            for label in impact_labels
+        ]
+
+        # Anchor each dot to the high of the minute bar containing the article,
+        # so markers sit just above the price action at publication time.
+        news_t = df_news["created_at"]
+        news_t = (
+            news_t.dt.tz_localize("UTC") if news_t.dt.tz is None else news_t.dt.tz_convert("UTC")
+        )
+        bar_idx = np.searchsorted(df["t"].values, news_t.values, side="right") - 1
+        bar_idx = np.clip(bar_idx, 0, len(df) - 1)
+        news_y = df["h"].to_numpy()[bar_idx] + NEWS_MARKER_PRICE_OFFSET
+
         fig.add_trace(
             go.Scatter(
                 x=df_news["created_at"],
-                y=[price_ref + 0.1] * len(df_news),
+                y=news_y,
                 mode="markers",
+                marker=dict(
+                    color=impact_colors,
+                    size=9,
+                    line=dict(width=1, color="#ffffff"),
+                ),
                 text=df_news["headline"],
+                customdata=impact_labels,
+                hovertemplate=(
+                    "<b>%{text}</b><br>Impact: %{customdata}<extra></extra>"
+                ),
                 showlegend=False,
             ),
             row=1,
             col=1,
         )
-        for item in df_news.itertuples():
+        for created_at, color in zip(df_news["created_at"], impact_colors):
             fig.add_vline(
-                x=item.created_at,
-                line=dict(color=PALETTE["orange"], width=1, dash="dot"),
+                x=created_at,
+                line=dict(color=color, width=1, dash="dot"),
                 row=1,
                 col=1,
             )

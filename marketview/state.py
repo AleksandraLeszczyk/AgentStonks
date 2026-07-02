@@ -47,6 +47,7 @@ _DEFAULTS: dict[str, object] = {
     "show_candle_body": True,
     "show_percentile_body": False,
     "show_whiskers": True,
+    "fill_gaps": True,
     "last_price": None,
     "prev_close": None,
     "bid_price": None,
@@ -309,6 +310,9 @@ class AppState:
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False
         self.show_whiskers: bool = True
+        # Draw synthetic flat bars at feed minutes without any trade, so the
+        # candle/volume series has no visual holes.
+        self.fill_gaps: bool = True
         self.last_price: float | None = None
         self.prev_close: float | None = None
         self.bid_price: float | None = None

@@ -30,8 +30,8 @@ def test_fallback_bars_loop_updates_state_from_rest_when_disconnected(monkeypatc
 
     assert list(state.bars) == bars
     assert state.last_price == 1.6
-    assert state.day_high == 2
-    assert state.day_low == 0.5
+    assert state.previous_minute_high == 2
+    assert state.previous_minute_low == 0.5
     assert state.day_volume == 100
     assert "Fallback" in state.status
     assert "Alpaca REST" in state.status
@@ -90,17 +90,22 @@ def test_fallback_bars_loop_keeps_last_quote_when_quote_fetch_fails(monkeypatch)
     assert state.ask_price == 1.6
 
 
-def test_fallback_bars_loop_skips_polling_when_stream_connected(monkeypatch):
+def test_fallback_bars_loop_backfills_instead_of_polling_when_stream_connected(monkeypatch):
+    """While the WS is healthy the loop must not snapshot-replace state, but it
+    does run a periodic backfill that merges only-missing bars."""
     state = AppState()
     state.bars_connected = True
     state.status = "✅ Streaming AAPL (IEX)"
-    called = []
-    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: called.append(1))
+    live_bar = {"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}
+    missed_bar = {"t": "2024-01-01T14:01:00Z", "o": 1.5, "h": 1.6, "l": 1.4, "c": 1.6, "v": 50}
+    state.bars.append(live_bar)
+    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: [dict(live_bar, c=9.9), missed_bar])
 
     stream._fallback_bars_loop("AAPL", "k", "s", "iex", state, "1Min", _StopAfter(2))
 
-    assert called == []
-    assert state.status == "✅ Streaming AAPL (IEX)"
+    assert list(state.bars) == [live_bar, missed_bar]  # hole filled, live bar untouched
+    assert state.status == "✅ Streaming AAPL (IEX)"  # no fallback warning
+    assert state.last_price is None  # snapshot-replace path did not run
 
 
 def test_fallback_bars_loop_falls_back_to_yfinance_when_rest_fails(monkeypatch):
@@ -235,3 +240,83 @@ def test_fallback_bars_loop_fires_volume_alert(monkeypatch):
 
     assert state.alerts == []
     assert state.agent_wake_event.is_set()
+
+
+def _bar(ts: str, c: float = 1.0, v: float = 100.0) -> dict:
+    return {"t": ts, "o": c, "h": c, "l": c, "c": c, "v": v}
+
+
+class TestMergeMissingBars:
+    def test_inserts_only_missing_timestamps_in_order(self):
+        state = AppState()
+        state.bars.extend([_bar("2024-01-01T14:00:00Z"), _bar("2024-01-01T14:03:00Z")])
+
+        added = stream.merge_missing_bars(
+            state,
+            [
+                _bar("2024-01-01T14:00:00Z", c=9.9),  # collision: streamed bar wins
+                _bar("2024-01-01T14:01:00Z"),
+                _bar("2024-01-01T14:02:00Z"),
+            ],
+        )
+
+        assert added == 2
+        ts = [b["t"] for b in state.bars]
+        assert ts == [
+            "2024-01-01T14:00:00Z",
+            "2024-01-01T14:01:00Z",
+            "2024-01-01T14:02:00Z",
+            "2024-01-01T14:03:00Z",
+        ]
+        assert state.bars[0]["c"] == 1.0  # not clobbered by the REST copy
+
+    def test_treats_z_and_offset_timestamps_as_equal(self):
+        state = AppState()
+        state.bars.append(_bar("2024-01-01T14:00:00+00:00"))
+        added = stream.merge_missing_bars(state, [_bar("2024-01-01T14:00:00Z")])
+        assert added == 0
+        assert len(state.bars) == 1
+
+    def test_empty_fetch_is_a_noop(self):
+        state = AppState()
+        assert stream.merge_missing_bars(state, []) == 0
+
+
+class TestBackfillBars:
+    def test_uses_rest_and_reports_added_count(self, monkeypatch):
+        state = AppState()
+        state.bars.append(_bar("2024-01-01T14:00:00Z"))
+        monkeypatch.setattr(
+            stream, "fetch_bars", lambda *a, **k: [_bar("2024-01-01T14:01:00Z")]
+        )
+
+        added, source = stream.backfill_bars("AAPL", "k", "s", "iex", state, "1Min")
+
+        assert added == 1
+        assert source == "Alpaca REST"
+
+    def test_falls_back_to_yfinance_when_rest_fails(self, monkeypatch):
+        state = AppState()
+
+        def _boom(*a, **k):
+            raise RuntimeError("REST down")
+
+        monkeypatch.setattr(stream, "fetch_bars", _boom)
+        seen = {}
+
+        def _yf(symbol, interval="1m"):
+            seen["interval"] = interval
+            return [_bar("2024-01-01T14:00:00Z")]
+
+        monkeypatch.setattr(stream, "fetch_intraday_bars", _yf)
+
+        added, source = stream.backfill_bars("AAPL", "k", "s", "iex", state, "5Min")
+
+        assert added == 1
+        assert source == "yfinance (delayed)"
+        assert seen["interval"] == "5m"
+
+
+def test_floor_ts_emits_alpaca_z_format():
+    # Must match REST bar timestamps so buckets dedupe across sources.
+    assert stream._floor_ts("2024-01-01T14:03:27.5Z", 5) == "2024-01-01T14:00:00Z"

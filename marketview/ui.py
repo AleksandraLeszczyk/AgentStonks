@@ -28,6 +28,7 @@ from .config import (
     CHART_POLL_SEC,
     FEEDS,
     MAX_BARS,
+    NEWS_IMPACT_COLORS,
     OPTIONS_POLL_SEC,
     OPTIONS_WALL_HISTORY_MAXLEN,
     PAPER_STARTING_CASH,
@@ -59,7 +60,7 @@ from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import PRICE_AXIS_ALERT_FIELDS, AppState, current_volume_ratio, format_alert
-from .stream import launch_stream, launch_stream_news
+from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
     analyze_fair_value_gaps,
     analyze_intraday,
@@ -131,11 +132,11 @@ def wrap_text(text: Optional[str], width: int = 80) -> str:
 
 
 _IMPACT_STYLE: dict[str, dict[str, str]] = {
-    "positive": {"label": "positive impact", "dot": "#26c6a2", "bg": "#0d2b24", "border": "#1a4a3d", "text": "#26c6a2"},
-    "negative": {"label": "negative impact", "dot": "#ef5350", "bg": "#2b0d0d", "border": "#4a1a1a", "text": "#ef5350"},
-    "neutral":  {"label": "neutral impact",  "dot": "#888",    "bg": "#1e1e2e", "border": "#2a2d3a", "text": "#888888"},
-    "small":    {"label": "small impact",    "dot": "#fb923c", "bg": "#2b1a0d", "border": "#4a2d1a", "text": "#fb923c"},
-    "unknown":  {"label": "unknown impact",  "dot": "#555",    "bg": "#1a1d27", "border": "#2a2d3a", "text": "#555555"},
+    "positive": {"label": "positive impact", "dot": NEWS_IMPACT_COLORS["positive"], "bg": "#0d2b24", "border": "#1a4a3d", "text": "#26c6a2"},
+    "negative": {"label": "negative impact", "dot": NEWS_IMPACT_COLORS["negative"], "bg": "#2b0d0d", "border": "#4a1a1a", "text": "#ef5350"},
+    "neutral":  {"label": "neutral impact",  "dot": NEWS_IMPACT_COLORS["neutral"],  "bg": "#1e1e2e", "border": "#2a2d3a", "text": "#888888"},
+    "small":    {"label": "small impact",    "dot": NEWS_IMPACT_COLORS["small"],    "bg": "#2b1a0d", "border": "#4a2d1a", "text": "#fb923c"},
+    "unknown":  {"label": "unknown impact",  "dot": NEWS_IMPACT_COLORS["unknown"],  "bg": "#1a1d27", "border": "#2a2d3a", "text": "#555555"},
 }
 
 
@@ -365,6 +366,8 @@ def _chart_panel() -> None:
             show_whiskers=state.show_whiskers,
             decisions=decisions,
             price_alerts=price_alerts,
+            news_impacts=state.news_impacts,
+            fill_gaps=state.fill_gaps,
         )
         if (state.symbol and bars)
         else empty_chart()
@@ -381,6 +384,12 @@ def _live_chart_controls() -> None:
             show_candle_body = st.checkbox("Open-Close", value=True)
             show_percentile_body = st.checkbox("20%-80%", value=False)
             show_whiskers = st.checkbox("Whiskers", value=True)
+            fill_gaps = st.checkbox(
+                "Fill no-trade gaps",
+                value=True,
+                help="Draw flat zero-volume placeholder bars for feed minutes "
+                "without any trade (common on IEX for thin symbols).",
+            )
             vwap_style = st.selectbox("VWAP", ["hide", "dot", "line"], index=0)
         with c2:
             st.markdown("**Overlays**")
@@ -407,11 +416,34 @@ def _live_chart_controls() -> None:
             disabled=not fit_enabled,
         )
 
+        st.markdown("**Data**")
+        backfill_clicked = st.button(
+            "⟲ Backfill missing bars",
+            disabled=not (state.symbol and state.api_key),
+            help="Re-fetch the session's bars via REST (yfinance if that fails) "
+            "and merge any that the stream missed, e.g. during a reconnect.",
+        )
+        if backfill_clicked:
+            with st.spinner("Backfilling…"):
+                try:
+                    added, source = backfill_bars(
+                        state.symbol, state.api_key, state.api_secret,
+                        state.feed, state, state.timeframe,
+                    )
+                except Exception as exc:
+                    st.error(f"Backfill failed: {exc}")
+                else:
+                    st.caption(
+                        f"Backfilled {added} bar(s) via {source}."
+                        if added else "No missing bars found."
+                    )
+
     state.ma_periods = _parse_ma_periods(vwma_selection)
     state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
     state.show_candle_body = show_candle_body
     state.show_percentile_body = show_percentile_body
     state.show_whiskers = show_whiskers
+    state.fill_gaps = fill_gaps
     state.vwap_style = vwap_style
     state.show_fib = show_fib
     state.mixture_distribution = dist_choice.lower() if fit_enabled else "none"
@@ -960,6 +992,8 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
             show_percentile_body=state.show_percentile_body,
             show_whiskers=state.show_whiskers,
             decisions=tracker.trade_markers() if tracker else None,
+            news_impacts=state.news_impacts,
+            fill_gaps=state.fill_gaps,
         )
         if (sym and bars)
         else None

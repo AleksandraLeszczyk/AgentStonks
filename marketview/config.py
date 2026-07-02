@@ -14,6 +14,12 @@ CHART_POLL_SEC = 30
 # connection cap, so they keep working even while the socket is stuck.
 FALLBACK_POLL_SEC = 15
 NEWS_FALLBACK_POLL_SEC = 60
+
+# Periodic REST backfill that repairs holes in the live bar series while the
+# WebSocket IS connected: the stream never re-delivers bars that closed during
+# a reconnect, and thin symbols get no bar at all for minutes without a trade
+# on the subscribed feed.
+BACKFILL_POLL_SEC = 60
 OPTIONS_POLL_SEC = 60
 OPTIONS_WALL_HISTORY_MAXLEN = 200
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]
@@ -63,6 +69,20 @@ PALETTE: dict[str, str] = {
     "accent": "#60a5fa",
     "orange": "#fb923c",
 }
+
+# Dot / marker colors per LLM-estimated news impact label, shared by the
+# News tab badges and the Live chart news markers.
+NEWS_IMPACT_COLORS: dict[str, str] = {
+    "positive": "#26c6a2",
+    "negative": "#ef5350",
+    "neutral":  "#888",
+    "small":    "#fb923c",
+    "unknown":  "#555",
+}
+
+# News dots on the Live chart sit this far above the high of the minute bar
+# containing the article's timestamp.
+NEWS_MARKER_PRICE_OFFSET = 0.1
 
 MA_COLORS: dict[int, str] = {
     5:  "#60a5fa",  # blue
