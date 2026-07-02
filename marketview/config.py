@@ -28,6 +28,16 @@ VOLUME_ALERT_DEFAULT_MULTIPLIER = 1.5
 VOLUME_ADV_WINDOW = 20
 VOLUME_ADV_MIN_DAYS = 5
 
+# Quote reliability thresholds for get_quote. The IEX feed reports IEX's own
+# top-of-book, not the consolidated NBBO: outside regular hours or when IEX's
+# book is empty near the touch, the "latest quote" is a placeholder-wide
+# two-sided quote (e.g. ±5% around the mid, 100x100) or an hours-old snapshot.
+# Quotes wider than QUOTE_WIDE_SPREAD_PCT percent of the mid, or older than
+# QUOTE_STALE_SEC, get a warning attached so the agent doesn't treat them as
+# executable prices.
+QUOTE_WIDE_SPREAD_PCT = 1.0
+QUOTE_STALE_SEC = 120.0
+
 # Trading agent
 AGENT_CYCLE_SEC = 60
 AGENT_LOG_POLL_SEC = 4

@@ -44,6 +44,29 @@ def _fire_due_alerts(state: AppState) -> None:
         state.agent_wake_event.set()
 
 
+def _apply_quote(state: AppState, quote: dict) -> None:
+    """Copy an Alpaca quote (WS message or REST payload -- same field names)
+    into state. Caller must hold state.lock.
+
+    Alpaca reports a one-sided book as bp/ap = 0; store None for that side so
+    a bogus 0.0 never reaches the spread computation or a bid/ask alert. The
+    quote timestamp is kept so consumers can tell a live quote from an
+    hours-old off-session snapshot.
+    """
+    if "bp" in quote:
+        price = float(quote["bp"])
+        state.bid_price = price if price > 0 else None
+    if "bs" in quote:
+        state.bid_size = float(quote["bs"])
+    if "ap" in quote:
+        price = float(quote["ap"])
+        state.ask_price = price if price > 0 else None
+    if "as" in quote:
+        state.ask_size = float(quote["as"])
+    if "t" in quote:
+        state.quote_ts = str(quote["t"])
+
+
 _TF_MINUTES: dict[str, int] = {
     "1Min": 1, "5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60, "1Day": 1440,
 }
@@ -174,14 +197,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 # snapshot) never see a torn mix of this tick's bid with the
                 # previous tick's ask, or vice versa.
                 with state.lock:
-                    if "bp" in msg:
-                        state.bid_price = float(msg["bp"])
-                    if "bs" in msg:
-                        state.bid_size = float(msg["bs"])
-                    if "ap" in msg:
-                        state.ask_price = float(msg["ap"])
-                    if "as" in msg:
-                        state.ask_size = float(msg["as"])
+                    _apply_quote(state, msg)
 
                 # A quote moves bid/ask price+size and the derived spread.
                 _fire_due_alerts(state)
@@ -277,14 +293,7 @@ def _fallback_bars_loop(
             state.previous_minute_low = last_bar.get("l")
             state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
             if quote:
-                if "bp" in quote:
-                    state.bid_price = float(quote["bp"])
-                if "bs" in quote:
-                    state.bid_size = float(quote["bs"])
-                if "ap" in quote:
-                    state.ask_price = float(quote["ap"])
-                if "as" in quote:
-                    state.ask_size = float(quote["as"])
+                _apply_quote(state, quote)
         state.status = f"⚠️ Fallback: polling {symbol} via {source} (stream down)"
         # Keep alerts live even when the WS is down and prices come from REST.
         _fire_due_alerts(state)
@@ -322,6 +331,7 @@ def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         state.bid_size = None
         state.ask_price = None
         state.ask_size = None
+        state.quote_ts = None
 
     stop_event = threading.Event()
     state.bars_fallback_stop_event = stop_event

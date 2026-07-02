@@ -53,6 +53,7 @@ _DEFAULTS: dict[str, object] = {
     "bid_size": None,
     "ask_price": None,
     "ask_size": None,
+    "quote_ts": None,
     "previous_minute_high": None,
     "previous_minute_low": None,
     "day_volume": None,
@@ -314,6 +315,9 @@ class AppState:
         self.bid_size: float | None = None
         self.ask_price: float | None = None
         self.ask_size: float | None = None
+        # RFC-3339 timestamp of the last quote applied to bid/ask, so consumers
+        # can tell a live quote from an hours-old off-session snapshot.
+        self.quote_ts: str | None = None
         self.previous_minute_high: float | None = None
         self.previous_minute_low: float | None = None
         self.day_volume: float | None = None

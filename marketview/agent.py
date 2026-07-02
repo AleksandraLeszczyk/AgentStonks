@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from . import historical
 from . import observability as obs
 from . import technical_analysis as ta
-from .config import AGENT_MAX_TOOL_ITERS
+from .config import AGENT_MAX_TOOL_ITERS, QUOTE_STALE_SEC, QUOTE_WIDE_SPREAD_PCT
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert
 
@@ -403,7 +403,12 @@ _TOOL_GET_QUOTE = {
     "type": "function",
     "function": {
         "name": "get_quote",
-        "description": "Get the latest streamed quote and trade price for the ticker.",
+        "description": (
+            "Get the latest streamed quote and trade price for the ticker, including "
+            "spread, spread_pct and quote age. If a `warning` field is present the "
+            "bid/ask are unreliable (placeholder-wide or stale off-hours quote from the "
+            "thin IEX book) -- trust last_price over bid/ask in that case."
+        ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
 }
@@ -956,16 +961,58 @@ def _log(state: "AppState", entry: dict) -> None:
         state.agent_log.append(entry)
 
 
+def _quote_age_sec(quote_ts: "str | None") -> "float | None":
+    """Seconds elapsed since an RFC-3339 quote timestamp, or None if absent/unparseable."""
+    if not quote_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(quote_ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+
+
 def _tool_get_quote(state: "AppState") -> dict:
     with state.lock:
-        return {
+        result = {
             "last_price": state.last_price,
             "prev_close": state.prev_close,
             "bid_price": state.bid_price,
             "bid_size": state.bid_size,
             "ask_price": state.ask_price,
             "ask_size": state.ask_size,
+            "quote_time": state.quote_ts,
         }
+
+    # The IEX feed's top-of-book is not the consolidated NBBO: off-hours or
+    # with an empty IEX book it degrades to a placeholder-wide (or crossed, or
+    # hours-old) quote. Surface spread and age, and attach an explicit warning
+    # so the agent leans on last_price instead of unexecutable bid/ask levels.
+    warnings = []
+    bid, ask = result["bid_price"], result["ask_price"]
+    if bid is not None and ask is not None:
+        mid = (bid + ask) / 2
+        result["spread"] = round(ask - bid, 4)
+        if mid > 0:
+            spread_pct = (ask - bid) / mid * 100
+            result["spread_pct"] = round(spread_pct, 3)
+            if ask < bid:
+                warnings.append("crossed quote (ask below bid) -- bid/ask unreliable, use last_price")
+            elif spread_pct > QUOTE_WIDE_SPREAD_PCT:
+                warnings.append(
+                    f"spread is {spread_pct:.1f}% of the mid -- placeholder-wide quote from a thin "
+                    "IEX book (likely pre/post-market); bid/ask are not executable prices, use last_price"
+                )
+    age = _quote_age_sec(result["quote_time"])
+    if age is not None:
+        result["quote_age_sec"] = round(age, 1)
+        if age > QUOTE_STALE_SEC:
+            warnings.append(
+                f"quote is {age / 60:.0f} min old (market closed or stream down) -- bid/ask may be stale"
+            )
+    if warnings:
+        result["warning"] = "; ".join(warnings)
+    return result
 
 
 def _tool_analyze_intraday_momentum(state: "AppState", limit: object = None) -> dict:

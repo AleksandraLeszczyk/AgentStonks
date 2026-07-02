@@ -56,6 +56,19 @@ def test_fallback_bars_loop_refreshes_quote_when_disconnected(monkeypatch):
     assert state.ask_size == 20
 
 
+def test_apply_quote_treats_zero_price_as_no_quote():
+    """Alpaca reports a one-sided book as bp/ap = 0 -- that side must become None,
+    not a 0.0 that would corrupt the spread and bid/ask alerts."""
+    state = AppState()
+    state.bid_price = 1.5
+    ts = "2026-07-02T14:51:59.118379395Z"
+    stream._apply_quote(state, {"bp": 0, "bs": 0, "ap": 1.57, "as": 20, "t": ts})
+
+    assert state.bid_price is None
+    assert state.ask_price == 1.57
+    assert state.quote_ts == ts
+
+
 def test_fallback_bars_loop_keeps_last_quote_when_quote_fetch_fails(monkeypatch):
     state = AppState()
     state.bars_connected = False

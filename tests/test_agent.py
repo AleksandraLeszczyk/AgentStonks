@@ -78,6 +78,35 @@ class TestToolHandlers:
         assert result["last_price"] == 101.0
         assert result["bid_price"] == 100.5
 
+    def test_get_quote_tight_fresh_quote_has_no_warning(self):
+        from datetime import datetime, timezone
+
+        state = AppState()
+        state.last_price = 100.01
+        state.bid_price, state.ask_price = 100.0, 100.02
+        state.quote_ts = datetime.now(timezone.utc).isoformat()
+        result = _tool_get_quote(state)
+        assert result["spread"] == 0.02
+        assert result["quote_age_sec"] < 5
+        assert "warning" not in result
+
+    def test_get_quote_flags_placeholder_wide_quote(self):
+        # Real off-hours IEX quote: ~10% wide around the mid, useless as a price.
+        state = AppState()
+        state.last_price = 288.64
+        state.bid_price, state.ask_price = 274.46, 305.29
+        result = _tool_get_quote(state)
+        assert result["spread_pct"] > 10
+        assert "use last_price" in result["warning"]
+
+    def test_get_quote_flags_stale_quote(self):
+        state = AppState()
+        state.bid_price, state.ask_price = 100.0, 100.02
+        state.quote_ts = "2020-01-01T00:00:00Z"
+        result = _tool_get_quote(state)
+        assert result["quote_age_sec"] > 3600
+        assert "stale" in result["warning"]
+
     def test_get_news_maps_impact_labels(self):
         state = AppState()
         state.news = [{"id": "1", "headline": "h", "summary": "s", "created_at": "t", "source": "src"}]
