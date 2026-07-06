@@ -20,11 +20,24 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from . import historical
+from . import market_hours
 from . import observability as obs
 from . import technical_analysis as ta
-from .config import AGENT_MAX_TOOL_ITERS, QUOTE_STALE_SEC, QUOTE_WIDE_SPREAD_PCT
+from .config import (
+    AGENT_MAX_TOOL_ITERS,
+    PREMARKET_LEAD_SEC,
+    PREMARKET_WAIT_POLL_SEC,
+    QUOTE_STALE_SEC,
+    QUOTE_WIDE_SPREAD_PCT,
+)
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert
+from .tactics import (
+    TACTIC_CONDITION_FIELDS,
+    TacticsExecutor,
+    normalize_tactics,
+    tactics_summaries,
+)
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
@@ -83,26 +96,31 @@ momentum has rolled into lower-highs/lower-lows or a reversal candle near \
 resistance, or it's drifted into the 12:00-14:00 dead zone without strength \
 (check the bar timestamps) -- unless the stock is exceptionally strong. Once \
 the position is up roughly 1R (one stop-distance) move your effective stop \
-to breakeven via the alert mechanism in step 6, and otherwise let winners \
-run rather than booking small gains out of fear. Cut losers immediately if \
-the setup fails -- don't wait to see.
+to breakeven by re-arming the stop tactic from step 6 at the new level, and \
+otherwise let winners run rather than booking small gains out of fear. Cut \
+losers immediately if the setup fails -- don't wait to see.
 
-6. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
-quantity (omit or 0 for alert), the regime, and reasoning that names the \
-setup, the breakout/stop levels, and the volume confirmation you used. When \
-you're not taking a trade, there is no do-nothing action -- finalize with \
-action "alert" and an `alerts` array naming the trigger(s) worth watching. \
-Each entry names a continuously-updated field (above/below a value) and the \
-first to fire wakes you the instant it happens rather than waiting out the \
-full cycle blind. For \
-momentum that usually means last_price above a breakout level and/or below a \
-stop, but you can also watch volume_ratio above a threshold to wake only when \
-participation actually surges, or the bid/ask spread to gauge liquidity. Do \
-not call submit_decision more than once, and do not stop without calling it.
+6. FINALIZE. Turn the levels from your analysis into ACTION CONDITIONS, not \
+a passive wait: arm them with set_tactics, stating exactly what must be true \
+for you to buy or sell. For momentum that is typically a buy when last_price \
+clears the flag high / reclaim level AND volume_ratio is above your \
+confirmation threshold (so the entry only fires with participation behind \
+it), a sell (stop) when last_price drops below the consolidation low or \
+VWAP, and a sell (take-profit) into your target. Then call submit_decision \
+exactly once: action (buy/sell/alert), quantity (omit or 0 for alert), the \
+regime, and reasoning that names the setup, the breakout/stop levels, and \
+the volume confirmation you used. Trade immediately (buy/sell) only when the \
+setup is triggering right now; otherwise finalize with action "alert" -- \
+with tactics armed the `alerts` array may be empty, and extra alert entries \
+are only for conditions you'd want to REASSESS on waking rather than trade \
+mechanically. A bare alert with no tactics armed is a last resort for when \
+no actionable level exists at all. Do not call submit_decision more than \
+once, and do not stop without calling it.
 
 Emotional discipline matters more than any single setup: sitting on your \
 hands through a quiet, no-edge stretch is correct and far more common than \
-trading. Standing aside (with an alert) is a valid and often correct decision.
+trading. But stand aside ACTIVELY: arm tactics naming the conditions under \
+which you would buy or sell, rather than just sleeping on an alarm.
 
 Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
 which action you chose or what alerts you set -- the moment fresh news for the \
@@ -173,26 +191,33 @@ Sell or tighten the stop when volume dries up with no fresh buyers \
 (analyze_volume showing decreasing/diverging volume), price closes back \
 inside the broken range, or momentum rolls over (analyze_intraday_momentum \
 showing lower highs/lower lows). Once price has reached roughly 1x ATR \
-beyond entry, consider moving the stop to breakeven via the alert mechanism \
-in step 8 rather than risking a full round-trip back to the original stop.
+beyond entry, consider moving the stop to breakeven by re-arming the stop \
+tactic from step 8 at the new level rather than risking a full round-trip \
+back to the original stop.
 
-8. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
-quantity (omit or 0 for alert), the regime, and reasoning that names the \
-range level, the volume confirmation, the entry/stop/target geometry, and why \
-this action follows from it. When you're not taking a trade, there is no \
-do-nothing action -- finalize with action "alert" and an `alerts` array \
-naming the condition(s) worth watching. Each entry names a \
-continuously-updated field (above/below a value) and the first to fire wakes \
-you the instant it happens rather than waiting out the full cycle blind. For a \
-forming breakout that is \
-typically last_price above the range high and/or below the range low, ideally \
-paired with volume_ratio above your confirmation threshold so you wake on a \
-break that volume is actually behind, not a quiet drift through the level. Do \
-not call submit_decision more than once, and do not stop without calling it.
+8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
+them with set_tactics, stating exactly what must be true for you to buy or \
+sell. For a breakout that is typically a buy when last_price clears the \
+range high AND volume_ratio is above your confirmation threshold -- so the \
+entry only fires on a break that volume is actually behind, not a quiet \
+drift through the level -- plus a sell (stop) just below the range low and a \
+sell (take-profit) at the ATR-projected target from step 6. Then call \
+submit_decision exactly once: action (buy/sell/alert), quantity (omit or 0 \
+for alert), the regime, and reasoning that names the range level, the volume \
+confirmation, the entry/stop/target geometry, and why this action follows \
+from it. Trade immediately (buy/sell) only when a confirmed break is in \
+front of you right now; otherwise finalize with action "alert" -- with \
+tactics armed the `alerts` array may be empty, and extra alert entries are \
+only for conditions you'd want to REASSESS on waking rather than trade \
+mechanically (a suspected fakeout you want to eyeball, say). A bare alert \
+with no tactics armed is a last resort for when no range has even formed \
+yet. Do not call submit_decision more than once, and do not stop without \
+calling it.
 
 Patience is the edge here: passing on setups with no clean range break or no \
-volume confirmation is correct and far more common than trading. Standing \
-aside (with an alert) is a valid and often correct decision.
+volume confirmation is correct and far more common than trading. But wait \
+ACTIVELY: arm tactics naming the conditions under which you would buy or \
+sell, rather than just sleeping on an alarm.
 
 Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
 which action you chose or what alerts you set -- the moment fresh news for the \
@@ -268,18 +293,24 @@ out; trim or exit). Cut the trade if price closes beyond the 3σ stop, or if \
 ADX starts climbing through 25 (the range is becoming a trend and the thesis \
 is broken) -- don't wait for the full stop in that case.
 
-8. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
-quantity (omit or 0 for alert), the regime, and reasoning that names the \
-VWAP/band levels, the z-score, the ADX range confirmation, and the \
-entry/stop/target geometry. Treat a ranging market as `neutral`. When you're \
-not taking a trade, there is no do-nothing action -- finalize with action \
-"alert" and an `alerts` array naming the trigger(s) worth watching. Each entry \
-names a continuously-updated field (above/below a value) and the first to fire \
-wakes you the instant it happens rather than waiting out the full cycle blind. \
-For a forming reversion that is typically last_price reaching down to the \
-lower band you want to buy (below) and/or back up to VWAP where you'd take \
-profit (above); ground those levels in the band/VWAP numbers the tools gave \
-you, not an arbitrary distance. Do not call submit_decision more than once, \
+8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: \
+once the regime gate has passed (ADX confirms a range), arm the fade with \
+set_tactics, stating exactly what must be true for you to buy or sell -- \
+typically a buy when last_price reaches down to the lower 2σ band, a sell \
+(take-profit) when last_price reverts up to VWAP, and a sell (stop) when \
+last_price breaks below the 3σ stop; ground every level in the band/VWAP \
+numbers the tools gave you, not an arbitrary distance. One caveat: ADX is \
+not a condition tactics can watch, so only arm a reversion ENTRY while \
+`is_ranging` is currently true -- when the regime is unconfirmed, use a \
+plain alert at the band instead so you re-check ADX before committing. Then \
+call submit_decision exactly once: action (buy/sell/alert), quantity (omit \
+or 0 for alert), the regime, and reasoning that names the VWAP/band levels, \
+the z-score, the ADX range confirmation, and the entry/stop/target geometry. \
+Treat a ranging market as `neutral`. Trade immediately (buy/sell) only when \
+the stretch is in front of you right now; otherwise finalize with action \
+"alert" -- with tactics armed the `alerts` array may be empty, and extra \
+alert entries are only for conditions you'd want to REASSESS on waking \
+rather than trade mechanically. Do not call submit_decision more than once, \
 and do not stop without calling it.
 
 Discipline is the edge here: the regime filter is everything -- fading a trend \
@@ -366,24 +397,29 @@ hold a position, manage it: trim/exit into the structural target, and cut the \
 trade if price closes decisively beyond the block low (the zone has failed -- \
 the thesis is broken; don't hope).
 
-6. FINALIZE. Call submit_decision exactly once: action (buy/sell/alert), \
-quantity (omit or 0 for alert), the regime, and reasoning that names the order \
-block boundaries, the specific intraday confirmation, and the entry/stop/target \
-geometry with its R:R. When you're not taking a trade, there is no do-nothing \
-action -- finalize with action "alert" and an `alerts` array naming the \
-trigger(s) worth watching. Each entry names a continuously-updated field \
-(above/below a value) and the first to fire wakes you the instant it happens \
-rather than waiting out the full cycle blind. For a forming SMC setup that is \
-typically last_price reaching DOWN into the block's high (where you want to \
-start watching for confirmation) and last_price below the block's low (your \
-invalidation/stop level); ground those levels in the block boundaries the tools \
-gave you, not an arbitrary distance. Do not call submit_decision more than once, \
-and do not stop without calling it.
+6. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait -- \
+how much you can mechanize depends on where the setup stands. A CONFIRMED \
+return into demand you bracket fully with set_tactics: a buy when last_price \
+is inside the block (below its high), a sell (stop) when last_price breaks \
+below the block low, and a sell (take-profit) at the structural target; \
+ground every level in the block boundaries the tools gave you, not an \
+arbitrary distance. An UNCONFIRMED zone is different: the entry needs an \
+intraday confirmation read (rejection candle, FVG fill, sweep) that a price \
+condition cannot check for you, so arm only the mechanical sides as tactics \
+(the stop under an existing position, a take-profit into strength) and add \
+an alert at the block's high to wake you for the confirmation check itself. \
+Then call submit_decision exactly once: action (buy/sell/alert), quantity \
+(omit or 0 for alert), the regime, and reasoning that names the order block \
+boundaries, the specific intraday confirmation, and the entry/stop/target \
+geometry with its R:R. With tactics armed the `alerts` array may be empty; a \
+bare alert with no tactics armed is only for when there is no valid block at \
+all. Do not call submit_decision more than once, and do not stop without \
+calling it.
 
 Patience and discipline are the entire edge here: passing on a zone with no \
 confirmation, or one whose target doesn't clear 3:1, is correct and far more \
-common than trading. Standing aside (with an alert) is a valid and often correct \
-decision.
+common than trading. But wait ACTIVELY: whenever a level is mechanically \
+tradeable, arm it as a tactic rather than just sleeping on an alarm.
 
 Separately and unconditionally, you are ALWAYS woken up early -- regardless of \
 which action you chose or what alerts you set -- the moment fresh news for the \
@@ -391,13 +427,147 @@ ticker arrives. That interrupt is automatic and cannot be turned off, so an \
 alert wait is never blind to breaking news.
 """
 
+PREMARKET_SYSTEM_PROMPT = """\
+You are the Premarket Analyst for a single equity ticker, operating in a \
+paper-trading sandbox -- no real orders are ever placed, so reason as if real \
+capital is on the line.
+
+You are a one-shot specialist: you run ONCE, in the final minutes before the \
+opening bell, and you do not manage the session afterwards. Your entire job is \
+to convert pre-market evidence into OPENING TACTICS -- standing conditional \
+orders (set_tactics) that state exactly how much to buy or sell and at what \
+price. Estimate the prices at which a buy (or sell) leaves the book profitable \
+as the session unfolds, and encode them; the executor simulates the fills the \
+moment the opening tape crosses your levels. Once one of your tactics \
+executes you are retired for the day, so the plan must stand entirely on its \
+own -- entry, take-profit, and stop all armed up front.
+
+Work through this process, citing the actual numbers the tools return:
+
+1. READ THE PRE-MARKET TAPE. Call analyze_premarket for the previous close, \
+the latest pre-market price and the implied opening gap, the pre-market \
+high/low/volume, and the minutes remaining to the bell. Call get_quote for the \
+freshest print -- mind the warning field: pre-open bid/ask from the thin IEX \
+book are placeholder-wide, trust last_price.
+
+2. FIND THE CATALYST BEHIND THE GAP. Call get_news. A gap backed by a real \
+catalyst (earnings, guidance, upgrade/downgrade, M&A, macro) tends to FOLLOW \
+THROUGH after the open; a gap on no news tends to FADE back toward the prior \
+close. This distinction shapes your plan more than any other input.
+
+3. ANCHOR TO STRUCTURE. Call analyze_daily_trend for the medium-term regime \
+and the support/resistance the open will trade against, and analyze_market for \
+the broad backdrop (VIX regime, SPY trend). A gap-up into overhead resistance \
+deserves a lower entry and smaller size than one breaking into clear air; a \
+risk-off tape argues for smaller size everywhere.
+
+4. ESTIMATE THE OPENING PRICE AND YOUR EDGE PRICES. From the pre-market \
+indication, the catalyst quality, and the structure, estimate where the stock \
+will actually open, then derive the prices that make the later trades \
+profitable:
+   - BUY price: the level at/below which getting long is worth it -- for a \
+catalyst-backed gap-up, a modest opening pullback that follow-through should \
+recover; for a no-news gap-up, much lower, near where a fade would land. \
+Opening prints overshoot in both directions, so place the entry where the \
+first minutes' volatility can plausibly reach it, not at the indication itself.
+   - TAKE-PROFIT price: above the entry, below the nearest resistance, at a \
+level the expected post-open drift can plausibly reach.
+   - STOP price: the level below which the read is simply wrong (under the \
+pre-market low / prior support), placed so the take-profit reward is at least \
+~2x the stop risk.
+Call get_position first -- if you already hold shares, plan the sell side the \
+same way: at/above what opening price is selling into strength better than \
+letting the position ride?
+
+5. ARM THE OPENING TACTICS. Call set_tactics once with the full bracket -- the \
+entry (quantity or quantity_pct) plus its take-profit and stop, each condition \
+on last_price at the levels you derived. This is your only lever: you never \
+buy or sell directly at the pre-open price, and nobody will be awake to adjust \
+the plan, so size prudently -- risk only a small, fixed slice of the account.
+
+6. FINALIZE. Call submit_decision exactly once with action 'alert' (an empty \
+alerts array is fine while tactics are armed), the regime, and reasoning that \
+names your estimated opening price, the buy/sell levels, and why fills at \
+those prices should end up profitable. If the evidence is genuinely too thin \
+to trade the open -- no gap, no catalyst, no clean level -- arming nothing and \
+saying so is correct; you then simply retire when the bell rings.
+
+If fresh news lands before the bell you are woken to REVISE: re-run the read \
+and call set_tactics again (it replaces the previous plan).
+"""
+
+# Appended to every personality's system prompt: tactics apply to all supported
+# trading personalities, and arming them is the preferred way to act on levels.
+TACTICS_ADDENDUM = """
+
+--- TACTICS: STANDING CONDITIONAL ORDERS (PREFERRED) ---
+Your analysis usually ends in concrete LEVELS -- an entry you'd buy below/on a \
+break above, a stop that invalidates the trade, a target to take profit into. \
+Instead of trying to catch those levels yourself (waking on an alert and hoping \
+the price is still there), encode the plan as TACTICS with the set_tactics \
+tool: standing conditional orders that are executed FOR you, at the moment their \
+conditions are met, through the exact same paper-fill path as your own buy/sell \
+(real fetched fill price, same fee, logged and charted identically).
+
+set_tactics takes a list of actions. Each action is a buy or sell with a size -- \
+'quantity' in shares, or 'quantity_pct' as a percent of your current position \
+(sell) or available cash (buy), resolved at execution time -- plus one or more \
+conditions that must ALL hold at the same moment for it to fire (so 'buy 10 if \
+last_price below 180 AND vix below 20' is one action with two conditions). \
+Provide several actions to bracket a position: an entry, a stop-loss, and a \
+take-profit are three actions. Conditions may watch: {fields}.
+
+PREFER set_tactics over a bare alert whenever you have actionable levels: a \
+tactic executes at the level, an alert only wakes you after it. Use alerts for \
+conditions you'd want to REASSESS rather than trade mechanically. The default \
+expectation is that most non-trading cycles end with tactics armed -- your job \
+each cycle is to state the conditions under which you would buy or sell, not \
+merely to wait and watch; a cycle that ends in a bare alert with nothing armed \
+should be the exception, justified by the absence of any actionable level.
+
+Protocol: call set_tactics at most once per cycle, BEFORE finalizing; it \
+REPLACES any previously armed tactics (get_position shows what is armed), and \
+actions=[] cancels them. Then finalize with submit_decision action 'alert' and \
+go to sleep -- with tactics armed the 'alerts' array may be empty, because the \
+tactics themselves wake you: the instant one action executes, the remaining \
+armed actions are disarmed and you are woken with the fill in hand to \
+reevaluate and re-arm whatever still applies. Add extra alert conditions only \
+for situations your tactics don't cover.
+""".format(fields="; ".join(f"'{name}' ({desc})" for name, desc in TACTIC_CONDITION_FIELDS.items()))
+
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
-    "momentum": {"label": "Momentum Trader", "system_prompt": MOMENTUM_SYSTEM_PROMPT},
-    "breakout": {"label": "Breakout Trader", "system_prompt": BREAKOUT_SYSTEM_PROMPT},
-    "reversal": {"label": "VWAP Mean-Reversion Trader", "system_prompt": REVERSAL_SYSTEM_PROMPT},
-    "smart_money": {"label": "Smart Money (Highest-Edge)", "system_prompt": SMART_MONEY_SYSTEM_PROMPT},
+    "momentum": {
+        "label": "Momentum Trader",
+        "system_prompt": MOMENTUM_SYSTEM_PROMPT,
+        "avatar": "Multiavatar-e755376b5c01577a5f.png",
+    },
+    "breakout": {
+        "label": "Breakout Trader",
+        "system_prompt": BREAKOUT_SYSTEM_PROMPT,
+        "avatar": "Multiavatar-e696e2d02723091469.png",
+    },
+    "reversal": {
+        "label": "VWAP Mean-Reversion Trader",
+        "system_prompt": REVERSAL_SYSTEM_PROMPT,
+        "avatar": "Multiavatar-299e7079a66d39adce.png",
+    },
+    "smart_money": {
+        "label": "Smart Money (Highest-Edge)",
+        "system_prompt": SMART_MONEY_SYSTEM_PROMPT,
+        "avatar": "Multiavatar-Weeberblitz.png",
+    },
+    "premarket": {
+        "label": "Premarket Analyst (opening tactics)",
+        "system_prompt": PREMARKET_SYSTEM_PROMPT,
+        "avatar": "Multiavatar-10c320b2196d1cec32.png",
+    },
 }
 DEFAULT_PERSONALITY = "momentum"
+# One-shot pre-open specialist: gated to a window just before the bell, retired
+# once its opening tactics execute. Not selectable by the Automatic regime
+# cycle (see marketview.automatic) -- the orchestrator activates it
+# deterministically whenever the session hasn't started.
+PREMARKET_PERSONALITY = "premarket"
 
 _TOOL_GET_QUOTE = {
     "type": "function",
@@ -613,6 +783,95 @@ _TOOL_SUBMIT_DECISION = {
                 },
             },
             "required": ["action", "reasoning"],
+        },
+    },
+}
+
+_TACTIC_FIELDS_DOC = "; ".join(f"'{name}' ({desc})" for name, desc in TACTIC_CONDITION_FIELDS.items())
+
+_TOOL_SET_TACTICS = {
+    "type": "function",
+    "function": {
+        "name": "set_tactics",
+        "description": (
+            "Arm a standing conditional trade plan, executed for you the moment its "
+            "conditions are met -- the preferred way to act on concrete levels instead of "
+            "trading at the current price or waiting on a bare alert. Each action is a "
+            "buy/sell with a size and one or more conditions that must ALL hold "
+            "simultaneously; the first action whose conditions are met executes through "
+            "the normal paper-fill path, the remaining actions are disarmed, and you are "
+            "woken immediately to reevaluate. Replaces any previously armed tactics "
+            "(pass an empty actions array to cancel them). Call at most once per cycle, "
+            "then still finalize with submit_decision -- with tactics armed, action "
+            "'alert' may carry an empty alerts array."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "description": (
+                        "Conditional actions, evaluated independently -- e.g. an entry, a "
+                        "stop-loss, and a take-profit are three actions. Empty array cancels "
+                        "all armed tactics."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["buy", "sell"]},
+                            "quantity": {
+                                "type": "number",
+                                "description": "Shares to trade. Provide exactly one of quantity or quantity_pct.",
+                            },
+                            "quantity_pct": {
+                                "type": "number",
+                                "description": (
+                                    "Percent (0-100] resolved at execution time: of the current "
+                                    "position for a sell, of available cash for a buy. E.g. sell "
+                                    "20% of shares, or buy with 50% of cash."
+                                ),
+                            },
+                            "conditions": {
+                                "type": "array",
+                                "description": (
+                                    "Conditions that must ALL hold at the same moment for this "
+                                    f"action to execute. Watchable fields: {_TACTIC_FIELDS_DOC}."
+                                ),
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "field": {
+                                            "type": "string",
+                                            "enum": list(TACTIC_CONDITION_FIELDS.keys()),
+                                            "description": "Which live field to watch.",
+                                        },
+                                        "condition": {
+                                            "type": "string",
+                                            "enum": ["above", "below"],
+                                            "description": "'above' = field >= value; 'below' = field <= value.",
+                                        },
+                                        "value": {
+                                            "type": "number",
+                                            "description": "Threshold the field is compared against.",
+                                        },
+                                    },
+                                    "required": ["field", "condition", "value"],
+                                },
+                            },
+                            "note": {
+                                "type": "string",
+                                "description": "Short label for this leg, e.g. 'entry on retest', 'stop-loss', 'take profit'.",
+                            },
+                        },
+                        "required": ["action", "conditions"],
+                    },
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Concise justification for the plan: the setup and the levels it encodes.",
+                },
+            },
+            "required": ["actions", "reasoning"],
         },
     },
 }
@@ -891,6 +1150,21 @@ _TOOL_GET_SMART_MONEY_FLOW = {
     },
 }
 
+_TOOL_ANALYZE_PREMARKET = {
+    "type": "function",
+    "function": {
+        "name": "analyze_premarket",
+        "description": (
+            "Pre-market read for the upcoming session: the previous close, the latest "
+            "pre-market price and the implied opening gap percentage, the pre-market "
+            "high/low/volume printed so far from the early bars, and how many minutes "
+            "remain until the opening bell. Use it to estimate where the stock will "
+            "open before deriving your buy/sell levels."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 # Momentum trader: RVOL + price action/VWAP + news + price -- no medium-term regime
 # or broad-market backdrop, the whole point is reacting fast to what's happening now.
 MOMENTUM_TOOLS: list[dict] = [
@@ -899,6 +1173,7 @@ MOMENTUM_TOOLS: list[dict] = [
     _TOOL_ANALYZE_VOLUME,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
+    _TOOL_SET_TACTICS,
     _TOOL_SUBMIT_DECISION,
 ]
 
@@ -911,6 +1186,7 @@ BREAKOUT_TOOLS: list[dict] = [
     _TOOL_BREAKOUT_TRADE_GEOMETRY,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
+    _TOOL_SET_TACTICS,
     _TOOL_SUBMIT_DECISION,
 ]
 
@@ -924,6 +1200,7 @@ REVERSAL_TOOLS: list[dict] = [
     _TOOL_VWAP_REVERSION_GEOMETRY,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
+    _TOOL_SET_TACTICS,
     _TOOL_SUBMIT_DECISION,
 ]
 
@@ -944,6 +1221,22 @@ SMART_MONEY_TOOLS: list[dict] = [
     _TOOL_SMART_MONEY_GEOMETRY,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
+    _TOOL_SET_TACTICS,
+    _TOOL_SUBMIT_DECISION,
+]
+
+# Premarket analyst: the pre-open read (gap, pre-market range, time to bell) +
+# the catalyst + the daily structure and broad backdrop the open will trade
+# against. No intraday tools -- there is no session yet; the whole output is a
+# set_tactics bracket for the opening prints.
+PREMARKET_TOOLS: list[dict] = [
+    _TOOL_GET_QUOTE,
+    _TOOL_ANALYZE_PREMARKET,
+    _TOOL_GET_NEWS,
+    _TOOL_ANALYZE_DAILY_TREND,
+    _TOOL_ANALYZE_MARKET,
+    _TOOL_GET_POSITION,
+    _TOOL_SET_TACTICS,
     _TOOL_SUBMIT_DECISION,
 ]
 
@@ -952,6 +1245,7 @@ PERSONALITY_TOOLS: dict[str, list[dict]] = {
     "breakout": BREAKOUT_TOOLS,
     "reversal": REVERSAL_TOOLS,
     "smart_money": SMART_MONEY_TOOLS,
+    "premarket": PREMARKET_TOOLS,
 }
 
 
@@ -1096,12 +1390,52 @@ def _tool_get_news(state: "AppState", limit: object = None) -> dict:
 
 def _tool_get_position(state: "AppState", tracker: "DecisionTracker") -> dict:
     snap = tracker.snapshot()
+    armed = tactics_summaries(state.tactics)
     return {
         "cash": snap["cash"],
         "position": snap["position"],
         # Kept fresh independently by the price stream, not fetched here.
         "portfolio_value": state.portfolio_value,
         "decisions_so_far": len(snap["decisions"]),
+        # Standing conditional orders still armed from a previous cycle; a
+        # set_tactics call replaces them, actions=[] cancels them.
+        "armed_tactics": armed or None,
+    }
+
+
+def _handle_set_tactics(args: dict, state: "AppState", tracker: "DecisionTracker", symbol: str) -> dict:
+    """Arm (or cancel) the tactics requested by a set_tactics tool call."""
+    raw_actions = args.get("actions")
+    reasoning = str(args.get("reasoning") or "")
+
+    if isinstance(raw_actions, list) and not raw_actions:
+        had = tactics_summaries(state.tactics)
+        state.tactics = None
+        _log(state, {"type": "tactics_set", "cancelled": had, "reasoning": reasoning})
+        return {"status": "cancelled", "cancelled_tactics": had}
+
+    tactics, error = normalize_tactics(symbol, raw_actions, reasoning)
+    if error is not None:
+        return {"error": error}
+
+    replaced = tactics_summaries(state.tactics)
+    state.tactics = tactics
+    summaries = tactics_summaries(tactics)
+    with state.lock:
+        price = state.last_price
+    # Recorded as a no-op "tactics" decision so the arming moment shows up on
+    # the portfolio-value chart and in the decision history/report.
+    tracker.record_tactics(symbol, summaries, reasoning, price)
+    _log(state, {"type": "tactics_set", "tactics": summaries, "replaced": replaced, "reasoning": reasoning})
+    return {
+        "status": "armed",
+        "tactics": summaries,
+        "replaced_tactics": replaced or None,
+        "note": (
+            "You are woken the instant any action executes (remaining actions are "
+            "disarmed). Now finalize the cycle with submit_decision -- action 'alert' "
+            "may carry an empty alerts array while tactics are armed."
+        ),
     }
 
 
@@ -1190,6 +1524,55 @@ def _tool_get_smart_money_flow(state: "AppState") -> dict:
     return historical.fetch_smart_money_flow(symbol)
 
 
+def _tool_analyze_premarket(state: "AppState") -> dict:
+    now = datetime.now(timezone.utc)
+    # The session the read is about: the one in progress (edge case: the bell
+    # already rang while the analyst was reasoning) or the upcoming one.
+    open_dt = market_hours.session_open(now) or market_hours.next_market_open(now)
+    with state.lock:
+        bars = list(state.bars)
+        last_price = state.last_price
+        prev_close = state.prev_close
+
+    result: dict = {
+        "market_is_open": market_hours.is_market_open(now),
+        "market_open_at": open_dt.isoformat(),
+        "minutes_until_open": round(max(0.0, (open_dt - now).total_seconds()) / 60.0, 1),
+        "prev_close": prev_close,
+        "last_price": last_price,
+    }
+    if last_price is not None and prev_close:
+        result["implied_gap_pct"] = round((last_price / prev_close - 1.0) * 100.0, 2)
+
+    # Pre-market bars: same trading day as the open, printed before the bell.
+    session_date = open_dt.astimezone(market_hours.MARKET_TZ).date()
+    pre_bars = []
+    for bar in bars:
+        try:
+            ts = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ts < open_dt and ts.astimezone(market_hours.MARKET_TZ).date() == session_date:
+            pre_bars.append(bar)
+    try:
+        if pre_bars:
+            result["premarket_session"] = {
+                "bars": len(pre_bars),
+                "high": max(float(b["h"]) for b in pre_bars),
+                "low": min(float(b["l"]) for b in pre_bars),
+                "volume": sum(float(b.get("v") or 0.0) for b in pre_bars),
+                "last_bar_close": float(pre_bars[-1]["c"]),
+                "last_bar_time": pre_bars[-1].get("t"),
+            }
+        else:
+            result["premarket_session"] = {
+                "note": "no pre-market bars for the upcoming session yet"
+            }
+    except (KeyError, TypeError, ValueError):
+        result["premarket_session"] = {"note": "pre-market bars are malformed"}
+    return result
+
+
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_quote": lambda args, state, tracker: _tool_get_quote(state),
     "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
@@ -1210,6 +1593,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_liquidity": lambda args, state, tracker: _tool_analyze_liquidity(state),
     "analyze_premium_discount": lambda args, state, tracker: _tool_analyze_premium_discount(state),
     "get_smart_money_flow": lambda args, state, tracker: _tool_get_smart_money_flow(state),
+    "analyze_premarket": lambda args, state, tracker: _tool_analyze_premarket(state),
     "smart_money_trade_geometry": lambda args, state, tracker: _tool_smart_money_trade_geometry(
         state, args.get("entry"), args.get("stop"), args.get("target")
     ),
@@ -1270,6 +1654,7 @@ def run_agent_cycle(
         name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol, "personality": personality}
     )
     system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
+    system_prompt = system_prompt + TACTICS_ADDENDUM
     tools = PERSONALITY_TOOLS.get(personality, MOMENTUM_TOOLS)
     if under_automatic:
         system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM
@@ -1345,12 +1730,25 @@ def run_agent_cycle(
                     },
                 )
                 obs.update_trace(output={"action": "stand_down", "reasoning": reasoning})
+                # The relinquishing strategy's conditional orders must not keep
+                # trading under whatever regime/strategy comes next.
+                state.tactics = None
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"status": "relinquished"})}
                 )
                 stood_down = True
                 decision_made = True
                 break
+
+            if name == "set_tactics":
+                # _handle_set_tactics writes its own "tactics_set" log entry on
+                # success; only a validation failure is logged as a plain tool call.
+                result = _handle_set_tactics(args, state, tracker, symbol)
+                result_content = json.dumps(result)
+                if "error" in result:
+                    _log(state, {"type": "tool_call", "name": name, "args": args, "result_preview": _preview(result_content)})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
+                continue
 
             if name == "submit_decision":
                 action = args.get("action", "")
@@ -1362,7 +1760,7 @@ def run_agent_cycle(
                 # doesn't sink a valid bracket.
                 alerts = [a for a in (normalize_alert(r) for r in (args.get("alerts") or [])) if a is not None]
 
-                if action == "alert" and not alerts:
+                if action == "alert" and not alerts and state.tactics is None:
                     # Some models (small/cheap ones especially) pick action="alert" but
                     # forget the conditions, or name a field that isn't watchable. Reject
                     # and let the model retry instead of silently recording a no-op -- it
@@ -1374,8 +1772,10 @@ def run_agent_cycle(
                         "entry having field (one of: "
                         f"{', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
                         "'below'), and a numeric value. Call submit_decision again "
-                        "with at least one valid condition. Standing aside always "
-                        "means setting an alert -- there is no do-nothing action.",
+                        "with at least one valid condition (or arm a plan with "
+                        "set_tactics first -- an empty alerts array is only allowed "
+                        "while tactics are armed). Standing aside always means "
+                        "setting an alert -- there is no do-nothing action.",
                     )
                     continue
 
@@ -1475,13 +1875,15 @@ def run_agent_cycle(
 def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
     """Block until the next cycle is actually due.
 
-    With no active alert, this is a plain `cycle_sec` timer (woken early only
-    by fresh news). With an active alert, the fixed timer is disabled --
-    the agent committed to "nothing changes until price reaches that level or
-    news arrives", so it should wait indefinitely for `state.agent_wake_event`
-    rather than also waking on the next scheduled tick. The price/news stream
-    threads set that event directly the moment a price alert condition is met
-    or fresh news arrives -- never on a timer just to check state.
+    With no active alert or armed tactics, this is a plain `cycle_sec` timer
+    (woken early only by fresh news). With an active alert or armed tactics,
+    the fixed timer is disabled -- the agent committed to "nothing changes
+    until a watched condition fires, a tactic executes, or news arrives", so it
+    should wait indefinitely for `state.agent_wake_event` rather than also
+    waking on the next scheduled tick. The price/news stream threads and the
+    TacticsExecutor set that event directly the moment a condition is met, a
+    conditional trade fills, or fresh news arrives -- never on a timer just to
+    check state.
     """
     state.agent_wake_event.clear()
     state.agent_wake_reason = None
@@ -1502,9 +1904,11 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
             )
             return
 
-    # An active alert means the agent should sleep until that condition
-    # fires or news arrives -- not get woken by the regular cycle timer too.
-    timeout = None if alerts else cycle_sec
+    # An active alert or armed tactics mean the agent should sleep until a
+    # condition fires, a tactic executes, or news arrives -- not get woken by
+    # the regular cycle timer too. (Armed tactics are watched independently by
+    # the TacticsExecutor, which wakes this thread on execution.)
+    timeout = None if (alerts or state.tactics is not None) else cycle_sec
     woke_early = state.agent_wake_event.wait(timeout=timeout)
     if stop_event.is_set():
         return
@@ -1512,6 +1916,132 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
         _log(state, {"type": "status", "text": f"{state.agent_wake_reason} Waking early."})
     state.agent_wake_event.clear()
     state.agent_wake_reason = None
+
+
+def _wait_for_premarket_window(state: "AppState", stop_event: threading.Event) -> bool:
+    """Block until PREMARKET_LEAD_SEC before the next opening bell -- the
+    earliest moment the Premarket Analyst is allowed to start its analysis.
+    Returns False when the agent was stopped while holding."""
+    logged = False
+    while not stop_event.is_set():
+        remaining = market_hours.seconds_until_next_open() - PREMARKET_LEAD_SEC
+        if remaining <= 0:
+            return True
+        if not logged:
+            open_at = market_hours.next_market_open()
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        f"Premarket analyst holding until {PREMARKET_LEAD_SEC // 60} min "
+                        f"before the bell (opens {open_at.strftime('%Y-%m-%d %H:%M UTC')})."
+                    ),
+                },
+            )
+            logged = True
+        stop_event.wait(min(remaining, PREMARKET_WAIT_POLL_SEC))
+    return False
+
+
+def run_premarket_session(
+    client: Any,
+    model: str,
+    symbol: str,
+    state: "AppState",
+    tracker: "DecisionTracker",
+    stop_event: threading.Event,
+) -> str:
+    """Run the Premarket Analyst end to end: hold until PREMARKET_LEAD_SEC
+    before the opening bell, run one opening-tactics cycle, then sleep until an
+    armed tactic executes (the opening trade is simulated by the
+    TacticsExecutor). Fresh news before the bell wakes it to revise the plan;
+    any wake after the open just keeps it sleeping until a tactic fires.
+
+    Returns "executed" once an opening tactic filled, "done" when the bell rang
+    with nothing armed (nothing to perform), or "stopped".
+    """
+    while not stop_event.is_set():
+        if not _wait_for_premarket_window(state, stop_event):
+            return "stopped"
+
+        state.agent_wake_event.clear()
+        state.agent_wake_reason = None
+        try:
+            run_agent_cycle(
+                client, model, symbol, state, tracker, personality=PREMARKET_PERSONALITY
+            )
+        except Exception as exc:
+            _log(state, {"type": "error", "text": f"Premarket cycle failed: {exc}"})
+
+        if state.tactics is None:
+            # No opening plan -- hold through the bell (so a caller that
+            # re-assesses on return doesn't spin pre-open) and retire.
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": "Premarket analyst armed no opening tactics; retiring at the bell.",
+                },
+            )
+            while not stop_event.is_set() and not market_hours.is_market_open():
+                stop_event.wait(PREMARKET_WAIT_POLL_SEC)
+            return "stopped" if stop_event.is_set() else "done"
+
+        # Opening tactics armed: sleep until the executor performs one.
+        while not stop_event.is_set():
+            state.agent_wake_event.wait()
+            if stop_event.is_set():
+                return "stopped"
+            reason = state.agent_wake_reason or ""
+            state.agent_wake_event.clear()
+            state.agent_wake_reason = None
+            if reason.startswith("Tactics executed"):
+                _log(
+                    state,
+                    {
+                        "type": "status",
+                        "text": "Opening tactic executed; premarket analyst retiring.",
+                    },
+                )
+                return "executed"
+            if state.tactics is None:
+                # Tactics were cleared without an execution (external cancel).
+                return "done"
+            if not market_hours.is_market_open():
+                # Pre-bell wake (fresh news / alert): revise the opening plan.
+                _log(
+                    state,
+                    {
+                        "type": "status",
+                        "text": f"{reason} Premarket analyst revising the opening plan.",
+                    },
+                )
+                break
+            # Post-open wake that wasn't an execution: the bracket is still
+            # armed and watched -- keep sleeping until a tactic fires.
+    return "stopped"
+
+
+def _premarket_loop(
+    state: "AppState",
+    tracker: "DecisionTracker",
+    symbol: str,
+    provider: str,
+    api_key: str,
+    model: str,
+    stop_event: threading.Event,
+) -> None:
+    """Standalone Premarket Analyst run: one premarket session, then the agent
+    disables itself -- the opening tactics were performed (or there was nothing
+    to perform) and this personality never trades the session that follows."""
+    client = get_agent_client(provider, api_key)
+    outcome = run_premarket_session(client, model, symbol, state, tracker, stop_event)
+    if outcome != "stopped" and state.agent_stop_event is stop_event:
+        stop_agent(state)
+    state.agent_running = False
+    _log(state, {"type": "status", "text": "Premarket analyst disabled."})
+    obs.flush()
 
 
 def _agent_loop(
@@ -1536,6 +2066,14 @@ def _agent_loop(
     _log(state, {"type": "status", "text": "Agent stopped"})
 
 
+def start_tactics_executor(state: "AppState", tracker: "DecisionTracker") -> None:
+    """Start the background matcher for armed tactics; stopped by `stop_agent`.
+    Shared by `launch_agent` and the Automatic orchestrator."""
+    executor = TacticsExecutor(state, tracker)
+    state.tactics_executor = executor
+    executor.start()
+
+
 def launch_agent(
     state: "AppState",
     tracker: "DecisionTracker",
@@ -1552,6 +2090,16 @@ def launch_agent(
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
+    start_tactics_executor(state, tracker)
+    if personality == PREMARKET_PERSONALITY:
+        # One-shot pre-open specialist: holds for the opening window, arms the
+        # opening tactics, and disables itself once they execute.
+        threading.Thread(
+            target=_premarket_loop,
+            args=(state, tracker, symbol, provider, api_key, model, stop_event),
+            daemon=True,
+        ).start()
+        return
     threading.Thread(
         target=_agent_loop,
         args=(state, tracker, symbol, provider, api_key, model, cycle_sec, stop_event, personality),
@@ -1563,6 +2111,12 @@ def stop_agent(state: "AppState") -> None:
     if state.agent_stop_event:
         state.agent_stop_event.set()
     state.agent_running = False
+    # Disarm any standing conditional orders and their matcher -- with no agent
+    # to wake, tactics must not keep trading on their own.
+    if state.tactics_executor is not None:
+        state.tactics_executor.stop()
+        state.tactics_executor = None
+    state.tactics = None
     # Interrupt a blocked _wait_for_next_cycle immediately instead of letting
     # it sit until the timeout expires.
     state.agent_wake_event.set()

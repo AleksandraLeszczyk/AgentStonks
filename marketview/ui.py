@@ -1,16 +1,25 @@
+import base64
 import html
 import json
 import os
 import re
 from dataclasses import asdict
 from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
-from .agent import AGENT_PERSONALITIES, DEFAULT_PERSONALITY, launch_agent, stop_agent
-from .automatic import AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
+from .agent import (
+    AGENT_PERSONALITIES,
+    DEFAULT_PERSONALITY,
+    PREMARKET_PERSONALITY,
+    launch_agent,
+    stop_agent,
+)
+from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
     build_analysis_gauges,
     build_chart,
@@ -38,6 +47,7 @@ from .config import (
     TIMEFRAMES,
     TRADE_FIXED_COST,
 )
+from .datalog import log_fetch, log_fetch_failure
 from .decisions import DecisionTracker
 from .historical import (
     HISTORICAL_PERIODS,
@@ -60,6 +70,7 @@ from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import PRICE_AXIS_ALERT_FIELDS, AppState, current_volume_ratio, format_alert
+from .tactics import tactic_price_levels, tactics_summaries
 from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
     analyze_fair_value_gaps,
@@ -95,6 +106,24 @@ def _personality_label(key: str) -> str:
         return AUTOMATIC_LABEL
     entry = AGENT_PERSONALITIES.get(key) or AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
     return entry["label"]
+
+
+AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"
+
+
+@lru_cache(maxsize=None)
+def _avatar_data_uri(key: str) -> Optional[str]:
+    """Base64 data URI for a personality's avatar PNG, or None if the file is missing."""
+    if key == AUTOMATIC_KEY:
+        filename = AUTOMATIC_AVATAR
+    else:
+        entry = AGENT_PERSONALITIES.get(key) or AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
+        filename = entry["avatar"]
+    try:
+        data = (AVATAR_DIR / filename).read_bytes()
+    except OSError:
+        return None
+    return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
 
 def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
@@ -343,6 +372,8 @@ def _chart_panel() -> None:
         # horizontal lines; volume/spread/portfolio alerts have no price level.
         price_alerts = [a for a in state.alerts if a.get("field") in PRICE_AXIS_ALERT_FIELDS]
 
+    # Price levels at which armed tactics (standing conditional orders) execute.
+    tactic_levels = tactic_price_levels(state.tactics)
     decisions = state.decision_tracker.trade_markers() if state.decision_tracker else None
 
     fig = (
@@ -366,6 +397,7 @@ def _chart_panel() -> None:
             show_whiskers=state.show_whiskers,
             decisions=decisions,
             price_alerts=price_alerts,
+            tactic_levels=tactic_levels,
             news_impacts=state.news_impacts,
             fill_gaps=state.fill_gaps,
         )
@@ -798,6 +830,17 @@ def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
         if action == "alert":
             return "⏰", PALETTE["accent"], "ALERT"
         return "💤", PALETTE["muted"], "SLEEP"
+    if etype == "tactics_set":
+        if entry.get("cancelled") is not None:
+            return "🎯", PALETTE["muted"], "TACTICS CANCELLED"
+        return "🎯", PALETTE["orange"], "TACTICS SET"
+    if etype == "tactics_execution":
+        action = entry.get("action")
+        if action == "buy":
+            return "🎯", PALETTE["up"], "TACTICS → BUY"
+        if action == "sell":
+            return "🎯", PALETTE["down"], "TACTICS → SELL"
+        return "🎯", PALETTE["orange"], "TACTICS"
     if etype == "regime_select":
         return "🤖", PALETTE["orange"], "REGIME → STRATEGY"
     if etype == "stand_down":
@@ -832,6 +875,39 @@ def _agent_entry_body(entry: dict) -> str:
         return (
             f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b>{extra}</div>"
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
+        )
+    if etype == "tactics_set":
+        cancelled = entry.get("cancelled")
+        reasoning = html.escape(entry.get("reasoning", ""))
+        if cancelled is not None:
+            what = " · ".join(html.escape(t) for t in cancelled) or "none armed"
+            return (
+                f"<div>Cancelled: {what}</div>"
+                f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
+            )
+        rows = "".join(f"<div>🎯 <b>{html.escape(t)}</b></div>" for t in entry.get("tactics") or [])
+        replaced = entry.get("replaced") or []
+        replaced_html = (
+            f"<div style='color:{PALETTE['muted']}'>replaced: {' · '.join(html.escape(t) for t in replaced)}</div>"
+            if replaced
+            else ""
+        )
+        return f"{rows}{replaced_html}<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
+    if etype == "tactics_execution":
+        price = entry.get("price")
+        price_str = f"${price:,.4f}" if price is not None else "—"
+        qty = entry.get("quantity") or 0
+        status = html.escape(str(entry.get("status", "")))
+        tactic = html.escape(entry.get("tactic", ""))
+        triggered = html.escape(entry.get("triggered_by", ""))
+        error = entry.get("error")
+        error_html = (
+            f"<div style='color:{PALETTE['down']}'>{html.escape(str(error))}</div>" if error else ""
+        )
+        return (
+            f"<div>Executed <b>{tactic}</b> · Status: <b>{status}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b></div>"
+            f"{error_html}"
+            f"<div style='margin-top:4px;color:{PALETTE['muted']}'>Triggered by {triggered}</div>"
         )
     if etype == "tool_call":
         args = entry.get("args") or {}
@@ -889,6 +965,82 @@ def _agent_log_html(log: list[dict]) -> str:
     )
 
 
+def _current_tactics_html(state: AppState) -> str:
+    """The 'current tactics' card for the Agent tab: every armed conditional
+    action with the plan's reasoning and arming time, or an explicit
+    nothing-armed note while the agent runs (idle agent renders nothing)."""
+    tactics = state.tactics
+    armed = tactics_summaries(tactics)
+    if not armed:
+        if not state.agent_running:
+            return ""
+        return (
+            f"<div style='background:{PALETTE['panel']};border:1px dashed {PALETTE['grid']};"
+            "border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:12px;"
+            f"color:{PALETTE['muted']}'>🎯 No tactics armed — the agent has not set "
+            "buy/sell conditions; it will act only when woken (alert, news, or timer).</div>"
+        )
+    try:
+        since = f" · armed {pd.to_datetime(tactics.ts).strftime('%H:%M:%S')}" if tactics.ts else ""
+    except Exception:
+        since = ""
+    items = "".join(f"<div>🎯 <b>{html.escape(t)}</b></div>" for t in armed)
+    reasoning = (
+        f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{html.escape(tactics.reasoning)}</div>"
+        if tactics.reasoning
+        else ""
+    )
+    return (
+        f"<div style='background:{PALETTE['panel']};border:1px solid {PALETTE['orange']};"
+        "border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:12px;"
+        f"color:{PALETTE['text']}'>"
+        f"<div style='color:{PALETTE['orange']};font-size:11px;margin-bottom:4px'>"
+        f"ARMED TACTICS — executes automatically, then wakes the agent{since}</div>"
+        f"{items}{reasoning}</div>"
+    )
+
+
+@st.fragment(run_every=AGENT_LOG_POLL_SEC)
+def _agent_identity_panel() -> None:
+    """Avatar card for the personality currently in charge. Under Automatic the
+    face shown is the strategy Automatic activated, not Automatic itself; while
+    it is still classifying the regime (or idle) the orchestrator's own avatar
+    shows. Polled so the card follows Automatic's strategy switches live."""
+    state = _get_state()
+    selected = state.llm_personality
+    display_key = selected
+    note = ""
+    if selected == AUTOMATIC_KEY and state.agent_running:
+        active = state.automatic_active_strategy
+        if active:
+            display_key = active
+            regime = f" — {state.automatic_regime} regime" if state.automatic_regime else ""
+            note = f"🤖 picked by Automatic{regime}"
+        else:
+            note = "🤖 Automatic is assessing the market regime…"
+    avatar = _avatar_data_uri(display_key)
+    img = (
+        f"<img src='{avatar}' alt='' style='width:56px;height:56px;border-radius:50%;flex:none'/>"
+        if avatar
+        else ""
+    )
+    note_html = (
+        f"<div style='color:{PALETTE['muted']};font-size:0.85rem'>{html.escape(note)}</div>"
+        if note
+        else ""
+    )
+    st.html(
+        f"<div style='display:flex;align-items:center;gap:14px;background:{PALETTE['panel']};"
+        f"border:1px solid {PALETTE['grid']};border-radius:12px;padding:10px 16px;margin:4px 0'>"
+        f"{img}"
+        f"<div>"
+        f"<div style='color:{PALETTE['text']};font-weight:600;font-size:1.05rem'>"
+        f"{html.escape(_personality_label(display_key))}</div>"
+        f"{note_html}"
+        f"</div></div>"
+    )
+
+
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
 def _agent_log_panel() -> None:
     state = _get_state()
@@ -899,6 +1051,9 @@ def _agent_log_panel() -> None:
         c1.metric("Paper cash", f"${snap['cash']:,.2f}")
         c2.metric("Position", f"{snap['position']:.2f} sh")
         c3.metric("Decisions", len(snap["decisions"]))
+    tactics_html = _current_tactics_html(state)
+    if tactics_html:
+        st.html(tactics_html)
     with state.lock:
         log = list(state.agent_log)
     st.html(_agent_log_html(log[-50:]))
@@ -1077,11 +1232,14 @@ def _agent_panel(symbol: str) -> None:
     state = _get_state()
     st.caption(
         "Runs an LLM research agent that reads already-fetched ticker data and makes "
-        "paper buy/sell/alert calls on a fixed interval. When it doesn't want to trade, the agent "
-        "sets condition alerts on any continuously-updated value -- price, bid/ask, spread, "
-        "day high/low, volume, relative volume, or portfolio value -- to wake up early the moment "
-        "one is crossed, and it always wakes up early when fresh news breaks for the ticker. "
-        "No real orders are ever placed. "
+        "paper buy/sell/alert calls on a fixed interval. Instead of trading only at the "
+        "current price, the agent prefers to arm tactics -- standing conditional orders "
+        "like 'buy 10 sh if price below X' or 'sell 20% of shares if price above Y' with "
+        "multiple AND-ed conditions (price, volume, VIX, momentum, ...) -- that a background "
+        "executor fills the instant they trigger, waking the agent to reevaluate. When it "
+        "doesn't want to trade, the agent sets condition alerts on any continuously-updated "
+        "value to wake up early the moment one is crossed, and it always wakes up early when "
+        "fresh news breaks for the ticker. No real orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
     with st.expander("LLM", expanded=True):
@@ -1102,7 +1260,16 @@ def _agent_panel(symbol: str) -> None:
             st.caption(
                 "🤖 Automatic detects the market regime and activates the best-fitting "
                 "strategy. That strategy trades until it sees no opportunities in the near "
-                "term and stands down, waking Automatic to re-assess and switch."
+                "term and stands down, waking Automatic to re-assess and switch. Before "
+                "the session starts it activates the Premarket Analyst instead."
+            )
+        elif personality == PREMARKET_PERSONALITY:
+            st.caption(
+                "🌅 The Premarket Analyst doesn't analyze on start: it holds until "
+                "~2 minutes before the opening bell, then runs one pre-market read and "
+                "arms opening tactics — how much to buy/sell and at what price for the "
+                "later trades to be profitable. Once a tactic executes (simulated at the "
+                "opening prints), the analyst retires and the agent disables itself."
             )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
@@ -1175,13 +1342,7 @@ def _agent_panel(symbol: str) -> None:
     status = "🟢 running" if state.agent_running else "⚪ idle"
     watching = f" — watching {state.symbol}" if state.agent_running and state.symbol else ""
     st.caption(f"Status: {status}{watching}")
-    if state.agent_running and state.llm_personality == AUTOMATIC_KEY:
-        active = state.automatic_active_strategy
-        if active:
-            regime = f" [{state.automatic_regime}]" if state.automatic_regime else ""
-            st.caption(f"🤖 Automatic → active strategy: {_personality_label(active)}{regime}")
-        else:
-            st.caption("🤖 Automatic → assessing market regime…")
+    _agent_identity_panel()
 
     _agent_performance_panel(symbol)
     _agent_log_panel()
@@ -1427,8 +1588,16 @@ def build_ui() -> None:
                 try:
                     historical_bars = fetch_bars(state.symbol, timeframe, MAX_BARS, state.api_key, state.api_secret, state.feed)
                 except Exception as exc:
+                    log_fetch_failure(
+                        "bars (timeframe reload)", [("Alpaca REST", exc)], symbol=state.symbol,
+                        consequence=f"staying on {state.timeframe}",
+                    )
                     st.error(f"Failed to reload bars: {exc}")
                 else:
+                    log_fetch(
+                        "bars (timeframe reload)", "Alpaca REST", symbol=state.symbol,
+                        detail=f"{len(historical_bars)} {timeframe} bars",
+                    )
                     state.timeframe = timeframe
                     with state.lock:
                         state.bars.clear()
@@ -1448,12 +1617,28 @@ def build_ui() -> None:
                 with st.spinner(f"Loading history for {sym}…"):
                     try:
                         historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
+                        log_fetch(
+                            "bars (initial load)", "Alpaca REST", symbol=sym,
+                            detail=f"{len(historical_bars)} {timeframe} bars",
+                        )
                         historical_trades = fetch_trades(sym, key, secret, feed)
+                        log_fetch(
+                            "trades (initial load)", "Alpaca REST", symbol=sym,
+                            detail=f"{len(historical_trades)} trades",
+                        )
                         news = fetch_news_with_fallback(
                             sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
                         )
                         daily_bars = fetch_daily_bars(sym, key, secret, feed)
+                        log_fetch(
+                            "daily bars (initial load)", "Alpaca REST", symbol=sym,
+                            detail=f"{len(daily_bars)} daily bars",
+                        )
                     except Exception as exc:
+                        log_fetch_failure(
+                            "initial data load", [("Alpaca REST", exc)], symbol=sym,
+                            consequence="start aborted",
+                        )
                         st.error(f"Failed to load data: {exc}")
                         state.status = f"Failed: {exc}"
                     else:

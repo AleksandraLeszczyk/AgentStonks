@@ -71,11 +71,13 @@ def compute_equity_curve(
 
 
 def decision_markers(decisions: list[dict], session_start: datetime) -> list[dict]:
-    """Filled buy/sell decisions shaped for plotting on the equity curve (value, not price)."""
+    """Filled buy/sell decisions -- plus tactics-armed moments -- shaped for
+    plotting on the equity curve (value, not price)."""
     cutoff = pd.Timestamp(session_start)
     markers: list[dict] = []
     for d in decisions:
-        if d.get("status") != "filled" or d.get("price") is None:
+        is_tactics = d.get("action") == "tactics"
+        if (d.get("status") != "filled" and not is_tactics) or d.get("price") is None:
             continue
         if pd.Timestamp(d["ts"]) <= cutoff:
             continue
@@ -84,6 +86,7 @@ def decision_markers(decisions: list[dict], session_start: datetime) -> list[dic
                 "ts": d["ts"],
                 "action": d["action"],
                 "value": d["cash_after"] + d["position_after"] * d["price"],
+                "label": " · ".join(d.get("tactics") or []) if is_tactics else None,
             }
         )
     return markers

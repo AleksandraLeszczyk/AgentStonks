@@ -5,6 +5,8 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 
+from .datalog import log_fetch, log_fetch_failure
+
 logger = logging.getLogger(__name__)
 
 HISTORICAL_PERIODS: dict[str, int] = {
@@ -31,17 +33,29 @@ def fetch_close_series(symbol: str, days: int) -> pd.Series:
     start = end - timedelta(days=days)
     try:
         df = yf.download(symbol, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
-    except Exception:
-        logger.exception("yfinance download failed for %s (start=%s, end=%s)", symbol, start, end)
+    except Exception as exc:
+        log_fetch_failure(
+            "daily closes",
+            [("yfinance", exc)],
+            symbol=symbol,
+            consequence=f"start={start:%Y-%m-%d}, end={end:%Y-%m-%d}",
+        )
         raise
     if df.empty:
-        logger.warning("yfinance returned no data for %s (start=%s, end=%s)", symbol, start, end)
+        log_fetch(
+            "daily closes",
+            "yfinance",
+            symbol=symbol,
+            detail=f"0 rows for start={start:%Y-%m-%d}, end={end:%Y-%m-%d}",
+        )
         return pd.Series(dtype=float)
     close = df["Close"]
     if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     close.index = pd.to_datetime(close.index)
-    return close.dropna()
+    close = close.dropna()
+    log_fetch("daily closes", "yfinance", symbol=symbol, detail=f"{len(close)} rows over {days}d")
+    return close
 
 
 def fetch_intraday_bars(symbol: str, interval: str = "1m") -> list[dict]:
@@ -54,11 +68,18 @@ def fetch_intraday_bars(symbol: str, interval: str = "1m") -> list[dict]:
     """
     try:
         df = yf.download(symbol, period="1d", interval=interval, auto_adjust=False, progress=False)
-    except Exception:
-        logger.exception("yfinance intraday download failed for %s", symbol)
+    except Exception as exc:
+        log_fetch_failure("intraday bars", [("yfinance", exc)], symbol=symbol)
         raise
     if df.empty:
+        log_fetch("intraday bars", "yfinance (delayed)", symbol=symbol, detail="0 bars returned")
         return []
+    log_fetch(
+        "intraday bars",
+        "yfinance (delayed)",
+        symbol=symbol,
+        detail=f"{len(df)} {interval} bars",
+    )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     idx = df.index
@@ -95,8 +116,13 @@ def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
     for key, symbol in (("spy", SPY_SYMBOL), ("vix", VIX_SYMBOL), ("vix3m", VIX3M_SYMBOL)):
         try:
             data[key] = fetch_close_series(symbol, days)
-        except Exception:
-            logger.error("Market indicator fetch failed for %s (%s); using empty series", symbol, key)
+        except Exception as exc:
+            log_fetch_failure(
+                "market indicators",
+                [("yfinance", exc)],
+                symbol=symbol,
+                consequence=f"using empty {key} series",
+            )
             data[key] = pd.Series(dtype=float)
 
     _market_cache["ts"] = now
@@ -108,44 +134,56 @@ def fetch_dividends(symbol: str, days: int) -> pd.Series:
     """Fetch dividend payouts for `symbol` over the trailing `days`. Raises on failure."""
     try:
         div = yf.Ticker(symbol).dividends
-    except Exception:
-        logger.exception("yfinance dividends lookup failed for %s", symbol)
+    except Exception as exc:
+        log_fetch_failure("dividends", [("yfinance", exc)], symbol=symbol)
         raise
     if div.empty:
+        log_fetch("dividends", "yfinance", symbol=symbol, detail="no payouts on record")
         return div
     cutoff = pd.Timestamp.now(tz=div.index.tz) - pd.Timedelta(days=days)
-    return div[div.index >= cutoff]
+    div = div[div.index >= cutoff]
+    log_fetch("dividends", "yfinance", symbol=symbol, detail=f"{len(div)} payouts over {days}d")
+    return div
 
 
 def fetch_earnings_dates(symbol: str, days: int) -> pd.DataFrame:
     """Fetch past and upcoming earnings dates for `symbol` over the trailing `days`."""
     try:
         earnings = yf.Ticker(symbol).get_earnings_dates(limit=20)
-    except Exception:
-        logger.error("yfinance earnings dates lookup failed for %s", symbol, exc_info=True)
+    except Exception as exc:
+        log_fetch_failure(
+            "earnings dates",
+            [("yfinance", exc)],
+            symbol=symbol,
+            consequence="returning no earnings dates",
+        )
         return pd.DataFrame()
     if earnings is None or earnings.empty:
+        log_fetch("earnings dates", "yfinance", symbol=symbol, detail="none on record")
         return pd.DataFrame()
+    log_fetch("earnings dates", "yfinance", symbol=symbol, detail=f"{len(earnings)} dates")
     cutoff = pd.Timestamp.now(tz=earnings.index.tz) - pd.Timedelta(days=days)
     return earnings[earnings.index >= cutoff]
 
 
 def fetch_static_analysis(symbol: str) -> dict:
     """Fetch the raw inputs (P/E, growth, dividend yield) for a simple static valuation estimate."""
-    ticker = yf.Ticker(symbol)
     try:
+        ticker = yf.Ticker(symbol)
         info = ticker.info
         growth_rate = info.get("earningsGrowth") or info.get("revenueGrowth")
+        log_fetch("fundamentals", "yfinance quoteSummary (.info)", symbol=symbol)
         return {
             "pe_ratio": info.get("trailingPE"),
             "forward_pe": info.get("forwardPE"),
             "dividend_yield": info.get("trailingAnnualDividendYield"),
             "growth_rate": growth_rate,
         }
-    except Exception:
+    except Exception as exc:
         # Yahoo Finance periodically restricts the quoteSummary endpoint; fall back
         # to computing dividend yield from the chart endpoint (less restricted).
-        logger.warning("yfinance .info unavailable for %s; falling back to fast_info", symbol, exc_info=True)
+        info_failure = ("yfinance quoteSummary (.info)", exc)
+        ticker = None
 
     dividend_yield = None
     try:
@@ -153,8 +191,20 @@ def fetch_static_analysis(symbol: str) -> dict:
         annual_div = float(ticker.dividends.last("365D").sum())
         if last_price and annual_div:
             dividend_yield = annual_div / last_price
-    except Exception:
-        pass
+        log_fetch(
+            "fundamentals",
+            "yfinance fast_info + dividends",
+            symbol=symbol,
+            detail="dividend yield only",
+            failures=[info_failure],
+        )
+    except Exception as exc:
+        log_fetch_failure(
+            "fundamentals",
+            [info_failure, ("yfinance fast_info + dividends", exc)],
+            symbol=symbol,
+            consequence="all fundamentals unavailable",
+        )
 
     return {
         "pe_ratio": None,
@@ -224,6 +274,7 @@ def fetch_smart_money_flow(symbol: str) -> dict:
         "institutional_net_pct_change": None,
     }
 
+    failures: list[tuple[str, object]] = []
     try:
         mh = ticker.major_holders
         if mh is not None and not mh.empty:
@@ -240,13 +291,13 @@ def fetch_smart_money_flow(symbol: str) -> dict:
                     result["institutions_pct_held"] = round(val, 4)
                 elif key == "institutionscount":
                     result["institutions_count"] = int(val)
-    except Exception:
-        logger.warning("yfinance major_holders unavailable for %s", symbol, exc_info=True)
+    except Exception as exc:
+        failures.append(("yfinance major_holders", exc))
 
     try:
         result["insider_flow"] = _net_insider_shares(ticker.insider_purchases)
-    except Exception:
-        logger.warning("yfinance insider_purchases unavailable for %s", symbol, exc_info=True)
+    except Exception as exc:
+        failures.append(("yfinance insider_purchases", exc))
 
     try:
         inst = ticker.institutional_holders
@@ -264,8 +315,24 @@ def fetch_smart_money_flow(symbol: str) -> dict:
                 })
             result["top_institutional_holders"] = result["top_institutional_holders"][:5]
             result["institutional_net_pct_change"] = round(net_change, 4)
-    except Exception:
-        logger.warning("yfinance institutional_holders unavailable for %s", symbol, exc_info=True)
+    except Exception as exc:
+        failures.append(("yfinance institutional_holders", exc))
+
+    if len(failures) == 3:
+        log_fetch_failure(
+            "smart money flow",
+            failures,
+            symbol=symbol,
+            consequence="no institutional ownership data",
+        )
+    else:
+        log_fetch(
+            "smart money flow",
+            "yfinance (SEC filings)",
+            symbol=symbol,
+            detail=f"{3 - len(failures)}/3 datasets",
+            failures=failures,
+        )
 
     result["summary"] = _summarize_smart_money_flow(result)
     _smart_money_cache[symbol] = {"ts": now, "data": result}

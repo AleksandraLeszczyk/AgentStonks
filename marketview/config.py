@@ -53,6 +53,19 @@ AGENT_MAX_TOOL_ITERS = 8
 PAPER_STARTING_CASH = 100_000.0
 TRADE_FIXED_COST = 1.15
 
+# Premarket analyst: it may start its single opening-tactics cycle no earlier
+# than PREMARKET_LEAD_SEC before the opening bell; while holding for that
+# window it re-checks the clock every PREMARKET_WAIT_POLL_SEC.
+PREMARKET_LEAD_SEC = 120
+PREMARKET_WAIT_POLL_SEC = 30.0
+
+# Tactics executor: the stream nudges it on every tick, so this poll is only a
+# fallback cadence covering the non-stream condition fields (vix, momentum) and
+# REST-fallback sessions. The momentum window is the lookback (in minutes) for
+# the `momentum_pct` tactic condition field.
+TACTICS_POLL_SEC = 2.0
+TACTICS_MOMENTUM_WINDOW_MIN = 10
+
 # 13:20 UTC = 09:20 ET, just before market open (09:30 ET)
 SESSION_START = datetime.now(tz=timezone.utc).replace(
     hour=13, minute=20, second=0, microsecond=0

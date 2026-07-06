@@ -197,5 +197,8 @@ class TestRunRegimeCycle:
         assert AUTOMATIC_KEY not in SELECTABLE_STRATEGIES
         assert "momentum" in SELECTABLE_STRATEGIES
         assert "smart_money" in SELECTABLE_STRATEGIES
+        # Premarket is activated deterministically before the open, never by
+        # the regime cycle.
+        assert "premarket" not in SELECTABLE_STRATEGIES
         enum = _TOOL_STAND_DOWN["function"]["parameters"]["properties"]["reasoning"]
         assert enum["type"] == "string"

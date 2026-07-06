@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 from marketview.agent import (
@@ -502,19 +503,30 @@ class TestRunAgentCycle:
         assert state.alerts == []
 
 
+def _set_price(state: AppState, price: float) -> None:
+    """Set the live price the way the stream does: last_price plus a tick in the
+    recent_prices window that last_price alerts are checked against."""
+    state.last_price = price
+    state.recent_prices.append((time.monotonic(), price))
+
+
 class TestAlertTrigger:
     def test_alert_triggered_above(self):
         state = AppState()
-        state.last_price = 151.0
+        _set_price(state, 151.0)
         assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is True
-        state.last_price = 149.0
+        # Fresh state: the wick window intentionally remembers recent ticks, so
+        # a lower print right after 151 would still (correctly) trigger.
+        state = AppState()
+        _set_price(state, 149.0)
         assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is False
 
     def test_alert_triggered_below(self):
         state = AppState()
-        state.last_price = 99.0
+        _set_price(state, 99.0)
         assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is True
-        state.last_price = 101.0
+        state = AppState()
+        _set_price(state, 101.0)
         assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is False
 
     def test_alert_triggered_on_non_price_field(self):
@@ -527,7 +539,7 @@ class TestAlertTrigger:
 
     def test_wait_returns_early_when_alert_fires(self):
         state = AppState()
-        state.last_price = 151.0
+        _set_price(state, 151.0)
         state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
         stop_event = threading.Event()
 
@@ -539,7 +551,9 @@ class TestAlertTrigger:
             _wait_for_next_cycle(state, stop_event, cycle_sec=60)
             finished.set()
 
-        thread = threading.Thread(target=run)
+        # daemon: a regression that never wakes must fail the assert below, not
+        # hang the interpreter at exit on a forever-blocked join.
+        thread = threading.Thread(target=run, daemon=True)
         thread.start()
         thread.join(timeout=5)
 
@@ -551,7 +565,7 @@ class TestAlertTrigger:
 
     def test_wait_returns_early_when_low_side_of_bracket_fires(self):
         state = AppState()
-        state.last_price = 94.0
+        _set_price(state, 94.0)
         state.alerts = [
             {"field": "last_price", "condition": "below", "value": 95.0},
             {"field": "last_price", "condition": "above", "value": 150.0},
@@ -566,7 +580,7 @@ class TestAlertTrigger:
             _wait_for_next_cycle(state, stop_event, cycle_sec=60)
             finished.set()
 
-        thread = threading.Thread(target=run)
+        thread = threading.Thread(target=run, daemon=True)
         thread.start()
         thread.join(timeout=5)
 

@@ -17,6 +17,7 @@ import requests
 from pydantic import BaseModel, field_validator
 
 from . import observability as obs
+from .datalog import log_fetch, log_fetch_failure
 from .llm import DEFAULT_NEWS_MODELS, parse_structured
 from .rest import fetch_news as _fetch_alpaca_news
 
@@ -124,7 +125,12 @@ def get_last_week_news(keywords: str, worldnews_api_key: str) -> list[News]:
             number=100,
         )
     except Exception as exc:
-        print(f"WorldNews API error: {exc}")
+        log_fetch_failure(
+            "news (weekly search)",
+            [("WorldNews API", exc)],
+            symbol=keywords,
+            consequence="returning no articles",
+        )
         return []
 
     df = pd.DataFrame.from_records([i.to_dict() for i in response.news])
@@ -156,14 +162,29 @@ def fetch_news_with_fallback(
     regardless of which provider served the result, so callers don't need to branch.
     """
     try:
-        return _fetch_alpaca_news(symbol, alpaca_key, alpaca_secret, limit=limit)
+        articles = _fetch_alpaca_news(symbol, alpaca_key, alpaca_secret, limit=limit)
+        log_fetch("news", "Alpaca news API", symbol=symbol, detail=f"{len(articles)} articles")
+        return articles
     except Exception as exc:
-        print(f"Alpaca news API error, falling back to WorldNews: {exc}")
+        alpaca_failure = ("Alpaca news API", exc)
 
     if not worldnews_api_key:
+        log_fetch_failure(
+            "news",
+            [alpaca_failure],
+            symbol=symbol,
+            consequence="no WorldNews API key configured; returning no articles",
+        )
         return []
 
     fallback = get_last_week_news(keywords=symbol, worldnews_api_key=worldnews_api_key)
+    log_fetch(
+        "news",
+        "WorldNews API",
+        symbol=symbol,
+        detail=f"{len(fallback[:limit])} articles",
+        failures=[alpaca_failure],
+    )
     return [
         {
             "id": f"worldnews-{symbol}-{i}",

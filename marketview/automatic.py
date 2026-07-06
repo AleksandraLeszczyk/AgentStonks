@@ -27,9 +27,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import agent
+from . import market_hours
 from . import observability as obs
 from .agent import (
     AGENT_PERSONALITIES,
+    PREMARKET_PERSONALITY,
     _TOOL_ANALYZE_DAILY_TREND,
     _TOOL_ANALYZE_INTRADAY_MOMENTUM,
     _TOOL_ANALYZE_MARKET,
@@ -46,6 +48,7 @@ from .agent import (
     _reject,
     _wait_for_next_cycle,
     run_agent_cycle,
+    run_premarket_session,
 )
 from .config import AGENT_CYCLE_SEC, AGENT_MAX_TOOL_ITERS
 from .decisions import DecisionTracker
@@ -54,9 +57,15 @@ from .state import AppState
 
 AUTOMATIC_KEY = "automatic"
 AUTOMATIC_LABEL = "Automatic (regime-adaptive orchestrator)"
+AUTOMATIC_AVATAR = "Multiavatar-18fd00dfa76e2785b7.png"
 
-# Strategies the orchestrator can choose between -- every tradeable personality.
-SELECTABLE_STRATEGIES: list[str] = list(AGENT_PERSONALITIES.keys())
+# Strategies the regime cycle can choose between -- every tradeable intraday
+# personality. The Premarket Analyst is excluded: it is not a regime call, the
+# orchestrator activates it deterministically whenever the session hasn't
+# started (see `_automatic_loop`).
+SELECTABLE_STRATEGIES: list[str] = [
+    key for key in AGENT_PERSONALITIES if key != PREMARKET_PERSONALITY
+]
 
 # Regime vocabulary the orchestrator classifies into. Free-text reasoning carries
 # the nuance; this enum just anchors the headline read.
@@ -302,6 +311,43 @@ def _automatic_loop(
 ) -> None:
     client = get_agent_client(provider, api_key)
     while not stop_event.is_set():
+        # 0. Before the session starts there is no intraday regime to read --
+        #    the Premarket Analyst runs instead. It holds until ~2 minutes
+        #    before the bell, arms opening tactics, and retires once one
+        #    executes; only then does the normal regime loop take over.
+        if not market_hours.is_market_open():
+            state.automatic_active_strategy = PREMARKET_PERSONALITY
+            state.automatic_regime = "premarket"
+            state.automatic_reason = (
+                "Session hasn't started -- the Premarket Analyst prepares opening tactics."
+            )
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        "Automatic: session hasn't started; activating "
+                        f"{_strategy_label(PREMARKET_PERSONALITY)}."
+                    ),
+                },
+            )
+            outcome = run_premarket_session(client, model, symbol, state, tracker, stop_event)
+            state.automatic_active_strategy = None
+            if stop_event.is_set():
+                break
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        "Premarket analyst "
+                        + ("executed its opening tactics" if outcome == "executed" else "finished")
+                        + "; Automatic assessing the regime."
+                    ),
+                },
+            )
+            continue
+
         # 1. Assess the regime and pick a strategy.
         state.automatic_active_strategy = None
         selection = None
@@ -387,6 +433,7 @@ def launch_automatic(
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
+    agent.start_tactics_executor(state, tracker)
     state.automatic_active_strategy = None
     state.automatic_regime = None
     state.automatic_reason = None

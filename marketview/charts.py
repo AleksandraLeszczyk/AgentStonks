@@ -549,6 +549,39 @@ def _add_price_alerts(price_alerts: list[dict], fig: go.Figure, x0: datetime, x1
         )
 
 
+def _add_tactic_levels(tactic_levels: list[dict], fig: go.Figure, x0: datetime, x1: datetime) -> None:
+    """Horizontal lines marking price-axis conditions of the agent's armed tactics --
+    the levels at which a standing conditional buy/sell will execute.
+
+    Expects entries shaped {"action", "label", "field", "condition", "value"}
+    (see tactics.tactic_price_levels); conditions on non-price fields are
+    filtered out by that helper.
+    """
+    for level_spec in tactic_levels:
+        level = level_spec.get("value")
+        if level is None:
+            continue
+        color = PALETTE["up"] if level_spec.get("action") == "buy" else PALETTE["down"]
+        fig.add_shape(
+            type="line",
+            x0=x0, x1=x1,
+            y0=level, y1=level,
+            line=dict(color=color, width=1.5, dash="dot"),
+            row=1, col=1,
+        )
+        fig.add_annotation(
+            xref="x", yref="y",
+            x=x1, y=level,
+            text=(
+                f" 🎯 {level_spec.get('label', '')} @ {level_spec.get('field', 'price')} "
+                f"{level_spec.get('condition', '')} {level:.2f}"
+            ),
+            font=dict(color=color, size=10, family="monospace"),
+            showarrow=False,
+            xanchor="left",
+        )
+
+
 def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: datetime) -> None:
     """Plot filled agent buy/sell decisions as markers on the price chart."""
     if not decisions:
@@ -644,6 +677,7 @@ def build_chart(
     show_whiskers: bool = True,
     decisions: Optional[list[dict]] = None,
     price_alerts: Optional[list[dict]] = None,
+    tactic_levels: Optional[list[dict]] = None,
     news_impacts: Optional[dict] = None,
     fill_gaps: bool = False,
 ) -> go.Figure:
@@ -916,6 +950,8 @@ def build_chart(
 
     if price_alerts:
         _add_price_alerts(price_alerts, fig, df["t"].iloc[0], df["t"].iloc[-1])
+    if tactic_levels:
+        _add_tactic_levels(tactic_levels, fig, df["t"].iloc[0], df["t"].iloc[-1])
 
     last = df.iloc[-1]
     color = PALETTE["up"] if last["c"] >= last["o"] else PALETTE["down"]
@@ -1002,6 +1038,21 @@ def build_performance_chart(
                     marker=dict(symbol=marker_symbol, size=12, color=color, line=dict(width=1.5, color="#ffffff")),
                     name=f"Agent {action}",
                     hovertemplate=f"<b>Agent {action}</b><br>Value: $%{{y:,.2f}}<extra></extra>",
+                )
+            )
+        # Moments the agent armed a conditional trade plan (tactics), so the
+        # curve shows when a standing order was set, not only when it filled.
+        sub = df_m[df_m["action"] == "tactics"]
+        if not sub.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["ts"],
+                    y=sub["value"],
+                    mode="markers",
+                    marker=dict(symbol="diamond", size=11, color=PALETTE["orange"], line=dict(width=1.5, color="#ffffff")),
+                    name="Tactics armed",
+                    customdata=sub.get("label"),
+                    hovertemplate="<b>🎯 Tactics armed</b><br>%{customdata}<br>Value: $%{y:,.2f}<extra></extra>",
                 )
             )
 

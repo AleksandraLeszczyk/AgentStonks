@@ -16,6 +16,7 @@ from .config import (
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
 )
+from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
 from .news import fetch_news_with_fallback
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
@@ -38,7 +39,13 @@ def _fire_due_alerts(state: AppState) -> None:
     tick (bars, trades, quotes) so an alert on any continuously-updated field --
     price, bid/ask, spread, day volume, volume ratio, portfolio value -- fires as
     soon as its field crosses the threshold, regardless of which tick moved it.
+
+    Armed tactics ride the same tick: the executor is nudged so a conditional
+    trade fires as soon as its conditions are met, not on its slow fallback poll.
     """
+    executor = state.tactics_executor
+    if executor is not None and state.tactics is not None:
+        executor.notify()
     alerts = state.alerts
     if not alerts:
         return
@@ -156,30 +163,52 @@ def backfill_bars(
     equivalent. Only missing timestamps are inserted -- streamed bars are never
     overwritten. Returns (bars_added, source_name).
     """
+    failures: list[tuple[str, object]] = []
+    consequence = "gaps in the bar series stay unrepaired until the next backfill"
     try:
         fetched = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
         source = "Alpaca REST"
     except Exception as exc:
+        failures.append(("Alpaca REST", exc))
         yf_interval = _YF_INTERVALS.get(timeframe)
         if yf_interval is None:
+            log_fetch_failure(
+                "bar backfill",
+                failures,
+                symbol=symbol,
+                consequence=f"no yfinance equivalent for {timeframe}; {consequence}",
+            )
             raise
-        logger.warning("Backfill via Alpaca REST failed for %s, trying yfinance: %s", symbol, exc)
-        fetched = fetch_intraday_bars(symbol, interval=yf_interval)
+        try:
+            fetched = fetch_intraday_bars(symbol, interval=yf_interval)
+        except Exception as exc2:
+            log_fetch_failure(
+                "bar backfill",
+                failures + [("yfinance", exc2)],
+                symbol=symbol,
+                consequence=consequence,
+            )
+            raise
         source = "yfinance (delayed)"
-    return merge_missing_bars(state, fetched), source
+    added = merge_missing_bars(state, fetched)
+    log_fetch(
+        "bar backfill",
+        source,
+        symbol=symbol,
+        detail=f"{added} missing {timeframe} bar(s) added",
+        failures=failures,
+    )
+    return added, source
 
 
 def _backfill_quietly(
     symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str
 ) -> None:
-    """backfill_bars wrapped for background use: log instead of raising."""
+    """backfill_bars wrapped for background use: swallow failures (already logged)."""
     try:
-        added, source = backfill_bars(symbol, key, secret, feed, state, timeframe)
-    except Exception as exc:
-        logger.warning("Bar backfill failed for %s: %s", symbol, exc)
-        return
-    if added:
-        logger.info("Backfilled %d missing %s bar(s) for %s via %s", added, timeframe, symbol, source)
+        backfill_bars(symbol, key, secret, feed, state, timeframe)
+    except Exception:
+        pass
 
 
 def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
@@ -217,6 +246,14 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 ).start()
             elif t == "b" and msg.get("S") == symbol:
                 bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v", "vw") if k in msg}
+                # First bar after a (re)connect logs at INFO; identical repeats
+                # log at DEBUG (see datalog de-duplication).
+                log_fetch(
+                    "bars",
+                    f"Alpaca WebSocket stream ({feed} feed)",
+                    symbol=symbol,
+                    detail=f"bar t={bar.get('t')} c={bar.get('c')}",
+                )
                 if tf_minutes == 1:
                     with state.lock:
                         state.bars.append(bar)
@@ -267,6 +304,12 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 _fire_due_alerts(state)
             elif t == "t" and msg.get("S") == symbol:
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
+                log_fetch(
+                    "last price",
+                    f"Alpaca WebSocket stream ({feed} feed)",
+                    symbol=symbol,
+                    detail=f"price={trade.get('p')}",
+                )
                 with state.lock:
                     state.trades.append(trade)
                     if "p" in msg:
@@ -284,6 +327,12 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                 # A trade moves last_price and portfolio_value -- re-check alerts.
                 _fire_due_alerts(state)
             elif t == "q" and msg.get("S") == symbol:
+                log_fetch(
+                    "ask/bid price",
+                    f"Alpaca WebSocket stream ({feed} feed)",
+                    symbol=symbol,
+                    detail=f"bid={msg.get('bp')}, ask={msg.get('ap')}",
+                )
                 # Single lock acquisition so readers (e.g. the UI's quote
                 # snapshot) never see a torn mix of this tick's bid with the
                 # previous tick's ask, or vice versa.
@@ -354,33 +403,69 @@ def _fallback_bars_loop(
                 last_backfill = now
                 _backfill_quietly(symbol, key, secret, feed, state, timeframe)
             continue
+        bar_failures: list[tuple[str, object]] = []
         try:
             bars = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
             source = "Alpaca REST"
         except Exception as exc:
-            logger.warning("Bars REST fallback failed for %s, trying yfinance: %s", symbol, exc)
+            bar_failures.append(("Alpaca REST", exc))
             try:
                 bars = fetch_intraday_bars(symbol)
                 source = "yfinance (delayed)"
             except Exception as exc2:
-                logger.warning("yfinance fallback also failed for %s: %s", symbol, exc2)
+                log_fetch_failure(
+                    "bars",
+                    bar_failures + [("yfinance", exc2)],
+                    symbol=symbol,
+                    consequence="no price data this cycle",
+                )
                 continue
         if not bars:
+            log_fetch(
+                "bars", source, symbol=symbol, detail="0 bars returned", failures=bar_failures
+            )
             continue
+        log_fetch(
+            "bars", source, symbol=symbol, detail=f"{len(bars)} bars", failures=bar_failures
+        )
 
         last_price = bars[-1].get("c")
+        price_source = f"{source} (last bar close)"
+        price_failures: list[tuple[str, object]] = []
         try:
             latest_trade = fetch_trades(symbol, key, secret, feed, lookback_hours=1)
             if latest_trade:
                 last_price = latest_trade[-1].get("p", last_price)
-        except Exception:
-            pass  # last bar's close is still a reasonable last_price
+                price_source = "Alpaca REST (latest trade)"
+        except Exception as exc:
+            # last bar's close is still a reasonable last_price
+            price_failures.append(("Alpaca REST trades", exc))
+        log_fetch(
+            "last price",
+            price_source,
+            symbol=symbol,
+            detail=f"price={last_price}",
+            failures=price_failures,
+        )
 
         quote = None
         try:
             quote = fetch_latest_quote(symbol, key, secret, feed)
-        except Exception:
-            pass  # bid/ask just won't refresh this cycle -- stays at its last known value
+        except Exception as exc:
+            # bid/ask just won't refresh this cycle -- stays at its last known value
+            log_fetch_failure(
+                "ask/bid price",
+                [("Alpaca REST /quotes/latest", exc)],
+                symbol=symbol,
+                consequence="no fallback source provides quotes; keeping last known bid/ask",
+            )
+        if quote:
+            log_fetch(
+                "ask/bid price",
+                "Alpaca REST /quotes/latest",
+                symbol=symbol,
+                detail=f"bid={quote.get('bp')}, ask={quote.get('ap')}",
+            )
 
         with state.lock:
             state.bars.clear()
@@ -472,6 +557,12 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
                     for k in ("id", "headline", "summary", "created_at", "url", "source")
                     if k in msg
                 }
+                log_fetch(
+                    "news",
+                    "Alpaca WebSocket news stream",
+                    symbol=symbol,
+                    detail=f"headline: {article.get('headline', '')[:80]}",
+                )
                 with state.lock:
                     state.news.append(article)
                 headline = article.get("headline", "")
@@ -520,7 +611,12 @@ def _fallback_news_loop(
         try:
             fresh = fetch_news_with_fallback(symbol, key, secret, worldnews_key)
         except Exception as exc:
-            logger.warning("News fallback poll failed for %s: %s", symbol, exc)
+            log_fetch_failure(
+                "news",
+                [("news fallback poll", exc)],
+                symbol=symbol,
+                consequence="retrying next poll",
+            )
             continue
         with state.lock:
             seen = {a.get("id") for a in state.news}

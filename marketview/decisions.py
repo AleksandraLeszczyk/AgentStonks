@@ -22,16 +22,18 @@ from .config import TRADE_FIXED_COST
 class Decision:
     ts: str
     symbol: str
-    action: str  # "buy" | "sell" | "alert"; "sleep" only as an internal no-op fallback
+    action: str  # "buy" | "sell" | "alert" | "tactics"; "sleep" only as an internal no-op fallback
     requested_quantity: float
     filled_quantity: float
     price: Optional[float]
     reasoning: str
-    status: str  # "filled" | "rejected" | "noop"
+    status: str  # "filled" | "rejected" | "noop" | "armed"
     cash_after: float
     position_after: float
     fee: float = 0.0
     alerts: Optional[list[dict]] = None
+    # Human-readable one-liner per armed conditional action, for action="tactics".
+    tactics: Optional[list[str]] = None
 
 
 class DecisionTracker:
@@ -89,6 +91,33 @@ class DecisionTracker:
             cash_after=self.cash,
             position_after=self.position,
             alerts=alerts,
+        )
+        with self.lock:
+            self.decisions.append(decision)
+        return decision
+
+    def record_tactics(
+        self, symbol: str, summaries: list[str], reasoning: str, price: Optional[float] = None
+    ) -> Decision:
+        """Record the arming of a conditional trade plan (see marketview.tactics).
+
+        No cash or position changes here -- the trade happens later, via
+        `record_trade`, when the TacticsExecutor sees the conditions met. `price`
+        is the last seen price at arming time, kept so the moment can be marked
+        on the portfolio-value chart.
+        """
+        decision = Decision(
+            ts=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            action="tactics",
+            requested_quantity=0,
+            filled_quantity=0,
+            price=price,
+            reasoning=reasoning,
+            status="armed",
+            cash_after=self.cash,
+            position_after=self.position,
+            tactics=summaries,
         )
         with self.lock:
             self.decisions.append(decision)

@@ -10,13 +10,12 @@ reads whatever was fetched most recently from `AppState`.
 """
 from __future__ import annotations
 
-import logging
 import math
 from datetime import datetime, timezone
 
 import yfinance as yf
 
-logger = logging.getLogger(__name__)
+from .datalog import log_fetch, log_fetch_failure
 
 RISK_FREE_RATE = 0.045
 CONTRACT_MULTIPLIER = 100
@@ -47,15 +46,30 @@ def _bs_gamma(spot: float, strike: float, t_years: float, vol: float, r: float =
 
 
 def _fetch_spot(ticker: "yf.Ticker") -> float:
+    symbol = getattr(ticker, "ticker", "")
+    failures: list[tuple[str, object]] = []
     try:
         price = ticker.fast_info.get("lastPrice")
         if price:
-            return float(price)
-    except Exception:
-        logger.warning("yfinance fast_info lookup failed for %s; falling back to history", ticker.ticker, exc_info=True)
+            price = float(price)
+            log_fetch("spot price", "yfinance fast_info", symbol=symbol, detail=f"{price}")
+            return price
+        failures.append(("yfinance fast_info", "no lastPrice in response"))
+    except Exception as exc:
+        failures.append(("yfinance fast_info", exc))
     hist = ticker.history(period="1d")
     if not hist.empty:
-        return float(hist["Close"].iloc[-1])
+        price = float(hist["Close"].iloc[-1])
+        log_fetch(
+            "spot price",
+            "yfinance daily history",
+            symbol=symbol,
+            detail=f"{price}",
+            failures=failures,
+        )
+        return price
+    failures.append(("yfinance daily history", "no rows returned"))
+    log_fetch_failure("spot price", failures, symbol=symbol)
     raise ValueError("could not determine spot price")
 
 
@@ -86,9 +100,20 @@ def fetch_option_chain(
         expirations = list(ticker.options)
         chosen_expiry = expiry or _select_expiry(expirations, max_dte)
         chain = ticker.option_chain(chosen_expiry)
-    except Exception:
-        logger.exception("yfinance option chain fetch failed for %s", symbol)
+    except Exception as exc:
+        log_fetch_failure(
+            "options chain",
+            [("yfinance", exc)],
+            symbol=symbol,
+            consequence="no put/call wall data",
+        )
         raise
+    log_fetch(
+        "options chain",
+        "yfinance",
+        symbol=symbol,
+        detail=f"expiry {chosen_expiry}, {len(chain.calls)} calls / {len(chain.puts)} puts",
+    )
     calls = chain.calls.set_index("strike")
     puts = chain.puts.set_index("strike")
 

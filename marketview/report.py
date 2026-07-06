@@ -72,6 +72,7 @@ table.report-table th {{
 tr.action-buy td:nth-child(2) {{ color: {PALETTE['up']}; font-weight: 600; }}
 tr.action-sell td:nth-child(2) {{ color: {PALETTE['down']}; font-weight: 600; }}
 tr.action-alert td:nth-child(2) {{ color: {PALETTE['orange']}; font-weight: 600; }}
+tr.action-tactics td:nth-child(2) {{ color: {PALETTE['orange']}; font-weight: 600; }}
 .empty-note {{ color: {PALETTE['muted']}; font-style: italic; }}
 .log-card {{
     background: {PALETTE['panel']};
@@ -134,6 +135,8 @@ def _decisions_table_html(decisions: list[dict]) -> str:
             reasoning += " " + " · ".join(
                 f"[wake when {html.escape(format_alert(a))}]" for a in d["alerts"]
             )
+        if d.get("action") == "tactics" and d.get("tactics"):
+            reasoning += " " + " · ".join(f"[🎯 {html.escape(t)}]" for t in d["tactics"])
         try:
             ts_fmt = pd.to_datetime(d.get("ts", "")).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
@@ -199,6 +202,27 @@ def _agent_log_html(log: list[dict]) -> str:
             body = (
                 f"<div><b>{strat}</b> relinquished control to Automatic</div>"
                 f"<div style='color:{PALETTE['muted']}'>{reasoning}</div>"
+            )
+        elif etype == "tactics_set":
+            cancelled = entry.get("cancelled")
+            label = "TACTICS CANCELLED" if cancelled is not None else "TACTICS SET"
+            color = PALETTE.get("orange", PALETTE["accent"])
+            reasoning = html.escape(entry.get("reasoning", ""))
+            summaries = cancelled if cancelled is not None else (entry.get("tactics") or [])
+            rows = "".join(f"<div>🎯 {html.escape(t)}</div>" for t in summaries)
+            body = f"{rows}<div style='color:{PALETTE['muted']}'>{reasoning}</div>"
+        elif etype == "tactics_execution":
+            label = f"TACTICS → {str(entry.get('action', '')).upper()}"
+            color = PALETTE["up"] if entry.get("action") == "buy" else PALETTE["down"]
+            price = entry.get("price")
+            price_str = f"${price:,.4f}" if price is not None else "—"
+            qty = entry.get("quantity") or 0
+            body = (
+                f"<div>Executed <b>{html.escape(entry.get('tactic', ''))}</b> · "
+                f"Status: <b>{html.escape(str(entry.get('status', '')))}</b> · "
+                f"Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b></div>"
+                f"<div style='color:{PALETTE['muted']}'>Triggered by "
+                f"{html.escape(entry.get('triggered_by', ''))}</div>"
             )
         else:
             color = PALETTE["down"] if etype == "error" else PALETTE["text"]

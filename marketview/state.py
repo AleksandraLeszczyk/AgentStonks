@@ -70,6 +70,8 @@ _DEFAULTS: dict[str, object] = {
     "agent_start_time": None,
     "agent_equity_history": [],
     "alerts": [],
+    "tactics": None,
+    "tactics_executor": None,
     "recent_prices": None,  # handled specially (deque of (monotonic_ts, price))
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
@@ -340,6 +342,12 @@ class AppState:
         # continuously-updated state field (see ALERTABLE_FIELDS). Cleared once
         # any one fires.
         self.alerts: list[dict] = []
+        # Armed conditional trade plan (see marketview.tactics) and the
+        # background executor that matches it against live data. Set when the
+        # agent calls set_tactics; cleared when an action executes, the agent
+        # replaces/cancels it, or the agent stops.
+        self.tactics = None  # "Tactics | None"
+        self.tactics_executor = None  # "TacticsExecutor | None"
         # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
         # last ~minute. Used by last_price alerts to check any price in the window,
         # not only the single most-recent tick.
