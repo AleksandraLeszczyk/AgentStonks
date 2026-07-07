@@ -144,6 +144,7 @@ def _decisions_table_html(decisions: list[dict]) -> str:
         rows.append(
             f'<tr class="action-{html.escape(action)}">'
             f"<td>{ts_fmt}</td><td>{html.escape(action)}</td>"
+            f"<td>{html.escape(str(d.get('symbol', '')))}</td>"
             f"<td>{html.escape(str(d.get('status', '')))}</td>"
             f"<td>{qty:.4f}</td><td>{price_str}</td><td>${fee:.2f}</td>"
             f"<td>{cash_str}</td><td>{position_after:.4f}</td>"
@@ -151,7 +152,7 @@ def _decisions_table_html(decisions: list[dict]) -> str:
         )
     return (
         "<table class='report-table'><thead><tr>"
-        "<th>Time (UTC)</th><th>Action</th><th>Status</th><th>Qty</th><th>Price</th>"
+        "<th>Time (UTC)</th><th>Action</th><th>Symbol</th><th>Status</th><th>Qty</th><th>Price</th>"
         "<th>Fee</th><th>Cash after</th><th>Position after</th><th>Reasoning</th>"
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
     )
@@ -240,9 +241,29 @@ def _agent_log_html(log: list[dict]) -> str:
     return "".join(cards)
 
 
+def _fig_sections(
+    figs: list[tuple[str, Optional[go.Figure]]],
+    *,
+    title: str,
+    first_includes_plotlyjs: bool,
+    empty_msg: str,
+) -> str:
+    """One <h2>-titled section per (symbol, figure) pair; a single empty-note
+    section when there are none."""
+    if not figs:
+        return f"<h2>{html.escape(title)}</h2>\n<p class=\"empty-note\">{html.escape(empty_msg)}</p>"
+    sections = []
+    for i, (symbol, fig) in enumerate(figs):
+        sections.append(
+            f"<h2>{html.escape(title)} — {html.escape(symbol)}</h2>\n"
+            + _fig_html(fig, include_plotlyjs=first_includes_plotlyjs and i == 0, empty_msg=empty_msg)
+        )
+    return "\n".join(sections)
+
+
 def build_report_html(
     *,
-    symbol: str,
+    symbols: list[str],
     feed: str,
     timeframe: str,
     session_start: datetime,
@@ -252,8 +273,8 @@ def build_report_html(
     llm_model: str,
     llm_personality: str,
     agent_running: bool,
-    live_fig: Optional[go.Figure],
-    historical_fig: Optional[go.Figure],
+    live_figs: list[tuple[str, Optional[go.Figure]]],
+    historical_figs: list[tuple[str, Optional[go.Figure]]],
     historical_period_label: Optional[str],
     performance_fig: Optional[go.Figure],
     performance_stats: Optional[dict],
@@ -261,9 +282,10 @@ def build_report_html(
     agent_log: list[dict],
 ) -> str:
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    symbols_label = ", ".join(symbols)
 
     conditions = {
-        "Symbol": symbol or "—",
+        "Symbols": symbols_label or "—",
         "Feed": feed,
         "Timeframe": timeframe,
         "Session start": session_start.strftime("%Y-%m-%d %H:%M UTC"),
@@ -287,25 +309,36 @@ def build_report_html(
 
     hist_title = f"Historical — {historical_period_label}" if historical_period_label else "Historical"
 
+    live_sections = _fig_sections(
+        live_figs,
+        title="Live chart",
+        first_includes_plotlyjs=True,
+        empty_msg="No live chart data available.",
+    )
+    historical_sections = _fig_sections(
+        historical_figs,
+        title=hist_title,
+        first_includes_plotlyjs=not live_figs,
+        empty_msg="No historical chart data available.",
+    )
+
     body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Agent run report — {html.escape(symbol or '')}</title>
+<title>Agent run report — {html.escape(symbols_label)}</title>
 <style>{_CSS}</style>
 </head>
 <body>
-<h1>Agent run report — {html.escape(symbol or 'Unknown')}</h1>
+<h1>Agent run report — {html.escape(symbols_label or 'Unknown')}</h1>
 <p class="subtitle">Generated {generated_at}</p>
 
 <h2>Starting conditions</h2>
 {_starting_conditions_html(conditions)}
 
-<h2>Live chart</h2>
-{_fig_html(live_fig, include_plotlyjs=True, empty_msg="No live chart data available.")}
+{live_sections}
 
-<h2>{html.escape(hist_title)}</h2>
-{_fig_html(historical_fig, include_plotlyjs=False, empty_msg="No historical chart data available.")}
+{historical_sections}
 
 <h2>Agent performance</h2>
 {perf_summary}

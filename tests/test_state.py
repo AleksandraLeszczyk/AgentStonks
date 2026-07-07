@@ -17,9 +17,8 @@ def _daily(date: str, volume: float) -> dict:
 
 def test_initial_values():
     s = AppState()
-    assert list(s.bars) == []
-    assert s.trades == []
-    assert s.news == []
+    assert s.symbols == []
+    assert s.symbol_states == {}
     assert s.symbol == ""
     assert s.status == "Idle"
     assert s.ws is None
@@ -31,21 +30,52 @@ def test_initial_values():
     assert s.starting_budget == PAPER_STARTING_CASH
 
 
+def test_set_symbols_creates_and_keeps_symbol_states():
+    s = AppState()
+    s.set_symbols(["aapl", "TSLA", "AAPL"])
+    assert s.symbols == ["AAPL", "TSLA"]
+    assert s.symbol == "AAPL"
+    aapl = s.sym("aapl")
+    assert aapl is not None and aapl.symbol == "AAPL"
+    assert aapl.app is s
+    # Re-setting keeps the existing state instance for symbols that stay.
+    s.set_symbols(["AAPL", "MSFT"])
+    assert s.sym("AAPL") is aapl
+    assert s.sym("TSLA") is None
+    assert [ss.symbol for ss in s.iter_symbol_states()] == ["AAPL", "MSFT"]
+
+
+def test_symbol_state_initial_values():
+    s = AppState()
+    s.set_symbols(["AAPL"])
+    ss = s.sym("AAPL")
+    assert list(ss.bars) == []
+    assert ss.trades == []
+    assert ss.news == []
+    assert ss.status == "Idle"
+    assert ss.alerts == []
+    assert ss.tactics is None
+
+
 def test_bars_deque_respects_max_bars():
     s = AppState()
+    s.set_symbols(["AAPL"])
+    ss = s.sym("AAPL")
     for i in range(MAX_BARS + 50):
-        s.bars.append({"t": i})
-    assert len(s.bars) == MAX_BARS
+        ss.bars.append({"t": i})
+    assert len(ss.bars) == MAX_BARS
 
 
 def test_lock_is_reentrant_from_multiple_threads():
     s = AppState()
+    s.set_symbols(["AAPL"])
+    ss = s.sym("AAPL")
     errors = []
 
     def writer(value):
         try:
-            with s.lock:
-                s.bars.append({"v": value})
+            with ss.lock:
+                ss.bars.append({"v": value})
         except Exception as exc:
             errors.append(exc)
 
@@ -56,15 +86,17 @@ def test_lock_is_reentrant_from_multiple_threads():
         t.join()
 
     assert not errors
-    assert len(s.bars) == 50
+    assert len(ss.bars) == 50
 
 
 def test_volume_alert_defaults_on():
     s = AppState()
+    s.set_symbols(["AAPL"])
+    ss = s.sym("AAPL")
     assert s.volume_alert_enabled is True
     assert s.volume_alert_multiplier == VOLUME_ALERT_DEFAULT_MULTIPLIER
-    assert s.volume_alert_triggered is False
-    assert s.day_volume is None
+    assert ss.volume_alert_triggered is False
+    assert ss.day_volume is None
 
 
 def test_completed_daily_bars_excludes_today():

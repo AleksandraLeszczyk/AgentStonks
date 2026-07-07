@@ -66,7 +66,7 @@ class FakeClient:
 
 def _base_state() -> AppState:
     state = AppState()
-    state.symbol = "AAPL"
+    state.set_symbols(["AAPL"])
     state.api_key = "k"
     state.api_secret = "s"
     state.feed = "iex"
@@ -103,7 +103,7 @@ class TestPremarketRegistration:
             )
         ]
         client = FakeClient(responses)
-        run_agent_cycle(client, "m", "AAPL", state, tracker, max_iters=3, personality=PREMARKET_PERSONALITY)
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, personality=PREMARKET_PERSONALITY)
         names = {t["function"]["name"] for t in client.tools_seen[0]}
         assert "analyze_premarket" in names
         assert "stand_down" not in names
@@ -115,7 +115,7 @@ class TestAnalyzePremarketTool:
         monkeypatch.setattr(market_hours, "session_open", lambda now=None: None)
         monkeypatch.setattr(market_hours, "next_market_open", lambda now=None: open_dt)
         monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: False)
-        state = _base_state()
+        state = _base_state().sym("AAPL")
         state.prev_close = 100.0
         state.last_price = 105.0
         # Prior day's bar is excluded; the same-day pre-open bar counts.
@@ -138,7 +138,7 @@ class TestAnalyzePremarketTool:
             "next_market_open",
             lambda now=None: datetime(2026, 7, 6, 13, 30, tzinfo=timezone.utc),
         )
-        state = _base_state()
+        state = _base_state().sym("AAPL")
         result = _tool_analyze_premarket(state)
         assert "note" in result["premarket_session"]
 
@@ -208,16 +208,16 @@ class TestRunPremarketSession:
 
         thread = threading.Thread(
             target=lambda: result.append(
-                run_premarket_session(client, "m", "AAPL", state, tracker, stop)
+                run_premarket_session(client, "m", ["AAPL"], state, tracker, stop)
             )
         )
         thread.start()
         deadline = time.monotonic() + 5
-        while state.tactics is None and time.monotonic() < deadline:
+        while not state.any_tactics() and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert state.tactics is not None
+        assert state.any_tactics()
         # Simulate the TacticsExecutor performing the opening trade.
-        state.tactics = None
+        state.sym("AAPL").tactics = None
         state.agent_wake_reason = "Tactics executed: buy 5 sh -> filled."
         state.agent_wake_event.set()
         thread.join(timeout=5)
@@ -248,7 +248,7 @@ class TestRunPremarketSession:
             )
         ]
         client = FakeClient(responses)
-        assert run_premarket_session(client, "m", "AAPL", state, tracker, threading.Event()) == "done"
+        assert run_premarket_session(client, "m", ["AAPL"], state, tracker, threading.Event()) == "done"
 
     def test_stopped_while_waiting_for_the_window(self):
         state = _base_state()
@@ -256,7 +256,7 @@ class TestRunPremarketSession:
         stop = threading.Event()
         stop.set()
         client = FakeClient([])
-        assert run_premarket_session(client, "m", "AAPL", state, tracker, stop) == "stopped"
+        assert run_premarket_session(client, "m", ["AAPL"], state, tracker, stop) == "stopped"
 
 
 class TestAutomaticPremarketRouting:
@@ -265,7 +265,7 @@ class TestAutomaticPremarketRouting:
         tracker = DecisionTracker(broker=FakeBroker())
         seen: dict = {}
 
-        def fake_session(client, model, symbol, st, tr, stop_event):
+        def fake_session(client, model, symbols, st, tr, stop_event):
             seen["active_strategy"] = st.automatic_active_strategy
             seen["regime"] = st.automatic_regime
             stop_event.set()
@@ -276,7 +276,7 @@ class TestAutomaticPremarketRouting:
         monkeypatch.setattr(automatic, "get_agent_client", lambda provider, api_key: object())
 
         automatic._automatic_loop(
-            state, tracker, "AAPL", "openai", "key", "model", 1, threading.Event()
+            state, tracker, ["AAPL"], "openai", "key", "model", 1, threading.Event()
         )
         assert seen["active_strategy"] == PREMARKET_PERSONALITY
         assert seen["regime"] == "premarket"

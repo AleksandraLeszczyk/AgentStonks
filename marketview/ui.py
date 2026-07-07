@@ -69,7 +69,13 @@ from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
-from .state import PRICE_AXIS_ALERT_FIELDS, AppState, current_volume_ratio, format_alert
+from .state import (
+    PRICE_AXIS_ALERT_FIELDS,
+    AppState,
+    SymbolState,
+    current_volume_ratio,
+    format_alert,
+)
 from .tactics import tactic_price_levels, tactics_summaries
 from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
@@ -95,9 +101,25 @@ def _get_state() -> AppState:
     # therefore __getattr__) still points at the pre-edit definition, so reading
     # the new field raises AttributeError instead of falling back to a default.
     # Writing straight into __dict__ sidesteps the class entirely.
-    state.__dict__.setdefault("previous_minute_high", None)
-    state.__dict__.setdefault("previous_minute_low", None)
+    state.__dict__.setdefault("symbols", [])
+    state.__dict__.setdefault("symbol_states", {})
     return state
+
+
+def _parse_symbols(text: str) -> list[str]:
+    """'aapl, tsla msft' -> ['AAPL', 'TSLA', 'MSFT'] (deduped, order kept)."""
+    seen: list[str] = []
+    for raw in re.split(r"[,;\s]+", text or ""):
+        sym = raw.strip().upper()
+        if sym and sym not in seen:
+            seen.append(sym)
+    return seen
+
+
+def _effective_symbols(state: AppState, symbols_input: str) -> list[str]:
+    """Symbols the panels should render: the sidebar input, falling back to
+    whatever is currently streamed."""
+    return _parse_symbols(symbols_input) or list(state.symbols)
 
 
 def _personality_label(key: str) -> str:
@@ -259,16 +281,23 @@ def _quote_html(
         arrow, chg_color = "▼", "#ef5350"
         delta_str = f"{change:.2f} ({pct:.2f}%)"
 
+    symbol_chip = (
+        f'<span style="font-size:13px;font-weight:700;color:{PALETTE["accent"]};'
+        f'letter-spacing:0.04em;margin-right:10px;">{html.escape(symbol)}</span>'
+    )
     price_row = ""
     if price is not None:
         price_row = (
             f'<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:10px;">'
+            f'{symbol_chip}'
             f'<span style="font-size:28px;font-weight:700;color:{PALETTE["text"]};'
             f'letter-spacing:-0.5px;">${price:,.4f}</span>'
             f'<span style="font-size:14px;font-weight:600;color:{chg_color};">'
             f'{arrow} {delta_str}</span>'
             f'</div>'
         )
+    else:
+        price_row = f'<div style="margin-bottom:6px;">{symbol_chip}</div>'
 
     def _side(label: str, p: float | None, sz: float | None, color: str) -> str:
         if p is None:
@@ -312,15 +341,15 @@ def _quote_html(
     )
 
 
-def _volume_alert_banner(state: AppState) -> None:
+def _volume_alert_banner(state: AppState, sym_state: SymbolState) -> None:
     """Live relative-volume readout + a prominent banner once the alert fires."""
     if not state.volume_alert_enabled:
         return
-    with state.lock:
-        day_volume = state.day_volume
-        triggered = state.volume_alert_triggered
-        multiplier = state.volume_alert_multiplier
-    daily_bars = state.daily_bars
+    with sym_state.lock:
+        day_volume = sym_state.day_volume
+        triggered = sym_state.volume_alert_triggered
+    multiplier = state.volume_alert_multiplier
+    daily_bars = sym_state.daily_bars
     ratio, _ = current_volume_ratio(day_volume, daily_bars)
     if ratio is None:
         return
@@ -329,12 +358,12 @@ def _volume_alert_banner(state: AppState) -> None:
             f"<div style='background:{PALETTE['orange']};color:#1a1d27;"
             "font-family:Inter,sans-serif;font-weight:600;border-radius:6px;"
             "padding:8px 12px;margin:4px 0'>"
-            f"⚡ High volume: {ratio:.2f}× average daily volume "
+            f"⚡ {sym_state.symbol} high volume: {ratio:.2f}× average daily volume "
             f"(alert threshold {multiplier:.1f}×)</div>"
         )
     else:
         st.caption(
-            f"📊 Relative volume: {ratio:.2f}× avg daily volume "
+            f"📊 {sym_state.symbol} relative volume: {ratio:.2f}× avg daily volume "
             f"(alerts at {multiplier:.1f}×)"
         )
 
@@ -345,43 +374,53 @@ def _price_ticker() -> None:
     st.caption(f"Status: {state.status}")
     if state.news_status not in ("Idle", state.status):
         st.caption(f"News: {state.news_status}")
-    if state.symbol:
-        with state.lock:
-            last_price = state.last_price
-            prev_close = state.prev_close
-            bid_price = state.bid_price
-            bid_size = state.bid_size
-            ask_price = state.ask_price
-            ask_size = state.ask_size
-            previous_minute_high = state.previous_minute_high
-            previous_minute_low = state.previous_minute_low
-        html = _quote_html(
-            last_price, prev_close, bid_price, bid_size, ask_price, ask_size, previous_minute_high, previous_minute_low, state.symbol
+    for sym_state in state.iter_symbol_states():
+        with sym_state.lock:
+            last_price = sym_state.last_price
+            prev_close = sym_state.prev_close
+            bid_price = sym_state.bid_price
+            bid_size = sym_state.bid_size
+            ask_price = sym_state.ask_price
+            ask_size = sym_state.ask_size
+            previous_minute_high = sym_state.previous_minute_high
+            previous_minute_low = sym_state.previous_minute_low
+        quote = _quote_html(
+            last_price, prev_close, bid_price, bid_size, ask_price, ask_size,
+            previous_minute_high, previous_minute_low, sym_state.symbol,
         )
-        if html:
-            st.html(html)
-        _volume_alert_banner(state)
+        if quote:
+            st.html(quote)
+        _volume_alert_banner(state, sym_state)
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
 def _chart_panel() -> None:
     state = _get_state()
-    with state.lock:
-        bars = list(state.bars)
-        # Only price-axis alerts (price/bid/ask/day high/low) can be drawn as
-        # horizontal lines; volume/spread/portfolio alerts have no price level.
-        price_alerts = [a for a in state.alerts if a.get("field") in PRICE_AXIS_ALERT_FIELDS]
+    tracker = state.decision_tracker
+    rendered = False
+    for sym_state in state.iter_symbol_states():
+        sym = sym_state.symbol
+        with sym_state.lock:
+            bars = list(sym_state.bars)
+            # Only price-axis alerts (price/bid/ask/day high/low) can be drawn as
+            # horizontal lines; volume/spread/portfolio alerts have no price level.
+            price_alerts = [
+                a for a in sym_state.alerts if a.get("field") in PRICE_AXIS_ALERT_FIELDS
+            ]
 
-    # Price levels at which armed tactics (standing conditional orders) execute.
-    tactic_levels = tactic_price_levels(state.tactics)
-    decisions = state.decision_tracker.trade_markers() if state.decision_tracker else None
+        if not bars:
+            continue
+        rendered = True
 
-    fig = (
-        build_chart(
+        # Price levels at which armed tactics (standing conditional orders) execute.
+        tactic_levels = tactic_price_levels(sym_state.tactics)
+        decisions = tracker.trade_markers(symbol=sym) if tracker else None
+
+        fig = build_chart(
             bars,
-            state.news,
-            state.trades,
-            state.symbol,
+            sym_state.news,
+            sym_state.trades,
+            sym,
             SESSION_START,
             ma_periods=state.ma_periods,
             show_fib=state.show_fib,
@@ -390,7 +429,7 @@ def _chart_panel() -> None:
             show_1y_avg=state.show_1y_avg,
             mixture_distribution=state.mixture_distribution,
             mixture_max_components=state.mixture_max_components,
-            daily_bars=state.daily_bars,
+            daily_bars=sym_state.daily_bars,
             vwap_style=state.vwap_style,
             show_candle_body=state.show_candle_body,
             show_percentile_body=state.show_percentile_body,
@@ -398,13 +437,12 @@ def _chart_panel() -> None:
             decisions=decisions,
             price_alerts=price_alerts,
             tactic_levels=tactic_levels,
-            news_impacts=state.news_impacts,
+            news_impacts=sym_state.news_impacts,
             fill_gaps=state.fill_gaps,
         )
-        if (state.symbol and bars)
-        else empty_chart()
-    )
-    st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
+    if not rendered:
+        st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
 
 
 def _live_chart_controls() -> None:
@@ -451,24 +489,28 @@ def _live_chart_controls() -> None:
         st.markdown("**Data**")
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
-            disabled=not (state.symbol and state.api_key),
-            help="Re-fetch the session's bars via REST (yfinance if that fails) "
-            "and merge any that the stream missed, e.g. during a reconnect.",
+            disabled=not (state.symbols and state.api_key),
+            help="Re-fetch each symbol's session bars via REST (yfinance if that "
+            "fails) and merge any that the stream missed, e.g. during a reconnect.",
         )
         if backfill_clicked:
             with st.spinner("Backfilling…"):
-                try:
-                    added, source = backfill_bars(
-                        state.symbol, state.api_key, state.api_secret,
-                        state.feed, state, state.timeframe,
-                    )
-                except Exception as exc:
-                    st.error(f"Backfill failed: {exc}")
-                else:
-                    st.caption(
-                        f"Backfilled {added} bar(s) via {source}."
-                        if added else "No missing bars found."
-                    )
+                notes = []
+                for sym_state in state.iter_symbol_states():
+                    try:
+                        added, source = backfill_bars(
+                            sym_state.symbol, state.api_key, state.api_secret,
+                            state.feed, sym_state, state.timeframe,
+                        )
+                    except Exception as exc:
+                        st.error(f"Backfill failed for {sym_state.symbol}: {exc}")
+                    else:
+                        notes.append(
+                            f"{sym_state.symbol}: {added} bar(s) via {source}"
+                            if added else f"{sym_state.symbol}: no missing bars"
+                        )
+                if notes:
+                    st.caption(" · ".join(notes))
 
     state.ma_periods = _parse_ma_periods(vwma_selection)
     state.show_7d_avg, state.show_28d_avg, state.show_1y_avg = _parse_avg_flags(avg_selection)
@@ -486,8 +528,8 @@ def _volume_alert_controls() -> None:
     state = _get_state()
     with st.expander("🔔 Volume Alert"):
         st.caption(
-            "Alerts when today's cumulative volume exceeds a multiple of the "
-            "average daily volume (mean of the last 20 completed days; yesterday's "
+            "Alerts when any symbol's cumulative volume today exceeds a multiple of "
+            "its average daily volume (mean of the last 20 completed days; yesterday's "
             "volume early on). Wakes the agent early when it fires. On by default."
         )
         c1, c2 = st.columns([1, 1.4])
@@ -500,16 +542,17 @@ def _volume_alert_controls() -> None:
             format="%.1f",
             key="vol_alert_multiplier",
         )
-    # Changing the threshold or re-enabling clears the one-shot latch so the
+    # Changing the threshold or re-enabling clears the one-shot latches so the
     # alert can fire again under the new settings.
     if enabled != state.volume_alert_enabled or multiplier != state.volume_alert_multiplier:
-        state.volume_alert_triggered = False
-        state.volume_alert_ratio = None
+        for sym_state in state.iter_symbol_states():
+            sym_state.volume_alert_triggered = False
+            sym_state.volume_alert_ratio = None
     state.volume_alert_enabled = enabled
     state.volume_alert_multiplier = multiplier
 
 
-def _news_analysis_controls(symbol: str) -> None:
+def _news_analysis_controls(symbols: list[str]) -> None:
     state = _get_state()
     provider = st.selectbox(
         "Provider",
@@ -526,26 +569,38 @@ def _news_analysis_controls(symbol: str) -> None:
 
     analyze_clicked = st.button("🔍 Analyze News", key="news_analyze_btn")
     if analyze_clicked:
-        sym = symbol.strip().upper() or state.symbol
-        if not state.news:
-            st.warning("No news loaded yet. Start the Live stream for a symbol first.")
+        states = [s for s in state.iter_symbol_states() if s.symbol in symbols] or list(
+            state.iter_symbol_states()
+        )
+        if not any(s.news for s in states):
+            st.warning("No news loaded yet. Start the Live stream for the symbols first.")
         elif not llm_key:
             st.error(f"{env_var} is not set; news analysis needs an LLM key.")
         else:
             with st.spinner("Scoring news impact…"):
-                try:
-                    state.news_impacts = score_news_impacts(sym, state.news, provider, llm_key)
-                except Exception as exc:
-                    st.error(f"News impact scoring failed: {exc}")
+                for sym_state in states:
+                    if not sym_state.news:
+                        continue
+                    try:
+                        sym_state.news_impacts = score_news_impacts(
+                            sym_state.symbol, sym_state.news, provider, llm_key
+                        )
+                    except Exception as exc:
+                        st.error(f"News impact scoring failed for {sym_state.symbol}: {exc}")
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
-def _news_panel(symbol: str) -> None:
+def _news_panel(symbols: list[str]) -> None:
     state = _get_state()
     if state.news_status not in ("Idle", state.status):
         st.caption(f"News: {state.news_status}")
-    _news_analysis_controls(symbol)
-    st.html(_news_html(state.news, state.symbol, state.news_impacts))
+    _news_analysis_controls(symbols)
+    rendered = False
+    for sym_state in state.iter_symbol_states():
+        st.html(_news_html(sym_state.news, sym_state.symbol, sym_state.news_impacts))
+        rendered = True
+    if not rendered:
+        st.info("Start the Live stream to load news for your symbols.")
 
 
 def _live_panel() -> None:
@@ -555,29 +610,43 @@ def _live_panel() -> None:
     _chart_panel()
 
 
-def _historical_panel(symbol: str) -> None:
+def _historical_panel(symbols: list[str]) -> None:
     period_label = st.selectbox("Period", list(HISTORICAL_PERIODS.keys()), index=3, key="hist_period")
 
-    sym = symbol.strip().upper()
-    if not sym:
-        st.plotly_chart(empty_chart("Enter a symbol in the sidebar"), width='stretch')
+    if not symbols:
+        st.plotly_chart(empty_chart("Enter symbols in the sidebar"), width='stretch')
         return
 
     days = HISTORICAL_PERIODS[period_label]
-    with st.spinner(f"Loading historical data for {sym}…"):
-        try:
-            ticker_close = fetch_close_series(sym, days)
-            spy_close = fetch_close_series(SPY_SYMBOL, days) if sym != SPY_SYMBOL else None
-            vix_close = fetch_close_series(VIX_SYMBOL, days)
-            dividends = fetch_dividends(sym, days)
-            earnings = fetch_earnings_dates(sym, days)
-        except Exception as exc:
-            st.error(f"Failed to load historical data: {exc}")
-            return
+    # Shared context series fetched once for the whole basket.
+    try:
+        spy_close = fetch_close_series(SPY_SYMBOL, days)
+        vix_close = fetch_close_series(VIX_SYMBOL, days)
+    except Exception as exc:
+        st.error(f"Failed to load market context series: {exc}")
+        spy_close, vix_close = None, None
 
-    fig = build_historical_chart(ticker_close, spy_close, vix_close, sym, period_label, dividends, earnings)
-    st.plotly_chart(fig, width='stretch')
-    _static_analysis_panel(sym)
+    for sym in symbols:
+        with st.spinner(f"Loading historical data for {sym}…"):
+            try:
+                ticker_close = fetch_close_series(sym, days)
+                dividends = fetch_dividends(sym, days)
+                earnings = fetch_earnings_dates(sym, days)
+            except Exception as exc:
+                st.error(f"Failed to load historical data for {sym}: {exc}")
+                continue
+
+        fig = build_historical_chart(
+            ticker_close,
+            spy_close if sym != SPY_SYMBOL else None,
+            vix_close,
+            sym,
+            period_label,
+            dividends,
+            earnings,
+        )
+        st.plotly_chart(fig, width='stretch', key=f"hist_chart_{sym}")
+        _static_analysis_panel(sym)
 
 
 def _static_analysis_panel(symbol: str) -> None:
@@ -601,155 +670,182 @@ def _static_analysis_panel(symbol: str) -> None:
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
-def _technical_analysis_panel(symbol: str) -> None:
-    """Visualizes the three human-readable reads from `technical_analysis`:
-    the daily trend regime, intraday momentum, and the broad market environment."""
+def _technical_analysis_panel(symbols: list[str]) -> None:
+    """Visualizes the three human-readable reads from `technical_analysis` for
+    each symbol: the daily trend regime, intraday momentum, and (once, shared)
+    the broad market environment."""
     state = _get_state()
-    sym = symbol.strip().upper() or state.symbol
-    with state.lock:
-        bars = list(state.bars)
-    daily_bars = state.daily_bars
 
-    if not sym or not bars:
-        st.info("Start the Live stream for a symbol first so there's data to analyze.")
+    states = [s for s in state.iter_symbol_states() if s.symbol in symbols] or list(
+        state.iter_symbol_states()
+    )
+    states = [s for s in states if s.bars]
+    if not states:
+        st.info("Start the Live stream for your symbols first so there's data to analyze.")
         return
 
-    trend = analyze_trend(daily_bars if daily_bars else bars)
-    intraday = analyze_intraday(bars)
+    # The broad-market read is symbol-independent -- compute it once.
     try:
         market_series = fetch_market_indicators()
         market = analyze_market(market_series.get("vix"), market_series.get("spy"), market_series.get("vix3m"))
     except Exception as exc:
         market = {"note": f"market indicators unavailable: {exc}"}
 
-    st.plotly_chart(build_analysis_gauges(trend, intraday, market), width='stretch')
+    for sym_state in states:
+        sym = sym_state.symbol
+        with sym_state.lock:
+            bars = list(sym_state.bars)
+        daily_bars = sym_state.daily_bars
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**📈 Trend (daily)**")
-        if "note" in trend:
-            st.caption(trend["note"])
-        else:
-            st.metric(
-                "Regime",
-                f"{trend['regime'].capitalize()} ({trend['trend_strength']})",
-                f"{trend['pct_change_over_period']:+.1f}%",
-            )
-            st.caption(trend["summary"])
-    with c2:
-        st.markdown("**⚡ Intraday Momentum**")
-        if "note" in intraday:
-            st.caption(intraday["note"])
-        else:
-            st.metric("Window change", f"{intraday['pct_change_in_window']:+.2f}%", intraday["momentum_pattern"])
-            st.caption(intraday["summary"])
-    with c3:
-        st.markdown("**🌍 Market Environment**")
-        if "note" in market:
-            st.caption(market["note"])
-        else:
-            st.metric("Risk environment", market["risk_environment"].capitalize(), f"score {market['risk_score']:+d}")
-            st.caption(market["summary"])
-            for insight in market.get("insights", []):
-                st.markdown(f"- {insight}")
+        st.subheader(sym)
+        trend = analyze_trend(daily_bars if daily_bars else bars)
+        intraday = analyze_intraday(bars)
+
+        st.plotly_chart(
+            build_analysis_gauges(trend, intraday, market),
+            width='stretch',
+            key=f"analysis_gauges_{sym}",
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**📈 Trend (daily)**")
+            if "note" in trend:
+                st.caption(trend["note"])
+            else:
+                st.metric(
+                    "Regime",
+                    f"{trend['regime'].capitalize()} ({trend['trend_strength']})",
+                    f"{trend['pct_change_over_period']:+.1f}%",
+                )
+                st.caption(trend["summary"])
+        with c2:
+            st.markdown("**⚡ Intraday Momentum**")
+            if "note" in intraday:
+                st.caption(intraday["note"])
+            else:
+                st.metric("Window change", f"{intraday['pct_change_in_window']:+.2f}%", intraday["momentum_pattern"])
+                st.caption(intraday["summary"])
+        with c3:
+            st.markdown("**🌍 Market Environment**")
+            if "note" in market:
+                st.caption(market["note"])
+            else:
+                st.metric("Risk environment", market["risk_environment"].capitalize(), f"score {market['risk_score']:+d}")
+                st.caption(market["summary"])
+                for insight in market.get("insights", []):
+                    st.markdown(f"- {insight}")
+        st.divider()
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
-def _smart_money_panel(symbol: str) -> None:
-    """Visualizes the Smart Money Concepts setup: higher-timeframe daily order blocks
-    drawn as demand/supply zones over the candles, with the suggested entry/stop/target
-    geometry -- the same composite read the `smart_money` agent personality trades
-    from, with the intraday confirmation reported alongside."""
+def _smart_money_panel(symbols: list[str]) -> None:
+    """Visualizes the Smart Money Concepts setup per symbol: higher-timeframe daily
+    order blocks drawn as demand/supply zones over the candles, with the suggested
+    entry/stop/target geometry -- the same composite read the `smart_money` agent
+    personality trades from, with the intraday confirmation reported alongside."""
     state = _get_state()
-    sym = symbol.strip().upper() or state.symbol
-    with state.lock:
-        intraday = list(state.bars)
-        spot = state.last_price
-    daily = state.daily_bars
 
-    if not sym or not daily:
-        st.info("Start the Live stream for a symbol first so there's daily structure to analyze.")
+    states = [s for s in state.iter_symbol_states() if s.symbol in symbols] or list(
+        state.iter_symbol_states()
+    )
+    states = [s for s in states if s.daily_bars]
+    if not states:
+        st.info("Start the Live stream for your symbols first so there's daily structure to analyze.")
         return
 
-    setup = analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
-    blocks = analyze_order_blocks(daily, spot=spot).get("order_blocks", [])
-    pd_read = analyze_premium_discount(daily, spot=spot)
-    liquidity = analyze_liquidity(intraday, spot=spot) if intraday else {}
+    for sym_state in states:
+        sym = sym_state.symbol
+        with sym_state.lock:
+            intraday = list(sym_state.bars)
+            spot = sym_state.last_price
+        daily = sym_state.daily_bars
 
-    # The chart renders daily candles, so only the daily order blocks (whose indices
-    # map to that x-axis) are drawn as zones. Intraday FVGs drive the agent's
-    # confirmation read but have no position on a daily chart, so they're left off.
-    # Premium/discount (daily) and the nearest liquidity pools overlay as levels.
-    chart_analysis = {
-        **setup,
-        "order_blocks": blocks,
-        "fair_value_gaps": [],
-        "premium_discount": pd_read,
-        "liquidity": liquidity,
-    }
-    st.plotly_chart(build_smart_money_chart(daily, chart_analysis, sym), width="stretch")
+        st.subheader(sym)
+        setup = analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
+        blocks = analyze_order_blocks(daily, spot=spot).get("order_blocks", [])
+        pd_read = analyze_premium_discount(daily, spot=spot)
+        liquidity = analyze_liquidity(intraday, spot=spot) if intraday else {}
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Signal", setup.get("signal", "n/a").replace("_", " "), setup.get("quality", ""))
-    rr = setup.get("reward_risk_to_target")
-    c2.metric("Reward : Risk", f"{rr:.1f}:1" if rr is not None else "n/a")
-    c3.metric("Range zone", (setup.get("premium_discount_zone") or "n/a").title())
-    confs = setup.get("intraday_confirmation") or []
-    c4.metric("Intraday confirmation", ", ".join(confs) if confs else "none")
-
-    st.caption(setup.get("summary", ""))
-
-    sweep = setup.get("recent_sweep")
-    if sweep is not None:
-        st.markdown(
-            f"- **Liquidity sweep:** {sweep['type']} stop-run of {sweep['level']:.2f} "
-            f"({sweep['bars_ago']} bars ago)"
+        # The chart renders daily candles, so only the daily order blocks (whose indices
+        # map to that x-axis) are drawn as zones. Intraday FVGs drive the agent's
+        # confirmation read but have no position on a daily chart, so they're left off.
+        # Premium/discount (daily) and the nearest liquidity pools overlay as levels.
+        chart_analysis = {
+            **setup,
+            "order_blocks": blocks,
+            "fair_value_gaps": [],
+            "premium_discount": pd_read,
+            "liquidity": liquidity,
+        }
+        st.plotly_chart(
+            build_smart_money_chart(daily, chart_analysis, sym),
+            width="stretch",
+            key=f"smart_money_chart_{sym}",
         )
 
-    ob = setup.get("order_block")
-    if ob is not None:
-        e, s, t = setup.get("suggested_entry"), setup.get("suggested_stop"), setup.get("structural_target")
-        st.markdown(
-            f"- **Demand order block:** {ob['bottom']:.2f}–{ob['top']:.2f} "
-            f"({'unmitigated' if not ob['mitigated'] else 'mitigated'}, {ob['bars_ago']} bars ago)"
-        )
-        if e is not None and s is not None and t is not None:
-            st.markdown(f"- **Geometry:** entry {e:.2f} · stop {s:.2f} · target {t:.2f}")
-    if "note" in setup and setup.get("order_block") is None:
-        st.caption(setup["note"])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Signal", setup.get("signal", "n/a").replace("_", " "), setup.get("quality", ""))
+        rr = setup.get("reward_risk_to_target")
+        c2.metric("Reward : Risk", f"{rr:.1f}:1" if rr is not None else "n/a")
+        c3.metric("Range zone", (setup.get("premium_discount_zone") or "n/a").title())
+        confs = setup.get("intraday_confirmation") or []
+        c4.metric("Intraday confirmation", ", ".join(confs) if confs else "none")
 
-    with st.expander("🏦 Institutional footprint (insiders · 13F)", expanded=False):
-        try:
-            flow = fetch_smart_money_flow(sym)
-        except Exception:
-            flow = None
-        if not flow:
-            st.caption("Institutional ownership data unavailable.")
-        else:
-            st.caption(flow.get("summary", ""))
-            f1, f2, f3 = st.columns(3)
-            inst_pct = flow.get("institutions_pct_held")
-            ins_pct = flow.get("insiders_pct_held")
-            f1.metric("Institutions", f"{inst_pct * 100:.1f}%" if inst_pct is not None else "n/a")
-            f2.metric("Insiders", f"{ins_pct * 100:.1f}%" if ins_pct is not None else "n/a")
-            insider = flow.get("insider_flow")
-            f3.metric(
-                "Insider 6mo",
-                insider["direction"].title() if insider else "n/a",
-                f"{insider['net_shares_6mo']:+,}" if insider else None,
+        st.caption(setup.get("summary", ""))
+
+        sweep = setup.get("recent_sweep")
+        if sweep is not None:
+            st.markdown(
+                f"- **Liquidity sweep:** {sweep['type']} stop-run of {sweep['level']:.2f} "
+                f"({sweep['bars_ago']} bars ago)"
             )
-            for h in (flow.get("top_institutional_holders") or [])[:5]:
-                chg = h.get("pct_change")
-                chg_str = f" ({chg * 100:+.1f}% q/q)" if chg is not None else ""
-                held = f"{h['pct_held'] * 100:.2f}%" if h.get("pct_held") is not None else "n/a"
-                st.markdown(f"- **{h['holder']}** — {held}{chg_str}")
+
+        ob = setup.get("order_block")
+        if ob is not None:
+            e, s, t = setup.get("suggested_entry"), setup.get("suggested_stop"), setup.get("structural_target")
+            st.markdown(
+                f"- **Demand order block:** {ob['bottom']:.2f}–{ob['top']:.2f} "
+                f"({'unmitigated' if not ob['mitigated'] else 'mitigated'}, {ob['bars_ago']} bars ago)"
+            )
+            if e is not None and s is not None and t is not None:
+                st.markdown(f"- **Geometry:** entry {e:.2f} · stop {s:.2f} · target {t:.2f}")
+        if "note" in setup and setup.get("order_block") is None:
+            st.caption(setup["note"])
+
+        with st.expander(f"🏦 Institutional footprint — {sym} (insiders · 13F)", expanded=False):
+            try:
+                flow = fetch_smart_money_flow(sym)
+            except Exception:
+                flow = None
+            if not flow:
+                st.caption("Institutional ownership data unavailable.")
+            else:
+                st.caption(flow.get("summary", ""))
+                f1, f2, f3 = st.columns(3)
+                inst_pct = flow.get("institutions_pct_held")
+                ins_pct = flow.get("insiders_pct_held")
+                f1.metric("Institutions", f"{inst_pct * 100:.1f}%" if inst_pct is not None else "n/a")
+                f2.metric("Insiders", f"{ins_pct * 100:.1f}%" if ins_pct is not None else "n/a")
+                insider = flow.get("insider_flow")
+                f3.metric(
+                    "Insider 6mo",
+                    insider["direction"].title() if insider else "n/a",
+                    f"{insider['net_shares_6mo']:+,}" if insider else None,
+                )
+                for h in (flow.get("top_institutional_holders") or [])[:5]:
+                    chg = h.get("pct_change")
+                    chg_str = f" ({chg * 100:+.1f}% q/q)" if chg is not None else ""
+                    held = f"{h['pct_held'] * 100:.2f}%" if h.get("pct_held") is not None else "n/a"
+                    st.markdown(f"- **{h['holder']}** — {held}{chg_str}")
+        st.divider()
 
 
-def _record_wall_snapshot(state: AppState, call_wall: float, put_wall: float) -> list[dict]:
+def _record_wall_snapshot(sym_state: SymbolState, call_wall: float, put_wall: float) -> list[dict]:
     """Append a {call_wall, put_wall} snapshot if it differs from the last one, so the
     agent's trend read (rising/falling walls) reflects real shifts, not poll noise."""
-    with state.lock:
-        history = list(state.options_wall_history)
+    with sym_state.lock:
+        history = list(sym_state.options_wall_history)
         last = history[-1] if history else None
         if last is None or last.get("call_wall") != call_wall or last.get("put_wall") != put_wall:
             history.append(
@@ -760,87 +856,101 @@ def _record_wall_snapshot(state: AppState, call_wall: float, put_wall: float) ->
                 }
             )
             history = history[-OPTIONS_WALL_HISTORY_MAXLEN:]
-            state.options_wall_history = history
+            sym_state.options_wall_history = history
         return history
 
 
 @st.fragment(run_every=OPTIONS_POLL_SEC)
-def _options_walls_panel(symbol: str) -> None:
-    """Independently fetches/refreshes the options chain (cached, on its own poll loop --
-    never triggered by the agent) and renders the Call Wall / Put Wall / gamma read.
-    The agent's get_put_call_walls tool only reads whatever this last stored on AppState."""
+def _options_walls_panel(symbols: list[str]) -> None:
+    """Independently fetches/refreshes each symbol's options chain (cached, on its
+    own poll loop -- never triggered by the agent) and renders the Call Wall /
+    Put Wall / gamma read. The agent's get_put_call_walls tool only reads whatever
+    this last stored on the SymbolState."""
     state = _get_state()
-    sym = symbol.strip().upper() or state.symbol
-    if not sym:
-        st.plotly_chart(empty_chart("Enter a symbol in the sidebar"), width='stretch')
+    if not symbols:
+        st.plotly_chart(empty_chart("Enter symbols in the sidebar"), width='stretch')
         return
 
-    with state.lock:
-        live_spot = state.last_price
+    for sym in symbols:
+        sym_state = state.sym(sym)
+        st.subheader(sym)
+        live_spot = None
+        if sym_state is not None:
+            with sym_state.lock:
+                live_spot = sym_state.last_price
 
-    try:
-        data = fetch_options_walls_data(sym, spot=live_spot)
-    except Exception as exc:
-        with state.lock:
-            data = state.options_chain
-        if not data:
-            st.error(f"Failed to fetch options chain for {sym}: {exc}")
-            return
-        st.warning(f"Using last successful options fetch for {sym} -- refresh failed: {exc}")
-    else:
-        with state.lock:
-            state.options_chain = data
+        try:
+            data = fetch_options_walls_data(sym, spot=live_spot)
+        except Exception as exc:
+            data = None
+            if sym_state is not None:
+                with sym_state.lock:
+                    data = sym_state.options_chain
+            if not data:
+                st.error(f"Failed to fetch options chain for {sym}: {exc}")
+                continue
+            st.warning(f"Using last successful options fetch for {sym} -- refresh failed: {exc}")
+        else:
+            if sym_state is not None:
+                with sym_state.lock:
+                    sym_state.options_chain = data
 
-    with state.lock:
-        prior_history = list(state.options_wall_history)
-    analysis = get_put_call_walls_and_gamma(
-        strikes=data["strikes"],
-        calls_oi=data["calls_oi"],
-        puts_oi=data["puts_oi"],
-        calls_gamma_exposure=data["calls_gamma_exposure"],
-        puts_gamma_exposure=data["puts_gamma_exposure"],
-        spot=data["spot"],
-        wall_history=prior_history,
-    )
-    _record_wall_snapshot(state, analysis["call_wall"], analysis["put_wall"])
+        prior_history: list[dict] = []
+        if sym_state is not None:
+            with sym_state.lock:
+                prior_history = list(sym_state.options_wall_history)
+        analysis = get_put_call_walls_and_gamma(
+            strikes=data["strikes"],
+            calls_oi=data["calls_oi"],
+            puts_oi=data["puts_oi"],
+            calls_gamma_exposure=data["calls_gamma_exposure"],
+            puts_gamma_exposure=data["puts_gamma_exposure"],
+            spot=data["spot"],
+            wall_history=prior_history,
+        )
+        if sym_state is not None:
+            _record_wall_snapshot(sym_state, analysis["call_wall"], analysis["put_wall"])
 
-    st.caption(f"Expiry {data['expiry']} · fetched {data['fetched_at']}")
-    fig = build_gamma_chart(data, analysis, sym)
-    st.plotly_chart(fig, width='stretch')
+        st.caption(f"Expiry {data['expiry']} · fetched {data['fetched_at']}")
+        fig = build_gamma_chart(data, analysis, sym)
+        st.plotly_chart(fig, width='stretch', key=f"gamma_chart_{sym}")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Call Wall (resistance)", f"${analysis['call_wall']:.2f}", analysis["call_wall_trend"] or "")
-    c2.metric("Put Wall (support)", f"${analysis['put_wall']:.2f}", analysis["put_wall_trend"] or "")
-    c3.metric("Net gamma regime", analysis["gamma_regime"].split(" ")[0].capitalize())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Call Wall (resistance)", f"${analysis['call_wall']:.2f}", analysis["call_wall_trend"] or "")
+        c2.metric("Put Wall (support)", f"${analysis['put_wall']:.2f}", analysis["put_wall_trend"] or "")
+        c3.metric("Net gamma regime", analysis["gamma_regime"].split(" ")[0].capitalize())
 
-    st.caption(analysis["summary"])
-    for insight in analysis["insights"]:
-        st.markdown(f"- {insight}")
+        st.caption(analysis["summary"])
+        for insight in analysis["insights"]:
+            st.markdown(f"- {insight}")
+        st.divider()
 
 
 def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
     """Return (icon, accent_color, label) for an agent log entry."""
     etype = entry.get("type")
+    symbol = entry.get("symbol")
+    suffix = f" {symbol}" if symbol else ""
     if etype == "decision":
         action = entry.get("action")
         if action == "buy":
-            return "🟢", PALETTE["up"], "BUY"
+            return "🟢", PALETTE["up"], f"BUY{suffix}"
         if action == "sell":
-            return "🔴", PALETTE["down"], "SELL"
+            return "🔴", PALETTE["down"], f"SELL{suffix}"
         if action == "alert":
             return "⏰", PALETTE["accent"], "ALERT"
         return "💤", PALETTE["muted"], "SLEEP"
     if etype == "tactics_set":
         if entry.get("cancelled") is not None:
-            return "🎯", PALETTE["muted"], "TACTICS CANCELLED"
-        return "🎯", PALETTE["orange"], "TACTICS SET"
+            return "🎯", PALETTE["muted"], f"TACTICS CANCELLED{suffix}"
+        return "🎯", PALETTE["orange"], f"TACTICS SET{suffix}"
     if etype == "tactics_execution":
         action = entry.get("action")
         if action == "buy":
-            return "🎯", PALETTE["up"], "TACTICS → BUY"
+            return "🎯", PALETTE["up"], f"TACTICS → BUY{suffix}"
         if action == "sell":
-            return "🎯", PALETTE["down"], "TACTICS → SELL"
-        return "🎯", PALETTE["orange"], "TACTICS"
+            return "🎯", PALETTE["down"], f"TACTICS → SELL{suffix}"
+        return "🎯", PALETTE["orange"], f"TACTICS{suffix}"
     if etype == "regime_select":
         return "🤖", PALETTE["orange"], "REGIME → STRATEGY"
     if etype == "stand_down":
@@ -967,36 +1077,49 @@ def _agent_log_html(log: list[dict]) -> str:
 
 def _current_tactics_html(state: AppState) -> str:
     """The 'current tactics' card for the Agent tab: every armed conditional
-    action with the plan's reasoning and arming time, or an explicit
-    nothing-armed note while the agent runs (idle agent renders nothing)."""
-    tactics = state.tactics
-    armed = tactics_summaries(tactics)
-    if not armed:
+    action (across all symbols) with each plan's reasoning and arming time, or
+    an explicit nothing-armed note while the agent runs (idle agent renders
+    nothing)."""
+    armed_blocks: list[str] = []
+    for sym_state in state.iter_symbol_states():
+        tactics = sym_state.tactics
+        armed = tactics_summaries(tactics)
+        if not armed:
+            continue
+        try:
+            since = f" · armed {pd.to_datetime(tactics.ts).strftime('%H:%M:%S')}" if tactics.ts else ""
+        except Exception:
+            since = ""
+        items = "".join(f"<div>🎯 <b>{html.escape(t)}</b></div>" for t in armed)
+        reasoning = (
+            f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{html.escape(tactics.reasoning)}</div>"
+            if tactics.reasoning
+            else ""
+        )
+        armed_blocks.append(
+            f"<div style='margin-bottom:6px'>"
+            f"<div style='color:{PALETTE['orange']};font-size:11px;margin-bottom:4px'>"
+            f"{html.escape(sym_state.symbol)}{since}</div>"
+            f"{items}{reasoning}</div>"
+        )
+
+    if not armed_blocks:
         if not state.agent_running:
             return ""
         return (
             f"<div style='background:{PALETTE['panel']};border:1px dashed {PALETTE['grid']};"
             "border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:12px;"
             f"color:{PALETTE['muted']}'>🎯 No tactics armed — the agent has not set "
-            "buy/sell conditions; it will act only when woken (alert, news, or timer).</div>"
+            "buy/sell conditions on any symbol; it will act only when woken "
+            "(alert, news, or timer).</div>"
         )
-    try:
-        since = f" · armed {pd.to_datetime(tactics.ts).strftime('%H:%M:%S')}" if tactics.ts else ""
-    except Exception:
-        since = ""
-    items = "".join(f"<div>🎯 <b>{html.escape(t)}</b></div>" for t in armed)
-    reasoning = (
-        f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{html.escape(tactics.reasoning)}</div>"
-        if tactics.reasoning
-        else ""
-    )
     return (
         f"<div style='background:{PALETTE['panel']};border:1px solid {PALETTE['orange']};"
         "border-radius:8px;padding:8px 14px;margin-bottom:8px;font-size:12px;"
         f"color:{PALETTE['text']}'>"
         f"<div style='color:{PALETTE['orange']};font-size:11px;margin-bottom:4px'>"
-        f"ARMED TACTICS — executes automatically, then wakes the agent{since}</div>"
-        f"{items}{reasoning}</div>"
+        f"ARMED TACTICS — execute automatically, then wake the agent</div>"
+        f"{''.join(armed_blocks)}</div>"
     )
 
 
@@ -1047,9 +1170,13 @@ def _agent_log_panel() -> None:
     tracker = state.decision_tracker
     if tracker:
         snap = tracker.snapshot()
+        positions = {s: q for s, q in snap["positions"].items() if q}
         c1, c2, c3 = st.columns(3)
         c1.metric("Paper cash", f"${snap['cash']:,.2f}")
-        c2.metric("Position", f"{snap['position']:.2f} sh")
+        c2.metric(
+            "Positions",
+            " · ".join(f"{s} {q:.2f} sh" for s, q in positions.items()) if positions else "flat",
+        )
         c3.metric("Decisions", len(snap["decisions"]))
     tactics_html = _current_tactics_html(state)
     if tactics_html:
@@ -1059,20 +1186,23 @@ def _agent_log_panel() -> None:
     st.html(_agent_log_html(log[-50:]))
 
 
-def _record_live_equity_point(state: AppState, cash: float, position: float, live_price: float | None) -> None:
-    """Append a snapshot of the agent's current value, so the chart keeps advancing every
-    poll instead of waiting on a full bar to close (bars can lag a minute or more behind)."""
-    if live_price is None:
+def _record_live_equity_point(state: AppState) -> None:
+    """Append a snapshot of the agent's current total value (all positions marked
+    to their live prices), so the chart keeps advancing every poll instead of
+    waiting on a full bar to close (bars can lag a minute or more behind)."""
+    value = state.mark_to_market()
+    if value is None:
         return
-    price = float(live_price)
+    tracker = state.decision_tracker
+    snap = tracker.snapshot() if tracker else {"cash": 0.0, "positions": {}}
     with state.lock:
         state.agent_equity_history.append(
             {
                 "ts": pd.Timestamp.now(tz="UTC").isoformat(),
-                "price": price,
-                "cash": cash,
-                "position": position,
-                "value": cash + position * price,
+                "price": None,
+                "cash": snap["cash"],
+                "position": sum(snap["positions"].values()),
+                "value": value,
             }
         )
         if len(state.agent_equity_history) > AGENT_EQUITY_HISTORY_MAXLEN:
@@ -1085,8 +1215,16 @@ def _merge_live_history(state: AppState, points: list[dict], agent_start: dateti
     return sorted(points + history, key=lambda p: p["ts"])
 
 
+def _bars_by_symbol(state: AppState) -> dict[str, list[dict]]:
+    result: dict[str, list[dict]] = {}
+    for sym_state in state.iter_symbol_states():
+        with sym_state.lock:
+            result[sym_state.symbol] = list(sym_state.bars)
+    return result
+
+
 @st.fragment(run_every=AGENT_PERFORMANCE_POLL_SEC)
-def _agent_performance_panel(symbol: str) -> None:
+def _agent_performance_panel(symbols: list[str]) -> None:
     state = _get_state()
     tracker = state.decision_tracker
     if not tracker:
@@ -1095,16 +1233,13 @@ def _agent_performance_panel(symbol: str) -> None:
 
     snap = tracker.snapshot()
     decisions = [asdict(d) for d in snap["decisions"]]
-    with state.lock:
-        bars = list(state.bars)
-        live_price = state.last_price
+    bars_by_symbol = _bars_by_symbol(state)
 
-    live_price = live_price or (bars[-1]["c"] if bars else None)
     agent_start = state.agent_start_time or SESSION_START
-    _record_live_equity_point(state, snap["cash"], snap["position"], live_price)
-    points = compute_equity_curve(bars, decisions, state.starting_budget, agent_start)
+    _record_live_equity_point(state)
+    points = compute_equity_curve(bars_by_symbol, decisions, state.starting_budget, agent_start)
     points = _merge_live_history(state, points, agent_start)
-    markers = decision_markers(decisions, agent_start)
+    markers = decision_markers(decisions, agent_start, points)
     stats = summarize(points, decisions, state.starting_budget)
 
     c1, c2, c3 = st.columns(3)
@@ -1112,76 +1247,101 @@ def _agent_performance_panel(symbol: str) -> None:
     c2.metric("Fees paid", f"${stats['total_fees']:,.2f}")
     c3.metric("Starting budget", f"${stats['starting_cash']:,.2f}")
 
-    fig = build_performance_chart(points, markers, symbol or state.symbol)
+    label = ", ".join(symbols or state.symbols)
+    fig = build_performance_chart(points, markers, label)
     st.plotly_chart(fig, width='stretch')
 
 
-def _build_agent_report_html(state: AppState, symbol: str) -> str:
-    sym = symbol.strip().upper() or state.symbol
+def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
+    syms = symbols or list(state.symbols)
 
     with state.lock:
-        bars = list(state.bars)
-        trades = list(state.trades)
         agent_log = list(state.agent_log)
 
     tracker = state.decision_tracker
     decisions = [asdict(d) for d in tracker.snapshot()["decisions"]] if tracker else []
 
-    live_fig = (
-        build_chart(
-            bars,
-            state.news,
-            trades,
-            sym,
-            SESSION_START,
-            ma_periods=state.ma_periods,
-            show_fib=state.show_fib,
-            show_7d_avg=state.show_7d_avg,
-            show_28d_avg=state.show_28d_avg,
-            show_1y_avg=state.show_1y_avg,
-            mixture_distribution=state.mixture_distribution,
-            mixture_max_components=state.mixture_max_components,
-            daily_bars=state.daily_bars,
-            vwap_style=state.vwap_style,
-            show_candle_body=state.show_candle_body,
-            show_percentile_body=state.show_percentile_body,
-            show_whiskers=state.show_whiskers,
-            decisions=tracker.trade_markers() if tracker else None,
-            news_impacts=state.news_impacts,
-            fill_gaps=state.fill_gaps,
+    live_figs: list[tuple[str, object]] = []
+    for sym in syms:
+        sym_state = state.sym(sym)
+        if sym_state is None:
+            continue
+        with sym_state.lock:
+            bars = list(sym_state.bars)
+            trades = list(sym_state.trades)
+        if not bars:
+            continue
+        live_figs.append(
+            (
+                sym,
+                build_chart(
+                    bars,
+                    sym_state.news,
+                    trades,
+                    sym,
+                    SESSION_START,
+                    ma_periods=state.ma_periods,
+                    show_fib=state.show_fib,
+                    show_7d_avg=state.show_7d_avg,
+                    show_28d_avg=state.show_28d_avg,
+                    show_1y_avg=state.show_1y_avg,
+                    mixture_distribution=state.mixture_distribution,
+                    mixture_max_components=state.mixture_max_components,
+                    daily_bars=sym_state.daily_bars,
+                    vwap_style=state.vwap_style,
+                    show_candle_body=state.show_candle_body,
+                    show_percentile_body=state.show_percentile_body,
+                    show_whiskers=state.show_whiskers,
+                    decisions=tracker.trade_markers(symbol=sym) if tracker else None,
+                    news_impacts=sym_state.news_impacts,
+                    fill_gaps=state.fill_gaps,
+                ),
+            )
         )
-        if (sym and bars)
-        else None
-    )
 
     historical_period_label = st.session_state.get("hist_period")
-    historical_fig = None
-    if sym and historical_period_label:
+    historical_figs: list[tuple[str, object]] = []
+    if historical_period_label:
+        days = HISTORICAL_PERIODS[historical_period_label]
         try:
-            days = HISTORICAL_PERIODS[historical_period_label]
-            ticker_close = fetch_close_series(sym, days)
-            spy_close = fetch_close_series(SPY_SYMBOL, days) if sym != SPY_SYMBOL else None
+            spy_close = fetch_close_series(SPY_SYMBOL, days)
             vix_close = fetch_close_series(VIX_SYMBOL, days)
-            dividends = fetch_dividends(sym, days)
-            earnings = fetch_earnings_dates(sym, days)
-            historical_fig = build_historical_chart(
-                ticker_close, spy_close, vix_close, sym, historical_period_label, dividends, earnings
-            )
         except Exception:
-            historical_fig = None
+            spy_close, vix_close = None, None
+        for sym in syms:
+            try:
+                ticker_close = fetch_close_series(sym, days)
+                dividends = fetch_dividends(sym, days)
+                earnings = fetch_earnings_dates(sym, days)
+                historical_figs.append(
+                    (
+                        sym,
+                        build_historical_chart(
+                            ticker_close,
+                            spy_close if sym != SPY_SYMBOL else None,
+                            vix_close,
+                            sym,
+                            historical_period_label,
+                            dividends,
+                            earnings,
+                        ),
+                    )
+                )
+            except Exception:
+                continue
 
     performance_fig = None
     performance_stats = None
     agent_start = state.agent_start_time or SESSION_START
     if tracker:
-        points = compute_equity_curve(bars, decisions, state.starting_budget, agent_start)
+        points = compute_equity_curve(_bars_by_symbol(state), decisions, state.starting_budget, agent_start)
         points = _merge_live_history(state, points, agent_start)
-        markers = decision_markers(decisions, agent_start)
+        markers = decision_markers(decisions, agent_start, points)
         performance_stats = summarize(points, decisions, state.starting_budget)
-        performance_fig = build_performance_chart(points, markers, sym)
+        performance_fig = build_performance_chart(points, markers, ", ".join(syms))
 
     return build_report_html(
-        symbol=sym,
+        symbols=syms,
         feed=state.feed,
         timeframe=state.timeframe,
         session_start=agent_start,
@@ -1191,8 +1351,8 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
         llm_model=state.llm_model,
         llm_personality=_personality_label(state.llm_personality),
         agent_running=state.agent_running,
-        live_fig=live_fig,
-        historical_fig=historical_fig,
+        live_figs=live_figs,
+        historical_figs=historical_figs,
         historical_period_label=historical_period_label,
         performance_fig=performance_fig,
         performance_stats=performance_stats,
@@ -1201,21 +1361,21 @@ def _build_agent_report_html(state: AppState, symbol: str) -> str:
     )
 
 
-def _agent_report_section(symbol: str) -> None:
+def _agent_report_section(symbols: list[str]) -> None:
     state = _get_state()
     st.divider()
     st.caption("Save everything about this run — charts, starting conditions, and the full decision history — to a single HTML file.")
     if st.button("📄 Generate Report", key="agent_generate_report"):
         with st.spinner("Building report…"):
             try:
-                report_html = _build_agent_report_html(state, symbol)
+                report_html = _build_agent_report_html(state, symbols)
             except Exception as exc:
                 st.error(f"Failed to build report: {exc}")
             else:
-                sym = symbol.strip().upper() or state.symbol or "agent"
+                label = "_".join(symbols or state.symbols) or "agent"
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 st.session_state["agent_report_html"] = report_html
-                st.session_state["agent_report_name"] = f"{sym}_agent_report_{ts}.html"
+                st.session_state["agent_report_name"] = f"{label}_agent_report_{ts}.html"
 
     report_html = st.session_state.get("agent_report_html")
     if report_html:
@@ -1228,18 +1388,20 @@ def _agent_report_section(symbol: str) -> None:
         )
 
 
-def _agent_panel(symbol: str) -> None:
+def _agent_panel(symbols: list[str]) -> None:
     state = _get_state()
     st.caption(
-        "Runs an LLM research agent that reads already-fetched ticker data and makes "
-        "paper buy/sell/alert calls on a fixed interval. Instead of trading only at the "
+        "Runs an LLM research agent that reads already-fetched data for every streamed "
+        "ticker and makes paper buy/sell/alert calls on a fixed interval, allocating one "
+        "shared cash balance across the whole basket. Instead of trading only at the "
         "current price, the agent prefers to arm tactics -- standing conditional orders "
-        "like 'buy 10 sh if price below X' or 'sell 20% of shares if price above Y' with "
-        "multiple AND-ed conditions (price, volume, VIX, momentum, ...) -- that a background "
-        "executor fills the instant they trigger, waking the agent to reevaluate. When it "
-        "doesn't want to trade, the agent sets condition alerts on any continuously-updated "
-        "value to wake up early the moment one is crossed, and it always wakes up early when "
-        "fresh news breaks for the ticker. No real orders are ever placed. "
+        "like 'buy 10 sh AAPL if price below X' or 'sell 20% of TSLA shares if price above Y' "
+        "with multiple AND-ed conditions (price, volume, VIX, momentum, ...) -- that a "
+        "background executor fills the instant they trigger, waking the agent to reevaluate. "
+        "When it doesn't want to trade, the agent sets condition alerts on any ticker's "
+        "continuously-updated values to wake up early the moment one is crossed, and it "
+        "always wakes up early when fresh news breaks for any of its tickers. No real "
+        "orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}."
     )
     with st.expander("LLM", expanded=True):
@@ -1267,9 +1429,10 @@ def _agent_panel(symbol: str) -> None:
             st.caption(
                 "🌅 The Premarket Analyst doesn't analyze on start: it holds until "
                 "~2 minutes before the opening bell, then runs one pre-market read and "
-                "arms opening tactics — how much to buy/sell and at what price for the "
-                "later trades to be profitable. Once a tactic executes (simulated at the "
-                "opening prints), the analyst retires and the agent disables itself."
+                "arms opening tactics — how much of each ticker to buy/sell and at what "
+                "price for the later trades to be profitable. Once a tactic executes "
+                "(simulated at the opening prints), the analyst retires and the agent "
+                "disables itself."
             )
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
@@ -1301,11 +1464,12 @@ def _agent_panel(symbol: str) -> None:
     llm_key = os.getenv(env_var, "")
 
     if start_clicked:
-        sym = symbol.strip().upper() or state.symbol
-        with state.lock:
-            has_bars = bool(state.bars)
-        if not sym or not state.api_key or not has_bars:
-            st.error("Start the Live stream for a symbol first (sidebar ▶ Start) so the agent has data to read.")
+        syms = [s for s in (symbols or state.symbols) if state.sym(s) is not None]
+        has_bars = any(
+            bool(ss.bars) for ss in state.iter_symbol_states() if ss.symbol in syms
+        )
+        if not syms or not state.api_key or not has_bars:
+            st.error("Start the Live stream for your symbols first (sidebar ▶ Start) so the agent has data to read.")
         elif not llm_key:
             st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
         else:
@@ -1318,7 +1482,7 @@ def _agent_panel(symbol: str) -> None:
                 launch_automatic(
                     state,
                     state.decision_tracker,
-                    sym,
+                    syms,
                     llm_key,
                     provider=provider,
                     model=model or None,
@@ -1328,7 +1492,7 @@ def _agent_panel(symbol: str) -> None:
                 launch_agent(
                     state,
                     state.decision_tracker,
-                    sym,
+                    syms,
                     llm_key,
                     provider=provider,
                     model=model or None,
@@ -1340,13 +1504,17 @@ def _agent_panel(symbol: str) -> None:
         stop_agent(state)
 
     status = "🟢 running" if state.agent_running else "⚪ idle"
-    watching = f" — watching {state.symbol}" if state.agent_running and state.symbol else ""
+    watching = (
+        f" — watching {', '.join(state.symbols)}"
+        if state.agent_running and state.symbols
+        else ""
+    )
     st.caption(f"Status: {status}{watching}")
     _agent_identity_panel()
 
-    _agent_performance_panel(symbol)
+    _agent_performance_panel(symbols)
     _agent_log_panel()
-    _agent_report_section(symbol)
+    _agent_report_section(symbols)
 
 
 _BIAS_STYLE: dict[str, dict[str, str]] = {
@@ -1471,13 +1639,12 @@ def _premarket_briefing_html(briefing: PremarketBriefing, symbol: str) -> str:
     )
 
 
-def _premarket_panel(symbol: str) -> None:
+def _premarket_panel(symbols: list[str]) -> None:
     state = _get_state()
-    sym = symbol.strip().upper() or state.symbol
 
     st.caption(
-        "Synthesizes recent news, historical price action, macro indicators, and fundamentals into "
-        "a structured morning briefing. Works any time — no live stream needed."
+        "Synthesizes recent news, historical price action, macro indicators, and fundamentals "
+        "into a structured morning briefing per symbol. Works any time — no live stream needed."
     )
 
     c1, c2 = st.columns([1, 2])
@@ -1501,34 +1668,42 @@ def _premarket_panel(symbol: str) -> None:
             key="premarket_model",
         )
     with c2:
-        if not sym:
-            st.info("Enter a symbol in the sidebar first.")
+        if not symbols:
+            st.info("Enter symbols in the sidebar first.")
         else:
-            generate_clicked = st.button("🌅 Generate Pre-Market Analysis", key="premarket_generate", type="primary")
+            generate_clicked = st.button(
+                f"🌅 Generate Pre-Market Analysis ({', '.join(symbols)})",
+                key="premarket_generate",
+                type="primary",
+            )
             if generate_clicked:
                 if not llm_key:
                     st.error(f"{env_var} is not set.")
                 else:
-                    with st.spinner(f"Generating pre-market briefing for {sym}…"):
-                        try:
-                            briefing = generate_premarket_analysis(
-                                symbol=sym,
-                                provider=provider,
-                                api_key=llm_key,
-                                alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
-                                alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
-                                worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
-                                model=model_override.strip() or None,
-                            )
-                            st.session_state["premarket_briefing"] = briefing
-                            st.session_state["premarket_symbol"] = sym
-                        except Exception as exc:
-                            st.error(f"Pre-market analysis failed: {exc}")
+                    briefings: dict[str, PremarketBriefing] = {}
+                    for sym in symbols:
+                        with st.spinner(f"Generating pre-market briefing for {sym}…"):
+                            try:
+                                briefing = generate_premarket_analysis(
+                                    symbol=sym,
+                                    provider=provider,
+                                    api_key=llm_key,
+                                    alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
+                                    alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
+                                    worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
+                                    model=model_override.strip() or None,
+                                )
+                            except Exception as exc:
+                                st.error(f"Pre-market analysis failed for {sym}: {exc}")
+                            else:
+                                if briefing is not None:
+                                    briefings[sym] = briefing
+                    if briefings:
+                        st.session_state["premarket_briefings"] = briefings
 
-    briefing: Optional[PremarketBriefing] = st.session_state.get("premarket_briefing")
-    cached_sym: str = st.session_state.get("premarket_symbol", "")
-    if briefing is not None and cached_sym:
-        st.html(_premarket_briefing_html(briefing, cached_sym))
+    briefings = st.session_state.get("premarket_briefings") or {}
+    for sym, briefing in briefings.items():
+        st.html(_premarket_briefing_html(briefing, sym))
 
 
 def build_ui() -> None:
@@ -1538,20 +1713,18 @@ def build_ui() -> None:
         layout="wide",
     )
 
-    # st.markdown(
-    #     f"<h1 style='color:{PALETTE['text']};font-family:Inter,sans-serif;margin:0 0 4px'>"
-    #     "📈 Market Stream</h1>"
-    #     f"<p style='color:{PALETTE['muted']};font-size:13px;margin:0'>"
-    #     "Real-time candlestick bars &amp; news via Alpaca streaming API</p>",
-    #     unsafe_allow_html=True,
-    # )
-
     with st.sidebar:
         st.header("Controls")
         c1, c2 = st.columns(2)
         start_clicked = c1.button("▶ Start", type="primary", width='stretch')
         stop_clicked = c2.button("⏹ Stop", width='stretch')
-        symbol = st.text_input("Symbol", value="AAPL", placeholder="AAPL, TSLA, MSFT…")
+        symbols_input = st.text_input(
+            "Symbols",
+            value="AAPL",
+            placeholder="AAPL, TSLA, MSFT…",
+            help="One or more tickers, comma- or space-separated. All live plots, "
+            "analyses, and the trading agent cover every listed symbol.",
+        )
         with st.expander("Connection"):
             feed = st.selectbox("Feed", FEEDS, index=0)
             api_key = st.text_input(
@@ -1565,6 +1738,7 @@ def build_ui() -> None:
                 placeholder="From env ALPACA_SECRET if blank",
             )
     state = _get_state()
+    symbols = _effective_symbols(state, symbols_input)
 
     tab_live, tab_news, tab_premarket, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
         ["📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
@@ -1577,94 +1751,120 @@ def build_ui() -> None:
         timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
 
         timeframe_changed = (
-            state.symbol
+            state.symbols
             and state.api_key
             and timeframe != state.timeframe
             and not start_clicked
             and not stop_clicked
         )
         if timeframe_changed:
-            with st.spinner(f"Reloading {state.symbol} at {timeframe}…"):
-                try:
-                    historical_bars = fetch_bars(state.symbol, timeframe, MAX_BARS, state.api_key, state.api_secret, state.feed)
-                except Exception as exc:
-                    log_fetch_failure(
-                        "bars (timeframe reload)", [("Alpaca REST", exc)], symbol=state.symbol,
-                        consequence=f"staying on {state.timeframe}",
-                    )
-                    st.error(f"Failed to reload bars: {exc}")
-                else:
-                    log_fetch(
-                        "bars (timeframe reload)", "Alpaca REST", symbol=state.symbol,
-                        detail=f"{len(historical_bars)} {timeframe} bars",
-                    )
-                    state.timeframe = timeframe
-                    with state.lock:
-                        state.bars.clear()
-                        state.bars.extend(historical_bars)
-                    launch_stream(state.symbol, state.api_key, state.api_secret, state.feed, state, timeframe)
-
-        if start_clicked:
-            sym = symbol.strip().upper()
-            key = api_key.strip() or os.getenv("ALPACA_API_KEY", "")
-            secret = api_secret.strip() or os.getenv("ALPACA_SECRET", "")
-
-            if not sym:
-                st.error("Please enter a symbol.")
-            elif not key or not secret:
-                st.error("API key and secret are required.")
-            else:
-                with st.spinner(f"Loading history for {sym}…"):
+            with st.spinner(f"Reloading {', '.join(state.symbols)} at {timeframe}…"):
+                reloaded = True
+                for sym_state in state.iter_symbol_states():
+                    sym = sym_state.symbol
                     try:
-                        historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
-                        log_fetch(
-                            "bars (initial load)", "Alpaca REST", symbol=sym,
-                            detail=f"{len(historical_bars)} {timeframe} bars",
-                        )
-                        historical_trades = fetch_trades(sym, key, secret, feed)
-                        log_fetch(
-                            "trades (initial load)", "Alpaca REST", symbol=sym,
-                            detail=f"{len(historical_trades)} trades",
-                        )
-                        news = fetch_news_with_fallback(
-                            sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
-                        )
-                        daily_bars = fetch_daily_bars(sym, key, secret, feed)
-                        log_fetch(
-                            "daily bars (initial load)", "Alpaca REST", symbol=sym,
-                            detail=f"{len(daily_bars)} daily bars",
+                        historical_bars = fetch_bars(
+                            sym, timeframe, MAX_BARS, state.api_key, state.api_secret, state.feed
                         )
                     except Exception as exc:
                         log_fetch_failure(
-                            "initial data load", [("Alpaca REST", exc)], symbol=sym,
-                            consequence="start aborted",
+                            "bars (timeframe reload)", [("Alpaca REST", exc)], symbol=sym,
+                            consequence=f"staying on {state.timeframe}",
                         )
-                        st.error(f"Failed to load data: {exc}")
-                        state.status = f"Failed: {exc}"
-                    else:
-                        state.symbol = sym
-                        state.feed = feed
-                        state.timeframe = timeframe
-                        state.api_key = key
-                        state.api_secret = secret
-                        state.daily_bars = daily_bars
-                        with state.lock:
-                            state.bars.clear()
-                            state.bars.extend(historical_bars)
-                            state.trades.clear()
-                            state.trades.extend(historical_trades)
-                        state.news = news
-                        state.news_impacts = {}
-                        news_llm_provider = state.news_llm_provider
-                        llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
-                        if llm_key and news:
+                        st.error(f"Failed to reload bars for {sym}: {exc}")
+                        reloaded = False
+                        break
+                    log_fetch(
+                        "bars (timeframe reload)", "Alpaca REST", symbol=sym,
+                        detail=f"{len(historical_bars)} {timeframe} bars",
+                    )
+                    with sym_state.lock:
+                        sym_state.bars.clear()
+                        sym_state.bars.extend(historical_bars)
+                if reloaded:
+                    state.timeframe = timeframe
+                    launch_stream(
+                        list(state.symbols), state.api_key, state.api_secret,
+                        state.feed, state, timeframe,
+                    )
+
+        if start_clicked:
+            syms = _parse_symbols(symbols_input)
+            key = api_key.strip() or os.getenv("ALPACA_API_KEY", "")
+            secret = api_secret.strip() or os.getenv("ALPACA_SECRET", "")
+
+            if not syms:
+                st.error("Please enter at least one symbol.")
+            elif not key or not secret:
+                st.error("API key and secret are required.")
+            else:
+                state.set_symbols(syms)
+                state.feed = feed
+                state.timeframe = timeframe
+                state.api_key = key
+                state.api_secret = secret
+                loaded: list[str] = []
+                failed = False
+                for sym in syms:
+                    sym_state = state.sym(sym)
+                    with st.spinner(f"Loading history for {sym}…"):
+                        try:
+                            historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
+                            log_fetch(
+                                "bars (initial load)", "Alpaca REST", symbol=sym,
+                                detail=f"{len(historical_bars)} {timeframe} bars",
+                            )
+                            historical_trades = fetch_trades(sym, key, secret, feed)
+                            log_fetch(
+                                "trades (initial load)", "Alpaca REST", symbol=sym,
+                                detail=f"{len(historical_trades)} trades",
+                            )
+                            news = fetch_news_with_fallback(
+                                sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
+                            )
+                            daily_bars = fetch_daily_bars(sym, key, secret, feed)
+                            log_fetch(
+                                "daily bars (initial load)", "Alpaca REST", symbol=sym,
+                                detail=f"{len(daily_bars)} daily bars",
+                            )
+                        except Exception as exc:
+                            log_fetch_failure(
+                                "initial data load", [("Alpaca REST", exc)], symbol=sym,
+                                consequence="start aborted",
+                            )
+                            st.error(f"Failed to load data for {sym}: {exc}")
+                            state.status = f"Failed ({sym}): {exc}"
+                            failed = True
+                            break
+                        sym_state.daily_bars = daily_bars
+                        with sym_state.lock:
+                            sym_state.bars.clear()
+                            sym_state.bars.extend(historical_bars)
+                            sym_state.trades.clear()
+                            sym_state.trades.extend(historical_trades)
+                        sym_state.news = news
+                        sym_state.news_impacts = {}
+                        loaded.append(sym)
+
+                if not failed:
+                    news_llm_provider = state.news_llm_provider
+                    llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
+                    if llm_key:
+                        for sym in loaded:
+                            sym_state = state.sym(sym)
+                            if not sym_state.news:
+                                continue
                             try:
-                                state.news_impacts = score_news_impacts(sym, news, news_llm_provider, llm_key)
+                                sym_state.news_impacts = score_news_impacts(
+                                    sym, sym_state.news, news_llm_provider, llm_key
+                                )
                             except Exception as exc:
-                                state.status = f"News impact scoring failed: {exc}"
-                        state.status = "Connecting WebSocket…"
-                        launch_stream(sym, key, secret, feed, state, timeframe)
-                        launch_stream_news(sym, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""))
+                                state.status = f"News impact scoring failed for {sym}: {exc}"
+                    state.status = "Connecting WebSocket…"
+                    launch_stream(syms, key, secret, feed, state, timeframe)
+                    launch_stream_news(
+                        syms, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", "")
+                    )
 
         if stop_clicked:
             if state.bars_fallback_stop_event:
@@ -1687,22 +1887,22 @@ def build_ui() -> None:
         _live_panel()
 
     with tab_news:
-        _news_panel(symbol)
+        _news_panel(symbols)
 
     with tab_premarket:
-        _premarket_panel(symbol)
+        _premarket_panel(symbols)
 
     with tab_historical:
-        _historical_panel(symbol)
+        _historical_panel(symbols)
 
     with tab_analysis:
-        _technical_analysis_panel(symbol)
+        _technical_analysis_panel(symbols)
 
     with tab_smart_money:
-        _smart_money_panel(symbol)
+        _smart_money_panel(symbols)
 
     with tab_walls:
-        _options_walls_panel(symbol)
+        _options_walls_panel(symbols)
 
     with tab_agent:
-        _agent_panel(symbol)
+        _agent_panel(symbols)

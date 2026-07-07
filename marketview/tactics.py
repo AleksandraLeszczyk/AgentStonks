@@ -30,7 +30,7 @@ from .state import ALERTABLE_FIELDS, PRICE_AXIS_ALERT_FIELDS, alert_field_value,
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
-    from .state import AppState
+    from .state import SymbolState
 
 logger = logging.getLogger(__name__)
 
@@ -159,16 +159,17 @@ def format_condition(cond: TacticCondition) -> str:
     return format_alert({"field": cond.field, "condition": cond.condition, "value": cond.value})
 
 
-def format_tactic_action(action: TacticAction) -> str:
+def format_tactic_action(action: TacticAction, symbol: "str | None" = None) -> str:
     """One-line human-readable description, e.g.
-    'buy 10 sh when last_price below 180 and vix below 20'."""
+    'buy 10 sh AAPL when last_price below 180 and vix below 20'."""
     if action.quantity is not None:
         size = f"{action.quantity:g} sh"
     else:
         of = "position" if action.action == "sell" else "cash"
         size = f"{action.quantity_pct:g}% of {of}"
     conds = " and ".join(format_condition(c) for c in action.conditions)
-    text = f"{action.action} {size} when {conds}"
+    sym = f" {symbol}" if symbol else ""
+    text = f"{action.action} {size}{sym} when {conds}"
     if action.note:
         text += f" ({action.note})"
     return text
@@ -178,7 +179,7 @@ def tactics_summaries(tactics: "Tactics | None") -> list[str]:
     """Human-readable one-liner per armed action; [] when nothing is armed."""
     if tactics is None:
         return []
-    return [format_tactic_action(a) for a in tactics.actions]
+    return [format_tactic_action(a, symbol=tactics.symbol) for a in tactics.actions]
 
 
 def tactic_price_levels(tactics: "Tactics | None") -> list[dict]:
@@ -209,7 +210,7 @@ def tactic_price_levels(tactics: "Tactics | None") -> list[dict]:
     return levels
 
 
-def momentum_pct(state: "AppState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":
+def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":
     """Percent change of the latest close vs the close ~`window_min` minutes ago,
     from the intraday bars. None when there isn't enough history yet."""
     with state.lock:
@@ -247,17 +248,18 @@ def fetch_vix_level() -> "float | None":
 
 
 class TacticsExecutor:
-    """Background matching engine for the armed `state.tactics`.
+    """Background matching engine for one symbol's armed `state.tactics`.
 
-    The stream calls `notify()` on every tick so a triggered condition executes
-    within milliseconds of the move; a slow fallback poll (`poll_sec`) keeps the
+    Each streamed symbol gets its own executor. The stream calls `notify()` on
+    every tick of that symbol so a triggered condition executes within
+    milliseconds of the move; a slow fallback poll (`poll_sec`) keeps the
     non-stream fields (vix, momentum) and REST-fallback sessions covered. Trades
-    go through the same `DecisionTracker` as the agent's own decisions -- the
-    executor never picks its own fill price -- and every execution wakes the
+    go through the same shared `DecisionTracker` as the agent's own decisions --
+    the executor never picks its own fill price -- and every execution wakes the
     agent to reevaluate the situation.
     """
 
-    def __init__(self, state: "AppState", tracker: "DecisionTracker", poll_sec: float = TACTICS_POLL_SEC) -> None:
+    def __init__(self, state: "SymbolState", tracker: "DecisionTracker", poll_sec: float = TACTICS_POLL_SEC) -> None:
         self.state = state
         self.tracker = tracker
         self.poll_sec = poll_sec
@@ -318,7 +320,7 @@ class TacticsExecutor:
         snap = self.tracker.snapshot()
         frac = (action.quantity_pct or 0.0) / 100.0
         if action.action == "sell":
-            return snap["position"] * frac
+            return snap["positions"].get(self.state.symbol, 0.0) * frac
         # Percent-of-cash buy: sized off available cash at the last seen price;
         # record_trade re-fetches the fill price and clamps to affordable anyway.
         with self.state.lock:
@@ -334,7 +336,7 @@ class TacticsExecutor:
         state.tactics = None
 
         conds = " and ".join(format_condition(c) for c in action.conditions)
-        summary = format_tactic_action(action)
+        summary = format_tactic_action(action, symbol=tactics.symbol)
         quantity = self._resolve_quantity(action)
         decision = None
         error = None
@@ -358,6 +360,7 @@ class TacticsExecutor:
             "type": "tactics_execution",
             "ts": datetime.now(timezone.utc).isoformat(),
             "action": action.action,
+            "symbol": tactics.symbol,
             "tactic": summary,
             "triggered_by": conds,
         }
@@ -377,11 +380,12 @@ class TacticsExecutor:
         else:
             entry.update({"status": "error", "error": error})
             outcome = f"failed: {error}"
-        with state.lock:
-            state.agent_log.append(entry)
+        app = state.app
+        with app.lock:
+            app.agent_log.append(entry)
 
         # Wake the agent to reevaluate with the fill (or failure) in hand. Any
         # remaining armed actions were disarmed above -- the agent re-sets what
         # still applies once it has seen the new position.
-        state.agent_wake_reason = f"Tactics executed: {summary} -> {outcome}."
-        state.agent_wake_event.set()
+        app.agent_wake_reason = f"Tactics executed: {summary} -> {outcome}."
+        app.agent_wake_event.set()

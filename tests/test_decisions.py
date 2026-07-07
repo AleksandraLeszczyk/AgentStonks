@@ -27,7 +27,7 @@ class TestRecordSleep:
         assert decision.filled_quantity == 0
         assert decision.fee == 0.0
         assert tracker.cash == 1000.0
-        assert tracker.position == 0.0
+        assert tracker.positions.get("AAPL", 0.0) == 0.0
 
 
 class TestRecordTradeBuy:
@@ -38,14 +38,14 @@ class TestRecordTradeBuy:
         assert decision.filled_quantity == 5
         assert decision.price == 100.0
         assert tracker.cash == 500.0
-        assert tracker.position == 5.0
+        assert tracker.positions["AAPL"] == 5.0
 
     def test_buy_clamps_to_affordable_quantity(self):
         tracker = DecisionTracker(starting_cash=250.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
         decision = tracker.record_trade("AAPL", "buy", 10, "go big", "k", "s")
         assert decision.filled_quantity == 2.5
         assert tracker.cash == 0.0
-        assert tracker.position == 2.5
+        assert tracker.positions["AAPL"] == 2.5
 
     def test_buy_with_zero_cash_is_rejected(self):
         tracker = DecisionTracker(starting_cash=0.0, broker=FakeBroker(price=100.0))
@@ -58,10 +58,10 @@ class TestRecordTradeSell:
     def test_sell_clamps_to_current_position(self):
         broker = FakeBroker(price=100.0)
         tracker = DecisionTracker(starting_cash=0.0, broker=broker, trade_cost=0.0)
-        tracker.position = 3.0
+        tracker.positions["AAPL"] = 3.0
         decision = tracker.record_trade("AAPL", "sell", 10, "take profit", "k", "s")
         assert decision.filled_quantity == 3.0
-        assert tracker.position == 0.0
+        assert tracker.positions.get("AAPL", 0.0) == 0.0
         assert tracker.cash == 300.0
 
     def test_sell_with_no_position_is_rejected(self):
@@ -86,7 +86,7 @@ class TestTradeCostFee:
         decision = tracker.record_trade("AAPL", "buy", 5, "bullish breakout", "k", "s")
         assert decision.fee == 1.0
         assert tracker.cash == 1000.0 - 5 * 100.0 - 1.0
-        assert tracker.position == 5.0
+        assert tracker.positions["AAPL"] == 5.0
 
     def test_buy_affordable_quantity_reserves_fee(self):
         tracker = DecisionTracker(starting_cash=101.0, broker=FakeBroker(price=100.0), trade_cost=1.0)
@@ -96,7 +96,7 @@ class TestTradeCostFee:
 
     def test_sell_deducts_fee_from_proceeds(self):
         tracker = DecisionTracker(starting_cash=0.0, broker=FakeBroker(price=100.0), trade_cost=1.0)
-        tracker.position = 3.0
+        tracker.positions["AAPL"] = 3.0
         decision = tracker.record_trade("AAPL", "sell", 3, "take profit", "k", "s")
         assert decision.fee == 1.0
         assert tracker.cash == 3 * 100.0 - 1.0
@@ -115,7 +115,7 @@ class TestSnapshotAndMarkers:
         tracker.record_trade("AAPL", "buy", 4, "x", "k", "s")
         snap = tracker.snapshot()
         assert snap["cash"] == 800.0
-        assert snap["position"] == 4.0
+        assert snap["positions"] == {"AAPL": 4.0}
         assert len(snap["decisions"]) == 1
 
     def test_trade_markers_excludes_sleep_and_rejected(self):

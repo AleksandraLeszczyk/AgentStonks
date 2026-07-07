@@ -2,7 +2,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
     import websocket
@@ -17,13 +17,140 @@ from .config import (
     VOLUME_ALERT_DEFAULT_MULTIPLIER,
 )
 
+# Continuously-updated state fields the agent can attach a condition alert to.
+# Every entry is refreshed on the live price/quote stream (and the REST
+# fallback), so an alert on any of them can fire between scheduled cycles. The
+# value is a human description used in tool schemas and the UI. `spread` and
+# `volume_ratio` are derived (see `alert_field_value`) rather than stored
+# directly, but update just as continuously as their inputs. All fields except
+# `portfolio_value` are per-symbol; an alert always carries the symbol whose
+# stream it watches.
+ALERTABLE_FIELDS: dict[str, str] = {
+    "last_price": "Latest traded price",
+    "bid_price": "Best (highest) bid price",
+    "ask_price": "Best (lowest) ask price",
+    "bid_size": "Shares offered at the best bid",
+    "ask_size": "Shares offered at the best ask",
+    "spread": "Ask price minus bid price (absolute, same units as price)",
+    "previous_minute_high": "High of the last completed 1-minute bar",
+    "previous_minute_low": "Low of the last completed 1-minute bar",
+    "day_volume": "Cumulative shares traded so far today",
+    "volume_ratio": "Today's cumulative volume divided by average daily volume",
+    "portfolio_value": "Paper portfolio value (cash + all positions marked to last price)",
+}
+
+# Subset of alertable fields that live on the price axis, so a triggered/pending
+# alert on them can be drawn as a horizontal line on the price chart.
+PRICE_AXIS_ALERT_FIELDS: frozenset[str] = frozenset(
+    {"last_price", "bid_price", "ask_price", "previous_minute_high", "previous_minute_low"}
+)
+
+
+class SymbolState:
+    """Per-ticker slice of the app state: everything the stream fills for one
+    symbol (bars, trades, news, quotes) plus the per-symbol agent artifacts
+    (pending condition alerts, armed tactics and their executor, options data).
+
+    Shared, app-wide values -- API credentials, the paper ledger, the agent's
+    wake plumbing -- live on the parent `AppState`; the delegation properties
+    below expose them so per-symbol code (stream handlers, the tactics
+    executor, agent tools) can keep reading/writing them through this object.
+    """
+
+    def __init__(self, symbol: str, app: "AppState") -> None:
+        self.symbol = symbol
+        self.app = app
+        self.lock = threading.Lock()
+        self.bars: deque[dict] = deque(maxlen=MAX_BARS)
+        self.daily_bars: list[dict] = []
+        self.trades: list[dict] = []
+        self.news: list[dict] = []
+        self.news_impacts: dict[str, str] = {}
+        self.status: str = "Idle"
+        self.news_status: str = "Idle"
+        self.last_price: float | None = None
+        self.prev_close: float | None = None
+        self.bid_price: float | None = None
+        self.bid_size: float | None = None
+        self.ask_price: float | None = None
+        self.ask_size: float | None = None
+        # RFC-3339 timestamp of the last quote applied to bid/ask, so consumers
+        # can tell a live quote from an hours-old off-session snapshot.
+        self.quote_ts: str | None = None
+        self.previous_minute_high: float | None = None
+        self.previous_minute_low: float | None = None
+        self.day_volume: float | None = None
+        self.volume_alert_triggered: bool = False
+        self.volume_alert_ratio: float | None = None
+        # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
+        # last ~minute. Used by last_price alerts to check any price in the window,
+        # not only the single most-recent tick.
+        self.recent_prices: deque = deque(maxlen=500)
+        # Pending condition alerts for THIS symbol: each {symbol, field,
+        # condition, value} watching a continuously-updated field (see
+        # ALERTABLE_FIELDS). All symbols' alerts clear together once any fires.
+        self.alerts: list[dict] = []
+        # Armed conditional trade plan for this symbol (see marketview.tactics)
+        # and the background executor matching it against live data.
+        self.tactics = None  # "Tactics | None"
+        self.tactics_executor = None  # "TacticsExecutor | None"
+        self.options_chain: "dict | None" = None
+        self.options_wall_history: list[dict] = []
+        self.options_status: str = ""
+
+    # --- delegation to the shared AppState -------------------------------
+    @property
+    def api_key(self) -> str:
+        return self.app.api_key
+
+    @property
+    def api_secret(self) -> str:
+        return self.app.api_secret
+
+    @property
+    def feed(self) -> str:
+        return self.app.feed
+
+    @property
+    def timeframe(self) -> str:
+        return self.app.timeframe
+
+    @property
+    def decision_tracker(self) -> "DecisionTracker | None":
+        return self.app.decision_tracker
+
+    @property
+    def agent_log(self) -> list[dict]:
+        return self.app.agent_log
+
+    @property
+    def agent_wake_event(self) -> threading.Event:
+        return self.app.agent_wake_event
+
+    @property
+    def agent_wake_reason(self) -> "str | None":
+        return self.app.agent_wake_reason
+
+    @agent_wake_reason.setter
+    def agent_wake_reason(self, value: "str | None") -> None:
+        self.app.agent_wake_reason = value
+
+    @property
+    def portfolio_value(self) -> "float | None":
+        return self.app.portfolio_value
+
+    @property
+    def volume_alert_enabled(self) -> bool:
+        return self.app.volume_alert_enabled
+
+    @property
+    def volume_alert_multiplier(self) -> float:
+        return self.app.volume_alert_multiplier
+
+
 _DEFAULTS: dict[str, object] = {
-    "bars": None,  # handled specially
-    "daily_bars": [],
-    "trades": [],
-    "news": [],
-    "news_impacts": {},
-    "symbol": "",
+    "symbols": [],
+    "symbol_states": {},
     "feed": "iex",
     "api_key": "",
     "api_secret": "",
@@ -48,20 +175,8 @@ _DEFAULTS: dict[str, object] = {
     "show_percentile_body": False,
     "show_whiskers": True,
     "fill_gaps": True,
-    "last_price": None,
-    "prev_close": None,
-    "bid_price": None,
-    "bid_size": None,
-    "ask_price": None,
-    "ask_size": None,
-    "quote_ts": None,
-    "previous_minute_high": None,
-    "previous_minute_low": None,
-    "day_volume": None,
     "volume_alert_enabled": True,
     "volume_alert_multiplier": VOLUME_ALERT_DEFAULT_MULTIPLIER,
-    "volume_alert_triggered": False,
-    "volume_alert_ratio": None,
     "agent_log": [],
     "agent_running": False,
     "agent_stop_event": None,
@@ -69,10 +184,6 @@ _DEFAULTS: dict[str, object] = {
     "starting_budget": PAPER_STARTING_CASH,
     "agent_start_time": None,
     "agent_equity_history": [],
-    "alerts": [],
-    "tactics": None,
-    "tactics_executor": None,
-    "recent_prices": None,  # handled specially (deque of (monotonic_ts, price))
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
@@ -83,42 +194,159 @@ _DEFAULTS: dict[str, object] = {
     "automatic_regime": None,
     "automatic_reason": None,
     "news_llm_provider": "openai",
-    "options_chain": None,
-    "options_wall_history": [],
-    "options_status": "",
 }
 
 
-# Continuously-updated state fields the agent can attach a condition alert to.
-# Every entry is refreshed on the live price/quote stream (and the REST
-# fallback), so an alert on any of them can fire between scheduled cycles. The
-# value is a human description used in tool schemas and the UI. `spread` and
-# `volume_ratio` are derived (see `alert_field_value`) rather than stored
-# directly, but update just as continuously as their inputs.
-ALERTABLE_FIELDS: dict[str, str] = {
-    "last_price": "Latest traded price",
-    "bid_price": "Best (highest) bid price",
-    "ask_price": "Best (lowest) ask price",
-    "bid_size": "Shares offered at the best bid",
-    "ask_size": "Shares offered at the best ask",
-    "spread": "Ask price minus bid price (absolute, same units as price)",
-    "previous_minute_high": "High of the last completed 1-minute bar",
-    "previous_minute_low": "Low of the last completed 1-minute bar",
-    "day_volume": "Cumulative shares traded so far today",
-    "volume_ratio": "Today's cumulative volume divided by average daily volume",
-    "portfolio_value": "Paper portfolio value (cash + position marked to last price)",
-}
+class AppState:
+    """Shared application state: the set of streamed symbols with one
+    `SymbolState` each, plus everything that spans symbols -- credentials,
+    the single WebSocket streams, chart settings, and the trading agent's
+    ledger/wake plumbing (one agent trades the whole basket)."""
 
-# Subset of alertable fields that live on the price axis, so a triggered/pending
-# alert on them can be drawn as a horizontal line on the price chart.
-PRICE_AXIS_ALERT_FIELDS: frozenset[str] = frozenset(
-    {"last_price", "bid_price", "ask_price", "previous_minute_high", "previous_minute_low"}
-)
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.symbols: list[str] = []
+        self.symbol_states: dict[str, SymbolState] = {}
+        self.feed: str = "iex"
+        self.api_key: str = ""
+        self.api_secret: str = ""
+        self.status: str = "Idle"
+        self.news_status: str = "Idle"
+        self.bars_connected: bool = False
+        self.news_connected: bool = False
+        self.ws: "websocket.WebSocketApp | None" = None
+        self.ws_news: "websocket.WebSocketApp | None" = None
+        self.bars_fallback_stop_event: "threading.Event | None" = None
+        self.news_fallback_stop_event: "threading.Event | None" = None
+        self.timeframe: str = "1Min"
+        self.ma_periods: list[int] = []
+        self.show_fib: bool = False
+        self.show_7d_avg: bool = False
+        self.show_28d_avg: bool = False
+        self.show_1y_avg: bool = False
+        self.mixture_distribution: str = "none"
+        self.mixture_max_components: int = 0
+        self.vwap_style: str = "hide"
+        self.show_candle_body: bool = True
+        self.show_percentile_body: bool = False
+        self.show_whiskers: bool = True
+        # Draw synthetic flat bars at feed minutes without any trade, so the
+        # candle/volume series has no visual holes.
+        self.fill_gaps: bool = True
+        self.volume_alert_enabled: bool = True
+        self.volume_alert_multiplier: float = VOLUME_ALERT_DEFAULT_MULTIPLIER
+        self.agent_log: list[dict] = []
+        self.agent_running: bool = False
+        self.agent_stop_event: "threading.Event | None" = None
+        self.decision_tracker: "DecisionTracker | None" = None
+        self.starting_budget: float = PAPER_STARTING_CASH
+        self.agent_start_time: "datetime | None" = None
+        self.agent_equity_history: list[dict] = []
+        self.portfolio_value: float | None = None
+        self.agent_wake_event: threading.Event = threading.Event()
+        self.agent_wake_reason: str | None = None
+        self.llm_provider: str = "openai"
+        self.llm_model: str = ""
+        self.llm_personality: str = "swing"
+        # Automatic orchestrator: which strategy it has currently activated (None
+        # when idle or assessing the regime), plus the regime read and reasoning
+        # behind that choice. Surfaced in the UI/report.
+        self.automatic_active_strategy: str | None = None
+        self.automatic_regime: str | None = None
+        self.automatic_reason: str | None = None
+        self.news_llm_provider: str = "openai"
+
+    def __getattr__(self, name: str) -> object:
+        # Provide defaults for attributes missing on old cached session-state instances.
+        if name not in _DEFAULTS:
+            raise AttributeError(f"'AppState' object has no attribute '{name}'")
+        if name == "lock":
+            value: object = threading.Lock()
+        elif name == "agent_wake_event":
+            value = threading.Event()
+        else:
+            raw = _DEFAULTS[name]
+            # Return a fresh copy for mutables so instances don't share state.
+            value = type(raw)() if isinstance(raw, (list, dict, deque)) else raw
+        object.__setattr__(self, name, value)
+        return value
+
+    # --- symbol management ------------------------------------------------
+    @property
+    def symbol(self) -> str:
+        """Primary (first) symbol, for display fallbacks. '' when none set."""
+        return self.symbols[0] if self.symbols else ""
+
+    def set_symbols(self, symbols: Iterable[str]) -> None:
+        """Replace the streamed symbol set, keeping existing SymbolStates for
+        symbols that stay and creating fresh ones for new symbols."""
+        ordered: list[str] = []
+        for raw in symbols:
+            sym = str(raw).strip().upper()
+            if sym and sym not in ordered:
+                ordered.append(sym)
+        self.symbols = ordered
+        self.symbol_states = {
+            sym: self.symbol_states.get(sym) or SymbolState(sym, self) for sym in ordered
+        }
+
+    def sym(self, symbol: str) -> "SymbolState | None":
+        return self.symbol_states.get(str(symbol).strip().upper())
+
+    def iter_symbol_states(self) -> Iterator[SymbolState]:
+        return iter(list(self.symbol_states.values()))
+
+    # --- cross-symbol agent helpers ----------------------------------------
+    def any_tactics(self) -> bool:
+        return any(ss.tactics is not None for ss in self.iter_symbol_states())
+
+    def iter_alerts(self) -> "list[tuple[SymbolState, dict]]":
+        return [(ss, a) for ss in self.iter_symbol_states() for a in list(ss.alerts)]
+
+    def clear_alerts(self) -> None:
+        for ss in self.iter_symbol_states():
+            ss.alerts = []
+
+    def mark_price(self, symbol: str) -> "float | None":
+        """Best available marking price for a symbol: live trade price, else the
+        latest bar close, else the previous close."""
+        ss = self.sym(symbol)
+        if ss is None:
+            return None
+        with ss.lock:
+            if ss.last_price is not None:
+                return float(ss.last_price)
+            if ss.bars:
+                close = ss.bars[-1].get("c")
+                if close is not None:
+                    return float(close)
+            return float(ss.prev_close) if ss.prev_close is not None else None
+
+    def mark_to_market(self) -> "float | None":
+        """Recompute and store the paper portfolio value: cash + every position
+        marked to its symbol's best available price. None while no tracker runs."""
+        tracker = self.decision_tracker
+        if tracker is None:
+            return None
+        snap = tracker.snapshot()
+        value = float(snap["cash"])
+        for symbol, position in snap["positions"].items():
+            if not position:
+                continue
+            price = self.mark_price(symbol)
+            if price is None:
+                continue
+            value += position * price
+        self.portfolio_value = value
+        return value
 
 
-def alert_field_value(state: "AppState", field: "str | None") -> "float | None":
-    """Current numeric value of a continuously-updated alertable field, or None
-    if it isn't available yet (no data, or an input field is unset)."""
+def alert_field_value(state: "SymbolState", field: "str | None") -> "float | None":
+    """Current numeric value of a continuously-updated alertable field for one
+    symbol, or None if it isn't available yet (no data, or an input is unset)."""
+    if field == "portfolio_value":
+        value = state.app.portfolio_value
+        return float(value) if value is not None else None
     if field == "spread":
         if state.ask_price is None or state.bid_price is None:
             return None
@@ -146,11 +374,12 @@ def compare(value: "float | None", condition: "str | None", target: "float | Non
 _PRICE_WINDOW_SEC = 60
 
 
-def alert_triggered(state: "AppState", alert: dict) -> bool:
+def alert_triggered(state: "SymbolState", alert: dict) -> bool:
     """Whether a generic condition alert's watched field currently meets its threshold.
 
-    `alert` is shaped {"field": <ALERTABLE_FIELDS key>, "condition": "above"|"below",
-    "value": <threshold>}.
+    `alert` is shaped {"symbol": <ticker>, "field": <ALERTABLE_FIELDS key>,
+    "condition": "above"|"below", "value": <threshold>} and is checked against
+    the `SymbolState` it was attached to.
 
     For last_price, any trade price recorded within the last minute counts — not
     only the single most-recent tick. This prevents a fast wick from being missed
@@ -170,9 +399,16 @@ def alert_triggered(state: "AppState", alert: dict) -> bool:
     return compare(value, condition, threshold)
 
 
-def normalize_alert(raw: object) -> "dict | None":
+def normalize_alert(
+    raw: object,
+    symbols: "list[str] | None" = None,
+    default_symbol: "str | None" = None,
+) -> "dict | None":
     """Validate one alert spec (e.g. from the LLM) and return a clean
-    {field, condition, value} dict, or None if it isn't a valid, watchable alert."""
+    {symbol, field, condition, value} dict, or None if it isn't a valid,
+    watchable alert. When `symbols` is given the alert's symbol must be one of
+    them; a missing symbol falls back to `default_symbol` (the sole streamed
+    ticker, typically)."""
     if not isinstance(raw, dict):
         return None
     field = raw.get("field")
@@ -183,12 +419,17 @@ def normalize_alert(raw: object) -> "dict | None":
         value = float(raw.get("value"))
     except (TypeError, ValueError):
         return None
-    return {"field": field, "condition": condition, "value": value}
+    symbol = str(raw.get("symbol") or default_symbol or "").strip().upper()
+    if not symbol:
+        return None
+    if symbols is not None and symbol not in symbols:
+        return None
+    return {"symbol": symbol, "field": field, "condition": condition, "value": value}
 
 
 def format_alert(alert: dict) -> str:
     """One-line human-readable description of a condition alert, e.g.
-    'last_price above 150' or 'day_volume above 5,000,000'."""
+    'AAPL last_price above 150' or 'TSLA day_volume above 5,000,000'."""
     field = alert.get("field", "?")
     condition = alert.get("condition", "?")
     value = alert.get("value")
@@ -196,7 +437,9 @@ def format_alert(alert: dict) -> str:
         value_str = f"{value:,.0f}" if abs(value) >= 1000 else f"{value:,.4f}".rstrip("0").rstrip(".")
     else:
         value_str = str(value)
-    return f"{field} {condition} {value_str}"
+    symbol = alert.get("symbol")
+    prefix = f"{symbol} " if symbol else ""
+    return f"{prefix}{field} {condition} {value_str}"
 
 
 def _daily_bar_date(bar: dict) -> str:
@@ -278,112 +521,3 @@ def current_volume_ratio(
     if not baseline or day_volume is None:
         return None, baseline
     return day_volume / baseline, baseline
-
-
-class AppState:
-    def __init__(self) -> None:
-        self.bars: deque[dict] = deque(maxlen=MAX_BARS)
-        self.daily_bars: list[dict] = []
-        self.trades: list[dict] = []
-        self.news: list[dict] = []
-        self.news_impacts: dict[str, str] = {}
-        self.symbol: str = ""
-        self.feed: str = "iex"
-        self.api_key: str = ""
-        self.api_secret: str = ""
-        self.status: str = "Idle"
-        self.news_status: str = "Idle"
-        self.bars_connected: bool = False
-        self.news_connected: bool = False
-        self.ws: "websocket.WebSocketApp | None" = None
-        self.ws_news: "websocket.WebSocketApp | None" = None
-        self.bars_fallback_stop_event: "threading.Event | None" = None
-        self.news_fallback_stop_event: "threading.Event | None" = None
-        self.lock = threading.Lock()
-        self.timeframe: str = "1Min"
-        self.ma_periods: list[int] = []
-        self.show_fib: bool = False
-        self.show_7d_avg: bool = False
-        self.show_28d_avg: bool = False
-        self.show_1y_avg: bool = False
-        self.mixture_distribution: str = "none"
-        self.mixture_max_components: int = 0
-        self.vwap_style: str = "hide"
-        self.show_candle_body: bool = True
-        self.show_percentile_body: bool = False
-        self.show_whiskers: bool = True
-        # Draw synthetic flat bars at feed minutes without any trade, so the
-        # candle/volume series has no visual holes.
-        self.fill_gaps: bool = True
-        self.last_price: float | None = None
-        self.prev_close: float | None = None
-        self.bid_price: float | None = None
-        self.bid_size: float | None = None
-        self.ask_price: float | None = None
-        self.ask_size: float | None = None
-        # RFC-3339 timestamp of the last quote applied to bid/ask, so consumers
-        # can tell a live quote from an hours-old off-session snapshot.
-        self.quote_ts: str | None = None
-        self.previous_minute_high: float | None = None
-        self.previous_minute_low: float | None = None
-        self.day_volume: float | None = None
-        self.volume_alert_enabled: bool = True
-        self.volume_alert_multiplier: float = VOLUME_ALERT_DEFAULT_MULTIPLIER
-        self.volume_alert_triggered: bool = False
-        self.volume_alert_ratio: float | None = None
-        self.agent_log: list[dict] = []
-        self.agent_running: bool = False
-        self.agent_stop_event: "threading.Event | None" = None
-        self.decision_tracker: "DecisionTracker | None" = None
-        self.starting_budget: float = PAPER_STARTING_CASH
-        self.agent_start_time: "datetime | None" = None
-        self.agent_equity_history: list[dict] = []
-        # Pending condition alerts: each {field, condition, value} watching a
-        # continuously-updated state field (see ALERTABLE_FIELDS). Cleared once
-        # any one fires.
-        self.alerts: list[dict] = []
-        # Armed conditional trade plan (see marketview.tactics) and the
-        # background executor that matches it against live data. Set when the
-        # agent calls set_tactics; cleared when an action executes, the agent
-        # replaces/cancels it, or the agent stops.
-        self.tactics = None  # "Tactics | None"
-        self.tactics_executor = None  # "TacticsExecutor | None"
-        # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
-        # last ~minute. Used by last_price alerts to check any price in the window,
-        # not only the single most-recent tick.
-        self.recent_prices: deque = deque(maxlen=500)
-        self.portfolio_value: float | None = None
-        self.agent_wake_event: threading.Event = threading.Event()
-        self.agent_wake_reason: str | None = None
-        self.llm_provider: str = "openai"
-        self.llm_model: str = ""
-        self.llm_personality: str = "swing"
-        # Automatic orchestrator: which strategy it has currently activated (None
-        # when idle or assessing the regime), plus the regime read and reasoning
-        # behind that choice. Surfaced in the UI/report.
-        self.automatic_active_strategy: str | None = None
-        self.automatic_regime: str | None = None
-        self.automatic_reason: str | None = None
-        self.news_llm_provider: str = "openai"
-        self.options_chain: "dict | None" = None
-        self.options_wall_history: list[dict] = []
-        self.options_status: str = ""
-
-    def __getattr__(self, name: str) -> object:
-        # Provide defaults for attributes missing on old cached session-state instances.
-        if name not in _DEFAULTS:
-            raise AttributeError(f"'AppState' object has no attribute '{name}'")
-        if name == "bars":
-            value: object = deque(maxlen=MAX_BARS)
-        elif name == "recent_prices":
-            value = deque(maxlen=500)
-        elif name == "lock":
-            value = threading.Lock()
-        elif name == "agent_wake_event":
-            value = threading.Event()
-        else:
-            raw = _DEFAULTS[name]
-            # Return a fresh copy for mutables so instances don't share state.
-            value = type(raw)() if isinstance(raw, (list, dict, deque)) else raw
-        object.__setattr__(self, name, value)
-        return value

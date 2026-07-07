@@ -46,7 +46,7 @@ LOG = [
 
 def _base_kwargs(**overrides) -> dict:
     kwargs = dict(
-        symbol="AAPL",
+        symbols=["AAPL"],
         feed="iex",
         timeframe="1Min",
         session_start=SESSION_START,
@@ -56,8 +56,8 @@ def _base_kwargs(**overrides) -> dict:
         llm_model="",
         llm_personality="Swing / Position Trader",
         agent_running=True,
-        live_fig=None,
-        historical_fig=None,
+        live_figs=[],
+        historical_figs=[],
         historical_period_label=None,
         performance_fig=None,
         performance_stats=None,
@@ -75,8 +75,8 @@ class TestBuildReportHtml:
         assert "<html" in result and "</html>" in result
 
     def test_includes_symbol_and_starting_conditions(self):
-        result = build_report_html(**_base_kwargs(symbol="AAPL", starting_budget=50_000.0))
-        assert "AAPL" in result
+        result = build_report_html(**_base_kwargs(symbols=["AAPL", "TSLA"], starting_budget=50_000.0))
+        assert "AAPL, TSLA" in result
         assert "$50,000.00" in result
 
     def test_empty_state_shows_placeholders(self):

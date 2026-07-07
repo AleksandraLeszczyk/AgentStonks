@@ -55,7 +55,7 @@ class FakeClient:
 
 def _base_state() -> AppState:
     state = AppState()
-    state.symbol = "AAPL"
+    state.set_symbols(["AAPL"])
     state.api_key = "k"
     state.api_secret = "s"
     state.feed = "iex"
@@ -83,7 +83,7 @@ class TestStandDown:
             )
         ]
         client = FakeClient(responses)
-        run_agent_cycle(client, "m", "AAPL", state, tracker, max_iters=3, personality="breakout")
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, personality="breakout")
         names = {t["function"]["name"] for t in client.tools_seen[0]}
         assert "stand_down" not in names
 
@@ -132,7 +132,7 @@ class TestStandDown:
             client, "m", "AAPL", state, tracker, max_iters=3, personality="momentum", under_automatic=True
         )
         assert result == "decided"
-        assert tracker.snapshot()["position"] == 1.0
+        assert tracker.snapshot()["positions"] == {"AAPL": 1.0}
 
 
 class TestRunRegimeCycle:
@@ -156,7 +156,7 @@ class TestRunRegimeCycle:
             ),
         ]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", "AAPL", state, tracker, max_iters=5)
+        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
         assert selection["strategy"] == "momentum"
         assert selection["regime"] == "bullish_trend"
         assert client.tools_seen[0] is REGIME_TOOLS
@@ -176,7 +176,7 @@ class TestRunRegimeCycle:
             ),
         ]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", "AAPL", state, tracker, max_iters=5)
+        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
         assert selection["strategy"] == "momentum"
         # the rejected attempt was surfaced back to the model
         second_call = client.calls[1]
@@ -188,7 +188,7 @@ class TestRunRegimeCycle:
         tracker = DecisionTracker(broker=FakeBroker())
         responses = [_response(content="thinking") for _ in range(3)]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", "AAPL", state, tracker, max_iters=3)
+        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
         assert selection is None
 
     def test_selectable_strategies_match_personalities(self):

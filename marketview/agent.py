@@ -14,6 +14,7 @@ in a live broker later only requires implementing `Broker` and passing it to
 """
 from __future__ import annotations
 
+import copy
 import json
 import threading
 from datetime import datetime, timezone
@@ -41,11 +42,11 @@ from .tactics import (
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
-    from .state import AppState
+    from .state import AppState, SymbolState
 
 
 MOMENTUM_SYSTEM_PROMPT = """\
-You are an autonomous momentum-trading agent for a single equity ticker, \
+You are an autonomous momentum-trading agent for a basket of equity tickers, \
 operating in a paper-trading sandbox -- no real orders are ever placed, so \
 reason as if real capital is on the line.
 
@@ -129,7 +130,7 @@ alert wait is never blind to breaking news.
 """
 
 BREAKOUT_SYSTEM_PROMPT = """\
-You are an autonomous breakout-trading agent for a single equity ticker, \
+You are an autonomous breakout-trading agent for a basket of equity tickers, \
 operating in a paper-trading sandbox -- no real orders are ever placed, so \
 reason as if real capital is on the line.
 
@@ -226,7 +227,7 @@ alert wait is never blind to breaking news.
 """
 
 REVERSAL_SYSTEM_PROMPT = """\
-You are an autonomous VWAP mean-reversion agent for a single equity ticker, \
+You are an autonomous VWAP mean-reversion agent for a basket of equity tickers, \
 operating in a paper-trading sandbox -- no real orders are ever placed, so \
 reason as if real capital is on the line.
 
@@ -428,7 +429,7 @@ alert wait is never blind to breaking news.
 """
 
 PREMARKET_SYSTEM_PROMPT = """\
-You are the Premarket Analyst for a single equity ticker, operating in a \
+You are the Premarket Analyst for a basket of equity tickers, operating in a \
 paper-trading sandbox -- no real orders are ever placed, so reason as if real \
 capital is on the line.
 
@@ -496,6 +497,24 @@ If fresh news lands before the bell you are woken to REVISE: re-run the read \
 and call set_tactics again (it replaces the previous plan).
 """
 
+# Appended to every personality's system prompt, formatted with the streamed
+# symbol list: one agent trades the whole basket from one shared cash balance.
+MULTI_SYMBOL_ADDENDUM = """
+
+--- YOUR TICKERS ---
+You are responsible for a basket of tickers: {symbols}. One shared cash balance \
+funds all of them; positions are tracked per ticker (get_position shows each). \
+Where the instructions above say "the ticker", apply the same process to each \
+ticker in the basket. Every per-ticker tool takes a `symbol` argument -- analyze \
+the tickers you care about, compare their setups, and put capital behind the \
+best one(s); capital committed to one ticker is unavailable to the others. \
+submit_decision trades ONE ticker (pass `symbol` for buy/sell); to act on \
+levels across several tickers in the same cycle, arm tactics per ticker with \
+set_tactics (each call replaces only that ticker's armed plan). Every alert \
+condition also names the `symbol` it watches. Fresh news for ANY of your \
+tickers wakes you early.
+"""
+
 # Appended to every personality's system prompt: tactics apply to all supported
 # trading personalities, and arming them is the preferred way to act on levels.
 TACTICS_ADDENDUM = """
@@ -525,9 +544,10 @@ each cycle is to state the conditions under which you would buy or sell, not \
 merely to wait and watch; a cycle that ends in a bare alert with nothing armed \
 should be the exception, justified by the absence of any actionable level.
 
-Protocol: call set_tactics at most once per cycle, BEFORE finalizing; it \
-REPLACES any previously armed tactics (get_position shows what is armed), and \
-actions=[] cancels them. Then finalize with submit_decision action 'alert' and \
+Protocol: call set_tactics at most once per TICKER per cycle, BEFORE \
+finalizing; it REPLACES that ticker's previously armed tactics (get_position \
+shows what is armed per ticker), and actions=[] cancels them. Then finalize \
+with submit_decision action 'alert' and \
 go to sleep -- with tactics armed the 'alerts' array may be empty, because the \
 tactics themselves wake you: the instant one action executes, the remaining \
 armed actions are disarmed and you are woken with the fill in hand to \
@@ -736,6 +756,14 @@ _TOOL_SUBMIT_DECISION = {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["buy", "sell", "alert"]},
+                "symbol": {
+                    "type": "string",
+                    "description": (
+                        "Ticker to trade -- required for buy/sell (must be one of your "
+                        "streamed tickers). Ignored for alert: each alert entry names "
+                        "its own symbol."
+                    ),
+                },
                 "quantity": {
                     "type": "number",
                     "description": "Shares to buy/sell. Ignored for alert. Must be > 0 for buy/sell.",
@@ -763,6 +791,10 @@ _TOOL_SUBMIT_DECISION = {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "symbol": {
+                                "type": "string",
+                                "description": "Ticker whose live field to watch -- one of your streamed tickers.",
+                            },
                             "field": {
                                 "type": "string",
                                 "enum": list(ALERTABLE_FIELDS.keys()),
@@ -778,7 +810,7 @@ _TOOL_SUBMIT_DECISION = {
                                 "description": "Threshold the field is compared against.",
                             },
                         },
-                        "required": ["field", "condition", "value"],
+                        "required": ["symbol", "field", "condition", "value"],
                     },
                 },
             },
@@ -1165,6 +1197,46 @@ _TOOL_ANALYZE_PREMARKET = {
     },
 }
 
+_SYMBOL_PARAM: dict = {
+    "type": "string",
+    "description": "Ticker symbol this call applies to -- one of your streamed tickers.",
+}
+
+
+def _add_symbol_param(tool: dict) -> dict:
+    """Give a per-ticker tool a required `symbol` argument (in place)."""
+    params = tool["function"]["parameters"]
+    params["properties"] = {"symbol": copy.deepcopy(_SYMBOL_PARAM), **params.get("properties", {})}
+    required = [r for r in (params.get("required") or []) if r != "symbol"]
+    params["required"] = ["symbol", *required]
+    return tool
+
+
+# Every tool that reads one ticker's data takes a required `symbol`. The
+# exceptions are basket-wide reads (get_position, analyze_market), the pure
+# geometry calculators, and the terminal decision tools (which carry symbols
+# in their own payloads).
+for _tool in (
+    _TOOL_GET_QUOTE,
+    _TOOL_ANALYZE_INTRADAY_MOMENTUM,
+    _TOOL_ANALYZE_DAILY_TREND,
+    _TOOL_ANALYZE_OPENING_RANGE,
+    _TOOL_ANALYZE_VOLUME,
+    _TOOL_GET_PUT_CALL_WALLS,
+    _TOOL_GET_NEWS,
+    _TOOL_ANALYZE_VWAP_BANDS,
+    _TOOL_ANALYZE_ORDER_BLOCKS,
+    _TOOL_ANALYZE_FAIR_VALUE_GAPS,
+    _TOOL_ANALYZE_SMART_MONEY_SETUP,
+    _TOOL_ANALYZE_LIQUIDITY,
+    _TOOL_ANALYZE_PREMIUM_DISCOUNT,
+    _TOOL_GET_SMART_MONEY_FLOW,
+    _TOOL_ANALYZE_PREMARKET,
+    _TOOL_SET_TACTICS,
+):
+    _add_symbol_param(_tool)
+
+
 # Momentum trader: RVOL + price action/VWAP + news + price -- no medium-term regime
 # or broad-market backdrop, the whole point is reacting fast to what's happening now.
 MOMENTUM_TOOLS: list[dict] = [
@@ -1266,7 +1338,7 @@ def _quote_age_sec(quote_ts: "str | None") -> "float | None":
     return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
 
-def _tool_get_quote(state: "AppState") -> dict:
+def _tool_get_quote(state: "SymbolState") -> dict:
     with state.lock:
         result = {
             "last_price": state.last_price,
@@ -1309,7 +1381,7 @@ def _tool_get_quote(state: "AppState") -> dict:
     return result
 
 
-def _tool_analyze_intraday_momentum(state: "AppState", limit: object = None) -> dict:
+def _tool_analyze_intraday_momentum(state: "SymbolState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 50), 300))
     with state.lock:
         bars = list(state.bars)[-n:]
@@ -1318,7 +1390,7 @@ def _tool_analyze_intraday_momentum(state: "AppState", limit: object = None) -> 
     return ta.analyze_intraday(bars)
 
 
-def _tool_analyze_daily_trend(state: "AppState", limit: object = None) -> dict:
+def _tool_analyze_daily_trend(state: "SymbolState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 60), 365))
     bars = list(state.daily_bars)[-n:]
     if not bars:
@@ -1326,7 +1398,7 @@ def _tool_analyze_daily_trend(state: "AppState", limit: object = None) -> dict:
     return ta.analyze_trend(bars)
 
 
-def _tool_analyze_opening_range(state: "AppState", minutes: object = None) -> dict:
+def _tool_analyze_opening_range(state: "SymbolState", minutes: object = None) -> dict:
     n = max(1, min(int(minutes or 15), 120))
     with state.lock:
         bars = list(state.bars)
@@ -1344,7 +1416,7 @@ def _tool_analyze_market(state: "AppState") -> dict:
     )
 
 
-def _tool_analyze_volume(state: "AppState") -> dict:
+def _tool_analyze_volume(state: "SymbolState") -> dict:
     with state.lock:
         bars = list(state.bars)
     if not bars:
@@ -1352,7 +1424,7 @@ def _tool_analyze_volume(state: "AppState") -> dict:
     return ta.analyze_volume(bars)
 
 
-def _tool_get_put_call_walls(state: "AppState") -> dict:
+def _tool_get_put_call_walls(state: "SymbolState") -> dict:
     with state.lock:
         data = state.options_chain
         history = list(state.options_wall_history)
@@ -1369,7 +1441,7 @@ def _tool_get_put_call_walls(state: "AppState") -> dict:
     )
 
 
-def _tool_get_news(state: "AppState", limit: object = None) -> dict:
+def _tool_get_news(state: "SymbolState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 10), 30))
     with state.lock:
         news = list(state.news)[:n]
@@ -1388,31 +1460,55 @@ def _tool_get_news(state: "AppState", limit: object = None) -> dict:
     }
 
 
-def _tool_get_position(state: "AppState", tracker: "DecisionTracker") -> dict:
+def _tool_get_position(app: "AppState", tracker: "DecisionTracker") -> dict:
     snap = tracker.snapshot()
-    armed = tactics_summaries(state.tactics)
+    # Standing conditional orders still armed from a previous cycle, per ticker;
+    # a set_tactics call replaces that ticker's plan, actions=[] cancels it.
+    armed = {
+        ss.symbol: tactics_summaries(ss.tactics)
+        for ss in app.iter_symbol_states()
+        if ss.tactics is not None
+    }
     return {
         "cash": snap["cash"],
-        "position": snap["position"],
+        "positions": {sym: qty for sym, qty in snap["positions"].items() if qty},
         # Kept fresh independently by the price stream, not fetched here.
-        "portfolio_value": state.portfolio_value,
+        "portfolio_value": app.portfolio_value,
         "decisions_so_far": len(snap["decisions"]),
-        # Standing conditional orders still armed from a previous cycle; a
-        # set_tactics call replaces them, actions=[] cancels them.
         "armed_tactics": armed or None,
     }
 
 
-def _handle_set_tactics(args: dict, state: "AppState", tracker: "DecisionTracker", symbol: str) -> dict:
-    """Arm (or cancel) the tactics requested by a set_tactics tool call."""
+def _resolve_symbol_state(app: "AppState", args: dict) -> "tuple[SymbolState | None, str | None]":
+    """Resolve a tool call's `symbol` argument to its SymbolState. A missing
+    symbol falls back to the sole streamed ticker; otherwise it must name one
+    of the streamed tickers. Returns (state, None) or (None, error)."""
+    raw = str(args.get("symbol") or "").strip().upper()
+    if not raw and len(app.symbols) == 1:
+        raw = app.symbols[0]
+    state = app.sym(raw) if raw else None
+    if state is None:
+        return None, (
+            f"unknown or missing symbol {raw!r}; pass one of your streamed tickers: "
+            f"{', '.join(app.symbols) or '(none)'}"
+        )
+    return state, None
+
+
+def _handle_set_tactics(args: dict, app: "AppState", tracker: "DecisionTracker") -> dict:
+    """Arm (or cancel) one symbol's tactics as requested by a set_tactics tool call."""
+    state, error = _resolve_symbol_state(app, args)
+    if error is not None:
+        return {"error": error}
+    symbol = state.symbol
     raw_actions = args.get("actions")
     reasoning = str(args.get("reasoning") or "")
 
     if isinstance(raw_actions, list) and not raw_actions:
         had = tactics_summaries(state.tactics)
         state.tactics = None
-        _log(state, {"type": "tactics_set", "cancelled": had, "reasoning": reasoning})
-        return {"status": "cancelled", "cancelled_tactics": had}
+        _log(app, {"type": "tactics_set", "symbol": symbol, "cancelled": had, "reasoning": reasoning})
+        return {"status": "cancelled", "symbol": symbol, "cancelled_tactics": had}
 
     tactics, error = normalize_tactics(symbol, raw_actions, reasoning)
     if error is not None:
@@ -1426,20 +1522,21 @@ def _handle_set_tactics(args: dict, state: "AppState", tracker: "DecisionTracker
     # Recorded as a no-op "tactics" decision so the arming moment shows up on
     # the portfolio-value chart and in the decision history/report.
     tracker.record_tactics(symbol, summaries, reasoning, price)
-    _log(state, {"type": "tactics_set", "tactics": summaries, "replaced": replaced, "reasoning": reasoning})
+    _log(app, {"type": "tactics_set", "symbol": symbol, "tactics": summaries, "replaced": replaced, "reasoning": reasoning})
     return {
         "status": "armed",
+        "symbol": symbol,
         "tactics": summaries,
         "replaced_tactics": replaced or None,
         "note": (
-            "You are woken the instant any action executes (remaining actions are "
-            "disarmed). Now finalize the cycle with submit_decision -- action 'alert' "
-            "may carry an empty alerts array while tactics are armed."
+            "You are woken the instant any action executes (that ticker's remaining "
+            "actions are disarmed). Now finalize the cycle with submit_decision -- "
+            "action 'alert' may carry an empty alerts array while tactics are armed."
         ),
     }
 
 
-def _tool_breakout_trade_geometry(state: "AppState", entry: object, stop: object, atr: object = None) -> dict:
+def _tool_breakout_trade_geometry(entry: object, stop: object, atr: object = None) -> dict:
     return ta.breakout_trade_geometry(
         float(entry),
         float(stop),
@@ -1447,7 +1544,7 @@ def _tool_breakout_trade_geometry(state: "AppState", entry: object, stop: object
     )
 
 
-def _tool_analyze_vwap_bands(state: "AppState", num_std: object = None) -> dict:
+def _tool_analyze_vwap_bands(state: "SymbolState", num_std: object = None) -> dict:
     with state.lock:
         bars = list(state.bars)
     if not bars:
@@ -1455,8 +1552,7 @@ def _tool_analyze_vwap_bands(state: "AppState", num_std: object = None) -> dict:
     return ta.analyze_vwap_bands(bars, num_std=float(num_std) if num_std is not None else 2.0)
 
 
-def _tool_vwap_reversion_geometry(
-    state: "AppState", entry: object, vwap: object, std_dev: object, side: object = None
+def _tool_vwap_reversion_geometry(entry: object, vwap: object, std_dev: object, side: object = None
 ) -> dict:
     return ta.vwap_reversion_geometry(
         float(entry),
@@ -1466,7 +1562,7 @@ def _tool_vwap_reversion_geometry(
     )
 
 
-def _tool_analyze_order_blocks(state: "AppState") -> dict:
+def _tool_analyze_order_blocks(state: "SymbolState") -> dict:
     bars = list(state.daily_bars)
     if not bars:
         return {"note": "no daily bars available yet"}
@@ -1475,7 +1571,7 @@ def _tool_analyze_order_blocks(state: "AppState") -> dict:
     return ta.analyze_order_blocks(bars, spot=spot)
 
 
-def _tool_analyze_fair_value_gaps(state: "AppState", limit: object = None) -> dict:
+def _tool_analyze_fair_value_gaps(state: "SymbolState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 50), 300))
     with state.lock:
         bars = list(state.bars)[-n:]
@@ -1485,7 +1581,7 @@ def _tool_analyze_fair_value_gaps(state: "AppState", limit: object = None) -> di
     return ta.analyze_fair_value_gaps(bars, spot=spot)
 
 
-def _tool_analyze_smart_money_setup(state: "AppState") -> dict:
+def _tool_analyze_smart_money_setup(state: "SymbolState") -> dict:
     daily = list(state.daily_bars)
     if not daily:
         return {"note": "no daily bars available yet"}
@@ -1495,11 +1591,11 @@ def _tool_analyze_smart_money_setup(state: "AppState") -> dict:
     return ta.analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
 
 
-def _tool_smart_money_trade_geometry(state: "AppState", entry: object, stop: object, target: object) -> dict:
+def _tool_smart_money_trade_geometry(entry: object, stop: object, target: object) -> dict:
     return ta.smart_money_trade_geometry(float(entry), float(stop), float(target))
 
 
-def _tool_analyze_liquidity(state: "AppState") -> dict:
+def _tool_analyze_liquidity(state: "SymbolState") -> dict:
     with state.lock:
         bars = list(state.bars)
         spot = state.last_price
@@ -1508,7 +1604,7 @@ def _tool_analyze_liquidity(state: "AppState") -> dict:
     return ta.analyze_liquidity(bars, spot=spot)
 
 
-def _tool_analyze_premium_discount(state: "AppState") -> dict:
+def _tool_analyze_premium_discount(state: "SymbolState") -> dict:
     daily = list(state.daily_bars)
     if not daily:
         return {"note": "no daily bars available yet"}
@@ -1517,14 +1613,14 @@ def _tool_analyze_premium_discount(state: "AppState") -> dict:
     return ta.analyze_premium_discount(daily, spot=spot)
 
 
-def _tool_get_smart_money_flow(state: "AppState") -> dict:
+def _tool_get_smart_money_flow(state: "SymbolState") -> dict:
     symbol = state.symbol
     if not symbol:
         return {"note": "no symbol set"}
     return historical.fetch_smart_money_flow(symbol)
 
 
-def _tool_analyze_premarket(state: "AppState") -> dict:
+def _tool_analyze_premarket(state: "SymbolState") -> dict:
     now = datetime.now(timezone.utc)
     # The session the read is about: the one in progress (edge case: the bell
     # already rang while the analyst was reasoning) or the upcoming one.
@@ -1573,42 +1669,55 @@ def _tool_analyze_premarket(state: "AppState") -> dict:
     return result
 
 
+def _per_symbol(handler: "Callable[..., dict]", *arg_names: str) -> "Callable[[dict, AppState, DecisionTracker], dict]":
+    """Wrap a SymbolState-reading tool helper: resolve the call's `symbol` to
+    its SymbolState (erroring on unknown tickers), then forward the named args."""
+
+    def run(args: dict, app: "AppState", tracker: "DecisionTracker") -> dict:
+        state, error = _resolve_symbol_state(app, args)
+        if error is not None:
+            return {"error": error}
+        return handler(state, *[args.get(name) for name in arg_names])
+
+    return run
+
+
 _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
-    "get_quote": lambda args, state, tracker: _tool_get_quote(state),
-    "analyze_intraday_momentum": lambda args, state, tracker: _tool_analyze_intraday_momentum(state, args.get("limit")),
-    "analyze_daily_trend": lambda args, state, tracker: _tool_analyze_daily_trend(state, args.get("limit")),
-    "analyze_opening_range": lambda args, state, tracker: _tool_analyze_opening_range(state, args.get("minutes")),
-    "analyze_market": lambda args, state, tracker: _tool_analyze_market(state),
-    "analyze_volume": lambda args, state, tracker: _tool_analyze_volume(state),
-    "breakout_trade_geometry": lambda args, state, tracker: _tool_breakout_trade_geometry(
-        state, args.get("entry"), args.get("stop"), args.get("atr")
+    "get_quote": _per_symbol(_tool_get_quote),
+    "analyze_intraday_momentum": _per_symbol(_tool_analyze_intraday_momentum, "limit"),
+    "analyze_daily_trend": _per_symbol(_tool_analyze_daily_trend, "limit"),
+    "analyze_opening_range": _per_symbol(_tool_analyze_opening_range, "minutes"),
+    "analyze_market": lambda args, app, tracker: _tool_analyze_market(app),
+    "analyze_volume": _per_symbol(_tool_analyze_volume),
+    "breakout_trade_geometry": lambda args, app, tracker: _tool_breakout_trade_geometry(
+        args.get("entry"), args.get("stop"), args.get("atr")
     ),
-    "analyze_vwap_bands": lambda args, state, tracker: _tool_analyze_vwap_bands(state, args.get("num_std")),
-    "vwap_reversion_geometry": lambda args, state, tracker: _tool_vwap_reversion_geometry(
-        state, args.get("entry"), args.get("vwap"), args.get("std_dev"), args.get("side")
+    "analyze_vwap_bands": _per_symbol(_tool_analyze_vwap_bands, "num_std"),
+    "vwap_reversion_geometry": lambda args, app, tracker: _tool_vwap_reversion_geometry(
+        args.get("entry"), args.get("vwap"), args.get("std_dev"), args.get("side")
     ),
-    "analyze_order_blocks": lambda args, state, tracker: _tool_analyze_order_blocks(state),
-    "analyze_fair_value_gaps": lambda args, state, tracker: _tool_analyze_fair_value_gaps(state, args.get("limit")),
-    "analyze_smart_money_setup": lambda args, state, tracker: _tool_analyze_smart_money_setup(state),
-    "analyze_liquidity": lambda args, state, tracker: _tool_analyze_liquidity(state),
-    "analyze_premium_discount": lambda args, state, tracker: _tool_analyze_premium_discount(state),
-    "get_smart_money_flow": lambda args, state, tracker: _tool_get_smart_money_flow(state),
-    "analyze_premarket": lambda args, state, tracker: _tool_analyze_premarket(state),
-    "smart_money_trade_geometry": lambda args, state, tracker: _tool_smart_money_trade_geometry(
-        state, args.get("entry"), args.get("stop"), args.get("target")
+    "analyze_order_blocks": _per_symbol(_tool_analyze_order_blocks),
+    "analyze_fair_value_gaps": _per_symbol(_tool_analyze_fair_value_gaps, "limit"),
+    "analyze_smart_money_setup": _per_symbol(_tool_analyze_smart_money_setup),
+    "analyze_liquidity": _per_symbol(_tool_analyze_liquidity),
+    "analyze_premium_discount": _per_symbol(_tool_analyze_premium_discount),
+    "get_smart_money_flow": _per_symbol(_tool_get_smart_money_flow),
+    "analyze_premarket": _per_symbol(_tool_analyze_premarket),
+    "smart_money_trade_geometry": lambda args, app, tracker: _tool_smart_money_trade_geometry(
+        args.get("entry"), args.get("stop"), args.get("target")
     ),
-    "get_put_call_walls": lambda args, state, tracker: _tool_get_put_call_walls(state),
-    "get_news": lambda args, state, tracker: _tool_get_news(state, args.get("limit")),
-    "get_position": lambda args, state, tracker: _tool_get_position(state, tracker),
+    "get_put_call_walls": _per_symbol(_tool_get_put_call_walls),
+    "get_news": _per_symbol(_tool_get_news, "limit"),
+    "get_position": lambda args, app, tracker: _tool_get_position(app, tracker),
 }
 
 
-def _dispatch_tool(name: str, args: dict, state: "AppState", tracker: "DecisionTracker") -> dict:
+def _dispatch_tool(name: str, args: dict, app: "AppState", tracker: "DecisionTracker") -> dict:
     handler = _DISPATCH.get(name)
     if handler is None:
         return {"error": f"unknown tool {name}"}
     try:
-        return handler(args, state, tracker)
+        return handler(args, app, tracker)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -1631,14 +1740,15 @@ def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
 def run_agent_cycle(
     client: Any,
     model: str,
-    symbol: str,
+    symbols: list[str],
     state: "AppState",
     tracker: "DecisionTracker",
     max_iters: int = AGENT_MAX_TOOL_ITERS,
     personality: str = DEFAULT_PERSONALITY,
     under_automatic: bool = False,
 ) -> str:
-    """Run one analyze-then-decide cycle. Always ends with exactly one recorded decision.
+    """Run one analyze-then-decide cycle over the whole symbol basket. Always
+    ends with exactly one recorded decision.
 
     When Langfuse is configured, the whole cycle is one trace: every LLM turn
     nests under it as a generation, so per-cycle latency, token usage, and cost
@@ -1650,24 +1760,31 @@ def run_agent_cycle(
     orchestrator can re-assess and pick another strategy), or "decided" when the
     cycle finalized with a normal buy/sell/alert (or the forced-sleep fallback).
     """
+    symbols_label = ", ".join(symbols)
     obs.update_trace(
-        name=f"agent-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol, "personality": personality}
+        name=f"agent-cycle:{symbols_label}",
+        input=symbols_label,
+        metadata={"model": model, "symbols": symbols_label, "personality": personality},
     )
     system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
-    system_prompt = system_prompt + TACTICS_ADDENDUM
+    system_prompt = (
+        system_prompt
+        + MULTI_SYMBOL_ADDENDUM.format(symbols=symbols_label)
+        + TACTICS_ADDENDUM
+    )
     tools = PERSONALITY_TOOLS.get(personality, MOMENTUM_TOOLS)
     if under_automatic:
         system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM
         tools = [*tools, _TOOL_STAND_DOWN]
-    state.alerts = []
+    state.clear_alerts()
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": f"Ticker: {symbol}. Run your analysis process and finish by calling submit_decision.",
+            "content": f"Tickers: {symbols_label}. Run your analysis process and finish by calling submit_decision.",
         },
     ]
-    _log(state, {"type": "cycle_start", "text": f"Starting analysis cycle for {symbol}"})
+    _log(state, {"type": "cycle_start", "text": f"Starting analysis cycle for {symbols_label}"})
 
     decision_made = False
     stood_down = False
@@ -1732,7 +1849,8 @@ def run_agent_cycle(
                 obs.update_trace(output={"action": "stand_down", "reasoning": reasoning})
                 # The relinquishing strategy's conditional orders must not keep
                 # trading under whatever regime/strategy comes next.
-                state.tactics = None
+                for ss in state.iter_symbol_states():
+                    ss.tactics = None
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"status": "relinquished"})}
                 )
@@ -1743,7 +1861,7 @@ def run_agent_cycle(
             if name == "set_tactics":
                 # _handle_set_tactics writes its own "tactics_set" log entry on
                 # success; only a validation failure is logged as a plain tool call.
-                result = _handle_set_tactics(args, state, tracker, symbol)
+                result = _handle_set_tactics(args, state, tracker)
                 result_content = json.dumps(result)
                 if "error" in result:
                     _log(state, {"type": "tool_call", "name": name, "args": args, "result_preview": _preview(result_content)})
@@ -1755,12 +1873,20 @@ def run_agent_cycle(
                 quantity = float(args.get("quantity") or 0)
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
+                default_symbol = symbols[0] if len(symbols) == 1 else None
                 # Validate each requested condition against the watchable-field
-                # registry; silently drop malformed specs so one bad entry
-                # doesn't sink a valid bracket.
-                alerts = [a for a in (normalize_alert(r) for r in (args.get("alerts") or [])) if a is not None]
+                # and streamed-symbol registries; silently drop malformed specs
+                # so one bad entry doesn't sink a valid bracket.
+                alerts = [
+                    a
+                    for a in (
+                        normalize_alert(r, symbols=symbols, default_symbol=default_symbol)
+                        for r in (args.get("alerts") or [])
+                    )
+                    if a is not None
+                ]
 
-                if action == "alert" and not alerts and state.tactics is None:
+                if action == "alert" and not alerts and not state.any_tactics():
                     # Some models (small/cheap ones especially) pick action="alert" but
                     # forget the conditions, or name a field that isn't watchable. Reject
                     # and let the model retry instead of silently recording a no-op -- it
@@ -1769,8 +1895,8 @@ def run_agent_cycle(
                         messages,
                         tc.id,
                         "action 'alert' requires a non-empty 'alerts' array, each "
-                        "entry having field (one of: "
-                        f"{', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
+                        f"entry having symbol (one of: {', '.join(symbols)}), field "
+                        f"(one of: {', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
                         "'below'), and a numeric value. Call submit_decision again "
                         "with at least one valid condition (or arm a plan with "
                         "set_tactics first -- an empty alerts array is only allowed "
@@ -1794,12 +1920,28 @@ def run_agent_cycle(
                     continue
 
                 if action in ("buy", "sell"):
+                    trade_state, symbol_error = _resolve_symbol_state(app=state, args=args)
+                    if symbol_error is not None:
+                        _reject(
+                            messages,
+                            tc.id,
+                            f"action '{action}' requires a valid 'symbol': {symbol_error}. "
+                            "Call submit_decision again with the ticker to trade.",
+                        )
+                        continue
                     decision = tracker.record_trade(
-                        symbol, action, quantity, reasoning, state.api_key, state.api_secret, state.feed
+                        trade_state.symbol, action, quantity, reasoning,
+                        state.api_key, state.api_secret, state.feed,
                     )
                 elif action == "alert":
-                    decision = tracker.record_alert(symbol, alerts, reasoning)
-                    state.alerts = alerts
+                    involved = sorted({a["symbol"] for a in alerts}) or list(symbols)
+                    decision = tracker.record_alert(", ".join(involved), alerts, reasoning)
+                    # Distribute each condition to the SymbolState whose stream
+                    # watches it (cycle start cleared the previous set).
+                    for a in alerts:
+                        alert_state = state.sym(a["symbol"])
+                        if alert_state is not None:
+                            alert_state.alerts = [*alert_state.alerts, a]
                 else:
                     # Unknown / removed action (e.g. a model still reaching for the old
                     # "sleep"). There is no do-nothing path: reject and retry.
@@ -1817,6 +1959,7 @@ def run_agent_cycle(
                     {
                         "type": "decision",
                         "action": decision.action,
+                        "symbol": decision.symbol,
                         "status": decision.status,
                         "price": decision.price,
                         "quantity": decision.filled_quantity,
@@ -1853,7 +1996,7 @@ def run_agent_cycle(
 
     if not decision_made:
         forced = tracker.record_sleep(
-            symbol, "Max reasoning iterations reached without a finalized decision; defaulting to sleep."
+            symbols_label, "Max reasoning iterations reached without a finalized decision; defaulting to sleep."
         )
         obs.update_trace(output={"action": forced.action, "regime": "unknown", "reasoning": forced.reasoning})
         _log(
@@ -1893,22 +2036,23 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_s
     # The stream only signals on the *next* tick, so an alert condition that's
     # already satisfied the instant it's set would otherwise wait for a tick
     # that may not come. Catch that once, up front.
-    alerts = state.alerts
-    if alerts:
-        hit = next((a for a in alerts if alert_triggered(state, a)), None)
+    alert_pairs = state.iter_alerts()
+    if alert_pairs:
+        hit = next((a for ss, a in alert_pairs if alert_triggered(ss, a)), None)
         if hit is not None:
-            state.alerts = []
+            state.clear_alerts()
             _log(
                 state,
                 {"type": "status", "text": f"Alert already met: {format_alert(hit)}; waking early."},
             )
             return
 
-    # An active alert or armed tactics mean the agent should sleep until a
-    # condition fires, a tactic executes, or news arrives -- not get woken by
-    # the regular cycle timer too. (Armed tactics are watched independently by
-    # the TacticsExecutor, which wakes this thread on execution.)
-    timeout = None if (alerts or state.tactics is not None) else cycle_sec
+    # An active alert or armed tactics (on any symbol) mean the agent should
+    # sleep until a condition fires, a tactic executes, or news arrives -- not
+    # get woken by the regular cycle timer too. (Armed tactics are watched
+    # independently by the per-symbol TacticsExecutors, which wake this thread
+    # on execution.)
+    timeout = None if (alert_pairs or state.any_tactics()) else cycle_sec
     woke_early = state.agent_wake_event.wait(timeout=timeout)
     if stop_event.is_set():
         return
@@ -1947,7 +2091,7 @@ def _wait_for_premarket_window(state: "AppState", stop_event: threading.Event) -
 def run_premarket_session(
     client: Any,
     model: str,
-    symbol: str,
+    symbols: list[str],
     state: "AppState",
     tracker: "DecisionTracker",
     stop_event: threading.Event,
@@ -1969,12 +2113,12 @@ def run_premarket_session(
         state.agent_wake_reason = None
         try:
             run_agent_cycle(
-                client, model, symbol, state, tracker, personality=PREMARKET_PERSONALITY
+                client, model, symbols, state, tracker, personality=PREMARKET_PERSONALITY
             )
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Premarket cycle failed: {exc}"})
 
-        if state.tactics is None:
+        if not state.any_tactics():
             # No opening plan -- hold through the bell (so a caller that
             # re-assesses on return doesn't spin pre-open) and retire.
             _log(
@@ -2005,7 +2149,7 @@ def run_premarket_session(
                     },
                 )
                 return "executed"
-            if state.tactics is None:
+            if not state.any_tactics():
                 # Tactics were cleared without an execution (external cancel).
                 return "done"
             if not market_hours.is_market_open():
@@ -2026,7 +2170,7 @@ def run_premarket_session(
 def _premarket_loop(
     state: "AppState",
     tracker: "DecisionTracker",
-    symbol: str,
+    symbols: list[str],
     provider: str,
     api_key: str,
     model: str,
@@ -2036,7 +2180,7 @@ def _premarket_loop(
     disables itself -- the opening tactics were performed (or there was nothing
     to perform) and this personality never trades the session that follows."""
     client = get_agent_client(provider, api_key)
-    outcome = run_premarket_session(client, model, symbol, state, tracker, stop_event)
+    outcome = run_premarket_session(client, model, symbols, state, tracker, stop_event)
     if outcome != "stopped" and state.agent_stop_event is stop_event:
         stop_agent(state)
     state.agent_running = False
@@ -2047,7 +2191,7 @@ def _premarket_loop(
 def _agent_loop(
     state: "AppState",
     tracker: "DecisionTracker",
-    symbol: str,
+    symbols: list[str],
     provider: str,
     api_key: str,
     model: str,
@@ -2058,7 +2202,7 @@ def _agent_loop(
     client = get_agent_client(provider, api_key)
     while not stop_event.is_set():
         try:
-            run_agent_cycle(client, model, symbol, state, tracker, personality=personality)
+            run_agent_cycle(client, model, symbols, state, tracker, personality=personality)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Agent cycle failed: {exc}"})
         _wait_for_next_cycle(state, stop_event, cycle_sec)
@@ -2067,24 +2211,27 @@ def _agent_loop(
 
 
 def start_tactics_executor(state: "AppState", tracker: "DecisionTracker") -> None:
-    """Start the background matcher for armed tactics; stopped by `stop_agent`.
-    Shared by `launch_agent` and the Automatic orchestrator."""
-    executor = TacticsExecutor(state, tracker)
-    state.tactics_executor = executor
-    executor.start()
+    """Start one background matcher per streamed symbol for its armed tactics;
+    stopped by `stop_agent`. Shared by `launch_agent` and the Automatic
+    orchestrator."""
+    for sym_state in state.iter_symbol_states():
+        executor = TacticsExecutor(sym_state, tracker)
+        sym_state.tactics_executor = executor
+        executor.start()
 
 
 def launch_agent(
     state: "AppState",
     tracker: "DecisionTracker",
-    symbol: str,
+    symbols: list[str],
     api_key: str,
     provider: str = "openai",
     model: "str | None" = None,
     cycle_sec: int = 60,
     personality: str = DEFAULT_PERSONALITY,
 ) -> None:
-    """Stop any running agent for this state, then start a new background cycle loop."""
+    """Stop any running agent for this state, then start a new background cycle
+    loop trading the whole symbol basket."""
     model = model or DEFAULT_AGENT_MODELS[provider]
     stop_agent(state)
     stop_event = threading.Event()
@@ -2096,13 +2243,13 @@ def launch_agent(
         # opening tactics, and disables itself once they execute.
         threading.Thread(
             target=_premarket_loop,
-            args=(state, tracker, symbol, provider, api_key, model, stop_event),
+            args=(state, tracker, symbols, provider, api_key, model, stop_event),
             daemon=True,
         ).start()
         return
     threading.Thread(
         target=_agent_loop,
-        args=(state, tracker, symbol, provider, api_key, model, cycle_sec, stop_event, personality),
+        args=(state, tracker, symbols, provider, api_key, model, cycle_sec, stop_event, personality),
         daemon=True,
     ).start()
 
@@ -2111,12 +2258,13 @@ def stop_agent(state: "AppState") -> None:
     if state.agent_stop_event:
         state.agent_stop_event.set()
     state.agent_running = False
-    # Disarm any standing conditional orders and their matcher -- with no agent
-    # to wake, tactics must not keep trading on their own.
-    if state.tactics_executor is not None:
-        state.tactics_executor.stop()
-        state.tactics_executor = None
-    state.tactics = None
+    # Disarm every symbol's standing conditional orders and their matchers --
+    # with no agent to wake, tactics must not keep trading on their own.
+    for sym_state in state.iter_symbol_states():
+        if sym_state.tactics_executor is not None:
+            sym_state.tactics_executor.stop()
+            sym_state.tactics_executor = None
+        sym_state.tactics = None
     # Interrupt a blocked _wait_for_next_cycle immediately instead of letting
     # it sit until the timeout expires.
     state.agent_wake_event.set()

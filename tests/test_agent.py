@@ -23,6 +23,13 @@ from marketview.decisions import DecisionTracker
 from marketview.state import AppState, alert_triggered
 
 
+def _app(*symbols: str):
+    """AppState streaming `symbols` (default AAPL) plus its first SymbolState."""
+    app = AppState()
+    app.set_symbols(list(symbols) or ["AAPL"])
+    return app, app.sym(app.symbols[0])
+
+
 class FakeBroker(Broker):
     def __init__(self, price: float = 100.0):
         self.price = price
@@ -67,11 +74,11 @@ class FakeClient:
 
 class TestToolHandlers:
     def test_analyze_volume_with_no_bars_returns_note(self):
-        state = AppState()
+        _, state = _app()
         assert "note" in _tool_analyze_volume(state)
 
     def test_get_quote_reads_state(self):
-        state = AppState()
+        _, state = _app()
         state.last_price = 101.0
         state.bid_price = 100.5
         result = _tool_get_quote(state)
@@ -79,7 +86,7 @@ class TestToolHandlers:
         assert result["bid_price"] == 100.5
 
     def test_get_news_maps_impact_labels(self):
-        state = AppState()
+        _, state = _app()
         state.news = [{"id": "1", "headline": "h", "summary": "s", "created_at": "t", "source": "src"}]
         state.news_impacts = {"1": "positive"}
         result = _tool_get_news(state)
@@ -92,8 +99,7 @@ class TestToolHandlers:
         assert "error" in result
 
     def test_breakout_trade_geometry_tool_computes_targets(self):
-        state = AppState()
-        result = _tool_breakout_trade_geometry(state, entry=100.0, stop=98.0, atr=4.0)
+        result = _tool_breakout_trade_geometry(entry=100.0, stop=98.0, atr=4.0)
         assert result["meets_min_reward_risk"] is True
 
     def test_breakout_personality_uses_breakout_tools(self):
@@ -122,15 +128,27 @@ class TestToolHandlers:
         assert "get_put_call_walls" not in names
 
     def test_vwap_reversion_geometry_tool_computes_reward_risk(self):
-        state = AppState()
-        result = _tool_vwap_reversion_geometry(state, entry=98.0, vwap=100.0, std_dev=1.0, side="long")
+        result = _tool_vwap_reversion_geometry(entry=98.0, vwap=100.0, std_dev=1.0, side="long")
         assert result["reward_risk_ratio"] == 2.0
         assert result["meets_min_reward_risk"] is True
 
     def test_analyze_vwap_bands_dispatches(self):
-        state = AppState()
-        result = _dispatch_tool("analyze_vwap_bands", {}, state, DecisionTracker())
+        app, _ = _app()
+        result = _dispatch_tool("analyze_vwap_bands", {}, app, DecisionTracker())
         assert "note" in result  # no bars yet
+
+    def test_dispatch_rejects_unknown_symbol(self):
+        app, _ = _app()
+        result = _dispatch_tool("analyze_vwap_bands", {"symbol": "ZZZ"}, app, DecisionTracker())
+        assert "error" in result and "ZZZ" in result["error"]
+
+    def test_dispatch_routes_symbol_to_its_state(self):
+        app, _ = _app("AAPL", "TSLA")
+        app.sym("TSLA").news = [{"id": "1", "headline": "tsla news", "summary": "", "created_at": "t", "source": "x"}]
+        result = _dispatch_tool("get_news", {"symbol": "TSLA"}, app, DecisionTracker())
+        assert result["articles"][0]["headline"] == "tsla news"
+        result = _dispatch_tool("get_news", {"symbol": "AAPL"}, app, DecisionTracker())
+        assert result["articles"] == []
 
     def test_smart_money_personality_uses_smart_money_tools(self):
         assert PERSONALITY_TOOLS["smart_money"] is SMART_MONEY_TOOLS
@@ -148,24 +166,25 @@ class TestToolHandlers:
         assert "analyze_vwap_bands" not in names
 
     def test_smart_money_trade_geometry_tool_computes_reward_risk(self):
-        state = AppState()
-        result = _tool_smart_money_trade_geometry(state, entry=100.0, stop=98.0, target=110.0)
+        result = _tool_smart_money_trade_geometry(entry=100.0, stop=98.0, target=110.0)
         assert result["reward_risk_ratio"] == 5.0
         assert result["meets_min_reward_risk"] is True
 
     def test_analyze_smart_money_setup_dispatches_without_daily_bars(self):
-        result = _dispatch_tool("analyze_smart_money_setup", {}, AppState(), DecisionTracker())
+        app, _ = _app()
+        result = _dispatch_tool("analyze_smart_money_setup", {}, app, DecisionTracker())
         assert "note" in result  # no daily bars yet
 
     def test_analyze_order_blocks_dispatches_without_daily_bars(self):
-        result = _dispatch_tool("analyze_order_blocks", {}, AppState(), DecisionTracker())
+        app, _ = _app()
+        result = _dispatch_tool("analyze_order_blocks", {}, app, DecisionTracker())
         assert "note" in result  # no daily bars yet
 
 
 class TestRunAgentCycle:
     def test_records_buy_decision_and_logs_tool_calls(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         state.feed = "iex"
@@ -185,10 +204,10 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=5)
+        run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=5)
 
         snap = tracker.snapshot()
-        assert snap["position"] == 2.0
+        assert snap["positions"] == {"AAPL": 2.0}
         assert snap["cash"] == 800.0
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "buy"
@@ -200,7 +219,7 @@ class TestRunAgentCycle:
 
     def test_breakout_personality_passes_breakout_tools_to_client(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -222,13 +241,13 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3, personality="breakout")
+        run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3, personality="breakout")
 
         assert client.tools_seen[0] is BREAKOUT_TOOLS
 
     def test_forces_sleep_when_max_iters_reached_without_decision(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -236,7 +255,7 @@ class TestRunAgentCycle:
         responses = [_response(content="still thinking...") for _ in range(3)]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
@@ -247,7 +266,7 @@ class TestRunAgentCycle:
         old "sleep" action gets an error back and must finalize with a real decision --
         here it corrects to an alert."""
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -272,12 +291,12 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "alert"
-        assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+        assert state.sym("AAPL").alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
 
         # the rejected "sleep" attempt must have been surfaced back to the model
         second_call_messages = client.calls[1]
@@ -286,7 +305,7 @@ class TestRunAgentCycle:
 
     def test_alert_decision_sets_state_alert_and_records_no_trade(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -308,7 +327,7 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
@@ -316,12 +335,12 @@ class TestRunAgentCycle:
         assert decision.action == "alert"
         assert decision.status == "noop"
         assert decision.price is None
-        assert decision.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
-        assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+        assert decision.alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
+        assert state.sym("AAPL").alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
 
     def test_alert_decision_supports_multiple_conditions_across_fields(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -346,23 +365,23 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         decision = snap["decisions"][0]
         assert decision.action == "alert"
         assert decision.alerts == [
-            {"field": "last_price", "condition": "below", "value": 95.0},
-            {"field": "volume_ratio", "condition": "above", "value": 2.0},
+            {"symbol": "AAPL", "field": "last_price", "condition": "below", "value": 95.0},
+            {"symbol": "AAPL", "field": "volume_ratio", "condition": "above", "value": 2.0},
         ]
-        assert state.alerts == decision.alerts
+        assert state.sym("AAPL").alerts == decision.alerts
 
     def test_alert_with_missing_fields_is_rejected_and_retried(self):
         """An incomplete alert call (no conditions) must not be silently downgraded to
         sleep -- the model gets an error back and a chance to correct itself, since it
         otherwise has no way to know its alert was dropped."""
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -389,13 +408,13 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gpt-4.1-mini", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "alert"
-        assert snap["decisions"][0].alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
-        assert state.alerts == [{"field": "last_price", "condition": "above", "value": 150.0}]
+        assert snap["decisions"][0].alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
+        assert state.sym("AAPL").alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
 
         # the rejected first attempt must have been surfaced back to the model as a tool result
         first_call_messages = client.calls[1]
@@ -407,7 +426,7 @@ class TestRunAgentCycle:
         otherwise-empty alert is rejected rather than silently watching nothing. The model
         then corrects to a valid, watchable condition."""
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -442,15 +461,15 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gpt-4.1-mini", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert snap["decisions"][0].action == "alert"
-        assert state.alerts == [{"field": "last_price", "condition": "below", "value": 95.0}]
+        assert state.sym("AAPL").alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "below", "value": 95.0}]
 
     def test_alert_with_missing_fields_falls_back_to_sleep_if_never_corrected(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         state.api_key = "k"
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
@@ -465,31 +484,35 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gpt-4.1-mini", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gpt-4.1-mini", ["AAPL"], state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
-        assert state.alerts == []
+        assert state.iter_alerts() == []
 
 
 class TestAlertTrigger:
     def test_alert_triggered_above(self):
-        state = AppState()
-        state.last_price = 151.0
+        import time
+        _, state = _app()
+        state.recent_prices.append((time.monotonic(), 151.0))
         assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is True
-        state.last_price = 149.0
+        state.recent_prices.clear()
+        state.recent_prices.append((time.monotonic(), 149.0))
         assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is False
 
     def test_alert_triggered_below(self):
-        state = AppState()
-        state.last_price = 99.0
+        import time
+        _, state = _app()
+        state.recent_prices.append((time.monotonic(), 99.0))
         assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is True
-        state.last_price = 101.0
+        state.recent_prices.clear()
+        state.recent_prices.append((time.monotonic(), 101.0))
         assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is False
 
     def test_alert_triggered_on_non_price_field(self):
-        state = AppState()
+        _, state = _app()
         state.day_volume = 6_000_000
         assert alert_triggered(state, {"field": "day_volume", "condition": "above", "value": 5_000_000}) is True
         state.bid_price, state.ask_price = 10.0, 10.05
@@ -497,9 +520,11 @@ class TestAlertTrigger:
         assert alert_triggered(state, {"field": "spread", "condition": "below", "value": 0.04}) is False
 
     def test_wait_returns_early_when_alert_fires(self):
-        state = AppState()
-        state.last_price = 151.0
-        state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
+        import time
+        state, sym_state = _app()
+        sym_state.last_price = 151.0
+        sym_state.recent_prices.append((time.monotonic(), 151.0))
+        sym_state.alerts = [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
         stop_event = threading.Event()
 
         start = threading.Event()
@@ -515,17 +540,19 @@ class TestAlertTrigger:
         thread.join(timeout=5)
 
         assert finished.is_set()
-        assert state.alerts == []  # cleared once triggered
+        assert sym_state.alerts == []  # cleared once triggered
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types
 
     def test_wait_returns_early_when_low_side_of_bracket_fires(self):
-        state = AppState()
-        state.last_price = 94.0
-        state.alerts = [
-            {"field": "last_price", "condition": "below", "value": 95.0},
-            {"field": "last_price", "condition": "above", "value": 150.0},
+        import time
+        state, sym_state = _app()
+        sym_state.last_price = 94.0
+        sym_state.recent_prices.append((time.monotonic(), 94.0))
+        sym_state.alerts = [
+            {"symbol": "AAPL", "field": "last_price", "condition": "below", "value": 95.0},
+            {"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0},
         ]
         stop_event = threading.Event()
 
@@ -542,7 +569,7 @@ class TestAlertTrigger:
         thread.join(timeout=5)
 
         assert finished.is_set()
-        assert state.alerts == []  # both levels cleared once either fires
+        assert sym_state.alerts == []  # both levels cleared once either fires
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
         assert "status" in log_types
@@ -552,7 +579,7 @@ class TestAlertTrigger:
         stream.py), which signal `agent_wake_event` directly. This simulates that
         external signal to verify `_wait_for_next_cycle` is a real, event-driven
         block rather than a self-polling loop."""
-        state = AppState()
+        state, _ = _app()
         stop_event = threading.Event()
 
         def signal_after_start():

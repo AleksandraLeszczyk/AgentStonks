@@ -80,7 +80,7 @@ REGIMES: list[str] = [
 
 
 AUTOMATIC_SYSTEM_PROMPT = f"""\
-You are the Automatic orchestrator for a single equity ticker, operating in a \
+You are the Automatic orchestrator for a basket of equity tickers, operating in a \
 paper-trading sandbox. You do NOT place trades yourself. Your one job each round \
 is to read the current market regime and activate the ONE strategy agent best \
 suited to it. That agent then trades on its own until its edge fades, at which \
@@ -88,9 +88,12 @@ point control returns to you and you re-assess.
 
 Work through this every round, citing the actual numbers the tools return \
 (trend strength, RSI, ATR, ADX, relative volume, support/resistance, VIX), not \
-just their labels:
+just their labels. Every per-ticker tool takes a `symbol` argument -- read each \
+ticker in the basket (or at least the ones that look most active) and pick the \
+strategy that fits the basket's dominant character; the activated strategy \
+trades ALL the tickers:
 
-1. READ THE TICKER'S OWN STRUCTURE. Call analyze_daily_trend (medium-term \
+1. READ EACH TICKER'S OWN STRUCTURE. Call analyze_daily_trend (medium-term \
 regime: bullish/bearish/neutral, MA alignment, RSI, support/resistance) and \
 analyze_order_blocks (institutional demand/supply zones at/below price).
 
@@ -191,28 +194,31 @@ def _strategy_label(key: str) -> str:
 def run_regime_cycle(
     client: Any,
     model: str,
-    symbol: str,
+    symbols: list[str],
     state: AppState,
     tracker: DecisionTracker,
     max_iters: int = AGENT_MAX_TOOL_ITERS,
 ) -> "dict | None":
-    """Run one regime-assessment round. Returns the selection dict
-    {"strategy", "regime", "reasoning"} the orchestrator should activate, or None
-    if the model failed to produce a valid selection."""
+    """Run one regime-assessment round over the symbol basket. Returns the
+    selection dict {"strategy", "regime", "reasoning"} the orchestrator should
+    activate, or None if the model failed to produce a valid selection."""
+    symbols_label = ", ".join(symbols)
     obs.update_trace(
-        name=f"regime-cycle:{symbol}", input=symbol, metadata={"model": model, "symbol": symbol}
+        name=f"regime-cycle:{symbols_label}",
+        input=symbols_label,
+        metadata={"model": model, "symbols": symbols_label},
     )
     messages: list[dict] = [
         {"role": "system", "content": AUTOMATIC_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                f"Ticker: {symbol}. Assess the current market regime and finish by "
+                f"Tickers: {symbols_label}. Assess the current market regime and finish by "
                 "calling select_strategy with the best-fitting strategy."
             ),
         },
     ]
-    _log(state, {"type": "cycle_start", "text": f"Automatic: assessing regime for {symbol}"})
+    _log(state, {"type": "cycle_start", "text": f"Automatic: assessing regime for {symbols_label}"})
 
     selection: "dict | None" = None
     for _ in range(max_iters):
@@ -302,7 +308,7 @@ def run_regime_cycle(
 def _automatic_loop(
     state: AppState,
     tracker: DecisionTracker,
-    symbol: str,
+    symbols: list[str],
     provider: str,
     api_key: str,
     model: str,
@@ -331,7 +337,7 @@ def _automatic_loop(
                     ),
                 },
             )
-            outcome = run_premarket_session(client, model, symbol, state, tracker, stop_event)
+            outcome = run_premarket_session(client, model, symbols, state, tracker, stop_event)
             state.automatic_active_strategy = None
             if stop_event.is_set():
                 break
@@ -352,7 +358,7 @@ def _automatic_loop(
         state.automatic_active_strategy = None
         selection = None
         try:
-            selection = run_regime_cycle(client, model, symbol, state, tracker)
+            selection = run_regime_cycle(client, model, symbols, state, tracker)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Regime assessment failed: {exc}"})
 
@@ -387,7 +393,7 @@ def _automatic_loop(
         while not stop_event.is_set():
             try:
                 status = run_agent_cycle(
-                    client, model, symbol, state, tracker,
+                    client, model, symbols, state, tracker,
                     personality=strategy, under_automatic=True,
                 )
             except Exception as exc:
@@ -419,15 +425,15 @@ def _automatic_loop(
 def launch_automatic(
     state: AppState,
     tracker: DecisionTracker,
-    symbol: str,
+    symbols: list[str],
     api_key: str,
     provider: str = "openai",
     model: "str | None" = None,
     cycle_sec: int = AGENT_CYCLE_SEC,
 ) -> None:
     """Stop any running agent for this state, then start the Automatic orchestrator
-    loop in the background. Uses the same stop/wake plumbing as `launch_agent`, so
-    `stop_agent` halts it too."""
+    loop (over the whole symbol basket) in the background. Uses the same stop/wake
+    plumbing as `launch_agent`, so `stop_agent` halts it too."""
     model = model or DEFAULT_AGENT_MODELS[provider]
     agent.stop_agent(state)
     stop_event = threading.Event()
@@ -439,6 +445,6 @@ def launch_automatic(
     state.automatic_reason = None
     threading.Thread(
         target=_automatic_loop,
-        args=(state, tracker, symbol, provider, api_key, model, cycle_sec, stop_event),
+        args=(state, tracker, symbols, provider, api_key, model, cycle_sec, stop_event),
         daemon=True,
     ).start()

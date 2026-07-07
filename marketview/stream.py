@@ -22,45 +22,50 @@ from .news import fetch_news_with_fallback
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
 from .state import (
     AppState,
+    SymbolState,
     alert_field_value,
     alert_triggered,
     current_volume_ratio,
     format_alert,
-    today_daily_bar,
     today_daily_volume,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _fire_due_alerts(state: AppState) -> None:
-    """Check every pending condition alert against the current state and, if any
-    is met, clear the set and wake the agent early. Called after each kind of
-    tick (bars, trades, quotes) so an alert on any continuously-updated field --
-    price, bid/ask, spread, day volume, volume ratio, portfolio value -- fires as
-    soon as its field crosses the threshold, regardless of which tick moved it.
+def _fire_due_alerts(sym_state: SymbolState) -> None:
+    """Check every pending condition alert (across ALL streamed symbols) against
+    current state and, if any is met, clear the set and wake the agent early.
+    Called after each kind of tick (bars, trades, quotes) so an alert on any
+    continuously-updated field -- price, bid/ask, spread, day volume, volume
+    ratio, portfolio value -- fires as soon as its field crosses the threshold,
+    regardless of which symbol's tick moved it (a trade on one symbol moves the
+    shared portfolio value, for instance).
 
-    Armed tactics ride the same tick: the executor is nudged so a conditional
-    trade fires as soon as its conditions are met, not on its slow fallback poll.
+    Armed tactics ride the same tick: the ticking symbol's executor is nudged so
+    a conditional trade fires as soon as its conditions are met, not on its slow
+    fallback poll.
     """
-    executor = state.tactics_executor
-    if executor is not None and state.tactics is not None:
+    executor = sym_state.tactics_executor
+    if executor is not None and sym_state.tactics is not None:
         executor.notify()
-    alerts = state.alerts
-    if not alerts:
+    app = sym_state.app
+    pairs = app.iter_alerts()
+    if not pairs:
         return
-    hit = next((a for a in alerts if alert_triggered(state, a)), None)
+    hit = next(((ss, a) for ss, a in pairs if alert_triggered(ss, a)), None)
     if hit is not None:
-        state.alerts = []
-        value = alert_field_value(state, hit.get("field"))
+        ss_hit, alert = hit
+        app.clear_alerts()
+        value = alert_field_value(ss_hit, alert.get("field"))
         value_str = f"{value:,.4f}" if isinstance(value, (int, float)) else "n/a"
-        state.agent_wake_reason = f"Alert hit: {format_alert(hit)} (now {value_str})."
-        state.agent_wake_event.set()
+        app.agent_wake_reason = f"Alert hit: {format_alert(alert)} (now {value_str})."
+        app.agent_wake_event.set()
 
 
-def _apply_quote(state: AppState, quote: dict) -> None:
+def _apply_quote(state: SymbolState, quote: dict) -> None:
     """Copy an Alpaca quote (WS message or REST payload -- same field names)
-    into state. Caller must hold state.lock.
+    into the symbol's state. Caller must hold state.lock.
 
     Alpaca reports a one-sided book as bp/ap = 0; store None for that side so
     a bogus 0.0 never reaches the spread computation or a bid/ask alert. The
@@ -124,7 +129,7 @@ def _bar_ts_key(ts: object) -> str:
     return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).isoformat()
 
 
-def merge_missing_bars(state: AppState, fetched: list[dict]) -> int:
+def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:
     """Insert fetched bars whose timestamps are absent from state.bars.
 
     On a timestamp collision the existing (streamed) bar always wins, so a
@@ -151,9 +156,9 @@ _YF_INTERVALS: dict[str, str] = {
 
 
 def backfill_bars(
-    symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str
+    symbol: str, key: str, secret: str, feed: str, state: SymbolState, timeframe: str
 ) -> tuple[int, str]:
-    """Repair holes in the live bar series from a slower-but-complete source.
+    """Repair holes in one symbol's live bar series from a slower-but-complete source.
 
     The WS stream never re-delivers bars that closed while the socket was down,
     and on the IEX feed a minute without an IEX trade produces no bar at all --
@@ -202,7 +207,7 @@ def backfill_bars(
 
 
 def _backfill_quietly(
-    symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str
+    symbol: str, key: str, secret: str, feed: str, state: SymbolState, timeframe: str
 ) -> None:
     """backfill_bars wrapped for background use: swallow failures (already logged)."""
     try:
@@ -211,9 +216,22 @@ def _backfill_quietly(
         pass
 
 
-def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
-    """Open Alpaca WebSocket and stream real-time bars and trades into state."""
+def _backfill_all_quietly(
+    symbols: list[str], key: str, secret: str, feed: str, app: AppState, timeframe: str
+) -> None:
+    for symbol in symbols:
+        sym_state = app.sym(symbol)
+        if sym_state is not None:
+            _backfill_quietly(symbol, key, secret, feed, sym_state, timeframe)
+
+
+def _start_stream(
+    symbols: list[str], key: str, secret: str, feed: str, app: AppState, timeframe: str = "1Min"
+) -> None:
+    """Open one Alpaca WebSocket and stream real-time bars/trades/quotes for
+    every subscribed symbol into its SymbolState."""
     tf_minutes = _TF_MINUTES.get(timeframe, 1)
+    symbols_label = ", ".join(symbols)
 
     def on_open(ws: websocket.WebSocketApp) -> None:
         ws.send(json.dumps({"action": "auth", "key": key, "secret": secret}))
@@ -227,24 +245,39 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         for msg in messages:
             t = msg.get("T")
             if t == "connected":
-                state.status = "Connected – authenticating…"
-            elif t == "success" and msg.get("msg") == "authenticated":
-                state.status = f"Authenticated – subscribing to {symbol} bars…"
+                app.status = "Connected – authenticating…"
+                continue
+            if t == "success" and msg.get("msg") == "authenticated":
+                app.status = f"Authenticated – subscribing to {symbols_label} bars…"
                 ws.send(
-                    json.dumps({"action": "subscribe", "bars": [symbol], "trades": [symbol], "quotes": [symbol]})
+                    json.dumps(
+                        {"action": "subscribe", "bars": symbols, "trades": symbols, "quotes": symbols}
+                    )
                 )
-            elif t == "subscription":
-                state.status = f"✅ Streaming {symbol} ({feed.upper()})"
-                state.bars_connected = True
+                continue
+            if t == "subscription":
+                app.status = f"✅ Streaming {symbols_label} ({feed.upper()})"
+                app.bars_connected = True
                 # This also fires on every reconnect. The stream only pushes
                 # bars from now on -- anything that closed while the socket was
-                # down is gone unless fetched again, so repair the hole now.
+                # down is gone unless fetched again, so repair the holes now.
                 threading.Thread(
-                    target=_backfill_quietly,
-                    args=(symbol, key, secret, feed, state, timeframe),
+                    target=_backfill_all_quietly,
+                    args=(symbols, key, secret, feed, app, timeframe),
                     daemon=True,
                 ).start()
-            elif t == "b" and msg.get("S") == symbol:
+                continue
+            if t == "error":
+                app.status = f"Stream error: {msg.get('msg')}"
+                app.bars_connected = False
+                continue
+
+            state = app.sym(msg.get("S", ""))
+            if state is None:
+                continue
+            symbol = state.symbol
+
+            if t == "b":
                 bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v", "vw") if k in msg}
                 # First bar after a (re)connect logs at INFO; identical repeats
                 # log at DEBUG (see datalog de-duplication).
@@ -279,30 +312,31 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     if "v" in bar:
                         state.day_volume = (state.day_volume or 0.0) + float(bar["v"])
                     day_volume = state.day_volume
-                    vol_enabled = state.volume_alert_enabled
-                    vol_multiplier = state.volume_alert_multiplier
                     vol_triggered = state.volume_alert_triggered
                     daily_bars = state.daily_bars
+                vol_enabled = app.volume_alert_enabled
+                vol_multiplier = app.volume_alert_multiplier
 
                 # High-volume alert: today's cumulative volume crossing
-                # multiplier x average daily volume. Latched (vol_triggered) so
-                # it fires once per session rather than on every later bar.
+                # multiplier x average daily volume. Latched per symbol
+                # (vol_triggered) so it fires once per session rather than on
+                # every later bar.
                 if vol_enabled and not vol_triggered and day_volume is not None:
                     ratio, baseline = current_volume_ratio(day_volume, daily_bars)
                     if ratio is not None and ratio >= vol_multiplier:
                         state.volume_alert_triggered = True
                         state.volume_alert_ratio = ratio
-                        state.agent_wake_reason = (
-                            f"High-volume alert: today's volume {day_volume:,.0f} is "
+                        app.agent_wake_reason = (
+                            f"High-volume alert for {symbol}: today's volume {day_volume:,.0f} is "
                             f"{ratio:.2f}x average daily volume ({baseline:,.0f}), above "
                             f"the {vol_multiplier:.2f}x threshold."
                         )
-                        state.agent_wake_event.set()
+                        app.agent_wake_event.set()
 
                 # Generic condition alerts: a bar moves previous_minute_high/low/day_volume
                 # (and the derived volume_ratio), so re-check after every bar.
                 _fire_due_alerts(state)
-            elif t == "t" and msg.get("S") == symbol:
+            elif t == "t":
                 trade = {k: msg[k] for k in ("i", "x", "p", "s", "t", "c") if k in msg}
                 log_fetch(
                     "last price",
@@ -315,18 +349,15 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
                     if "p" in msg:
                         state.last_price = float(msg["p"])
                         state.recent_prices.append((time.monotonic(), state.last_price))
-                    price = state.last_price
-                    tracker = state.decision_tracker
 
                 # Keep portfolio value marked-to-market independently of the
                 # agent loop -- it never has to fetch or compute this itself.
-                if tracker is not None and price is not None:
-                    snap = tracker.snapshot()
-                    state.portfolio_value = snap["cash"] + snap["position"] * price
+                if app.decision_tracker is not None:
+                    app.mark_to_market()
 
                 # A trade moves last_price and portfolio_value -- re-check alerts.
                 _fire_due_alerts(state)
-            elif t == "q" and msg.get("S") == symbol:
+            elif t == "q":
                 log_fetch(
                     "ask/bid price",
                     f"Alpaca WebSocket stream ({feed} feed)",
@@ -341,20 +372,17 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
 
                 # A quote moves bid/ask price+size and the derived spread.
                 _fire_due_alerts(state)
-            elif t == "error":
-                state.status = f"Stream error: {msg.get('msg')}"
-                state.bars_connected = False
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
-        logger.warning("Bars stream error for %s: %s", symbol, err)
-        state.status = f"WS error: {err}"
-        state.bars_connected = False
+        logger.warning("Bars stream error for %s: %s", symbols_label, err)
+        app.status = f"WS error: {err}"
+        app.bars_connected = False
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
-        logger.info("Bars stream closed for %s, reconnecting…", symbol)
-        state.bars_connected = False
-        if state.status.startswith("✅"):
-            state.status = "Stream closed"
+        logger.info("Bars stream closed for %s, reconnecting…", symbols_label)
+        app.bars_connected = False
+        if app.status.startswith("✅"):
+            app.status = "Stream closed"
 
     ws = websocket.WebSocketApp(
         BARS_STREAM_URL.format(feed=feed),
@@ -363,7 +391,7 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
         on_error=on_error,
         on_close=on_close,
     )
-    state.ws = ws
+    app.ws = ws
     # reconnect=5: without this, any drop (ping/pong timeout, network blip,
     # server-side close) ends run_forever for good and bars silently stop
     # arriving -- nothing else in the UI depends on this socket, so there's
@@ -380,16 +408,111 @@ def _start_stream(symbol: str, key: str, secret: str, feed: str, state: AppState
     ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
-def _fallback_bars_loop(
-    symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str, stop_event: threading.Event
-) -> None:
-    """REST-polling fallback that keeps prices flowing while the bars/trades WS isn't
-    connected. Alpaca's per-key streaming connection limit doesn't apply to REST calls,
-    so this keeps working even while `_start_stream` is stuck retrying a rejected socket
-    (e.g. another session/tab holding the one streaming slot Alpaca allows per key).
+def _poll_symbol_via_rest(
+    symbol: str, key: str, secret: str, feed: str, state: SymbolState, timeframe: str
+) -> "str | None":
+    """One REST fallback refresh of a single symbol's bars/price/quote.
+    Returns the bar source name on success, None when no bars were available."""
+    bar_failures: list[tuple[str, object]] = []
+    try:
+        bars = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
+        source = "Alpaca REST"
+    except Exception as exc:
+        bar_failures.append(("Alpaca REST", exc))
+        try:
+            bars = fetch_intraday_bars(symbol)
+            source = "yfinance (delayed)"
+        except Exception as exc2:
+            log_fetch_failure(
+                "bars",
+                bar_failures + [("yfinance", exc2)],
+                symbol=symbol,
+                consequence="no price data this cycle",
+            )
+            return None
+    if not bars:
+        log_fetch(
+            "bars", source, symbol=symbol, detail="0 bars returned", failures=bar_failures
+        )
+        return None
+    log_fetch(
+        "bars", source, symbol=symbol, detail=f"{len(bars)} bars", failures=bar_failures
+    )
 
-    Falls back further to yfinance (no API key, delayed quotes) if Alpaca's REST API
-    itself is also unavailable.
+    last_price = bars[-1].get("c")
+    price_source = f"{source} (last bar close)"
+    price_failures: list[tuple[str, object]] = []
+    try:
+        latest_trade = fetch_trades(symbol, key, secret, feed, lookback_hours=1)
+        if latest_trade:
+            last_price = latest_trade[-1].get("p", last_price)
+            price_source = "Alpaca REST (latest trade)"
+    except Exception as exc:
+        # last bar's close is still a reasonable last_price
+        price_failures.append(("Alpaca REST trades", exc))
+    log_fetch(
+        "last price",
+        price_source,
+        symbol=symbol,
+        detail=f"price={last_price}",
+        failures=price_failures,
+    )
+
+    quote = None
+    try:
+        quote = fetch_latest_quote(symbol, key, secret, feed)
+    except Exception as exc:
+        # bid/ask just won't refresh this cycle -- stays at its last known value
+        log_fetch_failure(
+            "ask/bid price",
+            [("Alpaca REST /quotes/latest", exc)],
+            symbol=symbol,
+            consequence="no fallback source provides quotes; keeping last known bid/ask",
+        )
+    if quote:
+        log_fetch(
+            "ask/bid price",
+            "Alpaca REST /quotes/latest",
+            symbol=symbol,
+            detail=f"bid={quote.get('bp')}, ask={quote.get('ap')}",
+        )
+
+    with state.lock:
+        state.bars.clear()
+        state.bars.extend(bars[-MAX_BARS:])
+        state.last_price = last_price
+        if last_price is not None:
+            state.recent_prices.append((time.monotonic(), float(last_price)))
+        last_bar = bars[-1] if bars else {}
+        state.previous_minute_high = last_bar.get("h")
+        state.previous_minute_low = last_bar.get("l")
+        state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
+        if quote:
+            _apply_quote(state, quote)
+    if state.app.decision_tracker is not None:
+        state.app.mark_to_market()
+    # Keep alerts live even when the WS is down and prices come from REST.
+    _fire_due_alerts(state)
+    return source
+
+
+def _fallback_bars_loop(
+    symbols: list[str],
+    key: str,
+    secret: str,
+    feed: str,
+    app: AppState,
+    timeframe: str,
+    stop_event: threading.Event,
+) -> None:
+    """REST-polling fallback that keeps prices flowing for every symbol while the
+    bars/trades WS isn't connected. Alpaca's per-key streaming connection limit
+    doesn't apply to REST calls, so this keeps working even while `_start_stream`
+    is stuck retrying a rejected socket (e.g. another session/tab holding the one
+    streaming slot Alpaca allows per key).
+
+    Falls back further to yfinance (no API key, delayed quotes) if Alpaca's REST
+    API itself is also unavailable.
 
     While the WS *is* connected this loop instead runs a periodic backfill
     (every BACKFILL_POLL_SEC) that merges only-missing bars, repairing holes
@@ -397,140 +520,98 @@ def _fallback_bars_loop(
     """
     last_backfill = 0.0
     while not stop_event.wait(FALLBACK_POLL_SEC):
-        if state.bars_connected:
+        if app.bars_connected:
             now = time.monotonic()
             if now - last_backfill >= BACKFILL_POLL_SEC:
                 last_backfill = now
-                _backfill_quietly(symbol, key, secret, feed, state, timeframe)
+                _backfill_all_quietly(symbols, key, secret, feed, app, timeframe)
             continue
-        bar_failures: list[tuple[str, object]] = []
-        try:
-            bars = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
-            source = "Alpaca REST"
-        except Exception as exc:
-            bar_failures.append(("Alpaca REST", exc))
-            try:
-                bars = fetch_intraday_bars(symbol)
-                source = "yfinance (delayed)"
-            except Exception as exc2:
-                log_fetch_failure(
-                    "bars",
-                    bar_failures + [("yfinance", exc2)],
-                    symbol=symbol,
-                    consequence="no price data this cycle",
-                )
+        polled_sources: list[str] = []
+        for symbol in symbols:
+            sym_state = app.sym(symbol)
+            if sym_state is None:
                 continue
-        if not bars:
-            log_fetch(
-                "bars", source, symbol=symbol, detail="0 bars returned", failures=bar_failures
-            )
-            continue
-        log_fetch(
-            "bars", source, symbol=symbol, detail=f"{len(bars)} bars", failures=bar_failures
-        )
-
-        last_price = bars[-1].get("c")
-        price_source = f"{source} (last bar close)"
-        price_failures: list[tuple[str, object]] = []
-        try:
-            latest_trade = fetch_trades(symbol, key, secret, feed, lookback_hours=1)
-            if latest_trade:
-                last_price = latest_trade[-1].get("p", last_price)
-                price_source = "Alpaca REST (latest trade)"
-        except Exception as exc:
-            # last bar's close is still a reasonable last_price
-            price_failures.append(("Alpaca REST trades", exc))
-        log_fetch(
-            "last price",
-            price_source,
-            symbol=symbol,
-            detail=f"price={last_price}",
-            failures=price_failures,
-        )
-
-        quote = None
-        try:
-            quote = fetch_latest_quote(symbol, key, secret, feed)
-        except Exception as exc:
-            # bid/ask just won't refresh this cycle -- stays at its last known value
-            log_fetch_failure(
-                "ask/bid price",
-                [("Alpaca REST /quotes/latest", exc)],
-                symbol=symbol,
-                consequence="no fallback source provides quotes; keeping last known bid/ask",
-            )
-        if quote:
-            log_fetch(
-                "ask/bid price",
-                "Alpaca REST /quotes/latest",
-                symbol=symbol,
-                detail=f"bid={quote.get('bp')}, ask={quote.get('ap')}",
+            source = _poll_symbol_via_rest(symbol, key, secret, feed, sym_state, timeframe)
+            if source:
+                polled_sources.append(source)
+        if polled_sources:
+            app.status = (
+                f"⚠️ Fallback: polling {', '.join(symbols)} via "
+                f"{polled_sources[0]} (stream down)"
             )
 
-        with state.lock:
-            state.bars.clear()
-            state.bars.extend(bars[-MAX_BARS:])
-            state.last_price = last_price
-            if last_price is not None:
-                state.recent_prices.append((time.monotonic(), float(last_price)))
-            last_bar = bars[-1] if bars else {}
-            state.previous_minute_high = last_bar.get("h")
-            state.previous_minute_low = last_bar.get("l")
-            state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
-            if quote:
-                _apply_quote(state, quote)
-        state.status = f"⚠️ Fallback: polling {symbol} via {source} (stream down)"
-        # Keep alerts live even when the WS is down and prices come from REST.
-        _fire_due_alerts(state)
 
-
-def launch_stream(symbol: str, key: str, secret: str, feed: str, state: AppState, timeframe: str = "1Min") -> None:
-    """Close any existing bars/trades stream and start a new background thread, plus a
-    REST-polling fallback that activates whenever the WS stream isn't connected."""
-    if state.ws:
+def launch_stream(
+    symbols: list[str], key: str, secret: str, feed: str, app: AppState, timeframe: str = "1Min"
+) -> None:
+    """Close any existing bars/trades stream and start a new background thread
+    streaming every symbol over one socket, plus a REST-polling fallback that
+    activates whenever the WS stream isn't connected."""
+    if app.ws:
         try:
-            state.ws.close()
+            app.ws.close()
         except Exception:
             pass
         time.sleep(0.5)
-    if state.bars_fallback_stop_event:
-        state.bars_fallback_stop_event.set()
+    if app.bars_fallback_stop_event:
+        app.bars_fallback_stop_event.set()
 
-    state.bars_connected = False
+    app.bars_connected = False
 
-    with state.lock:
-        if state.bars:
-            state.prev_close = state.bars[-1].get("c")
-        today_bar = today_daily_bar(state.daily_bars)
-        last_bar = state.bars[-1] if state.bars else None
-        state.previous_minute_high = last_bar.get("h") if last_bar else None
-        state.previous_minute_low = last_bar.get("l") if last_bar else None
-        # Seed today's running volume from today's partial daily bar (0 if the
-        # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
-        # one-shot alert latch for the new session.
-        state.day_volume = today_daily_volume(state.daily_bars)
-        state.volume_alert_triggered = False
-        state.volume_alert_ratio = None
-        state.last_price = None
-        state.bid_price = None
-        state.bid_size = None
-        state.ask_price = None
-        state.ask_size = None
-        state.quote_ts = None
+    for state in app.iter_symbol_states():
+        with state.lock:
+            if state.bars:
+                state.prev_close = state.bars[-1].get("c")
+            last_bar = state.bars[-1] if state.bars else None
+            state.previous_minute_high = last_bar.get("h") if last_bar else None
+            state.previous_minute_low = last_bar.get("l") if last_bar else None
+            # Seed today's running volume from today's partial daily bar (0 if the
+            # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
+            # one-shot alert latch for the new session.
+            state.day_volume = today_daily_volume(state.daily_bars)
+            state.volume_alert_triggered = False
+            state.volume_alert_ratio = None
+            state.last_price = None
+            state.bid_price = None
+            state.bid_size = None
+            state.ask_price = None
+            state.ask_size = None
+            state.quote_ts = None
 
     stop_event = threading.Event()
-    state.bars_fallback_stop_event = stop_event
+    app.bars_fallback_stop_event = stop_event
 
     threading.Thread(
-        target=_start_stream, args=(symbol, key, secret, feed, state, timeframe), daemon=True
+        target=_start_stream, args=(symbols, key, secret, feed, app, timeframe), daemon=True
     ).start()
     threading.Thread(
-        target=_fallback_bars_loop, args=(symbol, key, secret, feed, state, timeframe, stop_event), daemon=True
+        target=_fallback_bars_loop,
+        args=(symbols, key, secret, feed, app, timeframe, stop_event),
+        daemon=True,
     ).start()
 
 
-def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> None:
-    """Open Alpaca news WebSocket and stream real-time news articles into state."""
+def _news_message_states(app: AppState, msg: dict) -> list[SymbolState]:
+    """SymbolStates an Alpaca news message applies to. The news stream tags
+    articles with a `symbols` list (older payloads used a single `S`)."""
+    tagged = msg.get("symbols")
+    if not isinstance(tagged, list):
+        tagged = []
+    single = msg.get("S")
+    if single:
+        tagged = [*tagged, single]
+    states = []
+    for raw in tagged:
+        state = app.sym(str(raw))
+        if state is not None and state not in states:
+            states.append(state)
+    return states
+
+
+def _start_stream_news(symbols: list[str], key: str, secret: str, app: AppState) -> None:
+    """Open Alpaca news WebSocket and stream real-time news articles into every
+    matching symbol's state."""
+    symbols_label = ", ".join(symbols)
 
     def on_open(ws: websocket.WebSocketApp) -> None:
         ws.send(json.dumps({"action": "auth", "key": key, "secret": secret}))
@@ -544,47 +625,50 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
         for msg in messages:
             t = msg.get("T")
             if t == "connected":
-                state.news_status = "Connected – authenticating…"
+                app.news_status = "Connected – authenticating…"
             elif t == "success" and msg.get("msg") == "authenticated":
-                state.news_status = "Authenticated – subscribing to news…"
-                ws.send(json.dumps({"action": "subscribe", "news": [symbol]}))
+                app.news_status = "Authenticated – subscribing to news…"
+                ws.send(json.dumps({"action": "subscribe", "news": symbols}))
             elif t == "subscription":
-                state.news_status = f"✅ Streaming news ({symbol})"
-                state.news_connected = True
-            elif t == "n" and msg.get("S") == symbol:
+                app.news_status = f"✅ Streaming news ({symbols_label})"
+                app.news_connected = True
+            elif t == "n":
                 article = {
                     k: msg[k]
                     for k in ("id", "headline", "summary", "created_at", "url", "source")
                     if k in msg
                 }
-                log_fetch(
-                    "news",
-                    "Alpaca WebSocket news stream",
-                    symbol=symbol,
-                    detail=f"headline: {article.get('headline', '')[:80]}",
-                )
-                with state.lock:
-                    state.news.append(article)
-                headline = article.get("headline", "")
-                text = "Fresh news arrived for the ticker."
-                if headline:
-                    text += f" Latest: {headline}"
-                state.agent_wake_reason = text
-                state.agent_wake_event.set()
+                for state in _news_message_states(app, msg):
+                    log_fetch(
+                        "news",
+                        "Alpaca WebSocket news stream",
+                        symbol=state.symbol,
+                        detail=f"headline: {article.get('headline', '')[:80]}",
+                    )
+                    with state.lock:
+                        if any(a.get("id") == article.get("id") for a in state.news):
+                            continue
+                        state.news.append(article)
+                    headline = article.get("headline", "")
+                    text = f"Fresh news arrived for {state.symbol}."
+                    if headline:
+                        text += f" Latest: {headline}"
+                    app.agent_wake_reason = text
+                    app.agent_wake_event.set()
             elif t == "error":
-                state.news_status = f"News stream error: {msg.get('msg')}"
-                state.news_connected = False
+                app.news_status = f"News stream error: {msg.get('msg')}"
+                app.news_connected = False
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
-        logger.warning("News stream error for %s: %s", symbol, err)
-        state.news_status = f"WS error: {err}"
-        state.news_connected = False
+        logger.warning("News stream error for %s: %s", symbols_label, err)
+        app.news_status = f"WS error: {err}"
+        app.news_connected = False
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
-        logger.info("News stream closed for %s, reconnecting…", symbol)
-        state.news_connected = False
-        if state.news_status.startswith("✅"):
-            state.news_status = "Stream closed"
+        logger.info("News stream closed for %s, reconnecting…", symbols_label)
+        app.news_connected = False
+        if app.news_status.startswith("✅"):
+            app.news_status = "Stream closed"
 
     ws = websocket.WebSocketApp(
         NEWS_STREAM_URL,
@@ -593,64 +677,79 @@ def _start_stream_news(symbol: str, key: str, secret: str, state: AppState) -> N
         on_error=on_error,
         on_close=on_close,
     )
-    state.ws_news = ws
+    app.ws_news = ws
     ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
 def _fallback_news_loop(
-    symbol: str, key: str, secret: str, worldnews_key: str, state: AppState, stop_event: threading.Event
+    symbols: list[str],
+    key: str,
+    secret: str,
+    worldnews_key: str,
+    app: AppState,
+    stop_event: threading.Event,
 ) -> None:
-    """REST-polling fallback that keeps news flowing while the news WS isn't connected.
+    """REST-polling fallback that keeps news flowing for every symbol while the
+    news WS isn't connected.
 
     Alpaca's per-key streaming connection limit doesn't apply to REST calls, so this
     keeps working even while `_start_stream_news` is stuck retrying a rejected socket.
     """
     while not stop_event.wait(NEWS_FALLBACK_POLL_SEC):
-        if state.news_connected:
+        if app.news_connected:
             continue
-        try:
-            fresh = fetch_news_with_fallback(symbol, key, secret, worldnews_key)
-        except Exception as exc:
-            log_fetch_failure(
-                "news",
-                [("news fallback poll", exc)],
-                symbol=symbol,
-                consequence="retrying next poll",
-            )
-            continue
-        with state.lock:
-            seen = {a.get("id") for a in state.news}
-            new_articles = [a for a in fresh if a.get("id") not in seen]
-            state.news.extend(new_articles)
-        if new_articles:
-            state.news_status = f"⚠️ Fallback polling news for {symbol} (stream down)"
-            headline = new_articles[0].get("headline", "")
-            text = "Fresh news arrived for the ticker (via fallback poll)."
-            if headline:
-                text += f" Latest: {headline}"
-            state.agent_wake_reason = text
-            state.agent_wake_event.set()
+        for symbol in symbols:
+            state = app.sym(symbol)
+            if state is None:
+                continue
+            try:
+                fresh = fetch_news_with_fallback(symbol, key, secret, worldnews_key)
+            except Exception as exc:
+                log_fetch_failure(
+                    "news",
+                    [("news fallback poll", exc)],
+                    symbol=symbol,
+                    consequence="retrying next poll",
+                )
+                continue
+            with state.lock:
+                seen = {a.get("id") for a in state.news}
+                new_articles = [a for a in fresh if a.get("id") not in seen]
+                state.news.extend(new_articles)
+            if new_articles:
+                app.news_status = f"⚠️ Fallback polling news for {symbol} (stream down)"
+                headline = new_articles[0].get("headline", "")
+                text = f"Fresh news arrived for {symbol} (via fallback poll)."
+                if headline:
+                    text += f" Latest: {headline}"
+                app.agent_wake_reason = text
+                app.agent_wake_event.set()
 
 
-def launch_stream_news(symbol: str, key: str, secret: str, state: AppState, worldnews_key: str = "") -> None:
-    """Close any existing news stream and start a new background thread, plus a
-    REST-polling fallback that activates whenever the WS stream isn't connected."""
-    if state.ws_news:
+def launch_stream_news(
+    symbols: list[str], key: str, secret: str, app: AppState, worldnews_key: str = ""
+) -> None:
+    """Close any existing news stream and start a new background thread covering
+    every symbol, plus a REST-polling fallback that activates whenever the WS
+    stream isn't connected."""
+    if app.ws_news:
         try:
-            state.ws_news.close()
+            app.ws_news.close()
         except Exception:
             pass
         time.sleep(0.5)
-    if state.news_fallback_stop_event:
-        state.news_fallback_stop_event.set()
+    if app.news_fallback_stop_event:
+        app.news_fallback_stop_event.set()
 
-    state.news_connected = False
+    app.news_connected = False
     stop_event = threading.Event()
-    state.news_fallback_stop_event = stop_event
+    app.news_fallback_stop_event = stop_event
 
     threading.Thread(
-        target=_start_stream_news, args=(symbol, key, secret, state), daemon=True
+        target=_start_stream_news, args=(symbols, key, secret, app), daemon=True
     ).start()
     threading.Thread(
-        target=_fallback_news_loop, args=(symbol, key, secret, worldnews_key, state, stop_event), daemon=True
+        target=_fallback_news_loop,
+        args=(symbols, key, secret, worldnews_key, app, stop_event),
+        daemon=True,
     ).start()

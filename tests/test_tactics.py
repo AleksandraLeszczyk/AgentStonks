@@ -162,7 +162,9 @@ class TestFormattingAndLevels:
 
 class TestMomentumPct:
     def test_computes_pct_change_over_window(self):
-        state = AppState()
+        app = AppState()
+        app.set_symbols(["AAPL"])
+        state = app.sym("AAPL")
         state.bars.extend(
             [
                 {"t": "2026-07-02T14:00:00Z", "c": 100.0},
@@ -174,14 +176,17 @@ class TestMomentumPct:
         assert momentum_pct(state, window_min=10) == pytest.approx(10.0)
 
     def test_none_without_enough_bars(self):
-        state = AppState()
+        app = AppState()
+        app.set_symbols(["AAPL"])
+        state = app.sym("AAPL")
         state.bars.append({"t": "2026-07-02T14:00:00Z", "c": 100.0})
         assert momentum_pct(state) is None
 
 
 def _armed_state(symbol="AAPL", raw_actions=None, last_price=None):
-    state = AppState()
-    state.symbol = symbol
+    app = AppState()
+    app.set_symbols([symbol])
+    state = app.sym(symbol)
     state.last_price = last_price
     tactics, error = normalize_tactics(symbol, raw_actions, "test plan")
     assert error is None
@@ -191,7 +196,9 @@ def _armed_state(symbol="AAPL", raw_actions=None, last_price=None):
 
 class TestTacticsExecutor:
     def test_no_tactics_no_execution(self):
-        state = AppState()
+        app = AppState()
+        app.set_symbols(["AAPL"])
+        state = app.sym("AAPL")
         tracker = DecisionTracker(starting_cash=1000, broker=FakeBroker())
         executor = TacticsExecutor(state, tracker)
         assert executor.check_now() is None
@@ -255,7 +262,7 @@ class TestTacticsExecutor:
         state = _armed_state(raw_actions=raw, last_price=125.0)
         broker = FakeBroker(price=125.0)
         tracker = DecisionTracker(starting_cash=0, broker=broker)
-        tracker.position = 50.0
+        tracker.positions["AAPL"] = 50.0
 
         TacticsExecutor(state, tracker).check_now()
 
@@ -318,12 +325,12 @@ class TestTacticsExecutor:
 class TestAgentSetTactics:
     def _run(self, state, tracker, responses):
         client = FakeClient(responses)
-        return run_agent_cycle(client, "test-model", "AAPL", state, tracker, personality="momentum")
+        return run_agent_cycle(client, "test-model", ["AAPL"], state, tracker, personality="momentum")
 
     def test_set_tactics_arms_and_allows_bare_alert(self):
         state = AppState()
-        state.symbol = "AAPL"
-        state.last_price = 100.0
+        state.set_symbols(["AAPL"])
+        state.sym("AAPL").last_price = 100.0
         tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
         responses = [
             _response(
@@ -349,7 +356,8 @@ class TestAgentSetTactics:
         result = self._run(state, tracker, responses)
 
         assert result == "decided"
-        assert state.tactics is not None and len(state.tactics.actions) == 1
+        armed = state.sym("AAPL").tactics
+        assert armed is not None and len(armed.actions) == 1
         actions = [d.action for d in tracker.snapshot()["decisions"]]
         assert actions == ["tactics", "alert"]
         types = [e["type"] for e in state.agent_log]
@@ -357,11 +365,11 @@ class TestAgentSetTactics:
         armed_decision = tracker.snapshot()["decisions"][0]
         assert armed_decision.status == "armed"
         assert armed_decision.price == 100.0
-        assert armed_decision.tactics == ["buy 5 sh when last_price below 90"]
+        assert armed_decision.tactics == ["buy 5 sh AAPL when last_price below 90"]
 
     def test_bare_alert_without_tactics_still_rejected(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
         responses = [
             _response(
@@ -391,7 +399,7 @@ class TestAgentSetTactics:
 
     def test_invalid_tactics_returns_error_for_retry(self):
         state = AppState()
-        state.symbol = "AAPL"
+        state.set_symbols(["AAPL"])
         tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
         responses = [
             _response(
@@ -422,20 +430,20 @@ class TestAgentSetTactics:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "test-model", "AAPL", state, tracker, personality="momentum")
+        run_agent_cycle(client, "test-model", ["AAPL"], state, tracker, personality="momentum")
 
-        assert state.tactics is None
+        assert state.sym("AAPL").tactics is None
         # The error travelled back as the tool result on the second LLM turn.
         tool_msgs = [m for m in client.calls[1] if m.get("role") == "tool"]
         assert any("exactly one" in m["content"] for m in tool_msgs)
 
     def test_set_tactics_with_empty_actions_cancels(self):
         state = AppState()
-        state.symbol = "AAPL"
-        state.last_price = 100.0
+        state.set_symbols(["AAPL"])
+        state.sym("AAPL").last_price = 100.0
         tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker())
         tactics, _ = normalize_tactics("AAPL", [_entry_action(quantity=5)], "old plan")
-        state.tactics = tactics
+        state.sym("AAPL").tactics = tactics
         responses = [
             _response(
                 tool_calls=[
@@ -459,9 +467,9 @@ class TestAgentSetTactics:
 
         self._run(state, tracker, responses)
 
-        assert state.tactics is None
+        assert state.sym("AAPL").tactics is None
         cancelled = [e for e in state.agent_log if e["type"] == "tactics_set"]
-        assert cancelled and cancelled[0]["cancelled"] == ["buy 5 sh when last_price below 90"]
+        assert cancelled and cancelled[0]["cancelled"] == ["buy 5 sh AAPL when last_price below 90"]
 
     def test_all_personalities_expose_set_tactics(self):
         from marketview.agent import PERSONALITY_TOOLS

@@ -31,41 +31,41 @@ def _decision(ts: str, action: str, price: float, cash_after: float, position_af
 
 class TestComputeEquityCurve:
     def test_empty_bars_returns_empty(self):
-        assert compute_equity_curve([], [], 1000.0, SESSION_START) == []
+        assert compute_equity_curve({}, [], 1000.0, SESSION_START) == []
 
     def test_no_decisions_uses_starting_cash_throughout(self):
-        points = compute_equity_curve(BARS, [], 1000.0, SESSION_START)
+        points = compute_equity_curve({"AAPL": BARS}, [], 1000.0, SESSION_START)
         assert len(points) == 3
         assert all(p["value"] == 1000.0 for p in points)
         assert all(p["position"] == 0.0 for p in points)
 
     def test_decision_changes_value_from_its_timestamp_onward(self):
         decisions = [_decision("2024-01-15T14:00:30Z", "buy", 100.0, cash_after=898.85, position_after=1.0)]
-        points = compute_equity_curve(BARS, decisions, 1000.0, SESSION_START)
+        points = compute_equity_curve({"AAPL": BARS}, decisions, 1000.0, SESSION_START)
         assert points[0]["value"] == 1000.0  # before the decision
         assert points[1]["value"] == 898.85 + 1.0 * 102.0
         assert points[2]["value"] == 898.85 + 1.0 * 104.0
 
     def test_bars_before_session_start_are_excluded(self):
         old_bar = {"t": "2024-01-14T10:00:00Z", "o": 50.0, "h": 51.0, "l": 49.0, "c": 50.0, "v": 1000}
-        points = compute_equity_curve([old_bar] + BARS, [], 1000.0, SESSION_START)
+        points = compute_equity_curve({"AAPL": [old_bar] + BARS}, [], 1000.0, SESSION_START)
         assert len(points) == 3
 
     def test_live_price_appends_trailing_point_priced_off_live_price(self):
         decisions = [_decision("2024-01-15T14:00:30Z", "buy", 100.0, cash_after=898.85, position_after=1.0)]
-        points = compute_equity_curve(BARS, decisions, 1000.0, SESSION_START, live_price=110.0)
+        points = compute_equity_curve({"AAPL": BARS}, decisions, 1000.0, SESSION_START, live_prices={"AAPL": 110.0})
         assert len(points) == 4
         assert points[-1]["price"] == 110.0
         assert points[-1]["value"] == 898.85 + 1.0 * 110.0
         assert points[-1]["position"] == 1.0
 
     def test_live_price_works_with_no_bars(self):
-        points = compute_equity_curve([], [], 1000.0, SESSION_START, live_price=105.0)
+        points = compute_equity_curve({}, [], 1000.0, SESSION_START, live_prices={"AAPL": 105.0})
         assert len(points) == 1
         assert points[0]["value"] == 1000.0
 
     def test_no_live_price_and_no_bars_returns_empty(self):
-        assert compute_equity_curve([], [], 1000.0, SESSION_START, live_price=None) == []
+        assert compute_equity_curve({}, [], 1000.0, SESSION_START, live_prices=None) == []
 
 
 class TestDecisionMarkers:
