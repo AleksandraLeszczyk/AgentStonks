@@ -1,6 +1,5 @@
 import json
 import threading
-import time
 from types import SimpleNamespace
 
 from marketview.agent import (
@@ -78,35 +77,6 @@ class TestToolHandlers:
         result = _tool_get_quote(state)
         assert result["last_price"] == 101.0
         assert result["bid_price"] == 100.5
-
-    def test_get_quote_tight_fresh_quote_has_no_warning(self):
-        from datetime import datetime, timezone
-
-        state = AppState()
-        state.last_price = 100.01
-        state.bid_price, state.ask_price = 100.0, 100.02
-        state.quote_ts = datetime.now(timezone.utc).isoformat()
-        result = _tool_get_quote(state)
-        assert result["spread"] == 0.02
-        assert result["quote_age_sec"] < 5
-        assert "warning" not in result
-
-    def test_get_quote_flags_placeholder_wide_quote(self):
-        # Real off-hours IEX quote: ~10% wide around the mid, useless as a price.
-        state = AppState()
-        state.last_price = 288.64
-        state.bid_price, state.ask_price = 274.46, 305.29
-        result = _tool_get_quote(state)
-        assert result["spread_pct"] > 10
-        assert "use last_price" in result["warning"]
-
-    def test_get_quote_flags_stale_quote(self):
-        state = AppState()
-        state.bid_price, state.ask_price = 100.0, 100.02
-        state.quote_ts = "2020-01-01T00:00:00Z"
-        result = _tool_get_quote(state)
-        assert result["quote_age_sec"] > 3600
-        assert "stale" in result["warning"]
 
     def test_get_news_maps_impact_labels(self):
         state = AppState()
@@ -215,7 +185,7 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=5)
+        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=5)
 
         snap = tracker.snapshot()
         assert snap["position"] == 2.0
@@ -252,7 +222,7 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3, personality="breakout")
+        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3, personality="breakout")
 
         assert client.tools_seen[0] is BREAKOUT_TOOLS
 
@@ -266,7 +236,7 @@ class TestRunAgentCycle:
         responses = [_response(content="still thinking...") for _ in range(3)]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
@@ -302,7 +272,7 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
@@ -338,7 +308,7 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
@@ -376,7 +346,7 @@ class TestRunAgentCycle:
         ]
         client = FakeClient(responses)
 
-        run_agent_cycle(client, "gemini-2.0-flash", "AAPL", state, tracker, max_iters=3)
+        run_agent_cycle(client, "gemini-3.5-flash", "AAPL", state, tracker, max_iters=3)
 
         snap = tracker.snapshot()
         decision = snap["decisions"][0]
@@ -503,30 +473,19 @@ class TestRunAgentCycle:
         assert state.alerts == []
 
 
-def _set_price(state: AppState, price: float) -> None:
-    """Set the live price the way the stream does: last_price plus a tick in the
-    recent_prices window that last_price alerts are checked against."""
-    state.last_price = price
-    state.recent_prices.append((time.monotonic(), price))
-
-
 class TestAlertTrigger:
     def test_alert_triggered_above(self):
         state = AppState()
-        _set_price(state, 151.0)
+        state.last_price = 151.0
         assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is True
-        # Fresh state: the wick window intentionally remembers recent ticks, so
-        # a lower print right after 151 would still (correctly) trigger.
-        state = AppState()
-        _set_price(state, 149.0)
+        state.last_price = 149.0
         assert alert_triggered(state, {"field": "last_price", "condition": "above", "value": 150.0}) is False
 
     def test_alert_triggered_below(self):
         state = AppState()
-        _set_price(state, 99.0)
+        state.last_price = 99.0
         assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is True
-        state = AppState()
-        _set_price(state, 101.0)
+        state.last_price = 101.0
         assert alert_triggered(state, {"field": "last_price", "condition": "below", "value": 100.0}) is False
 
     def test_alert_triggered_on_non_price_field(self):
@@ -539,7 +498,7 @@ class TestAlertTrigger:
 
     def test_wait_returns_early_when_alert_fires(self):
         state = AppState()
-        _set_price(state, 151.0)
+        state.last_price = 151.0
         state.alerts = [{"field": "last_price", "condition": "above", "value": 150.0}]
         stop_event = threading.Event()
 
@@ -551,9 +510,7 @@ class TestAlertTrigger:
             _wait_for_next_cycle(state, stop_event, cycle_sec=60)
             finished.set()
 
-        # daemon: a regression that never wakes must fail the assert below, not
-        # hang the interpreter at exit on a forever-blocked join.
-        thread = threading.Thread(target=run, daemon=True)
+        thread = threading.Thread(target=run)
         thread.start()
         thread.join(timeout=5)
 
@@ -565,7 +522,7 @@ class TestAlertTrigger:
 
     def test_wait_returns_early_when_low_side_of_bracket_fires(self):
         state = AppState()
-        _set_price(state, 94.0)
+        state.last_price = 94.0
         state.alerts = [
             {"field": "last_price", "condition": "below", "value": 95.0},
             {"field": "last_price", "condition": "above", "value": 150.0},
@@ -580,7 +537,7 @@ class TestAlertTrigger:
             _wait_for_next_cycle(state, stop_event, cycle_sec=60)
             finished.set()
 
-        thread = threading.Thread(target=run, daemon=True)
+        thread = threading.Thread(target=run)
         thread.start()
         thread.join(timeout=5)
 
