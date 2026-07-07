@@ -845,7 +845,7 @@ def build_chart(
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])
     if not df_news.empty:
-        df_news["created_at"] = pd.to_datetime(df_news["created_at"])
+        df_news["created_at"] = pd.to_datetime(df_news["created_at"], format="ISO8601", utc=True)
         df_news = df_news[df_news["created_at"] > session_start]
 
     if not df_news.empty:

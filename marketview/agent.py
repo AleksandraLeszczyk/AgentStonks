@@ -104,10 +104,16 @@ losers immediately if the setup fails -- don't wait to see.
 6. FINALIZE. Turn the levels from your analysis into ACTION CONDITIONS, not \
 a passive wait: arm them with set_tactics, stating exactly what must be true \
 for you to buy or sell. For momentum that is typically a buy when last_price \
-clears the flag high / reclaim level AND volume_ratio is above your \
-confirmation threshold (so the entry only fires with participation behind \
-it), a sell (stop) when last_price drops below the consolidation low or \
-VWAP, and a sell (take-profit) into your target. Then call submit_decision \
+clears the flag high / reclaim level, a sell (stop) when last_price drops \
+below the consolidation low or VWAP, and a sell (take-profit) into your \
+target. Volume confirmation (step 3) is checked NOW, from analyze_volume's \
+`relative_volume`, while you decide whether to arm the entry at all -- do \
+NOT encode it as a tactic condition: the watchable volume_ratio field is \
+today's CUMULATIVE volume vs a full average day's, a different metric that \
+stays far below an intraday-pace threshold like 1.5 for most of the session \
+and would keep a good entry from ever firing. If participation hasn't \
+confirmed yet, arm only the levels you would trade mechanically and add an \
+alert at the breakout level to reassess volume when it is hit. Then call submit_decision \
 exactly once: action (buy/sell/alert), quantity (omit or 0 for alert), the \
 regime, and reasoning that names the setup, the breakout/stop levels, and \
 the volume confirmation you used. Trade immediately (buy/sell) only when the \
@@ -199,10 +205,16 @@ back to the original stop.
 8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
 them with set_tactics, stating exactly what must be true for you to buy or \
 sell. For a breakout that is typically a buy when last_price clears the \
-range high AND volume_ratio is above your confirmation threshold -- so the \
-entry only fires on a break that volume is actually behind, not a quiet \
-drift through the level -- plus a sell (stop) just below the range low and a \
-sell (take-profit) at the ATR-projected target from step 6. Then call \
+range high, plus a sell (stop) just below the range low and a sell \
+(take-profit) at the ATR-projected target from step 6. Volume confirmation \
+(step 2) is checked NOW, from analyze_volume's `relative_volume`, while you \
+decide whether to arm the entry at all -- do NOT encode it as a tactic \
+condition: the watchable volume_ratio field is today's CUMULATIVE volume vs \
+a full average day's, a different metric that stays far below an \
+intraday-pace threshold like 1.5 for most of the session and would keep the \
+entry from ever firing on a real break. If the break hasn't confirmed on \
+volume yet, arm only the levels you would trade mechanically and add an \
+alert at the range high to reassess participation when it is hit. Then call \
 submit_decision exactly once: action (buy/sell/alert), quantity (omit or 0 \
 for alert), the regime, and reasoning that names the range level, the volume \
 confirmation, the entry/stop/target geometry, and why this action follows \

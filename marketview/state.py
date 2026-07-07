@@ -35,7 +35,11 @@ ALERTABLE_FIELDS: dict[str, str] = {
     "previous_minute_high": "High of the last completed 1-minute bar",
     "previous_minute_low": "Low of the last completed 1-minute bar",
     "day_volume": "Cumulative shares traded so far today",
-    "volume_ratio": "Today's cumulative volume divided by average daily volume",
+    "volume_ratio": (
+        "Today's cumulative volume divided by the average FULL day's volume -- climbs "
+        "from ~0 toward ~1 over a normal session, so it is NOT an intraday-pace measure "
+        "and makes a poor breakout-confirmation condition"
+    ),
     "portfolio_value": "Paper portfolio value (cash + all positions marked to last price)",
 }
 
