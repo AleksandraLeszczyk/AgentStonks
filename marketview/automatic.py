@@ -44,7 +44,6 @@ from .agent import (
     _TOOL_GET_QUOTE,
     _dispatch_tool,
     _log,
-    _preview,
     _reject,
     _wait_for_next_cycle,
     run_agent_cycle,
@@ -296,7 +295,7 @@ def run_regime_cycle(
             else:
                 result = _dispatch_tool(name, args, state, tracker)
                 result_content = json.dumps(result)
-                _log(state, {"type": "tool_call", "name": name, "args": args, "result_preview": _preview(result_content)})
+                _log(state, {"type": "tool_call", "name": name, "args": args, "result": result})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
 
         if selection is not None:

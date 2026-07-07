@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from collections import deque
@@ -444,6 +445,33 @@ def format_alert(alert: dict) -> str:
     symbol = alert.get("symbol")
     prefix = f"{symbol} " if symbol else ""
     return f"{prefix}{field} {condition} {value_str}"
+
+
+def format_tool_kv(data: dict, max_items: int = 8, max_value_len: int = 48) -> list[tuple[str, str]]:
+    """Flatten a tool call's args/result dict into (key, value) pairs for log
+    display. Truncates each value individually rather than the whole blob, so
+    long results never get cut off mid-token."""
+    if not isinstance(data, dict):
+        return [("", _format_tool_value(data, max_value_len))]
+    items = list(data.items())
+    rows = [(str(k), _format_tool_value(v, max_value_len)) for k, v in items[:max_items]]
+    if len(items) > max_items:
+        rows.append(("…", f"+{len(items) - max_items} more"))
+    return rows
+
+
+def _format_tool_value(value: object, max_len: int) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        s = "true" if value else "false"
+    elif isinstance(value, float):
+        s = f"{value:,.4g}"
+    elif isinstance(value, (list, dict)):
+        s = json.dumps(value, separators=(",", ":"))
+    else:
+        s = str(value)
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
 
 
 def _daily_bar_date(bar: dict) -> str:

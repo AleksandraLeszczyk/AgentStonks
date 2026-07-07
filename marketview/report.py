@@ -13,7 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from .config import PALETTE
-from .state import format_alert
+from .state import format_alert, format_tool_kv
 
 _CSS = f"""
 body {{
@@ -183,8 +183,16 @@ def _agent_log_html(log: list[dict]) -> str:
         elif etype == "tool_call":
             label = str(entry.get("name", "tool"))
             color = PALETTE["accent"]
-            result = html.escape(entry.get("result_preview", ""))
-            body = f"<div>{result}</div>"
+            result = entry.get("result") or {}
+            if "error" in result:
+                body = f"<div style='color:{PALETTE['down']}'>⚠ {html.escape(str(result['error']))}</div>"
+            else:
+                pairs = " &nbsp;·&nbsp; ".join(
+                    f"<span style='color:{PALETTE['muted']}'>{html.escape(k)}</span>="
+                    f"<span>{html.escape(v)}</span>"
+                    for k, v in format_tool_kv(result)
+                )
+                body = f"<div style='font-family:monospace;font-size:11px'>{pairs}</div>"
         elif etype == "regime_select":
             label = "REGIME → STRATEGY"
             color = PALETTE.get("orange", PALETTE["accent"])

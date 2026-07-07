@@ -1734,10 +1734,6 @@ def _dispatch_tool(name: str, args: dict, app: "AppState", tracker: "DecisionTra
         return {"error": str(exc)}
 
 
-def _preview(text: str, width: int = 200) -> str:
-    return text if len(text) <= width else text[: width - 1] + "…"
-
-
 def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
     """Hand a malformed submit_decision back to the model as a tool error so it can
     retry. Used for the cases that have no valid resting state -- an empty alert, a
@@ -1876,7 +1872,7 @@ def run_agent_cycle(
                 result = _handle_set_tactics(args, state, tracker)
                 result_content = json.dumps(result)
                 if "error" in result:
-                    _log(state, {"type": "tool_call", "name": name, "args": args, "result_preview": _preview(result_content)})
+                    _log(state, {"type": "tool_call", "name": name, "args": args, "result": result})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
                 continue
 
@@ -1996,7 +1992,7 @@ def run_agent_cycle(
             else:
                 result = _dispatch_tool(name, args, state, tracker)
                 result_content = json.dumps(result)
-                _log(state, {"type": "tool_call", "name": name, "args": args, "result_preview": _preview(result_content)})
+                _log(state, {"type": "tool_call", "name": name, "args": args, "result": result})
 
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
 

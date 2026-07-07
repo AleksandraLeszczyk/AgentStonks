@@ -1,6 +1,5 @@
 import base64
 import html
-import json
 import os
 import re
 from dataclasses import asdict
@@ -75,6 +74,7 @@ from .state import (
     SymbolState,
     current_volume_ratio,
     format_alert,
+    format_tool_kv,
 )
 from .tactics import tactic_price_levels, tactics_summaries
 from .stream import backfill_bars, launch_stream, launch_stream_news
@@ -968,6 +968,17 @@ def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
     return "ℹ️", PALETTE["muted"], "status"
 
 
+def _kv_row_html(data: dict) -> str:
+    """Render a tool call's args/result dict as compact monospace key=value
+    chips instead of a raw (and often mid-token truncated) JSON blob."""
+    pairs = " &nbsp;·&nbsp; ".join(
+        f"<span style='color:{PALETTE['muted']}'>{html.escape(k)}</span>="
+        f"<span>{html.escape(v)}</span>"
+        for k, v in format_tool_kv(data)
+    )
+    return f"<span style='font-family:monospace;font-size:11px'>{pairs}</span>"
+
+
 def _agent_entry_body(entry: dict) -> str:
     etype = entry.get("type")
     if etype == "decision":
@@ -1021,9 +1032,21 @@ def _agent_entry_body(entry: dict) -> str:
         )
     if etype == "tool_call":
         args = entry.get("args") or {}
-        args_html = f"<div style='color:{PALETTE['muted']}'>args: {html.escape(json.dumps(args))}</div>" if args else ""
-        result = html.escape(entry.get("result_preview", ""))
-        return f"{args_html}<div>{result}</div>"
+        result = entry.get("result") or {}
+        parts = []
+        if args:
+            parts.append(f"<div style='margin-bottom:2px'>{_kv_row_html(args)}</div>")
+        if "error" in result:
+            parts.append(
+                f"<div style='color:{PALETTE['down']}'>⚠ {html.escape(str(result['error']))}</div>"
+            )
+        elif set(result.keys()) <= {"note"} and result.get("note"):
+            parts.append(
+                f"<div style='color:{PALETTE['muted']};font-style:italic'>{html.escape(str(result['note']))}</div>"
+            )
+        elif result:
+            parts.append(f"<div>{_kv_row_html(result)}</div>")
+        return "".join(parts)
     if etype == "regime_select":
         label = html.escape(str(entry.get("label", entry.get("strategy", ""))))
         regime = html.escape(str(entry.get("regime", "unknown")))
