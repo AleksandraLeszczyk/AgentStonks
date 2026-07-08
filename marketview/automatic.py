@@ -29,6 +29,7 @@ from typing import Any
 from . import agent
 from . import market_hours
 from . import observability as obs
+from . import scoring
 from .agent import (
     AGENT_PERSONALITIES,
     PREMARKET_PERSONALITY,
@@ -301,6 +302,10 @@ def run_regime_cycle(
         if selection is not None:
             break
 
+    # The select_strategy reasoning must cite real tool numbers -- audit it
+    # like any strategy cycle (see marketview.scoring).
+    scoring.record_cycle_grounding(state, messages, AUTOMATIC_KEY)
+
     return selection
 
 
@@ -336,7 +341,9 @@ def _automatic_loop(
                     ),
                 },
             )
+            scoring.record_activation_start(state, PREMARKET_PERSONALITY, "premarket")
             outcome = run_premarket_session(client, model, symbols, state, tracker, stop_event)
+            scoring.record_activation_end(state)
             state.automatic_active_strategy = None
             if stop_event.is_set():
                 break
@@ -354,6 +361,7 @@ def _automatic_loop(
             continue
 
         # 1. Assess the regime and pick a strategy.
+        scoring.maybe_score_week(state, tracker)
         state.automatic_active_strategy = None
         selection = None
         try:
@@ -373,6 +381,11 @@ def _automatic_loop(
             continue
 
         strategy = selection["strategy"]
+        # Opens this strategy's scoring window: at week's end each activation
+        # is judged on whether it made any active decision (a filled trade or
+        # armed tactics) -- an alerts-only window means the pick didn't fit
+        # that day's tape.
+        scoring.record_activation_start(state, strategy, selection.get("regime"))
         state.automatic_active_strategy = strategy
         state.automatic_regime = selection.get("regime")
         state.automatic_reason = selection.get("reasoning")
@@ -414,7 +427,9 @@ def _automatic_loop(
             if stop_event.is_set():
                 break
             _wait_for_next_cycle(state, stop_event, cycle_sec)
+        scoring.record_activation_end(state)
 
+    scoring.end_session(state, tracker)
     state.agent_running = False
     state.automatic_active_strategy = None
     _log(state, {"type": "status", "text": "Automatic orchestrator stopped"})
@@ -438,6 +453,7 @@ def launch_automatic(
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
+    scoring.begin_session(state, AUTOMATIC_KEY, symbols)
     agent.start_tactics_executor(state, tracker)
     state.automatic_active_strategy = None
     state.automatic_regime = None

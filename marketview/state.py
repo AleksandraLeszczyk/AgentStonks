@@ -199,6 +199,7 @@ _DEFAULTS: dict[str, object] = {
     "automatic_regime": None,
     "automatic_reason": None,
     "news_llm_provider": "openai",
+    "scorecard": None,
 }
 
 
@@ -260,6 +261,9 @@ class AppState:
         self.automatic_regime: str | None = None
         self.automatic_reason: str | None = None
         self.news_llm_provider: str = "openai"
+        # Per-session scoring collector (see marketview.scoring); attached by
+        # launch_agent/launch_automatic, flushed to the journal at session end.
+        self.scorecard = None  # "scoring.Scorecard | None"
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

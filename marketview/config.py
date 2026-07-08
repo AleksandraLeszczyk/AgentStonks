@@ -53,6 +53,11 @@ AGENT_MAX_TOOL_ITERS = 8
 PAPER_STARTING_CASH = 100_000.0
 TRADE_FIXED_COST = 1.15
 
+# Weekly agent-accuracy scoring (see marketview.scoring): a scoring session
+# runs at most once per ISO week, and only after the week has accumulated at
+# least this much total agent runtime -- short experiments alone never score.
+SCORING_MIN_TOTAL_RUNTIME_SEC = 3600
+
 # Premarket analyst: it may start its single opening-tactics cycle no earlier
 # than PREMARKET_LEAD_SEC before the opening bell; while holding for that
 # window it re-checks the clock every PREMARKET_WAIT_POLL_SEC.

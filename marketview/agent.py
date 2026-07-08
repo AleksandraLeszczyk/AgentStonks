@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from . import historical
 from . import market_hours
 from . import observability as obs
+from . import scoring
 from . import technical_analysis as ta
 from .config import (
     AGENT_MAX_TOOL_ITERS,
@@ -1763,11 +1764,14 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
 def _dispatch_tool(name: str, args: dict, app: "AppState", tracker: "DecisionTracker") -> dict:
     handler = _DISPATCH.get(name)
     if handler is None:
-        return {"error": f"unknown tool {name}"}
-    try:
-        return handler(args, app, tracker)
-    except Exception as exc:
-        return {"error": str(exc)}
+        result = {"error": f"unknown tool {name}"}
+    else:
+        try:
+            result = handler(args, app, tracker)
+        except Exception as exc:
+            result = {"error": str(exc)}
+    scoring.record_tool_call(app, name, result)
+    return result
 
 
 def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
@@ -1906,6 +1910,7 @@ def run_agent_cycle(
                 # _handle_set_tactics writes its own "tactics_set" log entry on
                 # success; only a validation failure is logged as a plain tool call.
                 result = _handle_set_tactics(args, state, tracker)
+                scoring.record_tactics_call(state, ok="error" not in result)
                 result_content = json.dumps(_round_prices_for_llm(result))
                 if "error" in result:
                     _log(state, {"type": "tool_call", "name": name, "args": args, "result": result})
@@ -2036,6 +2041,10 @@ def run_agent_cycle(
 
         if decision_made:
             break
+
+    # Deterministic numeric-faithfulness check over the cycle's full transcript
+    # (see marketview.scoring); aggregated into the weekly scoring session.
+    scoring.record_cycle_grounding(state, messages, personality)
 
     if stood_down:
         return "stand_down"
@@ -2229,6 +2238,7 @@ def _premarket_loop(
     outcome = run_premarket_session(client, model, symbols, state, tracker, stop_event)
     if outcome != "stopped" and state.agent_stop_event is stop_event:
         stop_agent(state)
+    scoring.end_session(state, tracker)
     state.agent_running = False
     _log(state, {"type": "status", "text": "Premarket analyst disabled."})
     obs.flush()
@@ -2251,7 +2261,11 @@ def _agent_loop(
             run_agent_cycle(client, model, symbols, state, tracker, personality=personality)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Agent cycle failed: {exc}"})
+        # Weekly scoring may come due mid-session on a long-running agent; the
+        # check is one stat() call once the week is scored.
+        scoring.maybe_score_week(state, tracker)
         _wait_for_next_cycle(state, stop_event, cycle_sec)
+    scoring.end_session(state, tracker)
     state.agent_running = False
     _log(state, {"type": "status", "text": "Agent stopped"})
 
@@ -2283,6 +2297,7 @@ def launch_agent(
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
+    scoring.begin_session(state, personality, symbols)
     start_tactics_executor(state, tracker)
     if personality == PREMARKET_PERSONALITY:
         # One-shot pre-open specialist: holds for the opening window, arms the
