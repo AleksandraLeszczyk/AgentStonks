@@ -113,8 +113,8 @@ def anthropic_generation(
     if client is None:
         yield None
         return
-    with client.start_as_current_generation(
-        name=name, model=model, input=input, metadata=metadata or None
+    with client.start_as_current_observation(
+        as_type="generation", name=name, model=model, input=input, metadata=metadata or None
     ) as generation:
         yield generation
 
