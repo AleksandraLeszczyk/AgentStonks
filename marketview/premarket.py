@@ -70,6 +70,13 @@ Be concise. If data is thin, lower confidence to "low" and say so in the summary
 """
 
 
+def _fmt_price(value: float) -> str:
+    """Format a dollar price for the LLM prompt: whole dollars above $100, cents below.
+    Keeps the model reasoning in round numbers for higher-priced names while the UI
+    (which formats independently) continues to show exact prices."""
+    return f"{value:.0f}" if value > 100 else f"{value:.2f}"
+
+
 def _price_context(symbol: str) -> tuple[str, dict[str, float]]:
     """Fetch daily closes for multiple lookback windows. Returns (text, last_closes_by_period)."""
     lines: list[str] = []
@@ -82,7 +89,10 @@ def _price_context(symbol: str) -> tuple[str, dict[str, float]]:
             start, end = float(series.iloc[0]), float(series.iloc[-1])
             pct = (end - start) / start * 100
             hi, lo = float(series.max()), float(series.min())
-            lines.append(f"  {label}: {pct:+.1f}%  (range {lo:.2f}–{hi:.2f}, last close {end:.2f})")
+            lines.append(
+                f"  {label}: {pct:+.1f}%  (range {_fmt_price(lo)}–{_fmt_price(hi)}, "
+                f"last close {_fmt_price(end)})"
+            )
             last_close[label] = end
         except Exception:
             pass
@@ -107,7 +117,7 @@ def _macro_context(days: int = 30) -> str:
         spy_str = f"SPY 5d {w1:+.1f}%"
         if m1 is not None:
             spy_str += f" / 1mo {m1:+.1f}%"
-        spy_str += f" (close {spy.iloc[-1]:.2f})"
+        spy_str += f" (close {_fmt_price(float(spy.iloc[-1]))})"
         parts.append(spy_str)
 
     if vix is not None and not vix.empty:

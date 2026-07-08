@@ -448,6 +448,8 @@ def _chart_panel() -> None:
 def _live_chart_controls() -> None:
     state = _get_state()
     with st.expander("Chart Settings"):
+        st.selectbox("Timeframe", TIMEFRAMES, index=0, key="live_timeframe")
+
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Candle**")
@@ -605,7 +607,7 @@ def _news_panel(symbols: list[str]) -> None:
 
 def _live_panel() -> None:
     _live_chart_controls()
-    _volume_alert_controls()
+    # _volume_alert_controls()
     _price_ticker()
     _chart_panel()
 
@@ -1771,7 +1773,7 @@ def build_ui() -> None:
         st.caption(
             "⚠️ Free Alpaca accounts: IEX feed available during US market hours (9:30–16:00 ET). "
         )
-        timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=0)
+        timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
 
         timeframe_changed = (
             state.symbols

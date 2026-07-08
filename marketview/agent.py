@@ -1350,6 +1350,42 @@ def _quote_age_sec(quote_ts: "str | None") -> "float | None":
     return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
 
+# Key-name fragments that mark a numeric field as NOT a dollar price (percentages,
+# ratios, oscillators, counts, volumes, timestamps) so _round_prices_for_llm leaves
+# them at full precision instead of rounding to whole dollars.
+_LLM_NON_PRICE_KEY_HINTS = (
+    "pct", "ratio", "rsi", "adx", "score", "count", "index", "bars",
+    "std_dev", "z_score", "timestamp", "volume", "window", "num_std",
+    "quantity", "qty", "position", "shares", "size",
+    "age", "minutes", "_sec",
+)
+
+
+def _round_prices_for_llm(obj: object) -> object:
+    """Recursively round dollar-price fields above $100 to whole dollars before a
+    tool result enters the LLM's context -- the model reasons in round numbers,
+    while the UI (which reads the same underlying values separately) keeps exact
+    prices. Non-price numerics (percentages, ratios, RSI/ADX, volumes, etc.) are
+    left untouched based on their key name."""
+    if isinstance(obj, dict):
+        return {k: _round_price_field(k, v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_round_prices_for_llm(v) for v in obj]
+    return obj
+
+
+def _round_price_field(key: str, value: object) -> object:
+    if isinstance(value, (dict, list)):
+        return _round_prices_for_llm(value)
+    if (
+        isinstance(value, float)
+        and value > 100
+        and not any(hint in key.lower() for hint in _LLM_NON_PRICE_KEY_HINTS)
+    ):
+        return round(value)
+    return value
+
+
 def _tool_get_quote(state: "SymbolState") -> dict:
     with state.lock:
         result = {
@@ -1870,7 +1906,7 @@ def run_agent_cycle(
                 # _handle_set_tactics writes its own "tactics_set" log entry on
                 # success; only a validation failure is logged as a plain tool call.
                 result = _handle_set_tactics(args, state, tracker)
-                result_content = json.dumps(result)
+                result_content = json.dumps(_round_prices_for_llm(result))
                 if "error" in result:
                     _log(state, {"type": "tool_call", "name": name, "args": args, "result": result})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
@@ -1977,13 +2013,15 @@ def run_agent_cycle(
                     },
                 )
                 result_content = json.dumps(
-                    {
-                        "status": decision.status,
-                        "filled_quantity": decision.filled_quantity,
-                        "price": decision.price,
-                        "cash_after": decision.cash_after,
-                        "position_after": decision.position_after,
-                    }
+                    _round_prices_for_llm(
+                        {
+                            "status": decision.status,
+                            "filled_quantity": decision.filled_quantity,
+                            "price": decision.price,
+                            "cash_after": decision.cash_after,
+                            "position_after": decision.position_after,
+                        }
+                    )
                 )
                 decision_made = True
                 obs.update_trace(
@@ -1991,7 +2029,7 @@ def run_agent_cycle(
                 )
             else:
                 result = _dispatch_tool(name, args, state, tracker)
-                result_content = json.dumps(result)
+                result_content = json.dumps(_round_prices_for_llm(result))
                 _log(state, {"type": "tool_call", "name": name, "args": args, "result": result})
 
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_content})
