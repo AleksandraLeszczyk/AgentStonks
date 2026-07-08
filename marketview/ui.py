@@ -11,6 +11,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
+from . import market_hours
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -1413,7 +1414,9 @@ def _agent_report_section(symbols: list[str]) -> None:
         )
 
 
-def _agent_panel(symbols: list[str]) -> None:
+def _agent_panel(
+    symbols: list[str], alpaca_key: str = "", alpaca_secret: str = "", feed: str = "iex"
+) -> None:
     state = _get_state()
     st.caption(
         "Runs an LLM research agent that reads already-fetched data for every streamed "
@@ -1489,15 +1492,41 @@ def _agent_panel(symbols: list[str]) -> None:
     llm_key = os.getenv(env_var, "")
 
     if start_clicked:
-        syms = [s for s in (symbols or state.symbols) if state.sym(s) is not None]
-        has_bars = any(
-            bool(ss.bars) for ss in state.iter_symbol_states() if ss.symbol in syms
-        )
-        if not syms or not state.api_key or not has_bars:
-            st.error("Start the Live stream for your symbols first (sidebar ▶ Start) so the agent has data to read.")
+        syms = list(symbols or state.symbols)
+        stream_ready = False
+        if not syms:
+            st.error("Enter at least one symbol in the sidebar first.")
         elif not llm_key:
             st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
         else:
+            # The live stream feeds every tool the agent reads. If it isn't
+            # running for these symbols yet, start it here rather than sending
+            # the user back to the sidebar first.
+            stream_ready = bool(state.api_key) and all(state.sym(s) is not None for s in syms)
+            if not stream_ready:
+                key = alpaca_key.strip() or os.getenv("ALPACA_API_KEY", "")
+                secret = alpaca_secret.strip() or os.getenv("ALPACA_SECRET", "")
+                if not key or not secret:
+                    st.error(
+                        "Alpaca API key and secret are required to start the live stream "
+                        "(sidebar Connection expander, or the ALPACA_API_KEY / "
+                        "ALPACA_SECRET environment variables)."
+                    )
+                else:
+                    timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
+                    stream_ready = _start_live_session(
+                        state, syms, key, secret, feed, timeframe
+                    )
+        if stream_ready:
+            if not market_hours.is_market_open():
+                open_et = market_hours.next_market_open().astimezone(market_hours.MARKET_TZ)
+                st.info(
+                    f"The trading session hasn't started yet (next open: "
+                    f"{open_et.strftime('%a %Y-%m-%d %H:%M')} ET). The agent is told the "
+                    "market is closed and adapts: the Premarket Analyst prepares opening "
+                    "tactics, other strategies study structure and arm plans for the "
+                    "open instead of trading the stale tape."
+                )
             state.starting_budget = starting_budget
             state.decision_tracker = DecisionTracker(starting_cash=starting_budget, trade_cost=TRADE_FIXED_COST)
             state.agent_log = []
@@ -1731,6 +1760,81 @@ def _premarket_panel(symbols: list[str]) -> None:
         st.html(_premarket_briefing_html(briefing, sym))
 
 
+def _start_live_session(
+    state: AppState, syms: list[str], key: str, secret: str, feed: str, timeframe: str
+) -> bool:
+    """Load history for every symbol and launch the bars + news streams.
+
+    Shared by the sidebar ▶ Start and the agent panel's ▶ Start Agent (which
+    starts the stream itself when it isn't running yet). Returns True when the
+    streams were launched, False when loading any symbol failed."""
+    state.set_symbols(syms)
+    state.feed = feed
+    state.timeframe = timeframe
+    state.api_key = key
+    state.api_secret = secret
+    loaded: list[str] = []
+    for sym in syms:
+        sym_state = state.sym(sym)
+        with st.spinner(f"Loading history for {sym}…"):
+            try:
+                historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
+                log_fetch(
+                    "bars (initial load)", "Alpaca REST", symbol=sym,
+                    detail=f"{len(historical_bars)} {timeframe} bars",
+                )
+                historical_trades = fetch_trades(sym, key, secret, feed)
+                log_fetch(
+                    "trades (initial load)", "Alpaca REST", symbol=sym,
+                    detail=f"{len(historical_trades)} trades",
+                )
+                news = fetch_news_with_fallback(
+                    sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
+                )
+                daily_bars = fetch_daily_bars(sym, key, secret, feed)
+                log_fetch(
+                    "daily bars (initial load)", "Alpaca REST", symbol=sym,
+                    detail=f"{len(daily_bars)} daily bars",
+                )
+            except Exception as exc:
+                log_fetch_failure(
+                    "initial data load", [("Alpaca REST", exc)], symbol=sym,
+                    consequence="start aborted",
+                )
+                st.error(f"Failed to load data for {sym}: {exc}")
+                state.status = f"Failed ({sym}): {exc}"
+                return False
+            sym_state.daily_bars = daily_bars
+            with sym_state.lock:
+                sym_state.bars.clear()
+                sym_state.bars.extend(historical_bars)
+                sym_state.trades.clear()
+                sym_state.trades.extend(historical_trades)
+            sym_state.news = news
+            sym_state.news_impacts = {}
+            loaded.append(sym)
+
+    news_llm_provider = state.news_llm_provider
+    llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
+    if llm_key:
+        for sym in loaded:
+            sym_state = state.sym(sym)
+            if not sym_state.news:
+                continue
+            try:
+                sym_state.news_impacts = score_news_impacts(
+                    sym, sym_state.news, news_llm_provider, llm_key
+                )
+            except Exception as exc:
+                state.status = f"News impact scoring failed for {sym}: {exc}"
+    state.status = "Connecting WebSocket…"
+    launch_stream(syms, key, secret, feed, state, timeframe)
+    launch_stream_news(
+        syms, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", "")
+    )
+    return True
+
+
 def build_ui() -> None:
     st.set_page_config(
         page_title="Market Stream",
@@ -1823,73 +1927,7 @@ def build_ui() -> None:
             elif not key or not secret:
                 st.error("API key and secret are required.")
             else:
-                state.set_symbols(syms)
-                state.feed = feed
-                state.timeframe = timeframe
-                state.api_key = key
-                state.api_secret = secret
-                loaded: list[str] = []
-                failed = False
-                for sym in syms:
-                    sym_state = state.sym(sym)
-                    with st.spinner(f"Loading history for {sym}…"):
-                        try:
-                            historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
-                            log_fetch(
-                                "bars (initial load)", "Alpaca REST", symbol=sym,
-                                detail=f"{len(historical_bars)} {timeframe} bars",
-                            )
-                            historical_trades = fetch_trades(sym, key, secret, feed)
-                            log_fetch(
-                                "trades (initial load)", "Alpaca REST", symbol=sym,
-                                detail=f"{len(historical_trades)} trades",
-                            )
-                            news = fetch_news_with_fallback(
-                                sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
-                            )
-                            daily_bars = fetch_daily_bars(sym, key, secret, feed)
-                            log_fetch(
-                                "daily bars (initial load)", "Alpaca REST", symbol=sym,
-                                detail=f"{len(daily_bars)} daily bars",
-                            )
-                        except Exception as exc:
-                            log_fetch_failure(
-                                "initial data load", [("Alpaca REST", exc)], symbol=sym,
-                                consequence="start aborted",
-                            )
-                            st.error(f"Failed to load data for {sym}: {exc}")
-                            state.status = f"Failed ({sym}): {exc}"
-                            failed = True
-                            break
-                        sym_state.daily_bars = daily_bars
-                        with sym_state.lock:
-                            sym_state.bars.clear()
-                            sym_state.bars.extend(historical_bars)
-                            sym_state.trades.clear()
-                            sym_state.trades.extend(historical_trades)
-                        sym_state.news = news
-                        sym_state.news_impacts = {}
-                        loaded.append(sym)
-
-                if not failed:
-                    news_llm_provider = state.news_llm_provider
-                    llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
-                    if llm_key:
-                        for sym in loaded:
-                            sym_state = state.sym(sym)
-                            if not sym_state.news:
-                                continue
-                            try:
-                                sym_state.news_impacts = score_news_impacts(
-                                    sym, sym_state.news, news_llm_provider, llm_key
-                                )
-                            except Exception as exc:
-                                state.status = f"News impact scoring failed for {sym}: {exc}"
-                    state.status = "Connecting WebSocket…"
-                    launch_stream(syms, key, secret, feed, state, timeframe)
-                    launch_stream_news(
-                        syms, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", "")
-                    )
+                _start_live_session(state, syms, key, secret, feed, timeframe)
 
         if stop_clicked:
             if state.bars_fallback_stop_event:
@@ -1930,4 +1968,4 @@ def build_ui() -> None:
         _options_walls_panel(symbols)
 
     with tab_agent:
-        _agent_panel(symbols)
+        _agent_panel(symbols, alpaca_key=api_key, alpaca_secret=api_secret, feed=feed)

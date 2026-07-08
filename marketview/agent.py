@@ -528,6 +528,41 @@ condition also names the `symbol` it watches. Fresh news for ANY of your \
 tickers wakes you early.
 """
 
+# Appended to a trading personality's system prompt when the cycle starts
+# outside regular session hours, so the agent knows the tape is stale and can
+# adjust instead of trading it blind. The Premarket Analyst is exempt: it has
+# its own pre-open protocol (and holds for the opening window deterministically).
+SESSION_CLOSED_ADDENDUM = """
+
+--- SESSION STATUS: MARKET CLOSED (PRE/POST-SESSION) ---
+The US regular session (09:30-16:00 ET) is NOT in progress right now; the next \
+opening bell is {open_at} ET, about {minutes_until_open} minutes from now. \
+Until then, intraday bars, quotes, and volume reads reflect the PREVIOUS \
+session plus any thin pre/post-market tape -- do not treat them as a live \
+tape, and expect some tools to report missing or stale data (that is normal \
+before the open, not an error). Do NOT open new positions on this stale/thin \
+data. Instead, use this cycle to study daily structure and news, then either \
+arm conservative opening tactics at levels that would genuinely be attractive \
+once trading resumes, or stand aside with an alert so the opening tape wakes \
+you -- both let you sleep through the wait instead of burning cycles. Once \
+the session opens you will see live data again; then trade normally per your \
+strategy above.
+"""
+
+
+def _session_closed_addendum(now: "datetime | None" = None) -> str:
+    """The formatted market-closed prompt addendum, or '' while the session is open."""
+    now = now or datetime.now(timezone.utc)
+    if market_hours.is_market_open(now):
+        return ""
+    open_dt = market_hours.next_market_open(now)
+    minutes = round(max(0.0, (open_dt - now).total_seconds()) / 60)
+    open_et = open_dt.astimezone(market_hours.MARKET_TZ)
+    return SESSION_CLOSED_ADDENDUM.format(
+        open_at=open_et.strftime("%Y-%m-%d %H:%M"), minutes_until_open=minutes
+    )
+
+
 # Appended to every personality's system prompt: tactics apply to all supported
 # trading personalities, and arming them is the preferred way to act on levels.
 TACTICS_ADDENDUM = """
@@ -1820,6 +1855,8 @@ def run_agent_cycle(
         + MULTI_SYMBOL_ADDENDUM.format(symbols=symbols_label)
         + TACTICS_ADDENDUM
     )
+    if personality != PREMARKET_PERSONALITY:
+        system_prompt = system_prompt + _session_closed_addendum()
     tools = PERSONALITY_TOOLS.get(personality, MOMENTUM_TOOLS)
     if under_automatic:
         system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM

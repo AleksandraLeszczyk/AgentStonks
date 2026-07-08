@@ -1,7 +1,9 @@
 import json
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from marketview import market_hours
 from marketview.agent import (
     BREAKOUT_TOOLS,
     MOMENTUM_TOOLS,
@@ -9,6 +11,7 @@ from marketview.agent import (
     REVERSAL_TOOLS,
     SMART_MONEY_TOOLS,
     _dispatch_tool,
+    _session_closed_addendum,
     _tool_analyze_volume,
     _tool_breakout_trade_geometry,
     _tool_get_news,
@@ -490,6 +493,64 @@ class TestRunAgentCycle:
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
         assert state.iter_alerts() == []
+
+
+class TestSessionAwareness:
+    # 2026-07-08 is a Wednesday; ET is UTC-4 in July.
+    OPEN_UTC = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)  # 11:00 ET, in session
+    PRE_OPEN_UTC = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)  # 08:00 ET, pre-market
+
+    def test_addendum_empty_while_market_open(self):
+        assert _session_closed_addendum(self.OPEN_UTC) == ""
+
+    def test_addendum_names_next_open_and_minutes_when_closed(self):
+        text = _session_closed_addendum(self.PRE_OPEN_UTC)
+        assert "MARKET CLOSED" in text
+        assert "2026-07-08 09:30" in text
+        assert "90 minutes" in text
+
+    def _run_cycle(self, personality: str = "momentum") -> FakeClient:
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "c1",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "waiting for the open",
+                            "alerts": [{"field": "last_price", "condition": "above", "value": 1.0}],
+                        },
+                    )
+                ]
+            ),
+        ]
+        client = FakeClient(responses)
+        run_agent_cycle(client, "gpt-4.1-mini", ["AAPL"], state, tracker, max_iters=2, personality=personality)
+        return client
+
+    def test_cycle_prompt_carries_addendum_when_market_closed(self, monkeypatch):
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: False)
+        client = self._run_cycle()
+        system_prompt = client.calls[0][0]["content"]
+        assert "MARKET CLOSED" in system_prompt
+
+    def test_cycle_prompt_clean_while_market_open(self, monkeypatch):
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
+        client = self._run_cycle()
+        system_prompt = client.calls[0][0]["content"]
+        assert "MARKET CLOSED" not in system_prompt
+
+    def test_premarket_personality_is_exempt(self, monkeypatch):
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: False)
+        client = self._run_cycle(personality="premarket")
+        system_prompt = client.calls[0][0]["content"]
+        assert "MARKET CLOSED" not in system_prompt
 
 
 class TestAlertTrigger:
