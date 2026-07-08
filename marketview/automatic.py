@@ -361,7 +361,7 @@ def _automatic_loop(
             continue
 
         # 1. Assess the regime and pick a strategy.
-        scoring.maybe_score_week(state, tracker)
+        scoring.maybe_score_day(state, tracker)
         state.automatic_active_strategy = None
         selection = None
         try:

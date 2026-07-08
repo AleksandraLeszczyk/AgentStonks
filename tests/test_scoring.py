@@ -9,13 +9,13 @@ from marketview.scoring import (
     begin_session,
     end_session,
     grounding_from_messages,
-    maybe_score_week,
+    maybe_score_day,
     record_activation_end,
     record_activation_start,
     record_cycle_grounding,
     record_tactics_call,
     record_tool_call,
-    week_report_path,
+    day_report_path,
 )
 from marketview.state import AppState
 
@@ -223,7 +223,7 @@ class TestActivationOutcomes:
         assert breakout["active_decisions"] == 2
 
 
-class TestWeeklyScoring:
+class TestDailyScoring:
     @pytest.fixture(autouse=True)
     def _tmp_scoring_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr(scoring, "SCORING_DIR", tmp_path / "scoring")
@@ -256,56 +256,56 @@ class TestWeeklyScoring:
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
         self._journal_session(now - timedelta(hours=2), runtime_sec=1200)
         self._journal_session(now - timedelta(hours=1), runtime_sec=1800)
-        assert maybe_score_week(now=now) is None
-        assert not week_report_path("2026-W28").exists()
+        assert maybe_score_day(now=now) is None
+        assert not day_report_path("2026-07-08").exists()
 
-    def test_short_sessions_accumulate_across_the_week(self):
+    def test_short_sessions_accumulate_across_the_day(self):
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
-        self._journal_session(now - timedelta(days=1), runtime_sec=2000)
+        self._journal_session(now - timedelta(hours=5), runtime_sec=2000)
         self._journal_session(now - timedelta(hours=2), runtime_sec=2000)
-        report = maybe_score_week(now=now)
+        report = maybe_score_day(now=now)
         assert report is not None
         assert report["sessions"] == 2
         assert report["total_runtime_sec"] == 4000
-        assert week_report_path("2026-W28").exists()
+        assert day_report_path("2026-07-08").exists()
 
-    def test_scored_week_registers_langfuse_score(self, monkeypatch):
+    def test_scored_day_registers_langfuse_score(self, monkeypatch):
         pushed = []
         monkeypatch.setattr(
             scoring.obs, "record_score", lambda **kwargs: pushed.append(kwargs)
         )
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
         self._journal_session(now - timedelta(hours=3), runtime_sec=4000)
-        assert maybe_score_week(now=now) is not None
+        assert maybe_score_day(now=now) is not None
         assert len(pushed) == 1
-        assert pushed[0]["name"] == "weekly-grounding"
+        assert pushed[0]["name"] == "daily-grounding"
         assert pushed[0]["value"] == 0.9
-        assert pushed[0]["input"]["week"] == "2026-W28"
+        assert pushed[0]["input"]["day"] == "2026-07-08"
         # already scored -> no second registration
-        assert maybe_score_week(now=now) is None
+        assert maybe_score_day(now=now) is None
         assert len(pushed) == 1
 
-    def test_no_grounding_week_registers_no_score(self, monkeypatch):
+    def test_no_grounding_day_registers_no_score(self, monkeypatch):
         pushed = []
         monkeypatch.setattr(
             scoring.obs, "record_score", lambda **kwargs: pushed.append(kwargs)
         )
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
         self._journal_session(now - timedelta(hours=3), runtime_sec=4000, grounding=None)
-        assert maybe_score_week(now=now) is not None
+        assert maybe_score_day(now=now) is not None
         assert pushed == []
 
-    def test_runs_at_most_once_per_week(self):
+    def test_runs_at_most_once_per_day(self):
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
         self._journal_session(now - timedelta(hours=3), runtime_sec=4000)
-        assert maybe_score_week(now=now) is not None
+        assert maybe_score_day(now=now) is not None
         self._journal_session(now - timedelta(hours=1), runtime_sec=4000)
-        assert maybe_score_week(now=now) is None  # this week already has a session
+        assert maybe_score_day(now=now) is None  # this day already has a session
 
-    def test_other_weeks_records_are_excluded(self):
+    def test_other_days_records_are_excluded(self):
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
-        self._journal_session(now - timedelta(days=10), runtime_sec=90_000)  # last week
-        assert maybe_score_week(now=now) is None
+        self._journal_session(now - timedelta(days=1), runtime_sec=90_000)  # yesterday
+        assert maybe_score_day(now=now) is None
 
     def test_report_aggregates_metrics(self):
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
@@ -324,7 +324,7 @@ class TestWeeklyScoring:
                  "effective": True},
             ],
         )
-        report = maybe_score_week(now=now)
+        report = maybe_score_day(now=now)
         assert report["grounding"]["mean_score"] == pytest.approx(0.9)
         assert report["tactics_validation"]["rejection_rate"] == pytest.approx(1 / 3)
         assert report["tools"]["error_rate"] == pytest.approx(0.1)
@@ -340,7 +340,7 @@ class TestWeeklyScoring:
         state = AppState()
         begin_session(state, "momentum", ["SPY"])
         state.scorecard.started_at = (now - timedelta(hours=2)).isoformat()
-        report = maybe_score_week(state, tracker=None, now=now)
+        report = maybe_score_day(state, tracker=None, now=now)
         assert report is not None
         assert report["sessions"] == 1
         assert report["total_runtime_sec"] == pytest.approx(7200, abs=1)

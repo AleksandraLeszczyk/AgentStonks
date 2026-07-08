@@ -151,7 +151,7 @@ def record_score(
     Langfuse scores must attach to a trace, so this opens a minimal
     evaluator-typed observation (carrying `input`, e.g. the full report being
     scored), scores its trace, and flushes immediately -- callers (like the
-    weekly scorer) may be running at session teardown with no later flush.
+    daily scorer) may be running at session teardown with no later flush.
     """
     client = _client()
     if client is None:

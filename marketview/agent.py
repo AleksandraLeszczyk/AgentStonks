@@ -2080,7 +2080,7 @@ def run_agent_cycle(
             break
 
     # Deterministic numeric-faithfulness check over the cycle's full transcript
-    # (see marketview.scoring); aggregated into the weekly scoring session.
+    # (see marketview.scoring); aggregated into the daily scoring session.
     scoring.record_cycle_grounding(state, messages, personality)
 
     if stood_down:
@@ -2298,9 +2298,9 @@ def _agent_loop(
             run_agent_cycle(client, model, symbols, state, tracker, personality=personality)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Agent cycle failed: {exc}"})
-        # Weekly scoring may come due mid-session on a long-running agent; the
-        # check is one stat() call once the week is scored.
-        scoring.maybe_score_week(state, tracker)
+        # Daily scoring may come due mid-session on a long-running agent; the
+        # check is one stat() call once the day is scored.
+        scoring.maybe_score_day(state, tracker)
         _wait_for_next_cycle(state, stop_event, cycle_sec)
     scoring.end_session(state, tracker)
     state.agent_running = False

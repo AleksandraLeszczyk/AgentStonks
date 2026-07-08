@@ -1,4 +1,4 @@
-"""Weekly agent-accuracy scoring.
+"""Daily agent-accuracy scoring.
 
 Collection vs. scoring are deliberately split:
 
@@ -9,15 +9,15 @@ Collection vs. scoring are deliberately split:
   activation windows. When the session ends the scorecard is flattened into
   one journal record (``data/scoring/journal.jsonl``).
 
-- **Scoring** runs at most once per ISO week. :func:`maybe_score_week`
-  aggregates the current week's journal records (plus the still-running
-  session, if any) into a single report file (``data/scoring/week-YYYY-Www.json``)
-  whose existence is the "this week already had a scoring session" gate. It
-  refuses to score until the week has accumulated at least
+- **Scoring** runs at most once per UTC calendar day. :func:`maybe_score_day`
+  aggregates the current day's journal records (plus the still-running
+  session, if any) into a single report file (``data/scoring/day-YYYY-MM-DD.json``)
+  whose existence is the "this day already had a scoring session" gate. It
+  refuses to score until the day has accumulated at least
   ``SCORING_MIN_TOTAL_RUNTIME_SEC`` (one hour) of agent runtime, so a couple
   of short experiments never produce a (statistically meaningless) report.
   When Langfuse is configured the report is also registered there as a
-  ``weekly-grounding`` score (see :func:`_register_langfuse_score`).
+  ``daily-grounding`` score (see :func:`_register_langfuse_score`).
 
 The grounding score is a deterministic faithfulness check, not an LLM judge:
 every number the model emits in a finalizing tool call (submit_decision,
@@ -91,14 +91,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _week_key(dt: datetime) -> str:
-    year, week, _ = dt.isocalendar()
-    return f"{year}-W{week:02d}"
+def _day_key(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).date().isoformat()
 
 
-def _week_key_of_iso(ts: str) -> "str | None":
+def _day_key_of_iso(ts: str) -> "str | None":
     try:
-        return _week_key(datetime.fromisoformat(ts.replace("Z", "+00:00")))
+        return _day_key(datetime.fromisoformat(ts.replace("Z", "+00:00")))
     except ValueError:
         return None
 
@@ -432,14 +431,14 @@ def _session_record(
 @_never_raise
 def end_session(state: "AppState", tracker: "DecisionTracker | None") -> None:
     """Flatten the finished session's scorecard into the journal, then give
-    the weekly scorer a chance to run."""
+    the daily scorer a chance to run."""
     card: "Scorecard | None" = state.scorecard
     if card is None:
         return
     state.scorecard = None
     record = _session_record(card, tracker, state)
     _append_journal(record)
-    maybe_score_week(state, tracker)
+    maybe_score_day(state, tracker)
 
 
 def _append_journal(record: dict) -> None:
@@ -465,14 +464,14 @@ def _read_journal() -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# Weekly scoring session
+# Daily scoring session
 # --------------------------------------------------------------------------
 
 _score_lock = threading.Lock()
 
 
-def week_report_path(week: str) -> Path:
-    return SCORING_DIR / f"week-{week}.json"
+def day_report_path(day: str) -> Path:
+    return SCORING_DIR / f"day-{day}.json"
 
 
 def _merge_strategy_stats(records: list[dict]) -> dict:
@@ -496,7 +495,7 @@ def _merge_strategy_stats(records: list[dict]) -> dict:
     return strategies
 
 
-def _build_week_report(week: str, records: list[dict]) -> dict:
+def _build_day_report(day: str, records: list[dict]) -> dict:
     grounding_cycles = [
         {"score": g["mean_score"], "min": g["min_score"], "n": g["scored_cycles"],
          "ungrounded": g.get("ungrounded", [])}
@@ -529,7 +528,7 @@ def _build_week_report(week: str, records: list[dict]) -> dict:
                if r["decisions"].get("return_pct") is not None]
 
     return {
-        "week": week,
+        "day": day,
         "scored_at": _utcnow().isoformat(),
         "sessions": len(records),
         "total_runtime_sec": round(sum(r.get("runtime_sec") or 0.0 for r in records), 1),
@@ -567,18 +566,18 @@ def _build_week_report(week: str, records: list[dict]) -> dict:
 
 @_never_raise
 def _register_langfuse_score(report: dict) -> None:
-    """Register the weekly report in Langfuse (no-op when unconfigured).
+    """Register the daily report in Langfuse (no-op when unconfigured).
 
-    The report rides along as the trace input; the score value is the week's
-    mean grounding score. Weeks whose cycles emitted no auditable numbers have
+    The report rides along as the trace input; the score value is the day's
+    mean grounding score. Days whose cycles emitted no auditable numbers have
     no grounding summary and register nothing.
     """
     grounding = report.get("grounding")
     if not grounding:
         return
     obs.record_score(
-        trace_name=f"weekly-scoring-{report['week']}",
-        name="weekly-grounding",
+        trace_name=f"daily-scoring-{report['day']}",
+        name="daily-grounding",
         value=grounding["mean_score"],
         comment=(
             f"{report['sessions']} session(s), "
@@ -598,36 +597,36 @@ def _log_status(state: "AppState | None", text: str) -> None:
 
 
 @_never_raise
-def maybe_score_week(
+def maybe_score_day(
     state: "AppState | None" = None,
     tracker: "DecisionTracker | None" = None,
     now: "datetime | None" = None,
 ) -> "dict | None":
-    """Run the weekly scoring session if it is due.
+    """Run the daily scoring session if it is due.
 
-    Skips (returning None) when this ISO week already has a report file, or
-    when the week's journaled agent runtime -- including the still-running
+    Skips (returning None) when this UTC day already has a report file, or
+    when the day's journaled agent runtime -- including the still-running
     session, if `state` carries a live scorecard -- totals less than
     ``SCORING_MIN_TOTAL_RUNTIME_SEC``. Otherwise writes and returns the report.
     Cheap to call every cycle: the already-scored check is one stat() call.
     """
     now = now or _utcnow()
-    week = _week_key(now)
+    day = _day_key(now)
     with _score_lock:
-        path = week_report_path(week)
+        path = day_report_path(day)
         if path.exists():
             return None
 
-        records = [r for r in _read_journal() if _week_key_of_iso(r.get("started_at", "")) == week]
+        records = [r for r in _read_journal() if _day_key_of_iso(r.get("started_at", "")) == day]
         card: "Scorecard | None" = state.scorecard if state is not None else None
-        if card is not None and _week_key_of_iso(card.started_at) == week:
+        if card is not None and _day_key_of_iso(card.started_at) == day:
             records.append(_session_record(card, tracker, state, ended_at=now.isoformat()))
 
         total_runtime = sum(r.get("runtime_sec") or 0.0 for r in records)
         if total_runtime < SCORING_MIN_TOTAL_RUNTIME_SEC:
             return None
 
-        report = _build_week_report(week, records)
+        report = _build_day_report(day, records)
         SCORING_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
@@ -639,7 +638,7 @@ def maybe_score_week(
     )
     _log_status(
         state,
-        f"Weekly scoring session {week}: {report['sessions']} session(s), {grounding_note}",
+        f"Daily scoring session {day}: {report['sessions']} session(s), {grounding_note}",
     )
-    logger.info("weekly scoring report written: %s", path)
+    logger.info("daily scoring report written: %s", path)
     return report
