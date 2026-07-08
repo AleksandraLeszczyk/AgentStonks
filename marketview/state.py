@@ -194,7 +194,7 @@ _DEFAULTS: dict[str, object] = {
     "agent_wake_reason": None,
     "llm_provider": "openai",
     "llm_model": "",
-    "llm_personality": "swing",
+    "llm_personality": "automatic",
     "automatic_active_strategy": None,
     "automatic_regime": None,
     "automatic_reason": None,
@@ -253,7 +253,7 @@ class AppState:
         self.agent_wake_reason: str | None = None
         self.llm_provider: str = "openai"
         self.llm_model: str = ""
-        self.llm_personality: str = "swing"
+        self.llm_personality: str = "automatic"
         # Automatic orchestrator: which strategy it has currently activated (None
         # when idle or assessing the regime), plus the regime read and reasoning
         # behind that choice. Surfaced in the UI/report.
