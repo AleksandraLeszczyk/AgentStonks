@@ -269,6 +269,32 @@ class TestWeeklyScoring:
         assert report["total_runtime_sec"] == 4000
         assert week_report_path("2026-W28").exists()
 
+    def test_scored_week_registers_langfuse_score(self, monkeypatch):
+        pushed = []
+        monkeypatch.setattr(
+            scoring.obs, "record_score", lambda **kwargs: pushed.append(kwargs)
+        )
+        now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
+        self._journal_session(now - timedelta(hours=3), runtime_sec=4000)
+        assert maybe_score_week(now=now) is not None
+        assert len(pushed) == 1
+        assert pushed[0]["name"] == "weekly-grounding"
+        assert pushed[0]["value"] == 0.9
+        assert pushed[0]["input"]["week"] == "2026-W28"
+        # already scored -> no second registration
+        assert maybe_score_week(now=now) is None
+        assert len(pushed) == 1
+
+    def test_no_grounding_week_registers_no_score(self, monkeypatch):
+        pushed = []
+        monkeypatch.setattr(
+            scoring.obs, "record_score", lambda **kwargs: pushed.append(kwargs)
+        )
+        now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
+        self._journal_session(now - timedelta(hours=3), runtime_sec=4000, grounding=None)
+        assert maybe_score_week(now=now) is not None
+        assert pushed == []
+
     def test_runs_at_most_once_per_week(self):
         now = datetime(2026, 7, 8, 15, 0, tzinfo=timezone.utc)
         self._journal_session(now - timedelta(hours=3), runtime_sec=4000)

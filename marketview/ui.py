@@ -1837,7 +1837,7 @@ def _start_live_session(
 
 def build_ui() -> None:
     st.set_page_config(
-        page_title="Market Stream",
+        page_title="Agent Stonks",
         page_icon="📈",
         layout="wide",
     )

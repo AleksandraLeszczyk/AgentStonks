@@ -16,6 +16,8 @@ Collection vs. scoring are deliberately split:
   refuses to score until the week has accumulated at least
   ``SCORING_MIN_TOTAL_RUNTIME_SEC`` (one hour) of agent runtime, so a couple
   of short experiments never produce a (statistically meaningless) report.
+  When Langfuse is configured the report is also registered there as a
+  ``weekly-grounding`` score (see :func:`_register_langfuse_score`).
 
 The grounding score is a deterministic faithfulness check, not an LLM judge:
 every number the model emits in a finalizing tool call (submit_decision,
@@ -39,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, TypeVar
 
+from . import observability as obs
 from .config import SCORING_MIN_TOTAL_RUNTIME_SEC
 
 if TYPE_CHECKING:
@@ -562,6 +565,30 @@ def _build_week_report(week: str, records: list[dict]) -> dict:
     }
 
 
+@_never_raise
+def _register_langfuse_score(report: dict) -> None:
+    """Register the weekly report in Langfuse (no-op when unconfigured).
+
+    The report rides along as the trace input; the score value is the week's
+    mean grounding score. Weeks whose cycles emitted no auditable numbers have
+    no grounding summary and register nothing.
+    """
+    grounding = report.get("grounding")
+    if not grounding:
+        return
+    obs.record_score(
+        trace_name=f"weekly-scoring-{report['week']}",
+        name="weekly-grounding",
+        value=grounding["mean_score"],
+        comment=(
+            f"{report['sessions']} session(s), "
+            f"{report['total_runtime_sec'] / 3600:.1f} h agent runtime, "
+            f"min cycle score {grounding['min_score']:.2f}"
+        ),
+        input=report,
+    )
+
+
 def _log_status(state: "AppState | None", text: str) -> None:
     if state is None:
         return
@@ -603,6 +630,8 @@ def maybe_score_week(
         report = _build_week_report(week, records)
         SCORING_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    _register_langfuse_score(report)
 
     grounding = report.get("grounding")
     grounding_note = (

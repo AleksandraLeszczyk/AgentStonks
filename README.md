@@ -62,7 +62,7 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - **Equity curve & performance summary** — replays recorded decisions against streamed bars to reconstruct portfolio value over time
 - **Live agent log** — cycle starts, tool calls, analysis, decisions, news alerts, and errors, streamed as they happen
 - **HTML report export** — generates a self-contained HTML file with starting conditions, charts, and full decision/activity history
-- **Weekly accuracy scoring** — a per-session scorecard accumulates a deterministic grounding check (every number the model states in a decision must trace back to a number it was actually shown) plus tool errors and tactics-validation rejections; at most once per ISO week, and only once the week has accumulated an hour of agent runtime, these are aggregated into a scoring report
+- **Weekly accuracy scoring** — a per-session scorecard accumulates a deterministic grounding check (every number the model states in a decision must trace back to a number it was actually shown) plus tool errors and tactics-validation rejections; at most once per ISO week, and only once the week has accumulated an hour of agent runtime, these are aggregated into a scoring report and, when Langfuse is configured, registered there as a `weekly-grounding` score
 - **Optional LLM observability** — when Langfuse credentials are set, each agent cycle is traced end-to-end (tool calls, token usage, latency) via `observability.py`; a no-op otherwise
 - **Data-source logging** — every fetch (WebSocket stream, Alpaca REST, yfinance, WorldNews) logs which source served the data and which fallbacks were tried, de-duplicated so repeated identical outcomes don't flood the console
 

@@ -138,6 +138,31 @@ def record_anthropic_usage(generation: Optional[Any], response: Any, output: Any
     generation.update(output=output, usage_details=usage_details)
 
 
+def record_score(
+    *,
+    trace_name: str,
+    name: str,
+    value: float,
+    comment: Optional[str] = None,
+    input: Any = None,
+) -> None:
+    """Register a standalone score in Langfuse under a fresh one-off trace.
+
+    Langfuse scores must attach to a trace, so this opens a minimal
+    evaluator-typed observation (carrying `input`, e.g. the full report being
+    scored), scores its trace, and flushes immediately -- callers (like the
+    weekly scorer) may be running at session teardown with no later flush.
+    """
+    client = _client()
+    if client is None:
+        return
+    with client.start_as_current_observation(
+        as_type="evaluator", name=trace_name, input=input
+    ) as span:
+        span.score_trace(name=name, value=value, comment=comment)
+    client.flush()
+
+
 def flush() -> None:
     """Flush buffered events to Langfuse (call on shutdown so none are lost)."""
     client = _client()
