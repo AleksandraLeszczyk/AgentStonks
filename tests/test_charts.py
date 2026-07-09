@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
-from marketview.charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
+from agent_stonks.charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
 
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
@@ -202,7 +202,7 @@ class TestFillIntradayGaps:
         return df.sort_values("t").reset_index(drop=True)
 
     def test_fills_missing_buckets_with_flat_zero_volume_bars(self):
-        from marketview.charts import _fill_intraday_gaps
+        from agent_stonks.charts import _fill_intraday_gaps
 
         filled = _fill_intraday_gaps(self._df(self.GAPPY_BARS))
         assert len(filled) == 5
@@ -216,7 +216,7 @@ class TestFillIntradayGaps:
         assert filled[~filled["synthetic"]]["v"].tolist() == [5000, 3000, 2000]
 
     def test_does_not_fill_across_days(self):
-        from marketview.charts import _fill_intraday_gaps
+        from agent_stonks.charts import _fill_intraday_gaps
 
         bars = self.GAPPY_BARS + [
             {"t": "2024-01-16T14:00:00Z", "o": 103.0, "h": 104.0, "l": 102.0, "c": 103.5, "v": 1000},

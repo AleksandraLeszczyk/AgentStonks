@@ -1,6 +1,6 @@
 import pandas as pd
 
-from marketview.technical_analysis import (
+from agent_stonks.technical_analysis import (
     adx,
     analyze_consolidation,
     analyze_fair_value_gaps,

@@ -1,7 +1,7 @@
 import threading
 
-from marketview.config import MAX_BARS, PAPER_STARTING_CASH, VOLUME_ALERT_DEFAULT_MULTIPLIER
-from marketview.state import (
+from agent_stonks.config import MAX_BARS, PAPER_STARTING_CASH, VOLUME_ALERT_DEFAULT_MULTIPLIER
+from agent_stonks.state import (
     AppState,
     average_daily_volume,
     completed_daily_bars,

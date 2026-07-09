@@ -1,6 +1,6 @@
 import pytest
 
-from marketview.historical import (
+from agent_stonks.historical import (
     estimate_dividend_return_10y,
     estimate_total_return,
     fetch_static_analysis,
@@ -15,7 +15,7 @@ class FakeTicker:
 class TestFetchStaticAnalysis:
     def test_returns_pe_dividend_yield_and_earnings_growth(self, monkeypatch):
         monkeypatch.setattr(
-            "marketview.historical.yf.Ticker",
+            "agent_stonks.historical.yf.Ticker",
             lambda symbol: FakeTicker(
                 {
                     "trailingPE": 25.0,
@@ -36,7 +36,7 @@ class TestFetchStaticAnalysis:
 
     def test_falls_back_to_revenue_growth_when_earnings_growth_missing(self, monkeypatch):
         monkeypatch.setattr(
-            "marketview.historical.yf.Ticker",
+            "agent_stonks.historical.yf.Ticker",
             lambda symbol: FakeTicker({"revenueGrowth": 0.08}),
         )
         result = fetch_static_analysis("AAPL")
@@ -46,7 +46,7 @@ class TestFetchStaticAnalysis:
         def raise_error(symbol):
             raise RuntimeError("network error")
 
-        monkeypatch.setattr("marketview.historical.yf.Ticker", raise_error)
+        monkeypatch.setattr("agent_stonks.historical.yf.Ticker", raise_error)
         result = fetch_static_analysis("AAPL")
         assert result == {
             "pe_ratio": None,

@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from marketview.report import build_report_html
+from agent_stonks.report import build_report_html
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
 

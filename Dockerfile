@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY marketview/ marketview/
+COPY agent_stonks/ agent_stonks/
 COPY main.py .
 
 EXPOSE 8501

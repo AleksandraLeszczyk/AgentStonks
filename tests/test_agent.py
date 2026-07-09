@@ -3,8 +3,8 @@ import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from marketview import market_hours
-from marketview.agent import (
+from agent_stonks import market_hours
+from agent_stonks.agent import (
     BREAKOUT_TOOLS,
     MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
@@ -21,9 +21,9 @@ from marketview.agent import (
     _wait_for_next_cycle,
     run_agent_cycle,
 )
-from marketview.broker import Broker
-from marketview.decisions import DecisionTracker
-from marketview.state import AppState, alert_triggered
+from agent_stonks.broker import Broker
+from agent_stonks.decisions import DecisionTracker
+from agent_stonks.state import AppState, alert_triggered
 
 
 def _app(*symbols: str):

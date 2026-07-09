@@ -1,6 +1,6 @@
 """
 News analysis pipeline using Alpaca, WorldNews API, and an LLM (Gemini,
-OpenAI, or Anthropic — see `marketview.llm`).
+OpenAI, or Anthropic — see `agent_stonks.llm`).
 
 This module is optional — only needed for LLM-based impact scoring.
 Required env vars: one of GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY,

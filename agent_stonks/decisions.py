@@ -104,7 +104,7 @@ class DecisionTracker:
     def record_tactics(
         self, symbol: str, summaries: list[str], reasoning: str, price: Optional[float] = None
     ) -> Decision:
-        """Record the arming of a conditional trade plan (see marketview.tactics).
+        """Record the arming of a conditional trade plan (see agent_stonks.tactics).
 
         No cash or position changes here -- the trade happens later, via
         `record_trade`, when the TacticsExecutor sees the conditions met. `price`

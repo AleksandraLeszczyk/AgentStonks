@@ -633,7 +633,7 @@ AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
 DEFAULT_PERSONALITY = "momentum"
 # One-shot pre-open specialist: gated to a window just before the bell, retired
 # once its opening tactics execute. Not selectable by the Automatic regime
-# cycle (see marketview.automatic) -- the orchestrator activates it
+# cycle (see agent_stonks.automatic) -- the orchestrator activates it
 # deterministically whenever the session hasn't started.
 PREMARKET_PERSONALITY = "premarket"
 
@@ -1835,7 +1835,7 @@ def run_agent_cycle(
 
     When Langfuse is configured, the whole cycle is one trace: every LLM turn
     nests under it as a generation, so per-cycle latency, token usage, and cost
-    roll up automatically (see `marketview.observability`).
+    roll up automatically (see `agent_stonks.observability`).
 
     When `under_automatic` is True the strategy is running under the Automatic
     orchestrator: it also gets a `stand_down` tool to relinquish control when the
@@ -2080,7 +2080,7 @@ def run_agent_cycle(
             break
 
     # Deterministic numeric-faithfulness check over the cycle's full transcript
-    # (see marketview.scoring); aggregated into the daily scoring session.
+    # (see agent_stonks.scoring); aggregated into the daily scoring session.
     scoring.record_cycle_grounding(state, messages, personality)
 
     if stood_down:

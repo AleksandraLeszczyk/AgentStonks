@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from marketview.performance import compute_equity_curve, decision_markers, summarize, total_fees_paid
+from agent_stonks.performance import compute_equity_curve, decision_markers, summarize, total_fees_paid
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
 

@@ -1,7 +1,7 @@
 import pytest
 import requests
 
-from marketview.broker import PaperBroker
+from agent_stonks.broker import PaperBroker
 
 
 class TestPaperBrokerGetCurrentPrice:

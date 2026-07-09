@@ -1,4 +1,4 @@
-from marketview.ui import build_news_html, wrap_text
+from agent_stonks.ui import build_news_html, wrap_text
 
 
 class TestWrapText:

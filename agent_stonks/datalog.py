@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 
-logger = logging.getLogger("marketview.data")
+logger = logging.getLogger("agent_stonks.data")
 
 # Last outcome signature per (what, symbol) — see module docstring.
 _last_outcome: dict[tuple[str, str], tuple] = {}

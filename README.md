@@ -1,7 +1,7 @@
 <img width="1025" height="672" alt="image" src="https://github.com/user-attachments/assets/6f68cbeb-dfa3-40dc-b7dd-222f1583a07b" />
 
 
-# MarketView
+# AgentStonks
 
 Real-time market data dashboard built with Streamlit and the Alpaca streaming API. Tracks a whole basket of US equities at once — live candlestick bars, trade volume profile, and news — plus historical context and an autonomous LLM paper-trading agent that trades the basket from a single shared cash balance.
 
@@ -79,8 +79,8 @@ Open http://localhost:8501.
 ## Docker
 
 ```bash
-docker build -t marketview .
-docker run -p 8501:8501 --env-file .env marketview
+docker build -t agent_stonks .
+docker run -p 8501:8501 --env-file .env agentstonks
 ```
 
 ## Configuration
@@ -103,7 +103,7 @@ Credentials can also be entered directly in the sidebar (Alpaca) or the Agent ta
 ## Project layout
 
 ```
-marketview/
+agent_stonks/
   config.py     — constants, color palette, agent timing/cost settings
   state.py      — shared mutable AppState (per-symbol SymbolState: bars, trades, news, position;
                   agent log, WebSocket handles, shared paper cash balance)

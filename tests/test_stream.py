@@ -1,5 +1,5 @@
-from marketview import stream
-from marketview.state import AppState
+from agent_stonks import stream
+from agent_stonks.state import AppState
 
 
 def _app(*symbols: str):

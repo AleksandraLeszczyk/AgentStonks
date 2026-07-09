@@ -2,7 +2,7 @@ import logging
 
 import pytest
 
-from marketview import datalog
+from agent_stonks import datalog
 
 
 @pytest.fixture(autouse=True)
@@ -13,7 +13,7 @@ def _reset_dedup():
 
 
 def test_log_fetch_basic_message(caplog):
-    with caplog.at_level(logging.INFO, logger="marketview.data"):
+    with caplog.at_level(logging.INFO, logger="agent_stonks.data"):
         datalog.log_fetch("ask/bid price", "Alpaca REST /quotes/latest", symbol="AAPL", detail="bid=1.0, ask=1.1")
     assert caplog.records[0].levelno == logging.INFO
     assert caplog.records[0].message == (
@@ -22,7 +22,7 @@ def test_log_fetch_basic_message(caplog):
 
 
 def test_log_fetch_lists_failed_sources(caplog):
-    with caplog.at_level(logging.INFO, logger="marketview.data"):
+    with caplog.at_level(logging.INFO, logger="agent_stonks.data"):
         datalog.log_fetch(
             "bars",
             "yfinance (delayed)",
@@ -36,7 +36,7 @@ def test_log_fetch_lists_failed_sources(caplog):
 
 
 def test_log_fetch_failure_message_and_level(caplog):
-    with caplog.at_level(logging.INFO, logger="marketview.data"):
+    with caplog.at_level(logging.INFO, logger="agent_stonks.data"):
         datalog.log_fetch_failure(
             "ask/bid price",
             [("Alpaca REST /quotes/latest", "timeout")],
@@ -51,14 +51,14 @@ def test_log_fetch_failure_message_and_level(caplog):
 
 
 def test_repeat_outcome_demotes_to_debug(caplog):
-    with caplog.at_level(logging.DEBUG, logger="marketview.data"):
+    with caplog.at_level(logging.DEBUG, logger="agent_stonks.data"):
         datalog.log_fetch("last price", "Alpaca WS", symbol="AAPL", detail="price=1")
         datalog.log_fetch("last price", "Alpaca WS", symbol="AAPL", detail="price=2")
     assert [r.levelno for r in caplog.records] == [logging.INFO, logging.DEBUG]
 
 
 def test_source_change_logs_at_info_again(caplog):
-    with caplog.at_level(logging.DEBUG, logger="marketview.data"):
+    with caplog.at_level(logging.DEBUG, logger="agent_stonks.data"):
         datalog.log_fetch("last price", "Alpaca WS", symbol="AAPL")
         datalog.log_fetch("last price", "Alpaca REST", symbol="AAPL")
         datalog.log_fetch("last price", "Alpaca WS", symbol="AAPL")
@@ -66,7 +66,7 @@ def test_source_change_logs_at_info_again(caplog):
 
 
 def test_failure_then_recovery_both_logged(caplog):
-    with caplog.at_level(logging.DEBUG, logger="marketview.data"):
+    with caplog.at_level(logging.DEBUG, logger="agent_stonks.data"):
         datalog.log_fetch_failure("ask/bid price", [("Alpaca REST", "boom")], symbol="AAPL")
         datalog.log_fetch_failure("ask/bid price", [("Alpaca REST", "boom")], symbol="AAPL")
         datalog.log_fetch("ask/bid price", "Alpaca REST", symbol="AAPL")
@@ -78,7 +78,7 @@ def test_failure_then_recovery_both_logged(caplog):
 
 
 def test_symbols_and_kinds_tracked_independently(caplog):
-    with caplog.at_level(logging.DEBUG, logger="marketview.data"):
+    with caplog.at_level(logging.DEBUG, logger="agent_stonks.data"):
         datalog.log_fetch("bars", "Alpaca WS", symbol="AAPL")
         datalog.log_fetch("bars", "Alpaca WS", symbol="TSLA")
         datalog.log_fetch("last price", "Alpaca WS", symbol="AAPL")
@@ -86,6 +86,6 @@ def test_symbols_and_kinds_tracked_independently(caplog):
 
 
 def test_no_symbol_message(caplog):
-    with caplog.at_level(logging.INFO, logger="marketview.data"):
+    with caplog.at_level(logging.INFO, logger="agent_stonks.data"):
         datalog.log_fetch("market indicators", "yfinance")
     assert caplog.records[0].message == "market indicators fetched from yfinance"

@@ -1,7 +1,7 @@
 import pytest
 
-from marketview.broker import Broker
-from marketview.decisions import DecisionTracker
+from agent_stonks.broker import Broker
+from agent_stonks.decisions import DecisionTracker
 
 
 class FakeBroker(Broker):

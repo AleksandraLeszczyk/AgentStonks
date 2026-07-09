@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from marketview.market_hours import (
+from agent_stonks.market_hours import (
     MARKET_TZ,
     is_market_open,
     next_market_open,

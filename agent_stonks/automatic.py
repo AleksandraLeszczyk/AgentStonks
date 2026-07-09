@@ -2,7 +2,7 @@
 Automatic orchestrator agent.
 
 This is a meta-agent that sits above the individual strategy agents in
-`marketview.agent`. Each round it runs a *regime-detection* cycle -- reading the
+`agent_stonks.agent`. Each round it runs a *regime-detection* cycle -- reading the
 same analysis tools the strategies use (daily trend, broad-market backdrop,
 intraday momentum, volume, VWAP/ADX range read, opening range, order blocks,
 options walls, news) -- and finishes by calling `select_strategy` to activate the
@@ -303,7 +303,7 @@ def run_regime_cycle(
             break
 
     # The select_strategy reasoning must cite real tool numbers -- audit it
-    # like any strategy cycle (see marketview.scoring).
+    # like any strategy cycle (see agent_stonks.scoring).
     scoring.record_cycle_grounding(state, messages, AUTOMATIC_KEY)
 
     return selection

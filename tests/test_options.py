@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from marketview.options import _bs_gamma, _select_expiry, fetch_option_chain
+from agent_stonks.options import _bs_gamma, _select_expiry, fetch_option_chain
 
 
 def _future_date(days: int) -> str:
@@ -69,7 +69,7 @@ class TestFetchOptionChain:
         calls, puts = _chain_frames()
         expiry = _future_date(30)
         ticker = FakeTicker([expiry], calls, puts, spot=100.0)
-        monkeypatch.setattr("marketview.options.yf.Ticker", lambda symbol: ticker)
+        monkeypatch.setattr("agent_stonks.options.yf.Ticker", lambda symbol: ticker)
 
         data = fetch_option_chain("AAPL")
 
@@ -86,7 +86,7 @@ class TestFetchOptionChain:
         calls, puts = _chain_frames()
         expiry = _future_date(30)
         ticker = FakeTicker([expiry], calls, puts, spot=100.0)
-        monkeypatch.setattr("marketview.options.yf.Ticker", lambda symbol: ticker)
+        monkeypatch.setattr("agent_stonks.options.yf.Ticker", lambda symbol: ticker)
 
         data = fetch_option_chain("AAPL", spot=123.0)
         assert data["spot"] == 123.0

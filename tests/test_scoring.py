@@ -3,8 +3,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from marketview import scoring
-from marketview.scoring import (
+from agent_stonks import scoring
+from agent_stonks.scoring import (
     Scorecard,
     begin_session,
     end_session,
@@ -17,7 +17,7 @@ from marketview.scoring import (
     record_tool_call,
     day_report_path,
 )
-from marketview.state import AppState
+from agent_stonks.state import AppState
 
 
 def _decision_call(name: str, args: dict) -> dict:

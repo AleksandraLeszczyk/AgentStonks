@@ -1,16 +1,16 @@
 import json
 from types import SimpleNamespace
 
-from marketview.agent import _TOOL_STAND_DOWN, run_agent_cycle
-from marketview.automatic import (
+from agent_stonks.agent import _TOOL_STAND_DOWN, run_agent_cycle
+from agent_stonks.automatic import (
     AUTOMATIC_KEY,
     REGIME_TOOLS,
     SELECTABLE_STRATEGIES,
     run_regime_cycle,
 )
-from marketview.broker import Broker
-from marketview.decisions import DecisionTracker
-from marketview.state import AppState
+from agent_stonks.broker import Broker
+from agent_stonks.decisions import DecisionTracker
+from agent_stonks.state import AppState
 
 
 class FakeBroker(Broker):

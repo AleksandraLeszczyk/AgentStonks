@@ -7,9 +7,9 @@ import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from marketview import agent as agent_module
-from marketview import automatic, market_hours
-from marketview.agent import (
+from agent_stonks import agent as agent_module
+from agent_stonks import automatic, market_hours
+from agent_stonks.agent import (
     AGENT_PERSONALITIES,
     PREMARKET_PERSONALITY,
     PREMARKET_TOOLS,
@@ -18,10 +18,10 @@ from marketview.agent import (
     run_agent_cycle,
     run_premarket_session,
 )
-from marketview.automatic import SELECTABLE_STRATEGIES
-from marketview.broker import Broker
-from marketview.decisions import DecisionTracker
-from marketview.state import AppState
+from agent_stonks.automatic import SELECTABLE_STRATEGIES
+from agent_stonks.broker import Broker
+from agent_stonks.decisions import DecisionTracker
+from agent_stonks.state import AppState
 
 
 class FakeBroker(Broker):

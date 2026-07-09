@@ -224,3 +224,4 @@ __marimo__/
 .claude
 graphify-out
 data/scoring/
+tests/__pycache__/*

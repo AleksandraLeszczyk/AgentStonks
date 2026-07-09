@@ -95,7 +95,7 @@ class SymbolState:
         # condition, value} watching a continuously-updated field (see
         # ALERTABLE_FIELDS). All symbols' alerts clear together once any fires.
         self.alerts: list[dict] = []
-        # Armed conditional trade plan for this symbol (see marketview.tactics)
+        # Armed conditional trade plan for this symbol (see agent_stonks.tactics)
         # and the background executor matching it against live data.
         self.tactics = None  # "Tactics | None"
         self.tactics_executor = None  # "TacticsExecutor | None"
@@ -261,7 +261,7 @@ class AppState:
         self.automatic_regime: str | None = None
         self.automatic_reason: str | None = None
         self.news_llm_provider: str = "openai"
-        # Per-session scoring collector (see marketview.scoring); attached by
+        # Per-session scoring collector (see agent_stonks.scoring); attached by
         # launch_agent/launch_automatic, flushed to the journal at session end.
         self.scorecard = None  # "scoring.Scorecard | None"
 

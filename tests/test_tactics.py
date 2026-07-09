@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import marketview.tactics as tactics_mod
-from marketview.agent import run_agent_cycle
-from marketview.broker import Broker
-from marketview.decisions import DecisionTracker
-from marketview.state import AppState
-from marketview.tactics import (
+import agent_stonks.tactics as tactics_mod
+from agent_stonks.agent import run_agent_cycle
+from agent_stonks.broker import Broker
+from agent_stonks.decisions import DecisionTracker
+from agent_stonks.state import AppState
+from agent_stonks.tactics import (
     TacticsExecutor,
     format_tactic_action,
     momentum_pct,
@@ -472,7 +472,7 @@ class TestAgentSetTactics:
         assert cancelled and cancelled[0]["cancelled"] == ["buy 5 sh AAPL when last_price below 90"]
 
     def test_all_personalities_expose_set_tactics(self):
-        from marketview.agent import PERSONALITY_TOOLS
+        from agent_stonks.agent import PERSONALITY_TOOLS
 
         for personality, tools in PERSONALITY_TOOLS.items():
             names = [t["function"]["name"] for t in tools]

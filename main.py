@@ -9,6 +9,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
-from marketview.ui import build_ui
+from agent_stonks.ui import build_ui
 
 build_ui()

@@ -1,7 +1,7 @@
 import pytest
 import requests
 
-from marketview.rest import fetch_bars, fetch_news, fetch_trades, _headers
+from agent_stonks.rest import fetch_bars, fetch_news, fetch_trades, _headers
 
 
 def test_headers():
