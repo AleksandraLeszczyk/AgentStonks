@@ -177,6 +177,39 @@ class TestBuildHistoricalChart:
         ticker_trace = next(t for t in fig.data if t.name == "AAPL")
         assert list(ticker_trace.y) == pytest.approx([0.0, 10.0, -10.0])
 
+    def test_price_targets_add_per_firm_step_lines(self):
+        ticker = _close_series([100, 102, 105])
+        targets = pd.DataFrame(
+            {
+                "firm": ["Morgan Stanley", "Morgan Stanley", "Wedbush"],
+                "date": pd.to_datetime(["2023-12-30", "2024-01-02", "2024-01-01"]),
+                "target": [110.0, 120.0, 130.0],
+            }
+        )
+        fig = build_historical_chart(
+            ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year",
+            price_targets=targets,
+        )
+        names = [t.name for t in fig.data]
+        assert "🎯 Morgan Stanley" in names
+        assert "🎯 Wedbush" in names
+
+        ms = next(t for t in fig.data if t.name == "🎯 Morgan Stanley")
+        assert ms.line.shape == "hv"
+        # Targets are on the % change scale relative to the first close (100),
+        # the carry-in date is clipped to the plotted range, and the last
+        # target is extended to the final close date.
+        assert list(ms.y) == pytest.approx([10.0, 20.0, 20.0])
+        assert pd.Timestamp(ms.x[0]) == ticker.index[0]
+        assert pd.Timestamp(ms.x[-1]) == ticker.index[-1]
+
+    def test_no_price_targets_adds_no_target_traces(self):
+        ticker = _close_series([100, 102, 105])
+        fig = build_historical_chart(
+            ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year",
+        )
+        assert not any(t.name.startswith("🎯") for t in fig.data if t.name)
+
     def test_earnings_and_dividends_add_vlines(self):
         ticker = _close_series([100, 102, 105])
         earnings = pd.DataFrame({"EPS Estimate": [1.5]}, index=pd.DatetimeIndex(["2024-01-02"]))

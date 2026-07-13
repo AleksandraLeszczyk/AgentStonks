@@ -214,6 +214,94 @@ def fetch_static_analysis(symbol: str) -> dict:
     }
 
 
+PRICE_TARGET_TTL_SEC = 6 * 3600
+_price_target_cache: dict = {}
+
+_TARGET_COLUMNS = ["firm", "date", "target"]
+
+
+def _fetch_target_actions(symbol: str) -> pd.DataFrame:
+    """Raw dated analyst price-target actions for `symbol` from yfinance
+    `upgrades_downgrades` (Yahoo's feed of rating/target changes). Analyst
+    actions land at most a few times a day, so the parsed frame is cached
+    for several hours. Raises on fetch failure; caller decides the fallback.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _price_target_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < PRICE_TARGET_TTL_SEC:
+        return cached["data"]
+
+    actions = yf.Ticker(symbol).upgrades_downgrades
+    if actions is None or actions.empty or "currentPriceTarget" not in actions.columns:
+        df = pd.DataFrame(columns=_TARGET_COLUMNS)
+    else:
+        df = actions.reset_index().rename(
+            columns={"GradeDate": "date", "Firm": "firm", "currentPriceTarget": "target"}
+        )
+        df["date"] = pd.to_datetime(df["date"])
+        if df["date"].dt.tz is not None:
+            df["date"] = df["date"].dt.tz_localize(None)
+        # Rows without a published target come through as 0.
+        df = df[df["target"] > 0][_TARGET_COLUMNS].sort_values("date")
+
+    _price_target_cache[symbol] = {"ts": now, "data": df}
+    return df
+
+
+def fetch_price_target_history(symbol: str, days: int, max_firms: int = 8) -> pd.DataFrame:
+    """Piecewise history of expert (analyst firm) price targets for `symbol`
+    over the trailing `days`.
+
+    Returns a DataFrame with columns [firm, date, target]: each firm's target
+    changes inside the window, plus the firm's standing target carried in at
+    the window start so its line spans the whole shown range. Limited to the
+    `max_firms` most recently active firms. Never raises -- returns an empty
+    frame when the feed is unavailable.
+    """
+    try:
+        actions = _fetch_target_actions(symbol)
+    except Exception as exc:
+        log_fetch_failure(
+            "price targets",
+            [("yfinance upgrades_downgrades", exc)],
+            symbol=symbol,
+            consequence="no expert target lines",
+        )
+        return pd.DataFrame(columns=_TARGET_COLUMNS)
+    if actions.empty:
+        log_fetch("price targets", "yfinance upgrades_downgrades", symbol=symbol, detail="no target actions on record")
+        return pd.DataFrame(columns=_TARGET_COLUMNS)
+
+    window_start = pd.Timestamp.now() - pd.Timedelta(days=days)
+    latest_by_firm = actions.groupby("firm")["date"].max().sort_values(ascending=False)
+    firms = latest_by_firm.head(max_firms).index
+
+    rows: list[pd.DataFrame] = []
+    for firm in firms:
+        events = actions[actions["firm"] == firm]
+        inside = events[events["date"] >= window_start]
+        before = events[events["date"] < window_start]
+        if not before.empty:
+            # The firm's target standing when the window opens.
+            carry = before.iloc[[-1]].copy()
+            carry["date"] = window_start
+            inside = pd.concat([carry, inside])
+        if not inside.empty:
+            rows.append(inside)
+
+    if not rows:
+        log_fetch("price targets", "yfinance upgrades_downgrades", symbol=symbol, detail=f"no targets within {days}d")
+        return pd.DataFrame(columns=_TARGET_COLUMNS)
+    result = pd.concat(rows).sort_values(["firm", "date"]).reset_index(drop=True)
+    log_fetch(
+        "price targets",
+        "yfinance upgrades_downgrades",
+        symbol=symbol,
+        detail=f"{len(result)} target points from {result['firm'].nunique()} firms over {days}d",
+    )
+    return result
+
+
 SMART_MONEY_TTL_SEC = 6 * 3600
 _smart_money_cache: dict = {}
 

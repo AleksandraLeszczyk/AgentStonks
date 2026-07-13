@@ -42,6 +42,9 @@ def empty_chart(msg: str = "Enter a symbol and click Start") -> go.Figure:
 
 _MIXTURE_COLORS = ["#e0e0e0", "#60a5fa", "#fb923c", "#a78bfa", "#34d399"]
 
+# Distinct from the price (accent blue), SPY (muted), and VIX (orange) lines.
+_TARGET_COLORS = ["#f472b6", "#fbbf24", "#a78bfa", "#2dd4bf", "#93c5fd", "#fb7185", "#a3e635", "#e879f9"]
+
 
 def _gmm_em(
     centers: np.ndarray,
@@ -1414,6 +1417,43 @@ def build_analysis_gauges(trend: dict, intraday: dict, market: dict) -> go.Figur
     return fig
 
 
+def _add_price_target_lines(
+    price_targets: pd.DataFrame,
+    fig: go.Figure,
+    base_price: float,
+    x_start: pd.Timestamp,
+    x_end: pd.Timestamp,
+) -> None:
+    """Piecewise (step) lines of each analyst firm's price target over the shown
+    range, on the same % change scale as the price line. Each firm gets its own
+    legend entry, so individual lines can be toggled from the legend."""
+    x_start, x_end = pd.Timestamp(x_start), pd.Timestamp(x_end)
+    for i, (firm, grp) in enumerate(price_targets.groupby("firm", sort=False)):
+        grp = grp.sort_values("date")
+        # Clip to the plotted close series and extend the last target to "now".
+        xs = list(grp["date"].clip(lower=x_start, upper=x_end)) + [x_end]
+        targets = grp["target"].tolist()
+        targets.append(targets[-1])
+        ys = [(t / base_price - 1.0) * 100 for t in targets]
+        color = _TARGET_COLORS[i % len(_TARGET_COLORS)]
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line_shape="hv",
+                name=f"🎯 {firm}",
+                line=dict(color=color, width=1.5, dash="dash"),
+                opacity=0.9,
+                legendgroup="targets",
+                customdata=targets,
+                hovertemplate=(
+                    f"<b>{firm} target</b><br>$%{{customdata:.2f}} (%{{y:+.1f}}%)<extra></extra>"
+                ),
+            )
+        )
+
+
 def build_historical_chart(
     ticker_close: pd.Series,
     spy_close: pd.Series,
@@ -1422,10 +1462,13 @@ def build_historical_chart(
     period_label: str,
     dividends: Optional[pd.Series] = None,
     earnings: Optional[pd.DataFrame] = None,
+    price_targets: Optional[pd.DataFrame] = None,
 ) -> go.Figure:
     """Plot `symbol` and SPY as % change over the period, with VIX on a secondary axis.
 
     Earnings and dividend dates for `symbol` are marked as vertical lines.
+    `price_targets` ([firm, date, target] rows, see fetch_price_target_history)
+    are drawn as per-firm piecewise target lines on the % change axis.
     """
     if ticker_close is None or ticker_close.empty:
         return empty_chart(f"No historical data for {symbol}")
@@ -1465,6 +1508,15 @@ def build_historical_chart(
                 line=dict(color=PALETTE["orange"], width=1.5),
                 yaxis="y2",
             )
+        )
+
+    if price_targets is not None and not price_targets.empty:
+        _add_price_target_lines(
+            price_targets,
+            fig,
+            float(ticker_close.iloc[0]),
+            ticker_pct.index[0],
+            ticker_pct.index[-1],
         )
 
     if earnings is not None and not earnings.empty:

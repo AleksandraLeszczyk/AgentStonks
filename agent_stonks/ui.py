@@ -59,6 +59,7 @@ from .historical import (
     fetch_dividends,
     fetch_earnings_dates,
     fetch_market_indicators,
+    fetch_price_target_history,
     fetch_smart_money_flow,
     fetch_static_analysis,
 )
@@ -620,6 +621,27 @@ def _historical_panel(symbols: list[str]) -> None:
         st.plotly_chart(empty_chart("Enter symbols in the sidebar"), width='stretch')
         return
 
+    # Targets default to shown: select symbols the first time they appear in the
+    # basket (keeping the user's deselections for ones they've already seen), and
+    # drop selections for symbols no longer in the basket before the widget renders.
+    seen_syms = st.session_state.setdefault("hist_target_seen", set())
+    selected = st.session_state.get("hist_target_syms") or []
+    st.session_state["hist_target_syms"] = [s for s in selected if s in symbols] + [
+        s for s in symbols if s not in seen_syms and s not in selected
+    ]
+    seen_syms.update(symbols)
+    target_syms = st.pills(
+        "Expert price targets",
+        symbols,
+        selection_mode="multi",
+        key="hist_target_syms",
+        help=(
+            "Overlay each analyst firm's price targets as piecewise lines over the shown "
+            "period (Yahoo's analyst actions feed). Click a firm in a chart's legend to "
+            "hide that firm's line."
+        ),
+    ) or []
+
     days = HISTORICAL_PERIODS[period_label]
     # Shared context series fetched once for the whole basket.
     try:
@@ -638,6 +660,7 @@ def _historical_panel(symbols: list[str]) -> None:
             except Exception as exc:
                 st.error(f"Failed to load historical data for {sym}: {exc}")
                 continue
+            price_targets = fetch_price_target_history(sym, days) if sym in target_syms else None
 
         fig = build_historical_chart(
             ticker_close,
@@ -647,6 +670,7 @@ def _historical_panel(symbols: list[str]) -> None:
             period_label,
             dividends,
             earnings,
+            price_targets=price_targets,
         )
         st.plotly_chart(fig, width='stretch', key=f"hist_chart_{sym}")
         _static_analysis_panel(sym)
@@ -1329,6 +1353,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
     historical_figs: list[tuple[str, object]] = []
     if historical_period_label:
         days = HISTORICAL_PERIODS[historical_period_label]
+        target_syms = st.session_state.get("hist_target_syms") or []
         try:
             spy_close = fetch_close_series(SPY_SYMBOL, days)
             vix_close = fetch_close_series(VIX_SYMBOL, days)
@@ -1339,6 +1364,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                 ticker_close = fetch_close_series(sym, days)
                 dividends = fetch_dividends(sym, days)
                 earnings = fetch_earnings_dates(sym, days)
+                price_targets = fetch_price_target_history(sym, days) if sym in target_syms else None
                 historical_figs.append(
                     (
                         sym,
@@ -1350,6 +1376,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                             historical_period_label,
                             dividends,
                             earnings,
+                            price_targets=price_targets,
                         ),
                     )
                 )

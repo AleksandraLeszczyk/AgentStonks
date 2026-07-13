@@ -98,9 +98,14 @@ momentum has rolled into lower-highs/lower-lows or a reversal candle near \
 resistance, or it's drifted into the 12:00-14:00 dead zone without strength \
 (check the bar timestamps) -- unless the stock is exceptionally strong. Once \
 the position is up roughly 1R (one stop-distance) move your effective stop \
-to breakeven by re-arming the stop tactic from step 6 at the new level, and \
-otherwise let winners run rather than booking small gains out of fear. Cut \
-losers immediately if the setup fails -- don't wait to see.
+to breakeven by re-arming the stop tactic from step 6 at the new level -- \
+and because you SLEEP while tactics are armed, arm an alert AT the +1R level \
+(and further checkpoints toward the target, plus a momentum_pct fade \
+condition if the move is extended) so you are actually woken to do this; on \
+every subsequent wake keep ratcheting the stop up under fresh structure \
+(higher lows, VWAP) rather than leaving it where you first set it. Otherwise \
+let winners run rather than booking small gains out of fear. Cut losers \
+immediately if the setup fails -- don't wait to see.
 
 6. FINALIZE. Turn the levels from your analysis into ACTION CONDITIONS, not \
 a passive wait: arm them with set_tactics, stating exactly what must be true \
@@ -199,9 +204,14 @@ Sell or tighten the stop when volume dries up with no fresh buyers \
 (analyze_volume showing decreasing/diverging volume), price closes back \
 inside the broken range, or momentum rolls over (analyze_intraday_momentum \
 showing lower highs/lower lows). Once price has reached roughly 1x ATR \
-beyond entry, consider moving the stop to breakeven by re-arming the stop \
-tactic from step 8 at the new level rather than risking a full round-trip \
-back to the original stop.
+beyond entry, move the stop to breakeven by re-arming the stop tactic from \
+step 8 at the new level rather than risking a full round-trip back to the \
+original stop -- and because you SLEEP while tactics are armed, arm an alert \
+AT that +1x ATR checkpoint (and at the next ATR multiple, plus a \
+momentum_pct fade condition if the move is extended) so you are actually \
+woken to do this; on every subsequent wake keep ratcheting the stop up under \
+fresh structure (the range high once reclaimed, higher lows) rather than \
+leaving it under the range low forever.
 
 8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
 them with set_tactics, stating exactly what must be true for you to buy or \
@@ -305,7 +315,12 @@ request a sell quantity larger than the current position.
 reverts there (a 'short_setup' or z back near 0 means the reversion has played \
 out; trim or exit). Cut the trade if price closes beyond the 3σ stop, or if \
 ADX starts climbing through 25 (the range is becoming a trend and the thesis \
-is broken) -- don't wait for the full stop in that case.
+is broken) -- don't wait for the full stop in that case. ADX is NOT a field \
+your tactics or alerts can watch and you SLEEP while tactics are armed, so \
+never sleep blind on just the stop and the VWAP target: arm an alert roughly \
+halfway between entry and VWAP (and a momentum_pct condition to catch the \
+stretch extending against you) so you are woken mid-reversion to re-check ADX \
+and tighten the stop -- to breakeven once the reversion is clearly under way.
 
 8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: \
 once the regime gate has passed (ADX confirms a range), arm the fade with \
@@ -409,7 +424,12 @@ block means a wider stop, which means fewer shares for the same dollar risk. \
 Never request a sell quantity larger than the current position. When you already \
 hold a position, manage it: trim/exit into the structural target, and cut the \
 trade if price closes decisively beyond the block low (the zone has failed -- \
-the thesis is broken; don't hope).
+the thesis is broken; don't hope). Manage it DYNAMICALLY too: you SLEEP while \
+tactics are armed, so arm checkpoint alerts at +1R and near the midpoint to \
+the structural target -- when one wakes you, move the stop to breakeven and \
+then trail it behind each newly reclaimed structure (a filled FVG, a breaker, \
+the last higher low). A 3:1+ trade that has already paid 1R must not be \
+allowed to round-trip back to the original stop below the block.
 
 6. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait -- \
 how much you can mechanize depends on where the setup stands. A CONFIRMED \
@@ -591,6 +611,31 @@ expectation is that most non-trading cycles end with tactics armed -- your job \
 each cycle is to state the conditions under which you would buy or sell, not \
 merely to wait and watch; a cycle that ends in a bare alert with nothing armed \
 should be the exception, justified by the absence of any actionable level.
+
+WHEN YOU HOLD A POSITION, MANAGE IT DYNAMICALLY. A stop and a take-profit \
+armed once at entry and never touched again only react at their two extremes: \
+with tactics armed you sleep until one fires, so a trade that moves well in \
+your favor and then rolls over will round-trip ALL the way back to the \
+original stop before you hear about it. Prevent that by arming recalibration \
+wake-ups alongside the bracket -- while holding a position the `alerts` array \
+should almost never be empty:
+- CHECKPOINT ALERTS at intermediate favorable levels: alongside the stop and \
+take-profit tactics, add alert entries on the way to the target -- +1R (entry \
+plus one stop-distance) is the canonical first checkpoint, roughly halfway to \
+target a good second. When a checkpoint wakes you, re-derive the stop from \
+CURRENT structure (breakeven at +1R, then trailing below the most recent \
+higher low / VWAP / the level the move is riding) and re-arm the tightened \
+bracket. Ratchet one way only: never move a stop away from price, only toward \
+it.
+- MOMENTUM-FADE conditions: 'momentum_pct' is watchable both as an alert \
+(wake to reassess) and as a tactic condition (sell mechanically). On a \
+winning position, 'momentum_pct below 0' (or a small negative threshold) \
+reacts to the move stalling within minutes, instead of waiting for price to \
+fall all the way back to a static stop.
+Every wake with an open position is a recalibration opportunity: check where \
+price, momentum, and volume stand NOW, tighten whatever can be tightened, and \
+re-arm. The plan you go back to sleep with should reflect the current state \
+of the trade, not the state at entry.
 
 Protocol: call set_tactics at most once per TICKER per cycle, BEFORE \
 finalizing; it REPLACES that ticker's previously armed tactics (get_position \

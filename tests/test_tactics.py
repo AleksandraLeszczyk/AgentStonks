@@ -7,11 +7,10 @@ import agent_stonks.tactics as tactics_mod
 from agent_stonks.agent import run_agent_cycle
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
-from agent_stonks.state import AppState
+from agent_stonks.state import AppState, momentum_pct
 from agent_stonks.tactics import (
     TacticsExecutor,
     format_tactic_action,
-    momentum_pct,
     normalize_tactics,
     tactic_price_levels,
     tactics_summaries,

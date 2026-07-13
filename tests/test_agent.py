@@ -580,6 +580,16 @@ class TestAlertTrigger:
         assert alert_triggered(state, {"field": "spread", "condition": "above", "value": 0.04}) is True
         assert alert_triggered(state, {"field": "spread", "condition": "below", "value": 0.04}) is False
 
+    def test_alert_triggered_on_momentum_pct(self):
+        from datetime import datetime, timedelta, timezone
+        _, state = _app()
+        t0 = datetime(2026, 7, 13, 15, 0, tzinfo=timezone.utc)
+        # Price fell 2% over the 10-minute momentum window.
+        state.bars.append({"t": t0.isoformat(), "c": 100.0})
+        state.bars.append({"t": (t0 + timedelta(minutes=10)).isoformat(), "c": 98.0})
+        assert alert_triggered(state, {"field": "momentum_pct", "condition": "below", "value": -1.0}) is True
+        assert alert_triggered(state, {"field": "momentum_pct", "condition": "above", "value": 0.0}) is False
+
     def test_wait_returns_early_when_alert_fires(self):
         import time
         state, sym_state = _app()

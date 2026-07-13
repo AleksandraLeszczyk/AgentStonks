@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 from .config import (
     MAX_BARS,
     PAPER_STARTING_CASH,
+    TACTICS_MOMENTUM_WINDOW_MIN,
     VOLUME_ADV_MIN_DAYS,
     VOLUME_ADV_WINDOW,
     VOLUME_ALERT_DEFAULT_MULTIPLIER,
@@ -21,9 +22,10 @@ from .config import (
 # Continuously-updated state fields the agent can attach a condition alert to.
 # Every entry is refreshed on the live price/quote stream (and the REST
 # fallback), so an alert on any of them can fire between scheduled cycles. The
-# value is a human description used in tool schemas and the UI. `spread` and
-# `volume_ratio` are derived (see `alert_field_value`) rather than stored
-# directly, but update just as continuously as their inputs. All fields except
+# value is a human description used in tool schemas and the UI. `spread`,
+# `volume_ratio`, and `momentum_pct` are derived (see `alert_field_value`)
+# rather than stored directly, but update just as continuously as their inputs
+# (`momentum_pct` moves as each intraday bar lands). All fields except
 # `portfolio_value` are per-symbol; an alert always carries the symbol whose
 # stream it watches.
 ALERTABLE_FIELDS: dict[str, str] = {
@@ -40,6 +42,11 @@ ALERTABLE_FIELDS: dict[str, str] = {
         "Today's cumulative volume divided by the average FULL day's volume -- climbs "
         "from ~0 toward ~1 over a normal session, so it is NOT an intraday-pace measure "
         "and makes a poor breakout-confirmation condition"
+    ),
+    "momentum_pct": (
+        f"Percent price change over the last ~{TACTICS_MOMENTUM_WINDOW_MIN} minutes of "
+        "intraday bars (positive = rising momentum, negative = falling) -- e.g. 'below 0' "
+        "wakes you the moment a winning move stalls, well before price falls to a static stop"
     ),
     "portfolio_value": "Paper portfolio value (cash + all positions marked to last price)",
 }
@@ -350,6 +357,32 @@ class AppState:
         return value
 
 
+def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":
+    """Percent change of the latest close vs the close ~`window_min` minutes ago,
+    from the intraday bars. None when there isn't enough history yet."""
+    with state.lock:
+        bars = list(state.bars)
+    if len(bars) < 2:
+        return None
+    try:
+        latest_ts = datetime.fromisoformat(str(bars[-1]["t"]).replace("Z", "+00:00"))
+        latest_close = float(bars[-1]["c"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    baseline = None
+    for bar in reversed(bars[:-1]):
+        try:
+            ts = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        baseline = float(bar["c"])
+        if (latest_ts - ts).total_seconds() >= window_min * 60:
+            break
+    if baseline is None or baseline == 0:
+        return None
+    return (latest_close / baseline - 1.0) * 100.0
+
+
 def alert_field_value(state: "SymbolState", field: "str | None") -> "float | None":
     """Current numeric value of a continuously-updated alertable field for one
     symbol, or None if it isn't available yet (no data, or an input is unset)."""
@@ -363,6 +396,8 @@ def alert_field_value(state: "SymbolState", field: "str | None") -> "float | Non
     if field == "volume_ratio":
         ratio, _ = current_volume_ratio(state.day_volume, state.daily_bars)
         return ratio
+    if field == "momentum_pct":
+        return momentum_pct(state)
     if field not in ALERTABLE_FIELDS:
         return None
     value = getattr(state, field, None)

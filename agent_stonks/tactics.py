@@ -25,8 +25,14 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from . import historical
-from .config import TACTICS_MOMENTUM_WINDOW_MIN, TACTICS_POLL_SEC
-from .state import ALERTABLE_FIELDS, PRICE_AXIS_ALERT_FIELDS, alert_field_value, compare, format_alert
+from .config import TACTICS_POLL_SEC
+from .state import (
+    ALERTABLE_FIELDS,
+    PRICE_AXIS_ALERT_FIELDS,
+    alert_field_value,
+    compare,
+    format_alert,
+)
 
 if TYPE_CHECKING:
     from .decisions import DecisionTracker
@@ -35,17 +41,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Every field a tactic condition can watch. All alertable fields are refreshed
-# on the live price/quote stream; the two extras are evaluated on demand by the
-# executor: `vix` from the (cached) broad-market fetch, `momentum_pct` from the
-# recent intraday bars.
+# Every field a tactic condition can watch. All alertable fields (including the
+# derived `momentum_pct`) are refreshed on the live price/quote stream; the one
+# extra, `vix`, is evaluated on demand by the executor from the (cached)
+# broad-market fetch.
 TACTIC_CONDITION_FIELDS: dict[str, str] = {
     **ALERTABLE_FIELDS,
     "vix": "CBOE VIX index level (broad-market fear gauge, refreshed every few minutes)",
-    "momentum_pct": (
-        f"Percent price change over the last ~{TACTICS_MOMENTUM_WINDOW_MIN} minutes of intraday "
-        "bars (positive = rising momentum, negative = falling)"
-    ),
 }
 
 
@@ -210,32 +212,6 @@ def tactic_price_levels(tactics: "Tactics | None") -> list[dict]:
     return levels
 
 
-def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":
-    """Percent change of the latest close vs the close ~`window_min` minutes ago,
-    from the intraday bars. None when there isn't enough history yet."""
-    with state.lock:
-        bars = list(state.bars)
-    if len(bars) < 2:
-        return None
-    try:
-        latest_ts = datetime.fromisoformat(str(bars[-1]["t"]).replace("Z", "+00:00"))
-        latest_close = float(bars[-1]["c"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    baseline = None
-    for bar in reversed(bars[:-1]):
-        try:
-            ts = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00"))
-        except (KeyError, TypeError, ValueError):
-            continue
-        baseline = float(bar["c"])
-        if (latest_ts - ts).total_seconds() >= window_min * 60:
-            break
-    if baseline is None or baseline == 0:
-        return None
-    return (latest_close / baseline - 1.0) * 100.0
-
-
 def fetch_vix_level() -> "float | None":
     """Latest VIX close from the cached broad-market fetch, or None if unavailable."""
     try:
@@ -293,8 +269,8 @@ class TacticsExecutor:
     def condition_value(self, cond_field: str) -> "float | None":
         if cond_field == "vix":
             return fetch_vix_level()
-        if cond_field == "momentum_pct":
-            return momentum_pct(self.state)
+        # momentum_pct and the other derived fields are handled by
+        # alert_field_value, which computes them from the same live state.
         return alert_field_value(self.state, cond_field)
 
     def _conditions_met(self, action: TacticAction) -> bool:
