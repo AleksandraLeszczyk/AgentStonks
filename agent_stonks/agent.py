@@ -405,9 +405,13 @@ negative news is driving price into the zone, do not buy the return; stand \
 aside. Call get_smart_money_flow for the slower-moving ownership picture: net \
 insider buying and institutional accumulation (rising 13F stakes) behind a \
 demand block corroborate the long; heavy insider selling or institutional \
-distribution is a caution flag that argues for a smaller size or a pass. It is \
-context, not a trigger -- never trade on it alone, and never let it override \
-clearly negative breaking news.
+distribution is a caution flag that argues for a smaller size or a pass. Call \
+get_analyst_targets for the Street's price targets: a demand-block long with \
+healthy upside remaining to the consensus mean has a natural structural \
+objective to aim the target at, whereas price already at/above the consensus \
+mean (or above the highest target) has little Street upside left and argues \
+for a tighter target or a pass. Both are context, not a trigger -- never trade \
+on them alone, and never let them override clearly negative breaking news.
 
 4. CONFIRM THE GEOMETRY. The stop sits JUST BEYOND the order block (below its \
 low); the target is the next opposing structural level (the nearest bearish \
@@ -493,7 +497,12 @@ close. This distinction shapes your plan more than any other input.
 and the support/resistance the open will trade against, and analyze_market for \
 the broad backdrop (VIX regime, SPY trend). A gap-up into overhead resistance \
 deserves a lower entry and smaller size than one breaking into clear air; a \
-risk-off tape argues for smaller size everywhere.
+risk-off tape argues for smaller size everywhere. Call get_analyst_targets for \
+the Street's price targets -- the consensus mean (and the UBS / Morgan Stanley \
+/ Barclays targets) act as objectives/resistance: a gap-up into or above the \
+consensus mean has little Street upside left (cap the take-profit below it, \
+size down), while a wide gap remaining to the mean leaves room for a \
+follow-through target.
 
 4. ESTIMATE THE OPENING PRICE AND YOUR EDGE PRICES. From the pre-market \
 indication, the catalyst quality, and the structure, estimate where the stock \
@@ -1275,6 +1284,26 @@ _TOOL_GET_SMART_MONEY_FLOW = {
     },
 }
 
+_TOOL_GET_ANALYST_TARGETS = {
+    "type": "function",
+    "function": {
+        "name": "get_analyst_targets",
+        "description": (
+            "Current Wall Street price targets for the ticker with the actionable read: the "
+            "yfinance CONSENSUS (mean/median/high/low target across every covering analyst, the "
+            "analyst count, and the recommendation) plus the standing target from UBS, Morgan "
+            "Stanley, and Barclays -- each annotated with the implied upside/downside vs the "
+            "current price. Use it to gauge how much room the Street sees: price near or above "
+            "the consensus mean means limited upside (don't chase a gap into it -- it acts as "
+            "resistance/an objective); a wide gap below the mean leaves room to run; price "
+            "outside the whole high-low range is a valuation extreme. Targets update at most a "
+            "few times a day (cached), so this is positional context, not an intraday trigger. "
+            "Returns labeled values, a list of actionable `insights`, and a one-line summary."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 _TOOL_ANALYZE_PREMARKET = {
     "type": "function",
     "function": {
@@ -1324,6 +1353,7 @@ for _tool in (
     _TOOL_ANALYZE_LIQUIDITY,
     _TOOL_ANALYZE_PREMIUM_DISCOUNT,
     _TOOL_GET_SMART_MONEY_FLOW,
+    _TOOL_GET_ANALYST_TARGETS,
     _TOOL_ANALYZE_PREMARKET,
     _TOOL_SET_TACTICS,
 ):
@@ -1383,6 +1413,7 @@ SMART_MONEY_TOOLS: list[dict] = [
     _TOOL_ANALYZE_LIQUIDITY,
     _TOOL_ANALYZE_VOLUME,
     _TOOL_GET_SMART_MONEY_FLOW,
+    _TOOL_GET_ANALYST_TARGETS,
     _TOOL_SMART_MONEY_GEOMETRY,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
@@ -1399,6 +1430,7 @@ PREMARKET_TOOLS: list[dict] = [
     _TOOL_ANALYZE_PREMARKET,
     _TOOL_GET_NEWS,
     _TOOL_ANALYZE_DAILY_TREND,
+    _TOOL_GET_ANALYST_TARGETS,
     _TOOL_ANALYZE_MARKET,
     _TOOL_GET_POSITION,
     _TOOL_SET_TACTICS,
@@ -1749,6 +1781,17 @@ def _tool_get_smart_money_flow(state: "SymbolState") -> dict:
     return historical.fetch_smart_money_flow(symbol)
 
 
+def _tool_get_analyst_targets(state: "SymbolState") -> dict:
+    symbol = state.symbol
+    if not symbol:
+        return {"note": "no symbol set"}
+    # Pass the live streamed price so the upside math is anchored to the current
+    # tape rather than Yahoo's slower quote.
+    with state.lock:
+        spot = state.last_price
+    return historical.fetch_analyst_targets(symbol, current_price=spot)
+
+
 def _tool_analyze_premarket(state: "SymbolState") -> dict:
     now = datetime.now(timezone.utc)
     # The session the read is about: the one in progress (edge case: the bell
@@ -1831,6 +1874,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_liquidity": _per_symbol(_tool_analyze_liquidity),
     "analyze_premium_discount": _per_symbol(_tool_analyze_premium_discount),
     "get_smart_money_flow": _per_symbol(_tool_get_smart_money_flow),
+    "get_analyst_targets": _per_symbol(_tool_get_analyst_targets),
     "analyze_premarket": _per_symbol(_tool_analyze_premarket),
     "smart_money_trade_geometry": lambda args, app, tracker: _tool_smart_money_trade_geometry(
         args.get("entry"), args.get("stop"), args.get("target")

@@ -4,6 +4,7 @@ import pytest
 from agent_stonks.historical import (
     estimate_dividend_return_10y,
     estimate_total_return,
+    fetch_analyst_targets,
     fetch_price_target_history,
     fetch_static_analysis,
 )
@@ -126,6 +127,102 @@ class TestFetchPriceTargetHistory:
         self._patch(monkeypatch, None)
         result = fetch_price_target_history("AAPL", days=30)
         assert result.empty
+
+
+class FakeAnalystTicker:
+    def __init__(self, info=None, upgrades_downgrades=None):
+        if info is None:
+            raise RuntimeError("no info")
+        self.info = info
+        self.upgrades_downgrades = upgrades_downgrades
+
+
+class TestFetchAnalystTargets:
+    @pytest.fixture(autouse=True)
+    def clear_caches(self, monkeypatch):
+        monkeypatch.setattr("agent_stonks.historical._analyst_targets_cache", {})
+        monkeypatch.setattr("agent_stonks.historical._price_target_cache", {})
+
+    def _patch(self, monkeypatch, info=None, actions=None):
+        monkeypatch.setattr(
+            "agent_stonks.historical.yf.Ticker",
+            lambda symbol: FakeAnalystTicker(info=info, upgrades_downgrades=actions),
+        )
+
+    def _info(self, **overrides):
+        base = {
+            "targetMeanPrice": 210.0,
+            "targetMedianPrice": 208.0,
+            "targetHighPrice": 250.0,
+            "targetLowPrice": 180.0,
+            "numberOfAnalystOpinions": 30,
+            "recommendationKey": "buy",
+            "currentPrice": 200.0,
+        }
+        base.update(overrides)
+        return base
+
+    def test_consensus_and_tracked_firm_targets_with_upside(self, monkeypatch):
+        actions = _target_actions(
+            [("UBS", 5, 220.0), ("Morgan Stanley", 8, 205.0), ("Barclays", 3, 215.0), ("Wedbush", 2, 260.0)]
+        )
+        self._patch(monkeypatch, info=self._info(), actions=actions)
+
+        result = fetch_analyst_targets("AAPL", current_price=200.0)
+
+        assert result["consensus"]["mean"] == 210.0
+        assert result["consensus"]["mean_upside_pct"] == 5.0
+        assert result["consensus"]["num_analysts"] == 30
+        # Only the tracked bulge-bracket firms are surfaced individually.
+        assert set(result["firms"]) == {"UBS", "Morgan Stanley", "Barclays"}
+        assert result["firms"]["UBS"]["target"] == 220.0
+        assert result["firms"]["UBS"]["upside_pct"] == 10.0
+
+    def test_takes_most_recent_target_per_firm(self, monkeypatch):
+        actions = _target_actions([("UBS", 40, 190.0), ("UBS", 4, 230.0)])
+        self._patch(monkeypatch, info=self._info(), actions=actions)
+
+        result = fetch_analyst_targets("AAPL", current_price=200.0)
+        assert result["firms"]["UBS"]["target"] == 230.0
+
+    def test_current_price_arg_overrides_yahoo_price(self, monkeypatch):
+        self._patch(monkeypatch, info=self._info(currentPrice=100.0), actions=None)
+
+        # 210 mean vs 200 live = +5%, not the +110% Yahoo's stale 100 would imply.
+        result = fetch_analyst_targets("AAPL", current_price=200.0)
+        assert result["current_price"] == 200.0
+        assert result["consensus"]["mean_upside_pct"] == 5.0
+
+    def test_falls_back_to_yahoo_price_when_arg_missing(self, monkeypatch):
+        self._patch(monkeypatch, info=self._info(currentPrice=200.0), actions=None)
+
+        result = fetch_analyst_targets("AAPL")
+        assert result["current_price"] == 200.0
+        assert result["consensus"]["mean_upside_pct"] == 5.0
+
+    def test_price_above_mean_flags_exhausted_upside(self, monkeypatch):
+        self._patch(monkeypatch, info=self._info(), actions=None)
+
+        result = fetch_analyst_targets("AAPL", current_price=215.0)
+        assert result["consensus"]["mean_upside_pct"] == pytest.approx(-2.3, abs=0.1)
+        assert any("ABOVE the consensus mean" in i for i in result["insights"])
+
+    def test_price_above_highest_target_flagged(self, monkeypatch):
+        self._patch(monkeypatch, info=self._info(), actions=None)
+
+        result = fetch_analyst_targets("AAPL", current_price=300.0)
+        assert any("HIGHEST analyst target" in i for i in result["insights"])
+
+    def test_no_data_returns_empty_with_summary(self, monkeypatch):
+        def raise_error(symbol):
+            raise RuntimeError("network error")
+
+        monkeypatch.setattr("agent_stonks.historical.yf.Ticker", raise_error)
+        result = fetch_analyst_targets("AAPL", current_price=200.0)
+        assert result["consensus"]["mean"] is None
+        assert result["firms"] == {}
+        assert result["summary"] == "No analyst price targets available."
+        assert result["insights"] == []
 
 
 class TestEstimateTotalReturn:

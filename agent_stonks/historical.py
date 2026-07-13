@@ -302,6 +302,210 @@ def fetch_price_target_history(symbol: str, days: int, max_firms: int = 8) -> pd
     return result
 
 
+# Bulge-bracket firms whose standing price target we surface individually
+# (alongside the yfinance consensus) in the pre-market read and the agent tool.
+ANALYST_TARGET_FIRMS: tuple[str, ...] = ("UBS", "Morgan Stanley", "Barclays")
+
+ANALYST_TARGETS_TTL_SEC = 6 * 3600
+# Cache holds the RAW targets (consensus prices + per-firm targets + Yahoo's
+# own current price); the price-relative upside fields are recomputed on every
+# call from the freshest `current_price` the caller passes.
+_analyst_targets_cache: dict = {}
+
+
+def _upside_pct(target: Optional[float], price: Optional[float]) -> Optional[float]:
+    """Percent upside from `price` to `target`, rounded, or None if either is missing."""
+    if target is None or not price:
+        return None
+    return round((float(target) / float(price) - 1.0) * 100.0, 1)
+
+
+def _latest_firm_targets(actions: pd.DataFrame, firms: tuple[str, ...]) -> dict:
+    """Each named firm's most recent standing target from the actions feed
+    (columns [firm, date, target]). Matches the firm name case-insensitively as
+    a substring, so 'Barclays' also picks up 'Barclays Capital'."""
+    result: dict = {}
+    if actions is None or actions.empty:
+        return result
+    firm_series = actions["firm"].astype(str)
+    for firm in firms:
+        matched = actions[firm_series.str.contains(firm, case=False, na=False, regex=False)]
+        if matched.empty:
+            continue
+        latest = matched.sort_values("date").iloc[-1]
+        result[firm] = {
+            "target": round(float(latest["target"]), 2),
+            "date": pd.Timestamp(latest["date"]).strftime("%Y-%m-%d"),
+            "as_reported": str(latest["firm"]),
+        }
+    return result
+
+
+def _fetch_raw_analyst_targets(symbol: str) -> dict:
+    """Cached raw analyst-target inputs for `symbol`: the yfinance consensus
+    (mean/median/high/low, analyst count, recommendation) from quoteSummary,
+    Yahoo's own current price, and the standing target of each tracked firm from
+    the upgrades/downgrades feed. Never raises -- missing pieces come back None/
+    empty. Cached for several hours (targets move at most a few times a day)."""
+    now = datetime.now(timezone.utc)
+    cached = _analyst_targets_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < ANALYST_TARGETS_TTL_SEC:
+        return cached["data"]
+
+    consensus: dict = {
+        "mean": None, "median": None, "high": None, "low": None,
+        "num_analysts": None, "recommendation": None,
+    }
+    info_price = None
+    failures: list[tuple[str, object]] = []
+    try:
+        info = yf.Ticker(symbol).info
+        consensus = {
+            "mean": info.get("targetMeanPrice"),
+            "median": info.get("targetMedianPrice"),
+            "high": info.get("targetHighPrice"),
+            "low": info.get("targetLowPrice"),
+            "num_analysts": info.get("numberOfAnalystOpinions"),
+            "recommendation": info.get("recommendationKey"),
+        }
+        info_price = info.get("currentPrice")
+    except Exception as exc:
+        failures.append(("yfinance quoteSummary (.info)", exc))
+
+    try:
+        actions = _fetch_target_actions(symbol)
+    except Exception as exc:
+        failures.append(("yfinance upgrades_downgrades", exc))
+        actions = pd.DataFrame(columns=_TARGET_COLUMNS)
+    firm_targets = _latest_firm_targets(actions, ANALYST_TARGET_FIRMS)
+
+    have_consensus = consensus.get("mean") is not None
+    if not have_consensus and not firm_targets:
+        log_fetch_failure(
+            "analyst targets",
+            failures or [("yfinance", "no consensus or firm targets on record")],
+            symbol=symbol,
+            consequence="no analyst price targets",
+        )
+    else:
+        log_fetch(
+            "analyst targets",
+            "yfinance (.info + upgrades_downgrades)",
+            symbol=symbol,
+            detail=f"consensus={'yes' if have_consensus else 'no'}, {len(firm_targets)} tracked firms",
+            failures=failures,
+        )
+
+    data = {"consensus": consensus, "firm_targets": firm_targets, "info_current_price": info_price}
+    _analyst_targets_cache[symbol] = {"ts": now, "data": data}
+    return data
+
+
+def fetch_analyst_targets(symbol: str, current_price: Optional[float] = None) -> dict:
+    """Current analyst price targets for `symbol` with the actionable read a
+    trader needs: the yfinance consensus (mean/median/high/low across every
+    covering analyst) and the standing target from each tracked bulge-bracket
+    firm (UBS, Morgan Stanley, Barclays), each annotated with the implied upside
+    vs the current price. `current_price` overrides Yahoo's (pass the live
+    streamed price); it falls back to Yahoo's own quote when omitted. Never
+    raises. Returns a dict with `consensus`, `firms`, `current_price`, a
+    one-line `summary`, and a list of actionable `insights`."""
+    raw = _fetch_raw_analyst_targets(symbol)
+    price = current_price if current_price else raw.get("info_current_price")
+
+    c = raw["consensus"]
+    consensus = {
+        "mean": c.get("mean"),
+        "median": c.get("median"),
+        "high": c.get("high"),
+        "low": c.get("low"),
+        "num_analysts": c.get("num_analysts"),
+        "recommendation": c.get("recommendation"),
+        "mean_upside_pct": _upside_pct(c.get("mean"), price),
+        "high_upside_pct": _upside_pct(c.get("high"), price),
+        "low_upside_pct": _upside_pct(c.get("low"), price),
+    }
+
+    firms: dict = {}
+    for name, ft in raw["firm_targets"].items():
+        firms[name] = {**ft, "upside_pct": _upside_pct(ft.get("target"), price)}
+
+    result = {
+        "symbol": symbol,
+        "current_price": price,
+        "consensus": consensus,
+        "firms": firms,
+    }
+    summary, insights = _summarize_analyst_targets(result)
+    result["summary"] = summary
+    result["insights"] = insights
+    return result
+
+
+def _summarize_analyst_targets(data: dict) -> "tuple[str, list[str]]":
+    """Turn analyst targets into a one-line summary and a list of actionable
+    insights (upside remaining, price outside the Street range, dispersion)."""
+    price = data.get("current_price")
+    cons = data.get("consensus") or {}
+    mean, high, low = cons.get("mean"), cons.get("high"), cons.get("low")
+    summary_parts: list[str] = []
+    insights: list[str] = []
+
+    if mean is not None:
+        up = cons.get("mean_upside_pct")
+        n = cons.get("num_analysts")
+        head = f"Consensus mean {mean:g}"
+        if up is not None:
+            head += f" ({up:+.1f}%)"
+        if n:
+            head += f" from {n} analysts"
+        summary_parts.append(head)
+        if up is not None:
+            if up <= 0:
+                insights.append(
+                    f"Price sits {abs(up):.1f}% ABOVE the consensus mean target ({mean:g}) -- "
+                    "Street-implied upside is exhausted; treat further rallies as extended."
+                )
+            elif up >= 15:
+                insights.append(
+                    f"Consensus mean target implies {up:+.1f}% upside -- the Street still sees "
+                    "meaningful room above the current price."
+                )
+            else:
+                insights.append(
+                    f"Only {up:+.1f}% to the consensus mean target -- limited Street upside remaining."
+                )
+
+    if high is not None and price and price > high:
+        insights.append(
+            f"Price is above the HIGHEST analyst target ({high:g}) -- no covering analyst sees "
+            "further upside; richly valued vs the Street."
+        )
+    if low is not None and price and price < low:
+        insights.append(
+            f"Price is below the LOWEST analyst target ({low:g}) -- trading under the entire Street "
+            "range; either a value gap or analysts are behind negative news."
+        )
+    if high is not None and low is not None and mean:
+        dispersion = (high - low) / mean * 100
+        if dispersion >= 40:
+            insights.append(
+                f"Wide target dispersion ({dispersion:.0f}% of mean, {low:g}-{high:g}) -- analysts "
+                "strongly disagree; the consensus is a weak anchor."
+            )
+
+    for name, f in (data.get("firms") or {}).items():
+        up = f.get("upside_pct")
+        part = f"{name} {f['target']:g}"
+        if up is not None:
+            part += f" ({up:+.1f}%)"
+        summary_parts.append(part)
+
+    if not summary_parts:
+        return "No analyst price targets available.", []
+    return "; ".join(summary_parts) + ".", insights
+
+
 SMART_MONEY_TTL_SEC = 6 * 3600
 _smart_money_cache: dict = {}
 

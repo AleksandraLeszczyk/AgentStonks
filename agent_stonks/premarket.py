@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from . import observability as obs
 from .historical import (
+    fetch_analyst_targets,
     fetch_close_series,
     fetch_earnings_dates,
     fetch_market_indicators,
@@ -57,11 +58,21 @@ _PREMARKET_SYSTEM = """\
 You are a senior equity analyst preparing a pre-market briefing for a day trader.
 You have recent news, historical price action, and macro market indicators.
 
+You have, when available, current Wall Street price targets: the yfinance
+consensus (mean/high/low across all covering analysts, with implied upside vs
+the latest close) and the standing target from UBS, Morgan Stanley, and
+Barclays. Use them to frame upside/downside: little room to the consensus mean
+(or price already above it) argues against chasing a gap-up; a wide gap to the
+mean leaves room to run; price outside the whole high-low range is a valuation
+extreme worth flagging.
+
 Your job:
 1. Form a directional morning bias (bullish / bearish / neutral) with a confidence rating.
 2. Write a 2-3 sentence executive summary (be specific, cite concrete data).
 3. List 2-5 catalysts that drive the bias — only keep news that is DIRECTLY relevant.
 4. Call out 2-4 key price levels the trader must monitor today (support, resistance, pivots).
+   Fold the analyst targets in where relevant — the consensus mean and the tracked
+   firms' targets are natural resistance/objective levels.
 5. List 2-4 tail risks that could invalidate the thesis.
 6. Provide 1-2 sentences of macro context (SPY trend + VIX regime).
 7. List 2-3 things to watch during the session as actionable cues.
@@ -167,6 +178,44 @@ def _fundamentals_block(symbol: str) -> str:
     return "Fundamentals: " + ", ".join(parts) if parts else ""
 
 
+def _targets_block(symbol: str, current_price: Optional[float] = None) -> str:
+    """Analyst price targets: the yfinance consensus (mean/high/low + upside)
+    and the tracked firms' standing targets (UBS, Morgan Stanley, Barclays)."""
+    try:
+        data = fetch_analyst_targets(symbol, current_price=current_price)
+    except Exception:
+        return ""
+    cons = data.get("consensus") or {}
+    firms = data.get("firms") or {}
+    if cons.get("mean") is None and not firms:
+        return ""
+
+    lines: list[str] = []
+    mean = cons.get("mean")
+    if mean is not None:
+        up = cons.get("mean_upside_pct")
+        parts = [f"mean {_fmt_price(mean)}" + (f" ({up:+.1f}%)" if up is not None else "")]
+        if cons.get("high") is not None:
+            parts.append(f"high {_fmt_price(cons['high'])}")
+        if cons.get("low") is not None:
+            parts.append(f"low {_fmt_price(cons['low'])}")
+        if cons.get("num_analysts"):
+            parts.append(f"{cons['num_analysts']} analysts")
+        if cons.get("recommendation"):
+            parts.append(f"rec {cons['recommendation']}")
+        lines.append("  Consensus (yfinance): " + ", ".join(parts))
+    for name, f in firms.items():
+        up = f.get("upside_pct")
+        lines.append(
+            f"  {name}: {_fmt_price(f['target'])}"
+            + (f" ({up:+.1f}%)" if up is not None else "")
+            + f", set {f['date']}"
+        )
+    for insight in data.get("insights", []):
+        lines.append(f"  • {insight}")
+    return "Analyst price targets:\n" + "\n".join(lines)
+
+
 def _earnings_block(symbol: str) -> str:
     try:
         df = fetch_earnings_dates(symbol, days=60)
@@ -221,17 +270,20 @@ def generate_premarket_analysis(
         except Exception:
             pass
 
-    price_text, _ = _price_context(sym)
+    price_text, last_close = _price_context(sym)
     macro_text = _macro_context(days=60)
     news_text = _news_block(news_items)
     fundamentals_text = _fundamentals_block(sym)
     earnings_text = _earnings_block(sym)
+    # The most recent daily close anchors the target upside math (no live
+    # pre-market print is available in this offline briefing path).
+    targets_text = _targets_block(sym, current_price=last_close.get("7d"))
 
     context_parts = [
         f"Symbol: {sym}",
         f"Analysis date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
     ]
-    for block in [earnings_text, fundamentals_text, price_text, macro_text, news_text]:
+    for block in [earnings_text, fundamentals_text, targets_text, price_text, macro_text, news_text]:
         if block:
             context_parts.append(block)
     context = "\n\n".join(context_parts)
