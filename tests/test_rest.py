@@ -1,7 +1,13 @@
 import pytest
 import requests
 
-from agent_stonks.rest import fetch_bars, fetch_news, fetch_trades, _headers
+from agent_stonks.rest import (
+    fetch_bars,
+    fetch_corporate_actions,
+    fetch_news,
+    fetch_trades,
+    _headers,
+)
 
 
 def test_headers():
@@ -51,6 +57,59 @@ class TestFetchTrades:
         )
         with pytest.raises(requests.HTTPError):
             fetch_trades("MSFT", "key", "secret")
+
+
+class TestFetchCorporateActions:
+    def test_flattens_grouped_response_chronologically(self, requests_mock):
+        requests_mock.get(
+            "https://data.alpaca.markets/v1beta1/corporate-actions",
+            json={
+                "corporate_actions": {
+                    "cash_dividends": [
+                        {"symbol": "AAPL", "rate": 0.25, "ex_date": "2026-07-20", "payable_date": "2026-08-01"}
+                    ],
+                    "forward_splits": [
+                        {"symbol": "AAPL", "new_rate": 4, "old_rate": 1, "ex_date": "2026-07-15"}
+                    ],
+                }
+            },
+        )
+        actions = fetch_corporate_actions("AAPL", "key", "secret")
+        assert [a["type"] for a in actions] == ["forward_split", "cash_dividend"]
+        assert [a["date"] for a in actions] == ["2026-07-15", "2026-07-20"]
+        assert actions[1]["rate"] == 0.25
+
+    def test_falls_back_through_date_fields(self, requests_mock):
+        requests_mock.get(
+            "https://data.alpaca.markets/v1beta1/corporate-actions",
+            json={
+                "corporate_actions": {
+                    "cash_mergers": [
+                        {"acquiree_symbol": "AAPL", "rate": 10.0, "effective_date": "2026-07-18"}
+                    ],
+                    "name_changes": [
+                        {"old_symbol": "AAPL", "new_symbol": "AAPL2", "process_date": "2026-07-16"}
+                    ],
+                }
+            },
+        )
+        actions = fetch_corporate_actions("AAPL", "key", "secret")
+        assert [a["date"] for a in actions] == ["2026-07-16", "2026-07-18"]
+
+    def test_returns_empty_when_nothing_scheduled(self, requests_mock):
+        requests_mock.get(
+            "https://data.alpaca.markets/v1beta1/corporate-actions",
+            json={"corporate_actions": {}},
+        )
+        assert fetch_corporate_actions("AAPL", "key", "secret") == []
+
+    def test_raises_on_http_error(self, requests_mock):
+        requests_mock.get(
+            "https://data.alpaca.markets/v1beta1/corporate-actions",
+            status_code=500,
+        )
+        with pytest.raises(requests.HTTPError):
+            fetch_corporate_actions("AAPL", "key", "secret")
 
 
 class TestFetchNews:

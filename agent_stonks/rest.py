@@ -125,6 +125,50 @@ def fetch_latest_quote(
     return r.json().get("quote", {})
 
 
+def fetch_corporate_actions(
+    symbol: str,
+    key: str,
+    secret: str,
+    days_ahead: int = 14,
+) -> list[dict]:
+    """Fetch incoming corporate actions (dividends, splits, mergers, spin-offs, ...)
+    taking effect between today and today+days_ahead from Alpaca. The response is
+    grouped by action type; flatten it into one chronological list of dicts, each
+    carrying "type", its anchor "date" (ex/effective/process date), and the raw
+    per-action fields. Raises on HTTP error."""
+    start = datetime.now(timezone.utc).date()
+    end = start + timedelta(days=days_ahead)
+    r = requests.get(
+        f"{DATA_REST}/v1beta1/corporate-actions",
+        headers=_headers(key, secret),
+        params=dict(
+            symbols=symbol,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            limit=1000,
+            sort="asc",
+        ),
+        timeout=10,
+    )
+    r.raise_for_status()
+    grouped = r.json().get("corporate_actions") or {}
+    actions: list[dict] = []
+    for group, entries in grouped.items():
+        kind = group[:-1] if group.endswith("s") else group  # "cash_dividends" -> "cash_dividend"
+        for entry in entries or []:
+            date = next(
+                (
+                    entry[field]
+                    for field in ("ex_date", "effective_date", "process_date", "payable_date")
+                    if entry.get(field)
+                ),
+                None,
+            )
+            actions.append({"type": kind, "date": date, **entry})
+    actions.sort(key=lambda action: action["date"] or "9999-12-31")
+    return actions
+
+
 def fetch_news(
     symbol: str,
     key: str,

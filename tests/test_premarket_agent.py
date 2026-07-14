@@ -77,8 +77,8 @@ class TestPremarketRegistration:
     def test_personality_registered_with_tools(self):
         assert PREMARKET_PERSONALITY in AGENT_PERSONALITIES
         names = {t["function"]["name"] for t in PREMARKET_TOOLS}
-        assert {"analyze_premarket", "get_quote", "get_news", "get_position",
-                "set_tactics", "submit_decision"} <= names
+        assert {"analyze_premarket", "get_quote", "get_news", "get_corporate_actions",
+                "get_position", "set_tactics", "submit_decision"} <= names
 
     def test_not_selectable_by_the_regime_cycle(self):
         assert PREMARKET_PERSONALITY not in SELECTABLE_STRATEGIES

@@ -191,6 +191,12 @@ class TestRunRegimeCycle:
         selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
         assert selection is None
 
+    def test_regime_tools_include_corporate_actions_but_no_trading(self):
+        names = {t["function"]["name"] for t in REGIME_TOOLS}
+        assert "get_corporate_actions" in names
+        assert "submit_decision" not in names
+        assert "set_tactics" not in names
+
     def test_selectable_strategies_match_personalities(self):
         # Orchestrator can pick any tradeable personality, and automatic is not
         # itself selectable.

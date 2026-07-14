@@ -5,7 +5,8 @@ This is a meta-agent that sits above the individual strategy agents in
 `agent_stonks.agent`. Each round it runs a *regime-detection* cycle -- reading the
 same analysis tools the strategies use (daily trend, broad-market backdrop,
 intraday momentum, volume, VWAP/ADX range read, opening range, order blocks,
-options walls, news) -- and finishes by calling `select_strategy` to activate the
+options walls, news, incoming corporate actions) -- and finishes by calling
+`select_strategy` to activate the
 single strategy best suited to current conditions.
 
 Once a strategy is activated, the orchestrator goes to sleep: it simply hands the
@@ -40,6 +41,7 @@ from .agent import (
     _TOOL_ANALYZE_ORDER_BLOCKS,
     _TOOL_ANALYZE_VOLUME,
     _TOOL_ANALYZE_VWAP_BANDS,
+    _TOOL_GET_CORPORATE_ACTIONS,
     _TOOL_GET_NEWS,
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_QUOTE,
@@ -106,7 +108,11 @@ vs lower-lows, VWAP position, ATR), analyze_volume (relative volume -- is there 
 real participation?), analyze_vwap_bands (the ADX read is the key range-vs-trend \
 gate: ADX below 20 = ranging, 25+ = trending), and analyze_opening_range (is an \
 opening-range break setting up?). Optionally get_put_call_walls and get_news for \
-positioning and catalysts.
+positioning and catalysts, and get_corporate_actions for incoming corporate \
+actions (ex-dividend dates, splits, mergers, spin-offs) -- these are scheduled \
+mechanical catalysts that can distort a ticker's tape: an ex-dividend gap-down \
+is not a bearish trend and a split resets every level, so don't let them \
+masquerade as an organic regime.
 
 4. MATCH THE REGIME TO A STRATEGY. Pick exactly one:
    - momentum -> a fresh, news-driven directional move ALREADY in progress on \
@@ -181,6 +187,7 @@ REGIME_TOOLS: list[dict] = [
     _TOOL_ANALYZE_ORDER_BLOCKS,
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_NEWS,
+    _TOOL_GET_CORPORATE_ACTIONS,
     _TOOL_SELECT_STRATEGY,
 ]
 

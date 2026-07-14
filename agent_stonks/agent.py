@@ -33,6 +33,7 @@ from .config import (
     QUOTE_WIDE_SPREAD_PCT,
 )
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
+from .rest import fetch_corporate_actions
 from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert
 from .tactics import (
     TACTIC_CONDITION_FIELDS,
@@ -491,7 +492,10 @@ book are placeholder-wide, trust last_price.
 2. FIND THE CATALYST BEHIND THE GAP. Call get_news. A gap backed by a real \
 catalyst (earnings, guidance, upgrade/downgrade, M&A, macro) tends to FOLLOW \
 THROUGH after the open; a gap on no news tends to FADE back toward the prior \
-close. This distinction shapes your plan more than any other input.
+close. This distinction shapes your plan more than any other input. Also call \
+get_corporate_actions -- an imminent ex-dividend date, split, merger, or \
+spin-off is a scheduled MECHANICAL catalyst: an ex-dividend gap-down is not a \
+fade signal, and a split resets every level your plan is anchored to.
 
 3. ANCHOR TO STRUCTURE. Call analyze_daily_trend for the medium-term regime \
 and the support/resistance the open will trade against, and analyze_market for \
@@ -1304,6 +1308,32 @@ _TOOL_GET_ANALYST_TARGETS = {
     },
 }
 
+_TOOL_GET_CORPORATE_ACTIONS = {
+    "type": "function",
+    "function": {
+        "name": "get_corporate_actions",
+        "description": (
+            "Incoming corporate actions scheduled for the ticker over the next two weeks "
+            "(configurable): cash/stock dividends with their ex-dividend and payable dates, "
+            "forward/reverse splits, mergers, spin-offs, and similar events, flattened into one "
+            "chronological list. These are scheduled, mechanical catalysts: an ex-dividend date "
+            "lowers the open by roughly the dividend (not a bearish signal), a split resets every "
+            "price level, and merger terms can pin or reprice the tape -- check them before "
+            "trusting a gap read or leaving tactics armed across an event date."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {
+                    "type": "integer",
+                    "description": "Lookahead window in days (default 14, max 90).",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
 _TOOL_ANALYZE_PREMARKET = {
     "type": "function",
     "function": {
@@ -1354,6 +1384,7 @@ for _tool in (
     _TOOL_ANALYZE_PREMIUM_DISCOUNT,
     _TOOL_GET_SMART_MONEY_FLOW,
     _TOOL_GET_ANALYST_TARGETS,
+    _TOOL_GET_CORPORATE_ACTIONS,
     _TOOL_ANALYZE_PREMARKET,
     _TOOL_SET_TACTICS,
 ):
@@ -1429,6 +1460,7 @@ PREMARKET_TOOLS: list[dict] = [
     _TOOL_GET_QUOTE,
     _TOOL_ANALYZE_PREMARKET,
     _TOOL_GET_NEWS,
+    _TOOL_GET_CORPORATE_ACTIONS,
     _TOOL_ANALYZE_DAILY_TREND,
     _TOOL_GET_ANALYST_TARGETS,
     _TOOL_ANALYZE_MARKET,
@@ -1792,6 +1824,20 @@ def _tool_get_analyst_targets(state: "SymbolState") -> dict:
     return historical.fetch_analyst_targets(symbol, current_price=spot)
 
 
+def _tool_get_corporate_actions(state: "SymbolState", days_ahead: object = None) -> dict:
+    symbol = state.symbol
+    if not symbol:
+        return {"note": "no symbol set"}
+    key, secret = state.api_key, state.api_secret
+    if not key or not secret:
+        return {"note": "Alpaca API keys are not configured; corporate actions unavailable"}
+    days = max(1, min(int(days_ahead or 14), 90))
+    actions = fetch_corporate_actions(symbol, key, secret, days_ahead=days)
+    if not actions:
+        return {"note": f"no corporate actions scheduled for {symbol} in the next {days} days"}
+    return {"window_days": days, "upcoming_corporate_actions": actions}
+
+
 def _tool_analyze_premarket(state: "SymbolState") -> dict:
     now = datetime.now(timezone.utc)
     # The session the read is about: the one in progress (edge case: the bell
@@ -1875,6 +1921,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_premium_discount": _per_symbol(_tool_analyze_premium_discount),
     "get_smart_money_flow": _per_symbol(_tool_get_smart_money_flow),
     "get_analyst_targets": _per_symbol(_tool_get_analyst_targets),
+    "get_corporate_actions": _per_symbol(_tool_get_corporate_actions, "days_ahead"),
     "analyze_premarket": _per_symbol(_tool_analyze_premarket),
     "smart_money_trade_geometry": lambda args, app, tracker: _tool_smart_money_trade_geometry(
         args.get("entry"), args.get("stop"), args.get("target")

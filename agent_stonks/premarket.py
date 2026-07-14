@@ -22,6 +22,7 @@ from .historical import (
 )
 from .llm import DEFAULT_NEWS_MODELS, parse_structured
 from .news import fetch_news_with_fallback, get_last_week_news
+from .rest import fetch_corporate_actions
 
 
 DEFAULT_PREMARKET_MODELS: dict[str, str] = {
@@ -65,6 +66,13 @@ Barclays. Use them to frame upside/downside: little room to the consensus mean
 (or price already above it) argues against chasing a gap-up; a wide gap to the
 mean leaves room to run; price outside the whole high-low range is a valuation
 extreme worth flagging.
+
+You may also have incoming corporate actions (ex-dividend dates, splits,
+mergers, spin-offs) over the next two weeks. Treat them as scheduled catalysts:
+an imminent ex-dividend date mechanically lowers the open by roughly the
+dividend (not a bearish signal), splits reset every price level and often draw
+retail flow, and merger/spin-off terms can pin or reprice the stock. Fold them
+into the bias, catalysts, and risk factors where relevant.
 
 Your job:
 1. Form a directional morning bias (bullish / bearish / neutral) with a confidence rating.
@@ -216,6 +224,31 @@ def _targets_block(symbol: str, current_price: Optional[float] = None) -> str:
     return "Analyst price targets:\n" + "\n".join(lines)
 
 
+def _corporate_actions_block(symbol: str, alpaca_key: str, alpaca_secret: str, days_ahead: int = 14) -> str:
+    """Incoming corporate actions (ex-dividends, splits, mergers, ...) from Alpaca,
+    one chronological line per action. Empty when keys are missing or nothing is scheduled."""
+    if not alpaca_key or not alpaca_secret:
+        return ""
+    try:
+        actions = fetch_corporate_actions(symbol, alpaca_key, alpaca_secret, days_ahead=days_ahead)
+    except Exception:
+        return ""
+    if not actions:
+        return ""
+    lines: list[str] = []
+    for action in actions[:10]:
+        details = ", ".join(
+            f"{field} {value}"
+            for field, value in action.items()
+            if field not in ("type", "date") and value not in (None, "", False)
+        )
+        lines.append(
+            f"  {action.get('date') or 'date TBD'}: {action['type'].replace('_', ' ')}"
+            + (f" ({details})" if details else "")
+        )
+    return f"Incoming corporate actions (next {days_ahead} days):\n" + "\n".join(lines)
+
+
 def _earnings_block(symbol: str) -> str:
     try:
         df = fetch_earnings_dates(symbol, days=60)
@@ -275,6 +308,7 @@ def generate_premarket_analysis(
     news_text = _news_block(news_items)
     fundamentals_text = _fundamentals_block(sym)
     earnings_text = _earnings_block(sym)
+    corporate_actions_text = _corporate_actions_block(sym, alpaca_key, alpaca_secret)
     # The most recent daily close anchors the target upside math (no live
     # pre-market print is available in this offline briefing path).
     targets_text = _targets_block(sym, current_price=last_close.get("7d"))
@@ -283,7 +317,15 @@ def generate_premarket_analysis(
         f"Symbol: {sym}",
         f"Analysis date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
     ]
-    for block in [earnings_text, fundamentals_text, targets_text, price_text, macro_text, news_text]:
+    for block in [
+        earnings_text,
+        corporate_actions_text,
+        fundamentals_text,
+        targets_text,
+        price_text,
+        macro_text,
+        news_text,
+    ]:
         if block:
             context_parts.append(block)
     context = "\n\n".join(context_parts)

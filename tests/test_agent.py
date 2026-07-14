@@ -14,6 +14,7 @@ from agent_stonks.agent import (
     _session_closed_addendum,
     _tool_analyze_volume,
     _tool_breakout_trade_geometry,
+    _tool_get_corporate_actions,
     _tool_get_news,
     _tool_get_quote,
     _tool_smart_money_trade_geometry,
@@ -94,6 +95,38 @@ class TestToolHandlers:
         state.news_impacts = {"1": "positive"}
         result = _tool_get_news(state)
         assert result["articles"][0]["impact"] == "positive"
+
+    def test_get_corporate_actions_without_keys_returns_note(self):
+        _, state = _app()
+        result = _tool_get_corporate_actions(state)
+        assert "note" in result
+
+    def test_get_corporate_actions_fetches_and_clamps_window(self, requests_mock):
+        app, state = _app()
+        app.api_key = "k"
+        app.api_secret = "s"
+        requests_mock.get(
+            "https://data.alpaca.markets/v1beta1/corporate-actions",
+            json={
+                "corporate_actions": {
+                    "cash_dividends": [{"symbol": "AAPL", "rate": 0.25, "ex_date": "2026-07-20"}]
+                }
+            },
+        )
+        result = _dispatch_tool("get_corporate_actions", {"days_ahead": 500}, app, DecisionTracker())
+        assert result["window_days"] == 90
+        assert result["upcoming_corporate_actions"][0]["type"] == "cash_dividend"
+
+    def test_get_corporate_actions_empty_returns_note(self, requests_mock):
+        app, state = _app()
+        app.api_key = "k"
+        app.api_secret = "s"
+        requests_mock.get(
+            "https://data.alpaca.markets/v1beta1/corporate-actions",
+            json={"corporate_actions": {}},
+        )
+        result = _dispatch_tool("get_corporate_actions", {}, app, DecisionTracker())
+        assert "no corporate actions" in result["note"]
 
     def test_dispatch_unknown_tool_returns_error(self):
         state = AppState()
