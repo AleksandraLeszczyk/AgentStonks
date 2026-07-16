@@ -5,9 +5,11 @@ Collection vs. scoring are deliberately split:
 - **Collection** is cheap, deterministic, and always on. While an agent runs,
   a per-session :class:`Scorecard` (on ``AppState.scorecard``) accumulates
   grounding results per cycle, set_tactics validation rejections, tool
-  errors / unreliable-quote warnings, and (under Automatic) the strategy
-  activation windows. When the session ends the scorecard is flattened into
-  one journal record (``data/scoring/journal.jsonl``).
+  errors / unreliable-quote warnings, per-symbol price extremes (fed tick by
+  tick from the market-data stream, see :func:`record_price`), and (under
+  Automatic) the strategy activation windows. When the session ends the
+  scorecard is flattened into one journal record
+  (``data/scoring/journal.jsonl``).
 
 - **Scoring** runs at most once per UTC calendar day. :func:`maybe_score_day`
   aggregates the current day's journal records (plus the still-running
@@ -18,6 +20,13 @@ Collection vs. scoring are deliberately split:
   of short experiments never produce a (statistically meaningless) report.
   When Langfuse is configured the report is also registered there as a
   ``daily-grounding`` score (see :func:`_register_langfuse_score`).
+
+Besides the daily report, every finished session registers a
+``session-profit-efficiency`` Langfuse score: the session's portfolio return
+divided by the best single round trip an oracle could have made on any of the
+session's symbols (buy the session minimum / sell the highest later price, or
+sell the session maximum / buy the lowest earlier price -- whichever is
+larger). See :func:`_profit_potential`.
 
 The grounding score is a deterministic faithfulness check, not an LLM judge:
 every number the model emits in a finalizing tool call (submit_decision,
@@ -215,6 +224,10 @@ class Scorecard:
         self.tool_errors = 0
         self.quote_calls = 0
         self.quote_warnings = 0
+        # Per-symbol running price extremes, order-aware so the two oracle
+        # round trips can be reconstructed at session end (see record_price):
+        # {min, max, max_after_min, min_before_max}.
+        self.price_extremes: dict[str, dict] = {}
         # Closed Automatic activation windows: {strategy, regime, started_at, ended_at}.
         self.activations: list[dict] = []
         self._open_activation: "dict | None" = None
@@ -285,6 +298,42 @@ def record_tool_call(state: "AppState", name: str, result: dict) -> None:
             card.quote_calls += 1
             if has_warning:
                 card.quote_warnings += 1
+
+
+@_never_raise
+def record_price(state: "AppState", symbol: str, price: "float | None") -> None:
+    """Fold one observed price into the session's per-symbol extremes.
+
+    Called from the market-data stream (trade ticks, bar highs/lows, REST
+    fallback refreshes) in arrival order, which lets the tracker keep the two
+    quantities the oracle round trips need without storing the series:
+
+    - ``max_after_min``: highest price seen since the running minimum was set
+      (buy the session minimum, sell the best later price);
+    - ``min_before_max``: running minimum at the moment the running maximum
+      was set (sell the session maximum, buy the best earlier price).
+    """
+    card: "Scorecard | None" = state.scorecard
+    if card is None or price is None:
+        return
+    p = float(price)
+    if p <= 0 or (card.symbols and symbol not in card.symbols):
+        return
+    with card.lock:
+        ex = card.price_extremes.get(symbol)
+        if ex is None:
+            card.price_extremes[symbol] = {
+                "min": p, "max": p, "max_after_min": p, "min_before_max": p,
+            }
+            return
+        if p < ex["min"]:
+            ex["min"] = p
+            ex["max_after_min"] = p
+        elif p > ex["max_after_min"]:
+            ex["max_after_min"] = p
+        if p > ex["max"]:
+            ex["max"] = p
+            ex["min_before_max"] = ex["min"]
 
 
 @_never_raise
@@ -378,6 +427,42 @@ def _activation_outcomes(activations: list[dict], decisions: list[dict]) -> list
     return out
 
 
+def _profit_potential(
+    price_extremes: dict[str, dict], return_pct: "float | None"
+) -> "dict | None":
+    """Session return measured against an oracle's best single round trip.
+
+    For each symbol the maximum possible profit is the better of the two
+    order-respecting round trips (buy the minimum / sell the highest later
+    price; sell the maximum / buy the lowest earlier price); the session's
+    ceiling is the best symbol's. ``profit_efficiency`` is the portfolio
+    return divided by that ceiling -- negative when the session lost money,
+    None when no prices were observed or they never moved.
+    """
+    per_symbol = {}
+    for symbol, ex in sorted(price_extremes.items()):
+        buy_min = (ex["max_after_min"] / ex["min"] - 1.0) * 100.0
+        sell_max = (ex["max"] / ex["min_before_max"] - 1.0) * 100.0
+        per_symbol[symbol] = {
+            "min": ex["min"],
+            "max": ex["max"],
+            "max_profit_pct": max(buy_min, sell_max),
+        }
+    if not per_symbol:
+        return None
+    best_symbol = max(per_symbol, key=lambda s: per_symbol[s]["max_profit_pct"])
+    max_possible = per_symbol[best_symbol]["max_profit_pct"]
+    efficiency = None
+    if return_pct is not None and max_possible > 0:
+        efficiency = return_pct / max_possible
+    return {
+        "symbols": per_symbol,
+        "best_symbol": best_symbol,
+        "max_possible_profit_pct": max_possible,
+        "profit_efficiency": efficiency,
+    }
+
+
 def _grounding_summary(cycle_results: list[dict]) -> "dict | None":
     if not cycle_results:
         return None
@@ -407,6 +492,7 @@ def _session_record(
         activations = list(card.activations)
         if card._open_activation is not None:  # still-running Automatic window
             activations.append({**card._open_activation, "ended_at": now_iso})
+        decision_quality = _decision_quality(decisions, card.start_value, end_value)
         record = {
             "started_at": card.started_at,
             "ended_at": now_iso,
@@ -422,7 +508,10 @@ def _session_record(
                 "quote_calls": card.quote_calls,
                 "quote_warnings": card.quote_warnings,
             },
-            "decisions": _decision_quality(decisions, card.start_value, end_value),
+            "decisions": decision_quality,
+            "profit_potential": _profit_potential(
+                card.price_extremes, decision_quality["return_pct"]
+            ),
             "activations": _activation_outcomes(activations, decisions),
         }
     return record
@@ -438,7 +527,33 @@ def end_session(state: "AppState", tracker: "DecisionTracker | None") -> None:
     state.scorecard = None
     record = _session_record(card, tracker, state)
     _append_journal(record)
+    _register_session_efficiency_score(record)
     maybe_score_day(state, tracker)
+
+
+@_never_raise
+def _register_session_efficiency_score(record: dict) -> None:
+    """Register the session's profit efficiency in Langfuse (no-op when
+    unconfigured).
+
+    The score is the session's portfolio return divided by the maximum profit
+    an oracle's best single round trip could have made on the session's
+    symbols (see :func:`_profit_potential`). Sessions with no observed prices,
+    or whose prices never moved, register nothing.
+    """
+    potential = record.get("profit_potential")
+    if not potential or potential.get("profit_efficiency") is None:
+        return
+    obs.record_score(
+        trace_name=f"session-scoring-{record['started_at']}",
+        name="session-profit-efficiency",
+        value=potential["profit_efficiency"],
+        comment=(
+            f"session return {record['decisions']['return_pct']:+.2f}% vs. max possible "
+            f"{potential['max_possible_profit_pct']:.2f}% ({potential['best_symbol']})"
+        ),
+        input=record,
+    )
 
 
 def _append_journal(record: dict) -> None:

@@ -13,6 +13,7 @@ from agent_stonks.scoring import (
     record_activation_end,
     record_activation_start,
     record_cycle_grounding,
+    record_price,
     record_tactics_call,
     record_tool_call,
     day_report_path,
@@ -179,6 +180,73 @@ class TestScorecardRecording:
         card = state.scorecard
         assert [a["strategy"] for a in card.activations] == ["momentum", "reversal"]
         assert card._open_activation["strategy"] == "breakout"
+
+
+class TestProfitPotential:
+    def _state(self, symbols=("SPY",)) -> AppState:
+        state = AppState()
+        begin_session(state, "momentum", list(symbols))
+        return state
+
+    def _feed(self, state: AppState, symbol: str, prices) -> None:
+        for p in prices:
+            record_price(state, symbol, p)
+
+    def test_min_before_max_round_trip(self):
+        # Global minimum comes first: both oracle variants collapse to
+        # buy-the-min / sell-the-later-max.
+        state = self._state()
+        self._feed(state, "SPY", [100.0, 90.0, 120.0, 110.0])
+        ex = state.scorecard.price_extremes["SPY"]
+        assert ex == {"min": 90.0, "max": 120.0,
+                      "max_after_min": 120.0, "min_before_max": 90.0}
+        potential = scoring._profit_potential(state.scorecard.price_extremes, 5.0)
+        assert potential["max_possible_profit_pct"] == pytest.approx(100 / 3)
+        assert potential["profit_efficiency"] == pytest.approx(0.15)
+
+    def test_max_before_min_uses_best_of_both_variants(self):
+        # Global maximum comes before the global minimum: selling the max
+        # (bought at the earlier min 100) beats buying the min (sold at the
+        # later high 90).
+        state = self._state()
+        self._feed(state, "SPY", [100.0, 120.0, 80.0, 90.0])
+        ex = state.scorecard.price_extremes["SPY"]
+        assert ex == {"min": 80.0, "max": 120.0,
+                      "max_after_min": 90.0, "min_before_max": 100.0}
+        potential = scoring._profit_potential(state.scorecard.price_extremes, None)
+        assert potential["max_possible_profit_pct"] == pytest.approx(20.0)
+        assert potential["profit_efficiency"] is None  # no session return known
+
+    def test_best_symbol_sets_the_ceiling(self):
+        state = self._state(symbols=("SPY", "TSLA"))
+        self._feed(state, "SPY", [100.0, 101.0])
+        self._feed(state, "TSLA", [200.0, 250.0])
+        potential = scoring._profit_potential(state.scorecard.price_extremes, 5.0)
+        assert potential["best_symbol"] == "TSLA"
+        assert potential["max_possible_profit_pct"] == pytest.approx(25.0)
+        assert potential["profit_efficiency"] == pytest.approx(0.2)
+
+    def test_flat_prices_yield_no_efficiency(self):
+        state = self._state()
+        self._feed(state, "SPY", [100.0, 100.0])
+        potential = scoring._profit_potential(state.scorecard.price_extremes, 5.0)
+        assert potential["max_possible_profit_pct"] == 0.0
+        assert potential["profit_efficiency"] is None
+
+    def test_no_prices_yield_no_potential(self):
+        assert scoring._profit_potential({}, 5.0) is None
+
+    def test_off_session_symbols_and_bad_prices_ignored(self):
+        state = self._state()
+        record_price(state, "NVDA", 500.0)  # not in the session's symbols
+        record_price(state, "SPY", None)
+        record_price(state, "SPY", 0.0)
+        assert state.scorecard.price_extremes == {}
+
+    def test_noop_without_scorecard(self):
+        state = AppState()
+        record_price(state, "SPY", 100.0)
+        assert state.scorecard is None
 
 
 class TestDecisionQuality:
@@ -353,3 +421,35 @@ class TestDailyScoring:
         records = scoring._read_journal()
         assert len(records) == 1
         assert records[0]["mode"] == "momentum"
+
+    def test_end_session_registers_profit_efficiency_score(self, monkeypatch):
+        pushed = []
+        monkeypatch.setattr(
+            scoring.obs, "record_score", lambda **kwargs: pushed.append(kwargs)
+        )
+        state = AppState()
+        begin_session(state, "momentum", ["SPY"])
+        # +5% session on a 90 -> 120 oracle move (33.3% max possible).
+        monkeypatch.setattr(
+            state, "mark_to_market", lambda: state.starting_budget * 1.05
+        )
+        for price in (100.0, 90.0, 120.0):
+            record_price(state, "SPY", price)
+        end_session(state, tracker=None)
+        record = scoring._read_journal()[0]
+        assert record["profit_potential"]["max_possible_profit_pct"] == pytest.approx(100 / 3)
+        assert record["profit_potential"]["profit_efficiency"] == pytest.approx(0.15)
+        efficiency = [p for p in pushed if p["name"] == "session-profit-efficiency"]
+        assert len(efficiency) == 1
+        assert efficiency[0]["value"] == pytest.approx(0.15)
+        assert efficiency[0]["trace_name"] == f"session-scoring-{record['started_at']}"
+
+    def test_end_session_without_prices_registers_no_score(self, monkeypatch):
+        pushed = []
+        monkeypatch.setattr(
+            scoring.obs, "record_score", lambda **kwargs: pushed.append(kwargs)
+        )
+        state = AppState()
+        begin_session(state, "momentum", ["SPY"])
+        end_session(state, tracker=None)
+        assert [p for p in pushed if p["name"] == "session-profit-efficiency"] == []
