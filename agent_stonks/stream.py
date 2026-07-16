@@ -16,6 +16,7 @@ from .config import (
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
 )
+from . import scoring
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
 from .news import fetch_news_with_fallback
@@ -317,6 +318,15 @@ def _start_stream(
                 vol_enabled = app.volume_alert_enabled
                 vol_multiplier = app.volume_alert_multiplier
 
+                # Session profit-potential tracking: the bar's low/high bound
+                # what an oracle could have traded this minute. Order within
+                # the bar is unknown; low-then-high assumes the optimistic
+                # buy-low-sell-high ordering.
+                if "l" in bar:
+                    scoring.record_price(app, symbol, bar["l"])
+                if "h" in bar:
+                    scoring.record_price(app, symbol, bar["h"])
+
                 # High-volume alert: today's cumulative volume crossing
                 # multiplier x average daily volume. Latched per symbol
                 # (vol_triggered) so it fires once per session rather than on
@@ -349,6 +359,8 @@ def _start_stream(
                     if "p" in msg:
                         state.last_price = float(msg["p"])
                         state.recent_prices.append((time.monotonic(), state.last_price))
+                if "p" in msg:
+                    scoring.record_price(app, symbol, msg["p"])
 
                 # Keep portfolio value marked-to-market independently of the
                 # agent loop -- it never has to fetch or compute this itself.
@@ -489,6 +501,12 @@ def _poll_symbol_via_rest(
         state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
         if quote:
             _apply_quote(state, quote)
+    # Session profit-potential tracking off the freshest bar and price; older
+    # bars are skipped -- replaying history would break the tracker's
+    # arrival-order assumption (and may predate the session anyway).
+    scoring.record_price(state.app, symbol, last_bar.get("l"))
+    scoring.record_price(state.app, symbol, last_bar.get("h"))
+    scoring.record_price(state.app, symbol, last_price)
     if state.app.decision_tracker is not None:
         state.app.mark_to_market()
     # Keep alerts live even when the WS is down and prices come from REST.

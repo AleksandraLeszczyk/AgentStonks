@@ -321,6 +321,99 @@ class TestTacticsExecutor:
         assert state.tactics is None
 
 
+def _bracket(stop=95.0, target=120.0):
+    return [
+        {
+            "action": "sell",
+            "quantity_pct": 100,
+            "conditions": [{"field": "last_price", "condition": "below", "value": stop}],
+            "note": "stop",
+        },
+        {
+            "action": "sell",
+            "quantity_pct": 100,
+            "conditions": [{"field": "last_price", "condition": "above", "value": target}],
+            "note": "take profit",
+        },
+    ]
+
+
+class TestTrailingStop:
+    """The executor trails an armed protective stop up as price advances from
+    the entry fill toward the take-profit target."""
+
+    def _setup(self, stop=95.0, target=120.0, entry=100.0):
+        broker = FakeBroker(price=entry)
+        tracker = DecisionTracker(starting_cash=10_000, broker=broker, trade_cost=0.0)
+        tracker.record_trade("AAPL", "buy", 10, "entry", "k", "s")
+        state = _armed_state(raw_actions=_bracket(stop=stop, target=target), last_price=entry)
+        return state, tracker, broker, TacticsExecutor(state, tracker)
+
+    def test_stop_trails_proportionally_and_target_stays(self):
+        state, _, _, executor = self._setup()
+        state.last_price = 104.0  # 20% of the 100 -> 120 entry->target range
+
+        assert executor.check_now() is None
+
+        stop_cond = state.tactics.actions[0].conditions[0]
+        target_cond = state.tactics.actions[1].conditions[0]
+        # Stop covers 20% of its own 95 -> 120 distance to the target.
+        assert stop_cond.value == pytest.approx(100.0)
+        assert stop_cond.initial_value == 95.0
+        assert target_cond.value == 120.0
+        assert state.tactics.high_water == 104.0
+
+    def test_stop_only_ratchets_up(self):
+        state, _, _, executor = self._setup()
+        state.last_price = 105.0
+        executor.check_now()
+        stop_cond = state.tactics.actions[0].conditions[0]
+        assert stop_cond.value == pytest.approx(101.25)
+
+        state.last_price = 103.0  # pullback, still above the trailed stop
+        assert executor.check_now() is None
+        assert stop_cond.value == pytest.approx(101.25)
+        assert state.tactics.high_water == 105.0
+
+    def test_pullback_through_trailed_stop_sells(self):
+        state, _, broker, executor = self._setup()
+        state.last_price = 110.0
+        executor.check_now()
+        assert state.tactics.actions[0].conditions[0].value == pytest.approx(107.5)
+
+        broker.price = 104.0
+        state.last_price = 104.0
+        fired = executor.check_now()
+
+        assert fired is not None and fired.note == "stop"
+        assert broker.orders[-1] == ("sell", 10.0, 104.0)
+
+    def test_target_touch_fires_take_profit_not_ratcheted_stop(self):
+        state, _, broker, executor = self._setup()
+        broker.price = 120.0
+        state.last_price = 120.0
+
+        fired = executor.check_now()
+
+        assert fired is not None and fired.note == "take profit"
+
+    def test_no_trailing_without_a_position(self):
+        state = _armed_state(raw_actions=_bracket(), last_price=104.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker(price=104.0))
+        executor = TacticsExecutor(state, tracker)
+
+        assert executor.check_now() is None
+        assert state.tactics.actions[0].conditions[0].value == 95.0
+
+    def test_stop_at_or_above_entry_is_left_alone(self):
+        # A stop the agent re-armed at breakeven is a deliberate manual level.
+        state, _, _, executor = self._setup(stop=100.0)
+        state.last_price = 110.0
+
+        assert executor.check_now() is None
+        assert state.tactics.actions[0].conditions[0].value == 100.0
+
+
 class TestAgentSetTactics:
     def _run(self, state, tracker, responses):
         client = FakeClient(responses)

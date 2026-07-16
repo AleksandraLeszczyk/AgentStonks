@@ -650,6 +650,21 @@ price, momentum, and volume stand NOW, tighten whatever can be tightened, and \
 re-arm. The plan you go back to sleep with should reflect the current state \
 of the trade, not the state at entry.
 
+AUTOMATIC TRAILING: when you hold a position and your armed sell actions \
+bracket it -- a take-profit ('sell when last_price above target') plus a \
+protective stop ('sell when last_price below stop') armed BELOW your entry \
+price -- the stop is trailed up for you mechanically while you sleep: as the \
+price's high-water mark covers a fraction of the entry-to-target distance, \
+the stop is raised to cover the same fraction of its own distance to the \
+target (e.g. price 20% of the way to target moves the stop 20% of the way \
+from its armed level to the target). The take-profit level itself never \
+moves, and the stop only ever ratchets up, never down. This is a safety \
+net, not a substitute for your own recalibration: structure-based stops \
+(under a higher low, VWAP) are usually tighter than the proportional trail, \
+so still re-derive and re-arm them at your checkpoint wakes. A stop you \
+re-arm at or above your entry price is treated as a deliberate manual level \
+and is NOT auto-trailed.
+
 Protocol: call set_tactics at most once per TICKER per cycle, BEFORE \
 finalizing; it REPLACES that ticker's previously armed tactics (get_position \
 shows what is armed per ticker), and actions=[] cancels them. Then finalize \
@@ -941,7 +956,10 @@ _TOOL_SET_TACTICS = {
             "woken immediately to reevaluate. Replaces any previously armed tactics "
             "(pass an empty actions array to cancel them). Call at most once per cycle, "
             "then still finalize with submit_decision -- with tactics armed, action "
-            "'alert' may carry an empty alerts array."
+            "'alert' may carry an empty alerts array. On an open long position, a sell "
+            "stop (last_price below, armed under your entry price) paired with a sell "
+            "take-profit (last_price above) is trailed up automatically as price "
+            "advances toward the target; the take-profit level never moves."
         ),
         "parameters": {
             "type": "object",

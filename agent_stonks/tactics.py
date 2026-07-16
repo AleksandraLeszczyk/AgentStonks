@@ -15,6 +15,12 @@ own buy/sell decisions take, so fills, fees, logging, and charting behave
 identically. After one action executes, the whole tactics set is disarmed and
 the agent is woken to reevaluate with the fill in hand; it re-arms whatever
 still applies on the next cycle.
+
+While a sell bracket is armed on an open long position -- a take-profit
+("sell when last_price above target") together with a protective stop ("sell
+when last_price below stop", armed below the entry price) -- the executor also
+trails the stop up mechanically as the price advances (see
+`TacticsExecutor._ratchet_trailing_stop`). The take-profit level never moves.
 """
 from __future__ import annotations
 
@@ -56,6 +62,10 @@ class TacticCondition:
     field: str  # one of TACTIC_CONDITION_FIELDS
     condition: str  # "above" (>=) | "below" (<=)
     value: float
+    # The value the condition was armed at, recorded the first time the
+    # trailing-stop ratchet moves `value` so the ratchet keeps interpolating
+    # from the armed level. None until (unless) the condition is ever trailed.
+    initial_value: Optional[float] = None
 
 
 @dataclass
@@ -77,6 +87,8 @@ class Tactics:
     reasoning: str
     actions: list[TacticAction] = field(default_factory=list)
     status: str = "armed"  # "armed" | "executed" | "cancelled"
+    # Highest last_price seen while armed; drives the trailing-stop ratchet.
+    high_water: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -280,7 +292,10 @@ class TacticsExecutor:
 
     def check_now(self) -> "TacticAction | None":
         """Evaluate the armed tactics once; execute and return the first action
-        whose conditions all hold, or None when nothing fired."""
+        whose conditions all hold, or None when nothing fired. When nothing
+        fired, trail any protective sell stops up behind the price (the ratchet
+        runs after evaluation so a price touching the take-profit level fires
+        the take-profit, never a stop ratcheted onto the same level)."""
         tactics = self.state.tactics
         if tactics is None or tactics.status != "armed":
             return None
@@ -288,7 +303,77 @@ class TacticsExecutor:
             if self._conditions_met(action):
                 self._execute(tactics, action)
                 return action
+        self._ratchet_trailing_stop(tactics)
         return None
+
+    def _entry_price(self, snap: dict) -> "float | None":
+        """Fill price of the most recent filled buy in this symbol, or None."""
+        for decision in reversed(snap["decisions"]):
+            if (
+                decision.symbol == self.state.symbol
+                and decision.action == "buy"
+                and decision.status == "filled"
+                and decision.price
+            ):
+                return float(decision.price)
+        return None
+
+    def _ratchet_trailing_stop(self, tactics: Tactics) -> None:
+        """Trail armed protective sell stops up as the price advances toward
+        the take-profit target.
+
+        Applies while the armed actions bracket an open long position with a
+        take-profit ("sell when last_price above target") and a stop ("sell
+        when last_price below stop" armed BELOW the entry price). Whenever the
+        high-water mark of last_price since arming covers a fraction of the
+        entry->target distance, each stop is raised to cover the same fraction
+        of its own distance to the target (stop = armed + fraction * (target -
+        armed)) -- locking in gains while always staying below the high that
+        produced it. The target never moves, stops only ever move up, and
+        stops armed at/above the entry (a manual breakeven/structure stop) are
+        left alone.
+        """
+        with self.state.lock:
+            price = self.state.last_price
+        if not price or price <= 0:
+            return
+        if tactics.high_water is None or price > tactics.high_water:
+            tactics.high_water = price
+
+        sells = [a for a in tactics.actions if a.action == "sell"]
+        targets = [
+            c.value
+            for a in sells
+            for c in a.conditions
+            if c.field == "last_price" and c.condition == "above"
+        ]
+        if not targets:
+            return
+        target = max(targets)
+
+        snap = self.tracker.snapshot()
+        if snap["positions"].get(self.state.symbol, 0.0) <= 0:
+            return
+        entry = self._entry_price(snap)
+        if entry is None or entry >= target or tactics.high_water <= entry:
+            return
+        progress = min(1.0, (tactics.high_water - entry) / (target - entry))
+
+        for action in sells:
+            for cond in action.conditions:
+                if cond.field != "last_price" or cond.condition != "below":
+                    continue
+                armed_at = cond.initial_value if cond.initial_value is not None else cond.value
+                if armed_at >= entry:
+                    continue
+                new_stop = round(armed_at + progress * (target - armed_at), 4)
+                if new_stop > cond.value:
+                    cond.initial_value = armed_at
+                    logger.info(
+                        "%s trailing stop ratcheted %.4f -> %.4f (high %.4f covers %.0f%% of entry %.4f -> target %.4f)",
+                        tactics.symbol, cond.value, new_stop, tactics.high_water, progress * 100, entry, target,
+                    )
+                    cond.value = new_stop
 
     def _resolve_quantity(self, action: TacticAction) -> float:
         if action.quantity is not None:
