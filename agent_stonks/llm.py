@@ -147,6 +147,40 @@ class AnthropicChatClient:
         self.chat = SimpleNamespace(completions=_AnthropicCompletions(self._client))
 
 
+class _OpenAIToolCompletions:
+    """Wraps OpenAI `chat.completions` to make function tools work with reasoning models.
+
+    Newer OpenAI models (e.g. gpt-5.6) apply a server-side default reasoning
+    effort, and `/v1/chat/completions` rejects function tools whenever reasoning
+    is active with: "Function tools with reasoning_effort are not supported ...
+    set reasoning_effort to 'none'." We forward that documented workaround by
+    defaulting `reasoning_effort="none"` on any tool-carrying call (unless the
+    caller set it explicitly). Tool-less calls are passed through untouched.
+    """
+
+    def __init__(self, completions: Any) -> None:
+        self._completions = completions
+
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("tools") and "reasoning_effort" not in kwargs:
+            kwargs["reasoning_effort"] = "none"
+        return self._completions.create(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:  # e.g. `.parse`, delegated unchanged
+        return getattr(self._completions, name)
+
+
+class _OpenAIToolChatClient:
+    """Proxies an OpenAI client, swapping in reasoning-safe tool completions."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self.chat = SimpleNamespace(completions=_OpenAIToolCompletions(client.chat.completions))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
 def get_agent_client(provider: str, api_key: str) -> Any:
     """Return a chat client exposing `.chat.completions.create(...)` for the given provider."""
     if provider == "gemini":
@@ -154,7 +188,7 @@ def get_agent_client(provider: str, api_key: str) -> Any:
         return OpenAI(api_key=api_key, base_url=_GEMINI_BASE_URL)
     if provider == "openai":
         OpenAI = obs.import_openai_class()
-        return OpenAI(api_key=api_key)
+        return _OpenAIToolChatClient(OpenAI(api_key=api_key))
     if provider == "anthropic":
         return AnthropicChatClient(api_key)
     raise ValueError(f"Unknown LLM provider: {provider!r}")
