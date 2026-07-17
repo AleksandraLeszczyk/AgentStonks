@@ -22,15 +22,44 @@ PROVIDERS: tuple[str, ...] = ("gemini", "openai", "anthropic")
 
 DEFAULT_AGENT_MODELS: dict[str, str] = {
     "gemini": "gemini-3.5-flash",
-    "openai": "gpt-5.4-mini",
-    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-5.6-luna",
+    "anthropic": "claude-haiku-4-5-20251001",
 }
 
 DEFAULT_NEWS_MODELS: dict[str, str] = {
     "gemini": "gemini-3.5-flash",
-    "openai": "gpt-5.4-nano",
+    "openai": "gpt-5.6-luna",
     "anthropic": "claude-haiku-4-5-20251001",
 }
+
+# Curated per-provider model menus for the UI's model pickers. Ordered roughly
+# most- to least-capable; the UI defaults the selection to the relevant
+# DEFAULT_*_MODELS entry. Keep every model referenced by a DEFAULT_* dict listed
+# here so those defaults are always selectable (see `models_for`).
+SUPPORTED_MODELS: dict[str, tuple[str, ...]] = {
+    "gemini": ("gemini-3.5-pro", "gemini-3.5-flash"),
+    "openai": ("gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"),
+    "anthropic": (
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+    ),
+}
+
+
+def models_for(provider: str, *, default: Optional[str] = None) -> list[str]:
+    """Return the selectable models for `provider`, guaranteeing `default` is present.
+
+    `default` (e.g. the agent/news/premarket default for this provider) is moved
+    to the front if listed and prepended if the catalog somehow omits it, so a
+    picker seeded with it never lands on a value outside its own options.
+    """
+    models = list(SUPPORTED_MODELS.get(provider, ()))
+    if default:
+        if default in models:
+            models.remove(default)
+        models.insert(0, default)
+    return models
 
 ENV_KEYS: dict[str, str] = {
     "gemini": "GEMINI_API_KEY",

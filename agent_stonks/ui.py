@@ -63,7 +63,7 @@ from .historical import (
     fetch_smart_money_flow,
     fetch_static_analysis,
 )
-from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS
+from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS, models_for
 from .news import fetch_news_with_fallback, score_news_impacts
 from .premarket import DEFAULT_PREMARKET_MODELS, PremarketBriefing, generate_premarket_analysis
 from .options import fetch_options_walls_data
@@ -1492,11 +1492,17 @@ def _agent_panel(
         provider = st.selectbox(
             "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
         )
-        model = st.text_input(
-            "Model (optional)",
-            value=state.llm_model,
-            placeholder=f"Default: {DEFAULT_AGENT_MODELS[provider]}",
-            key="agent_llm_model",
+        default_model = DEFAULT_AGENT_MODELS[provider]
+        model_options = models_for(provider, default=default_model)
+        current_model = state.llm_model if state.llm_model in model_options else default_model
+        model = st.selectbox(
+            "Model",
+            model_options,
+            index=model_options.index(current_model),
+            # Key is provider-scoped so switching providers rebuilds the widget
+            # instead of carrying a stale value that isn't in the new options.
+            key=f"agent_llm_model_{provider}",
+            help=f"Default: {default_model}",
         )
         state.llm_provider = provider
         state.llm_model = model
@@ -1742,11 +1748,14 @@ def _premarket_panel(symbols: list[str]) -> None:
         llm_key = os.getenv(env_var, "")
         if not llm_key:
             st.caption(f"⚠️ {env_var} is not set.")
-        model_override = st.text_input(
-            "Model override",
-            value="",
-            placeholder=DEFAULT_PREMARKET_MODELS.get(provider, ""),
-            key="premarket_model",
+        default_model = DEFAULT_PREMARKET_MODELS.get(provider, DEFAULT_NEWS_MODELS[provider])
+        premarket_models = models_for(provider, default=default_model)
+        model_override = st.selectbox(
+            "Model",
+            premarket_models,
+            index=0,
+            key=f"premarket_model_{provider}",
+            help=f"Default: {default_model}",
         )
     with c2:
         if not symbols:
@@ -1772,7 +1781,7 @@ def _premarket_panel(symbols: list[str]) -> None:
                                     alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
                                     alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
                                     worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
-                                    model=model_override.strip() or None,
+                                    model=model_override or None,
                                 )
                             except Exception as exc:
                                 st.error(f"Pre-market analysis failed for {sym}: {exc}")
