@@ -77,6 +77,8 @@ from .state import (
     current_volume_ratio,
     format_alert,
     format_tool_kv,
+    momentum_pct,
+    today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
 from .stream import backfill_bars, launch_stream, launch_stream_news
@@ -259,6 +261,33 @@ def _news_html(news: list[dict], symbol: str, impacts: Optional[dict] = None) ->
 build_news_html = _news_html
 
 
+def _today_range(
+    daily_bars: list[dict], intraday_bars: list[dict]
+) -> tuple[float | None, float | None, float | None]:
+    """(low, high, open) for today's session.
+
+    Prefers today's still-forming daily bar; falls back to today's intraday bars
+    (for pre-open/lagging feeds where the daily bar hasn't published yet)."""
+    bar = today_daily_bar(daily_bars)
+    if bar is not None:
+        try:
+            return float(bar["l"]), float(bar["h"]), float(bar["o"])
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    todays = [b for b in intraday_bars if str(b.get("t", "")).startswith(today)]
+    if not todays:
+        return None, None, None
+    try:
+        low = min(float(b["l"]) for b in todays)
+        high = max(float(b["h"]) for b in todays)
+        open_ = float(todays[0]["o"])
+    except (KeyError, TypeError, ValueError):
+        return None, None, None
+    return low, high, open_
+
+
 def _quote_html(
     price: float | None,
     prev_close: float | None,
@@ -269,6 +298,10 @@ def _quote_html(
     previous_minute_high: float | None,
     previous_minute_low: float | None,
     symbol: str,
+    today_low: float | None = None,
+    today_high: float | None = None,
+    current_momentum: float | None = None,
+    daily_momentum: float | None = None,
 ) -> str:
     if price is None and bid is None and ask is None:
         return ""
@@ -336,9 +369,50 @@ def _quote_html(
             f'</div>'
         )
 
+    def _stat_card(label: str, value: str, color: str) -> str:
+        return (
+            f'<div style="display:flex;flex-direction:column;align-items:center;'
+            f'background:{PALETTE["panel"]};border:1px solid {PALETTE["grid"]};'
+            f'border-radius:8px;padding:8px 16px;min-width:100px;">'
+            f'<span style="font-size:10px;font-weight:600;color:{PALETTE["muted"]};'
+            f'letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">{label}</span>'
+            f'<span style="font-size:18px;font-weight:700;color:{color};">{value}</span>'
+            f'</div>'
+        )
+
+    def _momentum_color(m: float | None) -> str:
+        if m is None or abs(m) < 1e-9:
+            return PALETTE["muted"]
+        return "#26c6a2" if m > 0 else "#ef5350"
+
+    day_low_card = (
+        _stat_card("Day Low", f"${today_low:,.4f}", PALETTE["muted"])
+        if today_low is not None else ""
+    )
+    day_high_card = (
+        _stat_card("Day High", f"${today_high:,.4f}", PALETTE["muted"])
+        if today_high is not None else ""
+    )
+    cur_mom_card = (
+        _stat_card("Momentum (10m)", f"{current_momentum:+.2f}%", _momentum_color(current_momentum))
+        if current_momentum is not None else ""
+    )
+    day_mom_card = (
+        _stat_card("Momentum (day)", f"{daily_momentum:+.2f}%", _momentum_color(daily_momentum))
+        if daily_momentum is not None else ""
+    )
+
+    stats_row = ""
+    if day_low_card or day_high_card or cur_mom_card or day_mom_card:
+        stats_row = (
+            f'<div style="display:flex;gap:10px;align-items:stretch;margin-top:10px;">'
+            f'{day_low_card}{day_high_card}{cur_mom_card}{day_mom_card}'
+            f'</div>'
+        )
+
     return (
         f'<div style="font-family:Inter,monospace;padding:4px 0 8px;">'
-        f'{price_row}{ba_row}'
+        f'{price_row}{ba_row}{stats_row}'
         f'</div>'
     )
 
@@ -386,9 +460,19 @@ def _price_ticker() -> None:
             ask_size = sym_state.ask_size
             previous_minute_high = sym_state.previous_minute_high
             previous_minute_low = sym_state.previous_minute_low
+            bars = list(sym_state.bars)
+        today_low, today_high, today_open = _today_range(sym_state.daily_bars, bars)
+        current_momentum = momentum_pct(sym_state)
+        daily_momentum = (
+            (last_price / today_open - 1.0) * 100.0
+            if last_price is not None and today_open
+            else None
+        )
         quote = _quote_html(
             last_price, prev_close, bid_price, bid_size, ask_price, ask_size,
             previous_minute_high, previous_minute_low, sym_state.symbol,
+            today_low=today_low, today_high=today_high,
+            current_momentum=current_momentum, daily_momentum=daily_momentum,
         )
         if quote:
             st.html(quote)
