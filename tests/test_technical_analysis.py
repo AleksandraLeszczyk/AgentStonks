@@ -17,13 +17,17 @@ from agent_stonks.technical_analysis import (
     breakout_trade_geometry,
     find_fair_value_gaps,
     find_order_blocks,
+    floor_pivots,
     get_put_call_walls_and_gamma,
+    key_levels,
     obv_trend,
     rsi,
     session_time_window,
     smart_money_trade_geometry,
     sma,
     support_resistance,
+    swing_levels,
+    volume_profile_levels,
     vwap_reversion_geometry,
 )
 
@@ -417,6 +421,142 @@ class TestVwapReversionGeometry:
         assert result["meets_min_reward_risk"] is True
 
 
+def _ts_bar(t, o, h, l, c, v=1000):
+    return {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+
+
+class TestKeyLevels:
+    # July is EDT (UTC-4): the 9:30 ET bell is 13:30Z.
+    PRIOR_DAILY = _ts_bar("2026-07-16T04:00:00Z", 100.0, 110.0, 95.0, 105.0)
+    TODAY_DAILY = _ts_bar("2026-07-17T04:00:00Z", 102.0, 107.0, 101.0, 106.0)
+    INTRADAY = [
+        _ts_bar("2026-07-17T13:00:00Z", 102.0, 103.0, 101.0, 102.5),  # premarket (9:00 ET)
+        _ts_bar("2026-07-17T13:30:00Z", 102.0, 104.0, 101.5, 103.5),
+        _ts_bar("2026-07-17T13:31:00Z", 103.5, 106.0, 103.0, 105.5),
+        _ts_bar("2026-07-17T13:32:00Z", 105.5, 107.0, 105.0, 106.0),
+    ]
+
+    def test_no_data_returns_note(self):
+        assert "note" in key_levels([], daily_bars=None)
+
+    def test_collects_session_structure_levels(self):
+        result = key_levels(
+            self.INTRADAY,
+            daily_bars=[self.PRIOR_DAILY, self.TODAY_DAILY],
+            opening_range_minutes=2,
+        )
+        levels = result["levels"]
+        # Prior-day levels come from the last COMPLETED daily bar, not today's.
+        assert levels["prior_day_high"] == 110.0
+        assert levels["prior_day_low"] == 95.0
+        assert levels["prior_day_close"] == 105.0
+        assert levels["premarket_high"] == 103.0
+        assert levels["opening_range_high"] == 106.0
+        assert levels["opening_range_low"] == 101.5
+        assert levels["session_high"] == 107.0
+        assert levels["session_low"] == 101.5
+
+    def test_splits_levels_around_spot_nearest_first(self):
+        result = key_levels(
+            self.INTRADAY,
+            daily_bars=[self.PRIOR_DAILY, self.TODAY_DAILY],
+            opening_range_minutes=2,
+        )
+        assert result["spot"] == 106.0
+        assert result["nearest_resistance"]["name"] == "session_high"
+        assert result["nearest_resistance"]["level"] == 107.0
+        assert [e["name"] for e in result["resistance_above"]] == ["session_high", "prior_day_high"]
+        support_names = [e["name"] for e in result["support_below"]]
+        assert support_names[0] == "opening_range_high"
+        assert "premarket_high" in support_names
+
+    def test_spot_above_everything_is_blue_sky(self):
+        result = key_levels(self.INTRADAY, daily_bars=[self.PRIOR_DAILY], spot=120.0)
+        assert result["nearest_resistance"] is None
+        assert result["resistance_above"] == []
+        assert "blue-sky" in result["summary"]
+
+    def test_timestampless_bars_count_as_session(self):
+        bars = _make_bars([100.0, 101.0, 102.0])
+        result = key_levels(bars)
+        assert result["levels"]["session_high"] == 102.5
+        assert result["levels"]["session_low"] == 99.5
+
+
+class TestSwingLevels:
+    def test_not_enough_bars_returns_note(self):
+        assert "note" in swing_levels(_make_bars([100.0, 101.0]))
+
+    def test_clusters_repeated_swing_highs_by_touch_count(self):
+        highs = [101, 102, 103, 105, 103, 102, 101, 102, 103, 104, 105, 103, 102, 101, 100]
+        lows = [99, 100, 101, 103, 101, 100, 99, 100, 101, 102, 103, 101, 100, 99, 98]
+        closes = [100, 101, 102, 104, 102, 101, 100, 101, 102, 103, 104, 102, 101, 100, 99]
+        result = swing_levels(_make_bars(closes, highs=[float(x) for x in highs], lows=[float(x) for x in lows]))
+        # The double top at 105 (indices 3 and 10) merges into one 2-touch cluster,
+        # ranked ahead of any single-touch level.
+        assert result["levels"][0]["touches"] == 2
+        assert result["levels"][0]["level"] == 105.0
+        assert result["nearest_resistance"]["level"] == 105.0
+        assert result["nearest_support"] is not None
+        assert result["nearest_support"]["level"] <= result["spot"]
+
+    def test_spot_above_all_swings_has_no_resistance(self):
+        highs = [101.0, 102.0, 103.0, 105.0, 103.0, 102.0, 101.0, 102.0, 103.0]
+        closes = [100.0, 101.0, 102.0, 104.0, 102.0, 101.0, 100.0, 101.0, 102.0]
+        result = swing_levels(_make_bars(closes, highs=highs), spot=120.0)
+        assert result["nearest_resistance"] is None
+
+
+class TestVolumeProfileLevels:
+    def test_not_enough_bars_returns_note(self):
+        assert "note" in volume_profile_levels(_make_bars([100.0] * 5))
+
+    def test_poc_sits_where_the_volume_traded(self):
+        heavy = _make_bars([100.0] * 15, volumes=[10_000] * 15)
+        ramp = _make_bars([102.0, 104.0, 106.0, 108.0, 110.0], volumes=[100] * 5)
+        result = volume_profile_levels(heavy + ramp, bins=10)
+        assert 99.0 <= result["poc"] <= 101.0
+        # Spot (110, the last close) sits in the thin ramp: an air pocket, with
+        # the heavy 100-area node below it.
+        assert result["spot_in_low_volume_node"] is True
+        assert result["nearest_hvn_above"] is None
+        assert 99.0 <= result["nearest_hvn_below"]["price"] <= 101.0
+        assert result["low_volume_nodes"]
+
+    def test_value_area_covers_the_heavy_node(self):
+        heavy = _make_bars([100.0] * 15, volumes=[10_000] * 15)
+        ramp = _make_bars([102.0, 104.0, 106.0, 108.0, 110.0], volumes=[100] * 5)
+        result = volume_profile_levels(heavy + ramp, bins=10)
+        assert result["value_area_low"] <= 100.0 <= result["value_area_high"]
+
+
+class TestFloorPivots:
+    PRIOR_DAILY = {"t": "2026-07-16T04:00:00Z", "o": 102.0, "h": 110.0, "l": 100.0, "c": 105.0, "v": 1e6}
+    TODAY_DAILY = {"t": "2026-07-17T04:00:00Z", "o": 104.0, "h": 108.0, "l": 103.0, "c": 106.0, "v": 5e5}
+
+    def test_no_prior_day_returns_note(self):
+        assert "note" in floor_pivots([], today="2026-07-17")
+        assert "note" in floor_pivots([self.TODAY_DAILY], today="2026-07-17")
+
+    def test_computes_classic_pivot_formulas_from_prior_day(self):
+        result = floor_pivots([self.PRIOR_DAILY, self.TODAY_DAILY], today="2026-07-17")
+        levels = result["levels"]
+        assert result["prior_day_date"] == "2026-07-16"
+        assert levels["pivot"] == 105.0
+        assert levels["r1"] == 110.0
+        assert levels["s1"] == 100.0
+        assert levels["r2"] == 115.0
+        assert levels["s2"] == 95.0
+        assert levels["r3"] == 120.0
+        assert levels["s3"] == 90.0
+
+    def test_splits_levels_around_spot(self):
+        result = floor_pivots([self.PRIOR_DAILY], spot=106.0, today="2026-07-17")
+        assert result["nearest_resistance"]["name"] == "r1"
+        assert result["nearest_resistance"]["level"] == 110.0
+        assert result["nearest_support"]["name"] == "pivot"
+
+
 class TestBreakoutTradeGeometry:
     def test_non_positive_entry_or_stop_returns_note(self):
         assert "note" in breakout_trade_geometry(entry=0, stop=10)
@@ -449,6 +589,27 @@ class TestBreakoutTradeGeometry:
         assert result["best_reward_risk_ratio"] is None
         assert result["meets_min_reward_risk"] is False
         assert "cannot project a target" in result["summary"]
+
+    def test_distant_resistance_leaves_room_to_run(self):
+        result = breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0, overhead_resistance=105.0)
+        assert result["rr_at_overhead_resistance"] == 2.5
+        assert result["room_to_run"] is True
+
+    def test_close_resistance_caps_reward(self):
+        result = breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0, overhead_resistance=102.0)
+        assert result["rr_at_overhead_resistance"] == 1.0
+        assert result["room_to_run"] is False
+        assert "Do NOT buy into this ceiling" in result["summary"]
+
+    def test_resistance_at_or_below_entry_is_already_cleared(self):
+        result = breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0, overhead_resistance=99.5)
+        assert result["room_to_run"] is True
+        assert result["rr_at_overhead_resistance"] is None
+        assert "already cleared" in result["summary"]
+
+    def test_no_resistance_given_omits_room_to_run(self):
+        result = breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0)
+        assert "room_to_run" not in result
 
 
 def _ohlc(o, h, l, c, v=1000):

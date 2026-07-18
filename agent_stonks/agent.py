@@ -72,22 +72,41 @@ and no volume is noise, not momentum; default to standing aside with an alert.
 higher-lows pattern, VWAP position, and ATR-based volatility. Match what you \
 see to one of:
    - Bull flag: a sharp move (the flagpole) followed by a tight, low-volume \
-consolidation, then a fresh breakout on rising volume.
+consolidation, then a fresh breakout on rising volume. Call \
+analyze_consolidation to MEASURE the flag instead of estimating it: \
+`base_high` is the breakout trigger, `base_low` the structural stop, \
+`base_height` the measured-move distance; `is_coiling` true with the edges \
+tested 2+ times marks a genuine tight flag whose break carries weight.
    - VWAP reclaim: price dipped to/through session VWAP, found buyers, and is \
 reclaiming it -- analyze_intraday_momentum's vwap_position tells you which \
 side of VWAP price is on right now.
    If neither is present, there is no trade -- stand aside with an alert.
 
-3. ENTRY DISCIPLINE. Never chase. Require: a recognizable setup from step 2, \
-a clear breakout/reclaim level (the flag's high, or VWAP), and volume \
-confirmation of at least 1.5x average -- analyze_volume's `relative_volume` \
-speaks to this directly. Know your stop before you size the trade: for a \
-bull flag, the stop sits just below the consolidation low; for a VWAP \
-reclaim, just below VWAP.
+3. ENTRY DISCIPLINE. Never chase, and never buy mid-air. Require: a \
+recognizable setup from step 2, a clear breakout/reclaim level to anchor the \
+entry (analyze_consolidation's `base_high`, or VWAP -- a MEASURED level, \
+never one you eyeballed), and volume confirmation of at least 1.5x average \
+-- analyze_volume's `relative_volume` speaks to this directly. Know your \
+stop before you size the trade: for a bull flag, just below `base_low`; for \
+a VWAP reclaim, just below VWAP.
+   Then check the ROOM OVERHEAD: call get_key_levels and take the nearest \
+resistance ABOVE your entry (prior-day high, premarket high, opening-range \
+high, session high). Feed it to breakout_trade_geometry as \
+`overhead_resistance`, with your entry, stop, atr, and base_height: if \
+`room_to_run` is false, the ceiling is too close to pay 2:1 on the stop -- \
+do NOT buy into it; arm the buy at a break of THAT level instead, so the \
+trade only triggers once the ceiling is cleared. An entry sitting within \
+about 1 ATR below an untested overhead level is chasing into resistance \
+even when the flag itself looks clean. No overhead level at all (blue sky \
+above the prior-day and session highs) is the highest-quality momentum \
+condition.
 
 4. SIZE THE TRADE. Call get_position for current cash and share count. Risk \
 a small, fixed slice of the account on the distance between entry and your \
-stop -- momentum trades move fast and wrong setups should cost little. Wider \
+stop -- momentum trades move fast and wrong setups should cost little. \
+breakout_trade_geometry (step 3) already returns `risk_per_share` and the \
+measured-move/ATR targets with their reward-to-risk -- require \
+`meets_min_reward_risk` before committing. Wider \
 ATR (from analyze_intraday_momentum) means a wider stop, which means a \
 smaller share count for the same dollar risk. Never request a sell quantity \
 larger than the current position.
@@ -111,9 +130,11 @@ immediately if the setup fails -- don't wait to see.
 6. FINALIZE. Turn the levels from your analysis into ACTION CONDITIONS, not \
 a passive wait: arm them with set_tactics, stating exactly what must be true \
 for you to buy or sell. For momentum that is typically a buy when last_price \
-clears the flag high / reclaim level, a sell (stop) when last_price drops \
-below the consolidation low or VWAP, and a sell (take-profit) into your \
-target. Volume confirmation (step 3) is checked NOW, from analyze_volume's \
+clears the measured `base_high` / reclaim level (or the overhead resistance \
+level itself, when `room_to_run` failed below it), a sell (stop) when \
+last_price drops below `base_low` or VWAP, and a sell (take-profit) into \
+your target -- the nearest overhead level from get_key_levels is the \
+natural first take-profit. Volume confirmation (step 3) is checked NOW, from analyze_volume's \
 `relative_volume`, while you decide whether to arm the entry at all -- do \
 NOT encode it as a tactic condition: the watchable volume_ratio field is \
 today's CUMULATIVE volume vs a full average day's, a different metric that \
@@ -141,6 +162,33 @@ which action you chose or what alerts you set -- the moment fresh news for the \
 ticker arrives. That interrupt is automatic and cannot be turned off, so an \
 alert wait is never blind to breaking news.
 """
+
+# Guidance for the advanced level tools (swing clusters, volume profile, floor
+# pivots -- steps 4-6 of the S/R plan). The tools are implemented and
+# dispatch-wired but not yet enabled: to turn them on, uncomment the
+# MOMENTUM_SYSTEM_PROMPT reassignment below AND the three _TOOL_ANALYZE_SWING_LEVELS /
+# _TOOL_ANALYZE_VOLUME_PROFILE / _TOOL_GET_FLOOR_PIVOTS entries in MOMENTUM_TOOLS.
+MOMENTUM_ADVANCED_LEVELS_ADDENDUM = """\
+
+ADVANCED LEVELS (confluence). Beyond get_key_levels' session structure, three \
+more level sources are available -- use them to CONFIRM or refine the entry, \
+stop, and target, favoring levels where two or more sources agree (confluence):
+- analyze_swing_levels: clustered swing-point S/R ranked by touch count -- a \
+level tested 3+ times is stronger evidence of defended supply/demand than any \
+single extreme print; when it disagrees with a raw session high by more than \
+the cluster tolerance, trust the cluster.
+- analyze_volume_profile: the POC and high-volume nodes are magnet/defended \
+levels (good stop anchors and first targets); a low-volume node just above \
+your entry is an air pocket -- price tends to travel through it fast to the \
+next high-volume node, improving the realistic first target.
+- get_floor_pivots: classic floor-trader pivots (P, R1-R3, S1-S3) from the \
+prior day's range -- formula levels, but widely watched; treat a pivot that \
+coincides with a structural level as reinforced, and one on its own as minor.
+Whichever of these caps your upside goes into breakout_trade_geometry's \
+`overhead_resistance`, exactly as with get_key_levels.
+"""
+# Uncomment to enable the advanced level guidance (with the MOMENTUM_TOOLS entries):
+# MOMENTUM_SYSTEM_PROMPT = MOMENTUM_SYSTEM_PROMPT + MOMENTUM_ADVANCED_LEVELS_ADDENDUM
 
 BREAKOUT_SYSTEM_PROMPT = """\
 You are an autonomous breakout-trading agent for a basket of equity tickers, \
@@ -796,6 +844,121 @@ _TOOL_ANALYZE_VOLUME = {
     },
 }
 
+_TOOL_ANALYZE_CONSOLIDATION = {
+    "type": "function",
+    "function": {
+        "name": "analyze_consolidation",
+        "description": (
+            "Measure the most recent consolidation/base in the intraday bars -- the flag of a "
+            "bull-flag setup. Returns the base's high (`base_high`, the objective breakout "
+            "trigger to arm a buy at), its low (`base_low`, the structural stop), its height "
+            "(for a measured-move target), whether the range has contracted on declining volume "
+            "(`is_coiling` -- a genuine tight flag), and how many times each edge has been "
+            "tested. Use these measured levels instead of estimating the flag high by eye."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "base_bars": {
+                    "type": "integer",
+                    "description": (
+                        "Number of most recent bars treated as the candidate base "
+                        "(default 10, max 60)."
+                    ),
+                }
+            },
+            "required": [],
+        },
+    },
+}
+
+_TOOL_GET_KEY_LEVELS = {
+    "type": "function",
+    "function": {
+        "name": "get_key_levels",
+        "description": (
+            "Map the session's structural support/resistance levels around the current price: "
+            "prior-day high/low/close, premarket high/low, opening-range high/low, and the "
+            "session high/low so far. Returns every level with its distance from spot, plus the "
+            "nearest overhead resistance (the realistic first target and 'room to run' cap for "
+            "a long entry) and the nearest support below (the stop anchor). An empty overhead "
+            "list means blue-sky territory -- no structural resistance above."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+# --- Advanced level tools (steps 4-6 of the S/R plan): implemented and
+# dispatch-wired, but NOT yet exposed to any personality. To enable them for
+# the Momentum Trader, uncomment the three entries in MOMENTUM_TOOLS and the
+# MOMENTUM_SYSTEM_PROMPT reassignment under MOMENTUM_ADVANCED_LEVELS_ADDENDUM.
+
+_TOOL_ANALYZE_SWING_LEVELS = {
+    "type": "function",
+    "function": {
+        "name": "analyze_swing_levels",
+        "description": (
+            "Locate clustered swing-point (fractal) support/resistance in the intraday bars: "
+            "confirmed local highs/lows, merged within ~0.25 ATR and ranked by how many times "
+            "each level was tested and how recently. A level tested 3+ times is far stronger "
+            "than any single extreme print. Returns the ranked clusters plus the nearest swing "
+            "resistance above and support below the current price."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "swing": {
+                    "type": "integer",
+                    "description": (
+                        "Bars required on each side to confirm a swing point (default 3, max 10); "
+                        "larger means fewer, more significant levels."
+                    ),
+                }
+            },
+            "required": [],
+        },
+    },
+}
+
+_TOOL_ANALYZE_VOLUME_PROFILE = {
+    "type": "function",
+    "function": {
+        "name": "analyze_volume_profile",
+        "description": (
+            "Build a volume-by-price profile of the intraday bars: the Point of Control (the "
+            "price with the most transacted volume -- a magnet/defended level), the 70% value "
+            "area, high-volume nodes (support/resistance where positions were built), and "
+            "low-volume nodes (air pockets price travels through quickly). An LVN just above "
+            "the entry with the next HVN well higher improves the realistic first target."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bins": {
+                    "type": "integer",
+                    "description": "Number of price slices in the profile (default 24, max 60).",
+                }
+            },
+            "required": [],
+        },
+    },
+}
+
+_TOOL_GET_FLOOR_PIVOTS = {
+    "type": "function",
+    "function": {
+        "name": "get_floor_pivots",
+        "description": (
+            "Compute classic floor-trader pivot levels (P, R1-R3, S1-S3) from the prior "
+            "completed session's high/low/close. Formula levels rather than structure, but "
+            "watched widely enough to act as intraday reaction points; a pivot coinciding with "
+            "a structural level (session high, swing cluster, high-volume node) is reinforced. "
+            "Returns the levels split around the current price, nearest first."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 _TOOL_ANALYZE_OPENING_RANGE = {
     "type": "function",
     "function": {
@@ -1153,9 +1316,11 @@ _TOOL_BREAKOUT_TRADE_GEOMETRY = {
         "name": "breakout_trade_geometry",
         "description": (
             "Compute the mechanical entry/stop/target math for a long breakout trade: targets "
-            "projected from ATR (1x and 2x), the resulting reward-to-risk ratio for each, and "
-            "whether the best one clears the 2:1 minimum. Use this instead of doing the "
-            "arithmetic yourself before sizing a trade."
+            "projected from ATR and/or the base height (1x and 2x each), the resulting "
+            "reward-to-risk ratio for each, and whether the best one clears the 2:1 minimum. "
+            "Pass the nearest overhead resistance (from get_key_levels) to also get "
+            "`room_to_run` -- whether that ceiling sits at least 2x the stop distance above "
+            "the entry. Use this instead of doing the arithmetic yourself before sizing a trade."
         ),
         "parameters": {
             "type": "object",
@@ -1165,6 +1330,21 @@ _TOOL_BREAKOUT_TRADE_GEOMETRY = {
                 "atr": {
                     "type": "number",
                     "description": "ATR (from analyze_intraday_momentum), for an ATR-multiple target.",
+                },
+                "base_height": {
+                    "type": "number",
+                    "description": (
+                        "Height of the consolidation base (from analyze_consolidation), for a "
+                        "measured-move target."
+                    ),
+                },
+                "overhead_resistance": {
+                    "type": "number",
+                    "description": (
+                        "Nearest structural resistance level above the entry (from "
+                        "get_key_levels), to check whether the trade has room to run before "
+                        "hitting a ceiling."
+                    ),
                 },
             },
             "required": ["entry", "stop"],
@@ -1392,6 +1572,11 @@ for _tool in (
     _TOOL_ANALYZE_DAILY_TREND,
     _TOOL_ANALYZE_OPENING_RANGE,
     _TOOL_ANALYZE_VOLUME,
+    _TOOL_ANALYZE_CONSOLIDATION,
+    _TOOL_GET_KEY_LEVELS,
+    _TOOL_ANALYZE_SWING_LEVELS,
+    _TOOL_ANALYZE_VOLUME_PROFILE,
+    _TOOL_GET_FLOOR_PIVOTS,
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_NEWS,
     _TOOL_ANALYZE_VWAP_BANDS,
@@ -1409,12 +1594,24 @@ for _tool in (
     _add_symbol_param(_tool)
 
 
-# Momentum trader: RVOL + price action/VWAP + news + price -- no medium-term regime
-# or broad-market backdrop, the whole point is reacting fast to what's happening now.
+# Momentum trader: RVOL + price action/VWAP + news + price, plus measured levels
+# (consolidation base, session-structure S/R) and the R:R geometry check so
+# entries anchor to data-based levels -- but still no medium-term regime or
+# broad-market backdrop, the whole point is reacting fast to what's happening now.
 MOMENTUM_TOOLS: list[dict] = [
     _TOOL_GET_QUOTE,
     _TOOL_ANALYZE_INTRADAY_MOMENTUM,
     _TOOL_ANALYZE_VOLUME,
+    _TOOL_ANALYZE_CONSOLIDATION,
+    _TOOL_GET_KEY_LEVELS,
+    _TOOL_BREAKOUT_TRADE_GEOMETRY,
+    # Advanced level sources (swing clusters, volume profile, floor pivots):
+    # implemented and dispatch-wired, disabled here. To enable, uncomment the
+    # three lines below AND the MOMENTUM_SYSTEM_PROMPT reassignment under
+    # MOMENTUM_ADVANCED_LEVELS_ADDENDUM near the top of this file.
+    # _TOOL_ANALYZE_SWING_LEVELS,
+    # _TOOL_ANALYZE_VOLUME_PROFILE,
+    # _TOOL_GET_FLOOR_PIVOTS,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
     _TOOL_SET_TACTICS,
@@ -1635,6 +1832,50 @@ def _tool_analyze_volume(state: "SymbolState") -> dict:
     return ta.analyze_volume(bars)
 
 
+def _tool_analyze_consolidation(state: "SymbolState", base_bars: object = None) -> dict:
+    n = max(5, min(int(base_bars or 10), 60))
+    with state.lock:
+        bars = list(state.bars)
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.analyze_consolidation(bars, base_bars=n)
+
+
+def _tool_get_key_levels(state: "SymbolState") -> dict:
+    with state.lock:
+        bars = list(state.bars)
+        spot = state.last_price
+    daily = list(state.daily_bars)
+    return ta.key_levels(bars, daily_bars=daily, spot=spot)
+
+
+def _tool_analyze_swing_levels(state: "SymbolState", swing: object = None) -> dict:
+    k = max(2, min(int(swing or 3), 10))
+    with state.lock:
+        bars = list(state.bars)
+        spot = state.last_price
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.swing_levels(bars, swing=k, spot=spot)
+
+
+def _tool_analyze_volume_profile(state: "SymbolState", bins: object = None) -> dict:
+    n = max(8, min(int(bins or 24), 60))
+    with state.lock:
+        bars = list(state.bars)
+        spot = state.last_price
+    if not bars:
+        return {"note": "no intraday bars available yet"}
+    return ta.volume_profile_levels(bars, bins=n, spot=spot)
+
+
+def _tool_get_floor_pivots(state: "SymbolState") -> dict:
+    with state.lock:
+        spot = state.last_price
+    daily = list(state.daily_bars)
+    return ta.floor_pivots(daily, spot=spot)
+
+
 def _tool_get_put_call_walls(state: "SymbolState") -> dict:
     with state.lock:
         data = state.options_chain
@@ -1747,11 +1988,19 @@ def _handle_set_tactics(args: dict, app: "AppState", tracker: "DecisionTracker")
     }
 
 
-def _tool_breakout_trade_geometry(entry: object, stop: object, atr: object = None) -> dict:
+def _tool_breakout_trade_geometry(
+    entry: object,
+    stop: object,
+    atr: object = None,
+    base_height: object = None,
+    overhead_resistance: object = None,
+) -> dict:
     return ta.breakout_trade_geometry(
         float(entry),
         float(stop),
+        base_height=float(base_height) if base_height is not None else None,
         atr=float(atr) if atr is not None else None,
+        overhead_resistance=float(overhead_resistance) if overhead_resistance is not None else None,
     )
 
 
@@ -1925,8 +2174,17 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_opening_range": _per_symbol(_tool_analyze_opening_range, "minutes"),
     "analyze_market": lambda args, app, tracker: _tool_analyze_market(app),
     "analyze_volume": _per_symbol(_tool_analyze_volume),
+    "analyze_consolidation": _per_symbol(_tool_analyze_consolidation, "base_bars"),
+    "get_key_levels": _per_symbol(_tool_get_key_levels),
+    "analyze_swing_levels": _per_symbol(_tool_analyze_swing_levels, "swing"),
+    "analyze_volume_profile": _per_symbol(_tool_analyze_volume_profile, "bins"),
+    "get_floor_pivots": _per_symbol(_tool_get_floor_pivots),
     "breakout_trade_geometry": lambda args, app, tracker: _tool_breakout_trade_geometry(
-        args.get("entry"), args.get("stop"), args.get("atr")
+        args.get("entry"),
+        args.get("stop"),
+        args.get("atr"),
+        args.get("base_height"),
+        args.get("overhead_resistance"),
     ),
     "analyze_vwap_bands": _per_symbol(_tool_analyze_vwap_bands, "num_std"),
     "vwap_reversion_geometry": lambda args, app, tracker: _tool_vwap_reversion_geometry(

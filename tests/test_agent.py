@@ -12,6 +12,7 @@ from agent_stonks.agent import (
     SMART_MONEY_TOOLS,
     _dispatch_tool,
     _session_closed_addendum,
+    _tool_analyze_consolidation,
     _tool_analyze_volume,
     _tool_breakout_trade_geometry,
     _tool_get_corporate_actions,
@@ -149,11 +150,54 @@ class TestToolHandlers:
     def test_momentum_personality_uses_momentum_tools(self):
         assert PERSONALITY_TOOLS["momentum"] is MOMENTUM_TOOLS
         names = {t["function"]["name"] for t in MOMENTUM_TOOLS}
-        assert {"analyze_intraday_momentum", "analyze_volume", "get_news", "get_quote"} <= names
+        assert {
+            "analyze_intraday_momentum",
+            "analyze_volume",
+            "analyze_consolidation",
+            "get_key_levels",
+            "breakout_trade_geometry",
+            "get_news",
+            "get_quote",
+        } <= names
         assert "analyze_daily_trend" not in names
         assert "analyze_market" not in names
         assert "analyze_opening_range" not in names
         assert "get_put_call_walls" not in names
+
+    def test_analyze_consolidation_with_no_bars_returns_note(self):
+        _, state = _app()
+        assert "note" in _tool_analyze_consolidation(state)
+
+    def test_get_key_levels_reads_intraday_and_daily_bars(self):
+        app, state = _app()
+        state.daily_bars = [{"t": "2026-07-16T04:00:00Z", "o": 100.0, "h": 110.0, "l": 95.0, "c": 105.0, "v": 1e6}]
+        state.bars.append({"t": "2026-07-17T13:31:00Z", "o": 102.0, "h": 104.0, "l": 101.0, "c": 103.0, "v": 1000})
+        state.last_price = 103.0
+        result = _dispatch_tool("get_key_levels", {"symbol": "AAPL"}, app, DecisionTracker())
+        assert result["levels"]["prior_day_high"] == 110.0
+        assert result["levels"]["session_high"] == 104.0
+        assert result["nearest_resistance"]["level"] == 104.0
+
+    def test_breakout_trade_geometry_tool_flags_close_overhead_resistance(self):
+        result = _tool_breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0, overhead_resistance=101.0)
+        assert result["room_to_run"] is False
+
+    def test_advanced_level_tools_dispatch_but_are_not_exposed_yet(self):
+        # Steps 4-6 of the S/R plan: analyzers are dispatch-wired (so enabling
+        # them is only a MOMENTUM_TOOLS + prompt-addendum uncomment away) but
+        # not yet in any personality's toolset.
+        app, state = _app()
+        tracker = DecisionTracker()
+        assert "note" in _dispatch_tool("analyze_swing_levels", {"symbol": "AAPL"}, app, tracker)
+        assert "note" in _dispatch_tool("analyze_volume_profile", {"symbol": "AAPL"}, app, tracker)
+        state.daily_bars = [{"t": "2026-07-16T04:00:00Z", "o": 102.0, "h": 110.0, "l": 100.0, "c": 105.0, "v": 1e6}]
+        state.last_price = 106.0
+        pivots = _dispatch_tool("get_floor_pivots", {"symbol": "AAPL"}, app, tracker)
+        assert pivots["levels"]["pivot"] == 105.0
+        assert pivots["nearest_resistance"]["name"] == "r1"
+        for tools in PERSONALITY_TOOLS.values():
+            names = {t["function"]["name"] for t in tools}
+            assert not {"analyze_swing_levels", "analyze_volume_profile", "get_floor_pivots"} & names
 
     def test_reversal_personality_uses_reversal_tools(self):
         assert PERSONALITY_TOOLS["reversal"] is REVERSAL_TOOLS

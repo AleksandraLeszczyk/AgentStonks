@@ -481,6 +481,429 @@ def analyze_opening_range(bars: list[dict], minutes: int = 15) -> dict:
     }
 
 
+def key_levels(
+    intraday_bars: list[dict],
+    daily_bars: "list[dict] | None" = None,
+    spot: "float | None" = None,
+    opening_range_minutes: int = 15,
+) -> dict:
+    """Session-structure support/resistance map: the concrete price levels an
+    intraday trader anchors entries, stops, and targets to.
+
+    Collects the most-watched structural levels -- the prior day's high/low/
+    close (from the last completed daily bar), today's premarket high/low,
+    the opening-range high/low, and the session high/low so far -- then splits
+    them around `spot` into overhead resistance (nearest first) and support
+    below (nearest first). The nearest overhead level is the natural first
+    target and "room to run" cap for a long entry; the nearest support anchors
+    the stop. An empty overhead list means blue-sky territory: price is above
+    every tracked level.
+    """
+    if not intraday_bars and not daily_bars:
+        return {"note": "no bar data available yet"}
+
+    # An empty `today` (timestamp-less synthetic bars) matches every bar, so
+    # they all count as today's session; with no intraday bars at all, fall
+    # back to the calendar date so the prior-day filter still works.
+    today = str(intraday_bars[-1].get("t", ""))[:10] if intraday_bars else ""
+    if not intraday_bars:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    levels: dict[str, float] = {}
+
+    prior = [
+        b
+        for b in (daily_bars or [])
+        if str(b.get("t", ""))[:10] and (not today or str(b.get("t", ""))[:10] < today)
+    ]
+    if prior:
+        prior_day = prior[-1]
+        levels["prior_day_high"] = float(prior_day["h"])
+        levels["prior_day_low"] = float(prior_day["l"])
+        levels["prior_day_close"] = float(prior_day["c"])
+
+    # Split today's intraday bars at the 9:30 ET bell; bars without a parseable
+    # timestamp count as regular-session bars (matching _session_bars' fallback).
+    premarket: list[dict] = []
+    session: list[dict] = []
+    for b in intraday_bars:
+        ts_raw = str(b.get("t", ""))
+        if ts_raw[:10] != today:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        except ValueError:
+            session.append(b)
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        et = ts.astimezone(_ET)
+        if et.hour * 60 + et.minute < 9 * 60 + 30:
+            premarket.append(b)
+        else:
+            session.append(b)
+
+    if premarket:
+        levels["premarket_high"] = max(float(b["h"]) for b in premarket)
+        levels["premarket_low"] = min(float(b["l"]) for b in premarket)
+    if session:
+        opening = session[: max(1, opening_range_minutes)]
+        levels["opening_range_high"] = max(float(b["h"]) for b in opening)
+        levels["opening_range_low"] = min(float(b["l"]) for b in opening)
+        levels["session_high"] = max(float(b["h"]) for b in session)
+        levels["session_low"] = min(float(b["l"]) for b in session)
+
+    if spot is None:
+        if intraday_bars:
+            spot = float(intraday_bars[-1]["c"])
+        elif "prior_day_close" in levels:
+            spot = levels["prior_day_close"]
+    if spot is None or not levels:
+        return {"note": "not enough data to build key levels"}
+
+    def _entry(name: str) -> dict:
+        level = levels[name]
+        return {
+            "name": name,
+            "level": round(level, 4),
+            "distance_pct": round((level / spot - 1) * 100, 2),
+        }
+
+    resistance = sorted(
+        (_entry(name) for name, value in levels.items() if value > spot),
+        key=lambda e: e["level"],
+    )
+    support = sorted(
+        (_entry(name) for name, value in levels.items() if value <= spot),
+        key=lambda e: -e["level"],
+    )
+    nearest_resistance = resistance[0] if resistance else None
+    nearest_support = support[0] if support else None
+
+    summary_parts = [f"Spot {spot:.2f}."]
+    if nearest_resistance is not None:
+        summary_parts.append(
+            f"Nearest overhead resistance: {nearest_resistance['name']} at "
+            f"{nearest_resistance['level']:.2f} ({nearest_resistance['distance_pct']:+.2f}%)"
+            + (
+                f"; {len(resistance) - 1} more level(s) above."
+                if len(resistance) > 1
+                else "; nothing tracked above it."
+            )
+        )
+    else:
+        summary_parts.append(
+            "No overhead level -- price is in blue-sky territory above the session, "
+            "premarket, and prior-day highs."
+        )
+    if nearest_support is not None:
+        summary_parts.append(
+            f"Nearest support: {nearest_support['name']} at {nearest_support['level']:.2f} "
+            f"({nearest_support['distance_pct']:+.2f}%)."
+        )
+    else:
+        summary_parts.append("No structural support below -- price is under every tracked level.")
+
+    return {
+        "spot": round(spot, 4),
+        "levels": {name: round(value, 4) for name, value in levels.items()},
+        "resistance_above": resistance,
+        "support_below": support,
+        "nearest_resistance": nearest_resistance,
+        "nearest_support": nearest_support,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def swing_levels(bars: list[dict], swing: int = 3, max_levels: int = 6, spot: "float | None" = None) -> dict:
+    """Clustered swing-point (fractal) support/resistance.
+
+    A swing high is a bar whose high is the highest of the `swing` bars on
+    each side (swing low mirrored) -- a confirmed local extreme, not a
+    still-forming one. Nearby pivots are then clustered within a tolerance of
+    0.25 ATR (falling back to 0.1% of price), because a level retested several
+    times is far stronger evidence of defended supply/demand than any single
+    extreme print. Clusters are ranked by touch count, then recency; each
+    carries its mean level, touches, and how many bars ago it was last tested.
+    """
+    n = len(bars)
+    if n < 2 * swing + 1:
+        return {"note": "not enough bars to locate swing points", "levels": []}
+
+    h = [float(b["h"]) for b in bars]
+    l = [float(b["l"]) for b in bars]
+    if spot is None:
+        spot = float(bars[-1]["c"])
+
+    pivots: list[tuple[float, int]] = []
+    for i in range(swing, n - swing):
+        if h[i] == max(h[i - swing : i + swing + 1]):
+            pivots.append((h[i], i))
+        if l[i] == min(l[i - swing : i + swing + 1]):
+            pivots.append((l[i], i))
+    if not pivots:
+        return {"note": "no confirmed swing points in the window", "levels": []}
+
+    atr_value = atr(bars, period=min(14, n - 1))
+    tolerance = 0.25 * atr_value if atr_value else spot * 0.001
+
+    clusters: list[dict] = []
+    for price, idx in sorted(pivots):
+        if clusters and abs(price - clusters[-1]["_sum"] / clusters[-1]["touches"]) <= tolerance:
+            cluster = clusters[-1]
+            cluster["_sum"] += price
+            cluster["touches"] += 1
+            cluster["last_index"] = max(cluster["last_index"], idx)
+        else:
+            clusters.append({"_sum": price, "touches": 1, "last_index": idx})
+
+    levels = []
+    for cluster in clusters:
+        level = cluster["_sum"] / cluster["touches"]
+        levels.append(
+            {
+                "level": round(level, 4),
+                "touches": cluster["touches"],
+                "last_test_bars_ago": n - 1 - cluster["last_index"],
+                "type": "resistance" if level > spot else "support",
+            }
+        )
+    levels.sort(key=lambda e: (-e["touches"], e["last_test_bars_ago"]))
+    levels = levels[:max_levels]
+
+    resistance = [e for e in levels if e["type"] == "resistance"]
+    support = [e for e in levels if e["type"] == "support"]
+    nearest_resistance = min(resistance, key=lambda e: e["level"]) if resistance else None
+    nearest_support = max(support, key=lambda e: e["level"]) if support else None
+
+    summary_parts = [
+        f"{len(levels)} clustered swing level(s) over {n} bars "
+        f"(cluster tolerance {tolerance:.4f}); spot {spot:.2f}."
+    ]
+    if nearest_resistance is not None:
+        summary_parts.append(
+            f"Nearest swing resistance {nearest_resistance['level']:.2f} "
+            f"({nearest_resistance['touches']} touch(es), last {nearest_resistance['last_test_bars_ago']} bars ago)."
+        )
+    else:
+        summary_parts.append("No swing resistance above spot -- price is above every confirmed swing high.")
+    if nearest_support is not None:
+        summary_parts.append(
+            f"Nearest swing support {nearest_support['level']:.2f} "
+            f"({nearest_support['touches']} touch(es), last {nearest_support['last_test_bars_ago']} bars ago)."
+        )
+    else:
+        summary_parts.append("No swing support below spot.")
+
+    return {
+        "spot": round(spot, 4),
+        "cluster_tolerance": round(tolerance, 4),
+        "levels": levels,
+        "nearest_resistance": nearest_resistance,
+        "nearest_support": nearest_support,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def volume_profile_levels(bars: list[dict], bins: int = 24, spot: "float | None" = None) -> dict:
+    """Volume-by-price profile: POC, value area, and high/low-volume nodes.
+
+    Buckets each bar's volume at its typical price ((H+L+C)/3) across `bins`
+    equal price slices of the window's range. The Point of Control (POC) is
+    the price with the most transacted volume -- a magnet/defended level; the
+    value area is the price band around the POC covering 70% of volume.
+    High-volume nodes (HVNs, >=1.5x the mean bin volume) act as
+    support/resistance where positions were actually built; low-volume nodes
+    (LVNs, <=0.5x) are air pockets price tends to travel through quickly --
+    an LVN just above an entry improves the odds of a fast run to the next
+    HVN.
+    """
+    if len(bars) < 10:
+        return {"note": "not enough bars for a volume profile"}
+
+    lo = min(float(b["l"]) for b in bars)
+    hi = max(float(b["h"]) for b in bars)
+    if hi <= lo:
+        return {"note": "no price range in the window; cannot build a profile"}
+    if spot is None:
+        spot = float(bars[-1]["c"])
+
+    width = (hi - lo) / bins
+    volume_by_bin = [0.0] * bins
+    for b in bars:
+        typical = (float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0
+        idx = min(bins - 1, max(0, int((typical - lo) / width)))
+        volume_by_bin[idx] += float(b.get("v") or 0.0)
+    total_volume = sum(volume_by_bin)
+    if total_volume <= 0:
+        return {"note": "no traded volume in the window; cannot build a profile"}
+
+    def _bin_center(idx: int) -> float:
+        return lo + (idx + 0.5) * width
+
+    poc_idx = max(range(bins), key=lambda i: volume_by_bin[i])
+    poc = _bin_center(poc_idx)
+
+    # Value area: expand from the POC toward whichever neighbor bin holds more
+    # volume until 70% of the total is covered.
+    covered = volume_by_bin[poc_idx]
+    low_idx = high_idx = poc_idx
+    while covered < 0.70 * total_volume and (low_idx > 0 or high_idx < bins - 1):
+        below = volume_by_bin[low_idx - 1] if low_idx > 0 else -1.0
+        above = volume_by_bin[high_idx + 1] if high_idx < bins - 1 else -1.0
+        if above >= below:
+            high_idx += 1
+            covered += volume_by_bin[high_idx]
+        else:
+            low_idx -= 1
+            covered += volume_by_bin[low_idx]
+    value_area_low = lo + low_idx * width
+    value_area_high = lo + (high_idx + 1) * width
+
+    mean_volume = total_volume / bins
+
+    def _nodes(predicate) -> list[dict]:
+        """Merge contiguous qualifying bins into volume-weighted nodes."""
+        nodes: list[dict] = []
+        run: list[int] = []
+        for i in range(bins + 1):
+            if i < bins and predicate(volume_by_bin[i]):
+                run.append(i)
+                continue
+            if run:
+                run_volume = sum(volume_by_bin[j] for j in run)
+                center = (
+                    sum(_bin_center(j) * volume_by_bin[j] for j in run) / run_volume
+                    if run_volume
+                    else _bin_center(run[len(run) // 2])
+                )
+                nodes.append(
+                    {
+                        "price": round(center, 4),
+                        "volume_pct": round(run_volume / total_volume * 100, 1),
+                    }
+                )
+                run = []
+        return nodes
+
+    hvns = _nodes(lambda v: v >= 1.5 * mean_volume)
+    lvns = _nodes(lambda v: 0 < v <= 0.5 * mean_volume)
+
+    spot_idx = min(bins - 1, max(0, int((spot - lo) / width)))
+    spot_in_lvn = 0 < volume_by_bin[spot_idx] <= 0.5 * mean_volume
+
+    hvns_above = [nd for nd in hvns if nd["price"] > spot]
+    hvns_below = [nd for nd in hvns if nd["price"] <= spot]
+    nearest_hvn_above = min(hvns_above, key=lambda nd: nd["price"]) if hvns_above else None
+    nearest_hvn_below = max(hvns_below, key=lambda nd: nd["price"]) if hvns_below else None
+
+    summary_parts = [
+        f"Volume profile over {len(bars)} bars ({lo:.2f}-{hi:.2f}, {bins} bins): "
+        f"POC {poc:.2f}, value area {value_area_low:.2f}-{value_area_high:.2f}; spot {spot:.2f}."
+    ]
+    if nearest_hvn_above is not None:
+        summary_parts.append(
+            f"Nearest high-volume node above: {nearest_hvn_above['price']:.2f} "
+            f"({nearest_hvn_above['volume_pct']:.0f}% of volume) -- likely resistance/magnet."
+        )
+    else:
+        summary_parts.append("No high-volume node above spot.")
+    if nearest_hvn_below is not None:
+        summary_parts.append(
+            f"Nearest high-volume node below: {nearest_hvn_below['price']:.2f} -- likely support."
+        )
+    if spot_in_lvn:
+        summary_parts.append(
+            "Spot sits in a low-volume node (air pocket) -- expect fast travel to the next high-volume node."
+        )
+
+    return {
+        "spot": round(spot, 4),
+        "range_low": round(lo, 4),
+        "range_high": round(hi, 4),
+        "poc": round(poc, 4),
+        "value_area_low": round(value_area_low, 4),
+        "value_area_high": round(value_area_high, 4),
+        "high_volume_nodes": hvns,
+        "low_volume_nodes": lvns,
+        "nearest_hvn_above": nearest_hvn_above,
+        "nearest_hvn_below": nearest_hvn_below,
+        "spot_in_low_volume_node": spot_in_lvn,
+        "summary": " ".join(summary_parts),
+    }
+
+
+def floor_pivots(daily_bars: "list[dict] | None", spot: "float | None" = None, today: "str | None" = None) -> dict:
+    """Classic floor-trader pivot levels from the last completed session.
+
+    P = (H+L+C)/3 from the prior day's bar, with the standard R1-R3 above and
+    S1-S3 below. These are formula levels rather than structure, but they are
+    watched widely enough to act as intraday reaction points -- and a pivot
+    that coincides with a structural level (session high, swing cluster, HVN)
+    is reinforced. Splits the levels around `spot` like key_levels does.
+    """
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prior = [
+        b for b in (daily_bars or []) if str(b.get("t", ""))[:10] and str(b.get("t", ""))[:10] < today
+    ]
+    if not prior:
+        return {"note": "no completed prior-day daily bar available for pivot levels"}
+
+    bar = prior[-1]
+    high, low, close = float(bar["h"]), float(bar["l"]), float(bar["c"])
+    pivot = (high + low + close) / 3.0
+    levels = {
+        "r3": high + 2 * (pivot - low),
+        "r2": pivot + (high - low),
+        "r1": 2 * pivot - low,
+        "pivot": pivot,
+        "s1": 2 * pivot - high,
+        "s2": pivot - (high - low),
+        "s3": low - 2 * (high - pivot),
+    }
+
+    result: dict = {
+        "prior_day_date": str(bar.get("t", ""))[:10],
+        "levels": {name: round(value, 4) for name, value in levels.items()},
+    }
+    summary_parts = [
+        f"Floor pivots from {result['prior_day_date']} (H {high:.2f} / L {low:.2f} / C {close:.2f}): "
+        f"P {pivot:.2f}, R1 {levels['r1']:.2f}, R2 {levels['r2']:.2f}, S1 {levels['s1']:.2f}, S2 {levels['s2']:.2f}."
+    ]
+
+    if spot is not None:
+        def _entry(name: str) -> dict:
+            return {
+                "name": name,
+                "level": round(levels[name], 4),
+                "distance_pct": round((levels[name] / spot - 1) * 100, 2),
+            }
+
+        resistance = sorted(
+            (_entry(name) for name, value in levels.items() if value > spot),
+            key=lambda e: e["level"],
+        )
+        support = sorted(
+            (_entry(name) for name, value in levels.items() if value <= spot),
+            key=lambda e: -e["level"],
+        )
+        result["spot"] = round(spot, 4)
+        result["resistance_above"] = resistance
+        result["support_below"] = support
+        result["nearest_resistance"] = resistance[0] if resistance else None
+        result["nearest_support"] = support[0] if support else None
+        if resistance:
+            summary_parts.append(
+                f"Spot {spot:.2f}: nearest pivot resistance {resistance[0]['name'].upper()} "
+                f"at {resistance[0]['level']:.2f} ({resistance[0]['distance_pct']:+.2f}%)."
+            )
+        else:
+            summary_parts.append(f"Spot {spot:.2f} is above every pivot level (including R3).")
+
+    result["summary"] = " ".join(summary_parts)
+    return result
+
+
 def _vix_label(value: float) -> str:
     if value < 13:
         return "very low (complacent)"
@@ -1011,7 +1434,11 @@ def session_time_window(latest_bar_ts: "str | None" = None) -> dict:
 
 
 def breakout_trade_geometry(
-    entry: float, stop: float, base_height: "float | None" = None, atr: "float | None" = None
+    entry: float,
+    stop: float,
+    base_height: "float | None" = None,
+    atr: "float | None" = None,
+    overhead_resistance: "float | None" = None,
 ) -> dict:
     """Mechanical entry/stop/target math for a long breakout trade.
 
@@ -1020,6 +1447,12 @@ def breakout_trade_geometry(
     a reward-to-risk multiple of the entry-to-stop distance. `meets_min_reward_risk`
     flags whether the best available target clears the 2:1 minimum breakout
     traders require before taking the trade.
+
+    `overhead_resistance` -- the nearest structural level above the entry (from
+    key_levels) -- caps the realistic first target: `room_to_run` is true only
+    when that ceiling sits at least 2x the stop distance above the entry.
+    Buying with `room_to_run` false is buying into resistance; the better play
+    is arming the entry at a break of that level instead.
     """
     if entry <= 0 or stop <= 0:
         return {"note": "entry and stop must be positive prices"}
@@ -1043,6 +1476,31 @@ def breakout_trade_geometry(
     best_rr = max(reward_risk.values()) if reward_risk else None
     meets_min_rr = best_rr is not None and best_rr >= 2.0
 
+    room_to_run: "bool | None" = None
+    rr_at_resistance: "float | None" = None
+    resistance_note: "str | None" = None
+    if overhead_resistance is not None and overhead_resistance > 0:
+        if overhead_resistance <= entry:
+            room_to_run = True
+            resistance_note = (
+                f"The given resistance {overhead_resistance:.2f} is at/below the entry -- "
+                "already cleared, it does not cap the trade (it becomes support on a retest)."
+            )
+        else:
+            rr_at_resistance = round((overhead_resistance - entry) / risk_per_share, 2)
+            room_to_run = rr_at_resistance >= 2.0
+            if room_to_run:
+                resistance_note = (
+                    f"Nearest overhead resistance {overhead_resistance:.2f} leaves "
+                    f"{rr_at_resistance:.1f}:1 reward-to-risk -- room to run."
+                )
+            else:
+                resistance_note = (
+                    f"Nearest overhead resistance {overhead_resistance:.2f} caps reward at "
+                    f"{rr_at_resistance:.1f}:1 -- below the 2:1 minimum. Do NOT buy into this "
+                    "ceiling; arm the entry at a break of that level instead."
+                )
+
     summary_parts = [f"Risk per share {risk_per_share:.2f} (entry {entry:.2f}, stop {stop:.2f})."]
     if targets:
         labelled = ", ".join(
@@ -1056,8 +1514,10 @@ def breakout_trade_geometry(
         )
     else:
         summary_parts.append("No base_height or atr given -- cannot project a target.")
+    if resistance_note:
+        summary_parts.append(resistance_note)
 
-    return {
+    result = {
         "risk_per_share": round(risk_per_share, 4),
         **targets,
         **reward_risk,
@@ -1065,6 +1525,11 @@ def breakout_trade_geometry(
         "meets_min_reward_risk": meets_min_rr,
         "summary": " ".join(summary_parts),
     }
+    if room_to_run is not None:
+        result["overhead_resistance"] = round(overhead_resistance, 4)
+        result["rr_at_overhead_resistance"] = rr_at_resistance
+        result["room_to_run"] = room_to_run
+    return result
 
 
 def vwap_reversion_geometry(
