@@ -11,7 +11,7 @@ reason over directly.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time as _dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -420,28 +420,125 @@ def analyze_vwap_bands(bars: list[dict], num_std: float = 2.0) -> dict:
     }
 
 
-def analyze_opening_range(bars: list[dict], minutes: int = 15) -> dict:
-    """Opening Range Breakout (ORB) read: the high/low set by the first `minutes`
-    of today's bars, and whether price has since broken out of that range.
+def _bar_dt(bar: dict) -> "datetime | None":
+    """Timezone-aware UTC datetime of a bar's timestamp, or None if unparseable."""
+    try:
+        dt = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-    Assumes 1-minute bars and that the earliest bar for today's date is the
-    first bar of the session (true if streaming started at/near the open).
+
+# How late (after 09:30 ET) the earliest retained session bar may be before the
+# buffer is judged not to reach back to the open. Generous enough for a thin
+# symbol whose first prints trickle in, tight enough that a stream started
+# mid-morning can never pass off its start time as the opening bell.
+_OPENING_RANGE_COVERAGE_GRACE_MIN = 3
+
+
+def compute_opening_range(
+    bars: list[dict],
+    minutes: int = 15,
+    now: "datetime | None" = None,
+    assume_coverage: bool = False,
+) -> dict:
+    """Measure today's opening range from bar timestamps: the high/low printed
+    in the 09:30 ET to 09:30+`minutes` window of the latest bar's session.
+
+    Unlike a first-N-bars slice, this refuses to fabricate a range when the bar
+    history does not actually reach back to the opening bell (stream started
+    mid-session, or the buffer has evicted the morning) -- it returns a dict
+    with only a `note` explaining why. `assume_coverage` skips that check for
+    callers that fetched the 09:30 window explicitly (the REST fallback).
+    Returns {date, minutes, high, low, bar_count, avg_volume, complete} on
+    success; `complete` is False while the window is still forming.
     """
     if not bars:
         return {"note": "no intraday bars available yet"}
 
-    today = str(bars[-1].get("t", ""))[:10]
-    day_bars = [b for b in bars if str(b.get("t", ""))[:10] == today]
-    if len(day_bars) < 2:
-        return {"note": "not enough bars in today's session yet to establish an opening range"}
+    stamped = [(b, dt) for b in bars if (dt := _bar_dt(b)) is not None]
+    if not stamped:
+        return {"note": "intraday bars carry no usable timestamps -- cannot anchor the 09:30 ET opening range"}
 
-    opening_bars = day_bars[: max(1, minutes)]
-    or_high = max(b["h"] for b in opening_bars)
-    or_low = min(b["l"] for b in opening_bars)
-    price = float(day_bars[-1]["c"])
+    session_date = stamped[-1][1].astimezone(_ET).date()
+    open_et = datetime.combine(session_date, _dt_time(9, 30), tzinfo=_ET)
+    window_end = open_et + timedelta(minutes=max(1, minutes))
 
-    if len(opening_bars) < minutes:
+    session = [(b, dt) for b, dt in stamped if dt.astimezone(_ET).date() == session_date and dt >= open_et]
+    if not session:
+        return {"note": "no bars from today's regular session yet -- the opening range has not formed"}
+
+    if not assume_coverage:
+        earliest = session[0][1]
+        if earliest > open_et + timedelta(minutes=_OPENING_RANGE_COVERAGE_GRACE_MIN):
+            return {
+                "note": (
+                    "opening range unavailable: bar history only reaches back to "
+                    f"{earliest.astimezone(_ET).strftime('%H:%M')} ET, not today's 09:30 ET open "
+                    "-- refusing to fabricate an opening range from a mid-session window"
+                )
+            }
+
+    opening = [(b, dt) for b, dt in session if dt < window_end]
+    if not opening:
+        return {"note": "no bars printed inside the opening window yet"}
+
+    now = now or datetime.now(timezone.utc)
+    complete = max(now, session[-1][1]) >= window_end
+    volumes = [float(b.get("v") or 0.0) for b, _ in opening]
+    return {
+        "date": session_date.isoformat(),
+        "minutes": max(1, minutes),
+        "high": round(max(float(b["h"]) for b, _ in opening), 4),
+        "low": round(min(float(b["l"]) for b, _ in opening), 4),
+        "bar_count": len(opening),
+        "avg_volume": (sum(volumes) / len(volumes)) if volumes else 0.0,
+        "complete": complete,
+    }
+
+
+def analyze_opening_range(
+    bars: list[dict],
+    minutes: int = 15,
+    opening_range: "dict | None" = None,
+    now: "datetime | None" = None,
+) -> dict:
+    """Opening Range Breakout (ORB) read: the high/low set by the 09:30 ET +
+    `minutes` window of today's session, and whether price has since broken out.
+
+    The range itself comes from `opening_range` when given (a cached/pre-fetched
+    result of :func:`compute_opening_range`, so the read survives buffer
+    eviction and mid-session starts); otherwise it is measured from `bars`.
+    When the range cannot be established honestly, the result carries only a
+    `note` -- never a fabricated range.
+    """
+    rng = opening_range if opening_range is not None else compute_opening_range(bars, minutes, now=now)
+    if "high" not in rng:
+        return rng
+
+    stamped = [(b, dt) for b in bars if (dt := _bar_dt(b)) is not None]
+    session_date = rng.get("date")
+    open_et = None
+    if session_date:
+        open_et = datetime.combine(
+            datetime.fromisoformat(session_date).date(), _dt_time(9, 30), tzinfo=_ET
+        )
+    window_end = open_et + timedelta(minutes=rng["minutes"]) if open_et else None
+
+    session = [
+        (b, dt)
+        for b, dt in stamped
+        if open_et is not None and dt >= open_et and dt.astimezone(_ET).date().isoformat() == session_date
+    ]
+    after_window = [(b, dt) for b, dt in session if window_end is not None and dt >= window_end]
+
+    or_high, or_low = float(rng["high"]), float(rng["low"])
+    price = float(session[-1][0]["c"]) if session else (float(bars[-1]["c"]) if bars else None)
+
+    if not rng.get("complete", True):
         status = "still forming"
+    elif price is None:
+        status = "unknown"
     elif price > or_high:
         status = "broken out above"
     elif price < or_low:
@@ -449,10 +546,12 @@ def analyze_opening_range(bars: list[dict], minutes: int = 15) -> dict:
     else:
         status = "inside_range"
 
-    opening_avg_volume = sum(b.get("v", 0) for b in opening_bars) / len(opening_bars)
-    breakout_bars = day_bars[len(opening_bars) :][-3:]
+    opening_avg_volume = float(rng.get("avg_volume") or 0.0)
+    breakout_bars = [b for b, _ in after_window][-3:]
     breakout_avg_volume = (
-        sum(b.get("v", 0) for b in breakout_bars) / len(breakout_bars) if breakout_bars else None
+        sum(float(b.get("v") or 0.0) for b in breakout_bars) / len(breakout_bars)
+        if breakout_bars
+        else None
     )
     volume_ratio = (
         breakout_avg_volume / opening_avg_volume
@@ -461,8 +560,8 @@ def analyze_opening_range(bars: list[dict], minutes: int = 15) -> dict:
     )
 
     summary_parts = [
-        f"Opening range (first {len(opening_bars)} min): {or_low:.2f}-{or_high:.2f}. "
-        f"Price {price:.2f} is {status.replace('_', ' ')}."
+        f"Opening range (09:30 ET + {rng['minutes']} min): {or_low:.2f}-{or_high:.2f}."
+        + (f" Price {price:.2f} is {status.replace('_', ' ')}." if price is not None else "")
     ]
     if volume_ratio is not None:
         summary_parts.append(
@@ -471,10 +570,11 @@ def analyze_opening_range(bars: list[dict], minutes: int = 15) -> dict:
         )
 
     return {
-        "opening_range_minutes": len(opening_bars),
-        "opening_range_high": round(or_high, 4),
-        "opening_range_low": round(or_low, 4),
-        "current_price": round(price, 4),
+        "opening_range_minutes": rng["minutes"],
+        "opening_range_date": session_date,
+        "opening_range_high": or_high,
+        "opening_range_low": or_low,
+        "current_price": round(price, 4) if price is not None else None,
         "status": status,
         "volume_ratio_vs_opening_range": round(volume_ratio, 2) if volume_ratio is not None else None,
         "summary": " ".join(summary_parts),
@@ -486,6 +586,7 @@ def key_levels(
     daily_bars: "list[dict] | None" = None,
     spot: "float | None" = None,
     opening_range_minutes: int = 15,
+    opening_range: "dict | None" = None,
 ) -> dict:
     """Session-structure support/resistance map: the concrete price levels an
     intraday trader anchors entries, stops, and targets to.
@@ -547,11 +648,20 @@ def key_levels(
         levels["premarket_high"] = max(float(b["h"]) for b in premarket)
         levels["premarket_low"] = min(float(b["l"]) for b in premarket)
     if session:
-        opening = session[: max(1, opening_range_minutes)]
-        levels["opening_range_high"] = max(float(b["h"]) for b in opening)
-        levels["opening_range_low"] = min(float(b["l"]) for b in opening)
         levels["session_high"] = max(float(b["h"]) for b in session)
         levels["session_low"] = min(float(b["l"]) for b in session)
+    # Opening-range levels come from the timestamp-anchored measurement (or a
+    # caller-supplied cached range), never from a first-N-bars slice: when the
+    # buffer doesn't reach back to the 09:30 ET open the levels are simply
+    # omitted rather than fabricated from a mid-session window.
+    rng = (
+        opening_range
+        if opening_range is not None
+        else compute_opening_range(intraday_bars, opening_range_minutes)
+    )
+    if "high" in rng:
+        levels["opening_range_high"] = float(rng["high"])
+        levels["opening_range_low"] = float(rng["low"])
 
     if spot is None:
         if intraday_bars:
@@ -1241,8 +1351,20 @@ def get_put_call_walls_and_gamma(
     }
 
 
-def analyze_volume(bars: list[dict]) -> dict:
-    """Volume confirmation read: is participation backing the recent price move?"""
+def analyze_volume(
+    bars: list[dict],
+    rvol_pace: "float | None" = None,
+    partial_volume_feed: bool = False,
+) -> dict:
+    """Volume confirmation read: is participation backing the recent price move?
+
+    `rvol_pace` is the time-of-day-adjusted relative volume (today's cumulative
+    volume vs an average day's cumulative at this minute -- see
+    state.rvol_pace); when provided it is surfaced as the primary participation
+    gauge, since the local 10-bar-vs-10-bar `relative_volume` only measures the
+    last few minutes against the few minutes before them. `partial_volume_feed`
+    marks single-venue (IEX) volume, a small sample of the consolidated tape.
+    """
     if not bars:
         return {"note": "no intraday bars available yet"}
 
@@ -1277,17 +1399,30 @@ def analyze_volume(bars: list[dict]) -> dict:
     else:
         confirmation = "inconclusive"
 
-    summary_parts = [
-        f"Volume is {volume_trend} (last 10 bars avg {recent_avg:,.0f} vs prior 10 avg {prior_avg:,.0f}"
+    summary_parts = []
+    if rvol_pace is not None:
+        summary_parts.append(
+            f"Time-of-day-adjusted relative volume (rvol_pace) is {rvol_pace:.2f}x an average "
+            f"day's pace ({'clearly elevated' if rvol_pace >= 1.5 else 'not elevated'} participation)."
+        )
+    summary_parts.append(
+        f"Local volume is {volume_trend} (last 10 bars avg {recent_avg:,.0f} vs prior 10 avg {prior_avg:,.0f}"
         + (f", {relative_volume:.1f}x" if relative_volume is not None else "")
         + ")."
-    ]
+    )
     if flow_trend:
         summary_parts.append(f"On-balance volume is {flow_trend}.")
     summary_parts.append(f"Volume is {confirmation} relative to the {price_pct_change:+.2f}% price move.")
+    if partial_volume_feed:
+        summary_parts.append(
+            "Note: volumes are from the IEX feed only (a few percent of the consolidated "
+            "tape) -- treat absolute volume levels and small-sample ratios as directional, "
+            "not precise."
+        )
 
     return {
         "bar_count": len(volumes),
+        "rvol_pace": round(rvol_pace, 2) if rvol_pace is not None else None,
         "recent_10bar_avg_volume": recent_avg,
         "prior_10bar_avg_volume": prior_avg,
         "relative_volume": round(relative_volume, 2) if relative_volume is not None else None,
@@ -1295,6 +1430,7 @@ def analyze_volume(bars: list[dict]) -> dict:
         "obv_trend": flow_trend,
         "price_pct_change_10bar": round(price_pct_change, 2),
         "confirmation": confirmation,
+        "partial_volume_feed": partial_volume_feed or None,
         "summary": " ".join(summary_parts),
     }
 

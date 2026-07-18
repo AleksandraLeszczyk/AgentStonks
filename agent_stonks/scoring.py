@@ -236,10 +236,14 @@ class Scorecard:
         started = datetime.fromisoformat(self.started_at)
         return max(0.0, ((now or _utcnow()) - started).total_seconds())
 
-    def close_activation(self, ended_at: "str | None" = None) -> None:
+    def close_activation(
+        self, ended_at: "str | None" = None, end_value: "float | None" = None
+    ) -> None:
         with self.lock:
             if self._open_activation is not None:
                 self._open_activation["ended_at"] = ended_at or _utcnow().isoformat()
+                if end_value is not None:
+                    self._open_activation["end_value"] = end_value
                 self.activations.append(self._open_activation)
                 self._open_activation = None
 
@@ -339,16 +343,20 @@ def record_price(state: "AppState", symbol: str, price: "float | None") -> None:
 @_never_raise
 def record_activation_start(state: "AppState", strategy: str, regime: "str | None") -> None:
     """Automatic activated `strategy`; a window opens until the strategy stands
-    down (or the orchestrator stops)."""
+    down (or the orchestrator stops). The portfolio value at activation is
+    captured so the window can be judged on its REALIZED return, not merely on
+    whether it armed anything."""
     card: "Scorecard | None" = state.scorecard
     if card is None:
         return
-    card.close_activation()
+    value = state.mark_to_market()
+    card.close_activation(end_value=value)
     with card.lock:
         card._open_activation = {
             "strategy": strategy,
             "regime": regime,
             "started_at": _utcnow().isoformat(),
+            "start_value": value,
         }
 
 
@@ -357,7 +365,7 @@ def record_activation_end(state: "AppState") -> None:
     card: "Scorecard | None" = state.scorecard
     if card is None:
         return
-    card.close_activation()
+    card.close_activation(end_value=state.mark_to_market())
 
 
 # --------------------------------------------------------------------------
@@ -401,8 +409,12 @@ def _decision_quality(
 
 def _activation_outcomes(activations: list[dict], decisions: list[dict]) -> list[dict]:
     """Attribute the session's decisions to each Automatic activation window
-    and judge it: a strategy that produced no filled trade and armed no tactics
-    -- only alarms, or nothing at all -- was not a good fit for that day."""
+    and judge it on what it actually MADE: `return_pct` is the portfolio change
+    over the window, and `effective` means a positive realized return. Merely
+    arming tactics or filling trades no longer counts as effective -- a window
+    that traded and lost, or watched and did nothing, was not a good pick.
+    (Windows from records without start/end values fall back to the old
+    armed-anything rule so old journals still aggregate.)"""
     out = []
     for window in activations:
         in_window = _decisions_in_window(
@@ -415,13 +427,19 @@ def _activation_outcomes(activations: list[dict], decisions: list[dict]) -> list
             or d.get("action") == "tactics"
         )
         alerts = sum(1 for d in in_window if d.get("action") == "alert")
+        start_value = window.get("start_value")
+        end_value = window.get("end_value")
+        return_pct = None
+        if start_value and end_value is not None:
+            return_pct = (end_value / start_value - 1.0) * 100.0
         out.append(
             {
                 **window,
                 "decisions": len(in_window),
                 "active_decisions": active,
                 "alert_decisions": alerts,
-                "effective": active > 0,
+                "return_pct": return_pct,
+                "effective": (return_pct > 0) if return_pct is not None else active > 0,
             }
         )
     return out
@@ -491,7 +509,10 @@ def _session_record(
     with card.lock:
         activations = list(card.activations)
         if card._open_activation is not None:  # still-running Automatic window
-            activations.append({**card._open_activation, "ended_at": now_iso})
+            open_activation = {**card._open_activation, "ended_at": now_iso}
+            if end_value is not None:
+                open_activation["end_value"] = end_value
+            activations.append(open_activation)
         decision_quality = _decision_quality(decisions, card.start_value, end_value)
         record = {
             "started_at": card.started_at,
@@ -591,6 +612,7 @@ def day_report_path(day: str) -> Path:
 
 def _merge_strategy_stats(records: list[dict]) -> dict:
     strategies: dict[str, dict] = {}
+    returns: dict[str, list[float]] = {}
     for record in records:
         for activation in record.get("activations") or []:
             stats = strategies.setdefault(
@@ -600,13 +622,19 @@ def _merge_strategy_stats(records: list[dict]) -> dict:
             stats["activations"] += 1
             if activation.get("effective"):
                 stats["effective"] += 1
-            else:
+            if not activation.get("active_decisions"):
                 stats["alert_only"] += 1
             regime = activation.get("regime")
             if regime and regime not in stats["regimes"]:
                 stats["regimes"].append(regime)
-    for stats in strategies.values():
+            if activation.get("return_pct") is not None:
+                returns.setdefault(activation["strategy"], []).append(activation["return_pct"])
+    for strategy, stats in strategies.items():
+        # `effective` now means a positive realized return over the window (see
+        # _activation_outcomes) -- effectiveness is the strategy's hit rate.
         stats["effectiveness"] = stats["effective"] / stats["activations"]
+        rets = returns.get(strategy)
+        stats["mean_return_pct"] = (sum(rets) / len(rets)) if rets else None
     return strategies
 
 

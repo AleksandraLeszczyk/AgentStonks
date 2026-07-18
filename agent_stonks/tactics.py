@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
@@ -62,10 +63,17 @@ class TacticCondition:
     field: str  # one of TACTIC_CONDITION_FIELDS
     condition: str  # "above" (>=) | "below" (<=)
     value: float
+    # Seconds the comparison must hold CONTINUOUSLY before it counts as met
+    # (0 = met on the first tick that satisfies it). Lets an entry demand a
+    # sustained cross instead of firing on a single wick tick.
+    hold_sec: float = 0.0
     # The value the condition was armed at, recorded the first time the
     # trailing-stop ratchet moves `value` so the ratchet keeps interpolating
     # from the armed level. None until (unless) the condition is ever trailed.
     initial_value: Optional[float] = None
+    # Monotonic timestamp of when the comparison started holding continuously
+    # (runtime state for hold_sec; None while the comparison is unmet).
+    met_since: Optional[float] = None
 
 
 @dataclass
@@ -78,6 +86,9 @@ class TacticAction:
     quantity_pct: Optional[float]
     conditions: list[TacticCondition] = field(default_factory=list)
     note: str = ""
+    # Whether the automatic trailing-stop ratchet may move this action's
+    # protective-stop conditions (sell stops only). False = leave my levels alone.
+    trail: bool = True
 
 
 @dataclass
@@ -147,8 +158,20 @@ def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tupl
                 cvalue = float(cond.get("value"))
             except (TypeError, ValueError):
                 return None, f"actions[{i}].conditions[{j}].value must be a number."
-            conditions.append(TacticCondition(field=cfield, condition=ccond, value=cvalue))
+            raw_hold = cond.get("hold_sec", 0)
+            try:
+                hold_sec = float(raw_hold or 0)
+            except (TypeError, ValueError):
+                return None, f"actions[{i}].conditions[{j}].hold_sec must be a number of seconds."
+            if not 0 <= hold_sec <= 600:
+                return None, f"actions[{i}].conditions[{j}].hold_sec must be between 0 and 600 seconds."
+            conditions.append(
+                TacticCondition(field=cfield, condition=ccond, value=cvalue, hold_sec=hold_sec)
+            )
 
+        trail = raw.get("trail", True)
+        if not isinstance(trail, bool):
+            return None, f"actions[{i}].trail must be a boolean."
         actions.append(
             TacticAction(
                 action=action,
@@ -156,6 +179,7 @@ def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tupl
                 quantity_pct=quantity_pct,
                 conditions=conditions,
                 note=str(raw.get("note") or ""),
+                trail=trail,
             )
         )
 
@@ -170,7 +194,10 @@ def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tupl
 
 def format_condition(cond: TacticCondition) -> str:
     # Same {field, condition, value} shape as a wake-up alert.
-    return format_alert({"field": cond.field, "condition": cond.condition, "value": cond.value})
+    text = format_alert({"field": cond.field, "condition": cond.condition, "value": cond.value})
+    if cond.hold_sec:
+        text += f" held {cond.hold_sec:g}s"
+    return text
 
 
 def format_tactic_action(action: TacticAction, symbol: "str | None" = None) -> str:
@@ -285,10 +312,25 @@ class TacticsExecutor:
         # alert_field_value, which computes them from the same live state.
         return alert_field_value(self.state, cond_field)
 
+    def _condition_met(self, cond: TacticCondition) -> bool:
+        ok = compare(self.condition_value(cond.field), cond.condition, cond.value)
+        if not cond.hold_sec:
+            return ok
+        # hold_sec: the comparison must hold continuously. Track when it first
+        # held; any tick that fails it resets the clock.
+        now = time.monotonic()
+        if not ok:
+            cond.met_since = None
+            return False
+        if cond.met_since is None:
+            cond.met_since = now
+        return (now - cond.met_since) >= cond.hold_sec
+
     def _conditions_met(self, action: TacticAction) -> bool:
-        return all(
-            compare(self.condition_value(c.field), c.condition, c.value) for c in action.conditions
-        )
+        # Evaluate every condition (no short-circuit) so each hold_sec timer
+        # keeps tracking even while a sibling condition is unmet.
+        results = [self._condition_met(c) for c in action.conditions]
+        return all(results)
 
     def check_now(self) -> "TacticAction | None":
         """Evaluate the armed tactics once; execute and return the first action
@@ -331,7 +373,14 @@ class TacticsExecutor:
         armed)) -- locking in gains while always staying below the high that
         produced it. The target never moves, stops only ever move up, and
         stops armed at/above the entry (a manual breakeven/structure stop) are
-        left alone.
+        left alone, as is any action armed with trail=False.
+
+        The ratchet ENGAGES only once the trade has paid one full R -- the
+        high-water mark has cleared entry + (entry - armed stop). Before that
+        the stop stays exactly where it was armed: for a breakout bracket the
+        armed stop sits below the broken range while the entry sits just above
+        it, so an early proportional trail would drag the stop up INTO the
+        broken level and turn a perfectly normal retest of it into a stop-out.
         """
         with self.state.lock:
             price = self.state.last_price
@@ -360,11 +409,17 @@ class TacticsExecutor:
         progress = min(1.0, (tactics.high_water - entry) / (target - entry))
 
         for action in sells:
+            if not action.trail:
+                continue
             for cond in action.conditions:
                 if cond.field != "last_price" or cond.condition != "below":
                     continue
                 armed_at = cond.initial_value if cond.initial_value is not None else cond.value
                 if armed_at >= entry:
+                    continue
+                # Engage only after +1R: high-water must clear entry by the
+                # armed stop distance before this stop is allowed to move.
+                if tactics.high_water < entry + (entry - armed_at):
                     continue
                 new_stop = round(armed_at + progress * (target - armed_at), 4)
                 if new_stop > cond.value:

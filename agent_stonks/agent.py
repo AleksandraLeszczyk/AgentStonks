@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from . import historical
@@ -33,8 +33,8 @@ from .config import (
     QUOTE_WIDE_SPREAD_PCT,
 )
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
-from .rest import fetch_corporate_actions
-from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert
+from .rest import fetch_bars_window, fetch_corporate_actions
+from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert, rvol_pace
 from .tactics import (
     TACTIC_CONDITION_FIELDS,
     TacticsExecutor,
@@ -134,14 +134,14 @@ clears the measured `base_high` / reclaim level (or the overhead resistance \
 level itself, when `room_to_run` failed below it), a sell (stop) when \
 last_price drops below `base_low` or VWAP, and a sell (take-profit) into \
 your target -- the nearest overhead level from get_key_levels is the \
-natural first take-profit. Volume confirmation (step 3) is checked NOW, from analyze_volume's \
-`relative_volume`, while you decide whether to arm the entry at all -- do \
-NOT encode it as a tactic condition: the watchable volume_ratio field is \
-today's CUMULATIVE volume vs a full average day's, a different metric that \
-stays far below an intraday-pace threshold like 1.5 for most of the session \
-and would keep a good entry from ever firing. If participation hasn't \
-confirmed yet, arm only the levels you would trade mechanically and add an \
-alert at the breakout level to reassess volume when it is hit. Then call submit_decision \
+natural first take-profit. Volume confirmation (step 3) can be encoded \
+mechanically: add an 'rvol_pace above 1.5' condition to the entry (the \
+time-of-day-adjusted pace field built for this) and prefer \
+'previous_minute_close' over last_price for the entry cross so a completed \
+bar must CLOSE through the level rather than a single wick tick. Do NOT use \
+the volume_ratio field as a pace condition -- it is today's CUMULATIVE \
+volume vs a full average day's and stays far below any intraday-pace \
+threshold for most of the session. Then call submit_decision \
 exactly once: action (buy/sell/alert), quantity (omit or 0 for alert), the \
 regime, and reasoning that names the setup, the breakout/stop levels, and \
 the volume confirmation you used. Trade immediately (buy/sell) only when the \
@@ -206,55 +206,71 @@ alert) the rest of the time.
 Work through this process every cycle, citing the actual numbers the tools \
 return (levels, ratios, ATR), not just their labels:
 
-1. WAIT FOR THE OPENING-RANGE BREAK. Call analyze_opening_range for today's \
+1. CHECK THE CLOCK FIRST. Call get_session_clock. Breakouts live in the \
+first 90 minutes and the final hour; the 12:00-14:00 ET dead zone is a \
+notorious fakeout factory. When `favorable_for_breakouts` is false, demand \
+much stronger confirmation and smaller size -- or simply arm nothing and \
+wait for a favorable window.
+
+2. WAIT FOR THE OPENING-RANGE BREAK. Call analyze_opening_range for today's \
 opening-range high/low and whether `status` shows price has broken out above \
 or below it yet. This range is your level -- don't anticipate the break, \
-wait for `status` to actually show it.
+wait for `status` to actually show it. If the tool returns only a `note` \
+(the range cannot be established, or hasn't formed), there is NO valid ORB \
+setup this cycle -- never substitute a level you eyeballed; stand aside \
+with an alert instead.
 
-2. DEMAND VOLUME. Call analyze_volume for relative volume and confirmation. A \
-breakout is only valid with volume at least 1.5x average -- ideally 2-3x \
-(`analyze_opening_range`'s `volume_ratio_vs_opening_range` and \
-analyze_volume's `relative_volume` and `confirmation` both speak to this \
-directly). No volume spike means no trade, full stop, regardless of how \
-clean the range break looks.
+3. DEMAND VOLUME. Call analyze_volume. The gate is `rvol_pace` -- today's \
+cumulative volume vs an average day's pace at this same minute: a breakout \
+is only valid with rvol_pace at least 1.5, ideally 2-3+. The local \
+`relative_volume` (last 10 bars vs prior 10) and \
+`volume_ratio_vs_opening_range` are secondary color on the last few \
+minutes, not the gate. No elevated pace means no trade, full stop, \
+regardless of how clean the range break looks.
 
-3. RULE OUT A FALSE BREAKOUT. A break that closes back inside the range, on \
+4. RULE OUT A FALSE BREAKOUT. A break that closes back inside the range, on \
 weak volume, or with a long wick rejecting the level, is a fakeout, not a \
 breakout -- it often reverses sharply as the trapped longs (or shorts) bail \
 out. If you see those tells, do not buy the break; consider whether the \
 reversal itself is the trade (a fade back through the level), or simply \
 set an alert and wait for a cleaner signal.
 
-4. CHECK FOR A CATALYST. Call get_news. A breakout with a real catalyst \
-behind it (earnings, guidance, upgrade, macro data) is more likely to follow \
-through than one on no news -- demand a cleaner setup and smaller size when \
-there's no catalyst.
+5. CHECK FOR A CATALYST AND THE BACKDROP. Call get_news. A breakout with a \
+real catalyst behind it (earnings, guidance, upgrade, macro data) is more \
+likely to follow through than one on no news -- demand a cleaner setup and \
+smaller size when there's no catalyst. Call analyze_market for the broad \
+backdrop: a risk-off tape (elevated/rising VIX, SPY in a drawdown) argues \
+for smaller size and stricter confirmation everywhere.
 
-5. ENTRY DISCIPLINE -- DON'T CHASE. Prefer the close of the breakout bar, or \
-better, a pullback/retest of the range high/low (resistance-turned-support) \
-for a better risk/reward. If price is already extended well beyond the range \
-(it ran 5-8%+ past it with no pullback), it's too late -- this is chasing, \
-not breakout trading; stand aside with an alert and wait for the next range to \
-form instead of buying the extension.
+6. ENTRY DISCIPLINE -- DON'T CHASE, AND CHECK THE ROOM OVERHEAD. Prefer the \
+close of the breakout bar, or better, a pullback/retest of the range \
+high/low (resistance-turned-support) for a better risk/reward. If price is \
+already extended well beyond the range (it ran 5-8%+ past it with no \
+pullback), it's too late -- this is chasing; stand aside with an alert. \
+Then call get_key_levels and take the nearest resistance ABOVE your entry \
+(prior-day high, premarket high, session high): feed it to \
+breakout_trade_geometry as `overhead_resistance`. If `room_to_run` is \
+false, the ceiling is too close to pay 2:1 on the stop -- do NOT buy into \
+it; arm the buy at a break of THAT level instead.
 
-6. SIZE THE TRADE WITH ATR-BASED TARGETS. Your stop sits just below the \
+7. SIZE THE TRADE WITH ATR-BASED TARGETS. Your stop sits just below the \
 opening-range low (never at a round number -- nudge it just under the \
 structure). Call analyze_intraday_momentum for the current `atr`, then call \
-breakout_trade_geometry with your entry, that stop, and the `atr` to get \
-projected targets and reward/risk ratios. Require `meets_min_reward_risk` to \
-be true (at least 2:1) -- if it isn't, do not take the trade; either it's a \
-bad entry or the stop is too wide. Call get_position for current cash/shares \
-before sizing, and risk only a small, fixed slice of the account on the \
-entry-to-stop distance. Never request a sell quantity larger than the \
-current position.
+breakout_trade_geometry with your entry, that stop, the `atr`, and the \
+overhead resistance from step 6 to get projected targets and reward/risk \
+ratios. Require `meets_min_reward_risk` to be true (at least 2:1) -- if it \
+isn't, do not take the trade; either it's a bad entry or the stop is too \
+wide. Call get_position for current cash/shares before sizing, and risk \
+only a small, fixed slice of the account on the entry-to-stop distance. \
+Never request a sell quantity larger than the current position.
 
-7. EXIT DISCIPLINE (when you already hold a position from a prior breakout). \
+8. EXIT DISCIPLINE (when you already hold a position from a prior breakout). \
 Sell or tighten the stop when volume dries up with no fresh buyers \
 (analyze_volume showing decreasing/diverging volume), price closes back \
 inside the broken range, or momentum rolls over (analyze_intraday_momentum \
 showing lower highs/lower lows). Once price has reached roughly 1x ATR \
 beyond entry, move the stop to breakeven by re-arming the stop tactic from \
-step 8 at the new level rather than risking a full round-trip back to the \
+step 9 at the new level rather than risking a full round-trip back to the \
 original stop -- and because you SLEEP while tactics are armed, arm an alert \
 AT that +1x ATR checkpoint (and at the next ATR multiple, plus a \
 momentum_pct fade condition if the move is extended) so you are actually \
@@ -262,30 +278,31 @@ woken to do this; on every subsequent wake keep ratcheting the stop up under \
 fresh structure (the range high once reclaimed, higher lows) rather than \
 leaving it under the range low forever.
 
-8. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
+9. FINALIZE. Turn the levels into ACTION CONDITIONS, not a passive wait: arm \
 them with set_tactics, stating exactly what must be true for you to buy or \
-sell. For a breakout that is typically a buy when last_price clears the \
-range high, plus a sell (stop) just below the range low and a sell \
-(take-profit) at the ATR-projected target from step 6. Volume confirmation \
-(step 2) is checked NOW, from analyze_volume's `relative_volume`, while you \
-decide whether to arm the entry at all -- do NOT encode it as a tactic \
-condition: the watchable volume_ratio field is today's CUMULATIVE volume vs \
-a full average day's, a different metric that stays far below an \
-intraday-pace threshold like 1.5 for most of the session and would keep the \
-entry from ever firing on a real break. If the break hasn't confirmed on \
-volume yet, arm only the levels you would trade mechanically and add an \
-alert at the range high to reassess participation when it is hit. Then call \
-submit_decision exactly once: action (buy/sell/alert), quantity (omit or 0 \
-for alert), the regime, and reasoning that names the range level, the volume \
-confirmation, the entry/stop/target geometry, and why this action follows \
-from it. Trade immediately (buy/sell) only when a confirmed break is in \
-front of you right now; otherwise finalize with action "alert" -- with \
-tactics armed the `alerts` array may be empty, and extra alert entries are \
-only for conditions you'd want to REASSESS on waking rather than trade \
-mechanically (a suspected fakeout you want to eyeball, say). A bare alert \
-with no tactics armed is a last resort for when no range has even formed \
-yet. Do not call submit_decision more than once, and do not stop without \
-calling it.
+sell. The canonical breakout entry is now FULLY mechanizable -- encode BOTH \
+confirmation rules as conditions on the one buy action: \
+'previous_minute_close above the range high' (a completed bar must CLOSE \
+through the level, which filters one-tick wick fakeouts; add hold_sec to \
+demand the cross sustain if you want a stricter filter) AND 'rvol_pace \
+above 1.5' (the break only buys on genuinely elevated participation). Do \
+NOT use last_price for the entry cross (it fires on a single wick) and do \
+NOT use volume_ratio (cumulative vs the full day -- it stays below any \
+pace threshold for most of the session); rvol_pace is the pace-adjusted \
+field built for this. The bracket around the entry: a sell (stop) on \
+last_price just below the range low -- stops stay on last_price with no \
+hold_sec so they react instantly -- and a sell (take-profit) at the \
+ATR-projected target from step 7. Then call submit_decision exactly once: \
+action (buy/sell/alert), quantity (omit or 0 for alert), the regime, and \
+reasoning that names the range level, the rvol_pace confirmation, the \
+entry/stop/target geometry, and why this action follows from it. Trade \
+immediately (buy/sell) only when a confirmed break is in front of you right \
+now; otherwise finalize with action "alert" -- with tactics armed the \
+`alerts` array may be empty, and extra alert entries are only for \
+conditions you'd want to REASSESS on waking rather than trade mechanically \
+(a suspected fakeout you want to eyeball, say). A bare alert with no \
+tactics armed is a last resort for when no range has even formed yet. Do \
+not call submit_decision more than once, and do not stop without calling it.
 
 Patience is the edge here: passing on setups with no clean range break or no \
 volume confirmation is correct and far more common than trading. But wait \
@@ -663,7 +680,11 @@ set_tactics takes a list of actions. Each action is a buy or sell with a size --
 conditions that must ALL hold at the same moment for it to fire (so 'buy 10 if \
 last_price below 180 AND vix below 20' is one action with two conditions). \
 Provide several actions to bracket a position: an entry, a stop-loss, and a \
-take-profit are three actions. Conditions may watch: {fields}.
+take-profit are three actions. A condition may also carry 'hold_sec' (0-600): \
+the comparison must then hold CONTINUOUSLY for that many seconds before it \
+counts as met -- useful on entries to demand a sustained cross instead of a \
+single wick tick (leave stops at 0 so they react instantly). Conditions may \
+watch: {fields}.
 
 PREFER set_tactics over a bare alert whenever you have actionable levels: a \
 tactic executes at the level, an alert only wakes you after it. Use alerts for \
@@ -705,13 +726,18 @@ price -- the stop is trailed up for you mechanically while you sleep: as the \
 price's high-water mark covers a fraction of the entry-to-target distance, \
 the stop is raised to cover the same fraction of its own distance to the \
 target (e.g. price 20% of the way to target moves the stop 20% of the way \
-from its armed level to the target). The take-profit level itself never \
-moves, and the stop only ever ratchets up, never down. This is a safety \
-net, not a substitute for your own recalibration: structure-based stops \
-(under a higher low, VWAP) are usually tighter than the proportional trail, \
-so still re-derive and re-arm them at your checkpoint wakes. A stop you \
-re-arm at or above your entry price is treated as a deliberate manual level \
-and is NOT auto-trailed.
+from its armed level to the target). The trail ENGAGES only once the trade \
+has paid one full R (the high-water mark clears entry + the entry-to-stop \
+distance) -- before that the stop stays exactly where you armed it, so a \
+normal retest of a broken level cannot be turned into a stop-out by an \
+early trail. The take-profit level itself never moves, and the stop only \
+ever ratchets up, never down. Pass 'trail': false on a stop action to pin \
+a structure stop exactly where you armed it. This is a safety net, not a \
+substitute for your own recalibration: structure-based stops (under a \
+higher low, VWAP) are usually tighter than the proportional trail, so still \
+re-derive and re-arm them at your checkpoint wakes. A stop you re-arm at or \
+above your entry price is treated as a deliberate manual level and is NOT \
+auto-trailed.
 
 Protocol: call set_tactics at most once per TICKER per cycle, BEFORE \
 finalizing; it REPLACES that ticker's previously armed tactics (get_position \
@@ -836,9 +862,13 @@ _TOOL_ANALYZE_VOLUME = {
     "function": {
         "name": "analyze_volume",
         "description": (
-            "Analyze recent trade volume to gauge participation: relative volume vs the prior "
-            "window, on-balance-volume trend, and whether volume confirms or diverges from the "
-            "recent price move. Returns labeled values plus a one-line summary."
+            "Analyze recent trade volume to gauge participation. `rvol_pace` is the primary "
+            "gauge: today's cumulative volume vs what an average day has accumulated by this "
+            "same minute of the session (1.0 = normal pace, 1.5+ = clearly elevated) -- the "
+            "honest intraday participation read. Also returns the local `relative_volume` "
+            "(last 10 bars vs the prior 10 -- a few-minute pulse, not a day-level gauge), "
+            "the on-balance-volume trend, and whether volume confirms or diverges from the "
+            "recent price move. Labeled values plus a one-line summary."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -964,10 +994,13 @@ _TOOL_ANALYZE_OPENING_RANGE = {
     "function": {
         "name": "analyze_opening_range",
         "description": (
-            "Analyze today's Opening Range Breakout (ORB) setup: the high/low set by the "
-            "first N minutes of today's session, whether price has since broken out above "
-            "or below that range, and whether recent volume confirms the breakout. Returns "
-            "labeled values plus a one-line summary."
+            "Analyze today's Opening Range Breakout (ORB) setup: the high/low printed in "
+            "the 09:30 ET + N minutes window of today's session (measured from bar "
+            "timestamps, recovered via a targeted history fetch when the live buffer "
+            "doesn't reach back to the open), whether price has since broken out above or "
+            "below that range, and whether recent volume confirms the breakout. When the "
+            "range genuinely cannot be established the result carries only a `note` -- "
+            "there is no valid ORB setup in that case, do not improvise one."
         ),
         "parameters": {
             "type": "object",
@@ -979,6 +1012,23 @@ _TOOL_ANALYZE_OPENING_RANGE = {
             },
             "required": [],
         },
+    },
+}
+
+_TOOL_GET_SESSION_CLOCK = {
+    "type": "function",
+    "function": {
+        "name": "get_session_clock",
+        "description": (
+            "Classify the current point in the trading day for breakout timing "
+            "discipline: opening window (first 90 min -- historically the most reliable "
+            "for breakouts), midday dead zone (12:00-14:00 ET -- notoriously fakeout-"
+            "prone), power hour (final hour -- favorable), or outside regular hours. "
+            "Returns the ET time, the window label, and `favorable_for_breakouts`. "
+            "Check it before arming any breakout entry; in an unfavorable window demand "
+            "much stronger confirmation or stand aside."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
     },
 }
 
@@ -1173,6 +1223,15 @@ _TOOL_SET_TACTICS = {
                                             "type": "number",
                                             "description": "Threshold the field is compared against.",
                                         },
+                                        "hold_sec": {
+                                            "type": "number",
+                                            "description": (
+                                                "Optional (0-600, default 0): seconds the comparison must hold "
+                                                "CONTINUOUSLY before it counts as met. Use on entries to demand a "
+                                                "sustained cross instead of firing on a single wick tick (protective "
+                                                "stops should usually stay at 0 so they react instantly)."
+                                            ),
+                                        },
                                     },
                                     "required": ["field", "condition", "value"],
                                 },
@@ -1180,6 +1239,14 @@ _TOOL_SET_TACTICS = {
                             "note": {
                                 "type": "string",
                                 "description": "Short label for this leg, e.g. 'entry on retest', 'stop-loss', 'take profit'.",
+                            },
+                            "trail": {
+                                "type": "boolean",
+                                "description": (
+                                    "Optional (default true): whether the automatic trailing-stop ratchet "
+                                    "may raise this action's protective sell stop. Set false to pin a "
+                                    "structure stop exactly where you armed it."
+                                ),
                             },
                         },
                         "required": ["action", "conditions"],
@@ -1618,12 +1685,17 @@ MOMENTUM_TOOLS: list[dict] = [
     _TOOL_SUBMIT_DECISION,
 ]
 
-# Breakout trader: ORB + volume + ATR-based targets + news + price.
+# Breakout trader: ORB + session clock discipline + volume + structural levels
+# (room-to-run for breakout_trade_geometry) + broad-market backdrop + ATR-based
+# targets + news + price.
 BREAKOUT_TOOLS: list[dict] = [
     _TOOL_GET_QUOTE,
+    _TOOL_GET_SESSION_CLOCK,
     _TOOL_ANALYZE_OPENING_RANGE,
     _TOOL_ANALYZE_VOLUME,
     _TOOL_ANALYZE_INTRADAY_MOMENTUM,
+    _TOOL_GET_KEY_LEVELS,
+    _TOOL_ANALYZE_MARKET,
     _TOOL_BREAKOUT_TRADE_GEOMETRY,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
@@ -1806,13 +1878,88 @@ def _tool_analyze_daily_trend(state: "SymbolState", limit: object = None) -> dic
     return ta.analyze_trend(bars)
 
 
+def _opening_range_for(state: "SymbolState", minutes: int, allow_fetch: bool = True) -> "dict | None":
+    """Today's opening range for one symbol, from the most reliable source
+    available: the per-symbol cache, else measured from the live bar buffer,
+    else recovered with a targeted REST fetch of the 09:30 ET window (which
+    survives buffer eviction and mid-session starts). Completed ranges are
+    cached on the SymbolState. Returns None when the range genuinely cannot
+    be established -- never a fabricated range."""
+    now = datetime.now(timezone.utc)
+    today_et = now.astimezone(market_hours.MARKET_TZ).date()
+
+    cached = state.opening_range
+    if (
+        cached
+        and cached.get("date") == today_et.isoformat()
+        and cached.get("minutes") == minutes
+        and cached.get("complete")
+    ):
+        return cached
+
+    with state.lock:
+        bars = list(state.bars)
+    rng = ta.compute_opening_range(bars, minutes)
+    if "high" not in rng and allow_fetch and state.api_key and state.api_secret:
+        open_utc = datetime.combine(
+            today_et, market_hours.MARKET_OPEN, tzinfo=market_hours.MARKET_TZ
+        ).astimezone(timezone.utc)
+        if now >= open_utc:
+            try:
+                window = fetch_bars_window(
+                    state.symbol,
+                    "1Min",
+                    open_utc,
+                    open_utc + timedelta(minutes=minutes),
+                    state.api_key,
+                    state.api_secret,
+                    state.feed,
+                )
+            except Exception:
+                window = []
+            if window:
+                rng = ta.compute_opening_range(window, minutes, assume_coverage=True)
+    if "high" not in rng:
+        return None
+    if rng.get("complete"):
+        state.opening_range = rng
+    return rng
+
+
+def breakout_preconditions(app: "AppState", symbols: list[str], minutes: int = 15) -> "str | None":
+    """Deterministic gate for activating the Breakout strategy: returns the
+    reason it is NOT currently tradeable, or None when it is.
+
+    The Breakout Trader's whole edge hangs on a real, measurable opening range
+    and a session window where breaks tend to follow through -- activating it
+    in the midday dead zone, or when no symbol's 09:30 ET window can be
+    established, deploys it into a tape it was never designed for.
+    """
+    clock = ta.session_time_window()
+    if not clock.get("favorable_for_breakouts"):
+        return f"breakout is not selectable right now: {clock.get('summary')}"
+    for symbol in symbols:
+        ss = app.sym(symbol)
+        if ss is not None and _opening_range_for(ss, minutes) is not None:
+            return None
+    return (
+        "breakout is not selectable: no symbol has a measurable opening range for "
+        "today's session (bar history does not reach back to the 09:30 ET open and "
+        "the opening window could not be recovered)"
+    )
+
+
 def _tool_analyze_opening_range(state: "SymbolState", minutes: object = None) -> dict:
     n = max(1, min(int(minutes or 15), 120))
     with state.lock:
         bars = list(state.bars)
     if not bars:
         return {"note": "no intraday bars available yet"}
-    return ta.analyze_opening_range(bars, minutes=n)
+    rng = _opening_range_for(state, n)
+    if rng is None:
+        # Fall through with the honest measurement note (no cache, no fetch).
+        return ta.analyze_opening_range(bars, minutes=n)
+    return ta.analyze_opening_range(bars, minutes=n, opening_range=rng)
 
 
 def _tool_analyze_market(state: "AppState") -> dict:
@@ -1827,9 +1974,11 @@ def _tool_analyze_market(state: "AppState") -> dict:
 def _tool_analyze_volume(state: "SymbolState") -> dict:
     with state.lock:
         bars = list(state.bars)
+        day_volume = state.day_volume
     if not bars:
         return {"note": "no intraday bars available yet"}
-    return ta.analyze_volume(bars)
+    pace = rvol_pace(day_volume, state.daily_bars)
+    return ta.analyze_volume(bars, rvol_pace=pace, partial_volume_feed=state.feed == "iex")
 
 
 def _tool_analyze_consolidation(state: "SymbolState", base_bars: object = None) -> dict:
@@ -1846,7 +1995,10 @@ def _tool_get_key_levels(state: "SymbolState") -> dict:
         bars = list(state.bars)
         spot = state.last_price
     daily = list(state.daily_bars)
-    return ta.key_levels(bars, daily_bars=daily, spot=spot)
+    # Same cached/recovered range the ORB tool uses, so the opening-range
+    # levels here can never disagree with analyze_opening_range's.
+    rng = _opening_range_for(state, 15)
+    return ta.key_levels(bars, daily_bars=daily, spot=spot, opening_range=rng)
 
 
 def _tool_analyze_swing_levels(state: "SymbolState", swing: object = None) -> dict:
@@ -2203,6 +2355,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
         args.get("entry"), args.get("stop"), args.get("target")
     ),
     "get_put_call_walls": _per_symbol(_tool_get_put_call_walls),
+    "get_session_clock": lambda args, app, tracker: ta.session_time_window(),
     "get_news": _per_symbol(_tool_get_news, "limit"),
     "get_position": lambda args, app, tracker: _tool_get_position(app, tracker),
 }

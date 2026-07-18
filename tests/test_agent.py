@@ -142,9 +142,18 @@ class TestToolHandlers:
     def test_breakout_personality_uses_breakout_tools(self):
         assert PERSONALITY_TOOLS["breakout"] is BREAKOUT_TOOLS
         names = {t["function"]["name"] for t in BREAKOUT_TOOLS}
-        assert {"analyze_opening_range", "analyze_volume", "breakout_trade_geometry"} <= names
+        # get_key_levels feeds breakout_trade_geometry's overhead_resistance;
+        # get_session_clock gates the timing windows; analyze_market sets the
+        # broad risk backdrop.
+        assert {
+            "analyze_opening_range",
+            "analyze_volume",
+            "breakout_trade_geometry",
+            "get_key_levels",
+            "get_session_clock",
+            "analyze_market",
+        } <= names
         assert "analyze_daily_trend" not in names
-        assert "analyze_market" not in names
         assert "get_put_call_walls" not in names
 
     def test_momentum_personality_uses_momentum_tools(self):
@@ -761,3 +770,52 @@ class TestAlertTrigger:
         stop_event.set()  # already stopped, should return immediately
 
         _wait_for_next_cycle(state, stop_event, cycle_sec=60)  # should not hang
+
+
+class TestOpeningRangeTool:
+    """_tool_analyze_opening_range: cache-first, honest refusal, no fabrication."""
+
+    @staticmethod
+    def _bar(ts, h, l, c, v=1000):
+        return {"t": ts, "o": c, "h": h, "l": l, "c": c, "v": v}
+
+    def _open_bars(self):
+        # 2026-07-16 is EDT: 09:30 ET = 13:30Z. 15 bars spanning 100-102.
+        return [
+            self._bar(f"2026-07-16T13:{30 + i}:00Z", 102.0 if i == 5 else 101.0, 100.0, 100.5)
+            for i in range(15)
+        ]
+
+    def test_measured_range_is_cached_on_state(self, monkeypatch):
+        from datetime import datetime as real_datetime
+
+        from agent_stonks.agent import _tool_analyze_opening_range
+
+        _, state = _app()
+        state.bars.extend(self._open_bars())
+        # Pin "today" to the bars' session so the cache date check matches.
+        class _FakeDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 7, 16, 14, 0, tzinfo=tz)
+
+        import agent_stonks.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "datetime", _FakeDatetime)
+        result = _tool_analyze_opening_range(state, minutes=15)
+        assert result["opening_range_high"] == 102.0
+        assert state.opening_range is not None
+        assert state.opening_range["date"] == "2026-07-16"
+        assert state.opening_range["complete"] is True
+
+    def test_mid_session_buffer_returns_note_without_keys(self):
+        from agent_stonks.agent import _tool_analyze_opening_range
+
+        _, state = _app()  # no API keys -> no REST recovery
+        state.bars.extend(
+            [self._bar("2026-07-16T16:45:00Z", 105.0, 104.0, 104.5),
+             self._bar("2026-07-16T16:46:00Z", 105.5, 104.5, 105.0)]
+        )
+        result = _tool_analyze_opening_range(state, minutes=15)
+        assert "opening_range_high" not in result
+        assert "note" in result

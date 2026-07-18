@@ -45,10 +45,12 @@ from .agent import (
     _TOOL_GET_NEWS,
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_QUOTE,
+    _TOOL_GET_SESSION_CLOCK,
     _dispatch_tool,
     _log,
     _reject,
     _wait_for_next_cycle,
+    breakout_preconditions,
     run_agent_cycle,
     run_premarket_session,
 )
@@ -103,9 +105,11 @@ analyze_order_blocks (institutional demand/supply zones at/below price).
 term structure, and the S&P's trend and drawdown -- a risk-off backdrop argues \
 for more defensive/selective strategies and smaller risk.
 
-3. READ TODAY'S INTRADAY CHARACTER. Call analyze_intraday_momentum (higher-highs \
-vs lower-lows, VWAP position, ATR), analyze_volume (relative volume -- is there \
-real participation?), analyze_vwap_bands (the ADX read is the key range-vs-trend \
+3. READ TODAY'S INTRADAY CHARACTER. Call get_session_clock (which part of the \
+session is this -- the opening window, the fakeout-prone midday dead zone, power \
+hour?), analyze_intraday_momentum (higher-highs vs lower-lows, VWAP position, \
+ATR), analyze_volume (rvol_pace -- is participation genuinely elevated for this \
+time of day?), analyze_vwap_bands (the ADX read is the key range-vs-trend \
 gate: ADX below 20 = ranging, 25+ = trending), and analyze_opening_range (is an \
 opening-range break setting up?). Optionally get_put_call_walls and get_news for \
 positioning and catalysts, and get_corporate_actions for incoming corporate \
@@ -118,9 +122,13 @@ masquerade as an organic regime.
    - momentum -> a fresh, news-driven directional move ALREADY in progress on \
 clearly elevated relative volume (a 5-20% gap with a catalyst). Best early in a \
 strong, high-participation move.
-   - breakout -> price is coiled against a clear opening range / level and a \
+   - breakout -> price is coiled against a clear, MEASURED opening range and a \
 volume-backed break looks imminent or just happened. Best when a level is being \
-tested with rising volume but no trend has resolved yet.
+tested with rising volume but no trend has resolved yet. Only selectable when \
+analyze_opening_range returns a real range (a `note`-only result means there is \
+no valid range -- do not pick breakout then) and get_session_clock shows a \
+favorable window (never the 12:00-14:00 ET dead zone); selecting it otherwise \
+is rejected and you must re-pick.
    - reversal -> a confirmed RANGE (ADX below 20, no catalyst, large-cap quiet \
 tape) where price is stretched from VWAP. Best in the quiet middle of the \
 session with no trend. Do NOT pick this when ADX shows a real trend.
@@ -178,6 +186,7 @@ _TOOL_SELECT_STRATEGY = {
 # terminal select_strategy. No trading tools -- the orchestrator never trades.
 REGIME_TOOLS: list[dict] = [
     _TOOL_GET_QUOTE,
+    _TOOL_GET_SESSION_CLOCK,
     _TOOL_ANALYZE_DAILY_TREND,
     _TOOL_ANALYZE_MARKET,
     _TOOL_ANALYZE_INTRADAY_MOMENTUM,
@@ -284,6 +293,19 @@ def run_regime_cycle(
                         "with a valid strategy.",
                     )
                     continue
+                if strategy == "breakout":
+                    # Deterministic gate: the ORB specialist needs a real,
+                    # measurable opening range and a favorable session window
+                    # -- never deploy it into the midday dead zone or onto a
+                    # session whose 09:30 window cannot be established.
+                    blocked = breakout_preconditions(state, symbols)
+                    if blocked:
+                        _reject(
+                            messages,
+                            tc.id,
+                            f"{blocked}. Call select_strategy again with a different strategy.",
+                        )
+                        continue
                 selection = {"strategy": strategy, "regime": regime, "reasoning": reasoning}
                 _log(
                     state,

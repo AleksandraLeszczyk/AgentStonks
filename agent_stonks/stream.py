@@ -310,6 +310,8 @@ def _start_stream(
                         state.previous_minute_high = bar["h"]
                     if "l" in bar:
                         state.previous_minute_low = bar["l"]
+                    if "c" in bar:
+                        state.previous_minute_close = bar["c"]
                     if "v" in bar:
                         state.day_volume = (state.day_volume or 0.0) + float(bar["v"])
                     day_volume = state.day_volume
@@ -498,6 +500,7 @@ def _poll_symbol_via_rest(
         last_bar = bars[-1] if bars else {}
         state.previous_minute_high = last_bar.get("h")
         state.previous_minute_low = last_bar.get("l")
+        state.previous_minute_close = last_bar.get("c")
         state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
         if quote:
             _apply_quote(state, quote)
@@ -583,6 +586,7 @@ def launch_stream(
             last_bar = state.bars[-1] if state.bars else None
             state.previous_minute_high = last_bar.get("h") if last_bar else None
             state.previous_minute_low = last_bar.get("l") if last_bar else None
+            state.previous_minute_close = last_bar.get("c") if last_bar else None
             # Seed today's running volume from today's partial daily bar (0 if the
             # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
             # one-shot alert latch for the new session.

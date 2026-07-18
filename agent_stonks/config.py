@@ -3,7 +3,10 @@ from datetime import datetime, timezone
 DATA_REST = "https://data.alpaca.markets"
 BARS_STREAM_URL = "wss://stream.data.alpaca.markets/v2/{feed}"
 NEWS_STREAM_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
-MAX_BARS = 300
+# Full regular session is 390 one-minute bars; 420 keeps the 09:30 ET open in
+# the buffer through the close (plus a little premarket) so session-anchored
+# reads (opening range, VWAP) never silently lose their anchor mid-afternoon.
+MAX_BARS = 420
 POLL_SEC = 3
 CHART_POLL_SEC = 30
 

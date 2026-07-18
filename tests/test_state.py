@@ -164,3 +164,61 @@ def test_current_volume_ratio_none_without_volume_or_baseline():
     bars = [_daily(f"2026-05-{d:02d}", 1000) for d in range(1, 8)]
     assert current_volume_ratio(None, bars, today="2026-06-25")[0] is None
     assert current_volume_ratio(500, [], today="2026-06-25")[0] is None
+
+
+# --- time-of-day-adjusted relative volume (rvol_pace) -----------------------
+
+def _et(iso: str):
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso)
+
+
+def test_intraday_cumulative_volume_fraction_anchors():
+    from agent_stonks.state import intraday_cumulative_volume_fraction
+
+    # 2026-07-16 is EDT (UTC-4): 09:30 ET = 13:30Z.
+    assert intraday_cumulative_volume_fraction(_et("2026-07-16T13:00:00+00:00")) is None  # pre-open
+    assert intraday_cumulative_volume_fraction(_et("2026-07-16T13:30:00+00:00")) == 0.0  # the bell
+    assert intraday_cumulative_volume_fraction(_et("2026-07-16T14:30:00+00:00")) == 0.24  # +60 min
+    assert intraday_cumulative_volume_fraction(_et("2026-07-16T21:00:00+00:00")) == 1.0  # after close
+    # Interpolates between anchors: +45 min sits halfway between 0.15 and 0.24.
+    mid = intraday_cumulative_volume_fraction(_et("2026-07-16T14:15:00+00:00"))
+    assert abs(mid - 0.195) < 1e-9
+
+
+def test_rvol_pace_measures_pace_not_full_day():
+    from agent_stonks.state import rvol_pace
+
+    daily = [_daily(f"2026-05-{d:02d}", 1_000_000) for d in range(1, 8)]  # ADV = 1M
+    # One hour in, an average day has done 24% of its volume (240k). Today has
+    # done 480k -- exactly twice the normal pace.
+    pace = rvol_pace(480_000, daily, now=_et("2026-07-16T14:30:00+00:00"), today="2026-06-25")
+    assert pace == 2.0
+    # The naive cumulative ratio would call the same tape "0.48x" -- the trap
+    # rvol_pace exists to avoid.
+    ratio, _ = current_volume_ratio(480_000, daily, today="2026-06-25")
+    assert ratio == 0.48
+
+
+def test_rvol_pace_none_outside_session_or_without_baseline():
+    from agent_stonks.state import rvol_pace
+
+    daily = [_daily(f"2026-05-{d:02d}", 1_000_000) for d in range(1, 8)]
+    assert rvol_pace(480_000, daily, now=_et("2026-07-16T12:00:00+00:00"), today="2026-06-25") is None
+    assert rvol_pace(480_000, [], now=_et("2026-07-16T14:30:00+00:00"), today="2026-06-25") is None
+    assert rvol_pace(None, daily, now=_et("2026-07-16T14:30:00+00:00"), today="2026-06-25") is None
+
+
+def test_previous_minute_close_is_watchable():
+    from agent_stonks.state import ALERTABLE_FIELDS, PRICE_AXIS_ALERT_FIELDS, alert_field_value
+
+    assert "previous_minute_close" in ALERTABLE_FIELDS
+    assert "previous_minute_close" in PRICE_AXIS_ALERT_FIELDS
+    assert "rvol_pace" in ALERTABLE_FIELDS
+    app = AppState()
+    app.set_symbols(["AAPL"])
+    state = app.sym("AAPL")
+    assert alert_field_value(state, "previous_minute_close") is None
+    state.previous_minute_close = 101.25
+    assert alert_field_value(state, "previous_minute_close") == 101.25

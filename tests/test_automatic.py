@@ -208,3 +208,85 @@ class TestRunRegimeCycle:
         assert "premarket" not in SELECTABLE_STRATEGIES
         enum = _TOOL_STAND_DOWN["function"]["parameters"]["properties"]["reasoning"]
         assert enum["type"] == "string"
+
+
+class TestBreakoutActivationGate:
+    """select_strategy('breakout') is deterministically rejected when the ORB
+    strategy has nothing real to trade: an unfavorable session window, or no
+    measurable opening range for today."""
+
+    def test_gated_breakout_pick_is_rejected_then_corrected(self, monkeypatch):
+        import agent_stonks.automatic as automatic_mod
+
+        monkeypatch.setattr(
+            automatic_mod,
+            "breakout_preconditions",
+            lambda app, symbols, minutes=15: "breakout is not selectable right now: midday dead zone",
+        )
+        state = _base_state()
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(
+                tool_calls=[
+                    _tool_call("c1", "select_strategy", {"strategy": "breakout", "regime": "breakout_pending", "reasoning": "x"})
+                ]
+            ),
+            _response(
+                tool_calls=[
+                    _tool_call("c2", "select_strategy", {"strategy": "reversal", "regime": "ranging", "reasoning": "adx 15"})
+                ]
+            ),
+        ]
+        client = FakeClient(responses)
+        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+        assert selection["strategy"] == "reversal"
+        tool_results = [m["content"] for m in client.calls[1] if m.get("role") == "tool"]
+        assert any("not selectable" in c for c in tool_results)
+
+    def test_preconditions_block_unfavorable_window(self, monkeypatch):
+        import agent_stonks.technical_analysis as ta_mod
+        from agent_stonks.agent import breakout_preconditions
+
+        monkeypatch.setattr(
+            ta_mod,
+            "session_time_window",
+            lambda *a, **k: {"favorable_for_breakouts": False, "summary": "12:30 ET -- midday dead zone."},
+        )
+        state = _base_state()
+        reason = breakout_preconditions(state, ["AAPL"])
+        assert reason is not None and "dead zone" in reason
+
+    def test_preconditions_block_missing_opening_range(self, monkeypatch):
+        import agent_stonks.technical_analysis as ta_mod
+        from agent_stonks.agent import breakout_preconditions
+
+        monkeypatch.setattr(
+            ta_mod,
+            "session_time_window",
+            lambda *a, **k: {"favorable_for_breakouts": True, "summary": "10:00 ET -- opening window."},
+        )
+        state = AppState()
+        state.set_symbols(["AAPL"])  # no API keys -> no REST recovery, no bars
+        reason = breakout_preconditions(state, ["AAPL"])
+        assert reason is not None and "opening range" in reason
+
+    def test_preconditions_pass_with_cached_range(self, monkeypatch):
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        import agent_stonks.technical_analysis as ta_mod
+        from agent_stonks.agent import breakout_preconditions
+
+        monkeypatch.setattr(
+            ta_mod,
+            "session_time_window",
+            lambda *a, **k: {"favorable_for_breakouts": True, "summary": "10:00 ET -- opening window."},
+        )
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        today = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        state.sym("AAPL").opening_range = {
+            "date": today, "minutes": 15, "high": 102.0, "low": 100.0,
+            "bar_count": 15, "avg_volume": 1000.0, "complete": True,
+        }
+        assert breakout_preconditions(state, ["AAPL"]) is None

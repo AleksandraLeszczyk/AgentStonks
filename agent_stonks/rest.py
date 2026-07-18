@@ -38,6 +38,38 @@ def fetch_bars(
     return r.json().get("bars", {}).get(symbol, [])
 
 
+def fetch_bars_window(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+    key: str,
+    secret: str,
+    feed: str = "iex",
+    limit: int = 200,
+) -> list[dict]:
+    """Fetch OHLCV bars for an explicit [start, end) window from Alpaca.
+
+    Used to recover session-anchored windows (e.g. the 09:30 ET opening range)
+    that the live bar buffer no longer covers. Raises on HTTP error.
+    """
+    r = requests.get(
+        f"{DATA_REST}/v2/stocks/bars",
+        headers=_headers(key, secret),
+        params=dict(
+            symbols=symbol,
+            timeframe=timeframe,
+            start=start.astimezone(timezone.utc).isoformat(),
+            end=end.astimezone(timezone.utc).isoformat(),
+            limit=limit,
+            feed=feed,
+        ),
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json().get("bars", {}).get(symbol, [])
+
+
 def fetch_trades(
     symbol: str,
     key: str,

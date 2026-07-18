@@ -18,6 +18,7 @@ from .config import (
     VOLUME_ADV_WINDOW,
     VOLUME_ALERT_DEFAULT_MULTIPLIER,
 )
+from .market_hours import MARKET_OPEN, MARKET_TZ
 
 # Continuously-updated state fields the agent can attach a condition alert to.
 # Every entry is refreshed on the live price/quote stream (and the REST
@@ -37,11 +38,23 @@ ALERTABLE_FIELDS: dict[str, str] = {
     "spread": "Ask price minus bid price (absolute, same units as price)",
     "previous_minute_high": "High of the last completed 1-minute bar",
     "previous_minute_low": "Low of the last completed 1-minute bar",
+    "previous_minute_close": (
+        "Close of the last completed 1-minute bar -- condition on this instead of "
+        "last_price to require a full bar to CLOSE through a level, filtering the "
+        "one-tick wick fakeouts that trigger a raw last_price cross"
+    ),
     "day_volume": "Cumulative shares traded so far today",
     "volume_ratio": (
         "Today's cumulative volume divided by the average FULL day's volume -- climbs "
         "from ~0 toward ~1 over a normal session, so it is NOT an intraday-pace measure "
-        "and makes a poor breakout-confirmation condition"
+        "and makes a poor breakout-confirmation condition (use rvol_pace for that)"
+    ),
+    "rvol_pace": (
+        "Time-of-day-adjusted relative volume: today's cumulative volume divided by "
+        "what an average day has accumulated by this same minute of the session "
+        "(1.0 = normal pace, 1.5+ = clearly elevated participation, 2-3+ = a real "
+        "volume surge). The honest intraday participation gauge -- usable as a "
+        "breakout-confirmation condition, unlike volume_ratio"
     ),
     "momentum_pct": (
         f"Percent price change over the last ~{TACTICS_MOMENTUM_WINDOW_MIN} minutes of "
@@ -54,7 +67,14 @@ ALERTABLE_FIELDS: dict[str, str] = {
 # Subset of alertable fields that live on the price axis, so a triggered/pending
 # alert on them can be drawn as a horizontal line on the price chart.
 PRICE_AXIS_ALERT_FIELDS: frozenset[str] = frozenset(
-    {"last_price", "bid_price", "ask_price", "previous_minute_high", "previous_minute_low"}
+    {
+        "last_price",
+        "bid_price",
+        "ask_price",
+        "previous_minute_high",
+        "previous_minute_low",
+        "previous_minute_close",
+    }
 )
 
 
@@ -91,7 +111,12 @@ class SymbolState:
         self.quote_ts: str | None = None
         self.previous_minute_high: float | None = None
         self.previous_minute_low: float | None = None
+        self.previous_minute_close: float | None = None
         self.day_volume: float | None = None
+        # Today's completed opening range, cached once measured (see
+        # technical_analysis.compute_opening_range) so the ORB read survives
+        # bar-buffer eviction and mid-session restarts. Keyed by its "date".
+        self.opening_range: dict | None = None
         self.volume_alert_triggered: bool = False
         self.volume_alert_ratio: float | None = None
         # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
@@ -396,6 +421,8 @@ def alert_field_value(state: "SymbolState", field: "str | None") -> "float | Non
     if field == "volume_ratio":
         ratio, _ = current_volume_ratio(state.day_volume, state.daily_bars)
         return ratio
+    if field == "rvol_pace":
+        return rvol_pace(state.day_volume, state.daily_bars)
     if field == "momentum_pct":
         return momentum_pct(state)
     if field not in ALERTABLE_FIELDS:
@@ -592,3 +619,67 @@ def current_volume_ratio(
     if not baseline or day_volume is None:
         return None, baseline
     return day_volume / baseline, baseline
+
+
+# Piecewise-linear cumulative intraday volume profile for US equities:
+# (minutes since the 09:30 ET open, fraction of the full day's volume an
+# average session has accumulated by then). Encodes the well-documented
+# U-shape -- heavy open, quiet midday, heavy close -- so a "pace" comparison
+# at 10:00 is made against what an average day has done by 10:00, not against
+# the whole day's volume.
+_INTRADAY_CUM_VOLUME_CURVE: list[tuple[float, float]] = [
+    (0, 0.000), (5, 0.040), (15, 0.090), (30, 0.150), (60, 0.240),
+    (90, 0.310), (120, 0.370), (150, 0.430), (180, 0.480), (210, 0.530),
+    (240, 0.580), (270, 0.640), (300, 0.710), (330, 0.790), (360, 0.880),
+    (390, 1.000),
+]
+
+
+def intraday_cumulative_volume_fraction(now: "datetime | None" = None) -> "float | None":
+    """Fraction of an average day's volume expected by `now` (ET session clock).
+
+    None before the 09:30 ET open (there is no meaningful intraday pace yet);
+    1.0 at/after the close. Linear interpolation between the profile anchors.
+    """
+    et = (now or datetime.now(timezone.utc)).astimezone(MARKET_TZ)
+    minutes = (et.hour * 60 + et.minute + et.second / 60.0) - (
+        MARKET_OPEN.hour * 60 + MARKET_OPEN.minute
+    )
+    if minutes < 0:
+        return None
+    curve = _INTRADAY_CUM_VOLUME_CURVE
+    if minutes >= curve[-1][0]:
+        return 1.0
+    for (m0, f0), (m1, f1) in zip(curve, curve[1:]):
+        if m0 <= minutes <= m1:
+            if m1 == m0:
+                return f1
+            return f0 + (f1 - f0) * (minutes - m0) / (m1 - m0)
+    return None
+
+
+def rvol_pace(
+    day_volume: "float | None",
+    daily_bars: list[dict],
+    now: "datetime | None" = None,
+    today: "str | None" = None,
+) -> "float | None":
+    """Time-of-day-adjusted relative volume (RVOL).
+
+    Today's cumulative volume divided by what an average day (ADV baseline x
+    the cumulative intraday profile) has accumulated by this minute of the
+    session. 1.0 is a normal pace; 1.5+ is clearly elevated participation.
+    None outside the session, without an ADV baseline, or with no volume yet.
+    """
+    if not day_volume:
+        return None
+    baseline = average_daily_volume(daily_bars, today=today)
+    if not baseline:
+        return None
+    fraction = intraday_cumulative_volume_fraction(now)
+    if not fraction:
+        return None
+    # Very early in the session the expected cumulative is tiny and the ratio
+    # explodes on a handful of prints; floor the divisor at 1% of ADV.
+    expected = baseline * max(fraction, 0.01)
+    return day_volume / expected

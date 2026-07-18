@@ -349,19 +349,40 @@ class TestTrailingStop:
         state = _armed_state(raw_actions=_bracket(stop=stop, target=target), last_price=entry)
         return state, tracker, broker, TacticsExecutor(state, tracker)
 
+    def test_no_trailing_before_one_r(self):
+        # Entry 100, armed stop 95 -> R = 5: below high-water 105 the stop must
+        # not move, so a retest of the broken level can't be trailed into.
+        state, _, _, executor = self._setup()
+        state.last_price = 104.0
+
+        assert executor.check_now() is None
+
+        stop_cond = state.tactics.actions[0].conditions[0]
+        assert stop_cond.value == 95.0
+        assert stop_cond.initial_value is None
+        assert state.tactics.high_water == 104.0
+
     def test_stop_trails_proportionally_and_target_stays(self):
         state, _, _, executor = self._setup()
-        state.last_price = 104.0  # 20% of the 100 -> 120 entry->target range
+        state.last_price = 106.0  # past +1R (105); 30% of the 100 -> 120 range
 
         assert executor.check_now() is None
 
         stop_cond = state.tactics.actions[0].conditions[0]
         target_cond = state.tactics.actions[1].conditions[0]
-        # Stop covers 20% of its own 95 -> 120 distance to the target.
-        assert stop_cond.value == pytest.approx(100.0)
+        # Stop covers 30% of its own 95 -> 120 distance to the target.
+        assert stop_cond.value == pytest.approx(102.5)
         assert stop_cond.initial_value == 95.0
         assert target_cond.value == 120.0
-        assert state.tactics.high_water == 104.0
+        assert state.tactics.high_water == 106.0
+
+    def test_trail_false_pins_the_stop(self):
+        state, _, _, executor = self._setup()
+        state.tactics.actions[0].trail = False
+        state.last_price = 110.0
+
+        assert executor.check_now() is None
+        assert state.tactics.actions[0].conditions[0].value == 95.0
 
     def test_stop_only_ratchets_up(self):
         state, _, _, executor = self._setup()
@@ -569,3 +590,70 @@ class TestAgentSetTactics:
         for personality, tools in PERSONALITY_TOOLS.items():
             names = [t["function"]["name"] for t in tools]
             assert "set_tactics" in names, personality
+
+
+class TestHoldSec:
+    """A condition with hold_sec must hold continuously before it counts as met
+    -- a single wick tick through the level no longer fires the action."""
+
+    def _clocked(self, monkeypatch, start=1000.0):
+        from types import SimpleNamespace
+
+        clock = {"t": start}
+        monkeypatch.setattr(
+            tactics_mod, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+        )
+        return clock
+
+    def test_normalize_accepts_and_bounds_hold_sec(self):
+        raw = [_entry_action(conditions=[
+            {"field": "last_price", "condition": "below", "value": 90, "hold_sec": 45}
+        ])]
+        tactics, error = normalize_tactics("AAPL", raw, "x")
+        assert error is None
+        assert tactics.actions[0].conditions[0].hold_sec == 45
+
+        raw = [_entry_action(conditions=[
+            {"field": "last_price", "condition": "below", "value": 90, "hold_sec": 601}
+        ])]
+        tactics, error = normalize_tactics("AAPL", raw, "x")
+        assert tactics is None and "hold_sec" in error
+
+    def test_sustained_cross_fires_wick_does_not(self, monkeypatch):
+        clock = self._clocked(monkeypatch)
+        raw = [_entry_action(quantity=5, conditions=[
+            {"field": "last_price", "condition": "below", "value": 90, "hold_sec": 30}
+        ])]
+        state = _armed_state(raw_actions=raw, last_price=85.0)
+        broker = FakeBroker(price=85.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=broker)
+        executor = TacticsExecutor(state, tracker)
+
+        assert executor.check_now() is None  # first satisfying tick starts the clock
+        clock["t"] += 10
+        state.last_price = 95.0  # wick back out -- the clock resets
+        assert executor.check_now() is None
+        state.last_price = 85.0
+        clock["t"] += 10
+        assert executor.check_now() is None  # fresh clock: only 0s held so far
+        clock["t"] += 31
+        fired = executor.check_now()
+        assert fired is not None and fired.action == "buy"
+        assert broker.orders == [("buy", 5.0, 85.0)]
+
+    def test_zero_hold_sec_fires_immediately(self):
+        state = _armed_state(raw_actions=[_entry_action(quantity=5)], last_price=85.0)
+        tracker = DecisionTracker(starting_cash=10_000, broker=FakeBroker(price=85.0))
+        assert TacticsExecutor(state, tracker).check_now() is not None
+
+    def test_format_mentions_hold(self):
+        raw = [_entry_action(conditions=[
+            {"field": "last_price", "condition": "below", "value": 90, "hold_sec": 30}
+        ])]
+        tactics, _ = normalize_tactics("AAPL", raw, "x")
+        assert format_tactic_action(tactics.actions[0]) == "buy 10 sh when last_price below 90 held 30s"
+
+    def test_normalize_rejects_non_bool_trail(self):
+        raw = [{**_entry_action(), "trail": "yes"}]
+        tactics, error = normalize_tactics("AAPL", raw, "x")
+        assert tactics is None and "trail" in error

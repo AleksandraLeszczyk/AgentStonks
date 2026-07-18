@@ -453,3 +453,73 @@ class TestDailyScoring:
         begin_session(state, "momentum", ["SPY"])
         end_session(state, tracker=None)
         assert [p for p in pushed if p["name"] == "session-profit-efficiency"] == []
+
+
+class TestActivationRealizedReturns:
+    """Activation windows carrying start/end portfolio values are judged on
+    realized return: only a window that MADE money is effective."""
+
+    def test_positive_return_is_effective(self):
+        activations = [
+            {"strategy": "breakout", "regime": "breakout_pending",
+             "started_at": "2026-07-06T10:00:00+00:00", "ended_at": "2026-07-06T12:00:00+00:00",
+             "start_value": 10_000.0, "end_value": 10_050.0},
+        ]
+        (outcome,) = scoring._activation_outcomes(activations, [])
+        assert outcome["return_pct"] == pytest.approx(0.5)
+        assert outcome["effective"] is True
+
+    def test_traded_but_lost_is_not_effective(self):
+        activations = [
+            {"strategy": "breakout", "regime": "breakout_pending",
+             "started_at": "2026-07-06T10:00:00+00:00", "ended_at": "2026-07-06T12:00:00+00:00",
+             "start_value": 10_000.0, "end_value": 9_990.0},
+        ]
+        decisions = [
+            {"ts": "2026-07-06T10:30:00+00:00", "action": "buy", "status": "filled"},
+            {"ts": "2026-07-06T11:00:00+00:00", "action": "tactics", "status": "armed"},
+        ]
+        (outcome,) = scoring._activation_outcomes(activations, decisions)
+        assert outcome["active_decisions"] == 2
+        assert outcome["return_pct"] == pytest.approx(-0.1)
+        assert outcome["effective"] is False  # armed plenty, still lost money
+
+    def test_legacy_window_without_values_falls_back_to_armed_anything(self):
+        activations = [
+            {"strategy": "momentum", "regime": "quiet",
+             "started_at": "2026-07-06T10:00:00+00:00", "ended_at": "2026-07-06T12:00:00+00:00"},
+        ]
+        decisions = [{"ts": "2026-07-06T10:30:00+00:00", "action": "tactics", "status": "armed"}]
+        (outcome,) = scoring._activation_outcomes(activations, decisions)
+        assert outcome["return_pct"] is None
+        assert outcome["effective"] is True
+
+    def test_merge_strategy_stats_aggregates_realized_returns(self):
+        records = [
+            {"activations": [
+                {"strategy": "breakout", "regime": "breakout_pending", "effective": False,
+                 "active_decisions": 2, "return_pct": -0.1},
+                {"strategy": "breakout", "regime": "breakout_pending", "effective": True,
+                 "active_decisions": 1, "return_pct": 0.3},
+                {"strategy": "momentum", "regime": "quiet", "effective": False,
+                 "active_decisions": 0, "return_pct": None},
+            ]},
+        ]
+        stats = scoring._merge_strategy_stats(records)
+        assert stats["breakout"]["activations"] == 2
+        assert stats["breakout"]["effectiveness"] == pytest.approx(0.5)
+        assert stats["breakout"]["mean_return_pct"] == pytest.approx(0.1)
+        assert stats["breakout"]["alert_only"] == 0
+        assert stats["momentum"]["mean_return_pct"] is None
+        assert stats["momentum"]["alert_only"] == 1
+
+    def test_record_activation_captures_portfolio_values(self):
+        state = AppState()
+        begin_session(state, "automatic", ["AAPL"])
+        record_activation_start(state, "breakout", "breakout_pending")
+        record_activation_end(state)
+        (window,) = state.scorecard.activations
+        # No decision tracker attached -> mark_to_market is None: the start
+        # key is recorded (as None) and no end value is written.
+        assert window["start_value"] is None
+        assert "end_value" not in window

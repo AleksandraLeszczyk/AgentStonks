@@ -778,3 +778,118 @@ class TestLiquidity:
         result = analyze_liquidity(_make_bars([float(c) for c in closes]), swing=1, spot=102.0)
         equal_pools = [p for p in result["buy_side_liquidity"] if p["equal"]]
         assert equal_pools
+
+
+class TestOpeningRange:
+    """analyze_opening_range / compute_opening_range: anchored to the 09:30 ET
+    wall clock from bar timestamps, never fabricated from a mid-session start.
+    2026-07-16 is EDT (UTC-4), so 09:30 ET = 13:30Z."""
+
+    @staticmethod
+    def _bar(ts, h, l, c, v=1000):
+        return {"t": ts, "o": c, "h": h, "l": l, "c": c, "v": v}
+
+    def _opening_bars(self):
+        # 15 one-minute bars 13:30Z-13:44Z spanning 100.0-102.0.
+        return [
+            self._bar(f"2026-07-16T13:{30 + i}:00Z", 101.0 + (i == 5), 100.0 + 0.1 * (i == 0), 100.5)
+            for i in range(15)
+        ]
+
+    def test_range_measured_from_the_bell(self):
+        from datetime import datetime, timezone
+
+        from agent_stonks.technical_analysis import analyze_opening_range
+
+        bars = self._opening_bars() + [
+            self._bar("2026-07-16T13:50:00Z", 102.5, 101.8, 102.4, v=3000),
+            self._bar("2026-07-16T13:51:00Z", 103.0, 102.2, 102.9, v=3000),
+        ]
+        result = analyze_opening_range(
+            bars, minutes=15, now=datetime(2026, 7, 16, 13, 52, tzinfo=timezone.utc)
+        )
+        assert result["opening_range_high"] == 102.0
+        assert result["opening_range_low"] == 100.0
+        assert result["status"] == "broken out above"
+        assert result["opening_range_date"] == "2026-07-16"
+        # Recent 3000-avg bars vs the 1000-avg opening bars.
+        assert result["volume_ratio_vs_opening_range"] == 3.0
+
+    def test_mid_session_start_refuses_to_fabricate(self):
+        from agent_stonks.technical_analysis import analyze_opening_range
+
+        bars = [  # stream started 12:45 ET -- nowhere near the open
+            self._bar("2026-07-16T16:45:00Z", 105.0, 104.0, 104.5),
+            self._bar("2026-07-16T16:46:00Z", 105.5, 104.5, 105.0),
+        ]
+        result = analyze_opening_range(bars, minutes=15)
+        assert "opening_range_high" not in result
+        assert "refusing to fabricate" in result["note"]
+
+    def test_cached_range_survives_buffer_eviction(self):
+        from agent_stonks.technical_analysis import analyze_opening_range
+
+        cached = {
+            "date": "2026-07-16",
+            "minutes": 15,
+            "high": 102.0,
+            "low": 100.0,
+            "bar_count": 15,
+            "avg_volume": 1000.0,
+            "complete": True,
+        }
+        bars = [  # buffer no longer reaches the open
+            self._bar("2026-07-16T19:00:00Z", 99.4, 98.9, 99.0),
+            self._bar("2026-07-16T19:01:00Z", 99.5, 99.0, 99.2),
+        ]
+        result = analyze_opening_range(bars, minutes=15, opening_range=cached)
+        assert result["opening_range_high"] == 102.0
+        assert result["status"] == "broken out below"
+
+    def test_still_forming_inside_the_window(self):
+        from datetime import datetime, timezone
+
+        from agent_stonks.technical_analysis import analyze_opening_range
+
+        bars = self._opening_bars()[:5]
+        result = analyze_opening_range(
+            bars, minutes=15, now=datetime(2026, 7, 16, 13, 36, tzinfo=timezone.utc)
+        )
+        assert result["status"] == "still forming"
+
+    def test_compute_coverage_grace_and_assume_coverage(self):
+        from agent_stonks.technical_analysis import compute_opening_range
+
+        late = [  # earliest bar 13:34Z -- 4 min after the bell, past the 3-min grace
+            self._bar(f"2026-07-16T13:{34 + i}:00Z", 101.0, 100.0, 100.5) for i in range(11)
+        ]
+        assert "high" not in compute_opening_range(late, 15)
+        rng = compute_opening_range(late, 15, assume_coverage=True)
+        assert rng["high"] == 101.0 and rng["low"] == 100.0
+
+    def test_no_bars_and_unstamped_bars(self):
+        from agent_stonks.technical_analysis import analyze_opening_range
+
+        assert "note" in analyze_opening_range([], minutes=15)
+        assert "note" in analyze_opening_range([{"h": 1, "l": 1, "c": 1}], minutes=15)
+
+    def test_key_levels_omit_opening_range_for_mid_session_buffer(self):
+        # Buffer starts 12:45 ET: session high/low still reported, but no
+        # fabricated opening-range levels.
+        bars = [
+            self._bar("2026-07-16T16:45:00Z", 105.0, 104.0, 104.5),
+            self._bar("2026-07-16T16:46:00Z", 105.5, 104.5, 105.0),
+        ]
+        result = key_levels(bars, daily_bars=None, opening_range_minutes=15)
+        assert "session_high" in result["levels"]
+        assert "opening_range_high" not in result["levels"]
+
+    def test_key_levels_use_supplied_cached_range(self):
+        bars = [
+            self._bar("2026-07-16T16:45:00Z", 105.0, 104.0, 104.5),
+        ]
+        cached = {"date": "2026-07-16", "minutes": 15, "high": 102.0, "low": 100.0,
+                  "bar_count": 15, "avg_volume": 1000.0, "complete": True}
+        result = key_levels(bars, daily_bars=None, opening_range=cached)
+        assert result["levels"]["opening_range_high"] == 102.0
+        assert result["levels"]["opening_range_low"] == 100.0
