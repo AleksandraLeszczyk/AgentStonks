@@ -32,8 +32,7 @@ The grounding score is a deterministic faithfulness check, not an LLM judge:
 every number the model emits in a finalizing tool call (submit_decision,
 set_tactics, select_strategy, stand_down) must trace back to a number it was
 actually shown earlier in that cycle's context (system/user prompts and tool
-results -- i.e. the post-``_round_prices_for_llm`` strings). See
-:func:`grounding_from_messages`.
+results). See :func:`grounding_from_messages`.
 
 Every hook called from the agent loops is wrapped to never raise: a scoring
 bug must not take down a trading session.
@@ -145,11 +144,9 @@ def _collect_decision_numbers(args: object, out: list[float]) -> None:
 
 
 def _is_grounded(n: float, seen: set[float]) -> bool:
-    # Absolute slack of 0.51 above $100 mirrors _round_prices_for_llm (the
-    # model only ever saw whole dollars there); the 1%-of-source slack accepts
-    # values legitimately derived from a shown level (entry +/- ATR, midpoints).
-    slack = 0.51 if abs(n) >= 100 else 0.01
-    return any(abs(n - t) <= max(slack, 0.01 * abs(t)) for t in seen)
+    # The 1%-of-source slack accepts values legitimately derived from a shown
+    # level (entry +/- ATR, midpoints).
+    return any(abs(n - t) <= max(0.01, 0.01 * abs(t)) for t in seen)
 
 
 def grounding_from_messages(messages: list[dict]) -> "dict | None":

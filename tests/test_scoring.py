@@ -92,9 +92,8 @@ class TestGroundingFromMessages:
         assert result["total"] == 1
         assert result["score"] == 1.0
 
-    def test_whole_dollar_rounding_slack_above_100(self):
-        # The model saw 587 (rounded); echoing 587.0 vs a raw 586.8 elsewhere is fine,
-        # and derived values within 1% of a shown level also count.
+    def test_derived_value_within_one_pct_is_grounded(self):
+        # Values within 1% of a shown level count as derived from it.
         messages = [
             _tool_msg({"support": 587}),
             _decision_call("set_tactics", {"reasoning": "entry near 586.6"}),
