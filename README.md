@@ -22,6 +22,7 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - **Average lines** — 7-day, 28-day, and 1-year daily average price overlays
 - **Fibonacci levels** — session high/low retracement levels
 - **Price profile fit** — fit a Gaussian or Cauchy mixture model to the volume profile (1–5 components), with optional centers shown on the candle chart
+- **ML predicted profile** — overlay of where today's volume is predicted to trade, from a LightGBM quantile-function (density/EMD) model trained on the LevelsML workflow at the 9:30 open; the mixture fit can target either the live volume or this predicted curve. Needs the optional `lightgbm` dependency and the trained pack at `../Models/open_profile_lgbm.json.gz` (retrain with `Models/train_open_profile.py`; override the location with `OPEN_PROFILE_MODEL`)
 - **Multi-timeframe** — 1Min, 5Min, 15Min, 30Min, 1Hour, 1Day
 - **IEX and SIP feeds** — switch between free (IEX) and paid (SIP) data
 
@@ -134,6 +135,10 @@ agent_stonks/
                   gaps / composite setup + geometry
   options.py    — yfinance options chain fetching (open interest, Black-Scholes gamma per strike)
   charts.py     — Plotly chart builders (candlestick + volume profile, gamma, Smart Money zones, performance, historical)
+  profile_model.py — ML predicted price profile: loads the LevelsML density-model pack
+                  (../Models/open_profile_lgbm.json.gz), rebuilds its at-open features from
+                  daily bars + the opening print, and turns predicted volume-quantiles into
+                  a smooth density for the Live chart overlay / mixture fit
   news.py       — optional LLM pipeline for news impact scoring (Alpaca + WorldNews sources)
   premarket.py  — LLM synthesis of news/historical/macro/fundamental data into a structured
                   pre-open briefing (catalysts, technical levels, outlook) per symbol

@@ -135,6 +135,9 @@ class SymbolState:
         self.options_chain: "dict | None" = None
         self.options_wall_history: list[dict] = []
         self.options_status: str = ""
+        # Today's ML-predicted price profile, cached per (day, open) by
+        # profile_model.predicted_open_profile: {"key": ..., "profile": ...}.
+        self.predicted_profile_cache: "dict | None" = None
 
     # --- delegation to the shared AppState -------------------------------
     @property
@@ -208,6 +211,8 @@ _DEFAULTS: dict[str, object] = {
     "show_1y_avg": False,
     "mixture_distribution": "none",
     "mixture_max_components": 0,
+    "mixture_fit_target": "live",
+    "show_predicted_profile": False,
     "vwap_style": "hide",
     "show_candle_body": True,
     "show_percentile_body": False,
@@ -265,6 +270,8 @@ class AppState:
         self.show_1y_avg: bool = False
         self.mixture_distribution: str = "none"
         self.mixture_max_components: int = 0
+        self.mixture_fit_target: str = "live"
+        self.show_predicted_profile: bool = False
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False

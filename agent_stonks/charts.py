@@ -53,6 +53,7 @@ def _gmm_em(
     seed: int,
     max_iter: int = 300,
     tol: float = 1e-8,
+    min_scale: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Weighted EM for a 1-D n-component GMM fitted directly to histogram bins.
@@ -67,7 +68,7 @@ def _gmm_em(
     w_norm = bin_weights / total_w
     global_mean = float(np.dot(w_norm, centers))
     global_std = float(np.sqrt(np.dot(w_norm, (centers - global_mean) ** 2)))
-    stds = np.full(n, max(global_std / n, 1e-6))
+    stds = np.full(n, max(global_std / n, min_scale))
     mix = np.ones(n) / n
     log_lik = -np.inf
     density = np.ones(len(centers))
@@ -89,7 +90,7 @@ def _gmm_em(
         mix = Nk / total_w
         means = (eff * centers[:, None]).sum(axis=0) / np.maximum(Nk, 1e-10)
         stds = np.sqrt((eff * (centers[:, None] - means) ** 2).sum(axis=0) / np.maximum(Nk, 1e-10))
-        stds = np.maximum(stds, 1e-6)
+        stds = np.maximum(stds, min_scale)
 
         new_log_lik = float((bin_weights * np.log(density_safe)).sum())
         if abs(new_log_lik - log_lik) < tol:
@@ -106,6 +107,7 @@ def _cmm_em(
     seed: int,
     max_iter: int = 300,
     tol: float = 1e-8,
+    min_scale: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Weighted ECM for a 1-D n-component Cauchy mixture fitted directly to histogram
@@ -120,7 +122,7 @@ def _cmm_em(
     w_norm = bin_weights / total_w
     global_mean = float(np.dot(w_norm, centers))
     global_std = float(np.sqrt(np.dot(w_norm, (centers - global_mean) ** 2)))
-    scales = np.full(n, max(global_std / n, 1e-6))
+    scales = np.full(n, max(global_std / n, min_scale))
     mix = np.ones(n) / n
     log_lik = -np.inf
     density = np.ones(len(centers))
@@ -146,7 +148,7 @@ def _cmm_em(
         delta = np.column_stack([((centers - locs[k]) / scales[k]) ** 2 for k in range(n)])
         u = 2.0 / (1.0 + delta)
         scales_sq = (z * u * (centers[:, None] - locs) ** 2).sum(axis=0) / np.maximum(Nk, 1e-10)
-        scales = np.maximum(np.sqrt(scales_sq), 1e-6)
+        scales = np.maximum(np.sqrt(scales_sq), min_scale)
         mix = Nk / total_w
 
         new_log_lik = float((bin_weights * np.log(density_safe)).sum())
@@ -172,11 +174,16 @@ def _fit_mixture(
     n_components: int,
     dist: str,
     n_init: int = 5,
+    min_scale: float = 1e-6,
 ) -> list[tuple[float, float, float]]:
     """
     Fit exactly n_components Gaussian or Cauchy distributions to a weighted
     histogram via EM (pure numpy). Runs n_init random restarts and returns
     the best by weighted log-likelihood.
+
+    `min_scale` floors each component's scale — pass ~half the histogram's
+    bin width so a component cannot collapse onto a single bin's spike
+    (structure below bin resolution isn't resolvable anyway).
     Returns a list of (mixing_weight, location, scale) tuples.
     """
     if weights.sum() == 0 or bin_centers.std() == 0:
@@ -186,7 +193,8 @@ def _fit_mixture(
     best_wll = -np.inf
     best_params: tuple = ()
     for init in range(n_init):
-        mix, loc, scale, density = em_fn(bin_centers, weights, n_components, seed=init)
+        mix, loc, scale, density = em_fn(bin_centers, weights, n_components, seed=init,
+                                         min_scale=min_scale)
         wll = float((weights * np.log(np.maximum(density, 1e-300))).sum())
         if wll > best_wll:
             best_wll, best_params = wll, (mix, loc, scale)
@@ -202,65 +210,114 @@ def _plot_price_distribution(
     n_time_buckets: int = 20,
     mixture_distribution: str = "none",
     mixture_max_components: int = 0,
+    predicted_profile: Optional[dict] = None,
+    mixture_fit_target: str = "live",
 ) -> tuple[go.Figure, list[tuple[float, float, float]]]:
     """
     Add a horizontal volume-weighted price distribution histogram to col 2.
     Colors run violet→red from oldest to newest trades.
+
+    `predicted_profile` ({"prices", "density", ...} from
+    profile_model.predicted_open_profile) is drawn as a curve over the
+    histogram; `mixture_fit_target` picks whether the Gaussian/Cauchy mixture
+    is fitted to the realized volume ("live") or that curve ("predicted").
     """
     df = df_trades.sort_values("t").reset_index(drop=True)
+    has_trades = not df.empty
 
-    price_min, price_max = df["p"].min(), df["p"].max()
-    bin_edges = np.linspace(price_min, price_max, n_price_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    bin_width = bin_edges[1] - bin_edges[0]
-    df["bin_idx"] = np.searchsorted(bin_edges[1:-1], df["p"].values)
+    bin_centers = np.array([])
+    total_per_bin = np.array([])
+    bin_width = 0.0
+    if has_trades:
+        price_min, price_max = df["p"].min(), df["p"].max()
+        bin_edges = np.linspace(price_min, price_max, n_price_bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        bin_width = bin_edges[1] - bin_edges[0]
+        df["bin_idx"] = np.searchsorted(bin_edges[1:-1], df["p"].values)
 
-    n = len(df)
-    df["bucket"] = np.clip(
-        df.index.to_numpy() * n_time_buckets // max(n, 1), 0, n_time_buckets - 1
-    )
-
-    def _hsv_to_rgb(hue_deg: float, s: float = 0.85, v: float = 0.95) -> str:
-        r, g, b = colorsys.hsv_to_rgb(hue_deg / 360.0, s, v)
-        return f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})"
-
-    bucket_colors = [
-        _hsv_to_rgb(270.0 * (1.0 - b / max(n_time_buckets - 1, 1)))
-        for b in range(n_time_buckets)
-    ]
-
-    agg = (
-        df.groupby(["bin_idx", "bucket"])["s"]
-        .sum()
-        .reindex(
-            pd.MultiIndex.from_product(
-                [range(n_price_bins), range(n_time_buckets)],
-                names=["bin_idx", "bucket"],
-            ),
-            fill_value=0,
+        n = len(df)
+        df["bucket"] = np.clip(
+            df.index.to_numpy() * n_time_buckets // max(n, 1), 0, n_time_buckets - 1
         )
-        .reset_index()
-    )
 
-    for bucket in range(n_time_buckets):
-        bdata = agg[agg["bucket"] == bucket]
-        t_lo = bucket / n_time_buckets
-        t_hi = (bucket + 1) / n_time_buckets
+        def _hsv_to_rgb(hue_deg: float, s: float = 0.85, v: float = 0.95) -> str:
+            r, g, b = colorsys.hsv_to_rgb(hue_deg / 360.0, s, v)
+            return f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})"
+
+        bucket_colors = [
+            _hsv_to_rgb(270.0 * (1.0 - b / max(n_time_buckets - 1, 1)))
+            for b in range(n_time_buckets)
+        ]
+
+        agg = (
+            df.groupby(["bin_idx", "bucket"])["s"]
+            .sum()
+            .reindex(
+                pd.MultiIndex.from_product(
+                    [range(n_price_bins), range(n_time_buckets)],
+                    names=["bin_idx", "bucket"],
+                ),
+                fill_value=0,
+            )
+            .reset_index()
+        )
+
+        for bucket in range(n_time_buckets):
+            bdata = agg[agg["bucket"] == bucket]
+            t_lo = bucket / n_time_buckets
+            t_hi = (bucket + 1) / n_time_buckets
+            fig.add_trace(
+                go.Bar(
+                    orientation="h",
+                    y=bin_centers[bdata["bin_idx"].values],
+                    x=bdata["s"].values,
+                    width=bin_width * 0.9,
+                    marker_color=bucket_colors[bucket],
+                    marker_line_width=0,
+                    showlegend=False,
+                    name=f"Time {t_lo:.0%}–{t_hi:.0%}",
+                    hovertemplate=(
+                        "<b>Price bin:</b> %{y:.4f}<br>"
+                        "<b>Volume:</b> %{x:,.0f}<br>"
+                        f"<b>Period:</b> {t_lo:.0%}–{t_hi:.0%} of session"
+                        "<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=2,
+            )
+
+        total_per_bin = (
+            agg.groupby("bin_idx")["s"]
+            .sum()
+            .reindex(range(n_price_bins), fill_value=0)
+            .values
+        )
+
+    pred_prices = pred_weights = None
+    pred_step = 0.0
+    if predicted_profile is not None:
+        pred_prices = np.asarray(predicted_profile["prices"], dtype=float)
+        pred_density = np.asarray(predicted_profile["density"], dtype=float)  # peak 1.0
+        pred_step = float(np.mean(np.diff(pred_prices)))
+        # Match the curve's peak to the tallest realized bin so both live on
+        # the volume axis; with no trades yet the units are arbitrary.
+        peak = float(total_per_bin.max()) if total_per_bin.size else 0.0
+        pred_weights = pred_density * (peak if peak > 0 else 1.0)
         fig.add_trace(
-            go.Bar(
-                orientation="h",
-                y=bin_centers[bdata["bin_idx"].values],
-                x=bdata["s"].values,
-                width=bin_width * 0.9,
-                marker_color=bucket_colors[bucket],
-                marker_line_width=0,
-                showlegend=False,
-                name=f"Time {t_lo:.0%}–{t_hi:.0%}",
+            go.Scatter(
+                x=pred_weights,
+                y=pred_prices,
+                mode="lines",
+                name="ML predicted profile",
+                line=dict(color="#22d3ee", width=2),
+                fill="tozerox",
+                fillcolor="rgba(34, 211, 238, 0.12)",
+                opacity=0.9,
                 hovertemplate=(
-                    "<b>Price bin:</b> %{y:.4f}<br>"
-                    "<b>Volume:</b> %{x:,.0f}<br>"
-                    f"<b>Period:</b> {t_lo:.0%}–{t_hi:.0%} of session"
-                    "<extra></extra>"
+                    "<b>Price:</b> %{y:.4f}<br>"
+                    "<b>Predicted rel. volume:</b> %{x:,.0f}"
+                    "<extra>ML predicted profile</extra>"
                 ),
             ),
             row=1,
@@ -270,18 +327,18 @@ def _plot_price_distribution(
     fit_enabled = mixture_distribution in _MIXTURE_EM and mixture_max_components > 0
     components: list[tuple[float, float, float]] = []
     if fit_enabled:
-        total_per_bin = (
-            agg.groupby("bin_idx")["s"]
-            .sum()
-            .reindex(range(n_price_bins), fill_value=0)
-            .values
-        )
-        total_vol = total_per_bin.sum()
+        if mixture_fit_target == "predicted" and pred_prices is not None:
+            fit_centers, fit_weights, fit_step = pred_prices, pred_weights, pred_step
+        else:
+            fit_centers, fit_weights, fit_step = bin_centers, total_per_bin, bin_width
+        total_vol = fit_weights.sum() if fit_weights is not None and len(fit_weights) else 0.0
         if total_vol > 0:
-            components = _fit_mixture(bin_centers, total_per_bin, mixture_max_components, mixture_distribution)
+            components = _fit_mixture(fit_centers, fit_weights, mixture_max_components,
+                                      mixture_distribution,
+                                      min_scale=max(fit_step / 2, 1e-6))
             if components:
-                price_smooth = np.linspace(price_min, price_max, 400)
-                scale = total_vol * bin_width
+                price_smooth = np.linspace(fit_centers.min(), fit_centers.max(), 400)
+                scale = total_vol * fit_step
                 prefix = "C" if mixture_distribution == "cauchy" else "G"
                 loc_sym = "x₀" if mixture_distribution == "cauchy" else "μ"
                 scale_sym = "γ" if mixture_distribution == "cauchy" else "σ"
@@ -330,6 +387,15 @@ def _plot_price_distribution(
                         row=1,
                         col=2,
                     )
+
+    if not has_trades:
+        fig.update_layout(
+            barmode="stack",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            height=700,
+        )
+        return fig, components
 
     # Invisible scatter to attach a colorbar legend
     fig.add_trace(
@@ -673,6 +739,8 @@ def build_chart(
     show_1y_avg: bool = False,
     mixture_distribution: str = "none",
     mixture_max_components: int = 0,
+    predicted_profile: Optional[dict] = None,
+    mixture_fit_target: str = "live",
     daily_bars: Optional[list[dict]] = None,
     vwap_style: str = "hide",
     show_candle_body: bool = True,
@@ -716,11 +784,13 @@ def build_chart(
         column_widths=[0.8, 0.2],
     )
 
-    if not df_trades.empty:
+    if not df_trades.empty or predicted_profile is not None:
         fig, mixture_components = _plot_price_distribution(
             df_trades, fig,
             mixture_distribution=mixture_distribution,
             mixture_max_components=mixture_max_components,
+            predicted_profile=predicted_profile,
+            mixture_fit_target=mixture_fit_target,
         )
     else:
         mixture_components = []

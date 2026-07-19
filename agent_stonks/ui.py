@@ -68,6 +68,7 @@ from .news import fetch_news_with_fallback, score_news_impacts
 from .premarket import DEFAULT_PREMARKET_MODELS, PremarketBriefing, generate_premarket_analysis
 from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
+from .profile_model import predicted_open_profile
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
 from .state import (
@@ -502,6 +503,12 @@ def _chart_panel() -> None:
         tactic_levels = tactic_price_levels(sym_state.tactics)
         decisions = tracker.trade_markers(symbol=sym) if tracker else None
 
+        predicted_profile = (
+            predicted_open_profile(sym_state, bars)
+            if state.show_predicted_profile
+            else None
+        )
+
         fig = build_chart(
             bars,
             sym_state.news,
@@ -515,6 +522,8 @@ def _chart_panel() -> None:
             show_1y_avg=state.show_1y_avg,
             mixture_distribution=state.mixture_distribution,
             mixture_max_components=state.mixture_max_components,
+            predicted_profile=predicted_profile,
+            mixture_fit_target=state.mixture_fit_target,
             daily_bars=sym_state.daily_bars,
             vwap_style=state.vwap_style,
             show_candle_body=state.show_candle_body,
@@ -573,6 +582,20 @@ def _live_chart_controls() -> None:
             value=1,
             disabled=not fit_enabled,
         )
+        show_predicted = st.checkbox(
+            "ML predicted profile",
+            value=False,
+            help="Draws where today's volume is predicted to trade (LevelsML "
+            "density model: per-quantile LightGBM at the open, from daily-bar "
+            "features). Needs the trained pack in ../Models and daily bars.",
+        )
+        fit_target_choice = st.selectbox(
+            "Fit to",
+            ["Live volume", "Predicted profile"],
+            index=0,
+            disabled=not (fit_enabled and show_predicted),
+            help="Which profile the Gaussian/Cauchy mixture is fitted to.",
+        )
 
         st.markdown("**Data**")
         backfill_clicked = st.button(
@@ -610,6 +633,12 @@ def _live_chart_controls() -> None:
     state.show_fib = show_fib
     state.mixture_distribution = dist_choice.lower() if fit_enabled else "none"
     state.mixture_max_components = max_components if fit_enabled else 0
+    state.show_predicted_profile = show_predicted
+    state.mixture_fit_target = (
+        "predicted"
+        if show_predicted and fit_target_choice == "Predicted profile"
+        else "live"
+    )
 
 
 def _volume_alert_controls() -> None:
@@ -1421,6 +1450,12 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     show_1y_avg=state.show_1y_avg,
                     mixture_distribution=state.mixture_distribution,
                     mixture_max_components=state.mixture_max_components,
+                    predicted_profile=(
+                        predicted_open_profile(sym_state, bars)
+                        if state.show_predicted_profile
+                        else None
+                    ),
+                    mixture_fit_target=state.mixture_fit_target,
                     daily_bars=sym_state.daily_bars,
                     vwap_style=state.vwap_style,
                     show_candle_body=state.show_candle_body,
