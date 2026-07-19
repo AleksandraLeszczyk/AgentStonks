@@ -68,12 +68,24 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - **Optional LLM observability** — when Langfuse credentials are set, each agent cycle is traced end-to-end (tool calls, token usage, latency) via `observability.py`; a no-op otherwise
 - **Data-source logging** — every fetch (WebSocket stream, Alpaca REST, yfinance, WorldNews) logs which source served the data and which fallbacks were tried, de-duplicated so repeated identical outcomes don't flood the console
 
+### 🧪 SimLab — strategy testing suite (`sim_main.py`)
+A separate app that replays the trading agents against **stored historical sessions** instead of the live tape — same prompts, same tools, same execution path (`run_agent_cycle`, `DecisionTracker`, `TacticsExecutor`), so a strategy tested here is exactly the strategy that trades live. Hours of "wait for the condition" collapse into minutes: between LLM cycles the engine fast-forwards bar by bar, firing armed tactics, condition alerts, and news wake-ups deterministically from the stored data.
+
+- **Agents tab** — every personality with its avatar, an editable system prompt (saved overrides apply only to simulations; the live app keeps the built-in), and the agent's exact tool set, each tool runnable by hand against any stored moment (pick dataset + symbol + time, see the JSON the agent would see)
+- **Datasets tab** — download named datasets (symbols + date range): minute bars 04:00–20:00 ET, ~1.5y of daily history, per-day news, and SPY/VIX/VIX3M context, stored as gzip JSON under `data/simlab/store/` deduplicated per (symbol, day) — overlapping datasets never re-download a day
+- **Simulate tab** — pick agent + dataset + day(s) + provider/model and run: a pinned simulated clock (`agent_stonks/clock.py`) drives real agent cycles at historical moments, `SimBroker` fills at the stored tape price, and live fetches are rerouted to the dataset (`simlab/patches.py`). Results: equity curve, per-symbol candlesticks with trade markers, the full decision ledger and agent log, an **oracle ceiling** (best single round trip available on the tape) with profit efficiency against it, and an **LLM judge** that grades every entry on the information available at entry time (outcome shown only to calibrate) plus an overall strategy-adherence review. Runs persist under `data/simlab/runs/`; with Langfuse configured, cycles are traced and run scores (`sim-return-pct`, `sim-profit-efficiency`, `sim-judge-overall`) are registered there
+
+```bash
+streamlit run sim_main.py
+```
+
 ## Quickstart
 
 ```bash
 cp .env.example .env        # fill in your Alpaca credentials
 pip install -r requirements.txt
-streamlit run main.py
+streamlit run main.py       # live dashboard
+streamlit run sim_main.py   # SimLab strategy testing
 ```
 
 Open http://localhost:8501.
@@ -142,7 +154,22 @@ agent_stonks/
   report.py     — self-contained HTML report of an agent run
   ui.py         — Streamlit layout (Live / News / Pre-Market / Historical / Technical Analysis /
                   Smart Money / Put-Call Walls / Agent tabs), event callbacks
+  clock.py      — swappable time source: wall clock live, pinned to the replayed
+                  moment under SimLab (agent path reads time through here)
+simlab/
+  data.py       — dataset download + smart local store (bars/news/market, gzip JSON,
+                  deduplicated per symbol-day; manifest of named datasets)
+  market.py     — time-windowed views over a stored dataset ("as of simulated t")
+  engine.py     — simulation engine: real agent cycles at a pinned clock, SimBroker
+                  fills from the tape, deterministic bar-by-bar fast-forward between
+                  cycles (tactics / alerts / news wake-ups)
+  patches.py    — simulation context rerouting every live-fetch call site to the dataset
+  judge.py      — LLM-as-judge: per-entry reasonableness + overall strategy adherence
+  results.py    — run records, oracle/profit scoring, persistence, Langfuse export
+  prompts.py    — editable per-personality prompt overrides (simulation-only)
+  app.py        — the three-tab SimLab Streamlit UI
 main.py         — entry point (loads .env, launches Streamlit)
+sim_main.py     — SimLab entry point (streamlit run sim_main.py)
 tests/          — pytest suite, mirrors most modules 1:1
 ```
 

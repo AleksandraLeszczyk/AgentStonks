@@ -226,3 +226,4 @@ __marimo__/
 data/scoring/
 graphify-out
 tests/__pycache__/*
+data/simlab/

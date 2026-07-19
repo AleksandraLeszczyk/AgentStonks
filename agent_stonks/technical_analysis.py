@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from . import clock
+
 _ET = ZoneInfo("America/New_York")
 
 
@@ -483,7 +485,7 @@ def compute_opening_range(
     if not opening:
         return {"note": "no bars printed inside the opening window yet"}
 
-    now = now or datetime.now(timezone.utc)
+    now = now or clock.now()
     complete = max(now, session[-1][1]) >= window_end
     volumes = [float(b.get("v") or 0.0) for b, _ in opening]
     return {
@@ -608,7 +610,7 @@ def key_levels(
     # back to the calendar date so the prior-day filter still works.
     today = str(intraday_bars[-1].get("t", ""))[:10] if intraday_bars else ""
     if not intraday_bars:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = clock.now().strftime("%Y-%m-%d")
 
     levels: dict[str, float] = {}
 
@@ -952,7 +954,7 @@ def floor_pivots(daily_bars: "list[dict] | None", spot: "float | None" = None, t
     that coincides with a structural level (session high, swing cluster, HVN)
     is reinforced. Splits the levels around `spot` like key_levels does.
     """
-    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = today or clock.now().strftime("%Y-%m-%d")
     prior = [
         b for b in (daily_bars or []) if str(b.get("t", ""))[:10] and str(b.get("t", ""))[:10] < today
     ]
@@ -1530,9 +1532,9 @@ def session_time_window(latest_bar_ts: "str | None" = None) -> dict:
         try:
             dt = datetime.fromisoformat(latest_bar_ts.replace("Z", "+00:00"))
         except ValueError:
-            dt = datetime.now(timezone.utc)
+            dt = clock.now()
     else:
-        dt = datetime.now(timezone.utc)
+        dt = clock.now()
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     et = dt.astimezone(_ET)

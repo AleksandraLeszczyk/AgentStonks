@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
     from .decisions import DecisionTracker
 
+from . import clock
 from .config import (
     MAX_BARS,
     PAPER_STARTING_CASH,
@@ -460,7 +461,7 @@ def alert_triggered(state: "SymbolState", alert: dict) -> bool:
     condition = alert.get("condition")
     threshold = alert.get("value")
     if field == "last_price":
-        cutoff = time.monotonic() - _PRICE_WINDOW_SEC
+        cutoff = clock.monotonic() - _PRICE_WINDOW_SEC
         return any(
             compare(price, condition, threshold)
             for ts, price in state.recent_prices
@@ -546,7 +547,7 @@ def _daily_bar_date(bar: dict) -> str:
 
 
 def _today_iso(today: "str | None" = None) -> str:
-    return today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return today or clock.now().strftime("%Y-%m-%d")
 
 
 def completed_daily_bars(daily_bars: list[dict], today: "str | None" = None) -> list[dict]:
@@ -641,7 +642,7 @@ def intraday_cumulative_volume_fraction(now: "datetime | None" = None) -> "float
     None before the 09:30 ET open (there is no meaningful intraday pace yet);
     1.0 at/after the close. Linear interpolation between the profile anchors.
     """
-    et = (now or datetime.now(timezone.utc)).astimezone(MARKET_TZ)
+    et = (now or clock.now()).astimezone(MARKET_TZ)
     minutes = (et.hour * 60 + et.minute + et.second / 60.0) - (
         MARKET_OPEN.hour * 60 + MARKET_OPEN.minute
     )

@@ -597,12 +597,8 @@ class TestHoldSec:
     -- a single wick tick through the level no longer fires the action."""
 
     def _clocked(self, monkeypatch, start=1000.0):
-        from types import SimpleNamespace
-
         clock = {"t": start}
-        monkeypatch.setattr(
-            tactics_mod, "time", SimpleNamespace(monotonic=lambda: clock["t"])
-        )
+        monkeypatch.setattr(tactics_mod.clock, "monotonic", lambda: clock["t"])
         return clock
 
     def test_normalize_accepts_and_bounds_hold_sec(self):

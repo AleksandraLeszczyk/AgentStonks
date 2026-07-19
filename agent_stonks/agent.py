@@ -20,6 +20,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import clock
 from . import historical
 from . import market_hours
 from . import observability as obs
@@ -650,7 +651,7 @@ strategy above.
 
 def _session_closed_addendum(now: "datetime | None" = None) -> str:
     """The formatted market-closed prompt addendum, or '' while the session is open."""
-    now = now or datetime.now(timezone.utc)
+    now = now or clock.now()
     if market_hours.is_market_open(now):
         return ""
     open_dt = market_hours.next_market_open(now)
@@ -1766,7 +1767,7 @@ PERSONALITY_TOOLS: dict[str, list[dict]] = {
 
 
 def _log(state: "AppState", entry: dict) -> None:
-    entry = {"ts": datetime.now(timezone.utc).isoformat(), **entry}
+    entry = {"ts": clock.now().isoformat(), **entry}
     with state.lock:
         state.agent_log.append(entry)
 
@@ -1779,7 +1780,7 @@ def _quote_age_sec(quote_ts: "str | None") -> "float | None":
         ts = datetime.fromisoformat(str(quote_ts).replace("Z", "+00:00"))
     except ValueError:
         return None
-    return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+    return max(0.0, (clock.now() - ts).total_seconds())
 
 
 # Key-name fragments that mark a numeric field as NOT a dollar price (percentages,
@@ -1885,7 +1886,7 @@ def _opening_range_for(state: "SymbolState", minutes: int, allow_fetch: bool = T
     survives buffer eviction and mid-session starts). Completed ranges are
     cached on the SymbolState. Returns None when the range genuinely cannot
     be established -- never a fabricated range."""
-    now = datetime.now(timezone.utc)
+    now = clock.now()
     today_et = now.astimezone(market_hours.MARKET_TZ).date()
 
     cached = state.opening_range
@@ -2258,7 +2259,7 @@ def _tool_get_corporate_actions(state: "SymbolState", days_ahead: object = None)
 
 
 def _tool_analyze_premarket(state: "SymbolState") -> dict:
-    now = datetime.now(timezone.utc)
+    now = clock.now()
     # The session the read is about: the one in progress (edge case: the bell
     # already rang while the analyst was reasoning) or the upcoming one.
     open_dt = market_hours.session_open(now) or market_hours.next_market_open(now)
@@ -2394,6 +2395,7 @@ def run_agent_cycle(
     max_iters: int = AGENT_MAX_TOOL_ITERS,
     personality: str = DEFAULT_PERSONALITY,
     under_automatic: bool = False,
+    system_prompt_override: "str | None" = None,
 ) -> str:
     """Run one analyze-then-decide cycle over the whole symbol basket. Always
     ends with exactly one recorded decision.
@@ -2414,7 +2416,11 @@ def run_agent_cycle(
         input=symbols_label,
         metadata={"model": model, "symbols": symbols_label, "personality": personality},
     )
-    system_prompt = AGENT_PERSONALITIES.get(personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY])["system_prompt"]
+    # An override replaces only the personality's base prompt (simlab's editable
+    # prompts); the operational addenda below are always appended unchanged.
+    system_prompt = system_prompt_override or AGENT_PERSONALITIES.get(
+        personality, AGENT_PERSONALITIES[DEFAULT_PERSONALITY]
+    )["system_prompt"]
     system_prompt = (
         system_prompt
         + MULTI_SYMBOL_ADDENDUM.format(symbols=symbols_label)

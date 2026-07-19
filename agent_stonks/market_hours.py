@@ -11,13 +11,15 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from . import clock
+
 MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
 
 
 def _as_market_time(now: "datetime | None") -> datetime:
-    return (now or datetime.now(tz=timezone.utc)).astimezone(MARKET_TZ)
+    return (now or clock.now()).astimezone(MARKET_TZ)
 
 
 def is_market_open(now: "datetime | None" = None) -> bool:
@@ -56,5 +58,5 @@ def session_open(now: "datetime | None" = None) -> "datetime | None":
 
 def seconds_until_next_open(now: "datetime | None" = None) -> float:
     """Seconds from `now` to the next regular-session open (always > 0)."""
-    base = (now or datetime.now(tz=timezone.utc)).astimezone(timezone.utc)
+    base = (now or clock.now()).astimezone(timezone.utc)
     return max(0.0, (next_market_open(now) - base).total_seconds())

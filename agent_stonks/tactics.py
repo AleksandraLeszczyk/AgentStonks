@@ -26,12 +26,10 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
-from . import historical
+from . import clock, historical
 from .config import TACTICS_POLL_SEC
 from .state import (
     ALERTABLE_FIELDS,
@@ -184,7 +182,7 @@ def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tupl
         )
 
     tactics = Tactics(
-        ts=datetime.now(timezone.utc).isoformat(),
+        ts=clock.now().isoformat(),
         symbol=symbol,
         reasoning=reasoning,
         actions=actions,
@@ -317,8 +315,10 @@ class TacticsExecutor:
         if not cond.hold_sec:
             return ok
         # hold_sec: the comparison must hold continuously. Track when it first
-        # held; any tick that fails it resets the clock.
-        now = time.monotonic()
+        # held; any tick that fails it resets the clock. clock.monotonic() is
+        # the wall clock live and the simulated clock under simlab, so hold
+        # timers measure tape time either way.
+        now = clock.monotonic()
         if not ok:
             cond.met_since = None
             return False
@@ -474,7 +474,7 @@ class TacticsExecutor:
 
         entry: dict = {
             "type": "tactics_execution",
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": clock.now().isoformat(),
             "action": action.action,
             "symbol": tactics.symbol,
             "tactic": summary,

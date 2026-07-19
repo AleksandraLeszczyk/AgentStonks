@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import threading
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
+from . import clock
 from .broker import Broker, PaperBroker
 from .config import TRADE_FIXED_COST
 
@@ -65,7 +65,7 @@ class DecisionTracker:
 
     def _noop_decision(self, symbol: str, action: str, reasoning: str, **extra) -> Decision:
         return Decision(
-            ts=datetime.now(timezone.utc).isoformat(),
+            ts=clock.now().isoformat(),
             symbol=symbol,
             action=action,
             requested_quantity=0,
@@ -162,7 +162,7 @@ class DecisionTracker:
             self.positions[symbol] = position
 
             decision = Decision(
-                ts=datetime.now(timezone.utc).isoformat(),
+                ts=clock.now().isoformat(),
                 symbol=symbol,
                 action=action,
                 requested_quantity=quantity,
