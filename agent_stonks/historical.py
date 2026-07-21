@@ -99,6 +99,73 @@ def fetch_intraday_bars(symbol: str, interval: str = "1m") -> list[dict]:
     ]
 
 
+# Consolidated-tape volume (yfinance) is identical for every caller within a
+# short window and each read is a full intraday/daily download, so cache briefly
+# to avoid re-hitting yfinance on every analyze_volume tool call. Keyed by
+# symbol; each entry is {"ts": datetime, "bars": list[dict]}.
+_intraday_volume_cache: dict[str, dict] = {}
+_daily_volume_cache: dict[str, dict] = {}
+_VOLUME_CACHE_TTL_SEC = 60
+
+
+def fetch_intraday_volume_bars(symbol: str, interval: str = "1m", ttl_sec: int = _VOLUME_CACHE_TTL_SEC) -> list[dict]:
+    """Today's intraday bars from yfinance, for the volume-confirmation read.
+
+    Alpaca's default (IEX) feed reports volume from a single venue -- a few
+    percent of the consolidated tape -- so its absolute volume and volume ratios
+    are unreliable. yfinance reports consolidated-tape volume across every
+    exchange, making it the more accurate source for volume analysis even though
+    its prices are ~15 minutes delayed. Bars share the {"t","o","h","l","c","v"}
+    Alpaca shape. Cached for `ttl_sec`; returns [] (or the last good cache) on
+    failure so callers can fall back to Alpaca volume.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _intraday_volume_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < ttl_sec:
+        return cached["bars"]
+    try:
+        bars = fetch_intraday_bars(symbol, interval=interval)
+    except Exception:
+        return cached["bars"] if cached else []
+    _intraday_volume_cache[symbol] = {"ts": now, "bars": bars}
+    return bars
+
+
+def fetch_daily_volume_bars(symbol: str, days: int = 90, ttl_sec: int = _VOLUME_CACHE_TTL_SEC) -> list[dict]:
+    """Completed daily volumes from yfinance (consolidated tape), oldest-first.
+
+    Supplies the average-daily-volume baseline that rvol_pace compares today's
+    cumulative volume against. Sourcing both from yfinance keeps that ratio
+    like-for-like; mixing a consolidated numerator with a single-venue Alpaca
+    baseline would inflate rvol_pace by the inverse of IEX's tape share. Each bar
+    is {"t": "YYYY-MM-DD", "v": float}. Cached for `ttl_sec`; [] on failure.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _daily_volume_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < ttl_sec:
+        return cached["bars"]
+    end = now
+    start = end - timedelta(days=days)
+    try:
+        df = yf.download(symbol, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
+    except Exception as exc:
+        log_fetch_failure("daily volume", [("yfinance", exc)], symbol=symbol)
+        return cached["bars"] if cached else []
+    if df.empty:
+        return []
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    idx = pd.to_datetime(df.index)
+    bars = [
+        {"t": ts.strftime("%Y-%m-%d"), "v": float(vol)}
+        for ts, vol in zip(idx, df["Volume"])
+        if pd.notna(vol)
+    ]
+    log_fetch("daily volume", "yfinance", symbol=symbol, detail=f"{len(bars)} days")
+    _daily_volume_cache[symbol] = {"ts": now, "bars": bars}
+    return bars
+
+
 def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
     """Fetch the broad-market condition series (SPY, VIX, VIX3M) for `analyze_market`.
 

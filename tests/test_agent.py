@@ -3,6 +3,7 @@ import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from agent_stonks import historical as agent_historical
 from agent_stonks import market_hours
 from agent_stonks.agent import (
     BREAKOUT_TOOLS,
@@ -78,9 +79,26 @@ class FakeClient:
 
 
 class TestToolHandlers:
-    def test_analyze_volume_with_no_bars_returns_note(self):
+    def test_analyze_volume_with_no_bars_returns_note(self, monkeypatch):
+        # With no Alpaca bars and yfinance volume unavailable, the tool reports
+        # the honest "no bars" note rather than fabricating a read.
+        monkeypatch.setattr(agent_historical, "fetch_intraday_volume_bars", lambda symbol: [])
         _, state = _app()
         assert "note" in _tool_analyze_volume(state)
+
+    def test_analyze_volume_uses_yfinance_consolidated_volume(self, monkeypatch):
+        # Volume is sourced from yfinance (consolidated tape) and reported as a
+        # full-tape feed, not Alpaca's single-venue IEX partial feed.
+        _, state = _app()
+        bars = [
+            {"t": f"2026-07-21T14:{m:02d}:00Z", "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 10_000 + m}
+            for m in range(30)
+        ]
+        monkeypatch.setattr(agent_historical, "fetch_intraday_volume_bars", lambda symbol: bars)
+        monkeypatch.setattr(agent_historical, "fetch_daily_volume_bars", lambda symbol: [])
+        result = _tool_analyze_volume(state)
+        assert result.get("partial_volume_feed") is None
+        assert result["bar_count"] == len(bars)
 
     def test_get_quote_reads_state(self):
         _, state = _app()

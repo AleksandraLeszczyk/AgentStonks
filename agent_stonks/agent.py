@@ -869,7 +869,9 @@ _TOOL_ANALYZE_VOLUME = {
             "honest intraday participation read. Also returns the local `relative_volume` "
             "(last 10 bars vs the prior 10 -- a few-minute pulse, not a day-level gauge), "
             "the on-balance-volume trend, and whether volume confirms or diverges from the "
-            "recent price move. Labeled values plus a one-line summary."
+            "recent price move. Volume is sourced from the consolidated tape (yfinance, all "
+            "exchanges) for accuracy rather than Alpaca's single-venue feed. Labeled values "
+            "plus a one-line summary."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -1937,6 +1939,18 @@ def _tool_analyze_market(state: "AppState") -> dict:
 
 
 def _tool_analyze_volume(state: "SymbolState") -> dict:
+    # Volume is read from yfinance (consolidated tape across every exchange)
+    # rather than Alpaca's single-venue IEX feed, whose few-percent tape share
+    # makes absolute volume and volume ratios unreliable. Today's cumulative
+    # volume and the ADV baseline both come from yfinance so rvol_pace stays a
+    # like-for-like ratio. Fall back to Alpaca's own bars only when yfinance is
+    # unavailable.
+    yf_bars = historical.fetch_intraday_volume_bars(state.symbol)
+    if yf_bars:
+        day_volume = sum(float(b.get("v") or 0.0) for b in yf_bars)
+        daily_bars = historical.fetch_daily_volume_bars(state.symbol) or state.daily_bars
+        pace = rvol_pace(day_volume, daily_bars)
+        return ta.analyze_volume(yf_bars, rvol_pace=pace, partial_volume_feed=False)
     with state.lock:
         bars = list(state.bars)
         day_volume = state.day_volume
