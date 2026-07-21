@@ -1152,6 +1152,258 @@ def volume_profile_levels(bars: list[dict], bins: int = 24, spot: "float | None"
     }
 
 
+# Regular-session bounds (ET) used to anchor the "beginning of the session"
+# warm-up and to keep the intraday spike scan on the cash session.
+_SESSION_OPEN_ET = _dt_time(9, 30)
+_SESSION_CLOSE_ET = _dt_time(16, 0)
+
+
+def _news_near(news_dts: "list[datetime]", when: datetime, window_min: int) -> bool:
+    """True if any news timestamp lands within `window_min` minutes (before OR
+    after) of `when`. A spike that a catalyst straddles is news-driven whichever
+    side the print fell on."""
+    tol = timedelta(minutes=window_min)
+    return any(abs(nd - when) <= tol for nd in news_dts)
+
+
+def analyze_volume_profile_2(
+    bars: list[dict],
+    news_times: "list[str] | None" = None,
+    date: "str | None" = None,
+    spot: "float | None" = None,
+    warmup_min: int = 15,
+    spike_mult: float = 3.0,
+    momentum_window: int = 5,
+    news_window_min: int = 15,
+    price_bins: int = 24,
+    scattered_mult: float = 1.5,
+    flat_bps: float = 8.0,
+) -> dict:
+    """Recent support/resistance from one session's intraday activity.
+
+    Two complementary views of the same 1-minute yfinance bars:
+
+    * The **volume profile** here is the minute-by-minute volume series (volume
+      transacted in each 1-min bin). Its intraday *spikes* -- local maxima whose
+      volume runs `spike_mult`x the session's median minute, past the opening
+      `warmup_min` where volume is always heavy -- mark prices where size
+      actually changed hands. Each spike is classed by how price momentum
+      shifted across it: a swing from up into flat/down is a **supply** line
+      (distribution -> resistance); down into flat/up is a **demand** line
+      (accumulation -> support); a catalyst printing within `news_window_min`
+      flags it **news_driven**; anything else is **unsure**.
+
+    * The **price profile** is a volume-weighted histogram of price. Rebuilt
+      *after* the spike bars' volume is removed, its remaining peaks are
+      **scattered** levels -- prices that accumulated real size drip-by-drip
+      rather than in one burst, hidden activity the spike scan alone misses.
+
+    News resets the picture: once a news-driven spike is found, every peak that
+    formed *before the most recent* one is dropped as stale (nothing is dropped
+    when no spike was news-driven). Returns the surviving peaks
+    (`{price, time, date, rel_vol, vol, type, news_driven}`) plus the nearest
+    surviving support below and resistance above `spot`.
+    """
+    stamped = sorted(
+        ((b, dt) for b in bars if (dt := _bar_dt(b)) is not None),
+        key=lambda pair: pair[1],
+    )
+    if not stamped:
+        return {"note": "intraday bars carry no usable timestamps"}
+
+    session_date = (
+        datetime.strptime(date, "%Y-%m-%d").date()
+        if date
+        else stamped[-1][1].astimezone(_ET).date()
+    )
+    open_et = datetime.combine(session_date, _SESSION_OPEN_ET, tzinfo=_ET)
+    close_et = datetime.combine(session_date, _SESSION_CLOSE_ET, tzinfo=_ET)
+    session = [
+        (b, dt)
+        for b, dt in stamped
+        if open_et <= dt.astimezone(_ET) < close_et
+        and dt.astimezone(_ET).date() == session_date
+    ]
+    if len(session) < warmup_min + 2 * momentum_window:
+        return {"note": f"not enough regular-session bars for {session_date.isoformat()} to scan for spikes"}
+
+    dts = [dt for _, dt in session]
+    closes = [float(b["c"]) for b, _ in session]
+    typicals = [(float(b["h"]) + float(b["l"]) + float(b["c"])) / 3.0 for b, _ in session]
+    vols = [float(b.get("v") or 0.0) for b, _ in session]
+    n = len(session)
+
+    warmup_end = open_et + timedelta(minutes=warmup_min)
+    eligible = [i for i in range(n) if dts[i] >= warmup_end]
+    post_warmup_vols = [vols[i] for i in eligible]
+    baseline = float(np.median([v for v in post_warmup_vols if v > 0])) if post_warmup_vols else 0.0
+    if baseline <= 0:
+        return {"note": "no post-warmup volume to baseline against; cannot scan for spikes"}
+
+    news_dts: list[datetime] = []
+    for raw in news_times or []:
+        try:
+            nd = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        news_dts.append(nd if nd.tzinfo else nd.replace(tzinfo=timezone.utc))
+
+    if spot is None:
+        spot = closes[-1]
+
+    def _et_hhmm(dt: datetime) -> str:
+        return dt.astimezone(_ET).strftime("%H:%M")
+
+    def _sign(bps: float) -> int:
+        return 1 if bps > flat_bps else (-1 if bps < -flat_bps else 0)
+
+    # --- Volume-profile spikes: local maxima >= spike_mult x baseline, with
+    # non-maximum suppression so a single burst yields one peak, not a cluster.
+    candidates = sorted(
+        (i for i in eligible if vols[i] >= spike_mult * baseline),
+        key=lambda i: vols[i],
+        reverse=True,
+    )
+    spike_idxs: list[int] = []
+    for i in candidates:
+        if all(abs(i - j) > momentum_window for j in spike_idxs):
+            spike_idxs.append(i)
+    spike_idxs.sort()
+
+    peaks: list[dict] = []
+    for i in spike_idxs:
+        w = momentum_window
+        before = closes[i] - closes[max(0, i - w)]
+        after = closes[min(n - 1, i + w)] - closes[i]
+        before_bps = before / closes[max(0, i - w)] * 1e4 if closes[max(0, i - w)] else 0.0
+        after_bps = after / closes[i] * 1e4 if closes[i] else 0.0
+        bs, as_ = _sign(before_bps), _sign(after_bps)
+        if bs > 0 and as_ <= 0:
+            kind = "supply"
+        elif bs < 0 and as_ >= 0:
+            kind = "demand"
+        else:
+            kind = "unsure"
+        news_driven = _news_near(news_dts, dts[i], news_window_min)
+        peaks.append(
+            {
+                "price": round(typicals[i], 4),
+                "time": _et_hhmm(dts[i]),
+                "date": session_date.isoformat(),
+                "rel_vol": round(vols[i] / baseline, 2),
+                "vol": int(round(vols[i])),
+                "type": kind,
+                "news_driven": news_driven,
+                "_dt": dts[i],
+            }
+        )
+
+    # --- Price profile with the spike bars' volume removed, to surface levels
+    # built up gradually ("scattered") rather than in the bursts above.
+    lo = min(float(b["l"]) for b, _ in session)
+    hi = max(float(b["h"]) for b, _ in session)
+    spike_set = set(spike_idxs)
+    half_bin = (hi - lo) / price_bins / 2.0 if hi > lo else 0.0
+    if hi > lo:
+        width = (hi - lo) / price_bins
+        resid_vol = [0.0] * price_bins
+        # Per bin, the non-spike minute that transacted the most volume -- a
+        # representative timestamp for a level with no single moment of its own.
+        bin_best: list["tuple[float, int] | None"] = [None] * price_bins
+        for i in range(n):
+            if i in spike_set:
+                continue
+            idx = min(price_bins - 1, max(0, int((typicals[i] - lo) / width)))
+            resid_vol[idx] += vols[i]
+            if bin_best[idx] is None or vols[i] > bin_best[idx][0]:
+                bin_best[idx] = (vols[i], i)
+        mean_bin = sum(resid_vol) / price_bins if price_bins else 0.0
+        spike_prices = [p["price"] for p in peaks]
+        for idx in range(price_bins):
+            v = resid_vol[idx]
+            if mean_bin <= 0 or v < scattered_mult * mean_bin:
+                continue
+            # Keep only local maxima so a broad node yields one scattered peak.
+            left = resid_vol[idx - 1] if idx > 0 else -1.0
+            right = resid_vol[idx + 1] if idx < price_bins - 1 else -1.0
+            if v < left or v < right:
+                continue
+            center = lo + (idx + 0.5) * width
+            # Skip a level a spike already owns (same price bin) -- it is not
+            # hidden activity, just the residue of that spike's own bar.
+            if any(abs(center - sp) <= half_bin for sp in spike_prices):
+                continue
+            best = bin_best[idx]
+            when = dts[best[1]] if best else dts[-1]
+            peaks.append(
+                {
+                    "price": round(center, 4),
+                    "time": _et_hhmm(when),
+                    "date": session_date.isoformat(),
+                    "rel_vol": round(v / baseline, 2),
+                    "vol": int(round(v)),
+                    "type": "scattered",
+                    "news_driven": False,
+                    "_dt": when,
+                }
+            )
+
+    peaks.sort(key=lambda p: p["_dt"])
+
+    # --- Drop everything before the freshest catalyst: levels that formed ahead
+    # of the most recent news-driven spike are stale once the news re-priced it.
+    news_spike_dts = [p["_dt"] for p in peaks if p["news_driven"]]
+    removed = 0
+    if news_spike_dts:
+        cutoff = max(news_spike_dts)
+        kept = [p for p in peaks if p["_dt"] >= cutoff]
+        removed = len(peaks) - len(kept)
+        peaks = kept
+
+    for p in peaks:
+        p.pop("_dt", None)
+
+    supports = [p for p in peaks if p["price"] < spot]
+    resistances = [p for p in peaks if p["price"] > spot]
+    nearest_support = max(supports, key=lambda p: p["price"]) if supports else None
+    nearest_resistance = min(resistances, key=lambda p: p["price"]) if resistances else None
+
+    by_type: dict[str, int] = {}
+    for p in peaks:
+        by_type[p["type"]] = by_type.get(p["type"], 0) + 1
+    summary_parts = [
+        f"{len(peaks)} support/resistance level(s) for {session_date.isoformat()} "
+        f"from {n} regular-session bars (spot {spot:.2f}): "
+        + (", ".join(f"{c} {t}" for t, c in sorted(by_type.items())) or "none")
+        + "."
+    ]
+    if removed:
+        summary_parts.append(f"Dropped {removed} pre-catalyst level(s) ahead of the latest news-driven spike.")
+    if nearest_resistance is not None:
+        summary_parts.append(
+            f"Nearest resistance above: {nearest_resistance['price']:.2f} "
+            f"({nearest_resistance['type']}, {nearest_resistance['rel_vol']}x)."
+        )
+    if nearest_support is not None:
+        summary_parts.append(
+            f"Nearest support below: {nearest_support['price']:.2f} "
+            f"({nearest_support['type']}, {nearest_support['rel_vol']}x)."
+        )
+
+    return {
+        "date": session_date.isoformat(),
+        "spot": round(spot, 4),
+        "baseline_minute_volume": int(round(baseline)),
+        "range_low": round(lo, 4),
+        "range_high": round(hi, 4),
+        "peaks": peaks,
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
+        "removed_pre_news": removed,
+        "summary": " ".join(summary_parts),
+    }
+
+
 def floor_pivots(daily_bars: "list[dict] | None", spot: "float | None" = None, today: "str | None" = None) -> dict:
     """Classic floor-trader pivot levels from the last completed session.
 

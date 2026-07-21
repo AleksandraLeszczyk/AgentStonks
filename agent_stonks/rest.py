@@ -216,3 +216,30 @@ def fetch_news(
     )
     r.raise_for_status()
     return r.json().get("news", [])
+
+
+def fetch_news_window(
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    key: str,
+    secret: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Fetch news articles published in an explicit [start, end) window from
+    Alpaca. Used to recover a prior session's catalysts (with their timestamps)
+    for the volume-profile spike classification. Raises on HTTP error."""
+    r = requests.get(
+        f"{DATA_REST}/v1beta1/news",
+        headers=_headers(key, secret),
+        params=dict(
+            symbols=symbol,
+            start=start.astimezone(timezone.utc).isoformat(),
+            end=end.astimezone(timezone.utc).isoformat(),
+            limit=limit,
+            sort="asc",
+        ),
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json().get("news", [])

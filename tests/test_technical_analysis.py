@@ -12,6 +12,7 @@ from agent_stonks.technical_analysis import (
     analyze_smart_money_setup,
     analyze_trend,
     analyze_volume,
+    analyze_volume_profile_2,
     analyze_vwap_bands,
     atr,
     breakout_trade_geometry,
@@ -594,6 +595,100 @@ class TestVolumeProfileLevels:
         ramp = _make_bars([102.0, 104.0, 106.0, 108.0, 110.0], volumes=[100] * 5)
         result = volume_profile_levels(heavy + ramp, bins=10)
         assert result["value_area_low"] <= 100.0 <= result["value_area_high"]
+
+
+def _session_bars(closes, volumes, start="2026-07-17T13:30:00Z"):
+    """Minute bars from `start` (default 09:30 ET on 2026-07-17), one per
+    (close, volume) pair, with a tight high/low around each close."""
+    from datetime import datetime, timedelta
+
+    base = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    bars = []
+    for i, (c, v) in enumerate(zip(closes, volumes)):
+        t = base + timedelta(minutes=i)
+        bars.append(
+            {
+                "t": t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "o": float(c),
+                "h": float(c) + 0.05,
+                "l": float(c) - 0.05,
+                "c": float(c),
+                "v": float(v),
+            }
+        )
+    return bars
+
+
+class TestAnalyzeVolumeProfile2:
+    def test_too_few_bars_returns_note(self):
+        bars = _session_bars([100.0] * 20, [1000] * 20)
+        assert "note" in analyze_volume_profile_2(bars)
+
+    def test_supply_spike_is_resistance(self):
+        # 15 warm-up min, then a run up into a heavy minute, then a fade down.
+        closes = [100.0] * 15
+        closes += [100.0 + 0.1 * i for i in range(1, 16)]   # up into the spike (idx 30)
+        closes += [closes[-1] - 0.1 * i for i in range(1, 16)]  # down after
+        vols = [5000] * 15 + [1000] * 30
+        vols[30] = 6000  # the spike minute
+        result = analyze_volume_profile_2(_session_bars(closes, vols))
+        supply = [p for p in result["peaks"] if p["type"] == "supply"]
+        assert supply, result["summary"]
+        assert supply[0]["rel_vol"] >= 3.0
+
+    def test_demand_spike_is_support(self):
+        # Down into the heavy minute, then a rally out of it.
+        closes = [100.0] * 15
+        closes += [100.0 - 0.1 * i for i in range(1, 16)]   # down into the spike (idx 30)
+        closes += [closes[-1] + 0.1 * i for i in range(1, 16)]  # up after
+        vols = [5000] * 15 + [1000] * 30
+        vols[30] = 6000
+        result = analyze_volume_profile_2(_session_bars(closes, vols))
+        demand = [p for p in result["peaks"] if p["type"] == "demand"]
+        assert demand, result["summary"]
+
+    def test_opening_warmup_spike_is_ignored(self):
+        # The single heaviest minute is in the opening warm-up window; it must
+        # not be reported as a spike.
+        closes = [100.0 + 0.05 * i for i in range(60)]
+        vols = [1000] * 60
+        vols[5] = 50_000  # enormous, but inside the first 15 min
+        result = analyze_volume_profile_2(_session_bars(closes, vols))
+        assert all(p["time"] > "09:45" for p in result["peaks"] if p["type"] != "scattered")
+
+    def test_news_driven_flag_and_pre_news_removal(self):
+        # Two spikes: an early one, and a later one straddled by a news print.
+        closes = [100.0] * 15 + [100.0 + 0.1 * i for i in range(1, 46)]
+        vols = [5000] * 15 + [1000] * 45
+        vols[25] = 6000  # early spike (~09:55 ET)
+        vols[45] = 6000  # later spike (~10:15 ET)
+        news = ["2026-07-17T14:15:00Z"]  # 10:15 ET, on the later spike
+        result = analyze_volume_profile_2(_session_bars(closes, vols), news_times=news)
+        assert result["removed_pre_news"] >= 1
+        # Everything surviving is at or after the catalyst minute.
+        assert all(p["time"] >= "10:15" for p in result["peaks"])
+        assert any(p["news_driven"] for p in result["peaks"])
+
+    def test_no_news_keeps_all_peaks(self):
+        closes = [100.0] * 15 + [100.0 + 0.1 * i for i in range(1, 46)]
+        vols = [5000] * 15 + [1000] * 45
+        vols[25] = 6000
+        vols[45] = 6000
+        result = analyze_volume_profile_2(_session_bars(closes, vols), news_times=[])
+        assert result["removed_pre_news"] == 0
+
+    def test_peak_shape_has_required_fields(self):
+        closes = [100.0] * 15 + [100.0 + 0.1 * i for i in range(1, 16)] + [
+            103.0 - 0.1 * i for i in range(1, 16)
+        ]
+        vols = [5000] * 15 + [1000] * 30
+        vols[30] = 6000
+        result = analyze_volume_profile_2(_session_bars(closes, vols))
+        assert result["peaks"]
+        for p in result["peaks"]:
+            assert set(p) >= {"price", "time", "date", "rel_vol", "vol", "type"}
+            assert p["type"] in {"supply", "demand", "unsure", "scattered"}
+            assert p["date"] == "2026-07-17"
 
 
 class TestFloorPivots:

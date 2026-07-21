@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from . import clock
@@ -34,7 +34,7 @@ from .config import (
     QUOTE_WIDE_SPREAD_PCT,
 )
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
-from .rest import fetch_bars_window, fetch_corporate_actions
+from .rest import fetch_bars_window, fetch_corporate_actions, fetch_news_window
 from .state import ALERTABLE_FIELDS, alert_triggered, format_alert, normalize_alert, rvol_pace
 from .tactics import (
     TACTIC_CONDITION_FIELDS,
@@ -992,6 +992,44 @@ _TOOL_ANALYZE_VOLUME_PROFILE = {
     },
 }
 
+_TOOL_ANALYZE_VOLUME_PROFILE_2 = {
+    "type": "function",
+    "function": {
+        "name": "analyze_volume_profile_2",
+        "description": (
+            "Recent support/resistance from one session's minute-by-minute volume "
+            "(yfinance consolidated tape). Finds intraday volume spikes -- local "
+            "surges past the opening warm-up -- and classifies each by how price "
+            "momentum shifted across it: up-into-flat/down is a SUPPLY line "
+            "(distribution/resistance), down-into-flat/up is a DEMAND line "
+            "(accumulation/support), a catalyst printing near it flags it news-driven, "
+            "else unsure. Then rebuilds a volume-by-price histogram with the spike "
+            "volume removed to surface SCATTERED levels (size built up gradually, not "
+            "in one burst). Any levels that formed before the most recent news-driven "
+            "spike are dropped as stale. Returns the surviving peaks "
+            "[{price, time, date, rel_vol, vol, type}] plus nearest support/resistance."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bins": {
+                    "type": "integer",
+                    "description": "Price slices for the scattered-level histogram (default 24, max 60).",
+                },
+                "date": {
+                    "type": "string",
+                    "description": (
+                        "Optional trading day to analyze, as 'YYYY-MM-DD'. Omit for today's "
+                        "live session. A prior date pulls that day's 1-min bars and news from "
+                        "history; must be an actual trading day within roughly the last 60 days."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
 _TOOL_GET_FLOOR_PIVOTS = {
     "type": "function",
     "function": {
@@ -1661,6 +1699,7 @@ for _tool in (
     _TOOL_GET_KEY_LEVELS,
     _TOOL_ANALYZE_SWING_LEVELS,
     _TOOL_ANALYZE_VOLUME_PROFILE,
+    _TOOL_ANALYZE_VOLUME_PROFILE_2,
     _TOOL_GET_FLOOR_PIVOTS,
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_NEWS,
@@ -2130,6 +2169,68 @@ def _tool_analyze_volume_profile(state: "SymbolState", bins: object = None, date
     return ta.volume_profile_levels(bars, bins=n, spot=spot)
 
 
+def _news_times_for_date(state: "SymbolState", session_date) -> list[str]:
+    """ISO timestamps of `symbol`'s news for one ET session, for the spike
+    news-driven classification. Today's session reads the already-loaded live
+    news; a prior session is recovered with a dated Alpaca news query. Best
+    effort -- any failure just yields no timestamps (spikes fall back to
+    supply/demand/unsure)."""
+    today_et = clock.now().astimezone(market_hours.MARKET_TZ).date()
+    if session_date >= today_et:
+        with state.lock:
+            return [str(item.get("created_at")) for item in state.news if item.get("created_at")]
+    if not (state.api_key and state.api_secret):
+        return []
+    start = datetime.combine(session_date, dt_time(0, 0), tzinfo=market_hours.MARKET_TZ)
+    end = start + timedelta(days=1)
+    try:
+        articles = fetch_news_window(state.symbol, start, end, state.api_key, state.api_secret)
+    except Exception:
+        return []
+    return [str(item.get("created_at")) for item in articles if item.get("created_at")]
+
+
+def _tool_analyze_volume_profile_2(state: "SymbolState", bins: object = None, date: object = None) -> dict:
+    n = max(8, min(int(bins or 24), 60))
+    day = str(date or "").strip()
+    with state.lock:
+        spot = state.last_price
+    if day:
+        # A prior session: minute bars for that ET day from yfinance (same
+        # consolidated-tape source as today's live volume).
+        try:
+            bars = historical.fetch_intraday_bars_for_date(state.symbol, day)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception:
+            return {"note": f"could not fetch intraday bars for {day}"}
+        if not bars:
+            return {"note": f"no intraday bars for {day} (non-trading day, or outside yfinance's ~60-day window)"}
+        try:
+            session_date = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError as exc:
+            return {"error": str(exc)}
+    else:
+        # Today's live session: consolidated-tape 1-min bars from yfinance so
+        # the volume series is accurate, not Alpaca's single-venue IEX feed.
+        bars = historical.fetch_intraday_volume_bars(state.symbol)
+        if not bars:
+            with state.lock:
+                bars = list(state.bars)
+        if not bars:
+            return {"note": "no intraday bars available yet"}
+        session_date = clock.now().astimezone(market_hours.MARKET_TZ).date()
+
+    news_times = _news_times_for_date(state, session_date)
+    return ta.analyze_volume_profile_2(
+        bars,
+        news_times=news_times,
+        date=day or None,
+        spot=spot,
+        price_bins=n,
+    )
+
+
 def _tool_get_floor_pivots(state: "SymbolState") -> dict:
     with state.lock:
         spot = state.last_price
@@ -2439,6 +2540,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_key_levels": _per_symbol(_tool_get_key_levels),
     "analyze_swing_levels": _per_symbol(_tool_analyze_swing_levels, "swing"),
     "analyze_volume_profile": _per_symbol(_tool_analyze_volume_profile, "bins", "date"),
+    "analyze_volume_profile_2": _per_symbol(_tool_analyze_volume_profile_2, "bins", "date"),
     "get_floor_pivots": _per_symbol(_tool_get_floor_pivots),
     "breakout_trade_geometry": lambda args, app, tracker: _tool_breakout_trade_geometry(
         args.get("entry"),

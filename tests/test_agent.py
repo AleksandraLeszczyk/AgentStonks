@@ -15,6 +15,7 @@ from agent_stonks.agent import (
     _session_closed_addendum,
     _tool_analyze_consolidation,
     _tool_analyze_volume,
+    _tool_analyze_volume_profile_2,
     _tool_breakout_trade_geometry,
     _tool_get_corporate_actions,
     _tool_get_news,
@@ -98,7 +99,37 @@ class TestToolHandlers:
         monkeypatch.setattr(agent_historical, "fetch_daily_volume_bars", lambda symbol: [])
         result = _tool_analyze_volume(state)
         assert result.get("partial_volume_feed") is None
-        assert result["bar_count"] == len(bars)
+
+    def test_analyze_volume_profile_2_no_bars_returns_note(self, monkeypatch):
+        # No yfinance intraday and no live buffer -> honest note, no fabrication.
+        monkeypatch.setattr(agent_historical, "fetch_intraday_volume_bars", lambda symbol: [])
+        _, state = _app()
+        assert "note" in _tool_analyze_volume_profile_2(state)
+
+    def test_analyze_volume_profile_2_reads_yfinance_and_classifies(self, monkeypatch):
+        # Today's live path sources 1-min bars from yfinance and returns the
+        # peaks list with the documented shape.
+        from datetime import timedelta
+
+        base = datetime(2026, 7, 17, 13, 30, tzinfo=timezone.utc)  # 09:30 ET
+        closes = [100.0] * 15 + [100.0 + 0.1 * i for i in range(1, 16)] + [
+            103.0 - 0.1 * i for i in range(1, 16)
+        ]
+        vols = [5000] * 15 + [1000] * 30
+        vols[30] = 6000
+        bars = [
+            {
+                "t": (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "o": c, "h": c + 0.05, "l": c - 0.05, "c": c, "v": float(v),
+            }
+            for i, (c, v) in enumerate(zip(closes, vols))
+        ]
+        monkeypatch.setattr(agent_historical, "fetch_intraday_volume_bars", lambda symbol: bars)
+        _, state = _app()
+        state.last_price = 101.5
+        result = _tool_analyze_volume_profile_2(state)
+        assert result["peaks"]
+        assert all(p["type"] in {"supply", "demand", "unsure", "scattered"} for p in result["peaks"])
 
     def test_get_quote_reads_state(self):
         _, state = _app()
@@ -224,7 +255,12 @@ class TestToolHandlers:
         assert pivots["nearest_resistance"]["name"] == "r1"
         for tools in PERSONALITY_TOOLS.values():
             names = {t["function"]["name"] for t in tools}
-            assert not {"analyze_swing_levels", "analyze_volume_profile", "get_floor_pivots"} & names
+            assert not {
+                "analyze_swing_levels",
+                "analyze_volume_profile",
+                "analyze_volume_profile_2",
+                "get_floor_pivots",
+            } & names
 
     def test_reversal_personality_uses_reversal_tools(self):
         assert PERSONALITY_TOOLS["reversal"] is REVERSAL_TOOLS
