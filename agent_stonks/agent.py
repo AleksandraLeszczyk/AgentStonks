@@ -970,7 +970,18 @@ _TOOL_ANALYZE_VOLUME_PROFILE = {
                 "bins": {
                     "type": "integer",
                     "description": "Number of price slices in the profile (default 24, max 60).",
-                }
+                },
+                "date": {
+                    "type": "string",
+                    "description": (
+                        "Optional trading day to profile, as 'YYYY-MM-DD'. Omit for today's live "
+                        "intraday bars. Pass a prior trading date (e.g. the previous session) to "
+                        "build the profile from that day's intraday bars instead -- useful for "
+                        "comparing today's price against yesterday's POC and value area. Must be an "
+                        "actual trading day within roughly the last 60 days; weekends/holidays "
+                        "return no data."
+                    ),
+                },
             },
             "required": [],
         },
@@ -1990,8 +2001,26 @@ def _tool_analyze_swing_levels(state: "SymbolState", swing: object = None) -> di
     return ta.swing_levels(bars, swing=k, spot=spot)
 
 
-def _tool_analyze_volume_profile(state: "SymbolState", bins: object = None) -> dict:
+def _tool_analyze_volume_profile(state: "SymbolState", bins: object = None, date: object = None) -> dict:
     n = max(8, min(int(bins or 24), 60))
+    day = str(date or "").strip()
+    if day:
+        # A prior session: pull that day's intraday bars from yfinance rather than
+        # today's live buffer. spot stays the live price so the profile still
+        # reports where the current price sits relative to the old day's levels.
+        try:
+            bars = historical.fetch_intraday_bars_for_date(state.symbol, day)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception:
+            return {"note": f"could not fetch intraday bars for {day}"}
+        if not bars:
+            return {"note": f"no intraday bars for {day} (non-trading day, or outside yfinance's ~60-day window)"}
+        with state.lock:
+            spot = state.last_price
+        result = ta.volume_profile_levels(bars, bins=n, spot=spot)
+        result["date"] = day
+        return result
     with state.lock:
         bars = list(state.bars)
         spot = state.last_price
@@ -2308,7 +2337,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_consolidation": _per_symbol(_tool_analyze_consolidation, "base_bars"),
     "get_key_levels": _per_symbol(_tool_get_key_levels),
     "analyze_swing_levels": _per_symbol(_tool_analyze_swing_levels, "swing"),
-    "analyze_volume_profile": _per_symbol(_tool_analyze_volume_profile, "bins"),
+    "analyze_volume_profile": _per_symbol(_tool_analyze_volume_profile, "bins", "date"),
     "get_floor_pivots": _per_symbol(_tool_get_floor_pivots),
     "breakout_trade_geometry": lambda args, app, tracker: _tool_breakout_trade_geometry(
         args.get("entry"),

@@ -99,6 +99,60 @@ def fetch_intraday_bars(symbol: str, interval: str = "1m") -> list[dict]:
     ]
 
 
+def fetch_intraday_bars_for_date(symbol: str, date: str, interval: str = "1m") -> list[dict]:
+    """Intraday bars for a single past trading day (`date`, "YYYY-MM-DD") from
+    yfinance. Used to build a volume-by-price profile of a prior session.
+
+    yfinance only serves intraday history for roughly the last 60 days, and a
+    non-trading day (weekend/holiday) returns no rows. Bars share the same
+    {"t","o","h","l","c","v"} shape (UTC ISO timestamps) as fetch_intraday_bars,
+    so callers don't branch on the source. Returns [] when the day has no data.
+    """
+    try:
+        start = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"date must be 'YYYY-MM-DD', got {date!r}") from exc
+    end = start + timedelta(days=1)
+    try:
+        df = yf.download(
+            symbol,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+        )
+    except Exception as exc:
+        log_fetch_failure("intraday bars (date)", [("yfinance", exc)], symbol=symbol)
+        raise
+    if df.empty:
+        log_fetch("intraday bars (date)", "yfinance (delayed)", symbol=symbol, detail=f"0 bars for {date}")
+        return []
+    log_fetch(
+        "intraday bars (date)",
+        "yfinance (delayed)",
+        symbol=symbol,
+        detail=f"{len(df)} {interval} bars for {date}",
+    )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize("America/New_York")
+    idx = idx.tz_convert("UTC")
+    return [
+        {
+            "t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "o": float(row.Open),
+            "h": float(row.High),
+            "l": float(row.Low),
+            "c": float(row.Close),
+            "v": float(row.Volume),
+        }
+        for ts, row in zip(idx, df.itertuples(index=False))
+    ]
+
+
 # Consolidated-tape volume (yfinance) is identical for every caller within a
 # short window and each read is a full intraday/daily download, so cache briefly
 # to avoid re-hitting yfinance on every analyze_volume tool call. Keyed by
