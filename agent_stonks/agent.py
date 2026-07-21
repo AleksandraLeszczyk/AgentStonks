@@ -189,7 +189,7 @@ Whichever of these caps your upside goes into breakout_trade_geometry's \
 `overhead_resistance`, exactly as with get_key_levels.
 """
 # Uncomment to enable the advanced level guidance (with the MOMENTUM_TOOLS entries):
-MOMENTUM_SYSTEM_PROMPT = MOMENTUM_SYSTEM_PROMPT + MOMENTUM_ADVANCED_LEVELS_ADDENDUM
+# MOMENTUM_SYSTEM_PROMPT = MOMENTUM_SYSTEM_PROMPT + MOMENTUM_ADVANCED_LEVELS_ADDENDUM
 
 BREAKOUT_SYSTEM_PROMPT = """\
 You are an autonomous breakout-trading agent for a basket of equity tickers, \
@@ -1690,9 +1690,9 @@ MOMENTUM_TOOLS: list[dict] = [
     # implemented and dispatch-wired, disabled here. To enable, uncomment the
     # three lines below AND the MOMENTUM_SYSTEM_PROMPT reassignment under
     # MOMENTUM_ADVANCED_LEVELS_ADDENDUM near the top of this file.
-    _TOOL_ANALYZE_SWING_LEVELS,
-    _TOOL_ANALYZE_VOLUME_PROFILE,
-    _TOOL_GET_FLOOR_PIVOTS,
+    # _TOOL_ANALYZE_SWING_LEVELS,
+    # _TOOL_ANALYZE_VOLUME_PROFILE,
+    # _TOOL_GET_FLOOR_PIVOTS,
     _TOOL_GET_NEWS,
     _TOOL_GET_POSITION,
     _TOOL_SET_TACTICS,
