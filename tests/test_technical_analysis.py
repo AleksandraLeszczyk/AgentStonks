@@ -21,6 +21,7 @@ from agent_stonks.technical_analysis import (
     get_put_call_walls_and_gamma,
     key_levels,
     obv_trend,
+    piecewise_regimes,
     rsi,
     session_time_window,
     smart_money_trade_geometry,
@@ -139,6 +140,71 @@ class TestAnalyzeIntraday:
         bars = _make_bars(closes, vwaps=[99.0] * 10)
         result = analyze_intraday(bars)
         assert "above" in result["vwap_position"]
+
+    def test_yesterday_momentum_block_from_prev_session(self):
+        today = _make_bars([100.0 + i for i in range(20)])
+        yesterday = _make_bars([120.0 - i for i in range(20)])  # down day
+        result = analyze_intraday(today, prev_session_bars=yesterday)
+        block = result["yesterday_momentum"]
+        assert block is not None
+        assert block["pct_change"] < 0
+        assert "downtrend" in block["momentum_pattern"]
+
+    def test_today_total_momentum_uses_full_session_not_window(self):
+        # Recent window is a fade off the highs, but the full session is a big up day.
+        full = _make_bars([100.0 + i for i in range(30)] + [130.0 - i * 0.2 for i in range(10)])
+        window = full[-10:]
+        result = analyze_intraday(window, full_session_bars=full)
+        assert result["today_total_momentum"]["pct_change"] > 0
+        assert result["today_total_momentum"]["bars"] == len(full)
+
+    def test_current_momentum_duration_reports_last_leg(self):
+        # A clean down leg followed by a clean up leg: current leg should be up.
+        closes = [120.0 - i for i in range(20)] + [100.0 + i for i in range(20)]
+        bars = _make_bars(closes)
+        result = analyze_intraday(bars, full_session_bars=bars)
+        leg = result["current_momentum_duration"]
+        assert leg is not None
+        assert leg["direction"] == "up"
+        assert leg["bars"] >= 3
+        assert leg["regimes_in_session"] >= 2
+
+    def test_market_neutral_strips_beta_scaled_market_move(self):
+        # Ticker up 2% over the window; market up 2% with beta 1.0 -> ~0 residual.
+        closes = [100.0 * (1 + 0.02 * i / 19) for i in range(20)]
+        bars = _make_bars(closes)
+        result = analyze_intraday(bars, market_return_pct=2.0, beta=1.0)
+        mn = result["market_neutral_momentum"]
+        assert mn is not None
+        assert mn["beta"] == 1.0
+        assert abs(mn["residual_pct"]) < 0.2
+        assert mn["market_component_pct"] == 2.0
+
+    def test_market_neutral_absent_without_inputs(self):
+        bars = _make_bars([100.0 + i for i in range(20)])
+        result = analyze_intraday(bars)
+        assert result["market_neutral_momentum"] is None
+
+
+class TestPiecewiseRegimes:
+    def test_single_straight_line_is_one_regime(self):
+        closes = pd.Series([100.0 + i for i in range(30)])
+        regimes = piecewise_regimes(closes)
+        assert len(regimes) == 1
+        assert regimes[0]["direction"] == "up"
+        assert regimes[0]["bars"] == 30
+
+    def test_v_shape_splits_into_down_then_up(self):
+        closes = pd.Series([120.0 - i for i in range(20)] + [100.0 + i for i in range(20)])
+        regimes = piecewise_regimes(closes)
+        assert len(regimes) >= 2
+        assert regimes[0]["direction"] == "down"
+        assert regimes[-1]["direction"] == "up"
+
+    def test_flat_series_is_flat_direction(self):
+        closes = pd.Series([100.0] * 30)
+        regimes = piecewise_regimes(closes)
+        assert all(r["direction"] == "flat" for r in regimes)
 
 
 class TestAnalyzeMarket:

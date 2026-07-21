@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, time as _dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from . import clock
@@ -225,8 +226,157 @@ def analyze_trend(bars: list[dict]) -> dict:
     }
 
 
-def analyze_intraday(bars: list[dict]) -> dict:
-    """Short-term price-action read for intraday bars: momentum, position vs VWAP, volatility."""
+def _hl_momentum_pattern(bars: list[dict]) -> str:
+    """Classify a run of bars as higher-highs/higher-lows (uptrend), lower-highs/
+    lower-lows (downtrend), or choppy, by comparing the most recent swing window
+    against the one before it. This is the same read for any session -- today's
+    window, yesterday's, or a full day -- so it lives as a shared helper."""
+    if len(bars) < 4:
+        return "not enough bars to classify high/low pattern"
+    swing = min(10, len(bars) // 2)
+    recent_highs = [b["h"] for b in bars[-swing:]]
+    recent_lows = [b["l"] for b in bars[-swing:]]
+    prior_highs = [b["h"] for b in bars[-2 * swing : -swing]] if len(bars) >= 2 * swing else []
+    prior_lows = [b["l"] for b in bars[-2 * swing : -swing]] if len(bars) >= 2 * swing else []
+    if not (prior_highs and prior_lows):
+        return "not enough bars to classify high/low pattern"
+    higher_highs = max(recent_highs) > max(prior_highs)
+    higher_lows = min(recent_lows) > min(prior_lows)
+    lower_highs = max(recent_highs) < max(prior_highs)
+    lower_lows = min(recent_lows) < min(prior_lows)
+    if higher_highs and higher_lows:
+        return "making higher highs and higher lows (uptrend)"
+    if lower_highs and lower_lows:
+        return "making lower highs and lower lows (downtrend)"
+    return "choppy / no consistent higher-high or lower-low pattern"
+
+
+def _session_momentum_block(bars: "list[dict] | None") -> "dict | None":
+    """Compact momentum read over a whole session (or any bar run): net move
+    open->close plus the higher-high/lower-low pattern. Returns None when there
+    aren't enough bars to say anything."""
+    if not bars or len(bars) < 2:
+        return None
+    closes = _closes(bars)
+    start = float(closes.iloc[0])
+    end = float(closes.iloc[-1])
+    pct = (end / start - 1) * 100 if start else 0.0
+    return {
+        "pct_change": round(pct, 2),
+        "momentum_pattern": _hl_momentum_pattern(bars),
+        "bars": len(bars),
+    }
+
+
+def _segment_sse(y: np.ndarray, a: int, b: int) -> float:
+    """Sum of squared residuals of the least-squares line fit to y[a:b+1]."""
+    if b - a < 2:
+        return 0.0
+    xs = np.arange(a, b + 1, dtype=float)
+    ys = y[a : b + 1]
+    coeffs = np.polyfit(xs, ys, 1)
+    resid = ys - np.polyval(coeffs, xs)
+    return float(np.dot(resid, resid))
+
+
+def piecewise_regimes(
+    closes: pd.Series,
+    tol_pct: float = 0.15,
+    flat_pct: float = 0.08,
+) -> list[dict]:
+    """Segment a close-price series into consecutive momentum regimes with
+    bottom-up piecewise-linear regression.
+
+    Starting from the finest partition, adjacent segments are greedily merged as
+    long as the merged segment's per-bar RMSE stays under `tol_pct`% of price --
+    so a straight run of bars collapses into one leg and a genuine turn stays a
+    boundary. Each regime carries its slope, net % move, and an up/down/flat
+    direction (flat when the leg's total move is under `flat_pct`% of price).
+    Returned oldest-first; the last entry is the leg in force right now.
+    """
+    y = np.asarray(closes, dtype=float)
+    n = len(y)
+    if n < 3:
+        return []
+
+    price_scale = float(np.median(np.abs(y))) or 1.0
+    tol = tol_pct / 100.0 * price_scale  # RMSE ceiling, in price units
+
+    # Finest partition: contiguous 2-bar segments as [start, end] index pairs.
+    segs: list[list[int]] = [[i, min(i + 1, n - 1)] for i in range(0, n - 1, 2)]
+    if segs[-1][1] < n - 1:
+        segs[-1][1] = n - 1
+
+    while len(segs) > 1:
+        best_j = 0
+        best_rmse = float("inf")
+        for j in range(len(segs) - 1):
+            a, b = segs[j][0], segs[j + 1][1]
+            rmse = (_segment_sse(y, a, b) / (b - a + 1)) ** 0.5
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_j = j
+        if best_rmse > tol:
+            break
+        segs[best_j] = [segs[best_j][0], segs[best_j + 1][1]]
+        del segs[best_j + 1]
+
+    flat_move = flat_pct / 100.0 * price_scale
+    regimes: list[dict] = []
+    for a, b in segs:
+        xs = np.arange(a, b + 1, dtype=float)
+        slope = float(np.polyfit(xs, y[a : b + 1], 1)[0]) if b > a else 0.0
+        net = float(y[b] - y[a])
+        if abs(net) < flat_move:
+            direction = "flat"
+        elif net > 0:
+            direction = "up"
+        else:
+            direction = "down"
+        base = float(y[a])
+        regimes.append(
+            {
+                "start_index": a,
+                "end_index": b,
+                "bars": b - a + 1,
+                "direction": direction,
+                "slope_per_bar": round(slope, 6),
+                "pct_move": round((net / base) * 100, 2) if base else 0.0,
+            }
+        )
+    return regimes
+
+
+def _bar_time(bar: dict) -> "datetime | None":
+    ts = bar.get("t")
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def analyze_intraday(
+    bars: list[dict],
+    *,
+    prev_session_bars: "list[dict] | None" = None,
+    full_session_bars: "list[dict] | None" = None,
+    market_return_pct: "float | None" = None,
+    beta: "float | None" = None,
+    beta_window_days: "int | None" = None,
+) -> dict:
+    """Short-term price-action read for intraday bars: momentum, position vs VWAP, volatility.
+
+    Optional context enriches the read:
+      * `prev_session_bars` -- yesterday's intraday bars, for yesterday's momentum.
+      * `full_session_bars` -- today's complete session (the `bars` argument may be
+        only a recent slice), for today's total momentum and for anchoring the
+        piecewise regime detection that measures how long the current leg has run.
+      * `market_return_pct` + `beta` -- the market's (SPY) % move over the same
+        recent window and the ticker's long-term beta to it, used to strip the
+        broad-market component out and report the idiosyncratic momentum.
+    """
     if len(bars) < 5:
         return {"note": "not enough bars for intraday analysis"}
 
@@ -235,25 +385,7 @@ def analyze_intraday(bars: list[dict]) -> dict:
     session_start = float(closes.iloc[0])
     pct_change = (price / session_start - 1) * 100 if session_start else 0.0
 
-    swing = min(10, len(bars) // 2)
-    recent_highs = [b["h"] for b in bars[-swing:]]
-    recent_lows = [b["l"] for b in bars[-swing:]]
-    prior_highs = [b["h"] for b in bars[-2 * swing : -swing]] if len(bars) >= 2 * swing else []
-    prior_lows = [b["l"] for b in bars[-2 * swing : -swing]] if len(bars) >= 2 * swing else []
-
-    if prior_highs and prior_lows:
-        higher_highs = max(recent_highs) > max(prior_highs)
-        higher_lows = min(recent_lows) > min(prior_lows)
-        lower_highs = max(recent_highs) < max(prior_highs)
-        lower_lows = min(recent_lows) < min(prior_lows)
-        if higher_highs and higher_lows:
-            momentum = "making higher highs and higher lows (uptrend)"
-        elif lower_highs and lower_lows:
-            momentum = "making lower highs and lower lows (downtrend)"
-        else:
-            momentum = "choppy / no consistent higher-high or lower-low pattern"
-    else:
-        momentum = "not enough bars to classify high/low pattern"
+    momentum = _hl_momentum_pattern(bars)
 
     vwap_note = None
     if "vw" in bars[-1] and bars[-1]["vw"]:
@@ -264,6 +396,60 @@ def analyze_intraday(bars: list[dict]) -> dict:
     atr_value = atr(bars, period=min(14, len(bars) - 1))
     volatility_pct = (atr_value / price * 100) if (atr_value is not None and price) else None
 
+    # Yesterday's momentum: the same higher-high/lower-low read over the prior
+    # session, so the agent can tell whether today continues or reverses it.
+    yesterday_block = _session_momentum_block(prev_session_bars)
+
+    # Today's total momentum: measured over the full session, not just the
+    # recent `bars` window, so a fade off the highs doesn't hide a big up day.
+    session_bars = full_session_bars if (full_session_bars and len(full_session_bars) >= 2) else bars
+    today_block = _session_momentum_block(session_bars)
+
+    # How long the current momentum has lasted: piecewise-linear regime
+    # detection over the session, reporting the leg in force right now.
+    current_leg = None
+    regimes = piecewise_regimes(_closes(session_bars)) if len(session_bars) >= 3 else []
+    if regimes:
+        leg = regimes[-1]
+        current_leg = {
+            "direction": leg["direction"],
+            "bars": leg["bars"],
+            "pct_move": leg["pct_move"],
+            "slope_per_bar": leg["slope_per_bar"],
+            "regimes_in_session": len(regimes),
+        }
+        start_t = _bar_time(session_bars[leg["start_index"]])
+        end_t = _bar_time(session_bars[leg["end_index"]])
+        if start_t and end_t:
+            current_leg["duration_minutes"] = round((end_t - start_t).total_seconds() / 60.0, 1)
+            current_leg["started_at"] = start_t.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET")
+
+    # Market-neutral momentum: strip the broad market's move (beta-scaled) out of
+    # this ticker's move so what's left is the stock's own, idiosyncratic push.
+    market_neutral = None
+    if market_return_pct is not None and beta is not None:
+        residual = pct_change - beta * market_return_pct
+        market_component = beta * market_return_pct
+        if abs(residual) < 0.02:
+            mn_dir = "flat"
+        elif residual > 0:
+            mn_dir = "up"
+        else:
+            mn_dir = "down"
+        market_neutral = {
+            "residual_pct": round(residual, 3),
+            "direction": mn_dir,
+            "beta": round(beta, 3),
+            "market_return_pct": round(market_return_pct, 3),
+            "market_component_pct": round(market_component, 3),
+            "beta_window_days": beta_window_days,
+            "note": (
+                "Momentum with the broad-market move removed: this ticker moved "
+                f"{pct_change:+.2f}% while beta*market accounts for "
+                f"{market_component:+.2f}%, leaving {residual:+.2f}% idiosyncratic."
+            ),
+        }
+
     summary_parts = [
         f"Price {pct_change:+.2f}% since the start of this window, {momentum}.",
     ]
@@ -271,6 +457,23 @@ def analyze_intraday(bars: list[dict]) -> dict:
         summary_parts.append(vwap_note.capitalize() + ".")
     if volatility_pct is not None:
         summary_parts.append(f"ATR-based volatility ~{volatility_pct:.2f}% of price.")
+    if today_block:
+        summary_parts.append(f"Today total {today_block['pct_change']:+.2f}%.")
+    if yesterday_block:
+        summary_parts.append(f"Yesterday {yesterday_block['pct_change']:+.2f}%.")
+    if current_leg:
+        dur = (
+            f"{current_leg['duration_minutes']:.0f}m"
+            if "duration_minutes" in current_leg
+            else f"{current_leg['bars']} bars"
+        )
+        summary_parts.append(
+            f"Current {current_leg['direction']} leg has run {dur} ({current_leg['pct_move']:+.2f}%)."
+        )
+    if market_neutral:
+        summary_parts.append(
+            f"Market-neutral (beta {market_neutral['beta']}): {market_neutral['residual_pct']:+.2f}%."
+        )
 
     return {
         "pct_change_in_window": round(pct_change, 2),
@@ -278,6 +481,10 @@ def analyze_intraday(bars: list[dict]) -> dict:
         "vwap_position": vwap_note,
         "atr": atr_value,
         "volatility_pct_of_price": round(volatility_pct, 2) if volatility_pct is not None else None,
+        "yesterday_momentum": yesterday_block,
+        "today_total_momentum": today_block,
+        "current_momentum_duration": current_leg,
+        "market_neutral_momentum": market_neutral,
         "summary": " ".join(summary_parts),
     }
 

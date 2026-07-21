@@ -251,6 +251,45 @@ def fetch_market_indicators(days: int = 365, ttl_sec: int = 300) -> dict:
     return data
 
 
+_beta_cache: dict[str, dict] = {}
+
+
+def fetch_market_beta(symbol: str, days: int = 180, ttl_sec: int = 3600) -> "dict | None":
+    """Long-term beta of `symbol` to the broad market (SPY) from daily returns.
+
+    Beta is the slope of the ticker's daily returns regressed on SPY's over the
+    trailing `days` -- the standard "how much of this name's move is just the
+    market" coefficient. It anchors the market-neutral momentum read, which
+    subtracts beta*market from the ticker's move to isolate its own push. Changes
+    slowly, so results are cached per symbol for `ttl_sec`. Returns None when
+    there isn't enough overlapping history to estimate it.
+    """
+    now = datetime.now(timezone.utc)
+    cached = _beta_cache.get(symbol)
+    if cached and (now - cached["ts"]).total_seconds() < ttl_sec:
+        return cached["value"]
+
+    value: "dict | None" = None
+    try:
+        sym_close = fetch_close_series(symbol, days)
+        mkt_close = fetch_close_series(SPY_SYMBOL, days)
+        sym_ret = sym_close.pct_change().dropna()
+        mkt_ret = mkt_close.pct_change().dropna()
+        joined = pd.concat([sym_ret, mkt_ret], axis=1, join="inner").dropna()
+        joined.columns = ["sym", "mkt"]
+        if len(joined) >= 20:
+            mkt_var = float(joined["mkt"].var())
+            if mkt_var > 0:
+                cov = float(joined["sym"].cov(joined["mkt"]))
+                value = {"beta": cov / mkt_var, "window_days": days, "obs": len(joined)}
+    except Exception as exc:
+        log_fetch_failure("market beta", [("yfinance", exc)], symbol=symbol)
+        value = None
+
+    _beta_cache[symbol] = {"ts": now, "value": value}
+    return value
+
+
 def fetch_dividends(symbol: str, days: int) -> pd.Series:
     """Fetch dividend payouts for `symbol` over the trailing `days`. Raises on failure."""
     try:

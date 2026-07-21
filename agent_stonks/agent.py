@@ -806,7 +806,11 @@ _TOOL_ANALYZE_INTRADAY_MOMENTUM = {
         "description": (
             "Analyze recent intraday price action for the ticker: momentum pattern "
             "(higher highs/lows vs lower highs/lows), position relative to session VWAP, "
-            "and ATR-based volatility. Returns labeled values plus a one-line summary."
+            "and ATR-based volatility. Also reports yesterday's momentum, today's total "
+            "momentum over the full session, how long the current momentum leg has lasted "
+            "(via piecewise-linear regime detection), and market-neutral momentum -- the "
+            "ticker's move with the beta-scaled broad-market (SPY) move removed. Returns "
+            "labeled values plus a one-line summary."
         ),
         "parameters": {
             "type": "object",
@@ -1839,13 +1843,110 @@ def _tool_get_quote(state: "SymbolState") -> dict:
     return result
 
 
+def _bar_dt(bar: dict) -> "datetime | None":
+    ts = bar.get("t")
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _bar_et_date(bar: dict):
+    dt = _bar_dt(bar)
+    return dt.astimezone(market_hours.MARKET_TZ).date() if dt else None
+
+
+def _fetch_prev_session_bars(symbol: str, today_et) -> "list[dict] | None":
+    """Yesterday's intraday session for `symbol`, recovered from yfinance when the
+    live buffer doesn't reach back that far. Walks back up to a week so weekends
+    and holidays resolve to the last actual trading day."""
+    for back in range(1, 6):
+        day = today_et - timedelta(days=back)
+        try:
+            prev = historical.fetch_intraday_bars_for_date(symbol, day.isoformat())
+        except Exception:
+            prev = []
+        if prev:
+            return prev
+    return None
+
+
+def _market_window_return(bars: list[dict]) -> "float | None":
+    """SPY's % move over the same clock window as `bars`, for beta-adjustment.
+
+    Aligns to the recent window by timestamp so the market move being removed is
+    contemporaneous with the ticker's; falls back to the same bar count when
+    timestamps are missing (e.g. synthetic bars)."""
+    try:
+        spy = historical.fetch_intraday_volume_bars(historical.SPY_SYMBOL)
+    except Exception:
+        spy = []
+    if not spy or len(spy) < 2:
+        return None
+    first_t, last_t = _bar_dt(bars[0]), _bar_dt(bars[-1])
+    window = spy
+    if first_t and last_t:
+        window = [b for b in spy if (bt := _bar_dt(b)) and first_t <= bt <= last_t]
+    if len(window) < 2:
+        window = spy[-len(bars):]
+    if len(window) < 2:
+        return None
+    start = float(window[0]["c"])
+    end = float(window[-1]["c"])
+    return (end / start - 1) * 100 if start else None
+
+
 def _tool_analyze_intraday_momentum(state: "SymbolState", limit: object = None) -> dict:
     n = max(1, min(int(limit or 50), 300))
     with state.lock:
-        bars = list(state.bars)[-n:]
-    if not bars:
+        all_bars = list(state.bars)
+    if not all_bars:
         return {"note": "no intraday bars available yet"}
-    return ta.analyze_intraday(bars)
+    bars = all_bars[-n:]
+
+    # Split the live buffer into today's and yesterday's ET sessions so the
+    # analysis can report today's total move and yesterday's momentum.
+    today_et = _bar_et_date(all_bars[-1])
+    full_session_bars = None
+    prev_session_bars = None
+    if today_et is not None:
+        full_session_bars = [b for b in all_bars if _bar_et_date(b) == today_et]
+        prior_dates = sorted(
+            {d for b in all_bars if (d := _bar_et_date(b)) is not None and d < today_et}
+        )
+        if prior_dates:
+            prev_et = prior_dates[-1]
+            prev_session_bars = [b for b in all_bars if _bar_et_date(b) == prev_et]
+        if not prev_session_bars:
+            prev_session_bars = _fetch_prev_session_bars(state.symbol, today_et)
+
+    # Market-neutral inputs: the ticker's long-term beta to SPY and SPY's move
+    # over the same recent window. Best-effort -- any fetch failure just omits
+    # the market-neutral block rather than failing the whole read.
+    market_return_pct = None
+    beta_val = None
+    beta_window = None
+    try:
+        beta_info = historical.fetch_market_beta(state.symbol)
+        if beta_info:
+            market_return_pct = _market_window_return(bars)
+            if market_return_pct is not None:
+                beta_val = beta_info["beta"]
+                beta_window = beta_info["window_days"]
+    except Exception:
+        market_return_pct = None
+        beta_val = None
+
+    return ta.analyze_intraday(
+        bars,
+        prev_session_bars=prev_session_bars,
+        full_session_bars=full_session_bars,
+        market_return_pct=market_return_pct,
+        beta=beta_val,
+        beta_window_days=beta_window,
+    )
 
 
 def _tool_analyze_daily_trend(state: "SymbolState", limit: object = None) -> dict:
