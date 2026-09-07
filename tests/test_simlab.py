@@ -1753,3 +1753,56 @@ class TestVolumeFetchPatches:
             # Last row is the sim day's partial; nothing beyond the sim day.
             assert daily[-1]["t"] == DAY.isoformat()
             assert all(row["t"] <= DAY.isoformat() for row in daily)
+
+
+class TestPriceChartSessions:
+    """The Results price chart across more than one day.
+
+    `_price_chart` is where the two session helpers are actually applied, so
+    these pin the wiring rather than the arithmetic (`tests/test_charts.py`
+    covers that).
+    """
+
+    def bars(self, days=("2024-01-15", "2024-01-16")):
+        out = []
+        for day in days:
+            idx = pd.date_range(
+                f"{day} 04:00", f"{day} 19:59", freq="1min", tz="America/New_York"
+            )
+            out += [
+                {"t": ts.tz_convert("UTC").isoformat(), "o": 100.0, "h": 100.5,
+                 "l": 99.5, "c": 100.0, "v": 1000.0}
+                for ts in idx
+            ]
+        return out
+
+    def test_the_night_between_two_days_is_removed_from_the_axis(self):
+        from simlab.app import _price_chart
+
+        fig = _price_chart("AAPL", self.bars(), [])
+        assert len(fig.layout.xaxis.rangebreaks) == 1
+
+    def test_session_boundaries_are_drawn(self):
+        from agent_stonks.charts import SESSION_MARKER_COLOR
+        from simlab.app import _price_chart
+
+        fig = _price_chart("AAPL", self.bars(), [])
+        marks = [
+            s for s in fig.layout.shapes if s.line.color == SESSION_MARKER_COLOR
+        ]
+        assert len(marks) == 4  # open + close, two days
+
+    def test_the_breaks_survive_the_shared_chart_layout(self):
+        """`_chart_layout` sets `xaxis=dict(gridcolor=...)` afterwards, which
+        merges rather than replaces -- pinned because a replace would silently
+        put the empty nights back."""
+        from simlab.app import _price_chart
+
+        fig = _price_chart("AAPL", self.bars(), [])
+        assert fig.layout.xaxis.gridcolor
+        assert fig.layout.xaxis.rangebreaks
+
+    def test_no_bars_is_still_a_figure(self):
+        from simlab.app import _price_chart
+
+        assert _price_chart("AAPL", [], []) is not None

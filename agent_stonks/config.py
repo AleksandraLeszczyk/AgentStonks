@@ -202,6 +202,11 @@ NEWS_IMPACT_COLORS: dict[str, str] = {
 # so the spacing looks right at any price scale.
 NEWS_MARKER_OFFSET_FRAC = 0.04
 
+# The day boundary on a chart covering more than one session: a rule at 09:30
+# and 16:00. Muted on purpose -- it is the frame the price is read inside, not
+# a signal competing with the candles.
+SESSION_MARKER_COLOR = "#5b6478"
+
 # Model-prediction overlays on the price chart (see model_overlays.py). One
 # color per overlay, so a level, its band and its label are recognisably the
 # same prediction; the momentum marks borrow the up/down palette because they

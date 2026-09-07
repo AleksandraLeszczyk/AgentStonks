@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
+from agent_stonks import charts
 from agent_stonks.charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
 
 
@@ -273,3 +274,121 @@ class TestFillIntradayGaps:
         dup = dict(self.GAPPY_BARS[1], t="2024-01-15T14:01:00+00:00", c=999.0)
         fig = build_chart(self.GAPPY_BARS + [dup], [], [], "AAPL", SESSION_START)
         assert isinstance(fig, go.Figure)
+
+
+class TestSessionRangebreaks:
+    """Collapsing the hours the exchange is shut, on a multi-day chart.
+
+    A run covering four days spends two thirds of its time axis on nights and
+    weekends, which a time axis draws as blank space. These pin that the right
+    stretches are removed -- and, just as importantly, that no real bar is.
+    """
+
+    def bars(self, days=("2024-01-15", "2024-01-16"), start="04:00", end="19:59"):
+        """Extended-hours minute bars (04:00-19:59 ET), the shape SimLab stores."""
+        out = []
+        for day in days:
+            idx = pd.date_range(
+                f"{day} {start}", f"{day} {end}", freq="1min", tz="America/New_York"
+            )
+            for i, ts in enumerate(idx):
+                out.append({
+                    "t": ts.tz_convert("UTC").isoformat(),
+                    "o": 100.0 + i * 0.001, "h": 100.5, "l": 99.5,
+                    "c": 100.0 + i * 0.001, "v": 1000.0,
+                })
+        return out
+
+    def test_one_break_per_night(self):
+        breaks = charts.session_rangebreaks(
+            self.bars(("2024-01-15", "2024-01-16", "2024-01-17"))
+        )
+        assert len(breaks) == 2
+
+    def test_the_break_is_in_utc_wall_clock_like_the_axis(self):
+        """Bar timestamps reach plotly as UTC, so the bounds have to be too.
+
+        Emitting exchange-local bounds hides the wrong eight hours -- in
+        January that would cut off the whole post-market instead of the night.
+        """
+        breaks = charts.session_rangebreaks(self.bars())
+        lo, hi = breaks[0]["bounds"]
+        # 19:59 ET + 1min = 20:00 EST = 01:00 UTC the next day; 04:00 EST = 09:00 UTC.
+        assert lo == "2024-01-16T01:00:00"
+        assert hi == "2024-01-16T09:00:00"
+
+    def test_no_real_bar_falls_inside_a_break(self):
+        bars = self.bars(("2024-01-15", "2024-01-16", "2024-01-17"))
+        stamps = pd.to_datetime([b["t"] for b in bars], utc=True).tz_localize(None)
+        for brk in charts.session_rangebreaks(bars):
+            lo, hi = (pd.Timestamp(b) for b in brk["bounds"])
+            assert not ((stamps >= lo) & (stamps < hi)).any()
+
+    def test_a_weekend_is_one_break_not_three(self):
+        # Friday to Monday: one gap between two consecutive bars.
+        breaks = charts.session_rangebreaks(self.bars(("2024-01-19", "2024-01-22")))
+        assert len(breaks) == 1
+        lo, hi = breaks[0]["bounds"]
+        assert pd.Timestamp(hi) - pd.Timestamp(lo) > pd.Timedelta(days=2)
+
+    def test_a_single_day_needs_no_breaks(self):
+        assert charts.session_rangebreaks(self.bars(("2024-01-15",))) == []
+
+    def test_an_intraday_hole_is_not_collapsed(self):
+        """A few minutes nobody traded is real elapsed time, not a closed
+        exchange; hiding it would make the axis lie about how long a move took."""
+        bars = self.bars(("2024-01-15",))
+        thinned = bars[:100] + bars[130:]
+        assert charts.session_rangebreaks(thinned) == []
+
+    def test_no_bars_is_no_breaks(self):
+        assert charts.session_rangebreaks([]) == []
+        assert charts.session_rangebreaks(BARS[:1]) == []
+
+
+class TestSessionMarkers:
+    def figure(self, bars):
+        fig = go.Figure(
+            go.Candlestick(
+                x=[b["t"] for b in bars], open=[b["o"] for b in bars],
+                high=[b["h"] for b in bars], low=[b["l"] for b in bars],
+                close=[b["c"] for b in bars],
+            )
+        )
+        charts.add_session_markers(fig, bars)
+        return fig
+
+    def marks(self, fig):
+        return sorted(
+            s.x0 for s in fig.layout.shapes
+            if s.line.color == charts.SESSION_MARKER_COLOR
+        )
+
+    def test_marks_the_regular_open_and_close_of_each_day(self):
+        bars = TestSessionRangebreaks().bars(("2024-01-15", "2024-01-16"))
+        marks = self.marks(self.figure(bars))
+        # 09:30 and 16:00 EST are 14:30 and 21:00 UTC.
+        assert marks == [
+            "2024-01-15T14:30:00", "2024-01-15T21:00:00",
+            "2024-01-16T14:30:00", "2024-01-16T21:00:00",
+        ]
+
+    def test_each_day_is_labelled_once_at_its_open(self):
+        bars = TestSessionRangebreaks().bars(("2024-01-15", "2024-01-16"))
+        fig = self.figure(bars)
+        labels = [a["text"].strip() for a in fig.layout.annotations]
+        assert labels == ["Mon 15 Jan", "Tue 16 Jan"]
+
+    def test_a_session_the_bars_never_reach_gets_no_marker(self):
+        """A run that stopped in the pre-market never saw an opening bell."""
+        bars = TestSessionRangebreaks().bars(("2024-01-15",), end="08:30")
+        assert self.marks(self.figure(bars)) == []
+
+    def test_a_session_that_ended_early_keeps_its_open_and_loses_its_close(self):
+        bars = TestSessionRangebreaks().bars(("2024-01-15",), end="11:00")
+        assert self.marks(self.figure(bars)) == ["2024-01-15T14:30:00"]
+
+    def test_no_bars_draws_nothing(self):
+        fig = go.Figure()
+        charts.add_session_markers(fig, [])
+        assert not fig.layout.shapes

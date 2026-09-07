@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from . import market_hours
 from .config import (
     AVG_LINE_COLORS,
     FIB_LEVELS,
@@ -16,6 +17,7 @@ from .config import (
     NEWS_IMPACT_COLORS,
     NEWS_MARKER_OFFSET_FRAC,
     PALETTE,
+    SESSION_MARKER_COLOR,
 )
 
 
@@ -726,6 +728,122 @@ def _bar_width_ms(df: pd.DataFrame) -> float:
         return 60_000
     delta_ms = float(df["t"].diff().dropna().dt.total_seconds().median() * 1000)
     return delta_ms * 0.8
+
+
+
+# --- multi-day sessions -----------------------------------------------------
+#
+# A chart covering more than one day has a problem a single-day one does not:
+# between 20:00 and 04:00 the exchange is shut, so there are no bars, and a
+# time axis draws that as blank space. Four nights of it and the tape is
+# squeezed into a few narrow columns of a mostly empty plot. These two helpers
+# are the fix -- one removes the empty stretches from the axis, the other puts
+# the day boundary back as something you can see, since once the gaps are gone
+# Monday's close butts straight up against Tuesday's pre-market.
+
+
+def _local_index(bars: list[dict]) -> pd.DatetimeIndex:
+    """Bar timestamps as an exchange-local, sorted, de-duplicated index."""
+    if not bars:
+        return pd.DatetimeIndex([])
+    idx = pd.to_datetime([b["t"] for b in bars], utc=True, format="mixed")
+    return pd.DatetimeIndex(idx.tz_convert(market_hours.MARKET_TZ)).unique().sort_values()
+
+
+def session_rangebreaks(bars: list[dict]) -> list[dict]:
+    """Axis rangebreaks hiding the time between one trading day and the next.
+
+    Returned as absolute `bounds` pairs computed from the bars themselves
+    rather than as a `pattern`: the pattern form would have to name the hours
+    the exchange is shut, and that is a claim about the data (which extended
+    hours a feed stores, whether a half-day closed at 13:00) that only the data
+    can answer. A weekend or a holiday needs no special case either -- it is
+    simply one longer gap between two consecutive bars.
+
+    Only gaps that cross an exchange-local **date** are broken. An intraday
+    hole is a symbol nobody traded for a few minutes, and collapsing those
+    would make the axis lie about how long a move took.
+
+    The bounds come back in **UTC** wall clock, because that is the frame the
+    axis is in: bar timestamps reach plotly as UTC ISO strings and it draws
+    them as such. The dates that decide *where* a gap is are exchange-local,
+    since that is what makes a session; the numbers that say *when* it is are
+    the axis's. Mixing the two hides the wrong eight hours.
+    """
+    idx = _local_index(bars)
+    if len(idx) < 2:
+        return []
+    step = pd.Series(idx).diff().median()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        step = pd.Timedelta(minutes=1)
+
+    breaks = []
+    dates = idx.date
+    for i in range(1, len(idx)):
+        if dates[i] == dates[i - 1]:
+            continue
+        # From just past the last bar of one day to the first of the next, so
+        # neither bar is clipped by its own break.
+        start = idx[i - 1] + step
+        if start >= idx[i]:
+            continue
+        breaks.append({"bounds": [_utc_wall(start), _utc_wall(idx[i])]})
+    return breaks
+
+
+def _utc_wall(ts: pd.Timestamp) -> str:
+    """A timestamp as the naive UTC wall clock the price axis is drawn in."""
+    return ts.tz_convert("UTC").tz_localize(None).isoformat()
+
+
+def add_session_markers(
+    fig: go.Figure,
+    bars: list[dict],
+    row: Optional[int] = None,
+    col: Optional[int] = None,
+    label: bool = True,
+) -> None:
+    """Vertical rules at each day's regular-session open and close.
+
+    With the overnight gaps removed the days run into each other, so this is
+    what puts the boundary back -- and it marks the boundary that matters,
+    09:30 and 16:00, rather than the first and last bar the feed happened to
+    carry. Extended-hours bars then read as what they are: the stretch outside
+    the rules.
+
+    A marker is drawn only when that day's bars actually reach it, so a
+    half-finished session (a run that stopped in the pre-market) is not given
+    an opening bell it never saw.
+    """
+    idx = _local_index(bars)
+    if not len(idx):
+        return
+
+    for day, times in pd.Series(idx).groupby(idx.date):
+        first, last = times.iloc[0], times.iloc[-1]
+        stamp = pd.Timestamp(day).tz_localize(market_hours.MARKET_TZ)
+        marks = (
+            (stamp + pd.Timedelta(hours=market_hours.MARKET_OPEN.hour,
+                                  minutes=market_hours.MARKET_OPEN.minute), "solid"),
+            (stamp + pd.Timedelta(hours=market_hours.MARKET_CLOSE.hour,
+                                  minutes=market_hours.MARKET_CLOSE.minute), "dot"),
+        )
+        for when, dash in marks:
+            if not first <= when <= last:
+                continue
+            fig.add_vline(
+                x=_utc_wall(when),
+                line=dict(color=SESSION_MARKER_COLOR, width=1, dash=dash),
+                row=row, col=col,
+            )
+            if label and dash == "solid":
+                fig.add_annotation(
+                    xref="x", yref="y domain",
+                    x=_utc_wall(when), y=1.0,
+                    text=f" {when:%a %d %b}",
+                    font=dict(color=SESSION_MARKER_COLOR, size=10, family="monospace"),
+                    showarrow=False, xanchor="left", yanchor="top",
+                )
 
 
 # --- model prediction overlays ----------------------------------------------

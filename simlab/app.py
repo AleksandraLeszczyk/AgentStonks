@@ -37,7 +37,12 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.apple_rules_ui import rules_panel, signal_catalogue
 from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
-from agent_stonks.charts import add_model_overlays, overlay_x_max
+from agent_stonks.charts import (
+    add_model_overlays,
+    add_session_markers,
+    overlay_x_max,
+    session_rangebreaks,
+)
 from agent_stonks.config import PALETTE
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
@@ -635,13 +640,19 @@ def _price_chart(
     decisions: list[dict],
     overlays: "list[dict] | None" = None,
 ) -> go.Figure:
-    """The replayed day's candles, the fills, and what the models predicted.
+    """The replayed day(s)' candles, the fills, and what the models predicted.
 
     `overlays` are `model_overlays.compute` items, drawn by the same renderer
     the live chart uses. There is no price-profile column here, so the
     predicted levels are drawn once instead of mirrored -- everything else is
     identical, which is the point of the items being data rather than plotly
     calls.
+
+    A run usually covers several days, and the exchange is shut for two thirds
+    of each one. Those stretches are removed from the time axis rather than
+    drawn as blank space (`charts.session_rangebreaks`), and the day boundary
+    they used to provide is put back as a rule at 09:30 and 16:00
+    (`charts.add_session_markers`).
     """
     fig = go.Figure()
     fig.add_trace(
@@ -672,6 +683,9 @@ def _price_chart(
                                 line=dict(width=1, color=PALETTE["text"])),
                 )
             )
+    if bars:
+        add_session_markers(fig, bars)
+        fig.update_xaxes(rangebreaks=session_rangebreaks(bars))
     if overlays and bars:
         x0, x1 = pd.Timestamp(bars[0]["t"]), pd.Timestamp(bars[-1]["t"])
         add_model_overlays(overlays, fig, x0, x1, row=None, col=None)
