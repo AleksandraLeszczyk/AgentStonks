@@ -67,9 +67,9 @@ SCORING_MIN_TOTAL_RUNTIME_SEC = 3600
 PREMARKET_LEAD_SEC = 120
 PREMARKET_WAIT_POLL_SEC = 30.0
 
-# Apple Trader: the rule-based (non-LLM) loop that watches every closed AAPL
-# minute bar for a momentum-regime change into positive and asks a saved model
-# about it (see agent_stonks.apple_trader).
+# Apple Trader: the rule-based (non-LLM) loop that watches every closed minute
+# bar of its configured symbol for a momentum-regime change into positive and
+# asks a saved model about it (see agent_stonks.apple_trader).
 #
 # ENTRY_MODE decides *when* it asks, and it is the setting that changes what the
 # agent does most:
@@ -88,9 +88,13 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # because the default entry mode is one only the forecaster can answer.
 # PROB_THRESHOLD is the probability a candidate has to clear to be bought; None
 # uses the cut-off the chosen model picked on its own validation block, which is
-# the intended setting because those cut-offs are not on a shared scale (0.07
-# for the classifier's posterior, 0.05 for N-BEATS' gated survival
-# probability).
+# the intended setting because those cut-offs are not on a shared scale -- and
+# since TimeToChange2 was re-run per ticker, not on a shared scale across
+# symbols either. On AAPL they are 0.07 (the classifier's posterior) and 0.05
+# (N-BEATS' gated survival probability); on GOOGL 0.43 and 0.41; on INTC 0.22
+# and 0.05. Each is picked on that symbol's own validation events, so a number
+# typed here means something different on each instrument, and None is the only
+# setting that means the same thing everywhere.
 #
 # There are two exits, and either one closes the position. TRAIL_PCT is the
 # price rule: sell once price is that far below the highest price seen since
@@ -103,8 +107,10 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # changes, so only a forecaster can be asked it.
 #
 # 0.30 is NOT a tuned number -- nothing in TimeToChange2 ever grid-searched an
-# exit -- but it is not a guess either. Over 428 positive-regime bars on five
-# AAPL sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) the reversal
+# exit -- but it is not a guess either. It was measured on **AAPL only**, and
+# nothing re-measured it when the forecaster was fitted for GOOGL and INTC, so
+# on those two it is a borrowed default rather than a placed one. Over 428
+# positive-regime bars on five AAPL sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) the reversal
 # probability separates bars within 3 of the end of a positive run from bars
 # with 8+ bars still to go at AUC 0.89, and the cut-off picks where on that
 # curve to sit:

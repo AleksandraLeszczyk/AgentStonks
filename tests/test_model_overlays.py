@@ -59,9 +59,18 @@ class TestCatalogue:
     def test_a_symbol_only_the_profile_model_covers_gets_only_that(self):
         assert mo.keys_for("MSFT") == [mo.PROFILE_RANGE_KEY]
 
-    def test_the_day_range_overlay_follows_its_models_tickers(self):
-        assert mo.OVERLAYS[mo.DAY_RANGE_KEY].covers("GOOGL")
-        assert not mo.OVERLAYS[mo.MOMENTUM_KEY].covers("GOOGL")
+    def test_each_overlay_follows_its_models_tickers(self):
+        """The catalogue reads `apple_models`, so re-running a notebook for a
+        new symbol widens the picker without a change here. Since TimeToChange2
+        was re-run per ticker (2026-09-07) the momentum overlay covers GOOGL
+        and INTC too; only a symbol nothing was fitted on is excluded."""
+        for key in (mo.DAY_RANGE_KEY, mo.MOMENTUM_KEY):
+            for symbol in ("AAPL", "GOOGL", "INTC"):
+                assert mo.OVERLAYS[key].covers(symbol), (key, symbol)
+            assert not mo.OVERLAYS[key].covers("MSFT")
+        # ...except the one model that claims to transfer, which covers every
+        # symbol because it was fitted without ticker dummies.
+        assert mo.OVERLAYS[mo.PROFILE_RANGE_KEY].covers("MSFT")
 
     def test_label_falls_back_to_the_key_for_an_unknown_overlay(self):
         assert mo.label("nope") == "nope"

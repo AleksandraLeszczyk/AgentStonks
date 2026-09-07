@@ -648,7 +648,7 @@ class TestRuleAgentEngine:
 
     def _run(self, monkeypatch, rule_config: dict, proba: float = 0.9):
         monkeypatch.setattr(
-            persistence_model, "load_bundle", lambda: self._bundle(proba)
+            persistence_model, "load_bundle", lambda *a, **k: self._bundle(proba)
         )
         rules = {**self.CONFIRM, **rule_config}
         market = SimMarket(["AAPL"], [DAY])
@@ -701,7 +701,7 @@ class TestRuleAgentEngine:
         assert result.config_summary["rule_config"] == {**self.CONFIRM, **rules}
 
     def test_a_dataset_without_the_ticker_fails_loudly(self, store, monkeypatch):
-        monkeypatch.setattr(persistence_model, "load_bundle", lambda: self._bundle())
+        monkeypatch.setattr(persistence_model, "load_bundle", lambda *a, **k: self._bundle())
         market = SimMarket(["TEST"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
@@ -711,7 +711,7 @@ class TestRuleAgentEngine:
         assert "only trades AAPL" in (result.error or "")
 
     def test_a_missing_model_fails_loudly(self, apple_store, monkeypatch):
-        monkeypatch.setattr(persistence_model, "load_bundle", lambda: None)
+        monkeypatch.setattr(persistence_model, "load_bundle", lambda *a, **k: None)
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
@@ -721,7 +721,7 @@ class TestRuleAgentEngine:
         # Names the file and the dependency: a run that simply never traded
         # would read like a strategy result rather than a setup problem.
         error = result.error or ""
-        assert "apple_momentum_2.joblib" in error
+        assert "timetochange2_persistence_AAPL.joblib" in error
         assert "scikit-learn" in error
 
     def test_anticipating_on_a_model_that_cannot_forecast_fails_loudly(
@@ -732,7 +732,7 @@ class TestRuleAgentEngine:
         `turn_proba` None on every bar -- which reads like a strategy that
         found nothing rather than a rule set that could never fire.
         """
-        monkeypatch.setattr(persistence_model, "load_bundle", lambda: self._bundle())
+        monkeypatch.setattr(persistence_model, "load_bundle", lambda *a, **k: self._bundle())
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
@@ -760,7 +760,7 @@ class TestRuleAgentEngine:
             rule_config={"model_key": "nbeats", "prob_threshold": 0.5},
         )
         result = SimulationEngine(market, config).run()
-        assert "timetochange2_nbeats.pt" in (result.error or "")
+        assert "timetochange2_nbeats_AAPL.pt" in (result.error or "")
 
     def test_the_model_leads_the_configuration_signature(self):
         """Results groups runs on this string, so two models are two
@@ -980,15 +980,19 @@ class TestDayRangeEngine:
         self, dayrange_store, monkeypatch
     ):
         """The pairing check reaches SimLab through the same `config_error`
-        the live loop uses, so a record naming one cannot be replayed."""
-        market = SimMarket(["GOOGL"], [DAY])
+        the live loop uses, so a record naming one cannot be replayed.
+
+        MSFT rather than GOOGL: since TimeToChange2 was re-run per ticker every
+        shipped model covers every shipped symbol, so an unmodelled symbol is
+        now the only pairing the registry refuses."""
+        market = SimMarket(["MSFT"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["GOOGL"], days=[DAY],
-            rule_config={"model_key": "nbeats", "ticker": "GOOGL"},
+            api_key="", symbols=["MSFT"], days=[DAY],
+            rule_config={"model_key": "nbeats", "ticker": "MSFT"},
         )
         error = SimulationEngine(market, config).run().error or ""
-        assert "cannot trade GOOGL" in error and "AAPL only" in error
+        assert "cannot trade MSFT" in error and "AAPL, GOOGL, INTC only" in error
 
     def test_the_dataset_is_checked_against_the_configured_symbol(
         self, dayrange_store, monkeypatch

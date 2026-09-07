@@ -326,58 +326,68 @@ class TestValidation:
 # case the tape-only half of the catalogue exists for.
 
 UNMODELLED = "MSFT"
-# A symbol TimeToChange2 was never fitted on. It has two models rather than
-# none -- the day-range forecast, which this agent has signals for, and the
-# delta-momentum regressor, which only Apple Trader runs -- so it is still the
-# case that not every catalogue entry is readable on it.
+# A symbol every notebook project has now been re-run for. It used to be the
+# narrowing case (TimeToChange2 was AAPL-only until 2026-09-07); since every
+# model covers every shipped symbol, `UNMODELLED` is the only narrowing the
+# shipped catalogue does, and the finer cases below stub the registry instead.
 DAYRANGE_ONLY = "GOOGL"
+
+ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
 
 
 class TestInstrument:
     def test_the_models_on_offer_follow_the_symbol(self):
-        assert apple_models.keys_for(TICKER) == [
-            "persistence", "nbeats", "dayrange", "momentum_change",
-        ]
-        assert apple_models.keys_for(DAYRANGE_ONLY) == ["dayrange", "momentum_change"]
-        assert apple_models.keys_for("INTC") == ["dayrange", "momentum_change"]
+        for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
+            assert apple_models.keys_for(symbol) == ALL_MODELS
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_is_not_loaded_for_a_symbol_it_was_not_fitted_on(self, monkeypatch):
-        """Cheaper than the file check and more honest: there is no GOOGL
-        N-BEATS file to be missing, because there is no GOOGL N-BEATS model."""
+        """Cheaper than the file check and more honest: there is no MSFT
+        N-BEATS file to be missing, because there is no MSFT N-BEATS model."""
         called: list = []
         monkeypatch.setitem(
             apple_models.MODELS, "nbeats",
             replace(apple_models.MODELS["nbeats"], load=called.append),
         )
-        assert apple_models.load("nbeats", DAYRANGE_ONLY) is None
+        assert apple_models.load("nbeats", UNMODELLED) is None
         assert called == []
-        # ...and the loader is still reached for the symbol it does cover.
+        # ...and the loader is still reached for a symbol it does cover.
         apple_models.load("nbeats", TICKER)
         assert called == [TICKER]
-        reason = apple_models.unavailable_reason("nbeats", DAYRANGE_ONLY)
-        assert "no" in reason.lower() and "AAPL" in reason
+        reason = apple_models.unavailable_reason("nbeats", UNMODELLED)
+        assert "no" in reason.lower() and UNMODELLED in reason
 
-    def test_the_catalogue_narrows_but_never_below_the_tape(self):
+    def test_the_catalogue_narrows_but_never_below_the_tape(self, monkeypatch):
+        """A symbol nothing was fitted on keeps the model-free half and loses
+        every model signal; a symbol one model skipped loses only that one.
+
+        The second case is stubbed: every shipped model covers every shipped
+        symbol today, and the narrowing machinery would otherwise be untested
+        until the next model arrives for one ticker ahead of the others."""
         every = set(ar.signals_for(TICKER))
-        dayrange_only = set(ar.signals_for(DAYRANGE_ONLY))
         unmodelled = set(ar.signals_for(UNMODELLED))
-
         assert every == set(ar.SIGNALS)
-        assert "nbeats.turn_proba" not in dayrange_only
-        assert "persistence.proba" not in dayrange_only
-        assert "dayrange.pred_high_dip_adr" in dayrange_only
         assert not any("." in key and key.split(".")[0] in apple_models.MODELS
                        for key in unmodelled)
         # The model-free half is identical on every symbol: it is computed from
         # bars, and bars are bars.
         tape = {key for key, spec in ar.SIGNALS.items() if spec.model is None}
-        assert unmodelled == tape and tape < dayrange_only
+        assert unmodelled == tape and tape < every
+
+        monkeypatch.setitem(
+            apple_models.MODELS, "nbeats",
+            replace(apple_models.MODELS["nbeats"], tickers=(TICKER,)),
+        )
+        narrowed = set(ar.signals_for(DAYRANGE_ONLY))
+        assert "nbeats.turn_proba" not in narrowed
+        assert "persistence.proba" in narrowed        # a different model, untouched
+        assert "dayrange.pred_high_dip_adr" in narrowed
+        assert tape < narrowed < every
 
     def test_a_rule_naming_an_absent_model_is_refused_with_the_signal_named(self):
         rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
-        error = ar.ruleset_error(rules, {}, DAYRANGE_ONLY)
-        assert "nbeats.turn_proba" in error and DAYRANGE_ONLY in error
+        error = ar.ruleset_error(rules, {}, UNMODELLED)
+        assert "nbeats.turn_proba" in error and UNMODELLED in error
         # ...and on AAPL the same rules get past this check, on to the ones
         # about the bundle itself (which a stub cannot satisfy).
         assert "cannot be read on" not in (
@@ -385,11 +395,11 @@ class TestInstrument:
         )
 
     def test_the_missing_model_is_reported_before_the_missing_file(self):
-        """Two different problems: 'GOOGL has no N-BEATS model' sends the reader
+        """Two different problems: 'MSFT has no N-BEATS model' sends the reader
         to the instrument picker, 'the file is not installed' sends them looking
         for a file that was never meant to exist."""
         rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
-        error = ar.ruleset_error(rules, {"nbeats": None}, DAYRANGE_ONLY)
+        error = ar.ruleset_error(rules, {"nbeats": None}, UNMODELLED)
         assert "cannot be read on" in error and "not installed" not in error
 
     def test_every_preset_offered_for_a_symbol_runs_on_it(self):

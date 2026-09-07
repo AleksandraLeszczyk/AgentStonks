@@ -454,10 +454,24 @@ class TestReversalRead:
 
 
 class TestBundle:
+    def test_one_bundle_per_ticker(self):
+        """TimeToChange2 was re-run per symbol, so each has its own classifier
+        and its own validation threshold -- not one model pointed elsewhere."""
+        assert pm.model_path().name == "timetochange2_persistence_AAPL.joblib"
+        assert pm.model_path("GOOGL").name == "timetochange2_persistence_GOOGL.joblib"
+
     def test_the_path_is_overridable_by_environment(self, monkeypatch):
-        assert pm.model_path().name == "apple_momentum_2.joblib"
+        monkeypatch.setenv(f"{pm.MODEL_PATH_ENV}_GOOGL", "/tmp/googl.joblib")
+        assert str(pm.model_path("GOOGL")) == "/tmp/googl.joblib"
+        # ...and one ticker's override says nothing about another's.
+        assert pm.model_path("INTC").name == "timetochange2_persistence_INTC.joblib"
+
+    def test_the_bare_override_answers_for_the_default_ticker_only(self, monkeypatch):
+        """One file cannot be two models. Letting it answer for every symbol
+        would hand a GOOGL run the AAPL classifier in silence."""
         monkeypatch.setenv(pm.MODEL_PATH_ENV, "/tmp/elsewhere.joblib")
         assert str(pm.model_path()) == "/tmp/elsewhere.joblib"
+        assert pm.model_path("GOOGL").name == "timetochange2_persistence_GOOGL.joblib"
 
     def test_a_missing_file_degrades_to_none(self, monkeypatch, tmp_path):
         monkeypatch.setenv(pm.MODEL_PATH_ENV, str(tmp_path / "nope.joblib"))

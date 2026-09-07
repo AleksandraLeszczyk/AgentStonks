@@ -48,8 +48,10 @@ them transfers, so "which model" and "which instrument" are one question rather
 than two. `AppleModel.tickers` is the answer, and it is deliberately a property
 of the model rather than of the app:
 
-    persistence, nbeats   AAPL only -- TimeToChange2 was never run on anything
-                          else.
+    persistence, nbeats   AAPL, GOOGL and INTC -- TimeToChange2's recipe was
+                          re-run per ticker (notebook 08), so each symbol has
+                          its own classifier, its own validation threshold and
+                          its own five-seed ensemble.
     dayrange              AAPL, GOOGL and INTC -- TimeToChange3's pipeline was
                           run per ticker, and each run produced its own bundle.
     momentum_change       AAPL, GOOGL and INTC -- TimeToChange trains and
@@ -57,8 +59,10 @@ of the model rather than of the app:
                           and the selection genuinely differs: Ridge on AAPL,
                           RandomForest on GOOGL, HistGradientBoosting on INTC.
 
-So AAPL has all four and GOOGL and INTC have two each, which is a statement
-about which notebooks were re-run per ticker rather than about the symbols.
+All four models now cover all three symbols. That is a recent state of affairs
+rather than a design invariant -- `keys_for` exists precisely because it was
+not true a month ago and need not stay true -- so nothing downstream may assume
+it.
 
 Everything downstream reads `models_for(ticker)` instead of `MODELS`, which is
 what makes an instrument with no model at all a supported choice rather than a
@@ -117,10 +121,11 @@ STRATEGY_MOMENTUM_CHANGE = "momentum_change"
 # it, and what a config or a stored record arriving without one means.
 DEFAULT_TICKER = "AAPL"
 
-# Which symbols each model was fitted on. TimeToChange2 (the two momentum
-# models) was only ever run on AAPL; TimeToChange3 and TimeToChange were both
-# run per ticker, one bundle each.
-MOMENTUM_TICKERS = (DEFAULT_TICKER,)
+# Which symbols each model was fitted on. All three notebook projects have now
+# been run per ticker, one bundle each -- and each really is its own model:
+# the split, the validation threshold and the ensemble's residuals all belong
+# to the symbol they were fitted on.
+MOMENTUM_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 MOMENTUM_CHANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 
@@ -161,21 +166,18 @@ class AppleModel:
 
 
 def _load_persistence(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The incumbent bundle.
+    """The incumbent bundle for one ticker.
 
     A wrapper rather than `persistence_model.load_bundle` itself, so the lookup
     happens when the model is asked for. Binding the function object into the
     registry at import time would freeze it past any later replacement -- which
     is exactly what a test that stubs out a missing model does.
-
-    The ticker is accepted and ignored: there is one AAPL bundle, and `load`
-    below has already refused every other symbol by the time this is called.
     """
-    return persistence_model.load_bundle()
+    return persistence_model.load_bundle(ticker)
 
 
 def _persistence_path(ticker: str = DEFAULT_TICKER) -> Path:
-    return persistence_model.model_path()
+    return persistence_model.model_path(ticker)
 
 
 def _load_nbeats(ticker: str = DEFAULT_TICKER) -> "dict | None":
@@ -189,15 +191,15 @@ def _load_nbeats(ticker: str = DEFAULT_TICKER) -> "dict | None":
         from . import nbeats_model
     except ImportError:
         return None
-    return nbeats_model.load_bundle()
+    return nbeats_model.load_bundle(ticker)
 
 
 def _nbeats_path(ticker: str = DEFAULT_TICKER) -> Path:
     try:
         from . import nbeats_model
     except ImportError:
-        return Path("timetochange2_nbeats.pt")
-    return nbeats_model.model_path()
+        return Path(f"timetochange2_nbeats_{(ticker or DEFAULT_TICKER).upper()}.pt")
+    return nbeats_model.model_path(ticker)
 
 
 def _load_dayrange(ticker: str = DEFAULT_TICKER) -> "dict | None":
@@ -416,7 +418,9 @@ def is_momentum(key: "str | None") -> bool:
     return get(key).strategy == STRATEGY_MOMENTUM
 
 
-def threshold(key: "str | None", bundle: "dict | None" = None) -> float:
+def threshold(
+    key: "str | None", bundle: "dict | None" = None, ticker: "str | None" = None
+) -> float:
     """The cut-off the named momentum model chose on its own validation block.
 
     Not comparable across models: the classifier's is a posterior and N-BEATS'
@@ -425,7 +429,12 @@ def threshold(key: "str | None", bundle: "dict | None" = None) -> float:
     `STRATEGY_MOMENTUM` -- a day-range forecast is a price, so there is no
     probability to cut. Callers should gate on `is_momentum` rather than read
     the 0.5 that a bundle without a threshold falls back to.
+
+    **Not comparable across symbols either**, which is why `ticker` is here:
+    each is picked on that symbol's own validation events, so AAPL's 0.07 is
+    not GOOGL's. Omitting it answers for `DEFAULT_TICKER`, which was harmless
+    while TimeToChange2 had been run on AAPL alone and is a wrong number now.
     """
     return persistence_model.model_threshold(
-        bundle if bundle is not None else load(key)
+        bundle if bundle is not None else load(key, ticker)
     )

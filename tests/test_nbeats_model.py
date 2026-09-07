@@ -341,7 +341,7 @@ class TestAppleModelsRegistry:
 
     def test_the_unavailable_message_names_the_file_and_the_dependency(self):
         reason = apple_models.unavailable_reason("nbeats")
-        assert "timetochange2_nbeats.pt" in reason
+        assert "timetochange2_nbeats_AAPL.pt" in reason
         assert "PyTorch" in reason
 
     @needs_model

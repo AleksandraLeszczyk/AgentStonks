@@ -1,7 +1,7 @@
 """Intraday momentum-persistence classifier (TimeToChange2 / mshift).
 
 Loads the classifier trained by FinNotebooks/TimeToChange2 notebook 04 and
-saved as `Models/apple_momentum_2.joblib`: given the 20 bars ending at a
+saved as `Models/timetochange2_persistence_<TICKER>.joblib`: given the 20 bars ending at a
 momentum-regime change it predicts the probability that the change is
 **persistent** -- that the new regime survives, rather than the score flicking
 back across the threshold a few minutes later.
@@ -33,6 +33,11 @@ TimeToChange2's own headline: out-of-fold AUC 0.82 over all regime changes, but
 pre-condition. It is **a filter that separates the impossible from the
 possible, not the likely from the unlikely** -- worth consulting before taking
 a change, not worth reading as a forecast of how far price will go.
+
+Fitted per ticker since 2026-09-07 (notebook 08's recipe): AAPL, GOOGL and
+INTC each have their own classifier, their own validation threshold and their
+own events. The thresholds are not close -- 0.07, 0.43 and 0.22 -- so a caller
+that reads one symbol's cut-off for another is not making a small error.
 
 Everything is session-local: no indicator crosses the overnight gap, so the
 live frame is today's streamed bars and nothing else. Two differences from
@@ -67,8 +72,15 @@ REGIME_NAME = {-1: "negative", 0: "balanced", 1: "positive"}
 
 # Default: the shared model store next to the AgentStonks checkout
 # (Code/Models), the same directory the LevelsML pack lives in.
+#
+# One bundle per ticker, named for the project that produced it:
+# `timetochange2_persistence_<TICKER>.joblib`, beside the N-BEATS checkpoint
+# fitted on the same events. The AAPL file was called `apple_momentum_2.joblib`
+# until 2026-09-07 -- it is the same bundle, renamed so the three symbols and
+# the two TimeToChange2 models read as one family.
 MODEL_PATH_ENV = "APPLE_MOMENTUM_MODEL"
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[2] / "Models" / "apple_momentum_2.joblib"
+MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
+DEFAULT_TICKER = "AAPL"
 
 # Regular-session window the model was trained on (mshift.data drops everything
 # outside it before computing anything).
@@ -86,7 +98,11 @@ MOMENTUM_DEFAULTS = {
 }
 
 _lock = threading.Lock()
-_cache: dict = {"path": None, "bundle": None}
+# Keyed by path rather than one slot, so a process that runs GOOGL after AAPL
+# does not evict and re-load a bundle each time it switches. Failures cache
+# under the same key (as None), which stops a per-minute loop re-hitting the
+# filesystem for a file that is not there.
+_cache: "dict[Path, dict | None]" = {}
 
 
 # --- the saved bundle -------------------------------------------------------
@@ -189,27 +205,37 @@ def _register_unpickle_alias() -> None:
     sys.modules["mshift.model"] = module
 
 
-def model_path() -> Path:
-    """Where the saved bundle is expected to live.
+def model_path(ticker: str = DEFAULT_TICKER) -> Path:
+    """Where one ticker's saved bundle is expected to live.
 
-    One file, not one per ticker: TimeToChange2 fitted a single AAPL model and
-    the honest reading of its own results does not transfer to other names.
+    One file per ticker: TimeToChange2's pipeline is fitted per symbol, on that
+    symbol's own events and with its own validation threshold, so GOOGL's
+    bundle is a different model rather than AAPL's pointed elsewhere.
+
+    Two env overrides, and the difference matters. `APPLE_MOMENTUM_MODEL_<TICKER>`
+    relocates one ticker's bundle. The bare `APPLE_MOMENTUM_MODEL` names a
+    single file, so it can only mean the default ticker's -- letting it answer
+    for every symbol would hand a GOOGL run the AAPL model without saying so.
     """
-    return Path(os.environ.get(MODEL_PATH_ENV) or DEFAULT_MODEL_PATH)
+    symbol = (ticker or DEFAULT_TICKER).upper()
+    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
+    if not override and symbol == DEFAULT_TICKER:
+        override = os.environ.get(MODEL_PATH_ENV)
+    return Path(override or MODEL_DIR / f"timetochange2_persistence_{symbol}.joblib")
 
 
-def load_bundle() -> "dict | None":
+def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """The saved bundle (pipeline + feature list + seq_len + threshold), or None.
 
     Cached after the first load; a missing file or a missing joblib/sklearn
     install is cached per path too, so a loop that asks every minute doesn't
     re-hit the filesystem.
     """
-    path = model_path()
+    path = model_path(ticker)
     with _lock:
-        if _cache["path"] == path:
-            return _cache["bundle"]
-        _cache.update(path=path, bundle=None)
+        if path in _cache:
+            return _cache[path]
+        _cache[path] = None
         try:
             import joblib  # noqa: F401  (also pulls in the sklearn unpickling path)
         except ImportError:
@@ -223,14 +249,14 @@ def load_bundle() -> "dict | None":
             return None
         if {"feature_columns", "seq_len"} - set(bundle):
             return None
-        _cache["bundle"] = bundle
+        _cache[path] = bundle
         return bundle
 
 
 def reset_bundle_cache() -> None:
-    """Drop the cached bundle (used by tests that swap the model file)."""
+    """Drop every cached bundle (used by tests that swap the model file)."""
     with _lock:
-        _cache.update(path=None, bundle=None)
+        _cache.clear()
 
 
 def momentum_params(bundle: "dict | None" = None) -> dict:

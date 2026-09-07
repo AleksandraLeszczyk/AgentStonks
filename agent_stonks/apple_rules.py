@@ -26,10 +26,11 @@ it.
 The catalogue is one thing; what is *readable on a given instrument* is
 another. Every model here was fitted on specific symbols and none of the
 notebooks claims transfer, so `signals_for(ticker)` is the list a builder
-offers: on AAPL it is everything, on GOOGL and INTC it drops the two momentum
-models (TimeToChange2 only ever ran on AAPL) and keeps the day-range forecast,
-and on anything else it is the model-free half -- the bar, the momentum regime,
-the position and the clock, which are computed from the tape and mean the same
+offers: on the symbols every notebook project has been re-run for -- AAPL,
+GOOGL and INTC today -- it is everything; on a symbol some model skipped it
+drops that model's signals and keeps the rest; and on a symbol nothing was
+fitted on it is the model-free half -- the bar, the momentum regime, the
+position and the clock, which are computed from the tape and mean the same
 thing on every symbol. `ruleset_error` re-checks the same fact, so a rule set
 carried over from another instrument is refused with the signal named rather
 than quietly running with that condition permanently unmet.

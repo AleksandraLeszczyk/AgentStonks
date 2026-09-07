@@ -129,10 +129,12 @@ def _apple_signature(config: AppleTraderConfig) -> str:
     # but only where a cut-off is a thing that exists. The day-range rules have
     # no threshold, and asking for one would load a 200 MB bundle to answer a
     # question its signature never asks.
-    # No ticker to pass: the two models that have a threshold were fitted on
-    # AAPL alone, so there is only one cut-off either could mean.
+    # The ticker has to be passed: since TimeToChange2 was re-run per symbol
+    # each bundle picks its own cut-off, so asking without one would sign a
+    # GOOGL run with AAPL's threshold -- while the trader, which reads the
+    # bundle it actually loaded, ran on GOOGL's.
     threshold = (
-        apple_models.threshold(config.model_key)
+        apple_models.threshold(config.model_key, ticker=config.ticker)
         if apple_models.is_momentum(config.model_key)
         else None
     )

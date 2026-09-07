@@ -37,17 +37,20 @@ Which symbol, and why it is a setting rather than a name
 `AppleTraderConfig.ticker` names the one symbol a run trades. Everything this
 agent does is a saved model's output, so the instrument is not free the way it
 is for a rule set written on the tape: a model exists for a symbol or it does
-not, and `apple_models` owns that fact. TimeToChange2 was only ever fitted on
-AAPL, so the momentum rules are AAPL-only and will stay that way until somebody
-retrains them; TimeToChange3 has been fitted per ticker, so the day-range rules
-run on AAPL, GOOGL and INTC, and so does TimeToChange's delta-momentum
-regressor. So AAPL runs all three strategies and GOOGL and INTC run two, which
-is a statement about which notebooks were re-run per ticker rather than about
-the symbols. The pairing is checked before the loop starts (`config_error`)
-rather than discovered as a bundle that would not load, and the picker only
-offers a model where one exists -- so "Apple Trader on GOOGL" means the
-day-range strategy or the delta-momentum one, and nothing else is on the
-menu.
+not, and `apple_models` owns that fact. All three notebook projects have now
+been re-run per ticker, so AAPL, GOOGL and INTC each run all three strategies
+off their own bundles -- but that is a fact about which notebooks have been
+re-run, not a property of the design, and it was not true a month ago. The
+pairing is still checked before the loop starts (`config_error`) rather than
+discovered as a bundle that would not load, and the picker still offers only
+the models a symbol has, so the first model trained for one ticker ahead of the
+others narrows the menu again with no code change.
+
+One consequence of per-ticker fitting is worth stating where the rules are
+described: **a model's threshold belongs to its symbol.** The persistence
+classifier picks 0.07 on AAPL, 0.43 on GOOGL and 0.22 on INTC, each on that
+symbol's own validation events, so `prob_threshold=None` means three different
+numbers and nothing may read one symbol's cut-off for another.
 
 The agent keeps its name. It is the loop that is Apple Trader, not the symbol.
 

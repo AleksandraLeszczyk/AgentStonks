@@ -556,6 +556,14 @@ def test_the_rules_fire_on_the_same_bars_as_the_notebook(ticker):
 
     from agent_stonks.apple_trader import AppleTraderConfig, MomentumChangeTrader
 
+    # The clock has to be pinned, and not as a formality: `_exit_reason` ends
+    # with the closing-flatten rule, which reads the *wall* clock rather than
+    # the bar. Run for real inside the last five minutes of a session it fires
+    # on every held bar and the trader churns -- 82 entries against the
+    # notebook's 32. Nothing here is about that rule (the notebook's `eod` exit
+    # is a bar-index rule, excluded below), so mid-session is the honest pin.
+    clock.set_simulated(datetime(2026, 8, 26, 15, 0, tzinfo=timezone.utc))
+
     params = M.pipeline_params(bundle)
     frame, events, _ = ml.prepare(src, params)
     # `live_confirm_lag`, not `persist` -- see the test above for the off-by-one.
@@ -592,6 +600,7 @@ def test_the_rules_fire_on_the_same_bars_as_the_notebook(ticker):
                 exits.append(ts)
         trader.entry = None
 
+    clock.clear()
     one_bar = pd.Timedelta(minutes=1)
     assert entries == list(notebook["entry_time"] - one_bar)
     # The notebook's last exit of a session can be its `eod` rule, which fires

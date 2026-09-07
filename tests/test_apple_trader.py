@@ -6,6 +6,7 @@ depending on the saved artifact or on live market data.
 """
 
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -754,7 +755,7 @@ class TestGuards:
 
     def test_missing_model_stops_the_loop_instead_of_trading(self, state, monkeypatch):
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.persistence_model, "load_bundle", lambda: None)
+        monkeypatch.setattr(at.persistence_model, "load_bundle", lambda *a, **k: None)
         stop_event = threading.Event()
         at._apple_trader_loop(
             state, tracker, confirm_config(model_key="persistence"), 60, stop_event
@@ -819,7 +820,7 @@ class TestGuards:
         )
         assert state.agent_running is False
         assert any(
-            "timetochange2_nbeats.pt" in e.get("text", "") for e in state.agent_log
+            "timetochange2_nbeats_AAPL.pt" in e.get("text", "") for e in state.agent_log
         )
 
 
@@ -1594,26 +1595,38 @@ class TestStrategySelection:
 # ----------------------------------------------------------------- instrument
 #
 # Which symbol a run trades, and the one thing that constrains it: a model was
-# fitted on a symbol or it was not. `NON_AAPL` is a symbol TimeToChange3 and
-# TimeToChange cover and TimeToChange2 does not, which is the whole shape of
-# the problem: AAPL runs all four models and GOOGL and INTC run two.
+# fitted on a symbol or it was not. As of 2026-09-07 every model covers every
+# shipped symbol, so `UNMODELLED` is the only pairing the *shipped* registry
+# refuses -- which is exactly why the narrower case is exercised against a
+# stubbed entry below rather than left uncovered. It was true a month ago and
+# will be true again the next time a notebook is re-run for one symbol first.
 
 NON_AAPL = "GOOGL"
 DAYRANGE_ONLY = NON_AAPL  # kept for the tests written before there were two
 UNMODELLED = "MSFT"
 
+ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
+
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        assert apple_models.keys_for(TICKER) == [
-            "persistence", "nbeats", "dayrange", "momentum_change",
-        ]
-        assert apple_models.keys_for(NON_AAPL) == ["dayrange", "momentum_change"]
+        for symbol in (TICKER, NON_AAPL, "INTC"):
+            assert apple_models.keys_for(symbol) == ALL_MODELS
         assert apple_models.keys_for(UNMODELLED) == []
 
-    def test_a_momentum_model_cannot_be_pointed_at_another_symbol(self):
+    def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
+        self, monkeypatch
+    ):
         """The check that keeps 'Apple Trader on GOOGL' from meaning a model
-        fitted on a different stock's tape."""
+        fitted on a different stock's tape.
+
+        Stubbed back to AAPL-only, because every shipped model now covers every
+        shipped symbol and the machinery would otherwise go untested until the
+        next model arrives for one ticker ahead of the others."""
+        monkeypatch.setitem(
+            apple_models.MODELS, "nbeats",
+            replace(apple_models.MODELS["nbeats"], tickers=(TICKER,)),
+        )
         error = at.model_ticker_error(
             AppleTraderConfig(model_key="nbeats", ticker=DAYRANGE_ONLY)
         )
@@ -1622,10 +1635,12 @@ class TestInstrument:
         # ...and it names what that symbol *can* run.
         assert "Day-range forecast" in error
 
-    def test_the_day_range_model_covers_the_retrained_symbols(self):
-        for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
-            config = AppleTraderConfig(model_key="dayrange", ticker=symbol)
-            assert at.model_ticker_error(config) is None
+    def test_every_model_covers_the_retrained_symbols(self):
+        """All three notebook projects have been re-run per ticker."""
+        for key in ALL_MODELS:
+            for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
+                config = AppleTraderConfig(model_key=key, ticker=symbol)
+                assert at.model_ticker_error(config) is None
 
     def test_an_unmodelled_symbol_is_refused_with_no_alternative_offered(self):
         error = at.model_ticker_error(
@@ -1636,7 +1651,7 @@ class TestInstrument:
     def test_the_pairing_is_part_of_config_error(self):
         """One call is what every launch path checks, so the pairing cannot be
         enforced in the live loop and forgotten in SimLab."""
-        config = AppleTraderConfig(model_key="nbeats", ticker=DAYRANGE_ONLY)
+        config = AppleTraderConfig(model_key="nbeats", ticker=UNMODELLED)
         assert "cannot trade" in (at.config_error(config, BUNDLE) or "")
 
     def test_a_ticker_is_normalised(self):
@@ -1684,7 +1699,7 @@ class TestInstrument:
     def test_the_loop_refuses_the_pairing_before_it_loads_anything(
         self, state, monkeypatch
     ):
-        """'There is no GOOGL N-BEATS model' rather than 'the file is missing':
+        """'There is no MSFT N-BEATS model' rather than 'the file is missing':
         different problems, different fixes."""
         loaded: list = []
         monkeypatch.setattr(
@@ -1693,7 +1708,7 @@ class TestInstrument:
         )
         at._apple_trader_loop(
             state, tracker_for_loop(), AppleTraderConfig(
-                model_key="nbeats", ticker=DAYRANGE_ONLY
+                model_key="nbeats", ticker=UNMODELLED
             ), 60, threading.Event(),
         )
         assert loaded == []

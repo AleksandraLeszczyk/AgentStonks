@@ -102,10 +102,15 @@ from . import persistence_model  # noqa: E402
 
 # The shared model store next to the AgentStonks checkout (Code/Models), where
 # the incumbent bundle and the LevelsML pack already live.
+#
+# One checkpoint per ticker, and each needs three files under the same stem:
+# `timetochange2_nbeats_<TICKER>.pt`, its `.json` metadata and its
+# `_residuals.npz` sidecar. The AAPL files carried no ticker until 2026-09-07 --
+# they are the same weights, renamed so the three symbols read as one family
+# beside `timetochange2_persistence_<TICKER>.joblib`.
 MODEL_PATH_ENV = "APPLE_NBEATS_MODEL"
-DEFAULT_MODEL_PATH = (
-    Path(__file__).resolve().parents[2] / "Models" / "timetochange2_nbeats.pt"
-)
+MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
+DEFAULT_TICKER = "AAPL"
 
 # How many futures to sample per decision. Notebook 7.8 measured the sampling
 # standard deviation at 0.013-0.016 here, against probabilities near 0.65.
@@ -120,7 +125,10 @@ BOOTSTRAP_SEED = 0
 PERSISTENCE_DEFAULTS = {"min_dwell": 15, "fast_move_bars": 10, "fast_move_pct": 0.01}
 
 _lock = threading.Lock()
-_cache: dict = {"path": None, "bundle": None}
+# Keyed by path rather than one slot: assembling a bundle here restores five
+# networks and a residual matrix, so a session switching between symbols must
+# not pay for it twice. Failures cache too, as None.
+_cache: "dict[Path, dict | None]" = {}
 
 DEVICE = torch.device("cpu")
 
@@ -531,9 +539,21 @@ def reversal_probability(samples: np.ndarray, start_regime, momentum: dict) -> d
 
 # --- loading -----------------------------------------------------------------
 
-def model_path() -> Path:
-    """Where the saved checkpoint is expected to live."""
-    return Path(os.environ.get(MODEL_PATH_ENV) or DEFAULT_MODEL_PATH)
+def model_path(ticker: str = DEFAULT_TICKER) -> Path:
+    """Where one ticker's saved checkpoint is expected to live.
+
+    One file per ticker: the ensemble is fitted on that symbol's own forecast
+    windows, and its residual sidecar is a property of those weights.
+
+    Two env overrides, as everywhere else here. `APPLE_NBEATS_MODEL_<TICKER>`
+    relocates one ticker's checkpoint; the bare `APPLE_NBEATS_MODEL` names a
+    single file and therefore answers for the default ticker only.
+    """
+    symbol = (ticker or DEFAULT_TICKER).upper()
+    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
+    if not override and symbol == DEFAULT_TICKER:
+        override = os.environ.get(MODEL_PATH_ENV)
+    return Path(override or MODEL_DIR / f"timetochange2_nbeats_{symbol}.pt")
 
 
 def residuals_path(path: "Path | None" = None) -> Path:
@@ -585,7 +605,7 @@ def _load_residuals(path: Path, feature_columns: "list[str]", horizon: int) -> n
     return residuals
 
 
-def load_bundle() -> "dict | None":
+def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """The N-BEATS model in the shape `persistence_model.read_latest` expects.
 
     Same keys as the incumbent joblib bundle (`feature_columns`, `seq_len`,
@@ -597,11 +617,11 @@ def load_bundle() -> "dict | None":
     or does not agree with itself; the caller reports that rather than trading
     on a model it could not fully assemble. Cached per path.
     """
-    path = model_path()
+    path = model_path(ticker)
     with _lock:
-        if _cache["path"] == path:
-            return _cache["bundle"]
-        _cache.update(path=path, bundle=None)
+        if path in _cache:
+            return _cache[path]
+        _cache[path] = None
         try:
             checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
             seeds = [_restore_seed(p) for p in checkpoint["seeds"]]
@@ -752,11 +772,11 @@ def load_bundle() -> "dict | None":
             "trained_at": ", ".join(meta.get("train_sessions") or []) or "unknown",
             "excluded_sessions_from": meta.get("excluded_sessions_from", "?"),
         }
-        _cache["bundle"] = bundle
+        _cache[path] = bundle
         return bundle
 
 
 def reset_bundle_cache() -> None:
     """Drop the cached bundle (used by tests that swap the checkpoint)."""
     with _lock:
-        _cache.update(path=None, bundle=None)
+        _cache.clear()
