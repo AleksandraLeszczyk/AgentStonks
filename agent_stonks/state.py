@@ -140,6 +140,11 @@ class SymbolState:
         # Today's ML-predicted price profile, cached per (day, open) by
         # profile_model.predicted_open_profile: {"key": ..., "profile": ...}.
         self.predicted_profile_cache: "dict | None" = None
+        # model_overlays.compute: {"key": ..., "result": ...}. The chart
+        # fragment re-runs every few seconds and scoring a session through a
+        # forecasting bundle is not free, so the answer is held until a new
+        # bar (or a different overlay selection) makes it stale.
+        self.model_overlay_cache: "dict | None" = None
 
     # --- delegation to the shared AppState -------------------------------
     @property
@@ -274,6 +279,11 @@ class AppState:
         self.mixture_max_components: int = 0
         self.mixture_fit_target: str = "live"
         self.show_predicted_profile: bool = False
+        # Which model predictions the price chart draws (model_overlays keys),
+        # and which momentum bundle answers the persistence question when the
+        # momentum overlay is on.
+        self.model_overlay_keys: list[str] = []
+        self.overlay_momentum_model: "str | None" = None
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False

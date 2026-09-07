@@ -16,7 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from agent_stonks import apple_models, clock, persistence_model
+from agent_stonks import apple_models, clock, model_overlays, persistence_model
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
@@ -37,6 +37,7 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.apple_rules_ui import rules_panel, signal_catalogue
 from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
+from agent_stonks.charts import add_model_overlays, overlay_x_max
 from agent_stonks.config import PALETTE
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
@@ -291,16 +292,29 @@ def _render_apple_rules() -> None:
     """
     ticker = rule_agent(APPLE_TRADER_KEY).default_ticker
     st.markdown(
-        f"A fixed loop over **{ticker}** minute bars with no LLM anywhere in it. Which "
-        "rules it runs is decided by which saved model it is pointed at, chosen per "
-        "simulation in the **Simulate** tab. It is never scored by the LLM judge — it "
-        "states no reasoning of its own to judge, so profit, profit efficiency and the "
-        "oracle ceiling are the whole verdict."
+        "A fixed loop over one symbol's minute bars with no LLM anywhere in it. Which "
+        "rules it runs is decided by which saved model it is pointed at, and which "
+        "**instrument** it can be pointed at is decided by the same choice — both are "
+        "picked per simulation in the **Simulate** tab. It is never scored by the LLM "
+        "judge — it states no reasoning of its own to judge, so profit, profit "
+        "efficiency and the oracle ceiling are the whole verdict."
+    )
+    st.caption(
+        ":material/model_training: Every rule here is a saved model's output, so the "
+        "instrument is only as free as the models are — "
+        + "; ".join(
+            f"**{symbol}**: "
+            + ", ".join(apple_models.get(k).label for k in apple_models.keys_for(symbol))
+            for symbol in apple_models.tickers()
+        )
+        + ". TimeToChange2 was only ever fitted on "
+        f"{ticker}; TimeToChange3 was run per ticker."
     )
 
     st.markdown("##### The momentum rules — `persistence`, `nbeats`")
     st.markdown(
-        f"Once a minute it reads the **{ticker}** bar that just closed and "
+        f"Once a minute it reads the bar that just closed (**{ticker}** only — see "
+        "above) and "
         "tracks the momentum regime — a Schmitt trigger over a volatility-normalised "
         "momentum score, so a value hovering near the line cannot emit a burst of fake "
         "changes:\n"
@@ -362,33 +376,55 @@ def _render_apple_rules() -> None:
     for model in (apple_models.get(key) for key in apple_models.keys()):
         with st.expander(model.label, expanded=model.key == AppleTraderConfig().model_key):
             st.markdown(model.summary)
+            st.caption(
+                ":material/candlestick_chart: Fitted on "
+                + ", ".join(model.tickers)
+                + (
+                    " — one bundle per symbol, each with its own daily models, its own "
+                    "opening ridge and its own held-out numbers."
+                    if len(model.tickers) > 1
+                    else ". Nothing claims it transfers, so it is the only instrument "
+                         "this model can be run on."
+                )
+            )
             if model.strategy == apple_models.STRATEGY_MOMENTUM and not model.anticipates:
                 st.caption(
                     ":material/block: Fitted on regime-change bars only, so it runs the "
                     "*Confirm* entry and not *Anticipate*."
                 )
-            bundle = apple_models.load(model.key)
-            if bundle is None:
-                st.error(
-                    f"{apple_models.unavailable_reason(model.key)} Simulations naming this "
-                    "model will fail until it is available."
+            # One provenance block per symbol: the numbers below are that
+            # bundle's own, and quoting AAPL's for a GOOGL run would be a
+            # different model's held-out error under the right heading.
+            for symbol in model.tickers:
+                if len(model.tickers) > 1:
+                    st.markdown(f"**{symbol}**")
+                bundle = apple_models.load(model.key, symbol)
+                if bundle is None:
+                    st.error(
+                        f"{apple_models.unavailable_reason(model.key, symbol)} Simulations "
+                        f"naming this model on {symbol} will fail until it is available."
+                    )
+                    continue
+                if model.strategy == apple_models.STRATEGY_DAYRANGE:
+                    _render_dayrange_bundle(bundle)
+                    continue
+                metrics = bundle.get("metrics") or {}
+                cols = st.columns(4)
+                cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
+                cols[1].metric("Features", len(bundle.get("feature_columns") or []))
+                cols[2].metric("Held-out AUC", f"{metrics.get('roc_auc', float('nan')):.2f}")
+                cols[3].metric(
+                    "Own threshold", f"{persistence_model.model_threshold(bundle):g}"
                 )
-                continue
-            if model.strategy == apple_models.STRATEGY_DAYRANGE:
-                _render_dayrange_bundle(bundle)
-                continue
-            metrics = bundle.get("metrics") or {}
-            cols = st.columns(4)
-            cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
-            cols[1].metric("Features", len(bundle.get("feature_columns") or []))
-            cols[2].metric("Held-out AUC", f"{metrics.get('roc_auc', float('nan')):.2f}")
-            cols[3].metric("Own threshold", f"{persistence_model.model_threshold(bundle):g}")
-            st.caption(
-                f"Fitted {bundle.get('trained_at', '?')}, excluding sessions from "
-                f"{bundle.get('excluded_sessions_from', '?')} onwards. "
-                f"{bundle.get('notes', '')}"
-            )
-            st.json({"settings": bundle.get("settings"), "metrics": metrics}, expanded=False)
+                st.caption(
+                    f"Fitted {bundle.get('trained_at', '?')}, excluding sessions from "
+                    f"{bundle.get('excluded_sessions_from', '?')} onwards. "
+                    f"{bundle.get('notes', '')}"
+                )
+                st.json(
+                    {"settings": bundle.get("settings"), "metrics": metrics},
+                    expanded=False,
+                )
     st.warning(
         ":material/warning: Those AUCs cover *all* regime changes, and roughly half of "
         "them are decided by one observable boolean — the old regime had already held 15 "
@@ -593,7 +629,20 @@ def _equity_chart(equity: list[dict], starting_cash: float) -> go.Figure:
     return _chart_layout(fig, height=300)
 
 
-def _price_chart(symbol: str, bars: list[dict], decisions: list[dict]) -> go.Figure:
+def _price_chart(
+    symbol: str,
+    bars: list[dict],
+    decisions: list[dict],
+    overlays: "list[dict] | None" = None,
+) -> go.Figure:
+    """The replayed day's candles, the fills, and what the models predicted.
+
+    `overlays` are `model_overlays.compute` items, drawn by the same renderer
+    the live chart uses. There is no price-profile column here, so the
+    predicted levels are drawn once instead of mirrored -- everything else is
+    identical, which is the point of the items being data rather than plotly
+    calls.
+    """
     fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
@@ -623,8 +672,79 @@ def _price_chart(symbol: str, bars: list[dict], decisions: list[dict]) -> go.Fig
                                 line=dict(width=1, color=PALETTE["text"])),
                 )
             )
+    if overlays and bars:
+        x0, x1 = pd.Timestamp(bars[0]["t"]), pd.Timestamp(bars[-1]["t"])
+        add_model_overlays(overlays, fig, x0, x1, row=None, col=None)
+        fig.update_xaxes(range=[x0, overlay_x_max(overlays, x1)])
     fig.update_layout(xaxis_rangeslider_visible=False)
     return _chart_layout(fig, height=420)
+
+
+
+def _run_overlay_controls(
+    record: dict, market: "SimMarket", symbol: str, days: "list[date]"
+) -> dict:
+    """Pick which model predictions to draw over a replayed day, and compute them.
+
+    Deliberately available on *every* run, not only the ones a model drove: the
+    interesting question in Results is usually what a model would have said
+    about a day, and an LLM agent's tape is as good a place to ask it as a rule
+    agent's. Nothing here reads the run's own decisions.
+
+    Each day is scored on its own, from the state of the world at its 9:31 --
+    completed daily bars strictly before it (`SimMarket.completed_daily_bars`)
+    and the stored opening print -- which is the same point-in-time view the
+    agent had. A replay chart that showed a forecast built on the day's own
+    outcome would be worse than no forecast at all.
+    """
+    available = model_overlays.keys_for(symbol)
+    if not available:
+        return {"items": [], "notes": []}
+
+    run_id = record.get("run_id") or "run"
+    selected = st.multiselect(
+        "Model predictions",
+        available,
+        format_func=model_overlays.label,
+        key=f"sim_overlays_{run_id}_{symbol}",
+        help="What the trained models predicted for this session, drawn over "
+        "the replayed tape: predicted ranges as horizontal lines, momentum "
+        "changes as marked moments, time-spanning predictions as a shaded "
+        "background.",
+    )
+    if not selected:
+        return {"items": [], "notes": []}
+
+    momentum_model = None
+    if model_overlays.MOMENTUM_KEY in selected:
+        momentum_keys = [k for k in apple_models.keys() if apple_models.is_momentum(k)]
+        momentum_model = st.selectbox(
+            "Momentum model",
+            momentum_keys,
+            format_func=lambda key: apple_models.get(key).label,
+            key=f"sim_overlay_model_{run_id}_{symbol}",
+        )
+
+    items: list[dict] = []
+    notes: list[str] = []
+    bars = market.series[symbol].minute_bars
+    for day in days:
+        t = market.session_open(day) + timedelta(minutes=1)
+        result = model_overlays.compute(
+            selected,
+            symbol,
+            bars,
+            daily_bars=market.completed_daily_bars(symbol, t),
+            session_date=day,
+            open_price=market.session_open_price(symbol, t),
+            momentum_model=momentum_model,
+        )
+        items.extend(result["items"])
+        for note in result["notes"]:
+            entry = f"{day}: {note}" if len(days) > 1 else note
+            if entry not in notes:
+                notes.append(entry)
+    return {"items": items, "notes": notes}
 
 
 def _render_judge_report(judge_report: dict) -> None:
@@ -703,7 +823,12 @@ def _render_run(record: dict) -> None:
                 with tab:
                     bars = market.series[sym].minute_bars
                     if bars:
-                        st.plotly_chart(_price_chart(sym, bars, decisions))
+                        overlays = _run_overlay_controls(record, market, sym, days)
+                        st.plotly_chart(
+                            _price_chart(sym, bars, decisions, overlays["items"])
+                        )
+                        for note in overlays["notes"]:
+                            st.caption(f":material/info: {note}")
                     else:
                         st.info("No stored bars for this symbol/day.")
         except Exception as exc:
@@ -1041,7 +1166,7 @@ def _render_rule_params(personalities: list[str], symbols: list[str]) -> dict:
     own instrument.
     """
     renderers = {
-        APPLE_TRADER_KEY: lambda: _render_apple_params(),
+        APPLE_TRADER_KEY: lambda: _render_apple_params(symbols),
         APPLE_TRADER2_KEY: lambda: _render_apple2_params(symbols),
     }
     return {key: renderers[key]() for key in personalities if key in renderers}
@@ -1074,41 +1199,80 @@ def _render_apple2_params(symbols: list[str]) -> AppleTrader2Config:
         return rules_panel("sim_apple_trader2", symbols=symbols)
 
 
-def _render_apple_params() -> AppleTraderConfig:
-    """Apple Trader's rules for this batch.
+def _render_apple_params(symbols: list[str]) -> AppleTraderConfig:
+    """Apple Trader's instrument and rules for this batch.
 
-    The model is chosen first because it chooses the strategy: the two
-    TimeToChange2 models are asked a question on every bar, the TimeToChange3
-    one is asked a single question at 9:35, and they share no tunable but
-    position size. Each renders its own knobs rather than greying out the
-    other's.
+    The instrument is chosen first because it decides which models exist for
+    it, and the model then chooses the strategy: the two TimeToChange2 models
+    are asked a question on every bar, the TimeToChange3 one is asked a single
+    question at 9:35, and they share no tunable but position size. Each renders
+    its own knobs rather than greying out the other's.
+
+    `symbols` is what the selected datasets carry, used only to mark the
+    instruments that can actually be replayed — the list itself comes from what
+    the models were fitted on, since without a model this agent has no rules at
+    all.
     """
     defaults = AppleTraderConfig()
     with st.expander("Apple Trader rules", expanded=True):
-        keys = apple_models.keys()
+        ticker = _render_apple_instrument(defaults, symbols)
+        keys = apple_models.keys_for(ticker)
         model_key = str(
             st.selectbox(
                 "Model", keys,
                 index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
                 format_func=_apple_model_label,
-                key="sim_apple_model",
+                # Scoped to the instrument, whose choice changes this list.
+                key=f"sim_apple_model_{ticker}",
                 help="On the confirm entry the two momentum models are handed the same "
                      "20 bars on the same tape and return one probability, so running a "
                      "dataset through both is a straight comparison. The day-range "
                      "forecast is not on that scale and is not comparable to them by "
                      "number — it is a different strategy on the same symbol, and the "
-                     "way to compare it is to run the same dataset through it.",
+                     "way to compare it is to run the same dataset through it. Only the "
+                     "models fitted on the instrument above are listed.",
             )
         )
         model = apple_models.get(model_key)
-        bundle = apple_models.load(model.key)
+        bundle = apple_models.load(model.key, ticker)
         st.caption(model.summary)
         if bundle is None:
-            st.error(apple_models.unavailable_reason(model_key))
+            st.error(apple_models.unavailable_reason(model_key, ticker))
 
         if model.strategy == apple_models.STRATEGY_DAYRANGE:
-            return _render_apple_dayrange_params(defaults, model_key)
-        return _render_apple_momentum_params(defaults, model, bundle)
+            return _render_apple_dayrange_params(defaults, model_key, ticker)
+        return _render_apple_momentum_params(defaults, model, bundle, ticker)
+
+
+def _render_apple_instrument(defaults: AppleTraderConfig, symbols: list[str]) -> str:
+    """Which symbol this batch trades, out of the ones a model exists for.
+
+    A fixed list rather than a free-text box (which is what Apple Trader 2
+    gets): every rule this agent has is a saved model's output, so a symbol
+    nothing was fitted on is not a thinner strategy, it is none. Whether the
+    selected datasets actually carry it is checked before anything is queued --
+    see `_rule_agents_missing_ticker` -- and flagged here as well, since the
+    dataset is picked on the same page.
+    """
+    options = apple_models.tickers()
+    available = {str(s).strip().upper() for s in (symbols or [])}
+    ticker = str(
+        st.selectbox(
+            "Instrument", options,
+            index=options.index(defaults.ticker) if defaults.ticker in options else 0,
+            format_func=(
+                lambda t: t if not available or t in available else f"{t} (not in the datasets)"
+            ),
+            key="sim_apple_ticker",
+            help="The one symbol the run trades. Only symbols a saved model covers are "
+                 "listed — the models are the strategy here, so the instrument and the "
+                 "model constrain each other. The same rules over two symbols are two "
+                 "configurations in Results, never one averaged row.",
+        )
+    )
+    labels = ", ".join(apple_models.get(k).label for k in apple_models.keys_for(ticker))
+    st.caption(f":material/model_training: Models fitted on {ticker}: {labels}.")
+    return ticker
 
 
 def _apple_model_label(key: str) -> str:
@@ -1121,7 +1285,7 @@ def _apple_model_label(key: str) -> str:
 
 
 def _render_apple_dayrange_params(
-    defaults: AppleTraderConfig, model_key: str
+    defaults: AppleTraderConfig, model_key: str, ticker: str
 ) -> AppleTraderConfig:
     """The day-range rules: the two resting levels, and nothing else."""
     st.caption(
@@ -1169,6 +1333,7 @@ def _render_apple_dayrange_params(
     )
     return AppleTraderConfig(
         model_key=model_key,
+        ticker=ticker,
         buy_k=float(buy_k),
         sell_k=float(sell_k),
         position_pct=float(position_pct),
@@ -1176,7 +1341,7 @@ def _render_apple_dayrange_params(
 
 
 def _render_apple_momentum_params(
-    defaults: AppleTraderConfig, model, bundle: "dict | None"
+    defaults: AppleTraderConfig, model, bundle: "dict | None", ticker: str
 ) -> AppleTraderConfig:
     """The momentum rules for this batch."""
     model_key = model.key
@@ -1268,6 +1433,7 @@ def _render_apple_momentum_params(
         )
     return AppleTraderConfig(
         model_key=str(model_key),
+        ticker=ticker,
         entry_mode=str(entry_mode),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),

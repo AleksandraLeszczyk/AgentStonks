@@ -14,10 +14,10 @@ Results, and how to build a trader exposing a uniform
 ``run_cycle(state, tracker)`` -- which is what hides Apple Trader's extra
 ``bundle`` argument from the day loop.
 
-The ticker is asked of the *config* rather than of the agent, because it is one
-for Apple Trader (whose strategy is a saved AAPL model) and a setting for Apple
-Trader 2 (whose strategy is a list of rules, most of which read the tape). Both
-are still single-symbol per run, which is what the dataset check depends on.
+The ticker is asked of the *config* rather than of the agent, because both of
+them pick their instrument -- Apple Trader from the symbols its chosen model was
+fitted on, Apple Trader 2 from anything the dataset carries. Both are still
+single-symbol per run, which is what the dataset check depends on.
 """
 from __future__ import annotations
 
@@ -33,8 +33,9 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
     build_trader,
     config_error,
+    model_ticker_error,
 )
-from agent_stonks.apple_trader import TICKER as APPLE_TRADER_TICKER
+from agent_stonks.apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
 from agent_stonks.apple_trader2 import (
     APPLE_TRADER2_AVATAR,
@@ -104,9 +105,18 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     simply never trades, which reads like a strategy result rather than the
     installation problem it is.
     """
-    bundle = apple_models.load(config.model_key)
+    # The model/instrument pairing is checked first: a model that was never
+    # fitted on this symbol is a different problem from one whose file is
+    # missing, and reporting it as the latter sends the reader looking for a
+    # file that was never meant to exist.
+    pairing = model_ticker_error(config)
+    if pairing is not None:
+        raise RuntimeError(pairing)
+    bundle = apple_models.load(config.model_key, config.ticker)
     if bundle is None:
-        raise RuntimeError(apple_models.unavailable_reason(config.model_key))
+        raise RuntimeError(
+            apple_models.unavailable_reason(config.model_key, config.ticker)
+        )
     mismatch = config_error(config, bundle)
     if mismatch is not None:
         raise RuntimeError(mismatch)
@@ -119,6 +129,8 @@ def _apple_signature(config: AppleTraderConfig) -> str:
     # but only where a cut-off is a thing that exists. The day-range rules have
     # no threshold, and asking for one would load a 200 MB bundle to answer a
     # question its signature never asks.
+    # No ticker to pass: the two models that have a threshold were fitted on
+    # AAPL alone, so there is only one cut-off either could mean.
     threshold = (
         apple_models.threshold(config.model_key)
         if apple_models.is_momentum(config.model_key)
@@ -177,9 +189,10 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         key=APPLE_TRADER_KEY,
         label=APPLE_TRADER_LABEL,
         avatar=APPLE_TRADER_AVATAR,
-        # Not configurable: both of this agent's strategies *are* a saved AAPL
-        # model, so there is nothing to point at another symbol.
-        ticker=lambda config: APPLE_TRADER_TICKER,
+        # Constrained rather than free: the symbols this agent can trade are
+        # the ones its chosen model was fitted on, which `model_ticker_error`
+        # enforces and the pickers offer.
+        ticker=lambda config: config.ticker,
         default_ticker=APPLE_TRADER_TICKER,
         build=_build_apple,
         signature=_apple_signature,

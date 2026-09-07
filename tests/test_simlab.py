@@ -749,7 +749,7 @@ class TestRuleAgentEngine:
         model rather than quietly falling back to the one that can.
         """
         monkeypatch.setattr(
-            apple_models, "load", lambda key: None if key == "nbeats" else self._bundle()
+            apple_models, "load", lambda key, ticker=None: None if key == "nbeats" else self._bundle()
         )
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
@@ -823,10 +823,16 @@ class TestDayRangeEngine:
     }
 
     @pytest.fixture()
-    def dayrange_store(self, tmp_path, monkeypatch):
-        """A stored AAPL session that dips under the buy level and recovers
-        through the sell level: five flat opening minutes the forecast is built
-        on, a slide to 102.4, then a climb to 105.5."""
+    def dayrange_store(self, tmp_path, monkeypatch, request):
+        """A stored session that dips under the buy level and recovers through
+        the sell level: five flat opening minutes the forecast is built on, a
+        slide to 102.4, then a climb to 105.5.
+
+        Written for AAPL unless the test is parameterised with another symbol
+        (`indirect=True`), which is how the same session is replayed under a
+        ticker the day-range model was retrained for.
+        """
+        symbol = getattr(request, "param", "AAPL")
         monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
         monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
         prices = (
@@ -839,15 +845,15 @@ class TestDayRangeEngine:
             _bar(OPEN_UTC + timedelta(minutes=i), price, volume=1000.0 + 37 * (i % 13))
             for i, price in enumerate(prices)
         ]
-        sim_data._write_gz(sim_data.bars_path("AAPL", DAY), bars)
-        sim_data._write_gz(sim_data.daily_path("AAPL"), {
-            "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15",
+        sim_data._write_gz(sim_data.bars_path(symbol, DAY), bars)
+        sim_data._write_gz(sim_data.daily_path(symbol), {
+            "symbol": symbol, "start": "2026-05-16", "end": "2026-06-15",
             "bars": [
                 _bar(datetime(2026, 6, 15, tzinfo=timezone.utc) - timedelta(days=i), 99.0)
                 for i in range(30, 0, -1)
             ],
         })
-        return tmp_path
+        return symbol
 
     def _stub_model(self, monkeypatch) -> dict:
         """The bundle and the forecast, replaced at the model module so the
@@ -869,14 +875,14 @@ class TestDayRangeEngine:
         monkeypatch.setattr(dayrange, "forecast_session", forecast)
         return seen
 
-    def _run(self, monkeypatch, rule_config: "dict | None" = None):
+    def _run(self, monkeypatch, rule_config: "dict | None" = None, symbol: str = "AAPL"):
         seen = self._stub_model(monkeypatch)
-        rules = {"model_key": "dayrange", **(rule_config or {})}
-        market = SimMarket(["AAPL"], [DAY])
+        rules = {"model_key": "dayrange", "ticker": symbol, **(rule_config or {})}
+        market = SimMarket([symbol], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
             model=config_signature(AppleTraderConfig(**rules)), api_key="",
-            symbols=["AAPL"], days=[DAY], starting_cash=10_000.0, rule_config=rules,
+            symbols=[symbol], days=[DAY], starting_cash=10_000.0, rule_config=rules,
         )
         return seen, SimulationEngine(market, config).run()
 
@@ -949,6 +955,51 @@ class TestDayRangeEngine:
         error = result.error or ""
         assert "timetochange3_dayrange_AAPL.joblib" in error
         assert "PyTorch" in error
+
+    @pytest.mark.parametrize("dayrange_store", ["GOOGL", "INTC"], indirect=True)
+    def test_the_retrained_symbols_replay_on_the_same_day_loop(
+        self, dayrange_store, monkeypatch
+    ):
+        """TimeToChange3 was fitted per ticker, so GOOGL and INTC are the same
+        strategy on another tape -- nothing about the loop, the levels or the
+        ledger changes, and the run is filed under its own symbol."""
+        symbol = dayrange_store
+        seen, result = self._run(monkeypatch, symbol=symbol)
+        assert result.error is None
+        assert [d["symbol"] for d in result.decisions][:2] == [symbol, symbol]
+        assert result.config_summary["rule_config"]["ticker"] == symbol
+        # The daily history and the opening window came from that symbol's
+        # stored bars -- there are no AAPL bars in this dataset at all, so a
+        # path still hard-coded to AAPL could not have produced a forecast.
+        assert len(seen["history"]) == 30
+        assert len(seen["opening"]) == 5
+
+    def test_a_momentum_model_cannot_be_pointed_at_another_symbol(
+        self, dayrange_store, monkeypatch
+    ):
+        """The pairing check reaches SimLab through the same `config_error`
+        the live loop uses, so a record naming one cannot be replayed."""
+        market = SimMarket(["GOOGL"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["GOOGL"], days=[DAY],
+            rule_config={"model_key": "nbeats", "ticker": "GOOGL"},
+        )
+        error = SimulationEngine(market, config).run().error or ""
+        assert "cannot trade GOOGL" in error and "AAPL only" in error
+
+    def test_the_dataset_is_checked_against_the_configured_symbol(
+        self, dayrange_store, monkeypatch
+    ):
+        """An AAPL dataset and a GOOGL config is a run that cannot trade."""
+        self._stub_model(monkeypatch)
+        market = SimMarket(["AAPL"], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=["AAPL"], days=[DAY],
+            rule_config={"model_key": "dayrange", "ticker": "GOOGL"},
+        )
+        assert "only trades GOOGL" in (SimulationEngine(market, config).run().error or "")
 
     def test_the_strategy_leads_the_configuration_signature(self, dayrange_store, monkeypatch):
         """Results groups on this string. A day-range run and a momentum run

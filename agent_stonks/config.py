@@ -202,6 +202,27 @@ NEWS_IMPACT_COLORS: dict[str, str] = {
 # so the spacing looks right at any price scale.
 NEWS_MARKER_OFFSET_FRAC = 0.04
 
+# Model-prediction overlays on the price chart (see model_overlays.py). One
+# color per overlay, so a level, its band and its label are recognisably the
+# same prediction; the momentum marks borrow the up/down palette because they
+# name a direction.
+MODEL_OVERLAY_COLORS: dict[str, str] = {
+    "day_range":     "#22d3ee",  # cyan, as the ML predicted profile curve
+    "profile_range": "#a78bfa",  # violet
+    "profile_poc":   "#f472b6",  # pink -- one number inside the violet band
+    "momentum_up":   "#26c6a2",
+    "momentum_down": "#ef5350",
+    "momentum_flat": "#888",
+    "momentum_hold": "#26c6a2",
+    "momentum_turn": "#fbbf24",  # amber: the one mark about the future
+}
+
+# Alpha for the semi-transparent backgrounds overlays paint behind the candles.
+# A predicted band covers most of the plot, so it has to read as a tint rather
+# than a fill; a predicted window is narrow and can afford a little more.
+MODEL_OVERLAY_BAND_ALPHA = 0.08
+MODEL_OVERLAY_SPAN_ALPHA = 0.14
+
 MA_COLORS: dict[int, str] = {
     5:  "#60a5fa",  # blue
     15: "#fb923c",  # orange

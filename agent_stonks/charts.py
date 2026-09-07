@@ -11,6 +11,8 @@ from .config import (
     AVG_LINE_COLORS,
     FIB_LEVELS,
     MA_COLORS,
+    MODEL_OVERLAY_BAND_ALPHA,
+    MODEL_OVERLAY_SPAN_ALPHA,
     NEWS_IMPACT_COLORS,
     NEWS_MARKER_OFFSET_FRAC,
     PALETTE,
@@ -726,6 +728,215 @@ def _bar_width_ms(df: pd.DataFrame) -> float:
     return delta_ms * 0.8
 
 
+# --- model prediction overlays ----------------------------------------------
+#
+# The one renderer for `model_overlays.compute` output. It is deliberately the
+# only place that knows how a prediction becomes a shape, because two figures
+# draw the same items: the live/agent chart built here (candles in col 1, the
+# price profile in col 2, volume in row 2) and SimLab's plain candlestick
+# figure, which passes `profile_col=None` and gets the same lines without the
+# mirrored ones.
+
+
+def _rgba(color: str, alpha: float) -> str:
+    """`#rrggbb` -> an `rgba()` string at `alpha`.
+
+    Semi-transparency has to be in the color rather than on the shape: a
+    plotly `opacity` on a rect fades its border with its fill, and these have
+    no border to fade.
+    """
+    raw = color.lstrip("#")
+    if len(raw) != 6:
+        return color
+    r, g, b = (int(raw[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def overlay_x_max(overlays: Optional[list[dict]], last_bar: pd.Timestamp) -> pd.Timestamp:
+    """How far right the time axis has to reach for these overlays.
+
+    Only items flagged `forward` count. A prediction about the rest of the
+    session (a day range forecast at 09:35 claims something about 16:00) would
+    otherwise stretch a two-hour chart across a whole day and squash the tape
+    into a corner -- those are clamped to the last bar instead. A prediction
+    that momentum will hold for the next 15 bars is *about* the space past the
+    last bar, and is invisible unless the axis makes room for it.
+    """
+    x_max = pd.Timestamp(last_bar)
+    for item in overlays or []:
+        if not item.get("forward"):
+            continue
+        edge = item.get("x1") if item.get("kind") == "span" else item.get("ts")
+        if edge is None:
+            continue
+        x_max = max(x_max, _as_tz_of(edge, x_max))
+    return x_max
+
+
+def _as_tz_of(value, reference: pd.Timestamp) -> pd.Timestamp:
+    """`value` as a timestamp comparable with `reference`.
+
+    Overlay items always carry UTC ISO strings, but the figures they are drawn
+    on do not agree on tz-awareness -- the live chart's index is UTC-aware and
+    SimLab hands plotly whatever the store wrote. Comparing the two raises, so
+    the reference decides.
+    """
+    stamp = pd.Timestamp(value)
+    if reference.tzinfo is None:
+        return stamp.tz_localize(None) if stamp.tzinfo else stamp
+    return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert(reference.tz)
+
+
+def add_model_overlays(
+    overlays: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: Optional[int] = 1,
+    col: Optional[int] = 1,
+    profile_axes: Optional[tuple[str, str]] = None,
+    volume_row: Optional[int] = None,
+) -> None:
+    """Draw `model_overlays.compute` items onto `fig`.
+
+    `x0`/`x1` are the visible time span: spans are clipped to it unless they
+    are flagged `forward`, so a band that starts before the first drawn bar
+    does not drag the axis backwards.
+
+    Levels and price-bounded bands are drawn in the price panel and, when
+    `profile_axes` names the price-profile subplot's `(xaxis, yaxis)`, again
+    across that histogram -- the two share a price axis, and a predicted range
+    is exactly the kind of thing you want to read against the realized volume
+    profile.
+
+    The profile panel is addressed by axis id rather than by `row`/`col`
+    because plotly resolves a `row`/`col` shape through the subplot's *traces*
+    and silently drops it when there are none -- and there are none before the
+    first trade of the session prints. An axis id is there from `make_subplots`
+    onwards.
+    """
+    def _profile_shape(**kwargs) -> None:
+        if profile_axes is None:
+            return
+        x_axis, y_axis = profile_axes
+        fig.add_shape(xref=f"{x_axis} domain", x0=0, x1=1, yref=y_axis, **kwargs)
+
+    if not overlays:
+        return
+
+    events: list[dict] = []
+    for item in overlays:
+        kind = item.get("kind")
+        color = item.get("color") or PALETTE["accent"]
+
+        if kind == "level":
+            value = item.get("value")
+            if value is None:
+                continue
+            line = dict(color=color, width=1.5, dash=item.get("dash", "dash"))
+            # A level that names the session it belongs to is drawn only over
+            # it; one that does not spans the axis. See `model_overlays._level`.
+            lx0 = max(_as_tz_of(item["x0"], pd.Timestamp(x0)), pd.Timestamp(x0)) \
+                if item.get("x0") else None
+            lx1 = min(_as_tz_of(item["x1"], pd.Timestamp(x0)), pd.Timestamp(x1)) \
+                if item.get("x1") else None
+            if lx0 is not None and lx1 is not None:
+                if lx1 <= lx0:
+                    continue
+                fig.add_shape(
+                    type="line", x0=lx0, x1=lx1, y0=value, y1=value,
+                    line=line, row=row, col=col,
+                )
+            else:
+                fig.add_hline(y=value, line=line, row=row, col=col)
+            _profile_shape(type="line", y0=value, y1=value, line=line)
+            fig.add_annotation(
+                xref="x", yref="y",
+                x=lx0 if lx0 is not None else x0, y=value,
+                text=f" {item.get('label', '')} {value:.2f}",
+                hovertext=item.get("note") or None,
+                font=dict(color=color, size=10, family="monospace"),
+                showarrow=False,
+                xanchor="left",
+                yanchor="bottom",
+            )
+
+        elif kind == "span":
+            sx0 = _as_tz_of(item["x0"], pd.Timestamp(x0))
+            sx1 = _as_tz_of(item["x1"], pd.Timestamp(x0))
+            if not item.get("forward"):
+                sx0 = max(sx0, pd.Timestamp(x0))
+                sx1 = min(sx1, pd.Timestamp(x1))
+            if sx1 <= sx0:
+                continue
+            y0, y1 = item.get("y0"), item.get("y1")
+            if y0 is None or y1 is None:
+                # A moment that lasts: a full-height column over the bars the
+                # prediction covers, in the price panel and under the volume.
+                fill = _rgba(color, MODEL_OVERLAY_SPAN_ALPHA)
+                rows = [row] if volume_row in (None, row) else [row, volume_row]
+                for target_row in rows:
+                    fig.add_vrect(
+                        x0=sx0, x1=sx1, fillcolor=fill, line_width=0,
+                        layer="below", row=target_row, col=col,
+                    )
+            else:
+                fig.add_shape(
+                    type="rect",
+                    x0=sx0, x1=sx1, y0=y0, y1=y1,
+                    fillcolor=_rgba(color, MODEL_OVERLAY_BAND_ALPHA),
+                    line_width=0, layer="below",
+                    row=row, col=col,
+                )
+                _profile_shape(
+                    type="rect", y0=y0, y1=y1,
+                    fillcolor=_rgba(color, MODEL_OVERLAY_BAND_ALPHA),
+                    line_width=0, layer="below",
+                )
+
+        elif kind == "event":
+            ts = _as_tz_of(item["ts"], pd.Timestamp(x0))
+            if item.get("line", True):
+                fig.add_vline(
+                    x=ts,
+                    line=dict(color=color, width=1, dash=item.get("dash", "dot")),
+                    row=row, col=col,
+                )
+            events.append({**item, "_ts": ts})
+
+    if not events:
+        return
+
+    # One trace per overlay key rather than one per event: the legend then says
+    # "Momentum regime changes" once, and clicking it hides the whole set.
+    for key in dict.fromkeys(e["key"] for e in events):
+        group = [e for e in events if e["key"] == key]
+        fig.add_trace(
+            go.Scatter(
+                x=[e["_ts"] for e in group],
+                y=[e["price"] for e in group],
+                mode="markers+text",
+                text=[e.get("icon", "◆") for e in group],
+                textposition="top center",
+                textfont=dict(size=13, color=group[0]["color"]),
+                marker=dict(
+                    size=9,
+                    color=[e["color"] for e in group],
+                    symbol="circle-open",
+                    line=dict(width=2, color=[e["color"] for e in group]),
+                ),
+                name=group[0].get("group") or group[0].get("label", key),
+                customdata=[[e.get("label", ""), e.get("note", "")] for e in group],
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>%{x|%H:%M}<br>"
+                    "%{customdata[1]}<extra></extra>"
+                ),
+                showlegend=True,
+            ),
+            row=row, col=col,
+        )
+
+
 def build_chart(
     bars: list[dict],
     news: list[dict],
@@ -751,6 +962,7 @@ def build_chart(
     tactic_levels: Optional[list[dict]] = None,
     news_impacts: Optional[dict] = None,
     fill_gaps: bool = False,
+    model_overlays: Optional[list[dict]] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -1025,6 +1237,11 @@ def build_chart(
         _add_price_alerts(price_alerts, fig, df["t"].iloc[0], df["t"].iloc[-1])
     if tactic_levels:
         _add_tactic_levels(tactic_levels, fig, df["t"].iloc[0], df["t"].iloc[-1])
+    if model_overlays:
+        add_model_overlays(
+            model_overlays, fig, df["t"].iloc[0], df["t"].iloc[-1],
+            row=1, col=1, profile_axes=("x2", "y2"), volume_row=2,
+        )
 
     last = df.iloc[-1]
     color = PALETTE["up"] if last["c"] >= last["o"] else PALETTE["down"]
@@ -1054,7 +1271,10 @@ def build_chart(
         xaxis=dict(
             range=[
                 pd.Timestamp(session_start).isoformat(),
-                df["t"].max().isoformat(),
+                # A forward-looking overlay -- "momentum holds for the next 15
+                # bars" -- lives entirely to the right of the newest bar, so
+                # the axis has to make room for it or it is drawn off-screen.
+                overlay_x_max(model_overlays, df["t"].max()).isoformat(),
             ],
             rangeslider=dict(visible=False),
         ),

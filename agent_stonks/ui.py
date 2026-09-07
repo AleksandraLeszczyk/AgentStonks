@@ -11,7 +11,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from . import apple_models, market_hours, persistence_model
+from . import apple_models, market_hours, model_overlays, persistence_model
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -32,7 +32,7 @@ from .apple_trader import (
     AppleTraderConfig,
     launch_apple_trader,
 )
-from .apple_trader import TICKER as APPLE_TRADER_TICKER
+from .apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from .apple_rules_ui import rules_panel, signal_catalogue
 from .apple_trader2 import (
     APPLE_TRADER2_AVATAR,
@@ -545,6 +545,9 @@ def _chart_panel() -> None:
             if state.show_predicted_profile
             else None
         )
+        overlays = model_overlays.live_overlays(
+            sym_state, bars, state.model_overlay_keys, state.overlay_momentum_model
+        )
 
         fig = build_chart(
             bars,
@@ -571,8 +574,11 @@ def _chart_panel() -> None:
             tactic_levels=tactic_levels,
             news_impacts=sym_state.news_impacts,
             fill_gaps=state.fill_gaps,
+            model_overlays=overlays["items"],
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
+        for note in overlays["notes"]:
+            st.caption(f":material/info: {sym} — {note}")
     if not rendered:
         st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
 
@@ -634,6 +640,8 @@ def _live_chart_controls() -> None:
             help="Which profile the Gaussian/Cauchy mixture is fitted to.",
         )
 
+        overlay_keys, overlay_momentum_model = _model_overlay_controls(state)
+
         st.markdown("**Data**")
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
@@ -676,6 +684,77 @@ def _live_chart_controls() -> None:
         if show_predicted and fit_target_choice == "Predicted profile"
         else "live"
     )
+    state.model_overlay_keys = overlay_keys
+    state.overlay_momentum_model = overlay_momentum_model
+
+
+
+def _model_overlay_controls(state: AppState) -> "tuple[list[str], str | None]":
+    """Which model predictions the price chart draws.
+
+    Offered per the symbols being streamed rather than globally: the day-range
+    and momentum models were each fitted on a fixed set of tickers, and an
+    overlay no chart here could show is a checkbox that does nothing. The
+    profile model claims to transfer, so it is always on the list.
+
+    The momentum picker is a second question and only appears with the momentum
+    overlay selected: the persistence probability drawn on a change bar is
+    whichever bundle answered it, and the two are not comparable numbers (see
+    `apple_models.threshold`), so the chart has to say which one it asked.
+
+    Both widgets are driven by `key=` alone rather than by `default=`/`index=`.
+    A default that changes with the selection re-creates the widget on the next
+    run and loses it, and the streamed symbols can change under a stored
+    selection -- so the session value is seeded once and then pruned to what is
+    still on offer.
+    """
+    available: list[str] = []
+    for sym in state.symbols or []:
+        for key in model_overlays.keys_for(sym):
+            if key not in available:
+                available.append(key)
+    if not available:
+        available = model_overlays.keys()
+
+    stored = [k for k in st.session_state.get("model_overlay_keys", []) if k in available]
+    st.session_state["model_overlay_keys"] = stored
+
+    st.markdown("**Model Predictions**")
+    selected = st.multiselect(
+        "Show on chart",
+        available,
+        format_func=model_overlays.label,
+        key="model_overlay_keys",
+        help="Draws what the trained models predict for this session: price "
+        "ranges as horizontal lines (in the candles and in the profile beside "
+        "them), momentum changes as marked moments, and anything that spans "
+        "time as a shaded background.",
+    )
+    for key in selected:
+        overlay = model_overlays.get(key)
+        if overlay:
+            st.caption(f"{overlay.label} — {overlay.summary}")
+
+    momentum_model = state.overlay_momentum_model
+    if model_overlays.MOMENTUM_KEY in selected:
+        momentum_keys = [
+            key for key in apple_models.keys() if apple_models.is_momentum(key)
+        ]
+        if st.session_state.get("overlay_momentum_model") not in momentum_keys:
+            st.session_state["overlay_momentum_model"] = (
+                apple_models.DEFAULT_MODEL
+                if apple_models.DEFAULT_MODEL in momentum_keys
+                else momentum_keys[0]
+            )
+        momentum_model = st.selectbox(
+            "Momentum model",
+            momentum_keys,
+            format_func=lambda key: apple_models.get(key).label,
+            key="overlay_momentum_model",
+            help="Which bundle answers 'will this change hold?'. Only a "
+            "forecasting one also marks a turn that has not happened yet.",
+        )
+    return selected, momentum_model
 
 
 def _volume_alert_controls() -> None:
@@ -1501,6 +1580,10 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     decisions=tracker.trade_markers(symbol=sym) if tracker else None,
                     news_impacts=sym_state.news_impacts,
                     fill_gaps=state.fill_gaps,
+                    model_overlays=model_overlays.live_overlays(
+                        sym_state, bars, state.model_overlay_keys,
+                        state.overlay_momentum_model,
+                    )["items"],
                 ),
             )
         )
@@ -1597,43 +1680,85 @@ def _agent_report_section(symbols: list[str]) -> None:
         )
 
 
-def _apple_trader_params() -> AppleTraderConfig:
-    """Apple Trader's tunables.
+def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
+    """Apple Trader's instrument and tunables.
 
-    The model comes first because it decides which of the rest even exist: the
-    momentum models are asked a question on every bar and the day-range model
-    is asked one at 9:35, so the two rule sets have no knob in common beyond
-    position size. Rather than grey out five inputs that mean nothing, each
-    strategy renders its own.
+    The instrument comes first because it decides which models exist, and the
+    model then decides which of the rest do: the momentum models are asked a
+    question on every bar and the day-range model is asked one at 9:35, so the
+    two rule sets have no knob in common beyond position size. Rather than grey
+    out five inputs that mean nothing, each strategy renders its own.
+
+    Only symbols something was fitted on are offered. Everything this agent
+    does is a saved model's output, so an instrument with no model is not a
+    strategy with fewer signals — it is no strategy at all.
     """
     defaults = AppleTraderConfig()
     with st.expander("Apple Trader rules", expanded=True):
-        keys = apple_models.keys()
+        ticker = _apple_instrument_row("apple_trader", defaults, symbols)
+        keys = apple_models.keys_for(ticker)
         model_key = str(
             st.selectbox(
                 "Model",
                 keys,
                 index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
                 format_func=_apple_model_label,
-                key="apple_trader_model",
+                # Scoped to the instrument: the models on offer change with it,
+                # and a widget holding one that is no longer an option would be
+                # a stale selection rather than a choice.
+                key=f"apple_trader_model_{ticker}",
                 help=(
                     "Which saved model the agent runs on — and, with it, which rules. The "
                     "two TimeToChange2 models answer the same question about the momentum "
                     "regime on every bar and differ only in how; the TimeToChange3 "
                     "day-range forecast is a different strategy that happens to live in "
-                    "the same agent."
+                    "the same agent. Only the models fitted on the instrument above are "
+                    "listed."
                 ),
             )
         )
         model = apple_models.get(model_key)
-        bundle = apple_models.load(model.key)
+        bundle = apple_models.load(model.key, ticker)
         st.caption(model.summary)
         if bundle is None:
-            st.error(apple_models.unavailable_reason(model_key))
+            st.error(apple_models.unavailable_reason(model_key, ticker))
 
         if model.strategy == apple_models.STRATEGY_DAYRANGE:
-            return _apple_dayrange_params(defaults, model_key)
-        return _apple_momentum_params(defaults, model, bundle)
+            return _apple_dayrange_params(defaults, model_key, ticker)
+        return _apple_momentum_params(defaults, model, bundle, ticker)
+
+
+def _apple_instrument_row(
+    prefix: str, defaults: AppleTraderConfig, symbols: "list[str] | None" = None
+) -> str:
+    """The symbol Apple Trader trades, out of the ones a model exists for.
+
+    Not a free-text field, unlike Apple Trader 2's: there every signal but the
+    model forecasts is computed from the tape, so any streamed symbol is a
+    working configuration. Here the model *is* the strategy, so the list is
+    exactly `apple_models.tickers()` and the caption says what each one buys.
+    """
+    options = apple_models.tickers()
+    streamed = {str(s).strip().upper() for s in (symbols or [])}
+    current = st.session_state.get(f"{prefix}_ticker") or defaults.ticker
+    ticker = str(
+        st.selectbox(
+            "Instrument",
+            options,
+            index=options.index(current) if current in options else 0,
+            format_func=lambda t: t if t in streamed or not streamed else f"{t} (not streamed)",
+            key=f"{prefix}_ticker",
+            help=(
+                "The one symbol this run trades. Only symbols a saved model covers are "
+                "listed — every rule here is a model's output, so an instrument without "
+                "one has no strategy to run. It also has to be streamed: add it to the "
+                "symbols in the sidebar before starting."
+            ),
+        )
+    )
+    labels = ", ".join(apple_models.get(k).label for k in apple_models.keys_for(ticker))
+    st.caption(f":material/model_training: Models fitted on {ticker}: {labels}.")
+    return ticker
 
 
 def _apple_model_label(key: str) -> str:
@@ -1648,7 +1773,9 @@ def _apple_model_label(key: str) -> str:
     return model.label + ("" if model.anticipates else " — cannot anticipate")
 
 
-def _apple_dayrange_params(defaults: AppleTraderConfig, model_key: str) -> AppleTraderConfig:
+def _apple_dayrange_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str
+) -> AppleTraderConfig:
     """The day-range rules: two resting levels below the predicted high."""
     st.caption(
         "At 9:35 the model forecasts where today's high **H** will land, and the two "
@@ -1716,6 +1843,7 @@ def _apple_dayrange_params(defaults: AppleTraderConfig, model_key: str) -> Apple
     )
     return AppleTraderConfig(
         model_key=model_key,
+        ticker=ticker,
         buy_k=float(buy_k),
         sell_k=float(sell_k),
         position_pct=float(position_pct),
@@ -1723,7 +1851,7 @@ def _apple_dayrange_params(defaults: AppleTraderConfig, model_key: str) -> Apple
 
 
 def _apple_momentum_params(
-    defaults: AppleTraderConfig, model, bundle: "dict | None"
+    defaults: AppleTraderConfig, model, bundle: "dict | None", ticker: str
 ) -> AppleTraderConfig:
     """The momentum rules: when the model is asked about a regime change, how
     sure it has to be, how much of the run to give back, and whether the model
@@ -1836,6 +1964,7 @@ def _apple_momentum_params(
         )
     return AppleTraderConfig(
         model_key=str(model_key),
+        ticker=ticker,
         entry_mode=str(entry_mode),
         prob_threshold=float(prob_threshold),
         trail_pct=float(trail_pct),
@@ -1923,18 +2052,19 @@ def _agent_panel(
             )
         if personality == APPLE_TRADER_KEY:
             st.caption(
-                f"🍎 Apple Trader runs no LLM, and the model chosen below decides which "
-                "of two strategies it runs. On the **momentum** models it reads the "
-                f"{APPLE_TRADER_TICKER} bar that just closed once a minute and asks one "
-                "question about the momentum regime — by default, whether a regime that "
-                "is still balanced or negative is about to turn positive — buying if the "
-                "answer is yes and selling on a trailing stop, or on the model expecting "
-                "that regime to flip negative. On the **day-range** model it asks nothing "
-                "per bar: at 9:35 it forecasts where the whole session's high and low "
-                "will land, then rests a buy well below the predicted high and a sell "
-                f"just under it for the rest of the day. Either way it trades "
-                f"{APPLE_TRADER_TICKER} only — that is the one symbol the models were "
-                "fitted on — and the provider/model settings below do not apply to it."
+                "🍎 Apple Trader runs no LLM, and the model chosen below decides which "
+                "of two strategies it runs. On the **momentum** models it reads the bar "
+                "that just closed once a minute and asks one question about the momentum "
+                "regime — by default, whether a regime that is still balanced or negative "
+                "is about to turn positive — buying if the answer is yes and selling on a "
+                "trailing stop, or on the model expecting that regime to flip negative. "
+                "On the **day-range** model it asks nothing per bar: at 9:35 it forecasts "
+                "where the whole session's high and low will land, then rests a buy well "
+                "below the predicted high and a sell just under it for the rest of the "
+                "day. It trades **one symbol**, picked below out of the ones a model was "
+                "fitted on — every rule here is a model's output, so the instrument and "
+                "the model constrain each other. The provider/model settings below do "
+                "not apply to it."
             )
         if personality == APPLE_TRADER2_KEY:
             st.caption(
@@ -1971,7 +2101,9 @@ def _agent_panel(
         if not os.getenv(env_var) and personality not in RULE_AGENT_KEYS:
             st.caption(f"⚠️ {env_var} is not set.")
 
-    apple_config = _apple_trader_params() if personality == APPLE_TRADER_KEY else None
+    apple_config = (
+        _apple_trader_params(symbols) if personality == APPLE_TRADER_KEY else None
+    )
     apple2_config = (
         _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
     )
@@ -1997,11 +2129,11 @@ def _agent_panel(
         # The one symbol this run trades: fixed for Apple Trader, configured for
         # Apple Trader 2. Either way it has to be streamed, or there are no bars
         # to read and the agent would idle all session.
-        rule_ticker = (
-            apple2_config.ticker
-            if personality == APPLE_TRADER2_KEY and apple2_config is not None
-            else APPLE_TRADER_TICKER
-        )
+        rule_ticker = APPLE_TRADER_TICKER
+        if personality == APPLE_TRADER2_KEY and apple2_config is not None:
+            rule_ticker = apple2_config.ticker
+        elif personality == APPLE_TRADER_KEY and apple_config is not None:
+            rule_ticker = apple_config.ticker
         stream_ready = False
         if not syms:
             st.error("Enter at least one symbol in the sidebar first.")

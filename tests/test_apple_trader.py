@@ -11,9 +11,11 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
+from agent_stonks import apple_models
 from agent_stonks import apple_trader as at
 from agent_stonks import clock
-from agent_stonks.apple_trader import TICKER, AppleTrader, AppleTraderConfig, config_signature
+from agent_stonks.apple_trader import DEFAULT_TICKER as TICKER
+from agent_stonks.apple_trader import AppleTrader, AppleTraderConfig, config_signature
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
@@ -767,7 +769,7 @@ class TestGuards:
         `turn_proba` None on a classifier, every bar reads as "not a buy", and
         the run finishes clean with an empty ledger that looks like a result."""
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.apple_models, "load", lambda key: BUNDLE)
+        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: BUNDLE)
         config = AppleTraderConfig(
             model_key="persistence", entry_mode=at.ENTRY_ANTICIPATE
         )
@@ -785,7 +787,7 @@ class TestGuards:
         run would trade normally and exit everything on the trailing stop,
         which is indistinguishable from a rule that just never triggered."""
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.apple_models, "load", lambda key: BUNDLE)
+        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: BUNDLE)
         config = confirm_config(model_key="persistence", reversal_threshold=0.3)
         at._apple_trader_loop(state, tracker, config, 60, threading.Event())
         assert state.agent_running is False
@@ -797,7 +799,7 @@ class TestGuards:
     def test_clearing_the_reversal_exit_lets_that_model_run(self, state, monkeypatch):
         """The classifier is not disqualified -- only that one rule is."""
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.apple_models, "load", lambda key: BUNDLE)
+        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: BUNDLE)
         config = confirm_config(model_key="persistence", reversal_threshold=None)
         assert at.config_error(config, BUNDLE) is None
         stop = threading.Event()
@@ -810,7 +812,7 @@ class TestGuards:
         than quietly running the one that happens to be loadable."""
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
         monkeypatch.setattr(
-            at.apple_models, "load", lambda key: None if key == "nbeats" else BUNDLE
+            at.apple_models, "load", lambda key, ticker=None: None if key == "nbeats" else BUNDLE
         )
         at._apple_trader_loop(
             state, tracker, AppleTraderConfig(model_key="nbeats"), 60, threading.Event()
@@ -1231,3 +1233,128 @@ class TestStrategySelection:
             AppleTraderConfig(buy_k=0.5, sell_k=0.5)
         with pytest.raises(ValueError, match="sell_k"):
             AppleTraderConfig(buy_k=0.2, sell_k=0.6)
+
+
+# ----------------------------------------------------------------- instrument
+#
+# Which symbol a run trades, and the one thing that constrains it: a model was
+# fitted on a symbol or it was not. `DAYRANGE_ONLY` is a symbol TimeToChange3
+# covers and TimeToChange2 does not, which is the whole shape of the problem.
+
+DAYRANGE_ONLY = "GOOGL"
+UNMODELLED = "MSFT"
+
+
+class TestInstrument:
+    def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
+        assert apple_models.keys_for(TICKER) == ["persistence", "nbeats", "dayrange"]
+        assert apple_models.keys_for(DAYRANGE_ONLY) == ["dayrange"]
+        assert apple_models.keys_for(UNMODELLED) == []
+
+    def test_a_momentum_model_cannot_be_pointed_at_another_symbol(self):
+        """The check that keeps 'Apple Trader on GOOGL' from meaning a model
+        fitted on a different stock's tape."""
+        error = at.model_ticker_error(
+            AppleTraderConfig(model_key="nbeats", ticker=DAYRANGE_ONLY)
+        )
+        assert error is not None
+        assert "AAPL only" in error and DAYRANGE_ONLY in error
+        # ...and it names what that symbol *can* run.
+        assert "Day-range forecast" in error
+
+    def test_the_day_range_model_covers_the_retrained_symbols(self):
+        for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
+            config = AppleTraderConfig(model_key="dayrange", ticker=symbol)
+            assert at.model_ticker_error(config) is None
+
+    def test_an_unmodelled_symbol_is_refused_with_no_alternative_offered(self):
+        error = at.model_ticker_error(
+            AppleTraderConfig(model_key="dayrange", ticker=UNMODELLED)
+        )
+        assert error is not None and "pick another instrument" in error
+
+    def test_the_pairing_is_part_of_config_error(self):
+        """One call is what every launch path checks, so the pairing cannot be
+        enforced in the live loop and forgotten in SimLab."""
+        config = AppleTraderConfig(model_key="nbeats", ticker=DAYRANGE_ONLY)
+        assert "cannot trade" in (at.config_error(config, BUNDLE) or "")
+
+    def test_a_ticker_is_normalised(self):
+        assert AppleTraderConfig(ticker=" googl ").ticker == "GOOGL"
+
+    def test_the_signature_carries_the_symbol(self):
+        """The same levels over two tapes are two experiments; filing them
+        together would average them into one row in Results."""
+        aapl = config_signature(AppleTraderConfig(model_key="dayrange"))
+        googl = config_signature(
+            AppleTraderConfig(model_key="dayrange", ticker=DAYRANGE_ONLY)
+        )
+        assert aapl.startswith("dayrange_AAPL(") and googl.startswith("dayrange_GOOGL(")
+        assert aapl != googl
+
+    def test_a_record_written_before_the_instrument_existed_is_an_aapl_run(self):
+        assert AppleTraderConfig(model_key="persistence").ticker == TICKER
+
+    def test_the_configured_symbol_is_the_one_traded(self, market_open, monkeypatch):
+        """Every read, order and log line follows the config, not the module."""
+        state = AppState()
+        state.set_symbols([DAYRANGE_ONLY])
+        state.api_key, state.api_secret, state.feed = "k", "s", "iex"
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = Reads(monkeypatch)
+        reads.to_positive(proba=0.99)
+
+        trader = AppleTrader(confirm_config(ticker=DAYRANGE_ONLY))
+        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
+        assert tracker.position_for(DAYRANGE_ONLY) > 0
+        assert tracker.position_for(TICKER) == 0
+        assert broker.orders[0][0] == DAYRANGE_ONLY
+
+    def test_a_symbol_that_is_not_streamed_says_so(self, market_open, monkeypatch):
+        state = AppState()
+        state.set_symbols([TICKER])
+        state.api_key, state.api_secret, state.feed = "k", "s", "iex"
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        Reads(monkeypatch)
+        trader = AppleTrader(confirm_config(ticker=DAYRANGE_ONLY))
+        assert trader.run_cycle(BUNDLE, state, tracker) == "no_data"
+        assert DAYRANGE_ONLY in state.agent_log[-1]["text"]
+
+    def test_the_loop_refuses_the_pairing_before_it_loads_anything(
+        self, state, monkeypatch
+    ):
+        """'There is no GOOGL N-BEATS model' rather than 'the file is missing':
+        different problems, different fixes."""
+        loaded: list = []
+        monkeypatch.setattr(
+            at.apple_models, "load",
+            lambda key, ticker=None: loaded.append((key, ticker)) or BUNDLE,
+        )
+        at._apple_trader_loop(
+            state, tracker_for_loop(), AppleTraderConfig(
+                model_key="nbeats", ticker=DAYRANGE_ONLY
+            ), 60, threading.Event(),
+        )
+        assert loaded == []
+        assert any("cannot trade" in e.get("text", "") for e in state.agent_log)
+        assert state.agent_running is False
+
+    def test_the_loop_loads_the_bundle_for_the_configured_symbol(
+        self, state, monkeypatch
+    ):
+        asked: list = []
+        monkeypatch.setattr(
+            at.apple_models, "load",
+            lambda key, ticker=None: asked.append((key, ticker)) or None,
+        )
+        at._apple_trader_loop(
+            state, tracker_for_loop(), AppleTraderConfig(
+                model_key="dayrange", ticker=DAYRANGE_ONLY
+            ), 60, threading.Event(),
+        )
+        assert asked == [("dayrange", DAYRANGE_ONLY)]
+
+
+def tracker_for_loop() -> DecisionTracker:
+    return DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))

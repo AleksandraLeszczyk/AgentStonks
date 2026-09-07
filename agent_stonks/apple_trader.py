@@ -2,7 +2,7 @@
 
 Every other personality in `agent_stonks.agent` is a system prompt handed to a
 model that reasons its way to a decision. This one is a plain loop: once a
-minute it looks at the AAPL bar that just closed and asks a saved model from
+minute it looks at the minute bar that just closed and asks a saved model from
 FinNotebooks one question. Same paper ledger, same fill path, same log -- only
 the decision-making is deterministic, so the same tape always produces the same
 trades.
@@ -23,6 +23,21 @@ by picking a model (see `agent_stonks.apple_models`, which owns that mapping):
 They share the ledger, the sizing, the flatten-before-close rule and the config
 record, and nothing else -- a forecast of the day's high is not a probability
 and there is no threshold to compare it against. `build_trader` is the seam.
+
+Which symbol, and why it is a setting rather than a name
+--------------------------------------------------------
+`AppleTraderConfig.ticker` names the one symbol a run trades. Everything this
+agent does is a saved model's output, so the instrument is not free the way it
+is for a rule set written on the tape: a model exists for a symbol or it does
+not, and `apple_models` owns that fact. TimeToChange2 was only ever fitted on
+AAPL, so the momentum rules are AAPL-only and will stay that way until somebody
+retrains them; TimeToChange3 has been fitted per ticker, so the day-range rules
+run on AAPL, GOOGL and INTC. The pairing is checked before the loop starts
+(`config_error`) rather than discovered as a bundle that would not load, and
+the picker only offers a model where one exists -- so "Apple Trader on GOOGL"
+means the day-range strategy, and nothing else is on the menu.
+
+The agent keeps its name. It is the loop that is Apple Trader, not the symbol.
 
 ---------------------------------------------------------------------------
 The momentum rules
@@ -289,9 +304,11 @@ APPLE_TRADER_AVATAR = "Multiavatar-4bcbffe68af819e050.png"
 # result grouping): this one has no LLM behind it, its rules are the "model".
 RULE_PROVIDER = "rules"
 
-# TimeToChange2 fitted a single AAPL model, and its own results do not claim to
-# transfer -- the personality is named after the one symbol it can trade.
-TICKER = "AAPL"
+# The symbol a run trades unless its config names another. Every model here
+# covers it (it is the only symbol all three were fitted on), which is what
+# makes it the safe default for a config arriving without one -- see
+# `apple_models.DEFAULT_TICKER`, which is the authority.
+DEFAULT_TICKER = apple_models.DEFAULT_TICKER
 
 # The two entry triggers. See the module docstring for what separates them and
 # `agent_stonks.config` for why `anticipate` is the default.
@@ -330,8 +347,11 @@ ENTRY_MODE_PROB_LABEL = {
 class AppleTraderConfig:
     """Tunables of the loop, for both strategies.
 
-    `model_key` comes first because it decides which of the others are even
-    read: it names the model, and a model names its rule set. On the momentum
+    `ticker` and `model_key` come first because between them they decide which
+    of the others are even read -- and they constrain each other: a model
+    exists for a symbol or it does not (`apple_models.keys_for`), so the pair
+    is validated together by `model_ticker_error`. `model_key` names the model,
+    and a model names its rule set. On the momentum
     strategy `entry_mode`, `prob_threshold`, `trail_pct` and
     `reversal_threshold` are the four that change what the agent does; on the
     day-range strategy it is `buy_k` and `sell_k`, and the momentum four are
@@ -350,6 +370,9 @@ class AppleTraderConfig:
     # Which saved model the agent runs on -- a key of `apple_models.MODELS`.
     # Its `strategy` decides the rules; see `build_trader`.
     model_key: str = APPLE_TRADER_MODEL
+    # The one symbol this run trades. Not free: it has to be one the chosen
+    # model was fitted on, which is why the two are checked together.
+    ticker: str = DEFAULT_TICKER
     # Which question to ask it: buy the predicted turn, or the confirmed one.
     # `anticipate` requires a model that can forecast, which is checked before
     # the loop starts rather than discovered on the first candidate.
@@ -374,6 +397,7 @@ class AppleTraderConfig:
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
 
     def __post_init__(self) -> None:
+        self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
         if self.entry_mode not in ENTRY_MODES:
             raise ValueError(
                 f"unknown entry_mode {self.entry_mode!r}; expected one of {ENTRY_MODES}"
@@ -422,6 +446,11 @@ def config_signature(
     unrelated. The entry mode follows it because the same model answers a
     different question in each.
 
+    The symbol is in the string for the same reason the model is: the same
+    levels over GOOGL are a different experiment from the same levels over
+    AAPL, and a record written before the instrument was configurable signs as
+    the AAPL run it was.
+
     The forecast exit appears only when it is armed, so a rule set that does not
     use it signs exactly as it did before the setting existed -- runs recorded
     then and runs configured now really are the same strategy, and Results
@@ -434,14 +463,14 @@ def config_signature(
     model = apple_models.get(c.model_key)
     if model.strategy == apple_models.STRATEGY_DAYRANGE:
         return (
-            f"{model.key}_{TICKER}(buy=H-{c.buy_k:g}A,sell=H-{c.sell_k:g}A,"
+            f"{model.key}_{c.ticker}(buy=H-{c.buy_k:g}A,sell=H-{c.sell_k:g}A,"
             f"size={c.position_pct:g}%)"
         )
     threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
     shown = f"{threshold:g}" if threshold is not None else "model"
     reversal = f",rev>={c.reversal_threshold:g}" if c.sells_on_reversal else ""
     return (
-        f"{model.key}_{TICKER}({c.entry_mode},p>={shown},"
+        f"{model.key}_{c.ticker}({c.entry_mode},p>={shown},"
         f"trail={c.trail_pct:g}%{reversal},size={c.position_pct:g}%)"
     )
 
@@ -495,6 +524,32 @@ def reversal_exit_error(config: AppleTraderConfig, bundle: "dict | None") -> "st
     )
 
 
+def model_ticker_error(config: AppleTraderConfig) -> "str | None":
+    """Why this model cannot trade this symbol, or None if it can.
+
+    The one check here that needs no bundle, because it is about a model that
+    was never fitted rather than one that failed to load -- and those are
+    different problems with different fixes. Left to the loader it would
+    surface as "no model at <path>", sending the reader to look for a file that
+    was never meant to exist.
+    """
+    if apple_models.covers(config.model_key, config.ticker):
+        return None
+    model = apple_models.get(config.model_key)
+    alternatives = ", ".join(
+        apple_models.get(key).label for key in apple_models.keys_for(config.ticker)
+    )
+    remedy = (
+        f"Pick one of the models {config.ticker} has ({alternatives})"
+        if alternatives
+        else f"Nothing here was fitted on {config.ticker}, so pick another instrument"
+    )
+    return (
+        f"{model.label} was fitted on {', '.join(model.tickers)} only and nothing "
+        f"claims it transfers, so it cannot trade {config.ticker}. {remedy}."
+    )
+
+
 def config_error(config: AppleTraderConfig, bundle: "dict | None") -> "str | None":
     """The first reason this rule set cannot run on this bundle, or None.
 
@@ -502,7 +557,11 @@ def config_error(config: AppleTraderConfig, bundle: "dict | None") -> "str | Non
     later is checked everywhere it needs to be rather than in whichever launch
     path was remembered.
     """
-    return entry_mode_error(config, bundle) or reversal_exit_error(config, bundle)
+    return (
+        model_ticker_error(config)
+        or entry_mode_error(config, bundle)
+        or reversal_exit_error(config, bundle)
+    )
 
 
 def _forecasters() -> str:
@@ -527,7 +586,7 @@ def _dayrange():
     return dayrange_model
 
 
-def fetch_opening_window(state: AppState, frame, want: int, ticker: str = TICKER):
+def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAULT_TICKER):
     """The first `want` regular-session bars of today, or a clear failure.
 
     The live buffer normally holds them -- it keeps the whole session -- but an
@@ -590,6 +649,9 @@ class AppleTrader:
         self, config: "AppleTraderConfig | None" = None, model_threshold: float = 0.5
     ) -> None:
         self.config = config or AppleTraderConfig()
+        # The symbol every read, order and log line below is about. Off the
+        # config once: it does not change mid-run.
+        self.ticker = self.config.ticker
         # The bundle's own cut-off, used when the config doesn't override it.
         self.model_threshold = model_threshold
         # The open long: entry price, the running peak the stop trails, and how
@@ -617,9 +679,15 @@ class AppleTrader:
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome
         tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(TICKER)
+        sym_state = state.sym(self.ticker)
         if sym_state is None:
-            _log(state, {"type": "error", "text": f"{TICKER} is not being streamed; nothing to trade."})
+            _log(
+                state,
+                {
+                    "type": "error",
+                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
+                },
+            )
             return "no_data"
 
         if not market_hours.is_market_open():
@@ -629,7 +697,7 @@ class AppleTrader:
             )
             return "closed"
 
-        position = tracker.position_for(TICKER)
+        position = tracker.position_for(self.ticker)
         frame = persistence_model.minute_frame(sym_state)
         # The reversal question costs a full forecast on every bar it is asked
         # on, and only an open position can act on the answer -- so it is asked
@@ -647,7 +715,12 @@ class AppleTrader:
             # session's first `horizon` minutes before it produces a number.
             _log(
                 state,
-                {"type": "status", "text": f"No scoreable {TICKER} bar yet; momentum is still forming."},
+                {
+                    "type": "status",
+                    "text": (
+                        f"No scoreable {self.ticker} bar yet; momentum is still forming."
+                    ),
+                },
             )
             return "no_data"
 
@@ -791,13 +864,20 @@ class AppleTrader:
         if quantity <= 0:
             _log(
                 state,
-                {"type": "status", "text": f"Entry signal confirmed but ${cash:,.2f} cash buys no {TICKER}."},
+                {
+                    "type": "status",
+                    "text": (
+                        f"Entry signal confirmed but ${cash:,.2f} cash buys no "
+                        f"{self.ticker}."
+                    ),
+                },
             )
             return False
 
         reasoning = self._entry_reasoning(read)
         decision = tracker.record_trade(
-            TICKER, "buy", quantity, reasoning, state.api_key, state.api_secret, state.feed
+            self.ticker, "buy", quantity, reasoning, state.api_key, state.api_secret,
+            state.feed
         )
         self._log_decision(state, decision, read)
         if decision.status == "filled":
@@ -840,7 +920,8 @@ class AppleTrader:
         self, state: AppState, tracker: DecisionTracker, quantity: float, read: dict, reasoning: str
     ) -> None:
         decision = tracker.record_trade(
-            TICKER, "sell", quantity, reasoning, state.api_key, state.api_secret, state.feed
+            self.ticker, "sell", quantity, reasoning, state.api_key, state.api_secret,
+            state.feed
         )
         self._log_decision(state, decision, read)
         if decision.status == "filled":
@@ -850,7 +931,7 @@ class AppleTrader:
 
     def _read_summary(self, read: dict, position: float) -> str:
         parts = [
-            f"{TICKER} {read['ts']:%H:%M} ${read['price']:,.2f}",
+            f"{self.ticker} {read['ts']:%H:%M} ${read['price']:,.2f}",
             f"momentum {read['mom']:+.2f} "
             f"({persistence_model.regime_name(read['regime'])})",
         ]
@@ -973,6 +1054,7 @@ class DayRangeTrader:
 
     def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
         self.config = config or AppleTraderConfig()
+        self.ticker = self.config.ticker
         # The session's forecast and the two levels derived from it, or None
         # before 9:35. Keyed by date so a multi-day run re-forecasts each
         # morning rather than trading Tuesday off Monday's levels.
@@ -990,9 +1072,15 @@ class DayRangeTrader:
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome
         tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(TICKER)
+        sym_state = state.sym(self.ticker)
         if sym_state is None:
-            _log(state, {"type": "error", "text": f"{TICKER} is not being streamed; nothing to trade."})
+            _log(
+                state,
+                {
+                    "type": "error",
+                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
+                },
+            )
             return "no_data"
 
         if not market_hours.is_market_open():
@@ -1007,7 +1095,10 @@ class DayRangeTrader:
 
         frame = persistence_model.minute_frame(sym_state)
         if not len(frame):
-            _log(state, {"type": "status", "text": f"No {TICKER} bars yet today."})
+            _log(
+                state,
+                {"type": "status", "text": f"No {self.ticker} bars yet today."},
+            )
             return "no_data"
 
         want = _dayrange().opening_minutes(bundle)
@@ -1020,7 +1111,8 @@ class DayRangeTrader:
                     {
                         "type": "status",
                         "text": (
-                            f"{len(frame)} of the first {want} {TICKER} minutes are in; the "
+                            f"{len(frame)} of the first {want} {self.ticker} minutes are in; "
+                            "the "
                             "day's high cannot be forecast until the opening window closes."
                         ),
                     },
@@ -1035,7 +1127,7 @@ class DayRangeTrader:
         if fresh_bar:
             self.last_bar_ts = ts
 
-        position = tracker.position_for(TICKER)
+        position = tracker.position_for(self.ticker)
         if position > 0 and self.entry is None:
             # A position without a remembered entry (agent restarted onto an
             # existing ledger): adopt it, so the log reads honestly. The exit
@@ -1106,12 +1198,12 @@ class DayRangeTrader:
             dayrange = _dayrange()
             history = dayrange.daily_frame_from_bars(
                 historical.fetch_daily_ohlc_bars(
-                    TICKER, days=dayrange.DAILY_HISTORY_DAYS
+                    self.ticker, days=dayrange.DAILY_HISTORY_DAYS
                 )
             )
             forecast = dayrange.forecast_session(
                 bundle, history, opening, today,
-                open_price=historical.fetch_session_open(TICKER),
+                open_price=historical.fetch_session_open(self.ticker),
             )
         except Exception as exc:
             self.blocked = {"date": today, "reason": str(exc)}
@@ -1120,7 +1212,8 @@ class DayRangeTrader:
                 {
                     "type": "error",
                     "text": (
-                        f"Apple Trader cannot forecast today's {TICKER} range, so it will not "
+                        f"Apple Trader cannot forecast today's {self.ticker} range, so it "
+                        "will not "
                         f"trade this session: {exc}"
                     ),
                 },
@@ -1143,7 +1236,7 @@ class DayRangeTrader:
         return True
 
     def _opening_window(self, state: AppState, frame, want: int):
-        return fetch_opening_window(state, frame, want)
+        return fetch_opening_window(state, frame, want, ticker=self.ticker)
 
     # --- the check on an open position -------------------------------------
 
@@ -1192,12 +1285,17 @@ class DayRangeTrader:
         if quantity <= 0:
             _log(
                 state,
-                {"type": "status", "text": f"Buy level touched but ${cash:,.2f} cash buys no {TICKER}."},
+                {
+                    "type": "status",
+                    "text": (
+                        f"Buy level touched but ${cash:,.2f} cash buys no {self.ticker}."
+                    ),
+                },
             )
             return False
 
         decision = tracker.record_trade(
-            TICKER, "buy", quantity, self._entry_reasoning(bar),
+            self.ticker, "buy", quantity, self._entry_reasoning(bar),
             state.api_key, state.api_secret, state.feed,
         )
         self._log_decision(state, decision)
@@ -1220,7 +1318,8 @@ class DayRangeTrader:
         self, state: AppState, tracker: DecisionTracker, quantity: float, bar, reasoning: str
     ) -> None:
         decision = tracker.record_trade(
-            TICKER, "sell", quantity, reasoning, state.api_key, state.api_secret, state.feed
+            self.ticker, "sell", quantity, reasoning, state.api_key, state.api_secret,
+            state.feed
         )
         self._log_decision(state, decision)
         if decision.status == "filled":
@@ -1231,7 +1330,7 @@ class DayRangeTrader:
     def _plan_summary(self) -> str:
         plan = self.plan
         return (
-            f"{TICKER} forecast for the session, from the first "
+            f"{self.ticker} forecast for the session, from the first "
             f"{plan['opening_end']:%H:%M} minutes: high ${plan['pred_high']:,.2f}, low "
             f"${plan['pred_low']:,.2f} (yesterday's average ${plan['prev_avg']:,.2f}, "
             f"14-day average range ${plan['adr14_abs']:,.2f}). Buy at "
@@ -1243,7 +1342,7 @@ class DayRangeTrader:
         price = float(bar["close"])
         plan = self.plan
         parts = [
-            f"{TICKER} {ts:%H:%M} ${price:,.2f}",
+            f"{self.ticker} {ts:%H:%M} ${price:,.2f}",
             f"buy ${plan['buy_level']:,.2f} ({price - plan['buy_level']:+.2f})",
             f"sell ${plan['sell_level']:,.2f} ({price - plan['sell_level']:+.2f})",
         ]
@@ -1303,7 +1402,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict, trader) -> st
         return (
             f"Apple Trader armed on {model.label} (fitted "
             f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
-            f"today's {TICKER} high and low will land, then rests a buy "
+            f"today's {config.ticker} high and low will land, then rests a buy "
             f"{config.buy_k:g} average daily ranges below the predicted high and a sell "
             f"{config.sell_k:g} below it, until the closing flatten."
         )
@@ -1317,7 +1416,8 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict, trader) -> st
     return (
         f"Apple Trader armed on {model.label} (fitted "
         f"{bundle.get('trained_at', 'unknown')}, held-out AUC "
-        f"{metrics.get('roc_auc', float('nan')):.2f}): watching every {TICKER} minute "
+        f"{metrics.get('roc_auc', float('nan')):.2f}): watching every {config.ticker} "
+        "minute "
         f"bar for a regime change into positive momentum, buying one the model rates "
         f"at least {trader.prob_threshold:.0%} likely to persist, and exiting on "
         f"{exit_rule}."
@@ -1343,14 +1443,23 @@ def _apple_trader_loop(
     stop_event: threading.Event,
 ) -> None:
     model = apple_models.get(config.model_key)
-    bundle = apple_models.load(config.model_key)
+    # The pairing check runs before the load, so "there is no GOOGL N-BEATS
+    # model" is never reported as a file that failed to appear.
+    pairing = model_ticker_error(config)
+    if pairing is not None:
+        _log(state, {"type": "error", "text": pairing})
+        scoring.end_session(state, tracker)
+        state.agent_running = False
+        return
+
+    bundle = apple_models.load(config.model_key, config.ticker)
     if bundle is None:
         _log(
             state,
             {
                 "type": "error",
                 "text": (
-                    f"{apple_models.unavailable_reason(config.model_key)} "
+                    f"{apple_models.unavailable_reason(config.model_key, config.ticker)} "
                     f"Apple Trader cannot run without it."
                 ),
             },
@@ -1391,17 +1500,19 @@ def launch_apple_trader(
 ) -> None:
     """Stop any running agent for this state, then start the Apple Trader loop.
 
-    It trades only `TICKER`, which must already be streamed. No LLM client, no
-    tools and no tactics are involved -- the loop places its own orders through
-    the same `DecisionTracker` as every other personality.
+    It trades only the one symbol its config names, which must already be
+    streamed. No LLM client, no tools and no tactics are involved -- the loop
+    places its own orders through the same `DecisionTracker` as every other
+    personality.
     """
+    config = config or AppleTraderConfig()
     stop_agent(state)
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
-    scoring.begin_session(state, APPLE_TRADER_KEY, [TICKER])
+    scoring.begin_session(state, APPLE_TRADER_KEY, [config.ticker])
     threading.Thread(
         target=_apple_trader_loop,
-        args=(state, tracker, config or AppleTraderConfig(), cycle_sec, stop_event),
+        args=(state, tracker, config, cycle_sec, stop_event),
         daemon=True,
     ).start()
