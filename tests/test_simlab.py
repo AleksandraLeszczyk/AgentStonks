@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -15,7 +16,8 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
     config_signature,
 )
-from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY
+from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
+from simlab import app as sim_app
 from simlab import data as sim_data
 from simlab import prompts as sim_prompts
 from simlab import results as sim_results
@@ -1011,6 +1013,188 @@ class TestDayRangeEngine:
         ).startswith("dayrange_AAPL(buy=")
 
 
+class TestMomentumChangeEngine:
+    """The delta-momentum rules replayed end to end on the engine.
+
+    The estimator is stubbed -- `tests/test_momentum_change_model.py` pins the model
+    against momlib itself -- so what this covers is the wiring, and one part of
+    it exists nowhere else in the app: this is the only strategy that reads
+    **minute bars from days before the one being simulated**. Live that is six
+    yfinance downloads; inside a run it has to be the dataset's stored bars,
+    reached through the patched `fetch_intraday_bars_for_date`. A run that
+    quietly fetched wall-clock history instead would still trade, and every
+    regime it traded would be wrong.
+    """
+
+    SYMBOL = "GOOGL"
+    # 09:30 ET on six quiet sessions, then the one that trades. Short days: the
+    # rules need twenty bars of warm-up and nothing here needs a real session,
+    # so `MIN_BARS_PER_DAY` is lowered to match rather than writing 2,700 bars.
+    HISTORY_DAYS = [date(2026, 6, d) for d in (5, 8, 9, 10, 11, 12)]
+    BARS_PER_HISTORY_DAY = 40
+
+    def _prices(self) -> list[float]:
+        """Flat, then a slide into a negative regime, then a recovery through
+        balanced into positive -- the two bars the rules are written for."""
+        return (
+            [100.0] * 22
+            + [100.0 - 0.02 * (i + 1) for i in range(18)]
+            + [99.64 + 0.04 * (i + 1) for i in range(25)]
+        )
+
+    @pytest.fixture()
+    def momentum_change_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
+        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
+        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
+        monkeypatch.setattr(momentum_change, "MIN_BARS_PER_DAY", 20)
+        momentum_change.reset_history_cache()
+
+        for day in self.HISTORY_DAYS:
+            open_utc = datetime.combine(
+                day, datetime.min.time(), tzinfo=timezone.utc
+            ).replace(hour=13, minute=30)
+            # A gentle wiggle rather than a flat line: `theta` is 0.4 times the
+            # previous session's minute volatility, and a session with none
+            # would make every regime threshold zero.
+            bars = [
+                _bar(open_utc + timedelta(minutes=i), 100.0 * (1 + 0.0002 * ((-1) ** i)))
+                for i in range(self.BARS_PER_HISTORY_DAY)
+            ]
+            sim_data._write_gz(sim_data.bars_path(self.SYMBOL, day), bars)
+
+        sim_data._write_gz(
+            sim_data.bars_path(self.SYMBOL, DAY),
+            [
+                _bar(OPEN_UTC + timedelta(minutes=i), price)
+                for i, price in enumerate(self._prices())
+            ],
+        )
+        sim_data._write_gz(sim_data.daily_path(self.SYMBOL), {
+            "symbol": self.SYMBOL, "start": "2026-05-16", "end": "2026-06-15", "bars": [],
+        })
+        return self.SYMBOL
+
+    def _stub_bundle(self, monkeypatch) -> dict:
+        """A bundle whose estimator reads the regime out of the feature row.
+
+        Deterministic and direction-aware, which is what makes both rules
+        reachable on one tape: a turn called up out of the negative regime, and
+        the same regime called over once it is positive.
+        """
+        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
+
+        class Scripted:
+            def predict(self, X):
+                regime = X["regime_before"].to_numpy(float)
+                return np.where(regime < 0, 0.9, np.where(regime > 0, -0.9, 0.0))
+
+        bundle = {
+            "estimator": Scripted(),
+            "feature_cols": list(momentum_change.FEATURE_COLS),
+            "pipeline_params": dict(momentum_change.PIPELINE_DEFAULTS),
+            "model_name": "Scripted",
+            "metrics": {},
+            "saved_at": "2026-09-07",
+        }
+        monkeypatch.setattr(momentum_change, "load_bundle", lambda ticker=None: bundle)
+        return bundle
+
+    def _run(self, monkeypatch, days: "list[date] | None" = None, **overrides):
+        self._stub_bundle(monkeypatch)
+        rules = {
+            "model_key": "momentum_change", "ticker": self.SYMBOL,
+            # The two risk exits are pinned by the unit tests; widened here so
+            # this one is about the wiring rather than about which rule fires
+            # first on a synthetic slide.
+            "m1_mult": -6.0, "stop_pct": 5.0,
+            **overrides,
+        }
+        run_days = self.HISTORY_DAYS + [DAY] if days is None else days
+        market = SimMarket([self.SYMBOL], run_days)
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
+            model=config_signature(AppleTraderConfig(**rules)), api_key="",
+            symbols=[self.SYMBOL], days=run_days, starting_cash=10_000.0,
+            rule_config=rules,
+        )
+        return SimulationEngine(market, config).run()
+
+    def test_it_buys_the_called_turn_and_sells_the_called_top(
+        self, momentum_change_store, monkeypatch
+    ):
+        result = self._run(monkeypatch)
+        assert result.error is None
+        actions = [(d["action"], d["status"]) for d in result.decisions]
+        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
+        buy, sell = result.decisions[0], result.decisions[1]
+        assert "negative momentum regime" in buy["reasoning"]
+        assert "Model exit" in sell["reasoning"]
+        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
+        # Bought into the slide and sold into the recovery, which is the shape
+        # of the rule rather than an accident of the tape.
+        assert float(sell["price"]) > float(buy["price"])
+
+    def test_the_previous_sessions_come_from_the_dataset_not_the_network(
+        self, momentum_change_store, monkeypatch
+    ):
+        """The one leak this strategy could have. `fetch_intraday_bars_for_date`
+        live is a yfinance download for a wall-clock date; unpatched inside a
+        run it would hand the model six real sessions from 2026-09 while the
+        simulated day is 2026-06-15."""
+        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
+        calls: list = []
+        real = momentum_change.history_bars
+
+        def spy(ticker, session_date, **kwargs):
+            bars = real(ticker, session_date, **kwargs)
+            calls.append((str(session_date)[:10], len(bars)))
+            return bars
+
+        monkeypatch.setattr(momentum_change, "history_bars", spy)
+        result = self._run(monkeypatch)
+        assert result.error is None
+
+        fetched = dict(calls)
+        assert fetched[str(DAY)] == len(self.HISTORY_DAYS) * self.BARS_PER_HISTORY_DAY
+        # Every session the model saw is one the dataset holds, and all of them
+        # finished before the simulated day.
+        assert max(d for d, _ in calls) == str(DAY)
+
+    def test_a_dataset_with_nothing_behind_it_refuses_rather_than_trades(
+        self, momentum_change_store, monkeypatch
+    ):
+        """The regime threshold is yesterday's volatility, so the first day of
+        a dataset has nothing to build one from. Scoring anyway would produce
+        confident numbers off a threshold the model never saw -- so the day is
+        skipped, once, in the log."""
+        result = self._run(monkeypatch, days=[DAY])
+        assert result.error is None
+        assert not [d for d in result.decisions if d["action"] == "buy"]
+
+    def test_the_run_is_filed_under_its_own_signature(
+        self, momentum_change_store, monkeypatch
+    ):
+        result = self._run(monkeypatch)
+        assert result.error is None
+        assert result.config_summary["rule_config"]["ticker"] == self.SYMBOL
+        assert result.config_summary["model"].startswith("momentum_change_GOOGL(")
+
+    def test_a_missing_bundle_fails_loudly(self, momentum_change_store, monkeypatch):
+        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
+        monkeypatch.setattr(momentum_change, "load_bundle", lambda ticker=None: None)
+        market = SimMarket([self.SYMBOL], [DAY])
+        config = SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
+            api_key="", symbols=[self.SYMBOL], days=[DAY],
+            rule_config={"model_key": "momentum_change", "ticker": self.SYMBOL},
+        )
+        result = SimulationEngine(market, config).run()
+        error = result.error or ""
+        assert "momentum_change_GOOGL.joblib" in error
+
+
+
 class TestAppleTrader2Engine:
     """Apple Trader 2 on the same rule day loop, driven by a rule list.
 
@@ -1806,3 +1990,174 @@ class TestPriceChartSessions:
         from simlab.app import _price_chart
 
         assert _price_chart("AAPL", [], []) is not None
+
+
+class TestRuleSetupSlots:
+    """The Simulate tab's per-agent setup slots.
+
+    A slot is an opaque id owning one set of widget keys, which is the whole
+    point: removing the middle of three setups must leave the other two's
+    inputs where they were, and indexing by position would shuffle them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def session(self, monkeypatch):
+        state: dict = {}
+        monkeypatch.setattr(sim_app.st, "session_state", state)
+        return state
+
+    def test_an_agent_starts_with_one_setup(self):
+        assert len(sim_app._rule_slots(APPLE_TRADER_KEY)) == 1
+
+    def test_adding_appends_a_new_distinct_slot(self):
+        first = list(sim_app._rule_slots(APPLE_TRADER_KEY))
+        sim_app._add_rule_slot(APPLE_TRADER_KEY)
+        slots = sim_app._rule_slots(APPLE_TRADER_KEY)
+        assert len(slots) == 2
+        assert slots[0] == first[0]
+        assert slots[0] != slots[1]
+
+    def test_removing_the_middle_leaves_the_others_untouched(self):
+        for _ in range(2):
+            sim_app._add_rule_slot(APPLE_TRADER_KEY)
+        first, middle, last = sim_app._rule_slots(APPLE_TRADER_KEY)
+        sim_app._drop_rule_slot(APPLE_TRADER_KEY, middle)
+        assert sim_app._rule_slots(APPLE_TRADER_KEY) == [first, last]
+
+    def test_the_last_setup_cannot_be_removed(self):
+        only = sim_app._rule_slots(APPLE_TRADER_KEY)[0]
+        sim_app._drop_rule_slot(APPLE_TRADER_KEY, only)
+        assert sim_app._rule_slots(APPLE_TRADER_KEY) == [only]
+
+    def test_removing_an_unknown_slot_is_a_no_op(self):
+        slots = list(sim_app._rule_slots(APPLE_TRADER_KEY))
+        sim_app._add_rule_slot(APPLE_TRADER_KEY)
+        sim_app._drop_rule_slot(APPLE_TRADER_KEY, "not-a-slot")
+        assert sim_app._rule_slots(APPLE_TRADER_KEY)[0] == slots[0]
+
+    def test_the_two_agents_keep_separate_slots(self):
+        sim_app._add_rule_slot(APPLE_TRADER_KEY)
+        assert len(sim_app._rule_slots(APPLE_TRADER_KEY)) == 2
+        assert len(sim_app._rule_slots(APPLE_TRADER2_KEY)) == 1
+
+
+class TestRuleCombinations:
+    """Several setups of one agent are several experiments."""
+
+    def setups(self, *configs):
+        return {APPLE_TRADER_KEY: list(configs)}
+
+    def test_one_combination_per_setup_per_dataset(self):
+        setups = self.setups(
+            AppleTraderConfig(trail_pct=0.35),
+            AppleTraderConfig(trail_pct=0.50),
+        )
+        combos, _ = sim_app._rule_combinations(setups, ["ds1", "ds2"])
+        assert len(combos) == 4
+        assert {c[3] for c in combos} == {"ds1", "ds2"}
+
+    def test_each_setup_gets_its_own_signature(self):
+        setups = self.setups(
+            AppleTraderConfig(trail_pct=0.35),
+            AppleTraderConfig(trail_pct=0.50),
+        )
+        combos, _ = sim_app._rule_combinations(setups, ["ds1"])
+        assert len({c[2] for c in combos}) == 2
+
+    def test_a_combination_maps_back_to_the_settings_that_made_it(self):
+        slow, fast = AppleTraderConfig(trail_pct=0.35), AppleTraderConfig(trail_pct=0.50)
+        combos, by_combo = sim_app._rule_combinations(self.setups(slow, fast), ["ds1"])
+        assert [by_combo[c].trail_pct for c in combos] == [0.35, 0.50]
+
+    def test_two_identical_setups_are_one_experiment(self):
+        """Identical settings are the same configuration; Results would file
+        the two runs as one row whatever this did."""
+        same = AppleTraderConfig(trail_pct=0.35)
+        combos, _ = sim_app._rule_combinations(self.setups(same, same), ["ds1"])
+        assert len(combos) == 1
+
+    def test_setups_the_signature_cannot_tell_apart_are_one_experiment(self):
+        """The closing flatten is in neither agent's signature.
+
+        So two setups differing only in it are one configuration everywhere
+        downstream -- the run record's `model` field, the already-tested check
+        and the Results grouping are all that string. Queueing both would
+        produce two runs shown as a single row.
+        """
+        combos, _ = sim_app._rule_combinations(
+            self.setups(
+                AppleTraderConfig(flatten_before_close_min=5),
+                AppleTraderConfig(flatten_before_close_min=9),
+            ),
+            ["ds1"],
+        )
+        assert len(combos) == 1
+
+    def test_setups_on_different_instruments_are_different_combinations(self):
+        combos, _ = sim_app._rule_combinations(
+            {APPLE_TRADER_KEY: [
+                AppleTraderConfig(model_key="dayrange", ticker="AAPL"),
+                AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
+            ]},
+            ["ds1"],
+        )
+        assert len(combos) == 2
+        assert len({c[2] for c in combos}) == 2
+
+    def test_both_agents_contribute_their_own_setups(self):
+        combos, _ = sim_app._rule_combinations(
+            {
+                APPLE_TRADER_KEY: [
+                    AppleTraderConfig(trail_pct=0.35),
+                    AppleTraderConfig(trail_pct=0.50),
+                ],
+                APPLE_TRADER2_KEY: [AppleTrader2Config()],
+            },
+            ["ds1"],
+        )
+        assert len(combos) == 3
+        assert {c[0] for c in combos} == {APPLE_TRADER_KEY, APPLE_TRADER2_KEY}
+
+    def test_no_datasets_is_no_combinations(self):
+        assert sim_app._rule_combinations(self.setups(AppleTraderConfig()), []) == ([], {})
+
+
+class TestRuleSetupTickerCheck:
+    """A setup whose symbol a dataset does not carry cannot trade at all."""
+
+    def scope(self, **symbols_by_name):
+        return {name: {"symbols": syms} for name, syms in symbols_by_name.items()}
+
+    def test_a_setup_the_dataset_covers_is_not_reported(self):
+        missing = sim_app._rule_agents_missing_ticker(
+            {APPLE_TRADER_KEY: [AppleTraderConfig(ticker="AAPL")]},
+            self.scope(ds1=["AAPL", "SPY"]), ["ds1"],
+        )
+        assert missing == []
+
+    def test_only_the_setup_that_is_missing_is_reported(self):
+        missing = sim_app._rule_agents_missing_ticker(
+            {APPLE_TRADER_KEY: [
+                AppleTraderConfig(model_key="dayrange", ticker="AAPL"),
+                AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
+            ]},
+            self.scope(ds1=["AAPL"]), ["ds1"],
+        )
+        assert missing == [(APPLE_TRADER_KEY, "GOOGL", ["ds1"])]
+
+    def test_one_symbol_is_reported_once_however_many_setups_use_it(self):
+        missing = sim_app._rule_agents_missing_ticker(
+            {APPLE_TRADER_KEY: [
+                AppleTraderConfig(ticker="AAPL", trail_pct=0.35),
+                AppleTraderConfig(ticker="AAPL", trail_pct=0.50),
+            ]},
+            self.scope(ds1=["SPY"]), ["ds1"],
+        )
+        assert missing == [(APPLE_TRADER_KEY, "AAPL", ["ds1"])]
+
+    def test_every_dataset_missing_the_symbol_is_named(self):
+        missing = sim_app._rule_agents_missing_ticker(
+            {APPLE_TRADER_KEY: [AppleTraderConfig(ticker="AAPL")]},
+            self.scope(ds1=["SPY"], ds2=["AAPL"], ds3=[]), ["ds1", "ds2", "ds3"],
+        )
+        assert missing == [(APPLE_TRADER_KEY, "AAPL", ["ds1", "ds3"])]

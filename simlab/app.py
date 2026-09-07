@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -16,7 +17,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from agent_stonks import apple_models, clock, model_overlays, persistence_model
+from agent_stonks import (
+    apple_models,
+    clock,
+    model_overlays,
+    momentum_change_model,
+    persistence_model,
+)
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
@@ -385,8 +392,8 @@ def _render_apple_rules() -> None:
                 ":material/candlestick_chart: Fitted on "
                 + ", ".join(model.tickers)
                 + (
-                    " — one bundle per symbol, each with its own daily models, its own "
-                    "opening ridge and its own held-out numbers."
+                    " — one bundle per symbol, each fitted, selected and measured on "
+                    "that symbol's own days."
                     if len(model.tickers) > 1
                     else ". Nothing claims it transfers, so it is the only instrument "
                          "this model can be run on."
@@ -412,6 +419,9 @@ def _render_apple_rules() -> None:
                     continue
                 if model.strategy == apple_models.STRATEGY_DAYRANGE:
                     _render_dayrange_bundle(bundle)
+                    continue
+                if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
+                    _render_momentum_change_bundle(bundle)
                     continue
                 metrics = bundle.get("metrics") or {}
                 cols = st.columns(4)
@@ -470,6 +480,42 @@ def _render_dayrange_bundle(bundle: dict) -> None:
          "opening_correction_gain": metadata.get("opening_correction_loo_gain")},
         expanded=False,
     )
+
+
+def _render_momentum_change_bundle(bundle: dict) -> None:
+    """The delta-momentum bundle's provenance, in its own units.
+
+    Two things this panel is careful about. The headline numbers are the
+    **holdout week's** -- five sessions removed before the estimator was fitted
+    *or* chosen -- rather than the validation days the selection ran on, because
+    the latter are only out-of-sample for fitting. And the R2 is on a bps/min
+    quantity, so it shares no scale with the AUCs above or the dollars below.
+    """
+    metrics = bundle.get("metrics") or {}
+    days = bundle.get("train_days") or []
+    cols = st.columns(4)
+    cols[0].metric("Estimator", bundle.get("model_name", "?"))
+    cols[1].metric("Holdout R²", f"{metrics.get('holdout_r2', float('nan')):.2f}")
+    cols[2].metric(
+        "Sign on changes", f"{metrics.get('holdout_sign_hit_rate_on_changes', float('nan')):.0%}"
+    )
+    cols[3].metric(
+        "MAE vs predict-zero",
+        f"{metrics.get('holdout_mae', float('nan')):.2f}",
+        delta=f"{metrics.get('holdout_mae', 0) - metrics.get('holdout_mae_predict_zero', 0):+.2f}",
+        delta_color="inverse",
+    )
+    st.caption(
+        f"{bundle.get('model_name', '?')} chosen on validation days and fitted "
+        f"{bundle.get('saved_at', '?')} on {len(days)} training days "
+        f"({days[0] if days else '?'} … {days[-1] if days else '?'}). The figures above "
+        f"are from the {int(metrics.get('n_holdout_days', 0))} reserved sessions, used "
+        "neither for fitting nor for selection. Target is Δ momentum in bps/min, so the "
+        "R² is not comparable to the AUCs above or the dollar errors below. "
+        f"{bundle.get('notes', '')}"
+    )
+    st.json({"metrics": metrics, "pipeline_params": bundle.get("pipeline_params")},
+            expanded=False)
 
 
 def render_agents_tab() -> None:
@@ -1140,54 +1186,178 @@ def _render_model_picker() -> tuple[list[tuple[str, str]], dict[str, str]]:
     return model_choices, api_keys
 
 
-def _rule_agents_missing_ticker(
-    rule_configs: dict, dataset_scope: dict, selected_names: list[str]
-) -> dict[str, list[str]]:
-    """Rule agent -> the selected datasets that do not carry the symbol its
-    configuration trades.
+def _rule_combinations(
+    rule_setups: dict, dataset_names: list[str]
+) -> "tuple[list[tuple], dict[tuple, object]]":
+    """(combinations, combination -> the settings that produced it).
 
-    A dataset without it is not a strategy result, it is a run that cannot
-    trade, so it is worth catching before the experiments are queued. Keyed on
-    the config rather than the agent because Apple Trader 2's symbol is one of
-    its settings.
+    A rule agent has no model dimension, so its own settings stand in for one:
+    each setup is queued against each dataset as its own experiment, and lands
+    in Results as its own configuration. That is what makes a threshold sweep
+    or a two-instrument comparison one batch rather than several trips through
+    this tab.
+
+    The combination is keyed on the agent's **signature**, which is what makes
+    two setups that sign the same collapse into one experiment rather than
+    running the same thing twice. Signature rather than settings on purpose:
+    the signature is the identity the whole pipeline uses -- it is the run
+    record's `model` field, what `_render_already_tested` matches on and what
+    Results groups by -- so two setups sharing one would produce two runs shown
+    as a single row whatever this did. Not every field is in it (neither
+    agent's carries the closing flatten), so setups can differ on screen and
+    still be one configuration; `_render_agent_setups` says so when they do.
     """
-    missing: dict[str, list[str]] = {}
-    for personality, config in rule_configs.items():
-        ticker = rule_agent(personality).ticker(config)
-        names = [
-            name for name in selected_names
-            if ticker not in (dataset_scope[name]["symbols"] or [])
-        ]
-        if names:
-            missing[personality] = names
+    combos: list[tuple] = []
+    by_combo: dict[tuple, object] = {}
+    for name in dataset_names:
+        for personality, configs in rule_setups.items():
+            agent = rule_agent(personality)
+            for config in configs:
+                combo = (personality, RULE_PROVIDER, agent.signature(config), name)
+                if combo not in by_combo:
+                    combos.append(combo)
+                by_combo[combo] = config
+    return combos, by_combo
+
+
+def _rule_agents_missing_ticker(
+    rule_setups: dict, dataset_scope: dict, selected_names: list[str]
+) -> list[tuple[str, str, list[str]]]:
+    """(agent, symbol, datasets that do not carry it) for every setup that
+    cannot be replayed.
+
+    A dataset without the symbol is not a strategy result, it is a run that
+    cannot trade, so it is worth catching before the experiments are queued.
+    Grouped by *symbol* rather than by agent, because one agent can now be
+    queued several times over different instruments and only some of them may
+    be missing.
+    """
+    missing: list[tuple[str, str, list[str]]] = []
+    for personality, configs in rule_setups.items():
+        agent = rule_agent(personality)
+        for ticker in dict.fromkeys(agent.ticker(config) for config in configs):
+            names = [
+                name for name in selected_names
+                if ticker not in (dataset_scope[name]["symbols"] or [])
+            ]
+            if names:
+                missing.append((personality, ticker, names))
     return missing
 
 
-def _rule_ticker(personality: str, rule_configs: dict) -> str:
-    """The symbol this agent's current configuration trades."""
-    agent = rule_agent(personality)
-    config = rule_configs.get(personality)
-    return agent.ticker(config) if config is not None else agent.default_ticker
+# Which rule-agent setups the Simulate tab is currently holding, per agent:
+# ``{personality: [slot_id, ...]}``. A slot is an opaque id that owns one set of
+# widget keys, so removing the second of three setups leaves the other two's
+# inputs exactly where they were -- which indexing by position would not.
+_RULE_SLOTS_KEY = "sim_rule_slots"
 
 
-def _render_rule_params(personalities: list[str], symbols: list[str]) -> dict:
-    """One rule set per selected rule agent, the way one prompt per personality
-    applies to every LLM combination.
+def _rule_slots(personality: str) -> list[str]:
+    """This agent's setup slots, creating the first one on demand."""
+    slots = st.session_state.setdefault(_RULE_SLOTS_KEY, {})
+    if not slots.get(personality):
+        slots[personality] = [uuid.uuid4().hex[:8]]
+    return slots[personality]
 
-    Keyed by personality, since rule agents share no tunables at all -- the
-    returned configs are what the queued experiments carry. `symbols` is every
-    symbol the selected datasets carry, offered to the one agent that picks its
-    own instrument.
+
+def _add_rule_slot(personality: str) -> None:
+    _rule_slots(personality).append(uuid.uuid4().hex[:8])
+
+
+def _drop_rule_slot(personality: str, slot: str) -> None:
+    slots = _rule_slots(personality)
+    if len(slots) > 1 and slot in slots:
+        slots.remove(slot)
+
+
+def _render_rule_params(
+    personalities: list[str], symbols: list[str]
+) -> dict[str, list]:
+    """Every rule-agent setup this batch will queue, per agent.
+
+    A *list* per agent rather than one configuration, because a rule agent's
+    settings are what an LLM agent's model is: the thing under test. One prompt
+    applies to every model in the grid, but a rule set does not apply to
+    anything -- it *is* the entry -- so sweeping a threshold or comparing two
+    instruments should be one batch rather than three trips through this tab.
+    Each setup queues its own experiment per dataset, and lands in Results as
+    its own configuration, since the signature is a function of the settings.
+
+    `symbols` is every symbol the selected datasets carry, offered to the agents
+    that pick their own instrument.
     """
     renderers = {
-        APPLE_TRADER_KEY: lambda: _render_apple_params(symbols),
-        APPLE_TRADER2_KEY: lambda: _render_apple2_params(symbols),
+        APPLE_TRADER_KEY: _render_apple_params,
+        APPLE_TRADER2_KEY: _render_apple2_params,
     }
-    return {key: renderers[key]() for key in personalities if key in renderers}
+    return {
+        key: _render_agent_setups(key, symbols, renderers[key])
+        for key in personalities
+        if key in renderers
+    }
 
 
-def _render_apple2_params(symbols: list[str]) -> AppleTrader2Config:
-    """Apple Trader 2's rule set for this batch.
+def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list:
+    """One agent's setups: an editor each, plus add and remove.
+
+    The newest setup is the one left open and the older ones collapse to their
+    **signature** -- the same string Results groups runs by, so a glance at the
+    collapsed titles answers the only question that matters here, which is
+    whether these are actually different configurations. The signature shown is
+    the one built on the previous rerun (an expander's label is fixed before its
+    body runs); every widget change reruns the page, so it trails an edit by
+    nothing a user can perceive.
+    """
+    slots = _rule_slots(personality)
+    label = _agent_label(personality)
+    st.markdown(f"**{label}** — {len(slots)} setup(s)")
+    configs = []
+    for index, slot in enumerate(slots):
+        prefix = f"sim_rule_{personality}_{slot}"
+        title = f"Setup {index + 1}"
+        remembered = st.session_state.get(f"{prefix}__signature")
+        if remembered and index != len(slots) - 1:
+            title += f" — {remembered}"
+        with st.expander(title, expanded=index == len(slots) - 1):
+            config = renderer(symbols, prefix)
+            configs.append(config)
+            signature = rule_agent(personality).signature(config)
+            st.session_state[f"{prefix}__signature"] = signature
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.button(
+                    "Remove this setup", icon=":material/delete:",
+                    key=f"{prefix}_remove", disabled=len(slots) == 1,
+                    on_click=_drop_rule_slot, args=(personality, slot),
+                    help=None if len(slots) > 1
+                    else "The last setup cannot be removed — deselect the agent instead.",
+                )
+                st.caption(f"`{signature}`")
+    st.button(
+        f"Add another {label} setup", icon=":material/add:",
+        key=f"sim_rule_add_{personality}", on_click=_add_rule_slot, args=(personality,),
+        help="Queues a second configuration of the same agent over the same "
+             "datasets — a threshold sweep, two instruments, or one rule switched "
+             "on and off, run side by side and compared in Results.",
+    )
+    duplicates = len(configs) - len({
+        rule_agent(personality).signature(config) for config in configs
+    })
+    if duplicates:
+        # Deliberately about the *signature* rather than about the settings:
+        # not every field is in it (the closing flatten is not, on either
+        # agent), so two setups can differ visibly here and still be one
+        # configuration everywhere downstream.
+        st.caption(
+            f":material/info: {duplicates} setup(s) sign the same as another and will "
+            "be queued once. Results identifies a configuration by its signature, so "
+            "two runs of one would be a single row — to test them apart, change "
+            "something the signature carries (it is shown under each setup)."
+        )
+    return configs
+
+
+def _render_apple2_params(symbols: list[str], prefix: str) -> AppleTrader2Config:
+    """One Apple Trader 2 setup.
 
     The same builder the live dashboard renders, under its own widget prefix --
     the two apps run in separate processes, but the prefix is what keeps a rule
@@ -1201,20 +1371,19 @@ def _render_apple2_params(symbols: list[str]) -> AppleTrader2Config:
     symbol's bars and a dataset without it cannot be replayed, which is what
     `_rule_agents_missing_ticker` checks before anything is queued.
     """
-    with st.expander("Apple Trader 2 rules", expanded=True):
-        st.caption(
-            "One list of buy/sell rules, checked in order on every closed minute bar. "
-            "Each rule is an action, a size and the conditions that arm it, joined by "
-            "AND or OR; the first rule that matches *and* can transact takes the bar. "
-            "The instrument and the rule set together are the configuration Results "
-            "groups these runs by, so moving one number queues a new configuration to "
-            "compare rather than a repeat."
-        )
-        return rules_panel("sim_apple_trader2", symbols=symbols)
+    st.caption(
+        "One list of buy/sell rules, checked in order on every closed minute bar. "
+        "Each rule is an action, a size and the conditions that arm it, joined by "
+        "AND or OR; the first rule that matches *and* can transact takes the bar. "
+        "The instrument and the rule set together are the configuration Results "
+        "groups these runs by, so moving one number queues a new configuration to "
+        "compare rather than a repeat."
+    )
+    return rules_panel(prefix, symbols=symbols)
 
 
-def _render_apple_params(symbols: list[str]) -> AppleTraderConfig:
-    """Apple Trader's instrument and rules for this batch.
+def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
+    """One Apple Trader setup: its instrument and rules.
 
     The instrument is chosen first because it decides which models exist for
     it, and the model then chooses the strategy: the two TimeToChange2 models
@@ -1228,38 +1397,42 @@ def _render_apple_params(symbols: list[str]) -> AppleTraderConfig:
     all.
     """
     defaults = AppleTraderConfig()
-    with st.expander("Apple Trader rules", expanded=True):
-        ticker = _render_apple_instrument(defaults, symbols)
-        keys = apple_models.keys_for(ticker)
-        model_key = str(
-            st.selectbox(
-                "Model", keys,
-                index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
-                format_func=_apple_model_label,
-                # Scoped to the instrument, whose choice changes this list.
-                key=f"sim_apple_model_{ticker}",
-                help="On the confirm entry the two momentum models are handed the same "
-                     "20 bars on the same tape and return one probability, so running a "
-                     "dataset through both is a straight comparison. The day-range "
-                     "forecast is not on that scale and is not comparable to them by "
-                     "number — it is a different strategy on the same symbol, and the "
-                     "way to compare it is to run the same dataset through it. Only the "
-                     "models fitted on the instrument above are listed.",
-            )
+    ticker = _render_apple_instrument(defaults, symbols, prefix)
+    keys = apple_models.keys_for(ticker)
+    model_key = str(
+        st.selectbox(
+            "Model", keys,
+            index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
+            format_func=_apple_model_label,
+            # Scoped to the instrument, whose choice changes this list.
+            key=f"{prefix}_model_{ticker}",
+            help="On the confirm entry the two momentum models are handed the same "
+                 "20 bars on the same tape and return one probability, so running a "
+                 "dataset through both is a straight comparison. Neither the day-range "
+                 "forecast nor the delta-momentum regressor is on that scale, and "
+                 "neither is comparable to them by number — each is a different "
+                 "strategy on the same symbol, and the way to compare them is to run "
+                 "the same dataset through each. Only the models fitted on the "
+                 "instrument above are listed.",
         )
-        model = apple_models.get(model_key)
-        bundle = apple_models.load(model.key, ticker)
-        st.caption(model.summary)
-        if bundle is None:
-            st.error(apple_models.unavailable_reason(model_key, ticker))
+    )
+    model = apple_models.get(model_key)
+    bundle = apple_models.load(model.key, ticker)
+    st.caption(model.summary)
+    if bundle is None:
+        st.error(apple_models.unavailable_reason(model_key, ticker))
 
-        if model.strategy == apple_models.STRATEGY_DAYRANGE:
-            return _render_apple_dayrange_params(defaults, model_key, ticker)
-        return _render_apple_momentum_params(defaults, model, bundle, ticker)
+    if model.strategy == apple_models.STRATEGY_DAYRANGE:
+        return _render_apple_dayrange_params(defaults, model_key, ticker, prefix)
+    if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
+        return _render_apple_momentum_change_params(defaults, model_key, ticker, prefix)
+    return _render_apple_momentum_params(defaults, model, bundle, ticker, prefix)
 
 
-def _render_apple_instrument(defaults: AppleTraderConfig, symbols: list[str]) -> str:
-    """Which symbol this batch trades, out of the ones a model exists for.
+def _render_apple_instrument(
+    defaults: AppleTraderConfig, symbols: list[str], prefix: str
+) -> str:
+    """Which symbol this setup trades, out of the ones a model exists for.
 
     A fixed list rather than a free-text box (which is what Apple Trader 2
     gets): every rule this agent has is a saved model's output, so a symbol
@@ -1277,7 +1450,7 @@ def _render_apple_instrument(defaults: AppleTraderConfig, symbols: list[str]) ->
             format_func=(
                 lambda t: t if not available or t in available else f"{t} (not in the datasets)"
             ),
-            key="sim_apple_ticker",
+            key=f"{prefix}_ticker",
             help="The one symbol the run trades. Only symbols a saved model covers are "
                  "listed — the models are the strategy here, so the instrument and the "
                  "model constrain each other. The same rules over two symbols are two "
@@ -1299,7 +1472,7 @@ def _apple_model_label(key: str) -> str:
 
 
 def _render_apple_dayrange_params(
-    defaults: AppleTraderConfig, model_key: str, ticker: str
+    defaults: AppleTraderConfig, model_key: str, ticker: str, prefix: str
 ) -> AppleTraderConfig:
     """The day-range rules: the two resting levels, and nothing else."""
     st.caption(
@@ -1312,7 +1485,7 @@ def _render_apple_dayrange_params(
     col_a, col_b = st.columns(2)
     buy_k = col_a.number_input(
         "Buy distance (× ADR below H)", min_value=0.05, max_value=3.0,
-        value=defaults.buy_k, step=0.05, format="%.2f", key="sim_apple_buy_k",
+        value=defaults.buy_k, step=0.05, format="%.2f", key=f"{prefix}_buy_k",
         help="The notebook's 0.75 was specified, not fitted, and its own sweep says "
              "why not to trust a peak: over five sessions the week total climbs "
              "steadily from $70 at 0.30 to $339 at 0.85 as deeper entries fill better, "
@@ -1324,14 +1497,14 @@ def _render_apple_dayrange_params(
     )
     sell_k = col_b.number_input(
         "Sell distance (× ADR below H)", min_value=0.0, max_value=3.0,
-        value=defaults.sell_k, step=0.05, format="%.2f", key="sim_apple_sell_k",
+        value=defaults.sell_k, step=0.05, format="%.2f", key=f"{prefix}_sell_k",
         help="Where the exit rests below the same predicted high — the smaller of the "
              "two numbers, since it is the higher price. A day that never reaches it "
              "is held to the closing flatten.",
     )
     position_pct = col_a.number_input(
         "Position size (% of cash)", min_value=1.0, max_value=100.0,
-        value=defaults.position_pct, step=5.0, key="sim_apple_dayrange_size",
+        value=defaults.position_pct, step=5.0, key=f"{prefix}_dayrange_size",
     )
     if sell_k >= buy_k:
         sell_k = round(max(0.0, buy_k - 0.05), 2)
@@ -1354,10 +1527,77 @@ def _render_apple_dayrange_params(
     )
 
 
-def _render_apple_momentum_params(
-    defaults: AppleTraderConfig, model, bundle: "dict | None", ticker: str
+def _render_apple_momentum_change_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, prefix: str
 ) -> AppleTraderConfig:
-    """The momentum rules for this batch."""
+    """The delta-momentum rules: two thresholds on a bps/min forecast, plus two
+    risk exits."""
+    st.caption(
+        "The model predicts how far the momentum score moves over the next 15 bars, "
+        "in **bps/min**. The rules read that as a direction call on a regime the tape "
+        "has already printed: buy a *negative* minute the model expects to turn up, "
+        "sell a *positive* one it expects to turn down, and cut on either risk exit. "
+        "The notebook's own ablation says the exits carry the P&L — sweeping all four "
+        "here is the intended use."
+    )
+    col_a, col_b = st.columns(2)
+    buy_thr = col_a.number_input(
+        "Buy above (Δ momentum, bps/min)", min_value=0.0, max_value=3.0,
+        value=float(defaults.buy_thr), step=0.05, format="%.2f", key=f"{prefix}_buy_thr",
+        help="How large an upward move the model has to predict before a negative "
+             "regime is bought. 0.30 is the notebook's, specified rather than fitted; "
+             "0 buys every negative minute the model does not call down, which is the "
+             "\"no model entry filter\" ablation.",
+    )
+    sell_thr = col_b.number_input(
+        "Sell below (−Δ momentum, bps/min)", min_value=0.0, max_value=3.0,
+        value=float(defaults.sell_thr), step=0.05, format="%.2f", key=f"{prefix}_sell_thr",
+        help="Stated positive and compared against its negation: at 0.30 a held "
+             "position is sold when the model predicts −0.30 bps/min or worse on a "
+             "positive minute. This is the exit the ablation says does the work on "
+             "both tickers.",
+    )
+    m1_mult = col_a.number_input(
+        "Momentum floor (× θ)", min_value=-6.0, max_value=0.0,
+        value=float(defaults.m1_mult), step=0.5, format="%.1f", key=f"{prefix}_m1_mult",
+        help="A hard exit when momentum falls below this multiple of the day's regime "
+             "threshold θ. Entries only happen while momentum is below −θ, so anything "
+             "above −1 is already breached at entry and churns one-minute round trips; "
+             "the notebook's sweep runs through that region deliberately.",
+    )
+    stop_pct = col_b.number_input(
+        "Stop below entry (%)", min_value=0.05, max_value=10.0,
+        value=float(defaults.stop_pct), step=0.05, format="%.2f", key=f"{prefix}_stop_pct",
+        help="A fixed stop measured from the entry price — not a trailing one. The "
+             "momentum rules' trailing stop is a different strategy's knob and is not "
+             "read here.",
+    )
+    position_pct = col_a.number_input(
+        "Position size (% of cash)", min_value=1.0, max_value=100.0,
+        value=defaults.position_pct, step=5.0, key=f"{prefix}_momentum_change_size",
+    )
+    st.caption(
+        ":material/warning: This is the only model here that reads days *before* the "
+        f"one being simulated: {momentum_change_model.HISTORY_SESSIONS} previous sessions of "
+        "minute bars, because the regime threshold is yesterday's volatility. A dataset "
+        "whose first days have nothing behind them will log a refusal to trade for "
+        "those sessions rather than trading them blind."
+    )
+    return AppleTraderConfig(
+        model_key=model_key,
+        ticker=ticker,
+        buy_thr=float(buy_thr),
+        sell_thr=float(sell_thr),
+        m1_mult=float(m1_mult),
+        stop_pct=float(stop_pct),
+        position_pct=float(position_pct),
+    )
+
+
+def _render_apple_momentum_params(
+    defaults: AppleTraderConfig, model, bundle: "dict | None", ticker: str, prefix: str
+) -> AppleTraderConfig:
+    """The momentum rules for one setup."""
     model_key = model.key
     st.caption(
         "Four knobs decide everything: **when** the saved model is asked about a "
@@ -1369,7 +1609,7 @@ def _render_apple_momentum_params(
     )
     entry_mode = st.segmented_control(
         "Entry", ENTRY_MODES, default=defaults.entry_mode,
-        format_func=lambda mode: ENTRY_MODE_LABEL.get(mode, mode), key="sim_apple_entry_mode",
+        format_func=lambda mode: ENTRY_MODE_LABEL.get(mode, mode), key=f"{prefix}_entry_mode",
         help="The setting that moves the fill most. On the 2026-07-27 SIP tape "
              "“Confirm” bought 337.45 / 338.67 / 336.35 and “Anticipate” bought the "
              "same three episodes at 336.56 / 338.20 / 335.99 — one to six bars "
@@ -1395,7 +1635,7 @@ def _render_apple_momentum_params(
         step=0.01, format="%.2f",
         # Keyed by model so switching re-seeds the input with that model's
         # own cut-off: the two probabilities are not on a shared scale.
-        key=f"sim_apple_prob_{model_key}",
+        key=f"{prefix}_prob_{model_key}",
         help=f"Default {bundle_threshold:g} is the cut-off this model chose on its own "
              "validation block — on the *confirm* question. On “Anticipate” it is a "
              "starting point rather than a tuned setting, and it is the first thing "
@@ -1404,14 +1644,14 @@ def _render_apple_momentum_params(
     )
     trail_pct = col_b.number_input(
         "Trailing stop (%)", min_value=0.05, max_value=10.0,
-        value=defaults.trail_pct, step=0.05, key="sim_apple_trail",
+        value=defaults.trail_pct, step=0.05, key=f"{prefix}_trail",
         help="Sell once price is this far below the highest price seen since the "
              "entry. The peak only ratchets up, so this starts as a stop under the "
              "entry and becomes a profit lock as the move runs.",
     )
     position_pct = col_a.number_input(
         "Position size (% of cash)", min_value=1.0, max_value=100.0,
-        value=defaults.position_pct, step=5.0, key="sim_apple_size",
+        value=defaults.position_pct, step=5.0, key=f"{prefix}_size",
     )
 
     # The second exit, and the one most worth an A/B here: run the same
@@ -1421,7 +1661,7 @@ def _render_apple_momentum_params(
         "Also sell on a forecast reversal",
         value=defaults.sells_on_reversal and model.anticipates,
         disabled=not model.anticipates,
-        key=f"sim_apple_reversal_on_{model_key}",
+        key=f"{prefix}_reversal_on_{model_key}",
         help="Closes the position when the model puts the positive regime at the "
              "probability below or better of flipping negative — while price may "
              "still be at its high, rather than waiting for the trailing stop's "
@@ -1430,7 +1670,7 @@ def _render_apple_momentum_params(
     reversal_threshold = col_b.number_input(
         "Reversal probability to sell", min_value=0.0, max_value=1.0,
         value=float(defaults.reversal_threshold or 0.30), step=0.05, format="%.2f",
-        disabled=not sells_on_reversal, key="sim_apple_reversal",
+        disabled=not sells_on_reversal, key=f"{prefix}_reversal",
         help="Over five AAPL sessions this separates bars within three of a positive "
              "run's end from bars with 8+ to go at 0.89 AUC, and the cut-off picks "
              "where to sit on it: 0.20 fires on 11% of held bars, 0.30 on 2.6%, 0.40 "
@@ -1467,7 +1707,9 @@ def render_simulate_tab() -> None:
 
     st.caption(
         "Pick several agents, models, and datasets — every combination is queued as "
-        "its own experiment."
+        "its own experiment. A rule-based agent has no model to vary, so its "
+        "**setups** take that place: add it as many times as you have "
+        "configurations to compare, and each one is queued against every dataset."
     )
     names = [d.name for d in datasets]
     selected_names = st.multiselect(
@@ -1492,7 +1734,7 @@ def render_simulate_tab() -> None:
             for symbol in (dataset_scope[name]["symbols"] or [])
         }
     )
-    rule_configs = _render_rule_params(rule_personalities, dataset_symbols)
+    rule_setups = _render_rule_params(rule_personalities, dataset_symbols)
     # The model picker only sizes the LLM grid: a rule agent runs the same
     # way whatever is selected there, so it is queued once per dataset instead.
     model_choices, api_keys = (
@@ -1541,21 +1783,14 @@ def render_simulate_tab() -> None:
             )
 
     # One combination per (agent, model, dataset) for the LLM agents; a rule
-    # agent has no model dimension, so its own rule set stands in for one --
-    # which also means retuning it queues a genuinely new combination.
-    rule_signatures = {
-        key: rule_agent(key).signature(config) for key, config in rule_configs.items()
-    }
+    # agent has no model dimension, so its own rule set stands in for one.
+    rule_combos, rule_by_combo = _rule_combinations(rule_setups, selected_names)
     combos = [
         (personality, provider, model, name)
         for name in selected_names
         for personality in llm_personalities
         for provider, model in model_choices
-    ] + [
-        (personality, RULE_PROVIDER, rule_signatures[personality], name)
-        for name in selected_names
-        for personality in rule_personalities
-    ]
+    ] + rule_combos
     days_by_dataset = {name: scope["days"] for name, scope in dataset_scope.items()}
     tested = _render_already_tested(combos, days_by_dataset)
     skip_tested = bool(tested) and st.checkbox(
@@ -1568,13 +1803,12 @@ def render_simulate_tab() -> None:
     if overridden:
         labels = ", ".join(_agent_label(p) for p in overridden)
         st.caption(f":material/edit: Runs with a **modified** prompt (Agents tab): {labels}.")
-    missing_ticker = _rule_agents_missing_ticker(rule_configs, dataset_scope,
+    missing_ticker = _rule_agents_missing_ticker(rule_setups, dataset_scope,
                                                  selected_names)
-    for personality, names_missing in missing_ticker.items():
+    for personality, ticker, names_missing in missing_ticker:
         st.error(
-            f":material/error: {_agent_label(personality)} is configured to trade "
-            f"{_rule_ticker(personality, rule_configs)}, which is not selected for: "
-            f"{', '.join(names_missing)}."
+            f":material/error: {_agent_label(personality)} has a setup trading "
+            f"{ticker}, which is not selected for: {', '.join(names_missing)}."
         )
     st.caption(
         ":material/monitoring: Langfuse export: "
@@ -1597,7 +1831,11 @@ def render_simulate_tab() -> None:
                     f"{len(llm_personalities)} LLM agent(s) × {len(model_choices)} model(s)"
                 )
             if rule_personalities:
-                parts.append(f"{len(rule_personalities)} rule-based agent(s)")
+                setups = sum(len(rule_setups.get(p, [])) for p in rule_personalities)
+                parts.append(
+                    f"{setups} rule-based setup(s) "
+                    f"over {len(rule_personalities)} agent(s)"
+                )
             st.caption(
                 f"({' + '.join(parts)}) × {len(selected_names)} dataset(s) = "
                 f"{len(combos)} combination(s)"
@@ -1620,11 +1858,10 @@ def render_simulate_tab() -> None:
                 "Pick at least one trading day and one symbol for: " + ", ".join(empty)
             )
         elif missing_ticker:
-            personality, names_missing = next(iter(missing_ticker.items()))
+            personality, ticker, names_missing = missing_ticker[0]
             st.error(
-                f"Add {_rule_ticker(personality, rule_configs)} to the symbols of "
-                f"{', '.join(names_missing)}, or deselect "
-                f"{_agent_label(personality)}."
+                f"Add {ticker} to the symbols of {', '.join(names_missing)}, or "
+                f"change the {_agent_label(personality)} setup that trades it."
             )
         elif missing_keys:
             st.error(f"An API key is required for: {', '.join(missing_keys)}.")
@@ -1647,7 +1884,9 @@ def render_simulate_tab() -> None:
                     "feed": by_name[name].feed,
                     "system_prompt_override": sim_prompts.get_override(personality),
                     "rule_config": (
-                        rule_agent(personality).to_record(rule_configs[personality])
+                        rule_agent(personality).to_record(
+                            rule_by_combo[(personality, provider, model, name)]
+                        )
                         if rule_based else None
                     ),
                     # A rule agent is never judged: no reasoning of its own to

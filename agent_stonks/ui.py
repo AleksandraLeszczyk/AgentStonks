@@ -11,7 +11,13 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from . import apple_models, market_hours, model_overlays, persistence_model
+from . import (
+    apple_models,
+    market_hours,
+    model_overlays,
+    momentum_change_model,
+    persistence_model,
+)
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -1711,9 +1717,9 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
                     "Which saved model the agent runs on — and, with it, which rules. The "
                     "two TimeToChange2 models answer the same question about the momentum "
                     "regime on every bar and differ only in how; the TimeToChange3 "
-                    "day-range forecast is a different strategy that happens to live in "
-                    "the same agent. Only the models fitted on the instrument above are "
-                    "listed."
+                    "day-range forecast and the TimeToChange delta-momentum regressor are "
+                    "each a different strategy that happens to live in the same agent. "
+                    "Only the models fitted on the instrument above are listed."
                 ),
             )
         )
@@ -1725,6 +1731,8 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
 
         if model.strategy == apple_models.STRATEGY_DAYRANGE:
             return _apple_dayrange_params(defaults, model_key, ticker)
+        if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
+            return _apple_momentum_change_params(defaults, model_key, ticker)
         return _apple_momentum_params(defaults, model, bundle, ticker)
 
 
@@ -1846,6 +1854,101 @@ def _apple_dayrange_params(
         ticker=ticker,
         buy_k=float(buy_k),
         sell_k=float(sell_k),
+        position_pct=float(position_pct),
+    )
+
+
+def _apple_momentum_change_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str
+) -> AppleTraderConfig:
+    """The delta-momentum rules: a bps/min forecast read against the regime the
+    tape has already printed."""
+    st.caption(
+        "The model predicts how far the momentum score moves over the next 15 minutes, "
+        "in **bps/min**. It buys a minute whose regime is still **negative** and that "
+        "the model expects to turn up, and sells a **positive** one it expects to turn "
+        "down — the tape picks the situation, the model picks the direction. Two risk "
+        "exits sit underneath: a momentum floor and a fixed stop."
+    )
+    c1, c2 = st.columns(2)
+    buy_thr = c1.number_input(
+        "Buy above (Δ momentum, bps/min)",
+        min_value=0.0,
+        max_value=3.0,
+        value=float(defaults.buy_thr),
+        step=0.05,
+        format="%.2f",
+        key="apple_trader_buy_thr",
+        help=(
+            "How large an upward move the model has to predict before a negative regime "
+            "is bought. The notebook's 0.30 was specified rather than fitted, and its "
+            "own ablation is blunt: the entry filter is the part that earns least."
+        ),
+    )
+    sell_thr = c2.number_input(
+        "Sell below (−Δ momentum, bps/min)",
+        min_value=0.0,
+        max_value=3.0,
+        value=float(defaults.sell_thr),
+        step=0.05,
+        format="%.2f",
+        key="apple_trader_sell_thr",
+        help=(
+            "Stated positive and compared against its negation: at 0.30 an open position "
+            "is sold when the model predicts −0.30 bps/min or worse on a positive minute. "
+            "On both tickers this exit is where the strategy's profit came from."
+        ),
+    )
+    m1_mult = c1.number_input(
+        "Momentum floor (× θ)",
+        min_value=-6.0,
+        max_value=0.0,
+        value=float(defaults.m1_mult),
+        step=0.5,
+        format="%.1f",
+        key="apple_trader_m1_mult",
+        help=(
+            "A hard exit when momentum drops below this multiple of the day's regime "
+            "threshold θ. Entries only happen below −θ, so anything above −1 is already "
+            "breached at entry and turns the rule into one-minute round trips."
+        ),
+    )
+    stop_pct = c2.number_input(
+        "Stop below entry (%)",
+        min_value=0.05,
+        max_value=10.0,
+        value=float(defaults.stop_pct),
+        step=0.05,
+        format="%.2f",
+        key="apple_trader_stop_pct",
+        help=(
+            "A fixed stop measured from the entry price. Not the trailing stop of the "
+            "momentum rules — that knob belongs to a different strategy and is not read "
+            "here."
+        ),
+    )
+    position_pct = c1.number_input(
+        "Position size (% of cash)",
+        min_value=1.0,
+        max_value=100.0,
+        value=defaults.position_pct,
+        step=5.0,
+        key="apple_trader_momentum_change_size",
+    )
+    st.caption(
+        ":material/history: Alone among these models this one reads the sessions *before* "
+        f"today — {momentum_change_model.HISTORY_SESSIONS} of them, fetched once each morning — "
+        "because the regime threshold is yesterday's minute volatility. If they cannot be "
+        "had, the agent says so and stands down for the day rather than scoring on a "
+        "threshold it invented."
+    )
+    return AppleTraderConfig(
+        model_key=model_key,
+        ticker=ticker,
+        buy_thr=float(buy_thr),
+        sell_thr=float(sell_thr),
+        m1_mult=float(m1_mult),
+        stop_pct=float(stop_pct),
         position_pct=float(position_pct),
     )
 

@@ -5,8 +5,8 @@ produced more than one answer. This module is where that choice lives, so the
 trader, the loop, SimLab and the UI ask for "the model named X" and never
 branch on which one they got.
 
-The three on offer
-------------------
+The four on offer
+-----------------
 `persistence`  the incumbent: a gradient-boosted classifier trained on the
                momentum-persistence label directly (TimeToChange2 notebook 04).
                Out-of-fold AUC 0.82 over all regime changes, **0.50** over the
@@ -24,14 +24,22 @@ The three on offer
                where the *whole session's* high and low will land, once, from
                the first five minutes. 30% of a 14-day rolling baseline's error
                removed over 129 test sessions.
+`momentum_change`
+               TimeToChange's regressor on the *size* of the next momentum
+               move: given the minute that just closed, how many bps/min will
+               the smoothed momentum score have shifted fifteen bars from now.
+               Not a probability -- a signed quantity, whose sign is the
+               reliable half (right on 94% / 91% / 86% of the holdout week's
+               changes on AAPL / GOOGL / INTC, against timing that is barely
+               better than chance).
 
 The first two are graded against each other on the same 35 events, and the gap
 is real but small -- notebook 07 replayed one held-out session through both and
 they made *identical* trades. So `nbeats` is a switch, not a promotion.
 
-`dayrange` is not on that scale at all and cannot be compared to them by
-number. It answers a different question, on a different horizon, and it brings
-its own trading rules with it.
+`dayrange` and `momentum_change` are not on that scale at all and cannot be
+compared to them by number. Each answers a different question, on a different
+horizon, and each brings its own trading rules with it.
 
 Which symbols a model exists for
 --------------------------------
@@ -44,6 +52,13 @@ of the model rather than of the app:
                           else.
     dayrange              AAPL, GOOGL and INTC -- TimeToChange3's pipeline was
                           run per ticker, and each run produced its own bundle.
+    momentum_change       AAPL, GOOGL and INTC -- TimeToChange trains and
+                          *selects* per ticker off the same weekly bar archive,
+                          and the selection genuinely differs: Ridge on AAPL,
+                          RandomForest on GOOGL, HistGradientBoosting on INTC.
+
+So AAPL has all four and GOOGL and INTC have two each, which is a statement
+about which notebooks were re-run per ticker rather than about the symbols.
 
 Everything downstream reads `models_for(ticker)` instead of `MODELS`, which is
 what makes an instrument with no model at all a supported choice rather than a
@@ -62,11 +77,15 @@ same bars and differ only in what they do with it. Both bundles carry
 `feature_columns`, `seq_len`, `threshold`, `settings` and `metrics`. That is
 what `strategy == STRATEGY_MOMENTUM` means.
 
-`dayrange` shares none of it. A forecast of the day's high is not a probability
-and there is no threshold to compare it against; the rules built on it are
-resting price levels rather than a per-bar signal. Pretending otherwise -- one
-`read_latest`, one probability, one trailing stop -- would have meant a
-`turn_proba` that is really a price and a threshold that means nothing.
+`dayrange` and `momentum_change` share none of it. A forecast of the day's high is
+not a probability and there is no threshold to compare it against; the rules
+built on it are resting price levels rather than a per-bar signal. A predicted
+delta momentum *is* per-bar, but it is a signed quantity in bps/min whose
+useful cut-offs are two-sided and unbounded, and it runs its own momentum and
+regime pipeline (per-day adaptive threshold, six sessions of history) that
+`persistence_model` shares none of. Pretending otherwise -- one `read_latest`,
+one probability, one trailing stop -- would have meant a `turn_proba` that is
+really a price or a bps/min figure, and a threshold that means nothing.
 So the seam is drawn at the strategy instead: `AppleModel.strategy` names which
 rule set a model drives, `apple_trader.build_trader` turns that into the right
 state machine, and everything downstream of it (the config record, the Results
@@ -92,15 +111,18 @@ from .config import APPLE_TRADER_MODEL
 # of one another (see the module docstring).
 STRATEGY_MOMENTUM = "momentum"
 STRATEGY_DAYRANGE = "dayrange"
+STRATEGY_MOMENTUM_CHANGE = "momentum_change"
 
-# The symbol everything here defaults to: the one every model covers, and the
-# only one Apple Trader (the first) ever trades.
+# The symbol everything here defaults to: the one with the most models behind
+# it, and what a config or a stored record arriving without one means.
 DEFAULT_TICKER = "AAPL"
 
 # Which symbols each model was fitted on. TimeToChange2 (the two momentum
-# models) was only ever run on AAPL; TimeToChange3 was run per ticker.
+# models) was only ever run on AAPL; TimeToChange3 and TimeToChange were both
+# run per ticker, one bundle each.
 MOMENTUM_TICKERS = (DEFAULT_TICKER,)
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
+MOMENTUM_CHANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 
 
 @dataclass(frozen=True)
@@ -202,9 +224,32 @@ def _dayrange_path(ticker: str = DEFAULT_TICKER) -> Path:
     return dayrange_model.model_path(ticker)
 
 
+def _load_momentum_change(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The TimeToChange delta-momentum bundle for one ticker, or None.
+
+    Imported here rather than at module scope for the same reason the other two
+    are: it reaches for scikit-learn and joblib, and listing the model names
+    should not require them.
+    """
+    try:
+        from . import momentum_change_model
+    except ImportError:
+        return None
+    return momentum_change_model.load_bundle(ticker)
+
+
+def _momentum_change_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import momentum_change_model
+    except ImportError:
+        return Path(f"momentum_change_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return momentum_change_model.model_path(ticker)
+
+
 PERSISTENCE_KEY = "persistence"
 NBEATS_KEY = "nbeats"
 DAYRANGE_KEY = "dayrange"
+MOMENTUM_CHANGE_KEY = "momentum_change"
 
 MODELS: "dict[str, AppleModel]" = {
     PERSISTENCE_KEY: AppleModel(
@@ -258,6 +303,26 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=DAYRANGE_TICKERS,
         load=_load_dayrange,
         path=_dayrange_path,
+    ),
+    MOMENTUM_CHANGE_KEY: AppleModel(
+        key=MOMENTUM_CHANGE_KEY,
+        label="Delta-momentum regressor (TimeToChange)",
+        summary=(
+            "Predicts how far the momentum score moves over the next 15 bars, in "
+            "bps/min — a signed size rather than a probability. Its sign is right on "
+            "86–94% of the holdout week's regime changes; its timing barely beats "
+            "chance, so the rules gate on a regime the tape has already printed and "
+            "use the model only for direction."
+        ),
+        requires="scikit-learn and joblib, plus six sessions of minute-bar history",
+        strategy=STRATEGY_MOMENTUM_CHANGE,
+        # Not applicable: this strategy has no entry mode. It is always reading
+        # a regime that has already printed, and the model's answer is a size
+        # rather than a claim about a change that has not happened.
+        anticipates=False,
+        tickers=MOMENTUM_CHANGE_TICKERS,
+        load=_load_momentum_change,
+        path=_momentum_change_path,
     ),
 }
 

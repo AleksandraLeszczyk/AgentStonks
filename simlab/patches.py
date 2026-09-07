@@ -21,7 +21,13 @@ duration of a simulation:
   yfinance for *wall-clock today*, which inside a simulation is a different
   day entirely; and a dated fetch of the simulated day would return bars from
   hours in the simulated future. Both leaks corrupted every stored
-  volume_detective run before this patch existed.
+  volume_detective run before this patch existed. ``fetch_intraday_bars_for_date``
+  has a second caller now: ``momentum_change_model.history_bars`` reads the six
+  sessions *before* the simulated one through it, because the delta-momentum
+  model's regime threshold is yesterday's minute volatility. That makes the
+  dataset's own days the model's history -- so a dataset needs six sessions of
+  run-up before the first day it is meant to trade, and a run without them
+  logs a refusal per session rather than scoring on an invented threshold.
 - ``historical.fetch_daily_ohlc_bars`` / ``fetch_session_open`` (the long
   daily history and today's opening print a per-session model needs) ->
   stored daily bars for days that finished before the simulated one, plus

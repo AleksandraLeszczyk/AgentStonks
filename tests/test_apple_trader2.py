@@ -326,14 +326,20 @@ class TestValidation:
 # case the tape-only half of the catalogue exists for.
 
 UNMODELLED = "MSFT"
+# A symbol TimeToChange2 was never fitted on. It has two models rather than
+# none -- the day-range forecast, which this agent has signals for, and the
+# delta-momentum regressor, which only Apple Trader runs -- so it is still the
+# case that not every catalogue entry is readable on it.
 DAYRANGE_ONLY = "GOOGL"
 
 
 class TestInstrument:
     def test_the_models_on_offer_follow_the_symbol(self):
-        assert apple_models.keys_for(TICKER) == ["persistence", "nbeats", "dayrange"]
-        assert apple_models.keys_for(DAYRANGE_ONLY) == ["dayrange"]
-        assert apple_models.keys_for("INTC") == ["dayrange"]
+        assert apple_models.keys_for(TICKER) == [
+            "persistence", "nbeats", "dayrange", "momentum_change",
+        ]
+        assert apple_models.keys_for(DAYRANGE_ONLY) == ["dayrange", "momentum_change"]
+        assert apple_models.keys_for("INTC") == ["dayrange", "momentum_change"]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_is_not_loaded_for_a_symbol_it_was_not_fitted_on(self, monkeypatch):

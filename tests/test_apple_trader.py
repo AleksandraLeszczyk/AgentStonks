@@ -1202,10 +1202,366 @@ class TestDayRangeGuards:
         assert tape.forecast_calls == 2
 
 
+# ------------------------------------------------------- the delta-momentum rules
+#
+# The third strategy: a signed bps/min forecast read against the regime the tape
+# has already printed. The stub below feeds `momentum_change_model.read_latest`
+# directly, exactly as `Reads` does for the momentum rules -- these pin the
+# RULES, and `tests/test_momentum_change_model.py` pins the model behind them.
+
+MOMENTUM_CHANGE_TICKER = "GOOGL"
+MOMENTUM_CHANGE_BUNDLE = {
+    "estimator": None,
+    "feature_cols": ["mom_15"],
+    "pipeline_params": {"persist": 15},
+    "model_name": "RandomForest",
+}
+
+
+class MomReads:
+    """Feeds `MomentumChangeTrader` a scripted sequence of reads, one per cycle."""
+
+    def __init__(self, monkeypatch, broker: "FakeBroker | None" = None):
+        self.broker = broker
+        self.minute = 0
+        self.next_read: "dict | None" = {}
+        self.history_problem: "str | None" = None
+        self.history_calls = 0
+        momentum_change = at._momentum_change()
+
+        def require_history(frame, session_date):
+            self.history_calls += 1
+            return self.history_problem
+
+        monkeypatch.setattr(
+            momentum_change, "session_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
+        )
+        monkeypatch.setattr(momentum_change, "require_history", require_history)
+        monkeypatch.setattr(momentum_change, "read_latest", lambda *a, **k: self.next_read)
+
+    def set(
+        self,
+        *,
+        price: float = 100.0,
+        pred: "float | None" = 0.0,
+        mom: "float | None" = -1.0,
+        theta: "float | None" = 0.5,
+        regime: int = -1,
+        regime_before: "int | None" = -1,
+        bars_today: int = 200,
+        warming_up: bool = False,
+        advance: bool = True,
+    ) -> dict:
+        """Stage the next bar. `advance=False` replays the SAME timestamp, the
+        way a cycle running before a new bar has closed would see it."""
+        if advance:
+            self.minute += 1
+        if self.broker is not None:
+            self.broker.price = price
+        self.next_read = {
+            "ts": pd.Timestamp("2026-07-21 10:30", tz="America/New_York")
+            + pd.Timedelta(minutes=self.minute),
+            "price": price,
+            "pred": pred,
+            "mom": mom,
+            "theta": theta,
+            "regime": regime,
+            "regime_before": regime_before,
+            "bars_today": bars_today,
+            "warming_up": warming_up,
+        }
+        return self.next_read
+
+    def turn_up(self, *, pred: float = 0.9, **kwargs) -> dict:
+        """The bar the entry acts on: the previous minute was still negative
+        and the model calls the move upwards."""
+        return self.set(regime_before=-1, regime=-1, pred=pred, **kwargs)
+
+
+def momentum_change_config(**kwargs) -> AppleTraderConfig:
+    kwargs.setdefault("ticker", MOMENTUM_CHANGE_TICKER)
+    return AppleTraderConfig(model_key="momentum_change", **kwargs)
+
+
+@pytest.fixture
+def momentum_change_state() -> AppState:
+    state = AppState()
+    state.set_symbols([MOMENTUM_CHANGE_TICKER])
+    state.api_key = "k"
+    state.api_secret = "s"
+    state.feed = "yfinance"
+    return state
+
+
+class TestMomentumChangeEntry:
+    def _trader(self, **kwargs):
+        return at.MomentumChangeTrader(momentum_change_config(**kwargs))
+
+    def test_a_negative_minute_the_model_calls_up_is_bought(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = self._trader()
+
+        reads.turn_up(pred=0.9)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "bought"
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) > 0
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "+0.90 bps/min" in reasoning and "negative momentum regime" in reasoning
+
+    def test_a_prediction_below_the_threshold_is_not_a_buy(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = MomReads(monkeypatch)
+        trader = self._trader(buy_thr=0.5)
+
+        reads.turn_up(pred=0.49)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
+
+    @pytest.mark.parametrize("regime_before", [0, 1])
+    def test_only_a_negative_regime_is_bought(
+        self, momentum_change_state, market_open, monkeypatch, regime_before
+    ):
+        """The model's timing is the weak half; the tape picks the situation.
+        A large prediction on a balanced or positive minute is not a trade."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = MomReads(monkeypatch)
+        trader = self._trader()
+
+        reads.set(regime_before=regime_before, regime=regime_before, pred=5.0)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
+
+    def test_a_bar_with_no_prediction_yet_is_not_a_buy(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = MomReads(monkeypatch)
+        trader = self._trader()
+
+        reads.set(pred=None, warming_up=True)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "warming_up"
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
+
+    def test_a_replayed_bar_does_not_buy_twice(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = self._trader()
+
+        reads.turn_up(pred=0.9)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "bought"
+        held = tracker.position_for(MOMENTUM_CHANGE_TICKER)
+        reads.turn_up(pred=0.9, advance=False)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == held
+
+
+def _mom_entered(state, tracker, reads, **kwargs):
+    trader = at.MomentumChangeTrader(momentum_change_config(**kwargs))
+    reads.turn_up(pred=0.9)
+    assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, state, tracker) == "bought"
+    return trader
+
+
+class TestMomentumChangeExit:
+    def test_the_stop_is_measured_from_the_entry_and_does_not_trail(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        """Unlike the momentum rules' trailing stop, a run-up does not move
+        this floor: it stays `stop_pct` under the price that was paid."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = _mom_entered(momentum_change_state, tracker, reads, stop_pct=0.5)
+
+        reads.set(price=105.0)   # a run-up the stop must ignore
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        reads.set(price=99.6)    # 0.4% down: still above the floor
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        reads.set(price=99.4)    # 0.6% down: through it
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
+        assert "Stop" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_momentum_floor_scales_with_the_days_threshold(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        """`m1_mult` is a multiple of theta rather than a number of bps,
+        because theta is set from yesterday's volatility."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = _mom_entered(momentum_change_state, tracker, reads, m1_mult=-2.0)
+
+        reads.set(price=100.0, mom=-0.9, theta=0.5)   # floor -1.0
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        reads.set(price=100.0, mom=-1.1, theta=0.5)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
+        assert "Momentum floor" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_model_closes_a_positive_regime_it_calls_over(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = _mom_entered(momentum_change_state, tracker, reads, sell_thr=0.3)
+
+        reads.set(price=100.5, regime_before=1, regime=1, mom=1.2, pred=-0.2)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        reads.set(price=100.5, regime_before=1, regime=1, mom=1.2, pred=-0.4)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
+        assert "Model exit" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_model_exit_needs_a_positive_regime(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        """A large negative prediction on a still-negative minute is the entry
+        question read backwards, not an exit."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = _mom_entered(momentum_change_state, tracker, reads)
+
+        reads.set(price=100.5, regime_before=-1, regime=-1, mom=-0.4, pred=-2.0)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+
+    def test_a_bar_where_two_exits_fire_is_reported_as_the_stop(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        """The notebook tests all three independently and exits on any, so the
+        order only decides what the ledger is told -- and a fact about price
+        beats a prediction."""
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = _mom_entered(momentum_change_state, tracker, reads, stop_pct=0.5)
+
+        reads.set(price=99.0, regime_before=1, regime=1, mom=1.2, pred=-2.0)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
+        assert "Stop" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_position_is_flattened_before_the_close(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(100.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        reads = MomReads(monkeypatch, broker)
+        trader = _mom_entered(momentum_change_state, tracker, reads)
+
+        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))
+        reads.set(price=100.2)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
+        assert "Session ends" in tracker.snapshot()["decisions"][-1].reasoning
+
+
+class TestMomentumChangeGuards:
+    def test_no_entry_inside_the_closing_flatten_window(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = MomReads(monkeypatch)
+        trader = at.MomentumChangeTrader(momentum_change_config())
+
+        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))
+        reads.turn_up(pred=0.9)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
+
+    def test_a_history_it_cannot_get_stops_the_day_rather_than_the_bar(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        """Six sessions missing at 09:31 are still missing at 14:00, so the
+        refusal is logged once and the session is skipped -- not retried every
+        minute for six and a half hours."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = MomReads(monkeypatch)
+        reads.history_problem = "only 2 of the 6 previous sessions"
+        trader = at.MomentumChangeTrader(momentum_change_config())
+
+        for _ in range(4):
+            reads.turn_up(pred=0.9)
+            assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "no_data"
+        assert reads.history_calls == 1
+        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
+        errors = [e for e in momentum_change_state.agent_log if e.get("type") == "error"]
+        assert len(errors) == 1 and "2 of the 6" in errors[0]["text"]
+
+    def test_a_new_session_tries_the_history_again(
+        self, momentum_change_state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        reads = MomReads(monkeypatch)
+        reads.history_problem = "only 2 of the 6 previous sessions"
+        trader = at.MomentumChangeTrader(momentum_change_config())
+        reads.turn_up(pred=0.9)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "no_data"
+
+        clock.set_simulated(datetime(2026, 7, 22, 14, 30, tzinfo=timezone.utc))
+        reads.history_problem = None
+        reads.turn_up(pred=0.9)
+        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "bought"
+        assert reads.history_calls == 2
+
+    def test_does_nothing_when_the_market_is_closed(self, momentum_change_state, monkeypatch):
+        clock.set_simulated(datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc))
+        try:
+            tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+            reads = MomReads(monkeypatch)
+            reads.turn_up(pred=0.9)
+            trader = at.MomentumChangeTrader(momentum_change_config())
+            assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "closed"
+        finally:
+            clock.clear()
+
+    def test_a_stop_at_zero_is_refused_by_the_config(self):
+        """It would be breached by the bar that opened the trade, on every
+        bar -- a rule that sells everything it buys."""
+        with pytest.raises(ValueError, match="stop_pct"):
+            AppleTraderConfig(stop_pct=0.0)
+
+
+class TestMomentumChangeSignature:
+    def test_every_knob_that_changes_behaviour_is_in_the_signature(self):
+        base = config_signature(momentum_change_config())
+        for changed in (
+            momentum_change_config(buy_thr=0.4),
+            momentum_change_config(sell_thr=0.4),
+            momentum_change_config(m1_mult=-1.5),
+            momentum_change_config(stop_pct=0.8),
+            momentum_change_config(position_pct=50.0),
+            momentum_change_config(ticker="INTC"),
+        ):
+            assert config_signature(changed) != base
+
+    def test_the_momentum_knobs_are_left_out(self):
+        """They are inert here, and a signature carrying them would split one
+        strategy's runs into two configurations the first time somebody moved
+        a knob that changes nothing."""
+        base = config_signature(momentum_change_config())
+        assert base == config_signature(momentum_change_config(trail_pct=9.0))
+        assert base == config_signature(momentum_change_config(prob_threshold=0.9))
+        assert base == config_signature(momentum_change_config(buy_k=1.5, sell_k=0.9))
+        assert "trail" not in base and "buy=H-" not in base
+
+    def test_it_is_not_confusable_with_the_other_strategies(self):
+        assert config_signature(momentum_change_config()).startswith("momentum_change_GOOGL(")
+        assert config_signature(dayrange_config()).startswith("dayrange_AAPL(")
+
+
 class TestStrategySelection:
     def test_the_model_chooses_the_state_machine(self):
         assert isinstance(
             at.build_trader(dayrange_config(), DAYRANGE_BUNDLE), at.DayRangeTrader
+        )
+        assert isinstance(
+            at.build_trader(momentum_change_config(), MOMENTUM_CHANGE_BUNDLE), at.MomentumChangeTrader
         )
         assert isinstance(at.build_trader(AppleTraderConfig(), BUNDLE), AppleTrader)
 
@@ -1238,17 +1594,21 @@ class TestStrategySelection:
 # ----------------------------------------------------------------- instrument
 #
 # Which symbol a run trades, and the one thing that constrains it: a model was
-# fitted on a symbol or it was not. `DAYRANGE_ONLY` is a symbol TimeToChange3
-# covers and TimeToChange2 does not, which is the whole shape of the problem.
+# fitted on a symbol or it was not. `NON_AAPL` is a symbol TimeToChange3 and
+# TimeToChange cover and TimeToChange2 does not, which is the whole shape of
+# the problem: AAPL runs all four models and GOOGL and INTC run two.
 
-DAYRANGE_ONLY = "GOOGL"
+NON_AAPL = "GOOGL"
+DAYRANGE_ONLY = NON_AAPL  # kept for the tests written before there were two
 UNMODELLED = "MSFT"
 
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        assert apple_models.keys_for(TICKER) == ["persistence", "nbeats", "dayrange"]
-        assert apple_models.keys_for(DAYRANGE_ONLY) == ["dayrange"]
+        assert apple_models.keys_for(TICKER) == [
+            "persistence", "nbeats", "dayrange", "momentum_change",
+        ]
+        assert apple_models.keys_for(NON_AAPL) == ["dayrange", "momentum_change"]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_momentum_model_cannot_be_pointed_at_another_symbol(self):

@@ -147,10 +147,35 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # 0.85 every session trades and deeper entries simply fill better; past 0.90
 # days start dropping out entirely and the totals turn erratic on a handful of
 # trades. 0.75 sits inside the first regime, on the rising part of it.
+#
+# The "momentum_change" model is the third strategy and ignores both blocks above. It
+# predicts how far the momentum score will move over the next fifteen bars, in
+# bps/min, and TimeToChange notebook 05's rules read that number as a direction
+# call on a regime the tape has already printed:
+#
+#     BUY   the previous minute's regime is negative and pred >=  BUY_THR
+#     SELL  the previous minute's regime is positive and pred <= -SELL_THR
+#     SELL  momentum falls below M1_MULT x theta  (the momentum floor)
+#     SELL  price falls STOP_PCT below the entry
+#
+# 0.30 / 0.30 / -2.0 / 0.5% are the notebook's, and like the day-range pair they
+# were specified rather than fitted. `scripts/simulate_week.py` sweeps all four
+# over the reserved holdout week of each ticker, and what it establishes is
+# mostly negative: on GOOGL and INTC alike the model's *exits* are the only
+# profitable component, the momentum floor churns one-minute round trips
+# whenever it sits above -theta (entries only happen while momentum is below
+# -theta, so a floor above it is already breached at entry), and 0.5 bp per
+# side turns both tickers negative. Sweep them in SimLab before believing any
+# cell; five sessions per ticker is a sanity check, not an edge.
 APPLE_TRADER_ENTRY_MODE = "anticipate"
 APPLE_TRADER_MODEL = "nbeats"
 APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
+APPLE_TRADER_BUY_THR = 0.30
+APPLE_TRADER_SELL_THR = 0.30
+APPLE_TRADER_M1_MULT = -2.0
+# Percent, like APPLE_TRADER_TRAIL_PCT -- the notebook's 0.005 fraction.
+APPLE_TRADER_STOP_PCT = 0.5
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
 APPLE_TRADER_TRAIL_PCT = 0.5

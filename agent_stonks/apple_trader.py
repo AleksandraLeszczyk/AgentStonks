@@ -7,8 +7,9 @@ FinNotebooks one question. Same paper ledger, same fill path, same log -- only
 the decision-making is deterministic, so the same tape always produces the same
 trades.
 
-Two strategies live here, and `AppleTraderConfig.model_key` picks between them
-by picking a model (see `agent_stonks.apple_models`, which owns that mapping):
+Three strategies live here, and `AppleTraderConfig.model_key` picks between
+them by picking a model (see `agent_stonks.apple_models`, which owns that
+mapping):
 
 * **the momentum rules** (`persistence`, `nbeats`, from TimeToChange2) -- buy a
   momentum-regime change into positive that the model expects to hold, sell on
@@ -19,10 +20,17 @@ by picking a model (see `agent_stonks.apple_models`, which owns that mapping):
   9:35 of where the session's high and low will land, then two resting levels
   derived from it and nothing more asked of the model all day. See
   `DayRangeTrader`.
+* **the delta-momentum rules** (`momentum_change`, from TimeToChange) -- a signed
+  forecast, in bps/min, of how far the momentum score moves over the next 15
+  bars, read as a direction call on the regime the tape has already printed.
+  Buy a negative minute it expects to turn up, sell a positive one it expects
+  to turn down, under a momentum floor and a fixed stop. See
+  `MomentumChangeTrader`.
 
 They share the ledger, the sizing, the flatten-before-close rule and the config
-record, and nothing else -- a forecast of the day's high is not a probability
-and there is no threshold to compare it against. `build_trader` is the seam.
+record, and nothing else -- a forecast of the day's high is not a probability,
+a bps/min quantity is not one either, and there is no threshold either of them
+can be compared against. `build_trader` is the seam.
 
 Which symbol, and why it is a setting rather than a name
 --------------------------------------------------------
@@ -32,10 +40,14 @@ is for a rule set written on the tape: a model exists for a symbol or it does
 not, and `apple_models` owns that fact. TimeToChange2 was only ever fitted on
 AAPL, so the momentum rules are AAPL-only and will stay that way until somebody
 retrains them; TimeToChange3 has been fitted per ticker, so the day-range rules
-run on AAPL, GOOGL and INTC. The pairing is checked before the loop starts
-(`config_error`) rather than discovered as a bundle that would not load, and
-the picker only offers a model where one exists -- so "Apple Trader on GOOGL"
-means the day-range strategy, and nothing else is on the menu.
+run on AAPL, GOOGL and INTC, and so does TimeToChange's delta-momentum
+regressor. So AAPL runs all three strategies and GOOGL and INTC run two, which
+is a statement about which notebooks were re-run per ticker rather than about
+the symbols. The pairing is checked before the loop starts (`config_error`)
+rather than discovered as a bundle that would not load, and the picker only
+offers a model where one exists -- so "Apple Trader on GOOGL" means the
+day-range strategy or the delta-momentum one, and nothing else is on the
+menu.
 
 The agent keeps its name. It is the loop that is Apple Trader, not the symbol.
 
@@ -283,14 +295,18 @@ from .clock import now as _now
 from .config import (
     APPLE_TRADER_BAR_LAG_SEC,
     APPLE_TRADER_BUY_K,
+    APPLE_TRADER_BUY_THR,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_ENTRY_MODE,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
+    APPLE_TRADER_M1_MULT,
     APPLE_TRADER_MODEL,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_PROB_THRESHOLD,
     APPLE_TRADER_REVERSAL_THRESHOLD,
     APPLE_TRADER_SELL_K,
+    APPLE_TRADER_SELL_THR,
+    APPLE_TRADER_STOP_PCT,
     APPLE_TRADER_TRAIL_PCT,
 )
 from .decisions import DecisionTracker
@@ -304,10 +320,9 @@ APPLE_TRADER_AVATAR = "Multiavatar-4bcbffe68af819e050.png"
 # result grouping): this one has no LLM behind it, its rules are the "model".
 RULE_PROVIDER = "rules"
 
-# The symbol a run trades unless its config names another. Every model here
-# covers it (it is the only symbol all three were fitted on), which is what
-# makes it the safe default for a config arriving without one -- see
-# `apple_models.DEFAULT_TICKER`, which is the authority.
+# The symbol a run trades unless its config names another -- what a record
+# written before the instrument was configurable means, and the one symbol
+# every model here covers. See `apple_models.DEFAULT_TICKER`, the authority.
 DEFAULT_TICKER = apple_models.DEFAULT_TICKER
 
 # The two entry triggers. See the module docstring for what separates them and
@@ -354,14 +369,15 @@ class AppleTraderConfig:
     and a model names its rule set. On the momentum
     strategy `entry_mode`, `prob_threshold`, `trail_pct` and
     `reversal_threshold` are the four that change what the agent does; on the
-    day-range strategy it is `buy_k` and `sell_k`, and the momentum four are
-    inert. `position_pct` and `flatten_before_close_min` are sizing and
-    housekeeping and apply to both.
+    day-range strategy it is `buy_k` and `sell_k`; on the delta-momentum
+    strategy it is `buy_thr`, `sell_thr`, `m1_mult` and `stop_pct`. Each set is
+    inert under the other two. `position_pct` and `flatten_before_close_min`
+    are sizing and housekeeping and apply to all three.
 
-    Fields that do not apply are kept rather than split into two dataclasses
+    Fields that do not apply are kept rather than split into three dataclasses
     so that one config survives the round trip through SimLab's JSON
     experiment record whichever model wrote it, and so switching models in the
-    UI does not lose the other strategy's settings. What keeps that from
+    UI does not lose the other strategies' settings. What keeps that from
     becoming a lie is `config_signature`, which renders only the fields in
     force -- an inert `trail_pct` never reaches Results and never splits one
     strategy's runs into two configurations.
@@ -393,6 +409,15 @@ class AppleTraderConfig:
     # carries what the notebook's sweep did and did not establish about them.
     buy_k: float = APPLE_TRADER_BUY_K
     sell_k: float = APPLE_TRADER_SELL_K
+    # --- the delta-momentum strategy's four. `buy_thr` and `sell_thr` are
+    # cut-offs on the predicted move in bps/min (both stated positive: the sell
+    # side compares against its negation), `m1_mult` is the momentum floor as a
+    # multiple of the day's regime threshold theta, and `stop_pct` the fixed
+    # stop below the entry, in percent like `trail_pct`. See `MomentumChangeTrader`.
+    buy_thr: float = APPLE_TRADER_BUY_THR
+    sell_thr: float = APPLE_TRADER_SELL_THR
+    m1_mult: float = APPLE_TRADER_M1_MULT
+    stop_pct: float = APPLE_TRADER_STOP_PCT
     position_pct: float = APPLE_TRADER_POSITION_PCT
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
 
@@ -418,6 +443,17 @@ class AppleTraderConfig:
                 f"sell_k {self.sell_k!r} must sit above the buy level, i.e. strictly "
                 f"below buy_k {self.buy_k!r} — both are distances *below* the predicted "
                 "high, so the smaller number is the higher price"
+            )
+        # Checked unconditionally for the same reason: a stop at or below zero
+        # is breached by the entry bar itself and would sell everything it
+        # bought, on every bar, the moment somebody switched to that strategy.
+        # The momentum floor is deliberately *not* checked -- a floor above
+        # -theta churns round trips rather than being nonsense, and the
+        # notebook's own sweep runs through that region on purpose.
+        if self.stop_pct <= 0:
+            raise ValueError(
+                f"stop_pct {self.stop_pct!r} must be a positive percentage below the "
+                "entry price; a stop at zero is breached by the bar that opened the trade"
             )
 
     @property
@@ -465,6 +501,11 @@ def config_signature(
         return (
             f"{model.key}_{c.ticker}(buy=H-{c.buy_k:g}A,sell=H-{c.sell_k:g}A,"
             f"size={c.position_pct:g}%)"
+        )
+    if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
+        return (
+            f"{model.key}_{c.ticker}(buy>={c.buy_thr:g},sell<=-{c.sell_thr:g},"
+            f"m1={c.m1_mult:g}θ,stop={c.stop_pct:g}%,size={c.position_pct:g}%)"
         )
     threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
     shown = f"{threshold:g}" if threshold is not None else "model"
@@ -584,6 +625,19 @@ def _dayrange():
     from . import dayrange_model
 
     return dayrange_model
+
+
+def _momentum_change():
+    """`agent_stonks.momentum_change_model`, imported on first use.
+
+    Not for weight, the way `_dayrange` is -- this one is scikit-learn and
+    pandas, both already loaded. It is for symmetry of failure: an optional
+    model that cannot be imported should make one strategy unavailable, not
+    stop the module that defines the other two from importing at all.
+    """
+    from . import momentum_change_model
+
+    return momentum_change_model
 
 
 def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAULT_TICKER):
@@ -1370,19 +1424,397 @@ class DayRangeTrader:
         )
 
 
+class MomentumChangeTrader:
+    """The delta-momentum rules: the tape says which regime, the model says
+    which way it is about to move.
+
+    TimeToChange's regressor predicts `mom[t+15] - mom[t-1]` in bps/min for the
+    bar that just closed. It is a signed size, not a probability, and notebook
+    05 reads it as a direction call *conditioned on a regime the tape has
+    already printed*:
+
+        BUY   the previous minute's regime is negative and pred >=  buy_thr
+        SELL  the previous minute's regime is positive and pred <= -sell_thr
+        SELL  momentum falls below m1 = m1_mult × theta   (the momentum floor)
+        SELL  price falls stop_pct below the entry price
+
+    Long only, one position at a time, and whatever is still open is flattened
+    before the close. The gate on `regime_before` rather than on the bar's own
+    regime is deliberate and comes from the notebook: the bar's own regime
+    already contains the move the model is being asked about.
+
+    Why the entry is gated on a regime at all
+    -----------------------------------------
+    Because the model's timing is the weak half. TimeToChange notebook 04
+    measured both: the *sign* of the prediction agrees with the realised move on
+    ~90% of change points, but the *magnitude* separates "near a change" from
+    "quiet" at AUC ~0.53 when run over every minute of an unseen day — barely
+    better than chance. So a rule that bought whenever the prediction was large
+    would be trading the half that does not work. Requiring the tape to have
+    printed a negative regime first is what makes the model's contribution the
+    part it is good at: which way this regime is about to break.
+
+    What this is not
+    ----------------
+    Not the momentum rules with a different model. There is no probability, no
+    threshold on one, no entry mode and no trailing stop; `prob_threshold`,
+    `entry_mode`, `trail_pct` and `reversal_threshold` are inert here and
+    `config_signature` leaves them out. And not the day-range rules either:
+    this one asks the model something on every bar.
+
+    Against the notebook
+    --------------------
+    Four differences, and the first two run against the strategy:
+
+    * **the fill**. `momlib/sim.py` reads a signal off the close of bar t and
+      fills at the **open of bar t+1**. Here the loop sees bar t after it
+      closed and sends a market order, which fills near that bar's close — a
+      bar earlier, at a worse-or-better price that is nobody's model. Same
+      class of difference `DayRangeTrader` has, and the same advice: read a
+      SimLab result against the notebook's with it in mind.
+    * **the event history is fifteen bars stale**. A persistent change is only
+      persistent once the new regime has held 15 minutes, so live the
+      `dist_change_*` and `bars_since_change` features lag by that much where
+      training had them immediately. `momentum_change_model`'s docstring has the
+      detail; `scripts/simulate_week.py` in TimeToChange prints what the lag
+      costs on the holdout week.
+    * **the flatten**. The notebook exits on the last actionable bar of the
+      session; here `flatten_before_close_min` applies as it does to every
+      other agent, giving up the last few minutes at its default of 5.
+    * **no entry inside the flatten window**, for the same reason it is refused
+      on the other two strategies: a long the next rule is about to shut is two
+      commissions.
+
+    And what the rules are worth, honestly: over the reserved holdout week
+    (2026-08-24..28, days used neither for fitting nor for selection) they made
+    −$80.26 on $10k on GOOGL and +$60.35 on INTC, against buy-and-hold of
+    +$123.50 and −$118.36 on the same sessions. The ablations are the more
+    useful number: the model's *exits* are the only profitable component on
+    both tickers, dropping the model entirely beats the full rules on INTC, and
+    0.5 bp per side turns both negative. The model transfers; the rules around
+    it are the part to sweep in SimLab.
+    """
+
+    def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
+        self.config = config or AppleTraderConfig()
+        self.ticker = self.config.ticker
+        # The open long: entry price and how many bars it has been held. No
+        # peak — the stop here is fixed at the entry rather than trailing.
+        self.entry: "dict | None" = None
+        self.last_bar_ts = None
+        # Why today cannot be traded, when the reason is permanent for the
+        # session (not enough previous sessions behind it). Kept so it is
+        # logged once rather than every minute, exactly as `DayRangeTrader`
+        # does with a forecast it cannot make.
+        self.blocked: "dict | None" = None
+        self.session = None
+
+    # --- one cycle --------------------------------------------------------
+
+    def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
+        """Read the newest closed bar and act on it. Returns a short outcome
+        tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
+        sym_state = state.sym(self.ticker)
+        if sym_state is None:
+            _log(
+                state,
+                {
+                    "type": "error",
+                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
+                },
+            )
+            return "no_data"
+
+        if not market_hours.is_market_open():
+            _log(
+                state,
+                {"type": "status", "text": "Market closed -- Apple Trader is not watching bars."},
+            )
+            return "closed"
+
+        momentum_change = _momentum_change()
+        today = momentum_change.market_date()
+        self._roll_session(today)
+        if self.blocked is not None:
+            return "no_data"
+
+        frame = momentum_change.session_frame(sym_state, self.ticker)
+        if not len(frame):
+            _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
+            return "no_data"
+
+        # The history check is fatal for the session rather than for the bar:
+        # six sessions missing at 09:31 are still missing at 14:00, and every
+        # feature built without them would be quietly wrong rather than absent.
+        problem = momentum_change.require_history(frame, today)
+        if problem is not None:
+            self.blocked = {"date": today, "reason": problem}
+            _log(
+                state,
+                {
+                    "type": "error",
+                    "text": (
+                        f"Apple Trader cannot score {self.ticker} today, so it will not "
+                        f"trade this session: {problem}"
+                    ),
+                },
+            )
+            return "no_data"
+
+        read = momentum_change.read_latest(bundle, frame)
+        if read is None:
+            _log(
+                state,
+                {"type": "status", "text": f"No scoreable {self.ticker} bar yet."},
+            )
+            return "no_data"
+
+        fresh_bar = read["ts"] != self.last_bar_ts
+        if fresh_bar:
+            self.last_bar_ts = read["ts"]
+
+        position = tracker.position_for(self.ticker)
+        if position > 0 and self.entry is None:
+            # A position without a remembered entry (agent restarted onto an
+            # existing ledger): adopt it at the current price. Unlike the
+            # trailing stop this only moves the *stop*, which is measured from
+            # the entry — so the adopted position gets one measured from here.
+            self.entry = {"price": read["price"], "bars": 0}
+        if position <= 0:
+            self.entry = None
+        if fresh_bar and self.entry is not None:
+            self.entry["bars"] += 1
+
+        _log(state, {"type": "analysis", "text": self._read_summary(read, position)})
+
+        if position > 0:
+            reason = self._exit_reason(read)
+            if reason is not None:
+                self._sell(state, tracker, position, read, reason)
+                return "sold"
+            return "hold"
+
+        if fresh_bar and self._entry_signal(read):
+            if self._closing_soon():
+                _log(
+                    state,
+                    {
+                        "type": "status",
+                        "text": (
+                            f"Entry signal on the {read['ts']:%H:%M} bar, but the session is "
+                            f"inside its last {self.config.flatten_before_close_min} min and "
+                            "any position would be flattened straight back out. Standing down."
+                        ),
+                    },
+                )
+                return "hold"
+            return "bought" if self._buy(state, tracker, read) else "hold"
+        return "warming_up" if read["warming_up"] else "hold"
+
+    def _roll_session(self, today) -> None:
+        """Forget yesterday at the start of a new session."""
+        if self.session == today:
+            return
+        self.session = today
+        self.entry = None
+        self.last_bar_ts = None
+        self.blocked = None
+
+    # --- the rules ---------------------------------------------------------
+
+    def _momentum_floor(self, read: dict) -> "float | None":
+        """The absolute momentum floor for today, in bps/min.
+
+        `m1_mult` is a multiple of the day's regime threshold rather than a
+        number of bps, because theta is set from yesterday's volatility and a
+        fixed floor would mean something different on every session. Entries
+        only happen while momentum is below −theta, so a multiplier above −1 is
+        already breached at entry — the notebook's sweep runs through there on
+        purpose and it churns one-minute round trips.
+        """
+        theta = read.get("theta")
+        return None if theta is None else self.config.m1_mult * theta
+
+    def _entry_signal(self, read: dict) -> bool:
+        """Whether this bar is a buy: a negative regime the model expects to
+        turn upwards by at least `buy_thr` bps/min."""
+        pred = read["pred"]
+        return (
+            pred is not None
+            and read["regime_before"] == -1
+            and pred >= self.config.buy_thr
+        )
+
+    def _model_exit_signal(self, read: dict) -> bool:
+        """Whether the model is calling this positive regime over."""
+        pred = read["pred"]
+        return (
+            pred is not None
+            and read["regime_before"] == 1
+            and pred <= -self.config.sell_thr
+        )
+
+    def _closing_soon(self) -> bool:
+        """Whether the flatten-before-close rule is already in force."""
+        to_close = market_hours.seconds_to_close()
+        return to_close is not None and to_close <= self.config.flatten_before_close_min * 60
+
+    def _exit_reason(self, read: dict) -> "str | None":
+        """Why this long should be closed on this bar, or None to keep holding.
+
+        `momlib/sim.py` tests all three sell conditions independently and exits
+        if any fires, so the order here changes only which one the ledger is
+        told about — not whether the position closes. They are ordered by how
+        little discretion each leaves: the stop is a fact about the entry price,
+        the floor a fact about the tape, the model a prediction, the bell not
+        about this position at all.
+        """
+        entry = self.entry or {}
+        entry_price = entry.get("price") or 0.0
+        price = read["price"]
+        pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
+
+        stop_price = entry_price * (1 - self.config.stop_pct / 100.0)
+        if entry_price and price < stop_price:
+            return (
+                f"Stop: ${price:,.2f} is below the ${stop_price:,.2f} floor "
+                f"{self.config.stop_pct:.2f}% under the ${entry_price:,.2f} entry. "
+                f"Selling at market ({pnl_pct:+.2f}%)."
+            )
+
+        floor = self._momentum_floor(read)
+        mom = read["mom"]
+        if floor is not None and mom is not None and mom < floor:
+            return (
+                f"Momentum floor: the score is {mom:+.2f} bps/min, below "
+                f"{self.config.m1_mult:g} × θ ({floor:+.2f}). The regime this trade was "
+                f"taken against has not turned, so the position goes ({pnl_pct:+.2f}%)."
+            )
+
+        if self._model_exit_signal(read):
+            return (
+                f"Model exit: the regime is positive and the model puts the next 15 bars "
+                f"at {read['pred']:+.2f} bps/min, at or past the "
+                f"−{self.config.sell_thr:g} sell threshold. Selling into the move rather "
+                f"than waiting for it to unwind ({pnl_pct:+.2f}%)."
+            )
+
+        if self._closing_soon():
+            to_close = market_hours.seconds_to_close() or 0.0
+            return (
+                f"Session ends in {to_close / 60:.0f} min. Momentum, the regime threshold "
+                "and every model feature are intraday, so the position is flattened "
+                f"rather than carried overnight ({pnl_pct:+.2f}%)."
+            )
+        return None
+
+    # --- orders ------------------------------------------------------------
+
+    def _buy(self, state: AppState, tracker: DecisionTracker, read: dict) -> bool:
+        """Deploy `position_pct` of the cash balance; False if it buys nothing."""
+        price = read["price"]
+        cash = tracker.snapshot()["cash"]
+        quantity = _order_quantity(cash, price, self.config.position_pct)
+        if quantity <= 0:
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        f"Entry signal confirmed but ${cash:,.2f} cash buys no "
+                        f"{self.ticker}."
+                    ),
+                },
+            )
+            return False
+
+        decision = tracker.record_trade(
+            self.ticker, "buy", quantity, self._entry_reasoning(read),
+            state.api_key, state.api_secret, state.feed,
+        )
+        self._log_decision(state, decision)
+        if decision.status == "filled":
+            self.entry = {"price": decision.price, "bars": 0}
+        return decision.status == "filled"
+
+    def _entry_reasoning(self, read: dict) -> str:
+        floor = self._momentum_floor(read)
+        floor_text = "—" if floor is None else f"{floor:+.2f} bps/min"
+        return (
+            f"The {read['ts']:%H:%M} bar closed with the previous minute still in a "
+            f"negative momentum regime ({read['mom']:+.2f} bps/min against a θ of "
+            f"{read['theta']:.2f}), and the model puts the next 15 bars at "
+            f"{read['pred']:+.2f} bps/min — at or past the {self.config.buy_thr:g} entry "
+            f"threshold, i.e. a turn upwards out of the regime. Buying at market; the "
+            f"exits are a {self.config.stop_pct:.2f}% stop, a momentum floor at "
+            f"{floor_text}, and the model calling the move over."
+        )
+
+    def _sell(
+        self, state: AppState, tracker: DecisionTracker, quantity: float, read: dict,
+        reasoning: str,
+    ) -> None:
+        decision = tracker.record_trade(
+            self.ticker, "sell", quantity, reasoning, state.api_key, state.api_secret,
+            state.feed,
+        )
+        self._log_decision(state, decision)
+        if decision.status == "filled":
+            self.entry = None
+
+    # --- logging -----------------------------------------------------------
+
+    def _read_summary(self, read: dict, position: float) -> str:
+        momentum_change = _momentum_change()
+        pred = "warming up" if read["pred"] is None else f"pred {read['pred']:+.2f}"
+        mom = "—" if read["mom"] is None else f"{read['mom']:+.2f}"
+        parts = [
+            f"{self.ticker} {read['ts']:%H:%M} ${read['price']:,.2f}",
+            f"{momentum_change.regime_name(read['regime_before'])} → "
+            f"{momentum_change.regime_name(read['regime'])}",
+            f"mom {mom} bps/min",
+            pred,
+        ]
+        if position > 0 and self.entry:
+            entry_price = self.entry["price"]
+            pnl = (read["price"] / entry_price - 1) * 100 if entry_price else 0.0
+            parts.append(
+                f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%), "
+                f"{self.entry['bars']} bars"
+            )
+        return " · ".join(parts)
+
+    def _log_decision(self, state: AppState, decision) -> None:
+        _log(
+            state,
+            {
+                "type": "decision",
+                "action": decision.action,
+                "symbol": decision.symbol,
+                "status": decision.status,
+                "price": decision.price,
+                "quantity": decision.filled_quantity,
+                "reasoning": decision.reasoning,
+            },
+        )
+
+
 def build_trader(config: AppleTraderConfig, bundle: dict):
     """The state machine this configuration's model calls for.
 
     The one place the strategy split turns into an object. Every launch path --
     the live loop below, SimLab's `rule_agents._build_apple` -- goes through
-    here, so a third strategy is added in one place rather than in whichever
+    here, so a fourth strategy is added in one place rather than in whichever
     entry points were remembered.
 
-    Both returned objects expose `run_cycle(bundle, state, tracker)` and
+    All three returned objects expose `run_cycle(bundle, state, tracker)` and
     nothing else that a caller needs.
     """
-    if apple_models.get(config.model_key).strategy == apple_models.STRATEGY_DAYRANGE:
+    strategy = apple_models.get(config.model_key).strategy
+    if strategy == apple_models.STRATEGY_DAYRANGE:
         return DayRangeTrader(config)
+    if strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
+        return MomentumChangeTrader(config)
     return AppleTrader(config, model_threshold=persistence_model.model_threshold(bundle))
 
 
@@ -1391,10 +1823,23 @@ def build_trader(config: AppleTraderConfig, bundle: dict):
 def _armed_summary(config: AppleTraderConfig, model, bundle: dict, trader) -> str:
     """The one line the log opens a run with: which model, and what it will do.
 
-    Per strategy, because the two have nothing in common to summarise -- one is
-    a probability against a threshold on every bar, the other is two price
-    levels set once.
+    Per strategy, because the three have nothing in common to summarise -- one
+    is a probability against a threshold on every bar, one is two price levels
+    set once, one is a signed bps/min forecast read against a printed regime.
     """
+    if config.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
+        metrics = bundle.get("metrics") or {}
+        sign = metrics.get("holdout_sign_hit_rate_on_changes")
+        quality = f", sign right on {sign:.0%} of the holdout week's changes" if sign else ""
+        return (
+            f"Apple Trader armed on {model.label} "
+            f"({_momentum_change().model_name(bundle)}, fitted "
+            f"{bundle.get('saved_at', 'unknown')}{quality}): reading every {config.ticker} "
+            f"minute bar for a negative regime the model expects to turn up by at least "
+            f"{config.buy_thr:g} bps/min, and exiting on a {config.stop_pct:.2f}% stop, a "
+            f"momentum floor at {config.m1_mult:g} × θ, or the model calling the positive "
+            f"regime over at −{config.sell_thr:g}."
+        )
     if config.strategy == apple_models.STRATEGY_DAYRANGE:
         metadata = bundle.get("metadata") or {}
         mae = (metadata.get("test_metrics_ensemble") or {}).get("mae_usd_mean")
