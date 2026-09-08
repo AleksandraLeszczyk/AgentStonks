@@ -94,9 +94,40 @@ class SimMarket:
 
     # --- per-symbol views at time t --------------------------------------
 
+    def _series(self, symbol: str) -> "_SymbolSeries | None":
+        """One symbol's stored series, or None when the dataset has no such
+        symbol.
+
+        Every per-symbol read below goes through this and returns its *empty*
+        answer for an unknown symbol, rather than raising `KeyError`. That is
+        not leniency, it is the contract `simlab.patches` claims to honour: the
+        live fetches these stand in for return `[]`/`None` when a symbol cannot
+        be had, so a caller asking for one it did not get should see the same
+        thing in a replay as it would live -- and then refuse for its own
+        reasons, in its own words.
+
+        The failure this prevents is specific and was observed rather than
+        imagined. Any model reading a *second* symbol for context -- a market
+        index like SPY for a relative-strength or beta feature is the obvious
+        case -- resolves it through the patched daily fetch, and on a dataset
+        recorded for one stock that used to raise a bare ``'SPY'`` out of the
+        middle of the day loop. It did not refuse the session; it ended the
+        whole simulation, with "partial results below". Standing the session
+        down with a sentence naming what was missing is the intended behaviour
+        of every such model, and it only works if the read comes back empty.
+
+        A symbol the run actually *trades* is checked long before this, when the
+        experiment is queued (`app.missing_rule_symbols`), so nothing is
+        silently swallowed here: that error is louder, earlier, and names the
+        dataset to re-download.
+        """
+        return self.series.get(str(symbol).upper())
+
     def completed_bars(self, symbol: str, t: datetime) -> list[dict]:
         """Minute bars completed by `t`, oldest first (the SymbolState buffer)."""
-        series = self.series[symbol]
+        series = self._series(symbol)
+        if series is None:
+            return []
         cutoff = t - timedelta(seconds=BAR_SEC)
         idx = bisect_right(series.minute_ts, cutoff)
         return series.minute_bars[:idx]
@@ -116,7 +147,9 @@ class SimMarket:
         trading date, plus today's partial bar rebuilt from the minute tape --
         mirroring what the live REST daily fetch shows mid-session."""
         today = t.astimezone(MARKET_TZ).date().isoformat()
-        series = self.series[symbol]
+        series = self._series(symbol)
+        if series is None:
+            return []
         out = [b for b in series.daily_bars if str(b.get("t", ""))[:10] < today]
         todays = [
             b
@@ -147,7 +180,10 @@ class SimMarket:
         never reach today's outcome through a row it cannot tell apart.
         """
         today = t.astimezone(MARKET_TZ).date().isoformat()
-        return [b for b in self.series[symbol].daily_bars if str(b.get("t", ""))[:10] < today]
+        series = self._series(symbol)
+        if series is None:
+            return []
+        return [b for b in series.daily_bars if str(b.get("t", ""))[:10] < today]
 
     def session_open_price(self, symbol: str, t: datetime) -> Optional[float]:
         """Today's official opening print from the stored daily bar, or None.
@@ -166,7 +202,10 @@ class SimMarket:
         today = t.astimezone(MARKET_TZ).date()
         if t.astimezone(MARKET_TZ).time() < MARKET_OPEN:
             return None
-        for bar in self.series[symbol].daily_bars:
+        series = self._series(symbol)
+        if series is None:
+            return None
+        for bar in series.daily_bars:
             if str(bar.get("t", ""))[:10] == today.isoformat():
                 try:
                     return float(bar["o"])
@@ -176,7 +215,10 @@ class SimMarket:
 
     def prev_close(self, symbol: str, t: datetime) -> Optional[float]:
         today = t.astimezone(MARKET_TZ).date().isoformat()
-        prior = [b for b in self.series[symbol].daily_bars if str(b.get("t", ""))[:10] < today]
+        series = self._series(symbol)
+        if series is None:
+            return None
+        prior = [b for b in series.daily_bars if str(b.get("t", ""))[:10] < today]
         if not prior:
             return None
         try:
@@ -186,7 +228,9 @@ class SimMarket:
 
     def news_at(self, symbol: str, t: datetime) -> list[dict]:
         """Articles published by `t`, newest first (the SymbolState news list)."""
-        series = self.series[symbol]
+        series = self._series(symbol)
+        if series is None:
+            return []
         out = [
             article
             for article, ts in zip(series.news, series.news_ts)
@@ -196,7 +240,9 @@ class SimMarket:
 
     def fresh_news(self, symbol: str, after: datetime, until: datetime) -> list[dict]:
         """Articles published in (after, until] -- the wake-the-agent interrupt."""
-        series = self.series[symbol]
+        series = self._series(symbol)
+        if series is None:
+            return []
         return [
             article
             for article, ts in zip(series.news, series.news_ts)
@@ -216,7 +262,9 @@ class SimMarket:
 
     def bars_window(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
         """Bars with start <= T < end (the patched fetch_bars_window)."""
-        series = self.series[symbol]
+        series = self._series(symbol)
+        if series is None:
+            return []
         return [
             bar
             for bar, ts in zip(series.minute_bars, series.minute_ts)

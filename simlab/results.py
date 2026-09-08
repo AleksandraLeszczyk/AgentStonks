@@ -232,30 +232,128 @@ def instrument_key(record: dict) -> str:
     return MULTI_INSTRUMENT
 
 
+def ml_model_key(record: dict) -> str:
+    """Which saved ML model a stored run's decisions came out of.
+
+    A different question from `model_key`, which is the *LLM* behind a run (and
+    the rule set's signature where there is no LLM). This one asks what the app
+    actually loaded out of `Code/Models`, and the three kinds of run answer it
+    differently:
+
+    * **Apple Trader** is one model by construction -- the model it names is
+      the strategy, and picking a different one changes which rules exist. Its
+      `model_key` is the answer.
+    * **Apple Trader 2** names models per *condition*, so a rule set reads
+      however many it mentions: none (price and momentum alone), one, or
+      several. The set is the key, joined in registry order so the same
+      combination is always the same row.
+    * an **LLM agent** loads no saved model at all. Grouping every LLM run into
+      one row would hide the comparison worth making on this axis, so they are
+      grouped by **provider** -- which is the closest thing an LLM run has to
+      "which model produced this", at a granularity that stays readable beside
+      four ML rows.
+
+    Rule sets are decoded rather than string-matched, so a condition renamed in
+    `apple_rules` moves this key with it instead of silently mis-filing runs.
+    Nothing heavy is imported: `apple_rules` reaches `apple_models` for the
+    registry and neither pulls in PyTorch.
+    """
+    config = record.get("config_summary") or {}
+    if not config.get("rule_based"):
+        provider = str(config.get("provider") or "?").strip() or "?"
+        return f"{LLM_MODEL_PREFIX}{provider}"
+
+    rule_config = config.get("rule_config") or {}
+    # Apple Trader: one named model, and it is the whole strategy.
+    named = str(rule_config.get("model_key") or "").strip()
+    if named:
+        return named
+    # Apple Trader 2: whatever its enabled conditions name.
+    if "rules" in rule_config:
+        try:
+            from agent_stonks.apple_rules import RuleSet
+
+            models = RuleSet.from_record(rule_config["rules"]).models()
+        except Exception:
+            # A stored record is JSON on disk and may predate a rule schema.
+            # An undecodable set is still a run that happened; losing it from
+            # the breakdown would be worse than filing it as unknown.
+            return UNKNOWN_INSTRUMENT
+        if models:
+            return ML_MODEL_JOIN.join(models)
+        return NO_ML_MODEL
+    return UNKNOWN_INSTRUMENT
+
+
+def agent_key(record: dict) -> str:
+    """Which agent personality ran -- the same key the agent breakdown groups
+    on, so a filter selection and a table row always mean the same run."""
+    return (record.get("config_summary") or {}).get("personality") or "?"
+
+
+# Sentinels are answers, not names, and they read as noise at the top of an
+# option list -- so every option list sorts them to the end.
+_SENTINELS = (NO_DATASET, NO_ML_MODEL, MULTI_INSTRUMENT, UNKNOWN_INSTRUMENT)
+
+
+def _sorted_options(keys: "set[str]") -> list[str]:
+    return sorted(keys, key=lambda key: (key in _SENTINELS, key))
+
+
 def filter_options(runs: list[dict]) -> dict[str, list[str]]:
-    """The datasets and models actually present in the stored runs, sorted --
-    the option lists for the Results filters."""
+    """The values actually present in the stored runs, per filter dimension,
+    sorted -- the option lists for the Results filters.
+
+    Every list holds *stored* keys, never display labels: the agent and ML
+    model lists are rendered through the same labellers the breakdown table
+    uses, so renaming an agent or a model moves the option without invalidating
+    a stored run or a selection.
+    """
     return {
-        # Named datasets first, the "(no dataset)" catch-all last.
-        "datasets": sorted({dataset_key(r) for r in runs},
-                           key=lambda name: (name == NO_DATASET, name)),
-        "models": sorted({model_key(r) for r in runs}),
+        "datasets": _sorted_options({dataset_key(r) for r in runs}),
+        "models": _sorted_options({model_key(r) for r in runs}),
+        "agents": _sorted_options({agent_key(r) for r in runs}),
+        "instruments": _sorted_options({instrument_key(r) for r in runs}),
+        "ml_models": _sorted_options({ml_model_key(r) for r in runs}),
     }
+
+
+# Each filter dimension and the key function it matches on. Sharing one table
+# between `filter_options` above and `filter_runs` below is what keeps the two
+# from drifting: an option can only be offered for a dimension that is also
+# filtered on, and both read the same key out of a record.
+_FILTER_KEYS = {
+    "datasets": dataset_key,
+    "models": model_key,
+    "agents": agent_key,
+    "instruments": instrument_key,
+    "ml_models": ml_model_key,
+}
 
 
 def filter_runs(
     runs: list[dict],
     datasets: "list[str] | None" = None,
     models: "list[str] | None" = None,
+    agents: "list[str] | None" = None,
+    instruments: "list[str] | None" = None,
+    ml_models: "list[str] | None" = None,
 ) -> list[dict]:
     """Runs matching every non-empty filter. An empty (or omitted) filter means
-    "no restriction on this dimension", so no selection shows everything."""
-    dataset_set, model_set = set(datasets or ()), set(models or ())
+    "no restriction on this dimension", so no selection shows everything, and
+    dimensions combine with AND -- narrowing one never widens another."""
+    selected = {
+        "datasets": set(datasets or ()),
+        "models": set(models or ()),
+        "agents": set(agents or ()),
+        "instruments": set(instruments or ()),
+        "ml_models": set(ml_models or ()),
+    }
+    active = [(_FILTER_KEYS[dim], values) for dim, values in selected.items() if values]
     return [
         record
         for record in runs
-        if (not dataset_set or dataset_key(record) in dataset_set)
-        and (not model_set or model_key(record) in model_set)
+        if all(key_of(record) in values for key_of, values in active)
     ]
 
 
@@ -316,59 +414,6 @@ def decision_trigger(decision: dict) -> str:
     return ""
 
 
-def ml_model_key(record: dict) -> str:
-    """Which saved ML model a stored run's decisions came out of.
-
-    A different question from `model_key`, which is the *LLM* behind a run (and
-    the rule set's signature where there is no LLM). This one asks what the app
-    actually loaded out of `Code/Models`, and the three kinds of run answer it
-    differently:
-
-    * **Apple Trader** is one model by construction -- the model it names is
-      the strategy, and picking a different one changes which rules exist. Its
-      `model_key` is the answer.
-    * **Apple Trader 2** names models per *condition*, so a rule set reads
-      however many it mentions: none (price and momentum alone), one, or
-      several. The set is the key, joined in registry order so the same
-      combination is always the same row.
-    * an **LLM agent** loads no saved model at all. Grouping every LLM run into
-      one row would hide the comparison worth making on this axis, so they are
-      grouped by **provider** -- which is the closest thing an LLM run has to
-      "which model produced this", at a granularity that stays readable beside
-      four ML rows.
-
-    Rule sets are decoded rather than string-matched, so a condition renamed in
-    `apple_rules` moves this key with it instead of silently mis-filing runs.
-    Nothing heavy is imported: `apple_rules` reaches `apple_models` for the
-    registry and neither pulls in PyTorch.
-    """
-    config = record.get("config_summary") or {}
-    if not config.get("rule_based"):
-        provider = str(config.get("provider") or "?").strip() or "?"
-        return f"{LLM_MODEL_PREFIX}{provider}"
-
-    rule_config = config.get("rule_config") or {}
-    # Apple Trader: one named model, and it is the whole strategy.
-    named = str(rule_config.get("model_key") or "").strip()
-    if named:
-        return named
-    # Apple Trader 2: whatever its enabled conditions name.
-    if "rules" in rule_config:
-        try:
-            from agent_stonks.apple_rules import RuleSet
-
-            models = RuleSet.from_record(rule_config["rules"]).models()
-        except Exception:
-            # A stored record is JSON on disk and may predate a rule schema.
-            # An undecodable set is still a run that happened; losing it from
-            # the breakdown would be worse than filing it as unknown.
-            return UNKNOWN_INSTRUMENT
-        if models:
-            return ML_MODEL_JOIN.join(models)
-        return NO_ML_MODEL
-    return UNKNOWN_INSTRUMENT
-
-
 BREAKDOWN_DIMENSIONS = ("model", "dataset", "agent", "instrument", "ml_model")
 
 
@@ -404,7 +449,7 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
         elif by == "ml_model":
             key = ml_model_key(record)
         else:
-            key = config.get("personality") or "?"
+            key = agent_key(record)
         group = groups.setdefault(
             key, {"count": 0, "returns": [], "efficiencies": [], "scores": [], "best": None}
         )

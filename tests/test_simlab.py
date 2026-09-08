@@ -81,6 +81,34 @@ class TestClock:
 
 
 class TestMarket:
+    def test_a_symbol_the_dataset_does_not_carry_reads_as_empty(self, store):
+        """Not `KeyError` -- the contract `simlab.patches` claims to honour.
+
+        Every live fetch these stand in for returns `[]`/`None` when a symbol
+        cannot be had, so a model reading a *second* symbol for context (a
+        market index for a relative-strength or beta feature, say) must see the
+        same thing in a replay as it would live, and refuse in its own words.
+
+        Before this, such a read raised a bare ``'SPY'`` out of the middle of
+        the day loop and ended the whole simulation with "partial results
+        below" instead of standing the session down. A symbol the run actually
+        trades is caught much earlier, when the experiment is queued
+        (`app.missing_rule_symbols`), so nothing real is swallowed here.
+        """
+        market = SimMarket(["TEST"], [DAY])
+        t = OPEN_UTC + timedelta(minutes=10)
+        assert market.completed_bars("SPY", t) == []
+        assert market.daily_bars_at("SPY", t) == []
+        assert market.completed_daily_bars("SPY", t) == []
+        assert market.bars_window("SPY", t, t + timedelta(minutes=5)) == []
+        assert market.news_at("SPY", t) == []
+        assert market.fresh_news("SPY", t - timedelta(minutes=5), t) == []
+        assert market.price_at("SPY", t) is None
+        assert market.session_open_price("SPY", t) is None
+        assert market.prev_close("SPY", t) is None
+        # ...and the symbol it does carry is unaffected.
+        assert market.completed_bars("TEST", t)
+
     def test_completed_bars_respect_bar_completion(self, store):
         market = SimMarket(["TEST"], [DAY])
         # At 13:31:00 exactly bar 0 (13:30) has completed; bar 1 has not.
@@ -2124,10 +2152,27 @@ class TestTopRuns:
 
 
 class TestRunFilters:
-    def _run(self, model="gpt-a", dataset="ds1", provider="openai"):
+    def _run(self, model="gpt-a", dataset="ds1", provider="openai",
+             personality="momentum", symbols=("AAPL",)):
         return {
             "dataset": dataset,
-            "config_summary": {"provider": provider, "model": model},
+            "config_summary": {
+                "provider": provider, "model": model,
+                "personality": personality, "symbols": list(symbols),
+            },
+        }
+
+    def _rule_run(self, ticker="AAPL", model_key="persistence", dataset="ds1"):
+        """A rule run, whose instrument and ML model come out of its setup
+        rather than out of the LLM fields."""
+        return {
+            "dataset": dataset,
+            "config_summary": {
+                "provider": "rules", "model": f"rules/{model_key}",
+                "personality": "apple_trader", "rule_based": True,
+                "symbols": [ticker],
+                "rule_config": {"ticker": ticker, "model_key": model_key},
+            },
         }
 
     def _runs(self):
@@ -2142,10 +2187,36 @@ class TestRunFilters:
         assert options["datasets"] == ["ds1", "ds2", sim_results.NO_DATASET]
         assert options["models"] == ["openai/gpt-a", "openai/gpt-b"]
 
+    def test_options_cover_the_new_dimensions(self):
+        runs = [
+            self._run(personality="momentum", symbols=["AAPL"]),
+            self._run(personality="contrarian", symbols=["INTC"]),
+            self._rule_run(ticker="GOOGL", model_key="dayrange"),
+        ]
+        options = sim_results.filter_options(runs)
+        assert options["agents"] == ["apple_trader", "contrarian", "momentum"]
+        assert options["instruments"] == ["AAPL", "GOOGL", "INTC"]
+        # LLM runs group by provider on this axis; the rule run names its model.
+        assert options["ml_models"] == [
+            "dayrange", f"{sim_results.LLM_MODEL_PREFIX}openai",
+        ]
+
+    def test_sentinel_options_sort_last(self):
+        runs = [
+            self._run(dataset="", symbols=["AAPL", "INTC"]),
+            self._run(dataset="zz", symbols=["AAPL"]),
+        ]
+        options = sim_results.filter_options(runs)
+        assert options["datasets"] == ["zz", sim_results.NO_DATASET]
+        assert options["instruments"] == ["AAPL", sim_results.MULTI_INSTRUMENT]
+
     def test_empty_filters_keep_everything(self):
         runs = self._runs()
         assert sim_results.filter_runs(runs) == runs
         assert sim_results.filter_runs(runs, datasets=[], models=[]) == runs
+        assert sim_results.filter_runs(
+            runs, agents=[], instruments=[], ml_models=[]
+        ) == runs
 
     def test_filters_combine(self):
         runs = self._runs()
@@ -2154,12 +2225,54 @@ class TestRunFilters:
         both = sim_results.filter_runs(runs, datasets=["ds1"], models=["openai/gpt-a"])
         assert both == [runs[0]]
 
+    def test_new_filters_select_and_intersect(self):
+        aapl = self._rule_run(ticker="AAPL", model_key="persistence")
+        intc = self._rule_run(ticker="INTC", model_key="persistence")
+        googl = self._rule_run(ticker="GOOGL", model_key="dayrange")
+        llm = self._run(personality="momentum", symbols=["AAPL"])
+        runs = [aapl, intc, googl, llm]
+
+        assert sim_results.filter_runs(runs, instruments=["AAPL"]) == [aapl, llm]
+        assert sim_results.filter_runs(runs, ml_models=["persistence"]) == [aapl, intc]
+        assert sim_results.filter_runs(runs, agents=["momentum"]) == [llm]
+        # Dimensions are AND-ed: narrowing one never widens another.
+        assert sim_results.filter_runs(
+            runs, instruments=["AAPL"], ml_models=["persistence"]
+        ) == [aapl]
+        assert sim_results.filter_runs(
+            runs, instruments=["AAPL"], agents=["momentum"]
+        ) == [llm]
+        assert sim_results.filter_runs(
+            runs, instruments=["INTC"], ml_models=["dayrange"]
+        ) == []
+
     def test_filter_keys_match_breakdown_groups(self):
         runs = self._runs()
         by_model = {r["group"] for r in sim_results.breakdown(runs, by="model")}
         assert by_model == set(sim_results.filter_options(runs)["models"])
         by_dataset = {r["group"] for r in sim_results.breakdown(runs, by="dataset")}
         assert by_dataset == set(sim_results.filter_options(runs)["datasets"])
+
+    def test_every_filter_agrees_with_its_breakdown(self):
+        """A selection and the row it narrows to have to be the same key, or
+        picking a row's value in the filter would empty the page."""
+        runs = [
+            self._run(personality="momentum", symbols=["AAPL"]),
+            self._run(personality="contrarian", symbols=["INTC"], dataset="ds2"),
+            self._rule_run(ticker="GOOGL", model_key="dayrange"),
+        ]
+        options = sim_results.filter_options(runs)
+        pairs = {
+            "agents": "agent", "instruments": "instrument",
+            "ml_models": "ml_model", "models": "model", "datasets": "dataset",
+        }
+        for option_key, dimension in pairs.items():
+            groups = {r["group"] for r in sim_results.breakdown(runs, by=dimension)}
+            assert groups == set(options[option_key]), dimension
+            for value in options[option_key]:
+                assert sim_results.filter_runs(runs, **{option_key: [value]}), (
+                    dimension, value,
+                )
 
 
 class TestPriorRuns:

@@ -2115,24 +2115,58 @@ def _breakdown_bar(labels: list[str], values: list[float], title: str, color: st
     return fig
 
 
+# The filters, in the order they are laid out, each as
+# (filter_options key / filter_runs keyword, label, placeholder, label maker).
+#
+# The five match the five breakdown dimensions one for one, and deliberately
+# use the same names: a filter and the table row it narrows to should not be
+# called different things. "LLM / rules" is what the filter used to call
+# "Models" -- renamed for the same reason the breakdown control was, since
+# "Models" sitting next to "ML model" reads as the same axis twice and is not.
+#
+# There is no strategy filter: a strategy is not a stored dimension of a run.
+# Which one an Apple Trader run used *is* the model it names, so the ML model
+# filter already selects it, and adding a control that only restates another
+# would give the page a knob that never narrows anything on its own.
+_RUN_FILTERS: "tuple[tuple[str, str, str, object], ...]" = (
+    ("datasets", "Datasets", "All datasets", None),
+    ("agents", "Agents", "All agents", _agent_label),
+    ("instruments", "Instruments", "All instruments", None),
+    ("ml_models", "ML models", "All ML models", _ml_model_label),
+    # No shortening here, unlike the top-run cards: a rule agent's whole rule
+    # set is its model string, and two sets can agree for a hundred characters
+    # before they differ. An abbreviated option list would offer the reader two
+    # identical-looking choices that are not the same runs.
+    ("models", "LLM / rules", "All models", None),
+)
+
+
 def _render_run_filters(runs: list[dict], key_prefix: str) -> list[dict]:
-    """Dataset / model filters over the stored runs. Selecting nothing in a
-    filter leaves that dimension unrestricted, so the default view is all runs.
+    """Dataset / agent / instrument / ML model / LLM filters over the stored
+    runs. Selecting nothing in a filter leaves that dimension unrestricted, so
+    the default view is all runs, and the dimensions combine with AND.
     Everything below (breakdown, charts, run picker) works off the result.
     Summary and Results each render their own copy -- hence the key prefix --
-    so filtering one tab doesn't silently reshape the other."""
+    so filtering one tab doesn't silently reshape the other.
+
+    Options are the values actually present in the stored runs, so a filter
+    never offers a choice that would empty the page on its own. They are stored
+    keys rendered through the breakdown's own labellers, which is what lets a
+    renamed agent or model move an option without stranding a stored run.
+    """
     options = sim_results.filter_options(runs)
-    col_datasets, col_models = st.columns(2)
-    datasets = col_datasets.multiselect(
-        "Datasets", options["datasets"], key=f"{key_prefix}_filter_datasets",
-        placeholder="All datasets",
-    )
-    models = col_models.multiselect(
-        "Models", options["models"], key=f"{key_prefix}_filter_models",
-        placeholder="All models",
-    )
-    filtered = sim_results.filter_runs(runs, datasets=datasets, models=models)
-    if datasets or models:
+    selections: dict[str, list[str]] = {}
+    # Three then two rather than one row of five: a multiselect a fifth of the
+    # page wide truncates its own chips.
+    columns = list(st.columns(3)) + list(st.columns(2))
+    for column, (dimension, label, placeholder, label_of) in zip(columns, _RUN_FILTERS):
+        selections[dimension] = column.multiselect(
+            label, options[dimension], key=f"{key_prefix}_filter_{dimension}",
+            placeholder=placeholder,
+            **({"format_func": label_of} if label_of else {}),
+        )
+    filtered = sim_results.filter_runs(runs, **selections)
+    if any(selections.values()):
         st.caption(f"Showing {len(filtered)} of {len(runs)} runs.")
     return filtered
 
@@ -2196,11 +2230,11 @@ def _confirm_delete_all_runs(total: int) -> None:
     with st.container(horizontal=True):
         if st.button("Delete them", type="primary", icon=":material/delete_forever:"):
             removed = sim_results.delete_all_runs()
-            for key in (
-                "last_run_id",
-                "results_filter_datasets", "results_filter_models",
-                "summary_filter_datasets", "summary_filter_models",
-            ):
+            for key in ["last_run_id"] + [
+                f"{prefix}_filter_{dimension}"
+                for prefix in ("results", "summary")
+                for dimension, *_ in _RUN_FILTERS
+            ]:
                 st.session_state.pop(key, None)
             st.toast(f"Deleted {removed} run{'' if removed == 1 else 's'}",
                      icon=":material/delete_sweep:")
