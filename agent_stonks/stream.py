@@ -3,7 +3,6 @@ import logging
 import socket
 import threading
 import time
-from datetime import datetime
 from typing import Any
 
 import websocket
@@ -16,6 +15,7 @@ from .config import (
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
 )
+from . import clock
 from . import scoring
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
@@ -118,7 +118,7 @@ def _floor_ts(ts: str, minutes: int) -> str:
     (isoformat()'s '+00:00' suffix broke that, duplicating buckets after a
     fallback refresh).
     """
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    dt = clock.parse_iso_strict(ts)
     total = dt.hour * 60 + dt.minute
     floored = (total // minutes) * minutes
     dt = dt.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
@@ -127,7 +127,7 @@ def _floor_ts(ts: str, minutes: int) -> str:
 
 def _bar_ts_key(ts: object) -> str:
     """Normalize a bar timestamp for cross-source comparison ('Z' vs '+00:00')."""
-    return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).isoformat()
+    return clock.parse_iso_strict(ts).isoformat()
 
 
 def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:

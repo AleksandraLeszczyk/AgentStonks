@@ -61,20 +61,27 @@ the simulator is for.
 
 from __future__ import annotations
 
-import math
 import threading
 from dataclasses import dataclass, field
 
 import pandas as pd
 
-from . import apple_models, apple_rules, historical, market_hours, persistence_model, scoring
-from . import observability as obs
-from .agent import _log, stop_agent
+from . import (
+    apple_models,
+    apple_rules,
+    historical,
+    market_hours,
+    persistence_model,
+    rule_agent,
+)
+from .agent import stop_agent
+from .rule_agent import BaseTrader
+from .state import append_agent_log as _log
 from .apple_rules import RuleSet
-from .apple_trader import fetch_opening_window
-from .clock import now as _now
+# `_dayrange` is the shared lazy import of the PyTorch/LightGBM model, kept
+# in one place so both agents defer the 200 MB dependency identically.
+from .apple_trader import _dayrange, fetch_opening_window
 from .config import (
-    APPLE_TRADER_BAR_LAG_SEC,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
 )
@@ -174,13 +181,6 @@ def config_error(
     return apple_rules.ruleset_error(config.rules, bundles, config.ticker)
 
 
-def _dayrange():
-    """`agent_stonks.dayrange_model`, imported on first use -- it pulls PyTorch
-    and LightGBM in, and a rule set that never mentions the day-range model must
-    not pay for them."""
-    from . import dayrange_model
-
-    return dayrange_model
 
 
 class SessionForecaster:
@@ -540,7 +540,7 @@ class SignalBus:
         return None
 
 
-class AppleTrader2:
+class AppleTrader2(BaseTrader):
     """The state machine driving one run: the rule list, and the book it keeps.
 
     One instance per launched agent; `run_cycle` is called once per closed bar
@@ -551,11 +551,8 @@ class AppleTrader2:
         self, config: "AppleTrader2Config | None" = None,
         bundles: "dict[str, dict | None] | None" = None,
     ) -> None:
-        self.config = config or AppleTrader2Config()
+        super().__init__(config or AppleTrader2Config())
         self.bundles = bundles or {}
-        # Read off the config once: every log line, order and state lookup below
-        # is about this one symbol, and the config is not re-read mid-run.
-        self.ticker = self.config.ticker
         # The momentum settings every regime signal is computed with. They come
         # from whichever momentum bundle the rules named -- the two carry the
         # same numbers -- and fall back to the shipped defaults when no rule
@@ -563,9 +560,6 @@ class AppleTrader2:
         # files present at all.
         self.params = persistence_model.momentum_params(self._momentum_bundle())
         self.forecaster = SessionForecaster(self.ticker)
-        # The open long: average entry, the peak the give-back is measured from,
-        # and how many bars it has been held. None while flat.
-        self.entry: "dict | None" = None
         # The last buy that filled, and the highest price seen since it did --
         # the anchor `pos.since_buy_pct` measures from. Deliberately NOT the
         # same record as `entry`: this one survives the sell that clears the
@@ -574,7 +568,6 @@ class AppleTrader2:
         # morning (a reference from yesterday would be measured across the
         # overnight gap, which nothing else here does).
         self.last_buy: "dict | None" = None
-        self.last_bar_ts = None
         # Bars seen this session, and the bar each rule last fired on -- the two
         # halves of `cooldown_bars`. Both reset each morning, which is what
         # makes a cooldown longer than a session mean "once a day".
@@ -593,23 +586,9 @@ class AppleTrader2:
     def run_cycle(self, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome tag
         ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(self.ticker)
-        if sym_state is None:
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
-                },
-            )
-            return "no_data"
-
-        if not market_hours.is_market_open():
-            _log(
-                state,
-                {"type": "status", "text": "Market closed -- Apple Trader 2 is not watching bars."},
-            )
-            return "closed"
+        sym_state, refused = self.preflight(state)
+        if refused is not None:
+            return refused
 
         frame = persistence_model.minute_frame(sym_state)
         if not len(frame):
@@ -651,7 +630,7 @@ class AppleTrader2:
             plan_fn=lambda: self._forecast(state, frame),
         )
 
-        if position > 0 and self._closing_soon():
+        if position > 0 and self.closing_soon():
             self._log_read(state, bus, position)
             self._flatten(state, tracker, position, bus)
             return "sold"
@@ -669,7 +648,7 @@ class AppleTrader2:
             shares=position,
             blocked=self._cooling_down,
         )
-        if match is not None and match.item.action == apple_rules.BUY and self._closing_soon():
+        if match is not None and match.item.action == apple_rules.BUY and self.closing_soon():
             self._log_read(state, bus, position)
             _log(
                 state,
@@ -729,13 +708,6 @@ class AppleTrader2:
         fired = self.fired_at.get(index)
         return fired is not None and self.bar_count - fired < item.cooldown_bars
 
-    def _closing_soon(self) -> bool:
-        to_close = market_hours.seconds_to_close()
-        return (
-            to_close is not None
-            and to_close <= self.config.flatten_before_close_min * 60
-        )
-
     def _forecast(self, state: AppState, frame) -> "dict | None":
         bundle = self.bundles.get(apple_models.DAYRANGE_KEY)
         if bundle is None:
@@ -751,18 +723,7 @@ class AppleTrader2:
             self.ticker, match.item.action, match.quantity, self._reasoning(match, bus),
             state.api_key, state.api_secret, state.feed,
         )
-        _log(
-            state,
-            {
-                "type": "decision",
-                "action": decision.action,
-                "symbol": decision.symbol,
-                "status": decision.status,
-                "price": decision.price,
-                "quantity": decision.filled_quantity,
-                "reasoning": decision.reasoning,
-            },
-        )
+        self.log_decision(state, decision)
         if decision.status != "filled":
             return "hold"
 
@@ -819,18 +780,7 @@ class AppleTrader2:
             ),
             state.api_key, state.api_secret, state.feed,
         )
-        _log(
-            state,
-            {
-                "type": "decision",
-                "action": decision.action,
-                "symbol": decision.symbol,
-                "status": decision.status,
-                "price": decision.price,
-                "quantity": decision.filled_quantity,
-                "reasoning": decision.reasoning,
-            },
-        )
+        self.log_decision(state, decision)
         if decision.status == "filled":
             self.entry = None
 
@@ -915,12 +865,6 @@ def armed_summary(config: AppleTrader2Config) -> str:
     )
 
 
-def _seconds_to_next_bar(cycle_sec: int, lag: float = APPLE_TRADER_BAR_LAG_SEC) -> float:
-    """Seconds to wait so the next cycle lands just after a bar closes."""
-    ts = _now().timestamp()
-    return (math.floor(ts / cycle_sec) + 1) * cycle_sec + lag - ts
-
-
 def _apple_trader2_loop(
     state: AppState,
     tracker: DecisionTracker,
@@ -932,25 +876,16 @@ def _apple_trader2_loop(
     mismatch = config_error(config, bundles)
     if mismatch is not None:
         _log(state, {"type": "error", "text": mismatch})
-        scoring.end_session(state, tracker)
-        state.agent_running = False
+        rule_agent.end_session(state, tracker, None)
         return
 
     trader = build_trader(config, bundles)
     _log(state, {"type": "status", "text": armed_summary(config)})
-
-    while not stop_event.is_set():
-        try:
-            trader.run_cycle(state, tracker)
-        except Exception as exc:
-            _log(state, {"type": "error", "text": f"Apple Trader 2 cycle failed: {exc}"})
-        scoring.maybe_score_day(state, tracker)
-        stop_event.wait(_seconds_to_next_bar(cycle_sec))
-
-    scoring.end_session(state, tracker)
-    state.agent_running = False
-    _log(state, {"type": "status", "text": "Apple Trader 2 stopped"})
-    obs.flush()
+    rule_agent.run_loop(
+        state, tracker,
+        lambda: trader.run_cycle(state, tracker),
+        stop_event, cycle_sec, "Apple Trader 2",
+    )
 
 
 def launch_apple_trader2(
@@ -967,13 +902,9 @@ def launch_apple_trader2(
     personality.
     """
     config = config or AppleTrader2Config()
-    stop_agent(state)
-    stop_event = threading.Event()
-    state.agent_stop_event = stop_event
-    state.agent_running = True
-    scoring.begin_session(state, APPLE_TRADER2_KEY, [config.ticker])
-    threading.Thread(
+    rule_agent.launch(
+        state, tracker, APPLE_TRADER2_KEY, config.ticker,
         target=_apple_trader2_loop,
-        args=(state, tracker, config, cycle_sec, stop_event),
-        daemon=True,
-    ).start()
+        args=(state, tracker, config, cycle_sec),
+        stop_agent=stop_agent,
+    )

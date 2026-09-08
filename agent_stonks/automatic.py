@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
 from typing import Any
 
 from . import agent
@@ -34,6 +33,19 @@ from . import scoring
 from .agent import (
     AGENT_PERSONALITIES,
     PREMARKET_PERSONALITY,
+    _dispatch_tool,
+    _log,
+    _reject,
+    _wait_for_next_cycle,
+    breakout_preconditions,
+    run_agent_cycle,
+    run_premarket_session,
+    selectable_personalities,
+)
+# The orchestrator's own regime-detection cycle is a personality in everything
+# but name, so it assembles a tool list the same way the others do -- from the
+# shared schemas rather than from a copy of them.
+from .agent_tools import (
     _TOOL_ANALYZE_DAILY_TREND,
     _TOOL_ANALYZE_INTRADAY_MOMENTUM,
     _TOOL_ANALYZE_MARKET,
@@ -46,14 +58,6 @@ from .agent import (
     _TOOL_GET_PUT_CALL_WALLS,
     _TOOL_GET_QUOTE,
     _TOOL_GET_SESSION_CLOCK,
-    _dispatch_tool,
-    _log,
-    _reject,
-    _wait_for_next_cycle,
-    breakout_preconditions,
-    run_agent_cycle,
-    run_premarket_session,
-    selectable_personalities,
 )
 from .config import AGENT_CYCLE_SEC, AGENT_MAX_TOOL_ITERS
 from .decisions import DecisionTracker

@@ -20,6 +20,7 @@ import pytest
 from agent_stonks import apple_models
 from agent_stonks import apple_rules as ar
 from agent_stonks import apple_trader2 as at2
+from agent_stonks import rule_agent
 from agent_stonks import clock, persistence_model
 from agent_stonks.apple_rules import ActionItem, Condition, RuleSet
 from agent_stonks.apple_trader2 import (
@@ -971,8 +972,7 @@ class TestLaunch:
         """The validation runs before the loop, so a configuration that cannot
         work reports itself instead of producing an empty ledger."""
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at2.scoring, "begin_session", lambda *a, **k: None)
-        monkeypatch.setattr(at2.scoring, "end_session", lambda *a, **k: None)
+        monkeypatch.setattr(rule_agent.scoring, "end_session", lambda *a, **k: None)
         at2._apple_trader2_loop(
             state, tracker, AppleTrader2Config(rules=RuleSet()), 60, threading.Event()
         )

@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, TypeVar
 
+from . import clock
 from . import observability as obs
 from .config import SCORING_MIN_TOTAL_RUNTIME_SEC
 
@@ -104,10 +105,8 @@ def _day_key(dt: datetime) -> str:
 
 
 def _day_key_of_iso(ts: str) -> "str | None":
-    try:
-        return _day_key(datetime.fromisoformat(ts.replace("Z", "+00:00")))
-    except ValueError:
-        return None
+    parsed = clock.parse_iso(ts)
+    return _day_key(parsed) if parsed is not None else None
 
 
 # --------------------------------------------------------------------------

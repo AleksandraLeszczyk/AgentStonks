@@ -37,7 +37,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Optional
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from . import clock, historical, market_hours
 from .config import TACTICS_POLL_SEC
@@ -120,13 +120,7 @@ class Tactics:
 def _parse_expiry(raw: object) -> "datetime | None":
     """Parse an expires_at value into an aware datetime, or None if unusable.
     A naive timestamp is taken as UTC (the convention every tool output uses)."""
-    try:
-        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+    return clock.parse_iso(raw)
 
 
 def normalize_tactics(symbol: str, raw_actions: object, reasoning: str) -> "tuple[Tactics | None, str | None]":

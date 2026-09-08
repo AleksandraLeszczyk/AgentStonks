@@ -92,7 +92,6 @@ import importlib
 import json
 import os
 import sys
-import threading
 import types
 from pathlib import Path
 
@@ -129,7 +128,8 @@ import torch.nn as nn  # noqa: E402
 # networks over a 32x8 window, once a day.
 torch.set_num_threads(1)
 
-from . import market_hours  # noqa: E402
+from . import market_hours, model_store  # noqa: E402
+from .model_store import ModelStore  # noqa: E402
 
 # The shared model store next to the AgentStonks checkout (Code/Models), where
 # the momentum bundles and the LevelsML pack already live. The path names the
@@ -143,9 +143,7 @@ from . import market_hours  # noqa: E402
 # -- `apple_models.DAYRANGE_TICKERS` is the list, and `apple_trader2` passes the
 # one its config names.
 MODEL_PATH_ENV = "APPLE_DAYRANGE_MODEL"
-DEFAULT_TICKER = "AAPL"
-MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
-DEFAULT_MODEL_PATH = MODEL_DIR / f"timetochange3_dayrange_{DEFAULT_TICKER}.joblib"
+DEFAULT_TICKER = model_store.DEFAULT_TICKER
 
 # How many minutes of the open the forecast is allowed to look at. Not a
 # tunable: the opening ridge was fitted on exactly this window.
@@ -171,13 +169,6 @@ DAILY_HISTORY_DAYS = 420
 MIN_DAILY_SESSIONS = 253
 
 EPS = 1e-12
-
-_lock = threading.Lock()
-# Keyed by path rather than a single slot, so a session that runs GOOGL after
-# AAPL does not evict and re-load a 1 MB bundle each time it switches. Failures
-# are cached under the same key (as None), which is what stops a per-minute loop
-# from re-hitting the filesystem for a file that is not there.
-_cache: "dict[Path, dict | None]" = {}
 
 
 # --- features (mirrors dayrange.features) -----------------------------------
@@ -634,35 +625,22 @@ def _register_unpickle_alias() -> None:
     sys.modules["dayrange.modeling"] = module
 
 
-def model_path(ticker: str = DEFAULT_TICKER) -> Path:
-    """Where one ticker's saved joblib is expected to live.
+# TimeToChange3 fits the whole pipeline per symbol and makes no claim that one
+# transfers to another, so `timetochange3_dayrange_GOOGL.joblib` is a different
+# model rather than the same one pointed elsewhere.
+_STORE = ModelStore(
+    env_key=MODEL_PATH_ENV,
+    filename="timetochange3_dayrange_{ticker}.joblib",
+    build=lambda path: _build_bundle(path),
+)
 
-    One file per ticker: TimeToChange3 fits the whole pipeline per symbol and
-    makes no claim that one transfers to another, so `timetochange3_dayrange_
-    GOOGL.joblib` is a different model rather than the same one pointed
-    elsewhere.
-
-    Two env overrides, and the difference matters. `APPLE_DAYRANGE_MODEL_<TICKER>`
-    relocates one ticker's bundle. The bare `APPLE_DAYRANGE_MODEL` names a single
-    file, so it can only mean the default ticker's -- letting it answer for every
-    symbol would hand a GOOGL run the AAPL model without saying so.
-    """
-    symbol = (ticker or DEFAULT_TICKER).upper()
-    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
-    if not override and symbol == DEFAULT_TICKER:
-        override = os.environ.get(MODEL_PATH_ENV)
-    return Path(override or MODEL_DIR / f"timetochange3_dayrange_{symbol}.joblib")
+model_path = _STORE.path
+metadata_path = _STORE.metadata_path
 
 
 def checkpoint_path(kind: str, path: "Path | None" = None) -> Path:
     """Where one sequence model's weights sit, beside the joblib."""
-    base = path or model_path()
-    return base.with_name(f"{base.stem}_{kind}.pt")
-
-
-def metadata_path(path: "Path | None" = None) -> Path:
-    base = path or model_path()
-    return base.with_suffix(".json")
+    return _STORE.sidecar_path(f"_{kind}.pt", path)
 
 
 def _restore_seq(path: Path) -> SeqRegressor:
@@ -681,7 +659,7 @@ def _restore_seq(path: Path) -> SeqRegressor:
     return reg
 
 
-def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
+def _build_bundle(path: Path) -> "dict | None":
     """One ticker's saved model plus its metadata, or None when it cannot be
     assembled.
 
@@ -693,65 +671,54 @@ def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
       three-way blend's, and dropping a voter silently changes it;
     * a checkpoint whose weights refuse to load onto these definitions, which
       is what a drifted mirror looks like from here.
-
-    Cached per path after the first load, including the failure, so a loop that
-    asks every minute doesn't re-hit the filesystem.
     """
-    path = model_path(ticker)
-    with _lock:
-        if path in _cache:
-            return _cache[path]
-        _cache[path] = None
-        try:
-            import joblib
-        except ImportError:
-            return None
-        _register_unpickle_alias()
-        try:
-            sk = joblib.load(path)
-        except (OSError, ValueError, KeyError, ModuleNotFoundError, AttributeError):
-            return None
-        if not isinstance(sk, dict) or {"lgbm", "weights", "daily_cols", "lookback"} - set(sk):
-            return None
+    try:
+        import joblib
+    except ImportError:
+        return None
+    _register_unpickle_alias()
+    try:
+        sk = joblib.load(path)
+    except (OSError, ValueError, KeyError, ModuleNotFoundError, AttributeError):
+        return None
+    if not isinstance(sk, dict) or {"lgbm", "weights", "daily_cols", "lookback"} - set(sk):
+        return None
 
-        models = {"lgbm": sk["lgbm"]}
-        try:
-            for kind in ("nbeats", "nhits"):
-                models[kind] = _restore_seq(checkpoint_path(kind, path))
-        except (OSError, KeyError, RuntimeError, ValueError, AttributeError):
-            return None
+    models = {"lgbm": sk["lgbm"]}
+    try:
+        for kind in ("nbeats", "nhits"):
+            models[kind] = _restore_seq(checkpoint_path(kind, path))
+    except (OSError, KeyError, RuntimeError, ValueError, AttributeError):
+        return None
 
-        meta_file = metadata_path(path)
-        try:
-            metadata = json.loads(meta_file.read_text()) if meta_file.exists() else {}
-        except (OSError, ValueError):
-            metadata = {}
+    meta_file = metadata_path(path)
+    try:
+        metadata = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+    except (OSError, ValueError):
+        metadata = {}
 
-        model = DayRangeModel(
-            daily_models=models, weights=sk["weights"], correction=sk.get("correction"),
-            use_constraint=bool(sk.get("use_constraint", True)), lookback=int(sk["lookback"]),
-            daily_cols=sk["daily_cols"], metadata=metadata,
-        )
-        _cache[path] = {
-            "model": model,
-            "metadata": metadata,
-            "daily_models": list(models),
-            "opening_minutes": int(metadata.get("opening_minutes") or OPENING_MINUTES),
-            "lookback": model.lookback,
-            "trained_at": metadata.get("created"),
-            "path": str(path),
-            # Which symbol this bundle was fitted on, as the file itself
-            # recorded it -- not the ticker that asked for it. A mismatch is
-            # worth being able to see rather than inferring from the filename.
-            "ticker": str(metadata.get("ticker") or "").upper() or None,
-        }
-        return _cache[path]
+    model = DayRangeModel(
+        daily_models=models, weights=sk["weights"], correction=sk.get("correction"),
+        use_constraint=bool(sk.get("use_constraint", True)), lookback=int(sk["lookback"]),
+        daily_cols=sk["daily_cols"], metadata=metadata,
+    )
+    return {
+        "model": model,
+        "metadata": metadata,
+        "daily_models": list(models),
+        "opening_minutes": int(metadata.get("opening_minutes") or OPENING_MINUTES),
+        "lookback": model.lookback,
+        "trained_at": metadata.get("created"),
+        "path": str(path),
+        # Which symbol this bundle was fitted on, as the file itself recorded
+        # it -- not the ticker that asked for it. A mismatch is worth being
+        # able to see rather than inferring from the filename.
+        "ticker": str(metadata.get("ticker") or "").upper() or None,
+    }
 
 
-def reset_bundle_cache() -> None:
-    """Drop every cached bundle (used by tests that swap the model file)."""
-    with _lock:
-        _cache.clear()
+load_bundle = _STORE.load
+reset_bundle_cache = _STORE.reset
 
 
 def opening_minutes(bundle: "dict | None" = None) -> int:

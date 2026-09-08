@@ -15,6 +15,7 @@ import pytest
 from agent_stonks import apple_models
 from agent_stonks import apple_trader as at
 from agent_stonks import clock
+from agent_stonks import rule_agent
 from agent_stonks.apple_trader import DEFAULT_TICKER as TICKER
 from agent_stonks.apple_trader import AppleTrader, AppleTraderConfig, config_signature
 from agent_stonks.broker import Broker
@@ -861,11 +862,13 @@ class TestConfigSignature:
 
 
 class TestCycleTiming:
+    """The bar-aligned cadence, now shared by every rule agent."""
+
     def test_wakes_just_after_the_next_bar_closes(self):
         clock.set_simulated(datetime(2026, 7, 21, 14, 30, 20, tzinfo=timezone.utc))
         try:
             # 40s to the boundary, plus the lag that lets the bar arrive.
-            assert at._seconds_to_next_bar(60, lag=5.0) == pytest.approx(45.0)
+            assert rule_agent.seconds_to_next_bar(60, lag=5.0) == pytest.approx(45.0)
         finally:
             clock.clear()
 
@@ -874,7 +877,7 @@ class TestCycleTiming:
         by landing before the lag."""
         clock.set_simulated(datetime(2026, 7, 21, 14, 30, 3, tzinfo=timezone.utc))
         try:
-            assert at._seconds_to_next_bar(60, lag=5.0) == pytest.approx(62.0)
+            assert rule_agent.seconds_to_next_bar(60, lag=5.0) == pytest.approx(62.0)
         finally:
             clock.clear()
 

@@ -55,3 +55,46 @@ def clear() -> None:
     global _sim_now, _sim_monotonic
     _sim_now = None
     _sim_monotonic = None
+
+
+# --------------------------------------------------------------------------
+# Timestamp parsing
+#
+# Not a time *source* -- these read a timestamp someone else produced, so the
+# simulation pin above does not apply to them. They live here because this is
+# the package's one dependency-free time module, and because the alternative
+# was the same three lines inlined at twenty call sites.
+#
+# Alpaca stamps bars and quotes RFC-3339 with a 'Z' suffix, which
+# `datetime.fromisoformat` did not accept before Python 3.11; the replace()
+# keeps the parse working on either. A timestamp that arrives naive is read as
+# UTC -- the convention every feed and tool output in this codebase uses, and
+# the reading that keeps a later `.astimezone()` from silently interpreting it
+# as the host's local time.
+# --------------------------------------------------------------------------
+
+def parse_iso_strict(raw: object) -> datetime:
+    """Aware UTC datetime from an RFC-3339 string; raises on anything else.
+
+    For call sites that cannot proceed without a timestamp -- a sort key or a
+    dict key, where a None would fail later and further away.
+    """
+    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def parse_iso(raw: object) -> "datetime | None":
+    """Aware UTC datetime from an RFC-3339 string, or None if unparseable."""
+    try:
+        return parse_iso_strict(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def bar_dt(bar: object) -> "datetime | None":
+    """Aware UTC datetime of a bar's `t` field, or None if absent/unparseable."""
+    try:
+        raw = bar["t"]
+    except (KeyError, TypeError, IndexError):
+        return None
+    return parse_iso(raw) if raw else None

@@ -2,7 +2,7 @@ import json
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
@@ -402,6 +402,18 @@ class AppState:
         return value
 
 
+def append_agent_log(state: "AppState", entry: dict) -> None:
+    """Timestamp an agent-log entry and append it under the state's lock.
+
+    Lives here rather than with any one agent because every agent writes to the
+    same log -- the LLM personalities, the rule-based traders and the Automatic
+    orchestrator all do -- and the UI panel reads it back. It is a property of
+    the state, not of whoever happens to be running.
+    """
+    with state.lock:
+        state.agent_log.append({"ts": clock.now().isoformat(), **entry})
+
+
 def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":
     """Percent change of the latest close vs the close ~`window_min` minutes ago,
     from the intraday bars. None when there isn't enough history yet."""
@@ -409,16 +421,17 @@ def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW
         bars = list(state.bars)
     if len(bars) < 2:
         return None
+    latest_ts = clock.bar_dt(bars[-1])
     try:
-        latest_ts = datetime.fromisoformat(str(bars[-1]["t"]).replace("Z", "+00:00"))
         latest_close = float(bars[-1]["c"])
     except (KeyError, TypeError, ValueError):
         return None
+    if latest_ts is None:
+        return None
     baseline = None
     for bar in reversed(bars[:-1]):
-        try:
-            ts = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00"))
-        except (KeyError, TypeError, ValueError):
+        ts = clock.bar_dt(bar)
+        if ts is None:
             continue
         baseline = float(bar["c"])
         if (latest_ts - ts).total_seconds() >= window_min * 60:

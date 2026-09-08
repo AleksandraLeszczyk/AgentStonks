@@ -17,60 +17,49 @@ from __future__ import annotations
 
 import gzip
 import json
-import os
-import threading
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from . import clock
+from .model_store import ModelStore
 from .state import completed_daily_bars, today_daily_bar
 
 # Default: sibling "Models" directory next to the AgentStonks repo checkout.
 MODEL_PATH_ENV = "OPEN_PROFILE_MODEL"
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[2] / "Models" / "open_profile_lgbm.json.gz"
 
 # Fewer than this many completed daily bars and the 20d rolling features are
 # all-NaN — a prediction would be climatology at best, so refuse instead.
 MIN_DAILY_BARS = 21
 
-_lock = threading.Lock()
-_cache: dict = {"path": None, "pack": None, "boosters": None}
+def _build_pack(path: Path) -> "dict | None":
+    """The model pack with its boosters instantiated, or None if unavailable."""
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        boosters = {q: lgb.Booster(model_str=s) for q, s in raw["boosters"].items()}
+    except (OSError, KeyError, ValueError):
+        return None
+    raw["_boosters"] = boosters
+    return raw
 
 
-def _model_path() -> Path:
-    return Path(os.environ.get(MODEL_PATH_ENV) or DEFAULT_MODEL_PATH)
+# The one model here that is not fitted per ticker: it predicts the shape of an
+# opening auction from features every symbol has, so there is one file and one
+# env override rather than a family.
+_STORE = ModelStore(
+    env_key=MODEL_PATH_ENV,
+    filename="open_profile_lgbm.json.gz",
+    build=_build_pack,
+)
 
-
-def load_pack() -> "dict | None":
-    """The model pack with instantiated boosters, or None if unavailable.
-
-    Cached after the first successful load; a missing file or missing
-    lightgbm install is also cached (per path) so the chart poll doesn't
-    retry the filesystem every few seconds.
-    """
-    path = _model_path()
-    with _lock:
-        if _cache["path"] == path:
-            return _cache["pack"]
-        _cache.update(path=path, pack=None, boosters=None)
-        try:
-            import lightgbm as lgb
-        except ImportError:
-            return None
-        try:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                raw = json.load(fh)
-            boosters = {
-                q: lgb.Booster(model_str=s) for q, s in raw["boosters"].items()
-            }
-        except (OSError, KeyError, ValueError):
-            return None
-        raw["_boosters"] = boosters
-        _cache["pack"] = raw
-        return raw
+_model_path = _STORE.path
+load_pack = _STORE.load
 
 
 def compute_features(

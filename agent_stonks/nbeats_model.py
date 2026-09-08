@@ -75,8 +75,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -98,7 +96,8 @@ except ImportError:
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
-from . import persistence_model  # noqa: E402
+from . import model_store, persistence_model  # noqa: E402
+from .model_store import ModelStore  # noqa: E402
 
 # The shared model store next to the AgentStonks checkout (Code/Models), where
 # the incumbent bundle and the LevelsML pack already live.
@@ -109,8 +108,7 @@ from . import persistence_model  # noqa: E402
 # they are the same weights, renamed so the three symbols read as one family
 # beside `timetochange2_persistence_<TICKER>.joblib`.
 MODEL_PATH_ENV = "APPLE_NBEATS_MODEL"
-MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
-DEFAULT_TICKER = "AAPL"
+DEFAULT_TICKER = model_store.DEFAULT_TICKER
 
 # How many futures to sample per decision. Notebook 7.8 measured the sampling
 # standard deviation at 0.013-0.016 here, against probabilities near 0.65.
@@ -123,12 +121,6 @@ BOOTSTRAP_SEED = 0
 # `min_dwell` is used: the fast-move clause fires 0 times on AAPL, which is
 # precisely what lets a momentum forecast reproduce the label exactly.
 PERSISTENCE_DEFAULTS = {"min_dwell": 15, "fast_move_bars": 10, "fast_move_pct": 0.01}
-
-_lock = threading.Lock()
-# Keyed by path rather than one slot: assembling a bundle here restores five
-# networks and a residual matrix, so a session switching between symbols must
-# not pay for it twice. Failures cache too, as None.
-_cache: "dict[Path, dict | None]" = {}
 
 DEVICE = torch.device("cpu")
 
@@ -539,32 +531,22 @@ def reversal_probability(samples: np.ndarray, start_regime, momentum: dict) -> d
 
 # --- loading -----------------------------------------------------------------
 
-def model_path(ticker: str = DEFAULT_TICKER) -> Path:
-    """Where one ticker's saved checkpoint is expected to live.
+# One file per ticker: the ensemble is fitted on that symbol's own forecast
+# windows, and its residual sidecar is a property of those weights.
+_STORE = ModelStore(
+    env_key=MODEL_PATH_ENV,
+    filename="timetochange2_nbeats_{ticker}.pt",
+    build=lambda path: _build_bundle(path),
+)
 
-    One file per ticker: the ensemble is fitted on that symbol's own forecast
-    windows, and its residual sidecar is a property of those weights.
-
-    Two env overrides, as everywhere else here. `APPLE_NBEATS_MODEL_<TICKER>`
-    relocates one ticker's checkpoint; the bare `APPLE_NBEATS_MODEL` names a
-    single file and therefore answers for the default ticker only.
-    """
-    symbol = (ticker or DEFAULT_TICKER).upper()
-    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
-    if not override and symbol == DEFAULT_TICKER:
-        override = os.environ.get(MODEL_PATH_ENV)
-    return Path(override or MODEL_DIR / f"timetochange2_nbeats_{symbol}.pt")
+model_path = _STORE.path
+# The sidecar JSON `mshift.deep.save_bundle` writes with the weights.
+metadata_path = _STORE.metadata_path
 
 
 def residuals_path(path: "Path | None" = None) -> Path:
     """The sidecar beside the checkpoint, written by the export script."""
-    path = Path(path or model_path())
-    return path.with_name(f"{path.stem}_residuals.npz")
-
-
-def metadata_path(path: "Path | None" = None) -> Path:
-    """The sidecar JSON `mshift.deep.save_bundle` writes with the weights."""
-    return Path(path or model_path()).with_suffix(".json")
+    return _STORE.sidecar_path("_residuals.npz", path)
 
 
 def _restore_seed(payload: dict) -> Seed:
@@ -605,7 +587,7 @@ def _load_residuals(path: Path, feature_columns: "list[str]", horizon: int) -> n
     return residuals
 
 
-def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
+def _build_bundle(path: Path) -> "dict | None":
     """The N-BEATS model in the shape `persistence_model.read_latest` expects.
 
     Same keys as the incumbent joblib bundle (`feature_columns`, `seq_len`,
@@ -615,168 +597,160 @@ def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
 
     None when the checkpoint, the residual sidecar or the metadata is missing
     or does not agree with itself; the caller reports that rather than trading
-    on a model it could not fully assemble. Cached per path.
+    on a model it could not fully assemble.
     """
-    path = model_path(ticker)
-    with _lock:
-        if path in _cache:
-            return _cache[path]
-        _cache[path] = None
-        try:
-            checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
-            seeds = [_restore_seed(p) for p in checkpoint["seeds"]]
-        except (OSError, KeyError, ValueError, RuntimeError, TypeError):
-            return None
-        if not seeds:
-            return None
+    try:
+        checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
+        seeds = [_restore_seed(p) for p in checkpoint["seeds"]]
+    except (OSError, KeyError, ValueError, RuntimeError, TypeError):
+        return None
+    if not seeds:
+        return None
 
-        first = checkpoint["seeds"][0]
-        feature_columns = list(first["feature_columns"])
-        seq_len = int(first["seq_len"])
-        horizon = int(first["horizon"])
-        settings = dict(first.get("settings") or {})
-        try:
-            target_index = feature_columns.index("f_mom")
-            residuals = _load_residuals(residuals_path(path), feature_columns, horizon)
-        except (OSError, KeyError, ValueError):
-            return None
+    first = checkpoint["seeds"][0]
+    feature_columns = list(first["feature_columns"])
+    seq_len = int(first["seq_len"])
+    horizon = int(first["horizon"])
+    settings = dict(first.get("settings") or {})
+    try:
+        target_index = feature_columns.index("f_mom")
+        residuals = _load_residuals(residuals_path(path), feature_columns, horizon)
+    except (OSError, KeyError, ValueError):
+        return None
 
-        meta = {}
-        try:
-            meta = json.loads(metadata_path(path).read_text())
-        except (OSError, ValueError):
-            pass
-        metrics = ((meta.get("metrics") or {}).get("persistence")) or {}
+    meta = {}
+    try:
+        meta = json.loads(metadata_path(path).read_text())
+    except (OSError, ValueError):
+        pass
+    metrics = ((meta.get("metrics") or {}).get("persistence")) or {}
 
-        momentum = {
-            **persistence_model.MOMENTUM_DEFAULTS,
-            **(settings.get("momentum") or {}),
-        }
-        min_dwell = int(
-            (settings.get("persistence") or {}).get(
-                "min_dwell", PERSISTENCE_DEFAULTS["min_dwell"]
-            )
+    momentum = {
+        **persistence_model.MOMENTUM_DEFAULTS,
+        **(settings.get("momentum") or {}),
+    }
+    min_dwell = int(
+        (settings.get("persistence") or {}).get(
+            "min_dwell", PERSISTENCE_DEFAULTS["min_dwell"]
         )
-        i_regime = feature_columns.index("f_regime")
-        i_dwell = feature_columns.index("f_prev_dwell")
-        i_in_regime = feature_columns.index("f_bars_in_regime")
+    )
+    i_regime = feature_columns.index("f_regime")
+    i_dwell = feature_columns.index("f_prev_dwell")
+    i_in_regime = feature_columns.index("f_bars_in_regime")
 
-        def _sampled_paths(X: np.ndarray) -> np.ndarray:
-            return bootstrap_paths(
-                ensemble_forecast(seeds, X, target_index), residuals, N_PATHS, BOOTSTRAP_SEED
-            )
+    def _sampled_paths(X: np.ndarray) -> np.ndarray:
+        return bootstrap_paths(
+            ensemble_forecast(seeds, X, target_index), residuals, N_PATHS, BOOTSTRAP_SEED
+        )
 
-        def score(X) -> np.ndarray:
-            """`(n, seq_len, n_features)` sequences -> persistence probability.
+    def score(X) -> np.ndarray:
+        """`(n, seq_len, n_features)` sequences -> persistence probability.
 
-            `regime` and `pre_dwell` are recovered from the sequence itself --
-            `f_regime` is the regime and `f_prev_dwell` is `log1p` of the dwell
-            as of the previous bar, which on a change bar *is* `pre_dwell`. So
-            the scorer needs nothing beyond the array it is handed, and cannot
-            reach for a column of the future even by accident.
-            """
-            X = np.asarray(X, dtype=np.float32)
-            if len(X) == 0:
-                return np.array([])
-            result = persistence_probability(
-                _sampled_paths(X),
-                np.rint(X[:, -1, i_regime]).astype(int),
-                np.expm1(X[:, -1, i_dwell]),
-                momentum,
-                min_dwell,
-            )
-            return np.clip(result["p_full"], 0.0, 1.0)
+        `regime` and `pre_dwell` are recovered from the sequence itself --
+        `f_regime` is the regime and `f_prev_dwell` is `log1p` of the dwell
+        as of the previous bar, which on a change bar *is* `pre_dwell`. So
+        the scorer needs nothing beyond the array it is handed, and cannot
+        reach for a column of the future even by accident.
+        """
+        X = np.asarray(X, dtype=np.float32)
+        if len(X) == 0:
+            return np.array([])
+        result = persistence_probability(
+            _sampled_paths(X),
+            np.rint(X[:, -1, i_regime]).astype(int),
+            np.expm1(X[:, -1, i_dwell]),
+            momentum,
+            min_dwell,
+        )
+        return np.clip(result["p_full"], 0.0, 1.0)
 
-        def score_turn(X) -> np.ndarray:
-            """`(n, seq_len, n_features)` sequences -> P(turns positive next bar).
+    def score_turn(X) -> np.ndarray:
+        """`(n, seq_len, n_features)` sequences -> P(turns positive next bar).
 
-            The `anticipate` half of the interface, and the reason the bundle
-            carries two callables: the anchor here is a bar whose regime is
-            still negative or balanced, so `score` above -- which asks whether
-            the regime the anchor is *in* survives -- would be answering the
-            wrong question entirely.
+        The `anticipate` half of the interface, and the reason the bundle
+        carries two callables: the anchor here is a bar whose regime is
+        still negative or balanced, so `score` above -- which asks whether
+        the regime the anchor is *in* survives -- would be answering the
+        wrong question entirely.
 
-            Like `score`, everything comes out of the array itself:
-            `f_bars_in_regime` is `log1p` of how long the current regime has
-            run as of the anchor bar, which is the `pre_dwell` the change bar
-            would report. Rows the gate closes are returned as a hard zero
-            without forecasting them -- the same answer the full computation
-            gives, for none of the five networks and 500 paths, which is what
-            keeps a per-bar cycle affordable when most bars cannot qualify.
-            """
-            X = np.asarray(X, dtype=np.float32)
-            if len(X) == 0:
-                return np.array([])
-            dwell = np.expm1(X[:, -1, i_in_regime])
-            open_gate = dwell >= min_dwell
-            out = np.zeros(len(X), dtype=float)
-            if not open_gate.any():
-                return out
-            candidates = X[open_gate]
-            result = turn_probability(
-                _sampled_paths(candidates),
-                np.rint(candidates[:, -1, i_regime]).astype(int),
-                dwell[open_gate],
-                momentum,
-                min_dwell,
-            )
-            out[open_gate] = np.clip(result["p_full"], 0.0, 1.0)
+        Like `score`, everything comes out of the array itself:
+        `f_bars_in_regime` is `log1p` of how long the current regime has
+        run as of the anchor bar, which is the `pre_dwell` the change bar
+        would report. Rows the gate closes are returned as a hard zero
+        without forecasting them -- the same answer the full computation
+        gives, for none of the five networks and 500 paths, which is what
+        keeps a per-bar cycle affordable when most bars cannot qualify.
+        """
+        X = np.asarray(X, dtype=np.float32)
+        if len(X) == 0:
+            return np.array([])
+        dwell = np.expm1(X[:, -1, i_in_regime])
+        open_gate = dwell >= min_dwell
+        out = np.zeros(len(X), dtype=float)
+        if not open_gate.any():
             return out
+        candidates = X[open_gate]
+        result = turn_probability(
+            _sampled_paths(candidates),
+            np.rint(candidates[:, -1, i_regime]).astype(int),
+            dwell[open_gate],
+            momentum,
+            min_dwell,
+        )
+        out[open_gate] = np.clip(result["p_full"], 0.0, 1.0)
+        return out
 
-        def score_reversal(X) -> np.ndarray:
-            """`(n, seq_len, n_features)` sequences -> P(flips to negative).
+    def score_reversal(X) -> np.ndarray:
+        """`(n, seq_len, n_features)` sequences -> P(flips to negative).
 
-            The exit half of the interface. Anchored on a bar whose regime is
-            positive, so it is asked only while a position is open -- and
-            unlike `score_turn` there is no gate to short-circuit on, because
-            the question has no observable pre-condition (see
-            `reversal_probability`). Every call forecasts.
+        The exit half of the interface. Anchored on a bar whose regime is
+        positive, so it is asked only while a position is open -- and
+        unlike `score_turn` there is no gate to short-circuit on, because
+        the question has no observable pre-condition (see
+        `reversal_probability`). Every call forecasts.
 
-            Rows whose anchor is not positive come back 0: the question is
-            about leaving a positive regime, and a bar that is not in one has
-            not posed it. `read_latest` never asks on such a bar, so this is a
-            guard on direct callers rather than a path the agent takes.
-            """
-            X = np.asarray(X, dtype=np.float32)
-            if len(X) == 0:
-                return np.array([])
-            regime = np.rint(X[:, -1, i_regime]).astype(int)
-            positive = regime == 1
-            out = np.zeros(len(X), dtype=float)
-            if not positive.any():
-                return out
-            result = reversal_probability(
-                _sampled_paths(X[positive]), regime[positive], momentum
-            )
-            out[positive] = np.clip(result["p_reversal"], 0.0, 1.0)
+        Rows whose anchor is not positive come back 0: the question is
+        about leaving a positive regime, and a bar that is not in one has
+        not posed it. `read_latest` never asks on such a bar, so this is a
+        guard on direct callers rather than a path the agent takes.
+        """
+        X = np.asarray(X, dtype=np.float32)
+        if len(X) == 0:
+            return np.array([])
+        regime = np.rint(X[:, -1, i_regime]).astype(int)
+        positive = regime == 1
+        out = np.zeros(len(X), dtype=float)
+        if not positive.any():
             return out
+        result = reversal_probability(
+            _sampled_paths(X[positive]), regime[positive], momentum
+        )
+        out[positive] = np.clip(result["p_reversal"], 0.0, 1.0)
+        return out
 
-        bundle = {
-            "score": score,
-            "score_turn": score_turn,
-            "score_reversal": score_reversal,
-            "feature_columns": feature_columns,
-            "seq_len": seq_len,
-            "horizon": horizon,
-            "n_seeds": len(seeds),
-            "n_paths": N_PATHS,
-            "n_residual_rows": int(len(residuals)),
-            # `p_full` is a survival probability multiplied by a hard gate, not
-            # a calibrated posterior: 0.5 means nothing on it, and roughly half
-            # the events are exactly zero because the gate closed. The cut-off
-            # is the one notebook 07 grid-searched on the validation events.
-            "threshold": float(metrics.get("threshold", 0.05)),
-            "settings": settings,
-            "metrics": metrics,
-            "forecast_metrics": (meta.get("metrics") or {}).get("forecast") or {},
-            "trained_at": ", ".join(meta.get("train_sessions") or []) or "unknown",
-            "excluded_sessions_from": meta.get("excluded_sessions_from", "?"),
-        }
-        _cache[path] = bundle
-        return bundle
+    bundle = {
+        "score": score,
+        "score_turn": score_turn,
+        "score_reversal": score_reversal,
+        "feature_columns": feature_columns,
+        "seq_len": seq_len,
+        "horizon": horizon,
+        "n_seeds": len(seeds),
+        "n_paths": N_PATHS,
+        "n_residual_rows": int(len(residuals)),
+        # `p_full` is a survival probability multiplied by a hard gate, not
+        # a calibrated posterior: 0.5 means nothing on it, and roughly half
+        # the events are exactly zero because the gate closed. The cut-off
+        # is the one notebook 07 grid-searched on the validation events.
+        "threshold": float(metrics.get("threshold", 0.05)),
+        "settings": settings,
+        "metrics": metrics,
+        "forecast_metrics": (meta.get("metrics") or {}).get("forecast") or {},
+        "trained_at": ", ".join(meta.get("train_sessions") or []) or "unknown",
+        "excluded_sessions_from": meta.get("excluded_sessions_from", "?"),
+    }
+    return bundle
 
 
-def reset_bundle_cache() -> None:
-    """Drop the cached bundle (used by tests that swap the checkpoint)."""
-    with _lock:
-        _cache.clear()
+load_bundle = _STORE.load
+reset_bundle_cache = _STORE.reset

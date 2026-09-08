@@ -57,16 +57,15 @@ without the model file, exactly like the LevelsML pack.
 
 from __future__ import annotations
 
-import os
 import sys
-import threading
 import types
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import clock, market_hours
+from . import clock, market_hours, model_store
+from .model_store import ModelStore
 
 REGIME_NAME = {-1: "negative", 0: "balanced", 1: "positive"}
 
@@ -79,13 +78,12 @@ REGIME_NAME = {-1: "negative", 0: "balanced", 1: "positive"}
 # until 2026-09-07 -- it is the same bundle, renamed so the three symbols and
 # the two TimeToChange2 models read as one family.
 MODEL_PATH_ENV = "APPLE_MOMENTUM_MODEL"
-MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
-DEFAULT_TICKER = "AAPL"
+DEFAULT_TICKER = model_store.DEFAULT_TICKER
 
 # Regular-session window the model was trained on (mshift.data drops everything
 # outside it before computing anything).
-RTH_START = "09:30"
-RTH_END = "15:59"
+RTH_START = model_store.RTH_START
+RTH_END = model_store.RTH_END
 
 # mshift.config.MomentumParams -- the fallbacks if a bundle carries no settings.
 MOMENTUM_DEFAULTS = {
@@ -96,14 +94,6 @@ MOMENTUM_DEFAULTS = {
     "exit_threshold": 0.40,
     "warmup_bars": 30,
 }
-
-_lock = threading.Lock()
-# Keyed by path rather than one slot, so a process that runs GOOGL after AAPL
-# does not evict and re-load a bundle each time it switches. Failures cache
-# under the same key (as None), which stops a per-minute loop re-hitting the
-# filesystem for a file that is not there.
-_cache: "dict[Path, dict | None]" = {}
-
 
 # --- the saved bundle -------------------------------------------------------
 
@@ -205,58 +195,42 @@ def _register_unpickle_alias() -> None:
     sys.modules["mshift.model"] = module
 
 
-def model_path(ticker: str = DEFAULT_TICKER) -> Path:
-    """Where one ticker's saved bundle is expected to live.
+def _build_bundle(path: Path) -> "dict | None":
+    """Unpickle one bundle, or None if it is absent or not this bundle's shape.
 
-    One file per ticker: TimeToChange2's pipeline is fitted per symbol, on that
-    symbol's own events and with its own validation threshold, so GOOGL's
-    bundle is a different model rather than AAPL's pointed elsewhere.
-
-    Two env overrides, and the difference matters. `APPLE_MOMENTUM_MODEL_<TICKER>`
-    relocates one ticker's bundle. The bare `APPLE_MOMENTUM_MODEL` names a
-    single file, so it can only mean the default ticker's -- letting it answer
-    for every symbol would hand a GOOGL run the AAPL model without saying so.
+    A joblib that loads but carries no `pipeline`, `feature_columns` and
+    `seq_len` is refused like a missing file: it is some other project's
+    artefact sitting at this path, and reading a prediction out of it would be
+    worse than having none.
     """
-    symbol = (ticker or DEFAULT_TICKER).upper()
-    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
-    if not override and symbol == DEFAULT_TICKER:
-        override = os.environ.get(MODEL_PATH_ENV)
-    return Path(override or MODEL_DIR / f"timetochange2_persistence_{symbol}.joblib")
+    try:
+        import joblib  # noqa: F401  (also pulls in the sklearn unpickling path)
+    except ImportError:
+        return None
+    _register_unpickle_alias()
+    try:
+        bundle = joblib.load(path)
+    except (OSError, ValueError, KeyError, ModuleNotFoundError, AttributeError):
+        return None
+    if not isinstance(bundle, dict) or "pipeline" not in bundle:
+        return None
+    if {"feature_columns", "seq_len"} - set(bundle):
+        return None
+    return bundle
 
 
-def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The saved bundle (pipeline + feature list + seq_len + threshold), or None.
+# TimeToChange2's pipeline is fitted per symbol, on that symbol's own events
+# and with its own validation threshold, so GOOGL's bundle is a different model
+# rather than AAPL's pointed elsewhere -- hence one file per ticker.
+_STORE = ModelStore(
+    env_key=MODEL_PATH_ENV,
+    filename="timetochange2_persistence_{ticker}.joblib",
+    build=_build_bundle,
+)
 
-    Cached after the first load; a missing file or a missing joblib/sklearn
-    install is cached per path too, so a loop that asks every minute doesn't
-    re-hit the filesystem.
-    """
-    path = model_path(ticker)
-    with _lock:
-        if path in _cache:
-            return _cache[path]
-        _cache[path] = None
-        try:
-            import joblib  # noqa: F401  (also pulls in the sklearn unpickling path)
-        except ImportError:
-            return None
-        _register_unpickle_alias()
-        try:
-            bundle = joblib.load(path)
-        except (OSError, ValueError, KeyError, ModuleNotFoundError, AttributeError):
-            return None
-        if not isinstance(bundle, dict) or "pipeline" not in bundle:
-            return None
-        if {"feature_columns", "seq_len"} - set(bundle):
-            return None
-        _cache[path] = bundle
-        return bundle
-
-
-def reset_bundle_cache() -> None:
-    """Drop every cached bundle (used by tests that swap the model file)."""
-    with _lock:
-        _cache.clear()
+model_path = _STORE.path
+load_bundle = _STORE.load
+reset_bundle_cache = _STORE.reset
 
 
 def momentum_params(bundle: "dict | None" = None) -> dict:

@@ -141,14 +141,13 @@ the bundle, exactly like the other saved models.
 
 from __future__ import annotations
 
-import os
-import threading
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from . import clock, historical, market_hours
+from . import clock, historical, market_hours, model_store
+from .model_store import ModelStore
 
 BPS = 1e4
 
@@ -157,16 +156,15 @@ REGIME_NAME = {-1: "negative", 0: "balanced", 1: "positive"}
 # Default: the shared model store next to the AgentStonks checkout
 # (Code/Models), where every other saved bundle lives.
 MODEL_PATH_ENV = "APPLE_MOMENTUM_CHANGE_MODEL"
-MODEL_DIR = Path(__file__).resolve().parents[2] / "Models"
 # The symbol the bare env override and the zero-argument calls mean, matching
 # every other model module and `apple_models.DEFAULT_TICKER`.
-DEFAULT_TICKER = "AAPL"
+DEFAULT_TICKER = model_store.DEFAULT_TICKER
 
 # Regular-session window the model was trained on -- `momlib.data` drops
 # everything outside it before computing anything, so a premarket bar reaching
 # the frame would shift every `minute_of_day` and every per-day aggregate.
-RTH_START = "09:30"
-RTH_END = "15:59"
+RTH_START = model_store.RTH_START
+RTH_END = model_store.RTH_END
 
 # `momlib.model.PIPELINE_PARAMS` -- the fallbacks if a bundle carries none.
 PIPELINE_DEFAULTS = {
@@ -197,11 +195,6 @@ HISTORY_LOOKBACK_DAYS = 16
 # Today is exempt -- it is partial by definition.
 MIN_BARS_PER_DAY = 300
 
-_lock = threading.Lock()
-# Keyed by path rather than one slot, so a process running GOOGL and INTC does
-# not evict one bundle to load the other. Failures cache as None, which is what
-# stops a per-minute loop re-hitting the filesystem for a file that is absent.
-_cache: "dict[Path, dict | None]" = {}
 
 # Today's history, keyed by (symbol, session date). Six dated fetches is six
 # yfinance downloads live; the answer cannot change during the session, so it
@@ -510,38 +503,7 @@ def score_bars(
 
 # --- the saved bundle --------------------------------------------------------
 
-def model_path(ticker: str = DEFAULT_TICKER) -> Path:
-    """Where one ticker's saved joblib is expected to live.
-
-    One file per ticker, because TimeToChange fits and *selects* per ticker --
-    GOOGL's RandomForest and INTC's HistGradientBoosting are not the same model
-    with different weights.
-
-    Two env overrides, and the difference matters.
-    `APPLE_MOMENTUM_CHANGE_MODEL_<TICKER>` relocates one ticker's bundle. The
-    bare `APPLE_MOMENTUM_CHANGE_MODEL` names a single file, so it can only mean
-    the default ticker's -- letting it answer for every symbol would hand an
-    INTC run the AAPL model without saying so.
-
-    The file name is `momlib.model.model_path`'s, deliberately: the model this
-    mirrors is the one the notebooks save, and the two stores agreeing means a
-    retrain lands where the app already looks. `dayrange_model` has the same
-    property for the same reason -- TimeToChange3 writes
-    `timetochange3_dayrange_<TICKER>` itself.
-    """
-    symbol = (ticker or DEFAULT_TICKER).upper()
-    override = os.environ.get(f"{MODEL_PATH_ENV}_{symbol}")
-    if not override and symbol == DEFAULT_TICKER:
-        override = os.environ.get(MODEL_PATH_ENV)
-    return Path(override or MODEL_DIR / f"momentum_change_{symbol}.joblib")
-
-
-def metadata_path(path: "Path | None" = None) -> Path:
-    """The readable JSON sidecar `momlib.model.save_model` writes beside it."""
-    return (path or model_path()).with_suffix(".json")
-
-
-def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
+def _build_bundle(path: Path) -> "dict | None":
     """One ticker's saved model plus its metadata, or None when it cannot be
     loaded.
 
@@ -551,20 +513,7 @@ def load_bundle(ticker: str = DEFAULT_TICKER) -> "dict | None":
     none. So is a bundle whose estimator was pickled by a scikit-learn this
     process cannot restore -- the failure mode this model exists to avoid (see
     the module docstring), and the reason the retrain command is in the error.
-
-    Cached per path after the first load, including the failure, so a loop that
-    asks every minute doesn't re-hit the filesystem.
     """
-    path = model_path(ticker)
-    with _lock:
-        if path in _cache:
-            return _cache[path]
-        bundle = _load_bundle_uncached(path)
-        _cache[path] = bundle
-        return bundle
-
-
-def _load_bundle_uncached(path: Path) -> "dict | None":
     if not path.exists():
         return None
     try:
@@ -585,10 +534,26 @@ def _load_bundle_uncached(path: Path) -> "dict | None":
     return bundle
 
 
-def reset_bundle_cache() -> None:
-    """Forget every loaded bundle -- for tests that move the model path."""
-    with _lock:
-        _cache.clear()
+# One file per ticker, because TimeToChange fits and *selects* per ticker --
+# GOOGL's RandomForest and INTC's HistGradientBoosting are not the same model
+# with different weights.
+#
+# The file name is `momlib.model.model_path`'s, deliberately: the model this
+# mirrors is the one the notebooks save, and the two stores agreeing means a
+# retrain lands where the app already looks. `dayrange_model` has the same
+# property for the same reason -- TimeToChange3 writes
+# `timetochange3_dayrange_<TICKER>` itself.
+_STORE = ModelStore(
+    env_key=MODEL_PATH_ENV,
+    filename="momentum_change_{ticker}.joblib",
+    build=_build_bundle,
+)
+
+model_path = _STORE.path
+# The readable JSON sidecar `momlib.model.save_model` writes beside the bundle.
+metadata_path = _STORE.metadata_path
+load_bundle = _STORE.load
+reset_bundle_cache = _STORE.reset
 
 
 def pipeline_params(bundle: "dict | None" = None) -> dict:

@@ -35,14 +35,10 @@ from agent_stonks.agent import (
 )
 from agent_stonks.apple_trader import (
     APPLE_TRADER_KEY,
-    ENTRY_ANTICIPATE,
-    ENTRY_MODE_LABEL,
-    ENTRY_MODE_PROB_LABEL,
-    ENTRY_MODE_SUMMARY,
-    ENTRY_MODES,
     RULE_PROVIDER,
     AppleTraderConfig,
 )
+from agent_stonks import apple_trader_ui
 from agent_stonks.apple_rules_ui import rules_panel, signal_catalogue
 from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
 from agent_stonks.charts import (
@@ -1562,318 +1558,169 @@ def _render_apple2_params(symbols: list[str], prefix: str) -> AppleTrader2Config
     return rules_panel(prefix, symbols=symbols)
 
 
-def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
-    """One Apple Trader setup: its instrument and rules.
-
-    The instrument is chosen first because it decides which models exist for
-    it, and the model then chooses the strategy: the two TimeToChange2 models
-    are asked a question on every bar, the TimeToChange3 one is asked a single
-    question at 9:35, and they share no tunable but position size. Each renders
-    its own knobs rather than greying out the other's.
-
-    `symbols` is what the selected datasets carry, used only to mark the
-    instruments that can actually be replayed — the list itself comes from what
-    the models were fitted on, since without a model this agent has no rules at
-    all.
-    """
-    defaults = AppleTraderConfig()
-    ticker = _render_apple_instrument(defaults, symbols, prefix)
-    keys = apple_models.keys_for(ticker)
-    model_key = str(
-        st.selectbox(
-            "Model", keys,
-            index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
-            format_func=_apple_model_label,
-            # Scoped to the instrument, whose choice changes this list.
-            key=f"{prefix}_model_{ticker}",
-            help="On the confirm entry the two momentum models are handed the same "
-                 "20 bars on the same tape and return one probability, so running a "
-                 "dataset through both is a straight comparison. Neither the day-range "
-                 "forecast nor the delta-momentum regressor is on that scale, and "
-                 "neither is comparable to them by number — each is a different "
-                 "strategy on the same symbol, and the way to compare them is to run "
-                 "the same dataset through each. Only the models fitted on the "
-                 "instrument above are listed.",
-        )
-    )
-    model = apple_models.get(model_key)
-    bundle = apple_models.load(model.key, ticker)
-    st.caption(model.summary)
-    if bundle is None:
-        st.error(apple_models.unavailable_reason(model_key, ticker))
-
-    if model.strategy == apple_models.STRATEGY_DAYRANGE:
-        return _render_apple_dayrange_params(defaults, model_key, ticker, prefix)
-    if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
-        return _render_apple_momentum_change_params(defaults, model_key, ticker, prefix)
-    return _render_apple_momentum_params(defaults, model, bundle, ticker, prefix)
-
-
-def _render_apple_instrument(
-    defaults: AppleTraderConfig, symbols: list[str], prefix: str
-) -> str:
-    """Which symbol this setup trades, out of the ones a model exists for.
-
-    A fixed list rather than a free-text box (which is what Apple Trader 2
-    gets): every rule this agent has is a saved model's output, so a symbol
-    nothing was fitted on is not a thinner strategy, it is none. Whether the
-    selected datasets actually carry it is checked before anything is queued --
-    see `_rule_agents_missing_ticker` -- and flagged here as well, since the
-    dataset is picked on the same page.
-    """
-    options = apple_models.tickers()
-    available = {str(s).strip().upper() for s in (symbols or [])}
-    ticker = str(
-        st.selectbox(
-            "Instrument", options,
-            index=options.index(defaults.ticker) if defaults.ticker in options else 0,
-            format_func=(
-                lambda t: t if not available or t in available else f"{t} (not in the datasets)"
-            ),
-            key=f"{prefix}_ticker",
-            help="The one symbol the run trades. Only symbols a saved model covers are "
-                 "listed — the models are the strategy here, so the instrument and the "
-                 "model constrain each other. The same rules over two symbols are two "
-                 "configurations in Results, never one averaged row.",
-        )
-    )
-    labels = ", ".join(apple_models.get(k).label for k in apple_models.keys_for(ticker))
-    st.caption(f":material/model_training: Models fitted on {ticker}: {labels}.")
-    return ticker
-
-
-def _apple_model_label(key: str) -> str:
-    """One picker entry. Only the momentum models carry the anticipation note:
-    on the day-range strategy there is no entry mode to be unable to run."""
-    model = apple_models.get(key)
-    if model.strategy != apple_models.STRATEGY_MOMENTUM:
-        return model.label
-    return model.label + ("" if model.anticipates else " — cannot anticipate")
-
-
-def _render_apple_dayrange_params(
-    defaults: AppleTraderConfig, model_key: str, ticker: str, prefix: str
-) -> AppleTraderConfig:
-    """The day-range rules: the two resting levels, and nothing else."""
-    st.caption(
-        "Two knobs, and they are the whole strategy. At 9:35 the model forecasts where "
-        "today's high **H** will land; the buy rests `buy × ADR` below it and the sell "
-        "`sell × ADR` below it, with ADR the trailing 14-day average daily range in "
-        "dollars. Each distinct pair is its own configuration in Results, so sweeping "
-        "them here is the intended use — notebook 05 only ever swept five sessions."
-    )
-    col_a, col_b = st.columns(2)
-    buy_k = col_a.number_input(
-        "Buy distance (× ADR below H)", min_value=0.05, max_value=3.0,
-        value=defaults.buy_k, step=0.05, format="%.2f", key=f"{prefix}_buy_k",
-        help="The notebook's 0.75 was specified, not fitted, and its own sweep says "
-             "why not to trust a peak: over five sessions the week total climbs "
-             "steadily from $70 at 0.30 to $339 at 0.85 as deeper entries fill better, "
-             "then turns erratic past 0.90 as whole days stop trading. Through all of "
-             "it the count of profitable sessions is flat at three in five. The levels "
-             "change the price paid on the same winning days, not how often the rule "
-             "is right — and the best cell of a 195-cell grid on five sessions is "
-             "mostly selection noise.",
-    )
-    sell_k = col_b.number_input(
-        "Sell distance (× ADR below H)", min_value=0.0, max_value=3.0,
-        value=defaults.sell_k, step=0.05, format="%.2f", key=f"{prefix}_sell_k",
-        help="Where the exit rests below the same predicted high — the smaller of the "
-             "two numbers, since it is the higher price. A day that never reaches it "
-             "is held to the closing flatten.",
-    )
-    position_pct = col_a.number_input(
-        "Position size (% of cash)", min_value=1.0, max_value=100.0,
-        value=defaults.position_pct, step=5.0, key=f"{prefix}_dayrange_size",
-    )
-    if sell_k >= buy_k:
-        sell_k = round(max(0.0, buy_k - 0.05), 2)
-        st.error(
-            "The sell level has to sit *above* the buy level, so its distance below the "
-            f"predicted high must be the smaller of the two — using {sell_k:g} until the "
-            "buy distance is raised."
-        )
-    st.caption(
-        ":material/info: No entry mode, no probability, no trailing stop — none of them "
-        "mean anything to a forecast of the day's range, and the run's signature leaves "
-        "them out so a day-range result is never filed beside a momentum one."
-    )
-    return AppleTraderConfig(
-        model_key=model_key,
-        ticker=ticker,
-        buy_k=float(buy_k),
-        sell_k=float(sell_k),
-        position_pct=float(position_pct),
-    )
-
-
-def _render_apple_momentum_change_params(
-    defaults: AppleTraderConfig, model_key: str, ticker: str, prefix: str
-) -> AppleTraderConfig:
-    """The delta-momentum rules: two thresholds on a bps/min forecast, plus two
-    risk exits."""
-    st.caption(
-        "The model predicts how far the momentum score moves over the next 15 bars, "
-        "in **bps/min**. The rules read that as a direction call on a regime the tape "
-        "has already printed: buy a *negative* minute the model expects to turn up, "
-        "sell a *positive* one it expects to turn down, and cut on either risk exit. "
-        "The notebook's own ablation says the exits carry the P&L — sweeping all four "
-        "here is the intended use."
-    )
-    col_a, col_b = st.columns(2)
-    buy_thr = col_a.number_input(
-        "Buy above (Δ momentum, bps/min)", min_value=0.0, max_value=3.0,
-        value=float(defaults.buy_thr), step=0.05, format="%.2f", key=f"{prefix}_buy_thr",
-        help="How large an upward move the model has to predict before a negative "
-             "regime is bought. 0.30 is the notebook's, specified rather than fitted; "
-             "0 buys every negative minute the model does not call down, which is the "
-             "\"no model entry filter\" ablation.",
-    )
-    sell_thr = col_b.number_input(
-        "Sell below (−Δ momentum, bps/min)", min_value=0.0, max_value=3.0,
-        value=float(defaults.sell_thr), step=0.05, format="%.2f", key=f"{prefix}_sell_thr",
-        help="Stated positive and compared against its negation: at 0.30 a held "
-             "position is sold when the model predicts −0.30 bps/min or worse on a "
-             "positive minute. This is the exit the ablation says does the work on "
-             "both tickers.",
-    )
-    m1_mult = col_a.number_input(
-        "Momentum floor (× θ)", min_value=-6.0, max_value=0.0,
-        value=float(defaults.m1_mult), step=0.5, format="%.1f", key=f"{prefix}_m1_mult",
-        help="A hard exit when momentum falls below this multiple of the day's regime "
-             "threshold θ. Entries only happen while momentum is below −θ, so anything "
-             "above −1 is already breached at entry and churns one-minute round trips; "
-             "the notebook's sweep runs through that region deliberately.",
-    )
-    stop_pct = col_b.number_input(
-        "Stop below entry (%)", min_value=0.05, max_value=10.0,
-        value=float(defaults.stop_pct), step=0.05, format="%.2f", key=f"{prefix}_stop_pct",
-        help="A fixed stop measured from the entry price — not a trailing one. The "
-             "momentum rules' trailing stop is a different strategy's knob and is not "
-             "read here.",
-    )
-    position_pct = col_a.number_input(
-        "Position size (% of cash)", min_value=1.0, max_value=100.0,
-        value=defaults.position_pct, step=5.0, key=f"{prefix}_momentum_change_size",
-    )
-    st.caption(
-        ":material/warning: This is the only model here that reads days *before* the "
-        f"one being simulated: {momentum_change_model.HISTORY_SESSIONS} previous sessions of "
-        "minute bars, because the regime threshold is yesterday's volatility. A dataset "
-        "whose first days have nothing behind them will log a refusal to trade for "
-        "those sessions rather than trading them blind."
-    )
-    return AppleTraderConfig(
-        model_key=model_key,
-        ticker=ticker,
-        buy_thr=float(buy_thr),
-        sell_thr=float(sell_thr),
-        m1_mult=float(m1_mult),
-        stop_pct=float(stop_pct),
-        position_pct=float(position_pct),
-    )
-
-
-def _render_apple_momentum_params(
-    defaults: AppleTraderConfig, model, bundle: "dict | None", ticker: str, prefix: str
-) -> AppleTraderConfig:
-    """The momentum rules for one setup."""
-    model_key = model.key
-    st.caption(
-        "Four knobs decide everything: **when** the saved model is asked about a "
-        "regime change, how sure it has to be, how much of the run the trade gives "
-        "back before selling, and whether the model also gets to call the exit. Each "
-        "distinct rule set is tracked as its own configuration in Results, so moving "
-        "the entry, retuning the stop or arming the reversal exit is a new test "
-        "rather than a repeat of one already run."
-    )
-    entry_mode = st.segmented_control(
-        "Entry", ENTRY_MODES, default=defaults.entry_mode,
-        format_func=lambda mode: ENTRY_MODE_LABEL.get(mode, mode), key=f"{prefix}_entry_mode",
-        help="The setting that moves the fill most. On the 2026-07-27 SIP tape "
-             "“Confirm” bought 337.45 / 338.67 / 336.35 and “Anticipate” bought the "
-             "same three episodes at 336.56 / 338.20 / 335.99 — one to six bars "
-             "earlier, while the regime was still balanced, taking the session from "
-             "−0.41% to +0.08%. That is three trades on one day: a check that the "
-             "wiring works, not a measurement of the edge.",
-    ) or defaults.entry_mode
-    st.caption(ENTRY_MODE_SUMMARY[entry_mode])
-
-    if entry_mode == ENTRY_ANTICIPATE and not model.anticipates:
-        st.error(
-            f"{model.label} was fitted on regime-change bars only, so it cannot "
+# SimLab's half of the Apple Trader form (see `agent_stonks.apple_trader_ui`).
+# Its wording is about what is worth sweeping and how a setting lands in
+# Results; the dashboard's is about the run that is about to start.
+_APPLE_TRADER_COPY_FIELDS = dict(
+    unavailable_suffix="not in the datasets",
+    instrument_help=(
+        "The one symbol the run trades. Only symbols a saved model covers are "
+        "listed — the models are the strategy here, so the instrument and the "
+        "model constrain each other. The same rules over two symbols are two "
+        "configurations in Results, never one averaged row."
+    ),
+    model_help=(
+        "On the confirm entry the two momentum models are handed the same "
+        "20 bars on the same tape and return one probability, so running a "
+        "dataset through both is a straight comparison. Neither the day-range "
+        "forecast nor the delta-momentum regressor is on that scale, and "
+        "neither is comparable to them by number — each is a different "
+        "strategy on the same symbol, and the way to compare them is to run "
+        "the same dataset through each. Only the models fitted on the "
+        "instrument above are listed."
+    ),
+    intro={
+        "dayrange": (
+            "Two knobs, and they are the whole strategy. At 9:35 the model forecasts where "
+            "today's high **H** will land; the buy rests `buy × ADR` below it and the sell "
+            "`sell × ADR` below it, with ADR the trailing 14-day average daily range in "
+            "dollars. Each distinct pair is its own configuration in Results, so sweeping "
+            "them here is the intended use — notebook 05 only ever swept five sessions."
+        ),
+        "momentum_change": (
+            "The model predicts how far the momentum score moves over the next 15 bars, "
+            "in **bps/min**. The rules read that as a direction call on a regime the tape "
+            "has already printed: buy a *negative* minute the model expects to turn up, "
+            "sell a *positive* one it expects to turn down, and cut on either risk exit. "
+            "The notebook's own ablation says the exits carry the P&L — sweeping all four "
+            "here is the intended use."
+        ),
+        "momentum": (
+            "Four knobs decide everything: **when** the saved model is asked about a "
+            "regime change, how sure it has to be, how much of the run the trade gives "
+            "back before selling, and whether the model also gets to call the exit. Each "
+            "distinct rule set is tracked as its own configuration in Results, so moving "
+            "the entry, retuning the stop or arming the reversal exit is a new test "
+            "rather than a repeat of one already run."
+        ),
+    },
+    outro={
+        "dayrange": (
+            ":material/info: No entry mode, no probability, no trailing stop — none of them "
+            "mean anything to a forecast of the day's range, and the run's signature leaves "
+            "them out so a day-range result is never filed beside a momentum one."
+        ),
+        "momentum_change": (
+            ":material/warning: This is the only model here that reads days *before* the "
+            f"one being simulated: {momentum_change_model.HISTORY_SESSIONS} previous sessions of "
+            "minute bars, because the regime threshold is yesterday's volatility. A dataset "
+            "whose first days have nothing behind them will log a refusal to trade for "
+            "those sessions rather than trading them blind."
+        ),
+    },
+    help={
+        "buy_k": (
+            "The notebook's 0.75 was specified, not fitted, and its own sweep says "
+            "why not to trust a peak: over five sessions the week total climbs "
+            "steadily from $70 at 0.30 to $339 at 0.85 as deeper entries fill better, "
+            "then turns erratic past 0.90 as whole days stop trading. Through all of "
+            "it the count of profitable sessions is flat at three in five. The levels "
+            "change the price paid on the same winning days, not how often the rule "
+            "is right — and the best cell of a 195-cell grid on five sessions is "
+            "mostly selection noise."
+        ),
+        "sell_k": (
+            "Where the exit rests below the same predicted high — the smaller of the "
+            "two numbers, since it is the higher price. A day that never reaches it "
+            "is held to the closing flatten."
+        ),
+        "buy_thr": (
+            "How large an upward move the model has to predict before a negative "
+            "regime is bought. 0.30 is the notebook's, specified rather than fitted; "
+            "0 buys every negative minute the model does not call down, which is the "
+            "\"no model entry filter\" ablation."
+        ),
+        "sell_thr": (
+            "Stated positive and compared against its negation: at 0.30 a held "
+            "position is sold when the model predicts −0.30 bps/min or worse on a "
+            "positive minute. This is the exit the ablation says does the work on "
+            "both tickers."
+        ),
+        "m1_mult": (
+            "A hard exit when momentum falls below this multiple of the day's regime "
+            "threshold θ. Entries only happen while momentum is below −θ, so anything "
+            "above −1 is already breached at entry and churns one-minute round trips; "
+            "the notebook's sweep runs through that region deliberately."
+        ),
+        "stop_pct": (
+            "A fixed stop measured from the entry price — not a trailing one. The "
+            "momentum rules' trailing stop is a different strategy's knob and is not "
+            "read here."
+        ),
+        "entry_mode": (
+            "The setting that moves the fill most. On the 2026-07-27 SIP tape "
+            "“Confirm” bought 337.45 / 338.67 / 336.35 and “Anticipate” bought the "
+            "same three episodes at 336.56 / 338.20 / 335.99 — one to six bars "
+            "earlier, while the regime was still balanced, taking the session from "
+            "−0.41% to +0.08%. That is three trades on one day: a check that the "
+            "wiring works, not a measurement of the edge."
+        ),
+        "anticipate_error": (
+            "{label} was fitted on regime-change bars only, so it cannot "
             "forecast a change that has not happened yet. Pick a forecasting model "
             "or switch the entry to \u201cConfirm the turn\u201d; this pairing stops the run "
             "rather than producing an empty ledger."
-        )
-    bundle_threshold = persistence_model.model_threshold(bundle)
+        ),
+        "prob_threshold": (
+            "Default {threshold} is the cut-off this model chose on its own "
+            "validation block — on the *confirm* question. On “Anticipate” it is a "
+            "starting point rather than a tuned setting, and it is the first thing "
+            "worth sweeping here: it decides how early in the build-up the entry "
+            "fires."
+        ),
+        "trail_pct": (
+            "Sell once price is this far below the highest price seen since the "
+            "entry. The peak only ratchets up, so this starts as a stop under the "
+            "entry and becomes a profit lock as the move runs."
+        ),
+        "sells_on_reversal": (
+            "Closes the position when the model puts the positive regime at the "
+            "probability below or better of flipping negative — while price may "
+            "still be at its high, rather than waiting for the trailing stop's "
+            "give-back. Only a forecasting model can be asked."
+        ),
+        "reversal_threshold": (
+            "Over five AAPL sessions this separates bars within three of a positive "
+            "run's end from bars with 8+ to go at 0.89 AUC, and the cut-off picks "
+            "where to sit on it: 0.20 fires on 11% of held bars, 0.30 on 2.6%, 0.40 "
+            "on 0.9%, with about half of each landing near the end against a 15% "
+            "base rate. It fires in the right places; whether that pays is untested "
+            "— A/B-ing those same sessions moved them +0.14%→+0.04% and "
+            "−0.58%→−0.64%, which is noise on 6 and 12 round trips. No notebook ever "
+            "tuned an exit, so this is the thing most worth sweeping here."
+        ),
+    },
+)
 
-    col_a, col_b = st.columns(2)
-    prob_threshold = col_a.number_input(
-        ENTRY_MODE_PROB_LABEL[entry_mode], min_value=0.0, max_value=1.0,
-        value=float(defaults.prob_threshold or bundle_threshold),
-        step=0.01, format="%.2f",
-        # Keyed by model so switching re-seeds the input with that model's
-        # own cut-off: the two probabilities are not on a shared scale.
-        key=f"{prefix}_prob_{model_key}",
-        help=f"Default {bundle_threshold:g} is the cut-off this model chose on its own "
-             "validation block — on the *confirm* question. On “Anticipate” it is a "
-             "starting point rather than a tuned setting, and it is the first thing "
-             "worth sweeping here: it decides how early in the build-up the entry "
-             "fires.",
-    )
-    trail_pct = col_b.number_input(
-        "Trailing stop (%)", min_value=0.05, max_value=10.0,
-        value=defaults.trail_pct, step=0.05, key=f"{prefix}_trail",
-        help="Sell once price is this far below the highest price seen since the "
-             "entry. The peak only ratchets up, so this starts as a stop under the "
-             "entry and becomes a profit lock as the move runs.",
-    )
-    position_pct = col_a.number_input(
-        "Position size (% of cash)", min_value=1.0, max_value=100.0,
-        value=defaults.position_pct, step=5.0, key=f"{prefix}_size",
+
+def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
+    """One Apple Trader setup: its instrument and rules.
+
+    `symbols` is what the selected datasets carry, used only to mark the
+    instruments that can actually be replayed -- the list itself comes from
+    what the models were fitted on, since without a model this agent has no
+    rules at all. Whether the datasets carry the chosen one is checked before
+    anything is queued (see `_rule_agents_missing_ticker`).
+
+    The prefix is per setup, not per app: SimLab renders several of these on
+    one page and their widgets must not collide.
+    """
+    return apple_trader_ui.params(
+        symbols, apple_trader_ui.FormCopy(prefix=prefix, **_APPLE_TRADER_COPY_FIELDS)
     )
 
-    # The second exit, and the one most worth an A/B here: run the same
-    # dataset with it on and off and the two land in Results as separate
-    # configurations, which is the comparison nothing has made yet.
-    sells_on_reversal = col_b.checkbox(
-        "Also sell on a forecast reversal",
-        value=defaults.sells_on_reversal and model.anticipates,
-        disabled=not model.anticipates,
-        key=f"{prefix}_reversal_on_{model_key}",
-        help="Closes the position when the model puts the positive regime at the "
-             "probability below or better of flipping negative — while price may "
-             "still be at its high, rather than waiting for the trailing stop's "
-             "give-back. Only a forecasting model can be asked.",
-    )
-    reversal_threshold = col_b.number_input(
-        "Reversal probability to sell", min_value=0.0, max_value=1.0,
-        value=float(defaults.reversal_threshold or 0.30), step=0.05, format="%.2f",
-        disabled=not sells_on_reversal, key=f"{prefix}_reversal",
-        help="Over five AAPL sessions this separates bars within three of a positive "
-             "run's end from bars with 8+ to go at 0.89 AUC, and the cut-off picks "
-             "where to sit on it: 0.20 fires on 11% of held bars, 0.30 on 2.6%, 0.40 "
-             "on 0.9%, with about half of each landing near the end against a 15% "
-             "base rate. It fires in the right places; whether that pays is untested "
-             "— A/B-ing those same sessions moved them +0.14%→+0.04% and "
-             "−0.58%→−0.64%, which is noise on 6 and 12 round trips. No notebook ever "
-             "tuned an exit, so this is the thing most worth sweeping here.",
-    )
-    if not model.anticipates:
-        st.caption(
-            f"{model.label} cannot forecast the breakdown of a regime, so the "
-            "trailing stop is the only exit available to it."
-        )
-    return AppleTraderConfig(
-        model_key=str(model_key),
-        ticker=ticker,
-        entry_mode=str(entry_mode),
-        prob_threshold=float(prob_threshold),
-        trail_pct=float(trail_pct),
-        reversal_threshold=float(reversal_threshold) if sells_on_reversal else None,
-        position_pct=float(position_pct),
-    )
+
+_apple_model_label = apple_trader_ui.model_label
 
 
 def render_simulate_tab() -> None:

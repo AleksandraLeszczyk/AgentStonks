@@ -13,10 +13,11 @@ to exactly those completion moments.
 from __future__ import annotations
 
 from bisect import bisect_right
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from agent_stonks.market_hours import MARKET_TZ
+from agent_stonks import clock
+from agent_stonks.market_hours import MARKET_CLOSE, MARKET_OPEN, MARKET_TZ
 
 from . import data
 
@@ -24,10 +25,7 @@ BAR_SEC = 60.0
 
 
 def parse_ts(raw: object) -> Optional[datetime]:
-    try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
+    return clock.parse_iso(raw)
 
 
 class _SymbolSeries:
@@ -89,10 +87,10 @@ class SimMarket:
         return sorted(out)
 
     def session_open(self, day: date) -> datetime:
-        return datetime.combine(day, time(9, 30), tzinfo=MARKET_TZ).astimezone(timezone.utc)
+        return datetime.combine(day, MARKET_OPEN, tzinfo=MARKET_TZ).astimezone(timezone.utc)
 
     def session_close(self, day: date) -> datetime:
-        return datetime.combine(day, time(16, 0), tzinfo=MARKET_TZ).astimezone(timezone.utc)
+        return datetime.combine(day, MARKET_CLOSE, tzinfo=MARKET_TZ).astimezone(timezone.utc)
 
     # --- per-symbol views at time t --------------------------------------
 
@@ -166,7 +164,7 @@ class SimMarket:
         auction out of a pre-market cycle.
         """
         today = t.astimezone(MARKET_TZ).date()
-        if t.astimezone(MARKET_TZ).time() < time(9, 30):
+        if t.astimezone(MARKET_TZ).time() < MARKET_OPEN:
             return None
         for bar in self.series[symbol].daily_bars:
             if str(bar.get("t", ""))[:10] == today.isoformat():

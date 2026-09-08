@@ -51,11 +51,11 @@ from dataclasses import dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
 
-from . import apple_models, momentum_change_model, persistence_model
+from . import apple_models, momentum_change_model, model_store, persistence_model
 
-# The shared store beside the AgentStonks checkout -- the same constant each
-# model module defines for itself (`persistence_model.MODEL_DIR` and friends).
-MODEL_DIR = persistence_model.MODEL_DIR
+# The shared store beside the AgentStonks checkout, where every model family
+# resolves its files from (see `model_store.ModelStore`).
+MODEL_DIR = model_store.MODEL_DIR
 
 OPEN_PROFILE_KEY = "open_profile"
 

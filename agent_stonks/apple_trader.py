@@ -284,19 +284,17 @@ open question, and SimLab is where it gets answered -- run the same dataset with
 
 from __future__ import annotations
 
-import math
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
 from . import agent as agent_mod
-from . import apple_models, historical, market_hours, persistence_model, scoring
-from . import observability as obs
-from .agent import _log, stop_agent
-from .clock import now as _now
+from . import apple_models, historical, market_hours, persistence_model, rule_agent
+from .agent import stop_agent
+from .rule_agent import BaseTrader
+from .state import append_agent_log as _log
 from .config import (
-    APPLE_TRADER_BAR_LAG_SEC,
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_BUY_THR,
     APPLE_TRADER_CYCLE_SEC,
@@ -686,37 +684,19 @@ def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAUL
     return recovered.iloc[:want]
 
 
-def _order_quantity(cash: float, price: float, position_pct: float) -> float:
-    """Shares that `position_pct` of `cash` buys at `price`, rounded down.
-
-    Shared by both strategies: how much to deploy is a property of the agent,
-    not of the rule that decided to deploy it.
-    """
-    if price <= 0:
-        return 0.0
-    budget = cash * position_pct / 100.0
-    return math.floor(budget / price * 1e4) / 1e4
-
-
-class AppleTrader:
+class AppleTrader(BaseTrader):
     """The state machine driving one run: the entry question and the trailing
     stop on a position already taken. One instance per launched agent."""
+
+    # The only strategy here whose exit trails the high-water mark.
+    TRAILS_PEAK = True
 
     def __init__(
         self, config: "AppleTraderConfig | None" = None, model_threshold: float = 0.5
     ) -> None:
-        self.config = config or AppleTraderConfig()
-        # The symbol every read, order and log line below is about. Off the
-        # config once: it does not change mid-run.
-        self.ticker = self.config.ticker
+        super().__init__(config or AppleTraderConfig())
         # The bundle's own cut-off, used when the config doesn't override it.
         self.model_threshold = model_threshold
-        # The open long: entry price, the running peak the stop trails, and how
-        # many bars it has been held.
-        self.entry: "dict | None" = None
-        # Timestamp of the last bar acted on, so a cycle that re-reads the same
-        # bar (slow fetch, market data lag) can't buy the same change twice.
-        self.last_bar_ts = None
 
     @property
     def prob_threshold(self) -> float:
@@ -736,23 +716,9 @@ class AppleTrader:
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome
         tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(self.ticker)
-        if sym_state is None:
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
-                },
-            )
-            return "no_data"
-
-        if not market_hours.is_market_open():
-            _log(
-                state,
-                {"type": "status", "text": "Market closed -- Apple Trader is not watching bars."},
-            )
-            return "closed"
+        sym_state, refused = self.preflight(state)
+        if refused is not None:
+            return refused
 
         position = tracker.position_for(self.ticker)
         frame = persistence_model.minute_frame(sym_state)
@@ -809,7 +775,7 @@ class AppleTrader:
             return "hold"
 
         if fresh_bar and self._entry_signal(read):
-            if self._closing_soon():
+            if self.closing_soon():
                 _log(
                     state,
                     {
@@ -861,11 +827,6 @@ class AppleTrader:
         proba = read["reversal_proba"]
         return proba is not None and proba >= self.reversal_threshold
 
-    def _closing_soon(self) -> bool:
-        """Whether the flatten-before-close rule is already in force."""
-        to_close = market_hours.seconds_to_close()
-        return to_close is not None and to_close <= self.config.flatten_before_close_min * 60
-
     # --- the check on an open position -------------------------------------
 
     def _exit_reason(self, read: dict) -> "str | None":
@@ -902,7 +863,7 @@ class AppleTrader:
                 f"({pnl_pct:+.2f}%)."
             )
 
-        if self._closing_soon():
+        if self.closing_soon():
             to_close = market_hours.seconds_to_close() or 0.0
             return (
                 f"Session ends in {to_close / 60:.0f} min. Momentum, regimes and every model "
@@ -914,35 +875,10 @@ class AppleTrader:
     # --- orders ------------------------------------------------------------
 
     def _buy(self, state: AppState, tracker: DecisionTracker, read: dict) -> bool:
-        """Deploy `position_pct` of the cash balance; False if it buys nothing."""
-        price = read["price"]
-        cash = tracker.snapshot()["cash"]
-        quantity = _order_quantity(cash, price, self.config.position_pct)
-        if quantity <= 0:
-            _log(
-                state,
-                {
-                    "type": "status",
-                    "text": (
-                        f"Entry signal confirmed but ${cash:,.2f} cash buys no "
-                        f"{self.ticker}."
-                    ),
-                },
-            )
-            return False
-
-        reasoning = self._entry_reasoning(read)
-        decision = tracker.record_trade(
-            self.ticker, "buy", quantity, reasoning, state.api_key, state.api_secret,
-            state.feed
+        return self.buy(
+            state, tracker, read["price"], self._entry_reasoning(read),
+            self._regime_note(read),
         )
-        self._log_decision(state, decision, read)
-        if decision.status == "filled":
-            # The peak starts at the fill, not at this bar's high: the stop
-            # trails the highest price seen since the position existed, and
-            # this bar's high happened before it did.
-            self.entry = {"price": decision.price, "peak": decision.price, "bars": 0}
-        return decision.status == "filled"
 
     def _entry_reasoning(self, read: dict) -> str:
         """Why this bar was bought, in the terms of the mode that bought it.
@@ -976,13 +912,7 @@ class AppleTrader:
     def _sell(
         self, state: AppState, tracker: DecisionTracker, quantity: float, read: dict, reasoning: str
     ) -> None:
-        decision = tracker.record_trade(
-            self.ticker, "sell", quantity, reasoning, state.api_key, state.api_secret,
-            state.feed
-        )
-        self._log_decision(state, decision, read)
-        if decision.status == "filled":
-            self.entry = None
+        self.sell(state, tracker, quantity, reasoning, self._regime_note(read))
 
     # --- logging -----------------------------------------------------------
 
@@ -1027,23 +957,14 @@ class AppleTrader:
             )
         return " · ".join(parts)
 
-    def _log_decision(self, state: AppState, decision, read: dict) -> None:
-        _log(
-            state,
-            {
-                "type": "decision",
-                "action": decision.action,
-                "symbol": decision.symbol,
-                "status": decision.status,
-                "price": decision.price,
-                "quantity": decision.filled_quantity,
-                "reasoning": decision.reasoning,
-                "regime": persistence_model.regime_name(read["regime"]),
-            },
-        )
+    @staticmethod
+    def _regime_note(read: dict) -> dict:
+        """The extra field this agent's decision log carries: which regime the
+        trade was taken in. The other two strategies have no regime to name."""
+        return {"regime": persistence_model.regime_name(read["regime"])}
 
 
-class DayRangeTrader:
+class DayRangeTrader(BaseTrader):
     """The day-range rules: one forecast at 9:35, then two resting levels.
 
     TimeToChange3's model says where the session's high and low will land, and
@@ -1109,43 +1030,25 @@ class DayRangeTrader:
     and there are no commissions or slippage in that number.
     """
 
+    # Its entry fires on a resting level rather than on a signal, and the log
+    # line says so.
+    ENTRY_TRIGGER_TEXT = "Buy level touched"
+
     def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
-        self.config = config or AppleTraderConfig()
-        self.ticker = self.config.ticker
+        super().__init__(config or AppleTraderConfig())
         # The session's forecast and the two levels derived from it, or None
         # before 9:35. Keyed by date so a multi-day run re-forecasts each
         # morning rather than trading Tuesday off Monday's levels.
         self.plan: "dict | None" = None
-        # Why today has no plan, when the reason is permanent for the session
-        # (too little daily history, an opening window that cannot be
-        # recovered). Kept so the failure is logged once instead of every
-        # minute for six and a half hours.
-        self.blocked: "dict | None" = None
-        self.entry: "dict | None" = None
-        self.last_bar_ts = None
 
     # --- one cycle --------------------------------------------------------
 
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome
         tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(self.ticker)
-        if sym_state is None:
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
-                },
-            )
-            return "no_data"
-
-        if not market_hours.is_market_open():
-            _log(
-                state,
-                {"type": "status", "text": "Market closed -- Apple Trader is not watching bars."},
-            )
-            return "closed"
+        sym_state, refused = self.preflight(state)
+        if refused is not None:
+            return refused
 
         today = _dayrange().market_date()
         self._roll_session(today)
@@ -1212,7 +1115,7 @@ class DayRangeTrader:
             return "hold"
 
         if fresh_bar and float(last["low"]) <= self.plan["buy_level"]:
-            if self._closing_soon():
+            if self.closing_soon():
                 _log(
                     state,
                     {
@@ -1317,7 +1220,7 @@ class DayRangeTrader:
                 f"(H − {self.config.sell_k:g} × ADR). Selling at market ({pnl_pct:+.2f}%)."
             )
 
-        if self._closing_soon():
+        if self.closing_soon():
             to_close = market_hours.seconds_to_close() or 0.0
             return (
                 f"Session ends in {to_close / 60:.0f} min and the day never came back up to "
@@ -1327,38 +1230,12 @@ class DayRangeTrader:
             )
         return None
 
-    def _closing_soon(self) -> bool:
-        """Whether the flatten-before-close rule is already in force."""
-        to_close = market_hours.seconds_to_close()
-        return to_close is not None and to_close <= self.config.flatten_before_close_min * 60
-
     # --- orders ------------------------------------------------------------
 
     def _buy(self, state: AppState, tracker: DecisionTracker, bar) -> bool:
-        """Deploy `position_pct` of the cash balance; False if it buys nothing."""
-        price = float(bar["close"])
-        cash = tracker.snapshot()["cash"]
-        quantity = _order_quantity(cash, price, self.config.position_pct)
-        if quantity <= 0:
-            _log(
-                state,
-                {
-                    "type": "status",
-                    "text": (
-                        f"Buy level touched but ${cash:,.2f} cash buys no {self.ticker}."
-                    ),
-                },
-            )
-            return False
-
-        decision = tracker.record_trade(
-            self.ticker, "buy", quantity, self._entry_reasoning(bar),
-            state.api_key, state.api_secret, state.feed,
+        return self.buy(
+            state, tracker, float(bar["close"]), self._entry_reasoning(bar)
         )
-        self._log_decision(state, decision)
-        if decision.status == "filled":
-            self.entry = {"price": decision.price, "bars": 0}
-        return decision.status == "filled"
 
     def _entry_reasoning(self, bar) -> str:
         plan = self.plan
@@ -1374,13 +1251,7 @@ class DayRangeTrader:
     def _sell(
         self, state: AppState, tracker: DecisionTracker, quantity: float, bar, reasoning: str
     ) -> None:
-        decision = tracker.record_trade(
-            self.ticker, "sell", quantity, reasoning, state.api_key, state.api_secret,
-            state.feed
-        )
-        self._log_decision(state, decision)
-        if decision.status == "filled":
-            self.entry = None
+        self.sell(state, tracker, quantity, reasoning)
 
     # --- logging -----------------------------------------------------------
 
@@ -1412,22 +1283,9 @@ class DayRangeTrader:
             )
         return " · ".join(parts)
 
-    def _log_decision(self, state: AppState, decision) -> None:
-        _log(
-            state,
-            {
-                "type": "decision",
-                "action": decision.action,
-                "symbol": decision.symbol,
-                "status": decision.status,
-                "price": decision.price,
-                "quantity": decision.filled_quantity,
-                "reasoning": decision.reasoning,
-            },
-        )
 
 
-class MomentumChangeTrader:
+class MomentumChangeTrader(BaseTrader):
     """The delta-momentum rules: the tape says which regime, the model says
     which way it is about to move.
 
@@ -1499,17 +1357,7 @@ class MomentumChangeTrader:
     """
 
     def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
-        self.config = config or AppleTraderConfig()
-        self.ticker = self.config.ticker
-        # The open long: entry price and how many bars it has been held. No
-        # peak — the stop here is fixed at the entry rather than trailing.
-        self.entry: "dict | None" = None
-        self.last_bar_ts = None
-        # Why today cannot be traded, when the reason is permanent for the
-        # session (not enough previous sessions behind it). Kept so it is
-        # logged once rather than every minute, exactly as `DayRangeTrader`
-        # does with a forecast it cannot make.
-        self.blocked: "dict | None" = None
+        super().__init__(config or AppleTraderConfig())
         self.session = None
 
     # --- one cycle --------------------------------------------------------
@@ -1517,23 +1365,9 @@ class MomentumChangeTrader:
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
         """Read the newest closed bar and act on it. Returns a short outcome
         tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state = state.sym(self.ticker)
-        if sym_state is None:
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": f"{self.ticker} is not being streamed; nothing to trade.",
-                },
-            )
-            return "no_data"
-
-        if not market_hours.is_market_open():
-            _log(
-                state,
-                {"type": "status", "text": "Market closed -- Apple Trader is not watching bars."},
-            )
-            return "closed"
+        sym_state, refused = self.preflight(state)
+        if refused is not None:
+            return refused
 
         momentum_change = _momentum_change()
         today = momentum_change.market_date()
@@ -1598,7 +1432,7 @@ class MomentumChangeTrader:
             return "hold"
 
         if fresh_bar and self._entry_signal(read):
-            if self._closing_soon():
+            if self.closing_soon():
                 _log(
                     state,
                     {
@@ -1657,11 +1491,6 @@ class MomentumChangeTrader:
             and pred <= -self.config.sell_thr
         )
 
-    def _closing_soon(self) -> bool:
-        """Whether the flatten-before-close rule is already in force."""
-        to_close = market_hours.seconds_to_close()
-        return to_close is not None and to_close <= self.config.flatten_before_close_min * 60
-
     def _exit_reason(self, read: dict) -> "str | None":
         """Why this long should be closed on this bar, or None to keep holding.
 
@@ -1702,7 +1531,7 @@ class MomentumChangeTrader:
                 f"than waiting for it to unwind ({pnl_pct:+.2f}%)."
             )
 
-        if self._closing_soon():
+        if self.closing_soon():
             to_close = market_hours.seconds_to_close() or 0.0
             return (
                 f"Session ends in {to_close / 60:.0f} min. Momentum, the regime threshold "
@@ -1714,31 +1543,7 @@ class MomentumChangeTrader:
     # --- orders ------------------------------------------------------------
 
     def _buy(self, state: AppState, tracker: DecisionTracker, read: dict) -> bool:
-        """Deploy `position_pct` of the cash balance; False if it buys nothing."""
-        price = read["price"]
-        cash = tracker.snapshot()["cash"]
-        quantity = _order_quantity(cash, price, self.config.position_pct)
-        if quantity <= 0:
-            _log(
-                state,
-                {
-                    "type": "status",
-                    "text": (
-                        f"Entry signal confirmed but ${cash:,.2f} cash buys no "
-                        f"{self.ticker}."
-                    ),
-                },
-            )
-            return False
-
-        decision = tracker.record_trade(
-            self.ticker, "buy", quantity, self._entry_reasoning(read),
-            state.api_key, state.api_secret, state.feed,
-        )
-        self._log_decision(state, decision)
-        if decision.status == "filled":
-            self.entry = {"price": decision.price, "bars": 0}
-        return decision.status == "filled"
+        return self.buy(state, tracker, read["price"], self._entry_reasoning(read))
 
     def _entry_reasoning(self, read: dict) -> str:
         floor = self._momentum_floor(read)
@@ -1757,13 +1562,7 @@ class MomentumChangeTrader:
         self, state: AppState, tracker: DecisionTracker, quantity: float, read: dict,
         reasoning: str,
     ) -> None:
-        decision = tracker.record_trade(
-            self.ticker, "sell", quantity, reasoning, state.api_key, state.api_secret,
-            state.feed,
-        )
-        self._log_decision(state, decision)
-        if decision.status == "filled":
-            self.entry = None
+        self.sell(state, tracker, quantity, reasoning)
 
     # --- logging -----------------------------------------------------------
 
@@ -1787,19 +1586,6 @@ class MomentumChangeTrader:
             )
         return " · ".join(parts)
 
-    def _log_decision(self, state: AppState, decision) -> None:
-        _log(
-            state,
-            {
-                "type": "decision",
-                "action": decision.action,
-                "symbol": decision.symbol,
-                "status": decision.status,
-                "price": decision.price,
-                "quantity": decision.filled_quantity,
-                "reasoning": decision.reasoning,
-            },
-        )
 
 
 def build_trader(config: AppleTraderConfig, bundle: dict):
@@ -1872,17 +1658,6 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict, trader) -> st
     )
 
 
-def _seconds_to_next_bar(cycle_sec: int, lag: float = APPLE_TRADER_BAR_LAG_SEC) -> float:
-    """Seconds to wait so the next cycle lands just after a bar closes.
-
-    Aligning to the clock (rather than sleeping a flat `cycle_sec` from
-    wherever the last cycle finished) keeps one cycle per closed bar however
-    long the scoring itself took.
-    """
-    ts = _now().timestamp()
-    return (math.floor(ts / cycle_sec) + 1) * cycle_sec + lag - ts
-
-
 def _apple_trader_loop(
     state: AppState,
     tracker: DecisionTracker,
@@ -1891,53 +1666,32 @@ def _apple_trader_loop(
     stop_event: threading.Event,
 ) -> None:
     model = apple_models.get(config.model_key)
-    # The pairing check runs before the load, so "there is no GOOGL N-BEATS
-    # model" is never reported as a file that failed to appear.
-    pairing = model_ticker_error(config)
-    if pairing is not None:
-        _log(state, {"type": "error", "text": pairing})
-        scoring.end_session(state, tracker)
-        state.agent_running = False
-        return
-
-    bundle = apple_models.load(config.model_key, config.ticker)
-    if bundle is None:
-        _log(
-            state,
-            {
-                "type": "error",
-                "text": (
-                    f"{apple_models.unavailable_reason(config.model_key, config.ticker)} "
-                    f"Apple Trader cannot run without it."
-                ),
-            },
-        )
-        scoring.end_session(state, tracker)
-        state.agent_running = False
-        return
-
-    mismatch = config_error(config, bundle)
-    if mismatch is not None:
-        _log(state, {"type": "error", "text": mismatch})
-        scoring.end_session(state, tracker)
-        state.agent_running = False
+    # Three ways the run is over before it starts, each reported and none
+    # raised. The pairing check runs before the load, so "there is no GOOGL
+    # N-BEATS model" is never reported as a file that failed to appear.
+    bundle = None
+    refusal = model_ticker_error(config)
+    if refusal is None:
+        bundle = apple_models.load(config.model_key, config.ticker)
+        if bundle is None:
+            refusal = (
+                f"{apple_models.unavailable_reason(config.model_key, config.ticker)} "
+                f"Apple Trader cannot run without it."
+            )
+        else:
+            refusal = config_error(config, bundle)
+    if refusal is not None:
+        _log(state, {"type": "error", "text": refusal})
+        rule_agent.end_session(state, tracker, None)
         return
 
     trader = build_trader(config, bundle)
     _log(state, {"type": "status", "text": _armed_summary(config, model, bundle, trader)})
-
-    while not stop_event.is_set():
-        try:
-            trader.run_cycle(bundle, state, tracker)
-        except Exception as exc:
-            _log(state, {"type": "error", "text": f"Apple Trader cycle failed: {exc}"})
-        scoring.maybe_score_day(state, tracker)
-        stop_event.wait(_seconds_to_next_bar(cycle_sec))
-
-    scoring.end_session(state, tracker)
-    state.agent_running = False
-    _log(state, {"type": "status", "text": "Apple Trader stopped"})
-    obs.flush()
+    rule_agent.run_loop(
+        state, tracker,
+        lambda: trader.run_cycle(bundle, state, tracker),
+        stop_event, cycle_sec, "Apple Trader",
+    )
 
 
 def launch_apple_trader(
@@ -1954,13 +1708,9 @@ def launch_apple_trader(
     personality.
     """
     config = config or AppleTraderConfig()
-    stop_agent(state)
-    stop_event = threading.Event()
-    state.agent_stop_event = stop_event
-    state.agent_running = True
-    scoring.begin_session(state, APPLE_TRADER_KEY, [config.ticker])
-    threading.Thread(
+    rule_agent.launch(
+        state, tracker, APPLE_TRADER_KEY, config.ticker,
         target=_apple_trader_loop,
-        args=(state, tracker, config, cycle_sec, stop_event),
-        daemon=True,
-    ).start()
+        args=(state, tracker, config, cycle_sec),
+        stop_agent=stop_agent,
+    )
