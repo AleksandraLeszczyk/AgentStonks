@@ -2046,8 +2046,14 @@ def render_simulate_tab() -> None:
 
 # Agent first and by default: it is the thing under test. "Model" covers both
 # the LLM behind a personality and the rule set behind the rule-based agent --
-# both are what varies while agent and dataset are held fixed.
-_BREAKDOWN_DIMENSIONS = {"Agent": "agent", "Model": "model", "Dataset": "dataset"}
+# both are what varies while agent and dataset are held fixed. "Instrument" is
+# the symbol a run traded, which is a dimension in its own right here: the same
+# rule set over AAPL and over INTC is two configurations, and whether a result
+# is the strategy or the tape is exactly what comparing them answers.
+_BREAKDOWN_DIMENSIONS = {
+    "Agent": "agent", "Model": "model", "Dataset": "dataset",
+    "Instrument": "instrument",
+}
 
 # Ranking metrics for the top-runs cards, mapped to their `summary` keys.
 _TOP_RUN_METRICS = {"Best return": "return_pct", "Profit efficiency": "profit_efficiency"}
@@ -2083,6 +2089,10 @@ def _best_run_tooltip(best: "dict | None") -> str:
         f"Model: {'/'.join(p for p in (provider, model) if p) or '?'}",
         "Agent: " + _agent_label(best.get("personality")),
         f"Dataset: {best.get('dataset') or '(no dataset)'}",
+        # Named here for the same reason the other three are: in a breakdown
+        # along any one dimension the rest are invisible, and which symbol
+        # produced a number is not a detail on this page.
+        f"Instrument: {best.get('instrument') or '?'}",
     ]
     if best.get("run_id"):
         lines.append(f"Run: {best['run_id']}")

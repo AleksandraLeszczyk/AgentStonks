@@ -29,6 +29,15 @@ RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "runs"
 # Stand-in group/filter key for runs saved without a dataset name.
 NO_DATASET = "(no dataset)"
 
+# A run that traded a basket rather than one instrument -- only an LLM agent
+# can produce one, since a rule agent is single-symbol by design. Its return is
+# a fact about the basket, so it gets its own row rather than being counted
+# once under each symbol it held.
+MULTI_INSTRUMENT = "(multi-instrument)"
+# A record with no symbols at all: not something the app writes, but a stored
+# file is JSON on disk and a breakdown should not lose a run to a missing key.
+UNKNOWN_INSTRUMENT = "(unknown)"
+
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -178,6 +187,38 @@ def dataset_key(record: dict) -> str:
     return record.get("dataset") or NO_DATASET
 
 
+def instrument_key(record: dict) -> str:
+    """Which instrument a stored run traded.
+
+    Not simply `config_summary["symbols"]`, because the two kinds of run mean
+    different things by it:
+
+    * a **rule run** is single-symbol by design and its setup names the
+      instrument, so `rule_config["ticker"]` is the authority. It also has to
+      be: runs stored before the Simulate tab narrowed a rule experiment's
+      symbols carry the whole basket they were handed, and reading that would
+      file a perfectly ordinary AAPL run under "several".
+    * an **LLM run** trades across whatever basket it was given. One symbol is
+      an instrument; several is a different kind of run, and there is no honest
+      way to file it under one of them.
+
+    A run that was handed an instrument and never traded still belongs to it --
+    "flat all day" is a result about that symbol, not an absence of one -- so
+    this reads the configuration rather than the fills.
+    """
+    config = record.get("config_summary") or {}
+    rule_config = config.get("rule_config") or {}
+    ticker = str(rule_config.get("ticker") or "").strip().upper()
+    if ticker:
+        return ticker
+    symbols = [str(s).strip().upper() for s in (config.get("symbols") or []) if s]
+    if len(symbols) == 1:
+        return symbols[0]
+    if not symbols:
+        return UNKNOWN_INSTRUMENT
+    return MULTI_INSTRUMENT
+
+
 def filter_options(runs: list[dict]) -> dict[str, list[str]]:
     """The datasets and models actually present in the stored runs, sorted --
     the option lists for the Results filters."""
@@ -205,14 +246,26 @@ def filter_runs(
     ]
 
 
+BREAKDOWN_DIMENSIONS = ("model", "dataset", "agent", "instrument")
+
+
 def breakdown(runs: list[dict], by: str) -> list[dict]:
     """Aggregate stored runs along one dimension: ``model`` (provider/model),
-    ``dataset``, or ``agent`` (personality). Averages skip runs where a metric
-    is unavailable (no judge report, oracle ceiling of 0). Each row also carries
-    ``best_run`` -- the identity (model, agent, dataset, run id) of the single
-    run behind ``best_return_pct``, since the other two dimensions are invisible
-    in a breakdown along the third."""
-    if by not in ("model", "dataset", "agent"):
+    ``dataset``, ``agent`` (personality), or ``instrument`` (the symbol the run
+    traded). Averages skip runs where a metric is unavailable (no judge report,
+    oracle ceiling of 0). Each row also carries ``best_run`` -- the identity
+    (model, agent, dataset, instrument, run id) of the single run behind
+    ``best_return_pct``, since the other dimensions are invisible in a
+    breakdown along one of them.
+
+    Every dimension groups whole runs, and every metric stays a whole-run
+    metric. That is what makes the instrument rows readable next to the others:
+    a run appears in exactly one group here, never split across symbols and
+    never counted twice, so "avg return" means the same thing in all four
+    views. It is also why a basket run gets its own row instead of being
+    attributed to each symbol it held -- see `instrument_key`.
+    """
+    if by not in BREAKDOWN_DIMENSIONS:
         raise ValueError(f"unknown breakdown dimension: {by}")
     groups: dict[str, dict] = {}
     for record in runs:
@@ -222,6 +275,8 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
             key = model_key(record)
         elif by == "dataset":
             key = dataset_key(record)
+        elif by == "instrument":
+            key = instrument_key(record)
         else:
             key = config.get("personality") or "?"
         group = groups.setdefault(
@@ -239,6 +294,7 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
                     "model": config.get("model") or "",
                     "personality": config.get("personality") or "",
                     "dataset": record.get("dataset") or "",
+                    "instrument": instrument_key(record),
                 }
         if summary.get("profit_efficiency") is not None:
             group["efficiencies"].append(float(summary["profit_efficiency"]))

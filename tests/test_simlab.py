@@ -1650,6 +1650,110 @@ class TestBreakdown:
             sim_results.breakdown([], by="provider-only")
 
 
+class TestInstrumentBreakdown:
+    """Which symbol a stored run is filed under, and why it is one row.
+
+    A rule run's setup names its instrument; an LLM run trades whatever basket
+    it was handed. Both have to land somewhere honest without a whole-run
+    return ever being counted under more than one symbol.
+    """
+
+    def _run(self, symbols=("AAPL",), ticker=None, return_pct=1.0, **extra):
+        config = {
+            "provider": "openai", "model": "gpt-a", "personality": "momentum",
+            "symbols": list(symbols),
+        }
+        if ticker is not None:
+            config["rule_based"] = True
+            config["rule_config"] = {"ticker": ticker}
+        config.update(extra)
+        return {
+            "run_id": "r1",
+            "dataset": "ds1",
+            "config_summary": config,
+            "summary": {"return_pct": return_pct, "profit_efficiency": 0.5},
+        }
+
+    def test_a_single_symbol_run_is_that_instrument(self):
+        assert sim_results.instrument_key(self._run(symbols=["GOOGL"])) == "GOOGL"
+
+    def test_a_rule_setup_names_the_instrument(self):
+        assert sim_results.instrument_key(
+            self._run(symbols=["AAPL"], ticker="INTC")
+        ) == "INTC"
+
+    def test_a_legacy_rule_run_is_filed_under_what_it_traded(self):
+        """Runs stored before the Simulate tab narrowed a rule experiment's
+        symbols carry the whole basket they were handed. The setup's ticker is
+        what that run actually traded, and reading the basket instead would
+        file an ordinary AAPL run under "several"."""
+        record = self._run(symbols=["NVDA", "AAPL", "GOOGL", "INTC"], ticker="AAPL")
+        assert sim_results.instrument_key(record) == "AAPL"
+
+    def test_a_basket_run_gets_its_own_row(self):
+        """Only an LLM agent can produce one. Its return is a fact about the
+        basket, so attributing it to each symbol would count it four times."""
+        record = self._run(symbols=["NVDA", "AAPL", "GOOGL", "INTC"])
+        assert sim_results.instrument_key(record) == sim_results.MULTI_INSTRUMENT
+
+    def test_a_record_without_symbols_is_not_lost(self):
+        assert sim_results.instrument_key({}) == sim_results.UNKNOWN_INSTRUMENT
+
+    def test_symbols_are_normalised(self):
+        assert sim_results.instrument_key(self._run(symbols=[" spy "])) == "SPY"
+        assert sim_results.instrument_key(
+            self._run(symbols=["AAPL"], ticker=" intc ")
+        ) == "INTC"
+
+    def test_runs_group_by_instrument(self):
+        rows = sim_results.breakdown(
+            [
+                self._run(symbols=["AAPL"], return_pct=2.0),
+                self._run(symbols=["AAPL"], return_pct=0.0),
+                self._run(symbols=["INTC"], return_pct=5.0),
+            ],
+            by="instrument",
+        )
+        by_group = {r["group"]: r for r in rows}
+        assert set(by_group) == {"AAPL", "INTC"}
+        assert by_group["AAPL"]["runs"] == 2
+        assert by_group["AAPL"]["avg_return_pct"] == 1.0
+        assert by_group["INTC"]["runs"] == 1
+        assert by_group["INTC"]["best_return_pct"] == 5.0
+
+    def test_every_run_lands_in_exactly_one_group(self):
+        """What keeps the instrument rows readable beside the other three:
+        the columns mean the same thing in every view because a run is counted
+        once, whatever it was handed."""
+        runs = [
+            self._run(symbols=["AAPL"]),
+            self._run(symbols=["AAPL"], ticker="GOOGL"),
+            self._run(symbols=["NVDA", "META"]),
+            self._run(symbols=[]),
+        ]
+        rows = sim_results.breakdown(runs, by="instrument")
+        assert sum(r["runs"] for r in rows) == len(runs)
+
+    def test_the_winning_run_names_its_instrument(self):
+        """In a breakdown along any other dimension the instrument is invisible,
+        which is what the best-run tooltip is for."""
+        rows = sim_results.breakdown(
+            [
+                self._run(symbols=["AAPL"], return_pct=2.0),
+                self._run(symbols=["INTC"], return_pct=9.0),
+            ],
+            by="model",
+        )
+        assert rows[0]["best_run"]["instrument"] == "INTC"
+
+    def test_instrument_is_an_offered_dimension(self):
+        assert "instrument" in sim_results.BREAKDOWN_DIMENSIONS
+        assert set(sim_app._BREAKDOWN_DIMENSIONS.values()) <= set(
+            sim_results.BREAKDOWN_DIMENSIONS
+        )
+        assert "instrument" in sim_app._BREAKDOWN_DIMENSIONS.values()
+
+
 class TestTopRuns:
     def _run(self, run_id="r1", return_pct=1.0, efficiency=0.5, **config):
         return {
