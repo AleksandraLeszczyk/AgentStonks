@@ -1559,6 +1559,354 @@ class TestMomentumChangeSignature:
         assert config_signature(dayrange_config()).startswith("dayrange_AAPL(")
 
 
+# --------------------------------------------------------------------------
+# The price-range rules (PriceRange2): one forecast at 09:35, quantile levels
+# and a stop.
+#
+# Stubbed the same way the day-range suite is, and for the same reason: these
+# pin the RULES, and `tests/test_pricerange_model.py` pins the forecast against
+# the notebook.
+# --------------------------------------------------------------------------
+
+PRICERANGE_BUNDLE = {"opening_minutes": 5}
+
+# A forecast whose quantile edges land on round numbers at the shipped buffers:
+# buy 100 x 1.0015 = 100.15, sell 108 x 1.0 = 108.
+PRICE_FORECAST = {
+    "pred_high": 110.0,
+    "pred_low": 98.0,
+    "pred_range_pct": 0.12,
+    "ref": 104.0,
+    "open_high": 105.0,
+    "open_low": 103.0,
+    "buy_edge": 100.0,
+    "sell_edge": 108.0,
+}
+PR_BUY_LEVEL = 100.15
+PR_SELL_LEVEL = 108.0
+
+
+class PriceTape(Tape):
+    """`Tape`, with the price-range model stubbed instead of the day-range one."""
+
+    def __init__(self, monkeypatch, broker=None, minutes: int = 5, forecast=None):
+        self.forecast = dict(forecast or PRICE_FORECAST)
+        super().__init__(monkeypatch, broker, minutes)
+        pricerange = at._pricerange()
+        monkeypatch.setattr(pricerange, "forecast_session", self._forecast)
+        monkeypatch.setattr(pricerange, "fetch_cross_frame", lambda *a, **k: None)
+        monkeypatch.setattr(
+            pricerange, "fetch_opening_volume_history", lambda *a, **k: None
+        )
+        monkeypatch.setattr(pricerange, "daily_frame_from_bars", lambda bars: None)
+
+    def _forecast(self, *args, **kwargs):
+        self.forecast_calls += 1
+        return dict(self.forecast)
+
+
+def pricerange_config(**kwargs) -> AppleTraderConfig:
+    return AppleTraderConfig(model_key="pricerange", **kwargs)
+
+
+class TestPriceRangeEntry:
+    def _trader(self, **kwargs):
+        return at.PriceRangeTrader(pricerange_config(**kwargs))
+
+    def test_it_rests_on_the_quantile_edges_not_the_point_forecast(
+        self, state, market_open, monkeypatch
+    ):
+        """The whole point of this strategy: the median edges lose money in
+        every one of PriceRange2's 112 sweep cells, so the levels come off the
+        75th/25th percentiles instead."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = PriceTape(monkeypatch)
+        trader = self._trader()
+
+        tape.append(104.0)
+        trader.run_cycle(PRICERANGE_BUNDLE, state, tracker)
+        assert trader.plan["buy_level"] == pytest.approx(PR_BUY_LEVEL)
+        assert trader.plan["sell_level"] == pytest.approx(PR_SELL_LEVEL)
+        # ...and not the point forecast, which is far wider.
+        assert trader.plan["buy_level"] > PRICE_FORECAST["pred_low"]
+        assert trader.plan["sell_level"] < PRICE_FORECAST["pred_high"]
+
+    def test_a_bar_that_trades_down_to_the_buy_level_is_bought(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._trader()
+
+        tape.append(101.0, low=PR_BUY_LEVEL - 0.01)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "bought"
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "100.15" in reasoning and "75th-percentile" in reasoning
+
+    def test_a_bar_that_stays_above_the_buy_level_is_not(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = PriceTape(monkeypatch)
+        trader = self._trader()
+
+        tape.append(104.0, low=PR_BUY_LEVEL + 0.01)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_the_buffers_move_the_levels_inward(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = PriceTape(monkeypatch)
+        trader = self._trader(entry_buffer=1.0, exit_buffer=2.0)
+
+        tape.append(104.0)
+        trader.run_cycle(PRICERANGE_BUNDLE, state, tracker)
+        assert trader.plan["buy_level"] == pytest.approx(101.0)   # 100 x 1.01
+        assert trader.plan["sell_level"] == pytest.approx(105.84)  # 108 x 0.98
+
+    def test_nothing_trades_before_the_opening_window_closes(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        tape = PriceTape(monkeypatch, minutes=3)
+        trader = self._trader()
+
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "warming_up"
+        assert trader.plan is None and tape.forecast_calls == 0
+
+    def test_the_forecast_is_made_once_and_reused_all_day(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = PriceTape(monkeypatch)
+        trader = self._trader()
+        for _ in range(6):
+            tape.append(104.0)
+            trader.run_cycle(PRICERANGE_BUNDLE, state, tracker)
+        assert tape.forecast_calls == 1
+
+    def test_a_bundle_without_quantiles_stands_down_for_the_session(
+        self, state, market_open, monkeypatch
+    ):
+        """The levels *are* the quantiles, so a point-only bundle has no rule.
+
+        Falling back to the median edges would be running the one configuration
+        that project measured as never profitable.
+        """
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+        tape = PriceTape(
+            monkeypatch,
+            forecast={**PRICE_FORECAST, "buy_edge": None, "sell_edge": None},
+        )
+        trader = self._trader()
+
+        tape.append(100.0, low=90.0)  # would fill on any level
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "no_data"
+        assert trader.plan is None and trader.blocked is not None
+        assert tracker.position_for(TICKER) == 0
+
+    def test_crossed_levels_stand_the_session_down(
+        self, state, market_open, monkeypatch
+    ):
+        """A forecast band narrower than the buffers is a real forecast about a
+        very quiet day -- and a buy above the sell would round-trip forever."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = PriceTape(
+            monkeypatch,
+            forecast={**PRICE_FORECAST, "buy_edge": 104.0, "sell_edge": 104.0},
+        )
+        trader = self._trader(entry_buffer=1.0)
+
+        tape.append(104.0, low=100.0)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "no_data"
+        assert trader.plan is None and trader.blocked is not None
+
+
+class TestPriceRangeExit:
+    def _entered(self, state, tracker, tape, **kwargs):
+        trader = at.PriceRangeTrader(pricerange_config(**kwargs))
+        tape.append(101.0, low=PR_BUY_LEVEL - 0.01)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "bought"
+        return trader
+
+    def test_the_sell_level_closes_the_position(self, state, market_open, monkeypatch):
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape)
+
+        tape.append(108.5, high=PR_SELL_LEVEL + 0.1)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_stop_closes_it_too(self, state, market_open, monkeypatch):
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape)
+        entry = trader.entry["price"]
+
+        tape.append(entry * 0.985, low=entry * 0.98)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "sold"
+        assert "Stop" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_bar_holding_both_levels_takes_the_stop(
+        self, state, market_open, monkeypatch
+    ):
+        """The rule, not an implementation detail: a minute bar does not record
+        which came first, and assuming the good one is how a backtest invents
+        money. PriceRange2's simulator takes the stop; so does this."""
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape)
+        entry = trader.entry["price"]
+
+        tape.append(104.0, low=entry * 0.98, high=PR_SELL_LEVEL + 1.0)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "sold"
+        assert "Stop" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_buy_is_spent_on_the_entry_not_the_exit(self, state, market_open, monkeypatch):
+        """Where `simulate.simulate_session` disarms, and it matters.
+
+        Disarming on the exit would spend the session's one trade on a sell the
+        ledger refused; disarming on a buy that filled nothing would spend it on
+        no trade at all.
+        """
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape)
+        assert trader.armed is False  # already spent, while still holding
+
+    def test_a_buy_that_fills_nothing_does_not_spend_the_session(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=0.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = at.PriceRangeTrader(pricerange_config())
+
+        tape.append(101.0, low=PR_BUY_LEVEL - 0.01)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.armed is True
+
+    def test_the_buy_does_not_re_arm_by_default(self, state, market_open, monkeypatch):
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape)
+
+        tape.append(108.5, high=PR_SELL_LEVEL + 0.1)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.armed is False
+        tape.append(101.0, low=PR_BUY_LEVEL - 0.5)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_re_entry_can_be_switched_on(self, state, market_open, monkeypatch):
+        broker = FakeBroker(101.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = PriceTape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape, allow_reentry=True)
+
+        tape.append(108.5, high=PR_SELL_LEVEL + 0.1)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.armed is True
+        tape.append(101.0, low=PR_BUY_LEVEL - 0.5)
+        assert trader.run_cycle(PRICERANGE_BUNDLE, state, tracker) == "bought"
+
+
+class TestPriceRangeSignature:
+    def test_the_levels_and_the_stop_are_the_signature(self):
+        base = config_signature(pricerange_config())
+        assert base == (
+            "pricerange_AAPL(buy=L75+0.15%,sell=H25-0%,stop=1%,size=95%)"
+        )
+        assert base != config_signature(pricerange_config(entry_buffer=0.3))
+        assert base != config_signature(pricerange_config(exit_buffer=0.1))
+        assert base != config_signature(pricerange_config(range_stop_pct=1.5))
+        assert base != config_signature(pricerange_config(allow_reentry=True))
+        assert base != config_signature(pricerange_config(ticker="INTC"))
+
+    def test_the_other_strategies_knobs_are_inert(self):
+        """Including `stop_pct`, which belongs to the delta-momentum rules.
+
+        The two stops were fitted separately and mean different things, which
+        is why they are separate fields -- and why moving one must not split
+        the other strategy's runs into two configurations in Results.
+        """
+        base = config_signature(pricerange_config())
+        assert base == config_signature(
+            pricerange_config(trail_pct=2.0, prob_threshold=0.9, buy_k=1.5,
+                              stop_pct=2.0, buy_thr=0.9)
+        )
+
+    def test_the_two_stops_do_not_share_a_field(self):
+        """Retuning the price-range stop must leave a momentum_change run's
+        signature untouched, and vice versa."""
+        momentum = config_signature(momentum_change_config())
+        assert momentum == config_signature(momentum_change_config(range_stop_pct=3.0))
+        price = config_signature(pricerange_config())
+        assert price == config_signature(pricerange_config(stop_pct=3.0))
+
+
+class TestStrategyCopy:
+    """Both apps must describe every strategy they can run.
+
+    There is no exception raised when they do not: `copy.intro.get(...)` and
+    `copy.help.get(...)` return None, `_caption(None)` renders nothing, and the
+    form comes up with an unexplained set of number inputs. So a strategy added
+    to the registry without its copy fails silently in exactly the place a user
+    is deciding what a knob does -- which is why this is a test rather than a
+    convention.
+    """
+
+    def _copies(self):
+        pytest.importorskip("streamlit")
+        from agent_stonks.ui import _APPLE_TRADER_COPY
+        from simlab.app import _APPLE_TRADER_COPY_FIELDS
+
+        return {
+            "live": (_APPLE_TRADER_COPY.intro, _APPLE_TRADER_COPY.outro,
+                     _APPLE_TRADER_COPY.help),
+            "simlab": (_APPLE_TRADER_COPY_FIELDS["intro"],
+                       _APPLE_TRADER_COPY_FIELDS["outro"],
+                       _APPLE_TRADER_COPY_FIELDS["help"]),
+        }
+
+    def test_every_level_based_strategy_is_introduced_in_both_apps(self):
+        """The three whose form is a set of price levels with no other context.
+
+        Not every strategy in the registry: the live app has never carried a
+        `momentum` intro, because that form's four knobs are each explained by
+        their own `help` and the model summary sits directly above them. These
+        three are the ones where the numbers mean nothing without a sentence
+        saying what they are distances *from*.
+        """
+        level_based = {"dayrange", "momentum_change", "pricerange"}
+        for app, (intro, outro, _) in self._copies().items():
+            assert not level_based - set(intro), f"{app} is missing an intro"
+            assert not level_based - set(outro), f"{app} is missing an outro"
+
+    def test_every_price_range_knob_has_help_in_both_apps(self):
+        """The four fields `pricerange_params` renders with a `help=` argument."""
+        knobs = {"entry_buffer", "exit_buffer", "range_stop_pct", "allow_reentry"}
+        for app, (_, _, help_) in self._copies().items():
+            missing = knobs - set(help_)
+            assert not missing, f"{app} has no help for {sorted(missing)}"
+
+    def test_the_rules_own_verdict_on_itself_reaches_the_user(self):
+        """PriceRange2 measured this rule as having no edge over holding, and
+        both apps say so where the rule is configured. That finding is the most
+        important thing about the strategy and the easiest to leave out."""
+        for app, (_, outro, _) in self._copies().items():
+            text = outro["pricerange"].lower()
+            assert "no edge" in text or "reduced exposure" in text, app
+
+
 class TestStrategySelection:
     def test_the_model_chooses_the_state_machine(self):
         assert isinstance(
@@ -1566,6 +1914,9 @@ class TestStrategySelection:
         )
         assert isinstance(
             at.build_trader(momentum_change_config(), MOMENTUM_CHANGE_BUNDLE), at.MomentumChangeTrader
+        )
+        assert isinstance(
+            at.build_trader(pricerange_config(), PRICERANGE_BUNDLE), at.PriceRangeTrader
         )
         assert isinstance(at.build_trader(AppleTraderConfig(), BUNDLE), AppleTrader)
 
@@ -1598,24 +1949,45 @@ class TestStrategySelection:
 # ----------------------------------------------------------------- instrument
 #
 # Which symbol a run trades, and the one thing that constrains it: a model was
-# fitted on a symbol or it was not. As of 2026-09-07 every model covers every
-# shipped symbol, so `UNMODELLED` is the only pairing the *shipped* registry
-# refuses -- which is exactly why the narrower case is exercised against a
-# stubbed entry below rather than left uncovered. It was true a month ago and
-# will be true again the next time a notebook is re-run for one symbol first.
+# fitted on a symbol or it was not. Between 2026-09-07 and the PriceRange2
+# integration every model covered every shipped symbol, which made `UNMODELLED`
+# the only pairing the shipped registry refused. That is no longer true, and
+# the reason is worth keeping: PriceRange2 was run on **GOOG** where the three
+# TimeToChange projects were run on **GOOGL**, and the two are different share
+# classes rather than spellings of one symbol. So the registry now narrows in
+# both directions on its own, and these tests say so.
 
 NON_AAPL = "GOOGL"
 DAYRANGE_ONLY = NON_AAPL  # kept for the tests written before there were two
+PRICERANGE_ONLY = "GOOG"
 UNMODELLED = "MSFT"
 
-ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
+# The four fitted by the TimeToChange projects, which share a symbol set.
+TIMETOCHANGE_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
+ALL_MODELS = TIMETOCHANGE_MODELS + ["pricerange"]
 
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        for symbol in (TICKER, NON_AAPL, "INTC"):
+        # AAPL and INTC are the two symbols every project was run on.
+        for symbol in (TICKER, "INTC"):
             assert apple_models.keys_for(symbol) == ALL_MODELS
         assert apple_models.keys_for(UNMODELLED) == []
+
+    def test_the_two_google_share_classes_are_not_interchangeable(self):
+        """GOOGL runs the TimeToChange models; GOOG runs PriceRange2's.
+
+        The pairing that would be easiest to get wrong and hardest to notice:
+        the two tickers track nearly the same price, so a model quietly
+        answering for the wrong one would look entirely plausible in the log.
+        """
+        assert apple_models.keys_for(NON_AAPL) == TIMETOCHANGE_MODELS
+        assert apple_models.keys_for(PRICERANGE_ONLY) == ["pricerange"]
+        assert "pricerange" not in apple_models.keys_for(NON_AAPL)
+        # And the refusal names the symbol it *was* fitted on, so the reader is
+        # not left guessing which of the two the file belongs to.
+        reason = apple_models.unavailable_reason("pricerange", NON_AAPL)
+        assert PRICERANGE_ONLY in reason and NON_AAPL in reason
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
         self, monkeypatch
@@ -1639,11 +2011,18 @@ class TestInstrument:
         assert "Day-range forecast" in error
 
     def test_every_model_covers_the_retrained_symbols(self):
-        """All three notebook projects have been re-run per ticker."""
-        for key in ALL_MODELS:
+        """Every project has been re-run per ticker, on the symbols it names.
+
+        Two symbol sets rather than one, because PriceRange2 was run on GOOG
+        and the TimeToChange projects on GOOGL.
+        """
+        for key in TIMETOCHANGE_MODELS:
             for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
                 config = AppleTraderConfig(model_key=key, ticker=symbol)
                 assert at.model_ticker_error(config) is None
+        for symbol in (TICKER, PRICERANGE_ONLY, "INTC"):
+            config = AppleTraderConfig(model_key="pricerange", ticker=symbol)
+            assert at.model_ticker_error(config) is None
 
     def test_an_unmodelled_symbol_is_refused_with_no_alternative_offered(self):
         error = at.model_ticker_error(

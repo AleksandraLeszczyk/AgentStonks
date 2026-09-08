@@ -9,12 +9,20 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Three overlays, because there are three shapes of answer
--------------------------------------------------------
+Four overlays, because there are three shapes of answer
+------------------------------------------------------
 `day_range`      TimeToChange3's forecast of where the session's high and low
                  will land, made once from the first five minutes. Two price
                  levels and the band between them -- the model's claim about
                  the *width* of the day. See `dayrange_model`.
+`price_range`    PriceRange2's answer to the same question, measured against
+                 the price trading at 09:35 rather than yesterday's average.
+                 The same band, plus the two *quantile* edges its rule rests
+                 orders at -- drawn because they are the interesting part: the
+                 median edges never made money in any of that project's 112
+                 sweep cells, so what the model is worth to a trader is the
+                 75th-percentile low, not the most likely one. See
+                 `pricerange_model`.
 `profile_range`  the LevelsML density model's predicted price profile, reduced
                  to the three numbers a price axis can carry: its outer
                  quantiles and its point of control. The curve itself is drawn
@@ -76,6 +84,7 @@ from .config import MODEL_OVERLAY_COLORS
 # --- the catalogue ----------------------------------------------------------
 
 DAY_RANGE_KEY = "day_range"
+PRICE_RANGE_KEY = "price_range"
 PROFILE_RANGE_KEY = "profile_range"
 MOMENTUM_KEY = "momentum"
 
@@ -116,6 +125,20 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="PyTorch, LightGBM and the day-range bundle",
         tickers=apple_models.DAYRANGE_TICKERS,
+    ),
+    PRICE_RANGE_KEY: ModelOverlay(
+        key=PRICE_RANGE_KEY,
+        label="Predicted price range",
+        summary=(
+            "PriceRange2's forecast of both session edges, made at 09:35 against the "
+            "price trading then. Two levels and the band between them, plus the "
+            "75th/25th-percentile edges its trading rule actually rests orders at."
+        ),
+        requires=(
+            "LightGBM, the PriceRange2 bundle, 21 sessions of opening volume and "
+            "daily bars for 17 cross-asset series"
+        ),
+        tickers=apple_models.PRICERANGE_TICKERS,
     ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
@@ -280,6 +303,8 @@ def compute(
     session_date=None,
     open_price: "float | None" = None,
     momentum_model: "str | None" = None,
+    cross: "pd.DataFrame | None" = None,
+    opening_volume: "pd.Series | None" = None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
@@ -294,6 +319,14 @@ def compute(
     `open_price` is the official opening print when the caller has one, and
     `momentum_model` picks which of the two momentum bundles answers the
     persistence question (defaults to the configured one).
+
+    `cross` and `opening_volume` are `price_range`'s two extra inputs, and they
+    are parameters rather than something fetched here because the two callers
+    hold them in different places: live they come off `historical` and the
+    Alpaca REST window, in SimLab off the dataset's own store. Absent, that one
+    overlay produces a note saying which input was missing -- never a forecast
+    built on 110 empty columns, which is what LightGBM would otherwise
+    cheerfully return.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -320,6 +353,9 @@ def compute(
     builders = {
         DAY_RANGE_KEY: lambda: _day_range_items(
             symbol, session, daily_bars or [], day, open_price
+        ),
+        PRICE_RANGE_KEY: lambda: _price_range_items(
+            symbol, session, daily_bars or [], day, open_price, cross, opening_volume
         ),
         PROFILE_RANGE_KEY: lambda: _profile_range_items(
             session, daily_bars or [], day
@@ -417,6 +453,105 @@ def _day_range_items(
         ],
         "",
     )
+
+
+# --- price range (PriceRange2) -----------------------------------------------
+
+
+def _price_range_items(
+    symbol: str,
+    session: pd.DataFrame,
+    daily_bars: "list[dict]",
+    day: pd.Timestamp,
+    open_price: "float | None",
+    cross: "pd.DataFrame | None",
+    opening_volume: "pd.Series | None",
+) -> "tuple[list[dict], str]":
+    """The predicted edges, the band between them, and the two traded levels.
+
+    Five items rather than the day-range overlay's three, because this model
+    ships quantiles and they are the part with a trading result behind them.
+    The point forecast is drawn as the band; the q75 low and q25 high are drawn
+    as separate lines inside it, in a lighter tone of the same hue, since they
+    are the same model answering the same question at a different quantile.
+    """
+    overlay = OVERLAYS[PRICE_RANGE_KEY]
+    bundle = apple_models.load(apple_models.PRICERANGE_KEY, symbol)
+    if bundle is None:
+        return [], (
+            f"{overlay.label}: "
+            + apple_models.unavailable_reason(apple_models.PRICERANGE_KEY, symbol)
+        )
+
+    from . import pricerange_model  # LightGBM; only once it is needed
+
+    want = pricerange_model.opening_minutes(bundle)
+    if len(session) < want:
+        return [], (
+            f"{overlay.label}: the forecast is built on the first {want} minutes and "
+            f"only {len(session)} bars have closed."
+        )
+    opening = session.iloc[:want]
+    if float(opening["minutes_from_open"].iloc[0]) >= 1.0:
+        return [], (
+            f"{overlay.label}: these bars start at {session.index[0]:%H:%M}, not the "
+            "09:30 open, so the first five minutes the forecast needs are not here."
+        )
+
+    history = pricerange_model.daily_frame_from_bars(daily_bars)
+    try:
+        forecast = pricerange_model.forecast_session(
+            bundle, history, opening, day,
+            cross=cross, open_price=open_price, opening_volume=opening_volume,
+        )
+    except ValueError as exc:
+        # `require_cross` and `require_opening_volume` explain themselves well
+        # enough to show a user directly -- they name the missing series.
+        return [], f"{overlay.label}: {exc}"
+
+    color = MODEL_OVERLAY_COLORS[PRICE_RANGE_KEY]
+    edge_color = MODEL_OVERLAY_COLORS["price_range_q"]
+    x0 = opening.index[-1]
+    x1 = _session_close(day)
+    high, low = forecast["pred_high"], forecast["pred_low"]
+    made_at = f"forecast at {pd.Timestamp(x0):%H:%M} off ${forecast['ref']:,.2f}"
+
+    items = [
+        _span(
+            PRICE_RANGE_KEY, "Predicted price range", x0, x1, color,
+            y0=low, y1=high,
+            note=(
+                f"{low:.2f} – {high:.2f}, {forecast['pred_range_pct']:.2%} of the "
+                f"09:35 price ({made_at})"
+            ),
+        ),
+        _level(PRICE_RANGE_KEY, "Pred. high", high, color,
+               note=f"predicted session high ({made_at})", x0=x0, x1=x1),
+        _level(PRICE_RANGE_KEY, "Pred. low", low, color,
+               note=f"predicted session low ({made_at})", x0=x0, x1=x1),
+    ]
+    if forecast["buy_edge"] is not None and forecast["sell_edge"] is not None:
+        items += [
+            _level(
+                PRICE_RANGE_KEY, "Sell edge (q25 high)", forecast["sell_edge"],
+                edge_color, dash="dot",
+                note=(
+                    "the 25th-percentile predicted high — a level the day is 75% "
+                    f"likely to reach, which is where the rule offers ({made_at})"
+                ),
+                x0=x0, x1=x1,
+            ),
+            _level(
+                PRICE_RANGE_KEY, "Buy edge (q75 low)", forecast["buy_edge"],
+                edge_color, dash="dot",
+                note=(
+                    "the 75th-percentile predicted low — a level the day is 75% "
+                    f"likely to reach, which is where the rule bids ({made_at})"
+                ),
+                x0=x0, x1=x1,
+            ),
+        ]
+    return items, ""
 
 
 # --- predicted profile range (LevelsML) -------------------------------------
@@ -702,6 +837,7 @@ def live_overlays(
     bars: "list[dict]",
     overlay_keys: "list[str] | None",
     momentum_model: "str | None" = None,
+    credentials: "tuple[str | None, str | None, str] | None" = None,
 ) -> dict:
     """`compute` for the live app, cached on the SymbolState until a new bar.
 
@@ -711,6 +847,11 @@ def live_overlays(
     Scoring a whole session through the N-BEATS bundle on every poll would cost
     seconds for a picture that did not move, so the result is held against the
     newest bar's timestamp and the selection that produced it.
+
+    `credentials` is `(api_key, api_secret, feed)`, needed only by
+    `price_range` and only for the 21 sessions of opening volume behind one of
+    its features -- everything else it reads comes from yfinance. Without them
+    that overlay explains what is missing rather than drawing anything.
     """
     wanted = [k for k in (overlay_keys or []) if k in OVERLAYS]
     if not wanted or not bars:
@@ -721,13 +862,35 @@ def live_overlays(
     if cached and cached.get("key") == key:
         return cached["result"]
 
+    day = session_date_of(bars)
+    cross = opening_volume = None
+    if PRICE_RANGE_KEY in wanted and OVERLAYS[PRICE_RANGE_KEY].covers(sym_state.symbol):
+        # Both are cached inside their own fetchers for the session, so the
+        # cost here is paid once a morning rather than once a bar -- but the
+        # covers() gate still matters, because a symbol with no bundle should
+        # not trigger 34 downloads to be told so.
+        from . import pricerange_model
+
+        api_key, api_secret, feed = credentials or (None, None, "iex")
+        try:
+            cross = pricerange_model.fetch_cross_frame(day)
+            opening_volume = pricerange_model.fetch_opening_volume_history(
+                sym_state.symbol, day, api_key, api_secret, feed
+            )
+        except Exception:
+            # A decoration must never take the chart down; `require_cross` and
+            # `require_opening_volume` turn the empty result into a note.
+            cross, opening_volume = None, None
+
     result = compute(
         wanted,
         sym_state.symbol,
         bars,
         daily_bars=list(sym_state.daily_bars or []),
-        session_date=session_date_of(bars),
+        session_date=day,
         momentum_model=momentum_model,
+        cross=cross,
+        opening_volume=opening_volume,
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}
     return result

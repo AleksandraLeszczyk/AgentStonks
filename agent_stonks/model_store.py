@@ -21,6 +21,11 @@ file, so it can only mean the default ticker's: letting it answer for every
 symbol would hand a GOOGL run the AAPL model without saying so. Every model
 here is fitted per symbol and none of them claims to transfer, so that
 distinction is load-bearing rather than pedantic.
+
+The override key is always upper-case (`APPLE_PRICERANGE_MODEL_GOOG`) even for
+a family whose *files* are lower-case, because an environment variable is typed
+by a person and a filename is written by a notebook. Those are two different
+naming authorities, and only the second one gets to be inconsistent.
 """
 from __future__ import annotations
 
@@ -59,10 +64,14 @@ RTH_END = (
 class ModelStore:
     """One model family's files, resolved per ticker and loaded at most once.
 
-    `filename` is a template taking `{ticker}` (already upper-cased), e.g.
+    `filename` is a template taking `{ticker}`, e.g.
     ``"timetochange2_persistence_{ticker}.joblib"``. It deliberately mirrors
     the name the notebook saves under -- the two stores agreeing is what makes
-    a retrain visible to the app with no further step.
+    a retrain visible to the app with no further step. `lowercase_file` is part
+    of that mirroring rather than a style preference: PriceRange2 builds its
+    filename from `config.MODEL_NAME` and so writes `pricerange2_aapl.joblib`.
+    A store that upper-cased the symbol would look in the wrong place, and
+    would go on looking in the wrong place after every future retrain.
     """
 
     def __init__(
@@ -73,10 +82,12 @@ class ModelStore:
         *,
         model_dir: "Path | None" = None,
         default_ticker: str = DEFAULT_TICKER,
+        lowercase_file: bool = False,
     ) -> None:
         self.env_key = env_key
         self.filename = filename
         self.default_ticker = default_ticker
+        self.lowercase_file = lowercase_file
         self.model_dir = model_dir or MODEL_DIR
         self._build = build
         self._lock = threading.Lock()
@@ -105,7 +116,10 @@ class ModelStore:
         override = os.environ.get(f"{self.env_key}_{symbol}")
         if not override and symbol == self.default_ticker:
             override = os.environ.get(self.env_key)
-        return Path(override or self.model_dir / self.filename.format(ticker=symbol))
+        # The env key keeps the upper-case symbol; only the filename follows
+        # whatever case the notebook that wrote it chose.
+        stem = symbol.lower() if self.lowercase_file else symbol
+        return Path(override or self.model_dir / self.filename.format(ticker=stem))
 
     def metadata_path(self, path: "Path | None" = None) -> Path:
         """The readable JSON sidecar the save step writes beside the model."""

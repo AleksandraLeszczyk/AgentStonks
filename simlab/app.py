@@ -421,6 +421,9 @@ def _render_apple_rules() -> None:
                 if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
                     _render_momentum_change_bundle(bundle)
                     continue
+                if model.strategy == apple_models.STRATEGY_PRICERANGE:
+                    _render_pricerange_bundle(bundle)
+                    continue
                 metrics = bundle.get("metrics") or {}
                 cols = st.columns(4)
                 cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
@@ -476,6 +479,66 @@ def _render_dayrange_bundle(bundle: dict) -> None:
     st.json(
         {"test_metrics": test, "constraint": metadata.get("constraint"),
          "opening_correction_gain": metadata.get("opening_correction_loo_gain")},
+        expanded=False,
+    )
+
+
+def _render_pricerange_bundle(bundle: dict) -> None:
+    """The price-range bundle's provenance, in its own units.
+
+    The headline is *skill against a baseline* rather than a raw error, and
+    deliberately: range is strongly autocorrelated, so a 21-day trailing mean
+    is already a good forecast and an MAE quoted alone says nothing about
+    whether the model added anything. INTC's skill is the lowest of the three
+    and its model is not the worst -- its baseline is the best.
+
+    Nothing here is comparable to the day-range panel above either, even though
+    the two models answer the same question: different spans, different
+    baselines, and different reference prices.
+    """
+    metadata = bundle.get("metadata") or {}
+    scores = metadata.get("walkforward_scores") or {}
+    walk = scores.get("walkforward") or {}
+    base = scores.get("rolling21") or {}
+    cols = st.columns(4)
+    cols[0].metric("Features", metadata.get("n_features", "?"))
+    cols[1].metric("Sessions", f"{walk.get('n', '?')} walk-forward")
+    cols[2].metric(
+        "vs 21-day baseline", f"{walk.get('skill_vs_baseline', float('nan')):.1%}"
+    )
+    cols[3].metric(
+        "Spearman (range)",
+        f"{walk.get('spearman_range', float('nan')):.2f}"
+        f" / {base.get('spearman_range', float('nan')):.2f}",
+        help="The model's rank correlation with the realised range, against the "
+             "baseline's. Both matter: the gap is the skill.",
+    )
+    st.caption(
+        f"Fitted {bundle.get('trained_at', '?')} on "
+        f"{metadata.get('n_train_sessions', '?')} sessions "
+        f"({' → '.join(metadata.get('train_span') or ['?', '?'])}), everything from the "
+        "held-out week excluded. Mean absolute error on the range is "
+        f"{walk.get('mae_range', float('nan')):.5f} log units "
+        f"(${walk.get('mae_range_usd', float('nan')):.2f}) against the baseline's "
+        f"{base.get('mae_range', float('nan')):.5f} — a number about prices, not a "
+        "label, so it shares no scale with the AUCs above."
+    )
+    st.warning(
+        ":material/warning: "
+        + str(metadata.get("known_bias") or "")
+        + " Both edge errors point the same way and therefore *add* on the range, where "
+        "a trailing baseline's happen to cancel — so this model can beat the baseline on "
+        "each edge separately and lose on the width. The quantile models are the fix, "
+        "and they are what the trading rule reads."
+    )
+    st.json(
+        {
+            "walkforward_scores": scores,
+            "feature_blocks_used": metadata.get("feature_blocks_used"),
+            "feature_blocks_rejected": metadata.get("feature_blocks_rejected"),
+            "block_selection": metadata.get("block_selection"),
+            "quantiles": bundle.get("quantiles"),
+        },
         expanded=False,
     )
 
@@ -805,6 +868,67 @@ def _price_chart(
 
 
 
+def _sim_cross_frame(market: "SimMarket", day: "date", t: datetime):
+    """The 17 cross-asset series `price_range` needs, out of the dataset itself.
+
+    The live path downloads these; a replay must not, because a forecast drawn
+    over a session from March has to be built from what March knew. So they are
+    read from the recorded store on exactly the same point-in-time terms as the
+    traded symbol -- `completed_daily_bars` for the history, `session_open_price`
+    for the one same-day field the block reads.
+
+    A dataset recorded for one stock has none of them and this returns an empty
+    frame, which `pricerange_model.require_cross` turns into a note naming the
+    missing series. That is the common case and the right answer: 110 of the
+    model's 156 features come from here.
+    """
+    from agent_stonks import pricerange_model
+
+    bars_by_name: "dict[str, list[dict]]" = {}
+    opens: "dict[str, float]" = {}
+    for feed_symbol, name in pricerange_model.CROSS_SYMBOLS.items():
+        if feed_symbol not in market.series:
+            continue
+        bars = market.completed_daily_bars(feed_symbol, t)
+        if bars:
+            bars_by_name[name] = bars
+        open_price = market.session_open_price(feed_symbol, t)
+        if open_price is not None:
+            opens[name] = float(open_price)
+    return pricerange_model.cross_frame_from_bars(bars_by_name, day, opens)
+
+
+def _sim_opening_volume(market: "SimMarket", symbol: str, day: "date"):
+    """Previous sessions' opening-window volume, out of the stored minute tape.
+
+    The replay equivalent of `pricerange_model.fetch_opening_volume_history`.
+    It reads the same `[09:30, 09:35)` window per session that the live fetch
+    asks Alpaca for, over whatever days the dataset holds before `day`.
+
+    Note what this means in practice: the feature behind it is a 21-session
+    rolling mean, so a dataset shorter than that cannot produce it and the
+    overlay says so. A typical five-day SimLab dataset will not run this model,
+    which is the honest outcome rather than a limitation to work around.
+    """
+    from agent_stonks import pricerange_model
+
+    volumes: "dict[pd.Timestamp, float]" = {}
+    for stored in sorted({str(b.get("t", ""))[:10] for b in market.series[symbol].daily_bars}):
+        if not stored or stored >= day.isoformat():
+            continue
+        session = date.fromisoformat(stored)
+        start = market.session_open(session)
+        window = market.bars_window(
+            symbol, start, start + timedelta(minutes=pricerange_model.OPENING_MINUTES)
+        )
+        volume = sum(float(b.get("v") or 0.0) for b in window)
+        if window and volume > 0:
+            volumes[pd.Timestamp(session)] = volume
+    out = pd.Series(volumes, dtype="float64").sort_index()
+    out.index = pd.DatetimeIndex(out.index, name="date")
+    return out
+
+
 def _run_overlay_controls(
     record: dict, market: "SimMarket", symbol: str, days: "list[date]"
 ) -> dict:
@@ -852,8 +976,13 @@ def _run_overlay_controls(
     items: list[dict] = []
     notes: list[str] = []
     bars = market.series[symbol].minute_bars
+    wants_price_range = model_overlays.PRICE_RANGE_KEY in selected
     for day in days:
         t = market.session_open(day) + timedelta(minutes=1)
+        cross = opening_volume = None
+        if wants_price_range:
+            cross = _sim_cross_frame(market, day, t)
+            opening_volume = _sim_opening_volume(market, symbol, day)
         result = model_overlays.compute(
             selected,
             symbol,
@@ -862,6 +991,8 @@ def _run_overlay_controls(
             session_date=day,
             open_price=market.session_open_price(symbol, t),
             momentum_model=momentum_model,
+            cross=cross,
+            opening_volume=opening_volume,
         )
         items.extend(result["items"])
         for note in result["notes"]:
@@ -1603,6 +1734,15 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the entry, retuning the stop or arming the reversal exit is a new test "
             "rather than a repeat of one already run."
         ),
+        "pricerange": (
+            "At 09:35 the model forecasts both edges of the session against the price "
+            "trading then, and the orders rest at the **75th-percentile low** and "
+            "**25th-percentile high** rather than the point forecast — PriceRange2 found "
+            "the median edges lose money in every one of 112 sweep cells, on all three "
+            "tickers, because price reaches the most likely low only about half the time. "
+            "The three knobs below move the levels inward and set the stop; the quantiles "
+            "themselves are fixed, being the one part of this rule that is established."
+        ),
     },
     outro={
         "dayrange": (
@@ -1617,8 +1757,46 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "whose first days have nothing behind them will log a refusal to trade for "
             "those sessions rather than trading them blind."
         ),
+        "pricerange": (
+            ":material/warning: This model reads the widest slice of the world of any here, "
+            "and a SimLab dataset usually cannot supply it: 21 previous sessions of opening "
+            "volume, and daily bars for **17 other markets** (SPY, QQQ, XLK, IWM, GLD, USO, "
+            "SLV, DBC, UNG, TLT, HYG, UUP, VXX, VIX, VVIX, 10-year, DXY) which together are "
+            "110 of its 156 features. Record those symbols alongside the traded one, over a "
+            "long enough span, or the agent will name what is missing and stand down.\n\n"
+            ":material/science: And what the rule is worth: PriceRange2's own nested test "
+            "says it has no edge over holding — it wins when holding loses, which is reduced "
+            "exposure, and its chosen parameters decayed up to 90% out of sample. Sweeping "
+            "here is a re-test of a negative result, not a search for the good cell."
+        ),
     },
     help={
+        "entry_buffer": (
+            "How far above the 75th-percentile predicted low the buy rests. The sweep's "
+            "profitable region centres near 0.15%: a level the price merely touches is "
+            "one a resting order mostly misses, so a little edge buys participation. "
+            "Note the fill model differs from the notebook's — this ledger is market-order "
+            "only, so it buys near the close of the bar that touched the level rather than "
+            "at the level itself, which costs money in one direction only."
+        ),
+        "exit_buffer": (
+            "How far below the 25th-percentile predicted high the sell rests. Ships at 0: "
+            "the 25th percentile is already fill-friendly and the sweep found no "
+            "consistent gain from tightening it further."
+        ),
+        "range_stop_pct": (
+            "The one parameter here with a real interior optimum — the sweep puts it near "
+            "1%, tighter stops being caught by ordinary noise and wider ones taking losses "
+            "too large to pay for. It is checked *before* the sell target on a bar that "
+            "contains both levels, because a minute bar does not record the order events "
+            "happened in and assuming the good one is how a backtest invents money."
+        ),
+        "allow_reentry": (
+            "Off is the notebook's: one forecast, one position. On, the buy re-arms after "
+            "every completed round trip, which turns the rule into a bet on mean reversion "
+            "inside the range rather than on the range itself. That variant was never "
+            "validated, so it is a genuinely new experiment — and it signs as one."
+        ),
         "buy_k": (
             "The notebook's 0.75 was specified, not fitted, and its own sweep says "
             "why not to trust a peak: over five sessions the week total climbs "

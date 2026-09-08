@@ -547,7 +547,8 @@ def _chart_panel() -> None:
             else None
         )
         overlays = model_overlays.live_overlays(
-            sym_state, bars, state.model_overlay_keys, state.overlay_momentum_model
+            sym_state, bars, state.model_overlay_keys, state.overlay_momentum_model,
+            credentials=(state.api_key, state.api_secret, state.feed),
         )
 
         fig = build_chart(
@@ -1584,6 +1585,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     model_overlays=model_overlays.live_overlays(
                         sym_state, bars, state.model_overlay_keys,
                         state.overlay_momentum_model,
+                        credentials=(state.api_key, state.api_secret, state.feed),
                     )["items"],
                 ),
             )
@@ -1716,6 +1718,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "down — the tape picks the situation, the model picks the direction. Two risk "
             "exits sit underneath: a momentum floor and a fixed stop."
         ),
+        "pricerange": (
+            "At 09:35 the model forecasts **both edges** of the session against the price "
+            "trading right then. The orders do not rest at those edges, though: they rest "
+            "at the **75th-percentile low** and the **25th-percentile high** — levels the "
+            "day is about 75% likely to reach rather than the most likely ones. The "
+            "buffers below nudge each level a little further inward, and a stop sits under "
+            "whatever gets filled."
+        ),
     },
     outro={
         "dayrange": (
@@ -1730,8 +1740,44 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "had, the agent says so and stands down for the day rather than scoring on a "
             "threshold it invented."
         ),
+        "pricerange": (
+            ":material/warning: PriceRange2 measured this rule and found **no edge over simply "
+            "holding**: across three tickers it beats buy-and-hold precisely when buy-and-hold "
+            "does badly (correlation −0.78), which is reduced exposure rather than skill, and "
+            "the parameters it was tuned on decayed by up to 90% out of sample. The *forecast* "
+            "is the validated part. Treat this as something to re-test in SimLab.\n\n"
+            ":material/cloud_download: It also reads more of the world than any other model "
+            "here — a year of daily bars, 21 sessions of opening volume (which needs Alpaca "
+            "credentials) and daily bars for 17 other markets. If any of it cannot be had the "
+            "agent names what is missing and stands down for the day."
+        ),
     },
     help={
+        "entry_buffer": (
+            "Bid this far *above* the 75th-percentile predicted low. A level the price "
+            "merely touches is one an order mostly misses, so paying a little edge buys a "
+            "much better chance of being filled at all. PriceRange2's sweep found the "
+            "profitable region centred near 0.15%."
+        ),
+        "exit_buffer": (
+            "Offer this far *below* the 25th-percentile predicted high, for the same "
+            "reason. The shipped default is 0 — the 25th percentile is already a "
+            "fill-friendly level, and the sweep found no consistent gain from moving it."
+        ),
+        "range_stop_pct": (
+            "A fixed stop below the fill. This is the one parameter in the strategy with a "
+            "genuine interior optimum: the sweep found it near 1%, with tighter stops "
+            "caught by ordinary noise and wider ones taking losses too big to pay for. "
+            "Checked before the sell target on any bar that contains both, because a "
+            "minute bar does not record which came first."
+        ),
+        "allow_reentry": (
+            "Off by default, as in the notebook: the forecast is one claim about one day, "
+            "so the rule takes one position on it. On, the buy re-arms after each "
+            "completed round trip, which is a bet on mean reversion *within* the range "
+            "rather than on the range itself — a different strategy, and one that project "
+            "did not validate."
+        ),
         "buy_k": (
             "How far under the predicted high the entry rests. The notebook's 0.75 was "
             "specified rather than fitted. Sweeping it over five sessions: out to about "

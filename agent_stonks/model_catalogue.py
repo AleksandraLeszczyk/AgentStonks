@@ -1,6 +1,6 @@
 """Every trained model in this app, described from its own saved file.
 
-The five ML models here are each loaded by their own module, each for their own
+The six ML models here are each loaded by their own module, each for their own
 consumer -- `apple_models` feeds the traders, `profile_model` feeds the price
 profile, `model_overlays` feeds both charts. What none of them offer is an
 answer to "what is actually installed, fitted on what, and how well does it
@@ -22,6 +22,9 @@ model names would undo that if it had to instantiate them to do it. So:
   metrics, the settings and (for day-range) the whole feature list. Their
   `model_path` helpers live in modules that import torch at module scope, so
   the paths are mirrored here instead -- see `_saved_path`.
+* `pricerange` is read from its sidecar too, for a different reason: no torch,
+  but a 4.9 MB joblib of LightGBM boosters that nothing on this tab needs
+  unpickled to describe.
 * `open_profile` is a gzipped JSON pack, so its metadata is readable with the
   standard library alone even though scoring it needs LightGBM.
 
@@ -152,18 +155,24 @@ class ModelSpec:
 
 # --- reading the files ------------------------------------------------------
 
-def _saved_path(env_prefix: str, pattern: str, ticker: str) -> Path:
+def _saved_path(
+    env_prefix: str, pattern: str, ticker: str, lowercase: bool = False
+) -> Path:
     """Where one ticker's file lives, mirroring the model modules' own lookup.
 
     `<ENV>_<TICKER>` relocates one ticker's file; the bare `<ENV>` names a
-    single file and so can only answer for the default ticker. Pinned against
-    the real `model_path` functions by `tests/test_model_catalogue.py`.
+    single file and so can only answer for the default ticker. `lowercase`
+    mirrors `ModelStore.lowercase_file` -- PriceRange2 writes
+    `pricerange2_aapl.joblib` -- and applies to the *filename* only, never to
+    the environment key. Pinned against the real `model_path` functions by
+    `tests/test_model_catalogue.py`.
     """
     symbol = (ticker or apple_models.DEFAULT_TICKER).upper()
     override = os.environ.get(f"{env_prefix}_{symbol}")
     if not override and symbol == apple_models.DEFAULT_TICKER:
         override = os.environ.get(env_prefix)
-    return Path(override or MODEL_DIR / pattern.format(ticker=symbol))
+    stem = symbol.lower() if lowercase else symbol
+    return Path(override or MODEL_DIR / pattern.format(ticker=stem))
 
 
 def _read_json(path: Path) -> dict:
@@ -482,6 +491,122 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _pricerange_spec(ticker: str) -> ModelSpec:
+    """PriceRange2's two-edge forecast, read from its JSON sidecar.
+
+    Read from the sidecar rather than the bundle for the same reason the
+    torch models are: the joblib is 4.9 MB of LightGBM boosters and the tab
+    only wants the numbers beside it. Everything shown here -- the walk-forward
+    table, the feature count, the blocks that were measured and rejected -- is
+    written by `train_model.py`, so a retrain updates the tab with no edit here.
+    """
+    path = _saved_path(
+        "APPLE_PRICERANGE_MODEL", "pricerange2_{ticker}.joblib", ticker, lowercase=True
+    )
+    files = (
+        ModelFile("bundle", path),
+        ModelFile("metadata", path.with_suffix(".json")),
+    )
+    available, reason = _availability(files, "lightgbm", "sklearn", "joblib")
+    meta = _read_json(path.with_suffix(".json"))
+
+    scores = meta.get("walkforward_scores") or {}
+    walk = scores.get("walkforward") or {}
+    base = scores.get("rolling21") or {}
+    metrics: "dict[str, object]" = {}
+    if walk:
+        metrics.update(
+            {
+                "MAE range (log units)": walk.get("mae_range"),
+                "MAE range ($)": walk.get("mae_range_usd"),
+                "MAE high": walk.get("mae_high"),
+                "MAE low": walk.get("mae_low"),
+                "Spearman (range)": walk.get("spearman_range"),
+                "skill vs 21-day baseline": walk.get("skill_vs_baseline"),
+                "bias (range)": walk.get("bias_range"),
+                "walk-forward sessions": walk.get("n"),
+            }
+        )
+    if base:
+        metrics["baseline MAE range"] = base.get("mae_range")
+        metrics["baseline Spearman"] = base.get("spearman_range")
+
+    # The feature list is not in the sidecar -- only its length and the top 25
+    # by gain, which is the more useful thing to show anyway.
+    features = tuple((meta.get("top_features") or {}).keys())
+    blocks = ", ".join(meta.get("feature_blocks_used") or ())
+    rejected = meta.get("feature_blocks_rejected") or {}
+
+    model = apple_models.get(apple_models.PRICERANGE_KEY)
+    return ModelSpec(
+        key=apple_models.PRICERANGE_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note="",
+        project="PriceRange2, mirrors `pricerange`",
+        predicts=(
+            "Both **edges** of the session — where the high and the low will land — "
+            "called once at 09:35 and never updated. Measured against `ref`, the price "
+            "actually trading at 09:35, which is what a trader can deal at when the "
+            "decision is made and which already contains the overnight gap. The range "
+            "falls out as the difference, so predicting edges costs nothing and gives "
+            "a rule the levels it needs."
+        ),
+        target="log(day high / ref), log(day low / ref)  →  y_high, y_low",
+        algorithm=(
+            "One LightGBM per edge, L1 objective (400 trees, 15 leaves, lr 0.03), "
+            "clipped to contain the opening range; plus "
+            f"{len(meta.get('quantiles') or ())} quantile models per edge at "
+            f"{', '.join(str(q) for q in meta.get('quantiles') or ())}"
+        ),
+        family="LightGBM (L1) ×2 + quantiles",
+        consumers=(
+            "Apple Trader — price-range strategy",
+            "Chart overlay — predicted price range",
+        ),
+        features=features,
+        inputs=(
+            f"{meta.get('n_features', '?')} features in {len(meta.get('feature_blocks_used') or ())} "
+            f"blocks ({blocks}): ~252 sessions of daily bars, the first 5 minutes of "
+            "today, 21 sessions of opening volume, and daily bars for 17 other markets"
+        ),
+        metrics=metrics,
+        headline=(
+            "skill vs 21-day baseline",
+            (f"{walk['skill_vs_baseline']:.1%}"
+             if walk.get("skill_vs_baseline") is not None else "—"),
+        ),
+        files=files,
+        trained_at=str(meta.get("created") or ""),
+        data_note=(
+            f"Trained on {meta.get('n_train_sessions', '?')} sessions, "
+            f"{' → '.join(meta.get('train_span') or ['?', '?'])} · "
+            f"{meta.get('data_sources', {}).get('bars', 'Alpaca SIP 1-minute')} · "
+            f"held out from the week of PRICERANGE_TEST_WEEK_START · "
+            f"blocks measured and dropped: {', '.join(rejected) or 'none'}"
+            if meta
+            else ""
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            (meta.get("known_bias") or "")
+            + " The point forecast runs narrow, so both edge errors point the same way "
+            "and *add* on the range where a trailing baseline's happen to cancel — the "
+            "model can beat the baseline on each edge separately while losing on the "
+            "width. The quantile models are the intended fix and are what the trading "
+            "rule reads. Note also that PriceRange2's own verdict on that rule is that "
+            "it has no edge over buy-and-hold: corr(hold return, rule outperformance) "
+            "= −0.78 across three tickers. The forecast is the validated artefact; the "
+            "rule is a consumer of it."
+        ).strip(),
+    )
+
+
 def _momentum_change_spec(ticker: str) -> ModelSpec:
     path = momentum_change_model.model_path(ticker)
     files = (
@@ -653,6 +778,7 @@ _BUILDERS = {
     apple_models.NBEATS_KEY: _nbeats_spec,
     apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.MOMENTUM_CHANGE_KEY: _momentum_change_spec,
+    apple_models.PRICERANGE_KEY: _pricerange_spec,
 }
 
 

@@ -372,6 +372,109 @@ class TestDayRangeOverlay:
         assert "first 5 minutes" in result["notes"][0]
 
 
+class TestPriceRangeOverlay:
+    def stub_forecast(self, monkeypatch, *, high=210.0, low=198.0,
+                      buy=200.5, sell=207.5, raises=None):
+        import agent_stonks.pricerange_model as pr
+
+        monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: {"stub": True})
+        monkeypatch.setattr(pr, "opening_minutes", lambda bundle=None: 5)
+        monkeypatch.setattr(pr, "daily_frame_from_bars", lambda bars: pd.DataFrame())
+
+        def forecast(*a, **k):
+            if raises is not None:
+                raise ValueError(raises)
+            return {
+                "pred_high": high, "pred_low": low, "pred_range_pct": 0.06,
+                "ref": 204.0, "open_high": 205.0, "open_low": 203.0,
+                "buy_edge": buy, "sell_edge": sell,
+            }
+
+        monkeypatch.setattr(pr, "forecast_session", forecast)
+
+    def _items(self, monkeypatch, **kwargs):
+        pytest.importorskip("agent_stonks.pricerange_model")
+        self.stub_forecast(monkeypatch, **kwargs)
+        return mo.compute([mo.PRICE_RANGE_KEY], "AAPL", minute_bars(),
+                          daily_bars=[], session_date=SESSION)
+
+    def test_draws_the_point_forecast_and_the_two_traded_edges(self, monkeypatch):
+        """Five items: the band, its two edges, and the two quantile levels.
+
+        The quantiles are the point with a trading result behind them, so an
+        overlay that showed only the point forecast would be showing the half
+        PriceRange2 found never made money.
+        """
+        items = self._items(monkeypatch)["items"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {
+            "Pred. high": 210.0,
+            "Pred. low": 198.0,
+            "Sell edge (q25 high)": 207.5,
+            "Buy edge (q75 low)": 200.5,
+        }
+        band = next(i for i in items if i["kind"] == "span")
+        assert (band["y0"], band["y1"]) == (198.0, 210.0)
+
+    def test_the_traded_edges_sit_inside_the_point_forecast(self, monkeypatch):
+        """A q75 low is above the median low, a q25 high below the median high.
+
+        Not arithmetic this module does -- it comes out of the model -- but a
+        drawing that put them the other way round would misrepresent what the
+        rule does, so it is worth asserting on the shape that reaches the chart.
+        """
+        items = self._items(monkeypatch)["items"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels["Pred. low"] < levels["Buy edge (q75 low)"]
+        assert levels["Sell edge (q25 high)"] < levels["Pred. high"]
+
+    def test_the_quantile_levels_are_drawn_distinctly(self, monkeypatch):
+        """Same model, different quantile -- a lighter tone and a dotted line,
+        so they read as the same claim rather than a second forecast."""
+        items = self._items(monkeypatch)["items"]
+        by_label = {i["label"]: i for i in items if i["kind"] == "level"}
+        assert by_label["Pred. high"]["color"] != by_label["Sell edge (q25 high)"]["color"]
+        assert by_label["Sell edge (q25 high)"]["dash"] == "dot"
+        assert by_label["Pred. high"]["dash"] == "dash"
+
+    def test_a_bundle_without_quantiles_still_draws_the_forecast(self, monkeypatch):
+        items = self._items(monkeypatch, buy=None, sell=None)["items"]
+        labels = {i["label"] for i in items if i["kind"] == "level"}
+        assert labels == {"Pred. high", "Pred. low"}
+
+    def test_the_band_runs_from_the_forecast_to_the_closing_bell(self, monkeypatch):
+        band = next(i for i in self._items(monkeypatch)["items"] if i["kind"] == "span")
+        close = pd.Timestamp(band["x1"]).tz_convert("America/New_York")
+        start = pd.Timestamp(band["x0"]).tz_convert("America/New_York")
+        assert (close.hour, close.minute) == (16, 0)
+        assert (start.hour, start.minute) == (9, 34)
+
+    def test_a_missing_input_becomes_the_models_own_explanation(self, monkeypatch):
+        """`require_cross` names the series it could not get; that text is what
+        the user should see, not a generic 'overlay unavailable'."""
+        result = self._items(
+            monkeypatch, raises="4 of the 17 cross-asset series are missing (UNG, vix…)"
+        )
+        assert result["items"] == []
+        assert "cross-asset series are missing" in result["notes"][0]
+        assert "UNG" in result["notes"][0]
+
+    def test_a_symbol_the_model_was_not_fitted_on_is_refused(self, monkeypatch):
+        """GOOGL is the case that matters: PriceRange2 was run on GOOG."""
+        result = mo.compute([mo.PRICE_RANGE_KEY], "GOOGL", minute_bars(),
+                            daily_bars=[], session_date=SESSION)
+        assert result["items"] == []
+        assert "GOOGL" in result["notes"][0]
+
+    def test_bars_that_miss_the_open_refuse_rather_than_forecast(self, monkeypatch):
+        pytest.importorskip("agent_stonks.pricerange_model")
+        self.stub_forecast(monkeypatch)
+        result = mo.compute([mo.PRICE_RANGE_KEY], "AAPL", minute_bars()[30:],
+                            daily_bars=[], session_date=SESSION)
+        assert result["items"] == []
+        assert "09:30 open" in result["notes"][0]
+
+
 class TestLiveOverlays:
     def make_state(self, bars):
         return SimpleNamespace(

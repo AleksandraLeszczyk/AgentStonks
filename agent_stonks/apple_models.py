@@ -5,7 +5,7 @@ produced more than one answer. This module is where that choice lives, so the
 trader, the loop, SimLab and the UI ask for "the model named X" and never
 branch on which one they got.
 
-The four on offer
+The five on offer
 -----------------
 `persistence`  the incumbent: a gradient-boosted classifier trained on the
                momentum-persistence label directly (TimeToChange2 notebook 04).
@@ -32,6 +32,12 @@ The four on offer
                reliable half (right on 94% / 91% / 86% of the holdout week's
                changes on AAPL / GOOGL / INTC, against timing that is barely
                better than chance).
+`pricerange`   PriceRange2's answer to the same question `dayrange` asks, from
+               1,164 sessions instead of 21: LightGBM on each edge, measured
+               against the traded price at 09:35 rather than yesterday's
+               average, and shipping six quantile models beside the point
+               forecast. 14.8% / 16.8% / 9.4% of a 21-day trailing baseline's
+               error removed over 659 walk-forward sessions.
 
 The first two are graded against each other on the same 35 events, and the gap
 is real but small -- notebook 07 replayed one held-out session through both and
@@ -40,6 +46,16 @@ they made *identical* trades. So `nbeats` is a switch, not a promotion.
 `dayrange` and `momentum_change` are not on that scale at all and cannot be
 compared to them by number. Each answers a different question, on a different
 horizon, and each brings its own trading rules with it.
+
+`dayrange` and `pricerange` *do* ask the same question, and are still not
+comparable by number: they are measured on different spans against different
+baselines (129 sessions vs a 14-day rolling mean; 659 vs a 21-day one) and,
+more fundamentally, against different reference prices. Their published skill
+figures are answers to two different arithmetic questions and putting them side
+by side would invite a comparison neither project ran. What can be said is that
+PriceRange2 has fifty times the training data, because Alpaca's SIP feed serves
+minute bars back to 2016 where yfinance serves thirty days -- which is the
+constraint TimeToChange3's own README names as binding.
 
 Which symbols a model exists for
 --------------------------------
@@ -58,11 +74,20 @@ of the model rather than of the app:
                           *selects* per ticker off the same weekly bar archive,
                           and the selection genuinely differs: Ridge on AAPL,
                           RandomForest on GOOGL, HistGradientBoosting on INTC.
+    pricerange            AAPL, **GOOG** and INTC. Note the middle one:
+                          PriceRange2 was run on GOOG, the other three projects
+                          on GOOGL, and the two are separate share classes.
+                          They are kept separate here rather than aliased --
+                          scoring one with a model fitted on the other is
+                          exactly the kind of quiet substitution `covers`
+                          exists to prevent. The consequence is visible and
+                          intended: this model does not appear on a GOOGL run,
+                          and it is the only model that appears on a GOOG one.
 
-All four models now cover all three symbols. That is a recent state of affairs
-rather than a design invariant -- `keys_for` exists precisely because it was
-not true a month ago and need not stay true -- so nothing downstream may assume
-it.
+The first four models cover the same three symbols; `pricerange` covers a
+different three. That both facts are true today is a state of affairs rather
+than a design invariant -- `keys_for` exists precisely because it was not true
+a month ago and need not stay true -- so nothing downstream may assume it.
 
 Everything downstream reads `models_for(ticker)` instead of `MODELS`, which is
 what makes an instrument with no model at all a supported choice rather than a
@@ -116,6 +141,7 @@ from .config import APPLE_TRADER_MODEL
 STRATEGY_MOMENTUM = "momentum"
 STRATEGY_DAYRANGE = "dayrange"
 STRATEGY_MOMENTUM_CHANGE = "momentum_change"
+STRATEGY_PRICERANGE = "pricerange"
 
 # The symbol everything here defaults to: the one with the most models behind
 # it, and what a config or a stored record arriving without one means.
@@ -128,6 +154,9 @@ DEFAULT_TICKER = "AAPL"
 MOMENTUM_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 MOMENTUM_CHANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
+# GOOG, not GOOGL -- PriceRange2 was run on the C-class shares. Deliberately
+# not aliased to GOOGL; see the module docstring.
+PRICERANGE_TICKERS = (DEFAULT_TICKER, "GOOG", "INTC")
 
 
 @dataclass(frozen=True)
@@ -248,10 +277,35 @@ def _momentum_change_path(ticker: str = DEFAULT_TICKER) -> Path:
     return momentum_change_model.model_path(ticker)
 
 
+def _load_pricerange(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The PriceRange2 bundle for one ticker, or None.
+
+    Imported here rather than at module scope for the same reason the others
+    are. This one is LightGBM and joblib -- no PyTorch -- so it is the cheapest
+    of the four to load, but it still pulls in LightGBM's OpenMP runtime, which
+    is not something `import apple_models` should do to a process that only
+    wanted to list model names.
+    """
+    try:
+        from . import pricerange_model
+    except ImportError:
+        return None
+    return pricerange_model.load_bundle(ticker)
+
+
+def _pricerange_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import pricerange_model
+    except ImportError:
+        return Path(f"pricerange2_{(ticker or DEFAULT_TICKER).lower()}.joblib")
+    return pricerange_model.model_path(ticker)
+
+
 PERSISTENCE_KEY = "persistence"
 NBEATS_KEY = "nbeats"
 DAYRANGE_KEY = "dayrange"
 MOMENTUM_CHANGE_KEY = "momentum_change"
+PRICERANGE_KEY = "pricerange"
 
 MODELS: "dict[str, AppleModel]" = {
     PERSISTENCE_KEY: AppleModel(
@@ -325,6 +379,31 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=MOMENTUM_CHANGE_TICKERS,
         load=_load_momentum_change,
         path=_momentum_change_path,
+    ),
+    PRICERANGE_KEY: AppleModel(
+        key=PRICERANGE_KEY,
+        label="Price-range forecast (PriceRange2)",
+        summary=(
+            "Forecasts both edges of the session — where the high and the low will "
+            "land — at 09:35, measured against the price actually trading then. One "
+            "LightGBM per edge over 1,164 sessions of consolidated minute data, its "
+            "own daily history and 17 other markets, clipped to contain the opening "
+            "range. It removes 9–17% of a 21-day trailing baseline's error over 659 "
+            "walk-forward sessions. Six quantile models ship with it, and the rules "
+            "trade those rather than the point forecast: the median edges never made "
+            "money in any of 112 sweep cells, because price reaches the most likely "
+            "low only about half the time."
+        ),
+        requires=(
+            "LightGBM and joblib, Alpaca credentials for 21 sessions of opening "
+            "volume, and daily bars for 17 cross-asset series"
+        ),
+        strategy=STRATEGY_PRICERANGE,
+        # Not applicable: nothing here forecasts a momentum regime.
+        anticipates=False,
+        tickers=PRICERANGE_TICKERS,
+        load=_load_pricerange,
+        path=_pricerange_path,
     ),
 }
 

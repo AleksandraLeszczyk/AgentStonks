@@ -104,6 +104,8 @@ def params(symbols: "list[str] | None", copy: FormCopy) -> AppleTraderConfig:
         return dayrange_params(defaults, model_key, ticker, copy)
     if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
         return momentum_change_params(defaults, model_key, ticker, copy)
+    if model.strategy == apple_models.STRATEGY_PRICERANGE:
+        return pricerange_params(defaults, model_key, ticker, copy)
     return momentum_params(defaults, model, bundle, ticker, copy)
 
 
@@ -188,6 +190,60 @@ def dayrange_params(
         ticker=ticker,
         buy_k=float(buy_k),
         sell_k=float(sell_k),
+        position_pct=float(position_pct),
+    )
+
+
+def pricerange_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy
+) -> AppleTraderConfig:
+    """The price-range rules: two quantile levels, a stop, and a re-arm switch.
+
+    Note what is *not* here. The quantiles themselves (75th for the low, 25th
+    for the high) are not offered as a knob, because PriceRange2 did not find
+    them by sweeping: it found that the median edges lose money in every one of
+    112 cells on all three tickers, and that these two are what makes the rule
+    fill at all. Exposing them would invite retuning the one part of this
+    strategy that is actually established.
+    """
+    _caption(copy.intro.get("pricerange"))
+    col_a, col_b = st.columns(2)
+    entry_buffer = col_a.number_input(
+        "Entry buffer (% above predicted low)",
+        min_value=0.0, max_value=2.0, value=defaults.entry_buffer, step=0.05,
+        format="%.2f",
+        key=copy.key("entry_buffer"), help=copy.help.get("entry_buffer"),
+    )
+    exit_buffer = col_b.number_input(
+        "Exit buffer (% below predicted high)",
+        min_value=0.0, max_value=2.0, value=defaults.exit_buffer, step=0.05,
+        format="%.2f",
+        key=copy.key("exit_buffer"), help=copy.help.get("exit_buffer"),
+    )
+    range_stop_pct = col_a.number_input(
+        "Stop (% below entry)",
+        min_value=0.1, max_value=5.0, value=defaults.range_stop_pct, step=0.1,
+        format="%.2f",
+        key=copy.key("range_stop_pct"), help=copy.help.get("range_stop_pct"),
+    )
+    position_pct = col_b.number_input(
+        "Position size (% of cash)",
+        min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
+        key=copy.key("pricerange_size"),
+    )
+    allow_reentry = st.checkbox(
+        "Re-arm the buy after a completed trade",
+        value=defaults.allow_reentry,
+        key=copy.key("allow_reentry"), help=copy.help.get("allow_reentry"),
+    )
+    _caption(copy.outro.get("pricerange"))
+    return AppleTraderConfig(
+        model_key=model_key,
+        ticker=ticker,
+        entry_buffer=float(entry_buffer),
+        exit_buffer=float(exit_buffer),
+        range_stop_pct=float(range_stop_pct),
+        allow_reentry=bool(allow_reentry),
         position_pct=float(position_pct),
     )
 
