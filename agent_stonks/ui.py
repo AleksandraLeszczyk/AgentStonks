@@ -18,6 +18,7 @@ from . import (
     momentum_change_model,
     persistence_model,
 )
+from .model_catalogue_ui import model_catalogue_panel
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -2641,8 +2642,11 @@ def build_ui() -> None:
     state = _get_state()
     symbols = _effective_symbols(state, symbols_input)
 
-    tab_live, tab_news, tab_premarket, tab_historical, tab_analysis, tab_smart_money, tab_walls, tab_agent = st.tabs(
-        ["📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent"]
+    (
+        tab_live, tab_news, tab_premarket, tab_historical, tab_analysis,
+        tab_smart_money, tab_walls, tab_agent, tab_models,
+    ) = st.tabs(
+        ["📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent", "🧠 ML Models"]
     )
 
     with tab_live:
@@ -2741,3 +2745,6 @@ def build_ui() -> None:
 
     with tab_agent:
         _agent_panel(symbols, alpaca_key=api_key, alpaca_secret=api_secret, feed=feed)
+
+    with tab_models:
+        model_catalogue_panel()

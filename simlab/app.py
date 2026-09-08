@@ -51,6 +51,7 @@ from agent_stonks.charts import (
     session_rangebreaks,
 )
 from agent_stonks.config import PALETTE
+from agent_stonks.model_catalogue_ui import model_catalogue_panel
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ
 
@@ -2199,13 +2200,20 @@ def build_ui() -> None:
         "Replay the trading agents against stored historical sessions: same prompts, same "
         "tools, same execution path as live — hours of tape in minutes of simulation."
     )
-    tab_agents, tab_datasets, tab_sim, tab_summary, tab_results = st.tabs(
-        [":material/smart_toy: Agents", ":material/database: Datasets",
+    # ML Models sits beside Agents rather than near Results: it describes what
+    # an agent *is* before a run, not what one did afterwards.
+    (
+        tab_agents, tab_models, tab_datasets, tab_sim, tab_summary, tab_results,
+    ) = st.tabs(
+        [":material/smart_toy: Agents", ":material/neurology: ML Models",
+         ":material/database: Datasets",
          ":material/play_circle: Simulate", ":material/leaderboard: Summary",
          ":material/insights: Results"]
     )
     with tab_agents:
         render_agents_tab()
+    with tab_models:
+        model_catalogue_panel()
     with tab_datasets:
         render_datasets_tab()
     with tab_sim:
