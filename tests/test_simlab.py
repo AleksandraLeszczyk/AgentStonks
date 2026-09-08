@@ -2126,16 +2126,138 @@ class TestRuleCombinations:
         assert sim_app._rule_combinations(self.setups(AppleTraderConfig()), []) == ([], {})
 
 
-class TestRuleSetupTickerCheck:
-    """A setup whose symbol a dataset does not carry cannot trade at all."""
+class TestExperimentSymbols:
+    """What each queued experiment is handed, which is now per combination.
 
-    def scope(self, **symbols_by_name):
-        return {name: {"symbols": syms} for name, syms in symbols_by_name.items()}
+    The whole point of the change: a rule run loads its own symbol's bars and
+    no others, so the symbol boxes stop being a step that can only be got
+    wrong, while the LLM basket -- which really is a configuration -- stays a
+    choice.
+    """
+
+    def test_a_rule_agent_gets_only_its_own_instrument(self):
+        assert sim_app._experiment_symbols(
+            APPLE_TRADER_KEY,
+            AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
+            ["AAPL", "GOOGL", "SPY"],
+        ) == ["GOOGL"]
+
+    def test_the_basket_does_not_have_to_contain_it(self):
+        """A rule run is no longer gated by the selection, so an instrument
+        absent from the basket is still queued -- whether the *dataset* carries
+        it is what `_rule_agents_missing_ticker` answers."""
+        assert sim_app._experiment_symbols(
+            APPLE_TRADER_KEY,
+            AppleTraderConfig(model_key="dayrange", ticker="INTC"),
+            ["AAPL"],
+        ) == ["INTC"]
+
+    def test_apple_trader_2_gets_its_own_instrument_too(self):
+        assert sim_app._experiment_symbols(
+            APPLE_TRADER2_KEY, AppleTrader2Config(ticker="SPY"), ["AAPL", "SPY"]
+        ) == ["SPY"]
+
+    def test_an_llm_agent_gets_the_whole_basket(self):
+        assert sim_app._experiment_symbols(
+            "momentum", None, ["AAPL", "GOOGL"]
+        ) == ["AAPL", "GOOGL"]
+
+    def test_the_basket_is_copied_not_aliased(self):
+        """Every combination is submitted from one scope dict; a shared list
+        would let one experiment record mutate another's."""
+        basket = ["AAPL"]
+        out = sim_app._experiment_symbols("momentum", None, basket)
+        assert out == basket and out is not basket
+
+
+class TestConfiguredRuleTickers:
+    """Which instruments the Simulate tab will actually trade.
+
+    The dataset scope is drawn above the agent setups but derives its symbols
+    from them, so the answer is read out of the widgets' stored state rather
+    than from the rendered setups. These pin that reading -- including the case
+    that makes it safe, which is a slot whose instrument widget has not been
+    drawn yet reporting exactly the value that widget will come up with.
+    """
+
+    @pytest.fixture(autouse=True)
+    def session(self, monkeypatch):
+        state: dict = {}
+        monkeypatch.setattr(sim_app.st, "session_state", state)
+        return state
+
+    def test_an_unrendered_setup_reports_the_agent_default(self, session):
+        tickers = sim_app._configured_rule_tickers([APPLE_TRADER_KEY])
+        assert tickers == {
+            APPLE_TRADER_KEY: [RULE_AGENTS[APPLE_TRADER_KEY].default_ticker]
+        }
+
+    def test_a_stored_instrument_wins_over_the_default(self, session):
+        slot = sim_app._rule_slots(APPLE_TRADER_KEY)[0]
+        session[f"sim_rule_{APPLE_TRADER_KEY}_{slot}_ticker"] = "GOOGL"
+        assert sim_app._configured_rule_tickers([APPLE_TRADER_KEY]) == {
+            APPLE_TRADER_KEY: ["GOOGL"]
+        }
+
+    def test_every_slot_contributes_its_own_instrument(self, session):
+        sim_app._add_rule_slot(APPLE_TRADER_KEY)
+        first, second = sim_app._rule_slots(APPLE_TRADER_KEY)
+        session[f"sim_rule_{APPLE_TRADER_KEY}_{first}_ticker"] = "AAPL"
+        session[f"sim_rule_{APPLE_TRADER_KEY}_{second}_ticker"] = "INTC"
+        assert sim_app._configured_rule_tickers([APPLE_TRADER_KEY]) == {
+            APPLE_TRADER_KEY: ["AAPL", "INTC"]
+        }
+
+    def test_two_slots_on_one_instrument_report_it_once(self, session):
+        sim_app._add_rule_slot(APPLE_TRADER_KEY)
+        for slot in sim_app._rule_slots(APPLE_TRADER_KEY):
+            session[f"sim_rule_{APPLE_TRADER_KEY}_{slot}_ticker"] = "AAPL"
+        assert sim_app._configured_rule_tickers([APPLE_TRADER_KEY]) == {
+            APPLE_TRADER_KEY: ["AAPL"]
+        }
+
+    def test_a_free_text_instrument_is_normalised(self, session):
+        """Apple Trader 2's box accepts anything typed into it, so what comes
+        back has to be squared with the dataset's own spelling."""
+        slot = sim_app._rule_slots(APPLE_TRADER2_KEY)[0]
+        session[f"sim_rule_{APPLE_TRADER2_KEY}_{slot}_ticker"] = "  spy "
+        assert sim_app._configured_rule_tickers([APPLE_TRADER2_KEY]) == {
+            APPLE_TRADER2_KEY: ["SPY"]
+        }
+
+    def test_an_llm_agent_contributes_nothing(self, session):
+        """It has no instrument of its own -- it trades the basket it is
+        handed, which is the one thing on that row still worth choosing."""
+        assert sim_app._configured_rule_tickers(["momentum"]) == {}
+
+    def test_both_rule_agents_are_reported_separately(self, session):
+        apple = sim_app._rule_slots(APPLE_TRADER_KEY)[0]
+        apple2 = sim_app._rule_slots(APPLE_TRADER2_KEY)[0]
+        session[f"sim_rule_{APPLE_TRADER_KEY}_{apple}_ticker"] = "AAPL"
+        session[f"sim_rule_{APPLE_TRADER2_KEY}_{apple2}_ticker"] = "GOOGL"
+        assert sim_app._configured_rule_tickers(
+            [APPLE_TRADER_KEY, APPLE_TRADER2_KEY]
+        ) == {APPLE_TRADER_KEY: ["AAPL"], APPLE_TRADER2_KEY: ["GOOGL"]}
+
+
+class TestRuleSetupTickerCheck:
+    """A setup whose symbol a dataset does not carry cannot trade at all.
+
+    Checked against the *dataset*, not against what is ticked on the page:
+    since a rule run is queued with its own symbol whichever boxes are
+    selected, the only thing that can defeat it is the bars not being there.
+    """
+
+    def datasets(self, **symbols_by_name):
+        return {
+            name: SimpleNamespace(name=name, symbols=syms)
+            for name, syms in symbols_by_name.items()
+        }
 
     def test_a_setup_the_dataset_covers_is_not_reported(self):
         missing = sim_app._rule_agents_missing_ticker(
             {APPLE_TRADER_KEY: [AppleTraderConfig(ticker="AAPL")]},
-            self.scope(ds1=["AAPL", "SPY"]), ["ds1"],
+            self.datasets(ds1=["AAPL", "SPY"]), ["ds1"],
         )
         assert missing == []
 
@@ -2145,7 +2267,7 @@ class TestRuleSetupTickerCheck:
                 AppleTraderConfig(model_key="dayrange", ticker="AAPL"),
                 AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
             ]},
-            self.scope(ds1=["AAPL"]), ["ds1"],
+            self.datasets(ds1=["AAPL"]), ["ds1"],
         )
         assert missing == [(APPLE_TRADER_KEY, "GOOGL", ["ds1"])]
 
@@ -2155,13 +2277,13 @@ class TestRuleSetupTickerCheck:
                 AppleTraderConfig(ticker="AAPL", trail_pct=0.35),
                 AppleTraderConfig(ticker="AAPL", trail_pct=0.50),
             ]},
-            self.scope(ds1=["SPY"]), ["ds1"],
+            self.datasets(ds1=["SPY"]), ["ds1"],
         )
         assert missing == [(APPLE_TRADER_KEY, "AAPL", ["ds1"])]
 
     def test_every_dataset_missing_the_symbol_is_named(self):
         missing = sim_app._rule_agents_missing_ticker(
             {APPLE_TRADER_KEY: [AppleTraderConfig(ticker="AAPL")]},
-            self.scope(ds1=["SPY"], ds2=["AAPL"], ds3=[]), ["ds1", "ds2", "ds3"],
+            self.datasets(ds1=["SPY"], ds2=["AAPL"], ds3=[]), ["ds1", "ds2", "ds3"],
         )
         assert missing == [(APPLE_TRADER_KEY, "AAPL", ["ds1", "ds3"])]

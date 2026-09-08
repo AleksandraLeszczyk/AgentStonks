@@ -1140,24 +1140,103 @@ def _render_already_tested(
     return tested
 
 
-def _render_dataset_scope(datasets: list) -> dict[str, dict]:
+def _configured_rule_tickers(personalities: list[str]) -> dict[str, list[str]]:
+    """The symbol each selected rule agent's setups currently trade.
+
+    Read out of `st.session_state` rather than from the rendered setups,
+    because the dataset scope is drawn *above* them and needs the answer first.
+    That is safe here in a way it would not be in a plain script: Streamlit
+    reruns the whole page on every widget change, and a widget's stored value
+    is already the new one by the time the rerun starts -- so this is the
+    current selection, not the previous one. `_render_agent_setups` leans on
+    the same property for the signature it shows on a collapsed setup.
+
+    A slot whose instrument widget has never rendered has no stored value; the
+    agent's `default_ticker` is what that widget will come up with, so it is
+    what this reports.
+    """
+    tickers: dict[str, list[str]] = {}
+    for personality in personalities:
+        agent = RULE_AGENTS.get(personality)
+        if agent is None:
+            continue
+        found = []
+        for slot in _rule_slots(personality):
+            stored = st.session_state.get(f"sim_rule_{personality}_{slot}_ticker")
+            symbol = str(stored or agent.default_ticker).strip().upper()
+            if symbol and symbol not in found:
+                found.append(symbol)
+        tickers[personality] = found
+    return tickers
+
+
+def _render_dataset_scope(
+    datasets: list, rule_tickers: dict[str, list[str]], has_llm: bool
+) -> dict[str, dict]:
     """Per-dataset trading days and symbols -- each selected dataset carries its
-    own, since days and symbols differ from dataset to dataset."""
+    own, since days and symbols differ from dataset to dataset.
+
+    The symbols are chosen for the user rather than by them, because which
+    instruments a batch trades is already decided elsewhere on this page:
+
+    * a **rule agent** names its own instrument in its setup and is
+      single-symbol by design, so its runs are queued with exactly that symbol
+      and there is nothing here to pick. Ticking a symbol never made one of
+      those runs trade it, and forgetting to tick the right one made the run
+      fail in the engine -- which is the manual step this replaces.
+    * an **LLM agent** is handed the whole basket and decides for itself, so
+      *which* basket is a real experimental choice and stays editable. It
+      defaults to everything the dataset carries.
+
+    With no LLM agent selected the multiselect disappears and the derived
+    symbols are shown instead, so the page still says what will be traded.
+    """
+    traded = sorted({t for tickers in rule_tickers.values() for t in tickers})
     scope: dict[str, dict] = {}
     for ds in datasets:
         with st.container(border=True):
             st.markdown(f"**{ds.name}** — {ds.start} → {ds.end} · tape `{ds.feed}`")
             col_days, col_symbols = st.columns(2)
             day_options = ds.days or []
-            scope[ds.name] = {
-                "days": col_days.multiselect(
-                    "Trading day(s)", day_options, default=day_options[:1],
-                    key=f"sim_days_{ds.name}",
-                ),
-                "symbols": col_symbols.multiselect(
-                    "Symbols", ds.symbols, default=ds.symbols, key=f"sim_syms_{ds.name}",
-                ),
-            }
+            days = col_days.multiselect(
+                "Trading day(s)", day_options, default=day_options[:1],
+                key=f"sim_days_{ds.name}",
+            )
+            if has_llm:
+                symbols = col_symbols.multiselect(
+                    "Symbols (LLM basket)", ds.symbols, default=ds.symbols,
+                    key=f"sim_syms_{ds.name}",
+                    help="The basket handed to the LLM agents, which trade across all "
+                         "of it. Rule agents ignore this — each is queued with the one "
+                         "symbol its setup names.",
+                )
+            else:
+                # Nothing reads a basket here, so there is no widget to get
+                # wrong. What the rule setups name is the whole answer.
+                symbols = [s for s in ds.symbols if s in traded]
+                with col_symbols:
+                    st.markdown("**Symbols**")
+                    if symbols:
+                        st.markdown(
+                            " ".join(f"`{s}`" for s in symbols)
+                            + f"<span style='color:{PALETTE['muted']}'> — selected "
+                            "automatically from the agent setups below.</span>",
+                            unsafe_allow_html=True,
+                        )
+                    elif not traded:
+                        # No agent picked yet. Saying the setups are wrong
+                        # would be describing a mistake nobody has made.
+                        st.caption(
+                            ":material/info: Chosen from the agent setups below — "
+                            "pick an agent to fill this in."
+                        )
+                    else:
+                        st.caption(
+                            ":material/warning: This dataset carries "
+                            f"{', '.join(ds.symbols) or 'nothing'}, none of which "
+                            f"the selected setups trade ({', '.join(traded)})."
+                        )
+            scope[ds.name] = {"days": days, "symbols": symbols}
     return scope
 
 
@@ -1221,8 +1300,36 @@ def _rule_combinations(
     return combos, by_combo
 
 
+def _experiment_symbols(
+    personality: str, rule_settings, basket: list[str]
+) -> list[str]:
+    """The symbols one queued experiment actually needs.
+
+    A rule agent is single-symbol by design -- its setup names the instrument
+    and the engine refuses to build it against any other -- so the run needs
+    that symbol and nothing else. Handing it the rest of the basket loaded bars
+    no rule would ever read, and made the symbol boxes a manual step whose only
+    possible outcomes were "the same run" and "a run that fails in the engine".
+
+    An LLM agent is the opposite: it is told what it is holding and picks
+    across it, so the basket *is* the configuration and stays the user's.
+
+    One consequence beyond the tab, worth knowing before comparing numbers:
+    `results.summarize_run` takes the oracle ceiling as the *best* round trip
+    over every symbol in the market, so a rule run against a seven-symbol
+    basket was divided by whichever of the seven moved most -- a ceiling it
+    could not have reached, since it only ever traded one of them. Its
+    `profit_efficiency` is now measured against its own instrument, which is
+    the honest denominator and **not comparable with rule runs stored before
+    this change**. Nothing rewrites those records; they are what they were.
+    """
+    if personality in RULE_AGENTS:
+        return [rule_agent(personality).ticker(rule_settings)]
+    return list(basket)
+
+
 def _rule_agents_missing_ticker(
-    rule_setups: dict, dataset_scope: dict, selected_names: list[str]
+    rule_setups: dict, datasets_by_name: dict, selected_names: list[str]
 ) -> list[tuple[str, str, list[str]]]:
     """(agent, symbol, datasets that do not carry it) for every setup that
     cannot be replayed.
@@ -1232,6 +1339,11 @@ def _rule_agents_missing_ticker(
     Grouped by *symbol* rather than by agent, because one agent can now be
     queued several times over different instruments and only some of them may
     be missing.
+
+    Checked against what a dataset **carries**, not against what is ticked on
+    the page. A rule run is queued with its own symbol whatever the basket
+    selection says, so the only thing that can defeat it is the dataset not
+    holding those bars -- and that is a download to redo, not a box to tick.
     """
     missing: list[tuple[str, str, list[str]]] = []
     for personality, configs in rule_setups.items():
@@ -1239,7 +1351,7 @@ def _rule_agents_missing_ticker(
         for ticker in dict.fromkeys(agent.ticker(config) for config in configs):
             names = [
                 name for name in selected_names
-                if ticker not in (dataset_scope[name]["symbols"] or [])
+                if ticker not in (datasets_by_name[name].symbols or [])
             ]
             if names:
                 missing.append((personality, ticker, names))
@@ -1717,7 +1829,20 @@ def render_simulate_tab() -> None:
         "Datasets", names, default=names[:1], key="sim_datasets"
     )
     by_name = {d.name: d for d in datasets}
-    dataset_scope = _render_dataset_scope([by_name[name] for name in selected_names])
+    # The agent selection is read before it is drawn: the dataset scope below
+    # derives its symbols from what the agents trade, and it is rendered first.
+    # Streamlit hands a widget's stored value back already updated at the top of
+    # the rerun a change causes, so this is the current selection.
+    chosen = st.session_state.get("sim_agents")
+    prior = list(chosen) if chosen is not None else _testable_agents()[:1]
+    rule_tickers = _configured_rule_tickers(
+        [p for p in prior if not sim_prompts.has_prompt(p)]
+    )
+    dataset_scope = _render_dataset_scope(
+        [by_name[name] for name in selected_names],
+        rule_tickers,
+        has_llm=any(sim_prompts.has_prompt(p) for p in prior),
+    )
     personalities = st.multiselect(
         "Agents", _testable_agents(),
         default=_testable_agents()[:1],
@@ -1726,14 +1851,12 @@ def render_simulate_tab() -> None:
     )
     llm_personalities = [p for p in personalities if sim_prompts.has_prompt(p)]
     rule_personalities = [p for p in personalities if not sim_prompts.has_prompt(p)]
-    # Every symbol the selected datasets carry: what an agent that picks its own
-    # instrument can actually be replayed on.
+    # Every symbol the selected datasets *carry*, not what is ticked: this only
+    # annotates the instrument pickers, and a rule agent's own symbol is no
+    # longer gated by a tick, so narrowing it to the selection would mark
+    # perfectly replayable instruments as unavailable.
     dataset_symbols = sorted(
-        {
-            symbol
-            for name in selected_names
-            for symbol in (dataset_scope[name]["symbols"] or [])
-        }
+        {symbol for name in selected_names for symbol in (by_name[name].symbols or [])}
     )
     rule_setups = _render_rule_params(rule_personalities, dataset_symbols)
     # The model picker only sizes the LLM grid: a rule agent runs the same
@@ -1804,12 +1927,12 @@ def render_simulate_tab() -> None:
     if overridden:
         labels = ", ".join(_agent_label(p) for p in overridden)
         st.caption(f":material/edit: Runs with a **modified** prompt (Agents tab): {labels}.")
-    missing_ticker = _rule_agents_missing_ticker(rule_setups, dataset_scope,
-                                                 selected_names)
+    missing_ticker = _rule_agents_missing_ticker(rule_setups, by_name, selected_names)
     for personality, ticker, names_missing in missing_ticker:
         st.error(
             f":material/error: {_agent_label(personality)} has a setup trading "
-            f"{ticker}, which is not selected for: {', '.join(names_missing)}."
+            f"{ticker}, which is not in: {', '.join(names_missing)}. Download that "
+            "symbol into the dataset, or point the setup at another instrument."
         )
     st.caption(
         ":material/monitoring: Langfuse export: "
@@ -1848,21 +1971,31 @@ def render_simulate_tab() -> None:
             st.caption("Pick at least one dataset, agent, and model.")
 
     if run:
+        # Symbols only have to be non-empty where something reads them: an LLM
+        # run is handed the basket, a rule run brings its own symbol and
+        # `missing_ticker` above is what catches a dataset that cannot serve it.
         empty = [
             name for name in selected_names
-            if not dataset_scope[name]["days"] or not dataset_scope[name]["symbols"]
+            if not dataset_scope[name]["days"]
+            or (llm_personalities and not dataset_scope[name]["symbols"])
         ]
         missing_keys = sorted({provider for provider, _ in model_choices
                                if not api_keys.get(provider)})
         if empty:
             st.error(
-                "Pick at least one trading day and one symbol for: " + ", ".join(empty)
+                (
+                    "Pick at least one trading day and one symbol for: "
+                    if llm_personalities
+                    else "Pick at least one trading day for: "
+                )
+                + ", ".join(empty)
             )
         elif missing_ticker:
             personality, ticker, names_missing = missing_ticker[0]
             st.error(
-                f"Add {ticker} to the symbols of {', '.join(names_missing)}, or "
-                f"change the {_agent_label(personality)} setup that trades it."
+                f"{', '.join(names_missing)} does not carry {ticker}. Download it "
+                f"into the dataset, or change the {_agent_label(personality)} setup "
+                "that trades it."
             )
         elif missing_keys:
             st.error(f"An API key is required for: {', '.join(missing_keys)}.")
@@ -1872,12 +2005,18 @@ def render_simulate_tab() -> None:
             for personality, provider, model, name in to_queue:
                 scope = dataset_scope[name]
                 rule_based = personality in rule_personalities
+                rule_settings = (
+                    rule_by_combo[(personality, provider, model, name)]
+                    if rule_based else None
+                )
                 sim_experiments.submit(name, {
                     "personality": personality,
                     "provider": provider,
                     "model": model,
                     "api_key": "" if rule_based else api_keys[provider],
-                    "symbols": scope["symbols"],
+                    "symbols": _experiment_symbols(
+                        personality, rule_settings, scope["symbols"]
+                    ),
                     "days": scope["days"],
                     "starting_cash": float(starting_cash),
                     "cycle_minutes": int(cycle_minutes),
@@ -1885,9 +2024,7 @@ def render_simulate_tab() -> None:
                     "feed": by_name[name].feed,
                     "system_prompt_override": sim_prompts.get_override(personality),
                     "rule_config": (
-                        rule_agent(personality).to_record(
-                            rule_by_combo[(personality, provider, model, name)]
-                        )
+                        rule_agent(personality).to_record(rule_settings)
                         if rule_based else None
                     ),
                     # A rule agent is never judged: no reasoning of its own to
