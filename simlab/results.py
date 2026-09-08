@@ -259,6 +259,63 @@ def filter_runs(
     ]
 
 
+# What fired a decision, in two or three words, keyed on how the trader that
+# wrote the reason opens its sentence.
+#
+# The traders already explain themselves in prose -- "Trailing stop: $89.46 is
+# -0.52% off the $89.93 high..." is a complete answer -- and this only adds the
+# headline, so a chart hover says *which kind* of thing fired before the reader
+# has parsed the sentence. Every opening below is a literal from
+# `apple_trader`, `apple_trader2` or the LLM agent's tactic executor.
+#
+# Order matters: the first marker that matches wins, so more specific openings
+# come before the prefixes they extend. Anything unrecognised falls back to no
+# tag at all -- the reason itself is always shown, so a trader whose wording
+# changes loses the headline and never gains a wrong one.
+_DECISION_TRIGGERS: "tuple[tuple[str, str], ...]" = (
+    # --- Apple Trader, momentum strategy (TimeToChange2) ---
+    ("trailing stop:", "Trailing stop"),
+    ("forecast reversal:", "ML forecast — reversal"),
+    ("momentum regime is still", "ML forecast — anticipated turn"),
+    ("momentum regime turned", "ML probability — change holds"),
+    # --- Apple Trader, day-range strategy (TimeToChange3) ---
+    ("the bar traded down to", "Predicted-range buy level"),
+    ("target:", "Predicted-range sell level"),
+    # --- Apple Trader, delta-momentum strategy (TimeToChange) ---
+    ("stop:", "Stop loss"),
+    ("momentum floor:", "Momentum floor"),
+    ("model exit:", "ML forecast — move over"),
+    ("the model puts the next 15 bars at", "ML forecast — turn upwards"),
+    # --- shared by all three: the closing bell, not a signal ---
+    ("session ends in", "Flattened at the close"),
+    # --- Apple Trader 2: the rule set says which rule, and its label says why ---
+    ("rule ", "Rule fired"),
+    # --- the LLM agents, whose fills come from tactics they armed earlier ---
+    ("tactics triggered", "Armed tactic"),
+)
+
+
+def decision_trigger(decision: dict) -> str:
+    """What fired this decision, in two or three words, or "" if unrecognised.
+
+    Derived from the reason the trader wrote rather than from a stored field,
+    which is a deliberate trade-off: it works on every run already in the
+    store, and the cost is that a reworded trader silently loses its headline.
+    That is the right way round for this to fail -- the reason itself is always
+    displayed, so an unmatched decision is less scannable, never mislabelled.
+
+    A structured trigger recorded at decision time would be sturdier and is the
+    thing to add if these tags ever carry more weight than a hover label.
+    """
+    reason = str(decision.get("reasoning") or "").strip().lower()
+    if not reason:
+        return ""
+    for marker, tag in _DECISION_TRIGGERS:
+        if reason.startswith(marker) or marker in reason:
+            return tag
+    return ""
+
+
 def ml_model_key(record: dict) -> str:
     """Which saved ML model a stored run's decisions came out of.
 

@@ -1754,6 +1754,180 @@ class TestInstrumentBreakdown:
         assert "instrument" in sim_app._BREAKDOWN_DIMENSIONS.values()
 
 
+class TestDecisionTrigger:
+    """What fired a fill, named in two or three words.
+
+    The strings below are copied verbatim from `apple_trader`,
+    `apple_trader2` and the tactic executor -- the whole classifier is a bet on
+    those openings, so the test has to be a sample of the real thing rather
+    than a paraphrase. If a trader is reworded, this fails and the tag is
+    updated; the failure mode in the app meanwhile is a missing headline, never
+    a wrong one.
+    """
+
+    def _reason(self, text):
+        return {"action": "sell", "reasoning": text}
+
+    def test_a_trailing_stop_is_named(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Trailing stop: $89.46 is -0.52% off the $89.93 high since the $89.77 "
+            "entry, past the 0.50% give-back. Selling at market (-0.34%)."
+        )) == "Trailing stop"
+
+    def test_a_hard_stop_is_named(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Stop: $88.10 is below the $88.50 floor 0.50% under the $88.94 entry. "
+            "Selling at market (-0.94%)."
+        )) == "Stop loss"
+
+    def test_the_two_stops_are_not_confused(self):
+        """They are different exits -- one gives back from a peak, the other
+        breaks a floor under the entry -- and 'Stop:' is a prefix of neither."""
+        trailing = sim_results.decision_trigger(self._reason("Trailing stop: ..."))
+        hard = sim_results.decision_trigger(self._reason("Stop: ..."))
+        assert trailing != hard
+
+    def test_a_model_entry_is_named_as_a_forecast(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Momentum regime is still balanced on this bar (momentum +0.73, and it "
+            "has held 20 bars), but the forecast puts it at 9% (>= 5%) to turn "
+            "positive on the next bar and stay there."
+        )) == "ML forecast — anticipated turn"
+
+    def test_a_persistence_entry_is_named_as_a_probability(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Momentum regime turned balanced -> positive on this bar (momentum +1.11, "
+            "the old regime had held 6 bars), and the persistence model puts it at "
+            "24% (>= 22%) to hold."
+        )) == "ML probability — change holds"
+
+    def test_a_forecast_reversal_exit_is_named(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Forecast reversal: the momentum regime is still positive (momentum "
+            "+0.42, 6 bars in), but the model puts it at 41% (>= 30%) to flip "
+            "negative inside the forecast horizon."
+        )) == "ML forecast — reversal"
+
+    def test_the_day_range_levels_are_named_apart(self):
+        buy = sim_results.decision_trigger(self._reason(
+            "The bar traded down to $341.16, at or through the $341.42 buy level — "
+            "0.75 average daily ranges ($6.34 each) below the $346.17 high."
+        ))
+        sell = sim_results.decision_trigger(self._reason(
+            "Target: the bar traded up to $88.83, at or through the $88.63 sell "
+            "level (H − 0.15 × ADR). Selling at market (+2.90%)."
+        ))
+        assert buy == "Predicted-range buy level"
+        assert sell == "Predicted-range sell level"
+
+    def test_the_delta_momentum_exits_are_named(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Momentum floor: the score is -1.20 bps/min, below -2 × θ (-0.90)."
+        )) == "Momentum floor"
+        assert sim_results.decision_trigger(self._reason(
+            "Model exit: the regime is positive and the model puts the next 15 bars "
+            "at -0.44 bps/min, at or past the -0.3 sell threshold."
+        )) == "ML forecast — move over"
+
+    def test_the_closing_bell_is_not_a_signal(self):
+        """Worth its own tag: a flatten at the close says nothing about the
+        strategy, and reading it as an exit signal would misjudge the run."""
+        assert sim_results.decision_trigger(self._reason(
+            "Session ends in 5 min. Momentum, regimes and every model feature are "
+            "intraday, so the position is flattened rather than carried overnight."
+        )) == "Flattened at the close"
+
+    def test_a_rule_agent_fill_is_named(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Rule 2 — Buy the dip below the predicted high, while flat: buy 50% of "
+            "cash when pos.shares <= 0 (0 now) and dayrange.pred_high_dip_adr >= "
+            "-0.75 (0.528 now)."
+        )) == "Rule fired"
+
+    def test_an_llm_tactic_fill_is_named(self):
+        assert sim_results.decision_trigger(self._reason(
+            "Tactics triggered (last_price below 304.4569 held 60s): Reassess "
+            "sustained lower 2σ stretch."
+        )) == "Armed tactic"
+
+    def test_an_unrecognised_reason_gets_no_tag(self):
+        """The safe failure: a reworded trader loses its headline and keeps its
+        prose. A wrong tag would be worse than none."""
+        assert sim_results.decision_trigger(self._reason(
+            "Exit the full position now. Trajectory overrides the volume levels."
+        )) == ""
+
+    def test_a_decision_without_a_reason_gets_no_tag(self):
+        assert sim_results.decision_trigger({"action": "buy"}) == ""
+        assert sim_results.decision_trigger({}) == ""
+
+
+class TestDecisionHover:
+    """The marker tooltip. What was traded, and the condition that fired."""
+
+    def _fill(self, **over):
+        return {
+            "ts": "2026-08-31T18:14:00+00:00", "symbol": "INTC", "action": "buy",
+            "filled_quantity": 556.9882, "price": 89.76850128173828,
+            "status": "filled",
+            "reasoning": "Trailing stop: $89.46 is -0.52% off the $89.93 high.",
+            **over,
+        }
+
+    def test_it_leads_with_the_trade(self):
+        card = sim_app._decision_hover(self._fill())
+        assert "<b>BUY</b>" in card
+        assert "$89.77" in card
+        assert "2026-08-31 18:14" in card
+
+    def test_fractional_shares_keep_their_precision(self):
+        """The fraction is what the position-sizing rule chose, not noise."""
+        assert "556.9882 sh" in sim_app._decision_hover(self._fill())
+        assert "3.2849 sh" in sim_app._decision_hover(
+            self._fill(filled_quantity=3.2848810798042805)
+        )
+
+    def test_a_whole_share_count_is_not_padded(self):
+        assert "10 sh" in sim_app._decision_hover(self._fill(filled_quantity=10.0))
+
+    def test_it_carries_the_trigger_and_the_reason(self):
+        card = sim_app._decision_hover(self._fill())
+        assert "Trailing stop" in card
+        assert "-0.52% off the $89.93 high" in card.replace("<br>", " ")
+
+    def test_the_reason_is_wrapped(self):
+        """Plotly sizes a hover label to its longest line, so an unwrapped
+        400-character reason is a tooltip wider than the chart."""
+        card = sim_app._decision_hover(self._fill(reasoning="word " * 200))
+        assert all(
+            len(line) <= sim_app._HOVER_WIDTH + 10 for line in card.split("<br>")
+        )
+
+    def test_a_very_long_reason_is_capped(self):
+        """An LLM can justify a fill at length, and a tooltip taller than the
+        plot covers the tape it is explaining."""
+        card = sim_app._decision_hover(self._fill(reasoning="word " * 500))
+        assert card.count("<br>") <= sim_app._HOVER_MAX_LINES + 4
+        assert "Decisions below" in card
+
+    def test_markup_in_a_reason_cannot_break_the_card(self):
+        card = sim_app._decision_hover(
+            self._fill(reasoning="proba >= 0.05 <b>not bold</b>")
+        )
+        assert "<b>not bold</b>" not in card
+        assert "&gt;=" in card
+
+    def test_a_fill_with_no_reason_says_so(self):
+        card = sim_app._decision_hover(self._fill(reasoning=""))
+        assert "No reason recorded" in card
+
+    def test_an_unfilled_quantity_falls_back_to_what_was_asked(self):
+        card = sim_app._decision_hover(
+            self._fill(filled_quantity=None, requested_quantity=12.5)
+        )
+        assert "12.5 sh" in card
+
+
 class TestMLModelBreakdown:
     """Which saved model produced a run's decisions.
 

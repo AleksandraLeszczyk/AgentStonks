@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import textwrap
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
@@ -681,6 +682,62 @@ def _equity_chart(equity: list[dict], starting_cash: float) -> go.Figure:
     return _chart_layout(fig, height=300)
 
 
+# The hover card's shape. Wide enough that a sentence is not shredded, short
+# enough that the label does not cover the candles it explains.
+_HOVER_WIDTH = 64
+_HOVER_MAX_LINES = 12
+
+
+def _decision_hover(decision: dict) -> str:
+    """One fill's hover card: what was traded, and why.
+
+    The "why" is the reason the trader wrote at decision time, which already
+    names the condition that fired -- a trailing stop names the give-back it
+    passed, a model entry names the probability and the threshold it cleared,
+    an Apple Trader 2 fill names the rule and every condition with the value it
+    held. None of that was reachable from the chart before; it was in the
+    Decisions table, several scrolls from the marker that raised the question.
+
+    `results.decision_trigger` supplies the headline above it, so the kind of
+    event is legible before the sentence is read. An unrecognised reason simply
+    has no headline -- the prose is what matters and it is always shown.
+    """
+    action = str(decision.get("action") or "").upper()
+    quantity = decision.get("filled_quantity") or decision.get("requested_quantity") or 0
+    # Fills are fractional and the fraction is not noise -- it is what the
+    # position-sizing rule chose -- so the trailing zeros go and nothing else.
+    quantity_text = f"{float(quantity):,.4f}".rstrip("0").rstrip(".") or "0"
+    price = decision.get("price")
+    price_text = f"${float(price):,.2f}" if price is not None else "—"
+    # The axis is in the frame the stored timestamps are in, so the hover reads
+    # the same clock as the candle under it.
+    stamp = str(decision.get("ts") or "").replace("T", " ")[:16]
+
+    lines = [
+        f"<b>{escape(action)}</b> {escape(quantity_text)} sh @ {escape(price_text)}",
+        f"<span style='font-size:11px'>{escape(stamp)}</span>",
+    ]
+    trigger = sim_results.decision_trigger(decision)
+    if trigger:
+        lines.append(f"<b>{escape(trigger)}</b>")
+    reason = str(decision.get("reasoning") or "").strip()
+    if reason:
+        # Wrapped rather than left to the browser: plotly sizes a hover label
+        # to its longest line, and a 400-character reason on one line produces
+        # a tooltip wider than the chart.
+        wrapped = textwrap.wrap(reason, width=_HOVER_WIDTH)
+        # An LLM agent can write a dozen paragraphs of justification, and a
+        # tooltip taller than the plot covers the tape it is explaining. The
+        # rule agents never come close to this; when it does bite, the
+        # Decisions table below the chart still holds the whole thing.
+        if len(wrapped) > _HOVER_MAX_LINES:
+            wrapped = wrapped[:_HOVER_MAX_LINES] + ["… (full reason in Decisions below)"]
+        lines.append("<br>".join(escape(line) for line in wrapped))
+    else:
+        lines.append("<i>No reason recorded.</i>")
+    return "<br>".join(lines)
+
+
 def _price_chart(
     symbol: str,
     bars: list[dict],
@@ -728,6 +785,16 @@ def _price_chart(
                     name=action,
                     marker=dict(color=color, size=13, symbol=symbol_marker,
                                 line=dict(width=1, color=PALETTE["text"])),
+                    hovertext=[_decision_hover(d) for d in fills],
+                    # `<extra></extra>` drops plotly's trace-name box, which
+                    # would repeat "buy" beside a card that already says it.
+                    hovertemplate="%{hovertext}<extra></extra>",
+                    hoverlabel=dict(
+                        align="left",
+                        bgcolor=PALETTE["panel"],
+                        bordercolor=color,
+                        font=dict(color=PALETTE["text"], size=12),
+                    ),
                 )
             )
     if bars:
