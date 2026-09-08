@@ -327,23 +327,21 @@ class TestValidation:
 # case the tape-only half of the catalogue exists for.
 
 UNMODELLED = "MSFT"
-# A symbol the three TimeToChange projects have all been re-run for. It used to
-# be the narrowing case (TimeToChange2 was AAPL-only until 2026-09-07), and it
-# is one again for a different reason: PriceRange2 was fitted on GOOG, the
-# other three on GOOGL, and the two are different share classes.
+# A symbol that carries most models but not all: it used to be the narrowing
+# case because TimeToChange2 was AAPL-only until 2026-09-07, and it is one
+# again for the opposite reason -- its delta-momentum bundle was withdrawn from
+# `Code/Models`, so the catalogue offers it three models rather than four.
 DAYRANGE_ONLY = "GOOGL"
-PRICERANGE_ONLY = "GOOG"
 
-TIMETOCHANGE_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
-ALL_MODELS = TIMETOCHANGE_MODELS + ["pricerange"]
+ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
+GOOGL_MODELS = ["persistence", "nbeats", "dayrange"]
 
 
 class TestInstrument:
     def test_the_models_on_offer_follow_the_symbol(self):
         for symbol in (TICKER, "INTC"):
             assert apple_models.keys_for(symbol) == ALL_MODELS
-        assert apple_models.keys_for(DAYRANGE_ONLY) == TIMETOCHANGE_MODELS
-        assert apple_models.keys_for(PRICERANGE_ONLY) == ["pricerange"]
+        assert apple_models.keys_for(DAYRANGE_ONLY) == GOOGL_MODELS
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_is_not_loaded_for_a_symbol_it_was_not_fitted_on(self, monkeypatch):

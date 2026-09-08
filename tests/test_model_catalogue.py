@@ -52,32 +52,6 @@ def test_dayrange_path_mirrors_the_real_one(ticker):
     ) == dayrange.model_path(ticker)
 
 
-@pytest.mark.parametrize("ticker", ["AAPL", "GOOG", "INTC"])
-def test_pricerange_path_mirrors_the_real_one(ticker):
-    """Including the case of the filename, which is the notebook's, not ours.
-
-    PriceRange2 builds its name from `config.MODEL_NAME` and so writes
-    `pricerange2_aapl.joblib`. The catalogue mirrors the lookup rather than
-    importing the module, so this is where the two can drift apart -- and an
-    upper-cased mirror would show a user a path nothing reads.
-    """
-    pricerange = pytest.importorskip("agent_stonks.pricerange_model")
-    mirrored = mc._saved_path(
-        "APPLE_PRICERANGE_MODEL", "pricerange2_{ticker}.joblib", ticker, lowercase=True
-    )
-    assert mirrored == pricerange.model_path(ticker)
-    assert mirrored.name == f"pricerange2_{ticker.lower()}.joblib"
-
-
-def test_pricerange_sidecar_path_mirrors_the_real_one():
-    pricerange = pytest.importorskip("agent_stonks.pricerange_model")
-    spec = mc.spec(apple_models.PRICERANGE_KEY, "AAPL")
-    by_role = {f.role: f.path for f in spec.files}
-    real = pricerange.model_path("AAPL")
-    assert by_role["bundle"] == real
-    assert by_role["metadata"] == pricerange.metadata_path(real)
-
-
 def test_nbeats_sidecar_paths_mirror_the_real_ones():
     torch_model = pytest.importorskip("agent_stonks.nbeats_model")
     spec = mc.spec(apple_models.NBEATS_KEY, "AAPL")

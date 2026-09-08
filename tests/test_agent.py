@@ -297,6 +297,66 @@ class TestToolHandlers:
         assert "analyze_daily_trend" not in names
         assert "get_put_call_walls" not in names
 
+    def test_volume_detective_is_switched_off_but_still_wired(self):
+        """The two halves of `DISABLED_PERSONALITIES`, which are easy to get
+        half-right.
+
+        *Off* means nothing can newly select it: not the live picker, not
+        SimLab's, not the Automatic orchestrator, and not the `select_strategy`
+        tool enum the model is handed. *Still wired* means the registry entry
+        survives -- because a personality key is also the identity of every run
+        that used it, `data/simlab/experiments` holds records naming this one,
+        and `ui._personality_label` falls back to the *default* for a key it
+        does not know. Deleting the entry would not raise; it would silently
+        relabel finished Volume Signal Detective runs as Momentum Trader.
+
+        The tests above pin the prompt and tools, which is what makes
+        re-enabling it a one-line change rather than an archaeology exercise.
+        """
+        from agent_stonks.agent_prompts import (
+            AGENT_PERSONALITIES,
+            DISABLED_PERSONALITIES,
+            selectable_personalities,
+        )
+        from agent_stonks.automatic import SELECTABLE_STRATEGIES, _TOOL_SELECT_STRATEGY
+
+        assert "volume_detective" in DISABLED_PERSONALITIES
+        assert "volume_detective" not in selectable_personalities()
+        assert "volume_detective" not in SELECTABLE_STRATEGIES
+        enum = _TOOL_SELECT_STRATEGY["function"]["parameters"]["properties"]["strategy"]
+        assert "volume_detective" not in enum["enum"]
+
+        # ...and the orchestrator's prompt no longer offers it either. The enum
+        # would reject the pick anyway, but describing a strategy the tool
+        # forbids costs a wasted round trip and a forced re-pick.
+        from agent_stonks.automatic import AUTOMATIC_SYSTEM_PROMPT
+
+        assert "volume_detective" not in AUTOMATIC_SYSTEM_PROMPT
+
+        # Still wired: label, prompt, tools and avatar all resolve, which is
+        # what keeps a finished run's identity intact in Results.
+        entry = AGENT_PERSONALITIES["volume_detective"]
+        assert entry["label"] == "Volume Signal Detective"
+        assert entry["system_prompt"] is VOLUME_DETECTIVE_SYSTEM_PROMPT
+        assert entry["avatar"]
+        assert PERSONALITY_TOOLS["volume_detective"] is VOLUME_DETECTIVE_TOOLS
+
+    def test_a_disabled_personality_keeps_its_label_in_results(self):
+        """The failure deleting the entry would actually produce.
+
+        `_personality_label` is what Results renders for a stored record, and
+        its fallback is the default personality -- so an unknown key does not
+        error, it misattributes. This is the assertion that would have caught
+        that, and it is why the disable path exists.
+        """
+        from agent_stonks.ui import _personality_label
+
+        assert _personality_label("volume_detective") == "Volume Signal Detective"
+        # The fallback this is protecting against, shown explicitly.
+        assert _personality_label("a_key_that_was_deleted") == _personality_label(
+            "momentum"
+        )
+
     def test_volume_detective_prompt_gates_levels_on_the_trajectory_read(self):
         # The tool and the guidance that makes it binding ship together: a
         # level map alone keeps bidding demand into a tape that has turned.

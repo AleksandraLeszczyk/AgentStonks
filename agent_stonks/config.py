@@ -182,41 +182,6 @@ APPLE_TRADER_SELL_THR = 0.30
 APPLE_TRADER_M1_MULT = -2.0
 # Percent, like APPLE_TRADER_TRAIL_PCT -- the notebook's 0.005 fraction.
 APPLE_TRADER_STOP_PCT = 0.5
-# --- the price-range strategy (PriceRange2) ------------------------------
-#
-# Resting levels off the quantile forecasts, not the point forecast:
-#
-#     buy   at  q75 predicted low  x (1 + ENTRY_BUFFER)
-#     sell  at  q25 predicted high x (1 - EXIT_BUFFER)
-#     stop  at  entry              x (1 - RANGE_STOP_PCT)
-#
-# These come from a 224-cell sweep over 400 walk-forward sessions, and they are
-# the *centre of the profitable region* rather than the best cell -- with 224
-# cells the best one is mostly luck. Two of the three are better established
-# than anything on the other strategies:
-#
-#   * the quantile levels are not a tuning choice. Using the median predicted
-#     edges never made money in any of 112 cells on any of the three tickers;
-#     the point forecast is the *most likely* low, so price reaches it about
-#     half the time and the rule sits unfilled. q75/q25 lift participation from
-#     ~0.56 to ~0.78. This is the most robust trading result in that project.
-#   * the stop has a genuine interior optimum near 1%. Tighter and ordinary
-#     noise stops the position out; wider and the losses are too big to pay for.
-#
-# What is *not* established is that the rule has an edge at all, and PriceRange2
-# is explicit that it does not: across three tickers `corr(buy-and-hold return,
-# rule's outperformance) = -0.78`. It beats holding precisely when holding does
-# badly, which is reduced exposure rather than skill, and its nested
-# out-of-sample decay reaches -90% on INTC. It ships so the forecast has a
-# consumer and so SimLab can re-test it -- not because it is expected to work.
-APPLE_TRADER_ENTRY_BUFFER = 0.15  # percent above the predicted low
-APPLE_TRADER_EXIT_BUFFER = 0.0    # percent below the predicted high
-APPLE_TRADER_RANGE_STOP_PCT = 1.0
-# Re-arm the buy after a completed round trip. Off, as in the notebook: the
-# forecast is one claim about one day, and a rule that takes it repeatedly is
-# betting on mean reversion within the range rather than on the range itself.
-APPLE_TRADER_ALLOW_REENTRY = False
-
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
 APPLE_TRADER_TRAIL_PCT = 0.5
@@ -279,13 +244,6 @@ SESSION_MARKER_COLOR = "#5b6478"
 # name a direction.
 MODEL_OVERLAY_COLORS: dict[str, str] = {
     "day_range":     "#22d3ee",  # cyan, as the ML predicted profile curve
-    # Amber-orange: a second range forecast on the same axis as `day_range`, so
-    # the two have to be told apart at a glance when both are switched on.
-    "price_range":   "#fb923c",
-    # The q75/q25 edges the rule actually trades, drawn inside the point
-    # forecast's band -- a lighter tone of the same hue, since they are the
-    # same model's answer at a different quantile rather than a different claim.
-    "price_range_q": "#fcd9b0",
     "profile_range": "#a78bfa",  # violet
     "profile_poc":   "#f472b6",  # pink -- one number inside the violet band
     "momentum_up":   "#26c6a2",

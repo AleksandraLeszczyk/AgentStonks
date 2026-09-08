@@ -26,37 +26,21 @@ mapping):
   Buy a negative minute it expects to turn up, sell a positive one it expects
   to turn down, under a momentum floor and a fixed stop. See
   `MomentumChangeTrader`.
-* **the price-range rules** (`pricerange`, from PriceRange2) -- the same shape
-  as the day-range rules and off the same kind of forecast, but resting on the
-  model's *quantile* edges rather than its point forecast, with a stop under
-  the fill. The quantiles are the whole point: PriceRange2 found the median
-  edges never profitable in any of 112 sweep cells. See `PriceRangeTrader`.
 
 They share the ledger, the sizing, the flatten-before-close rule and the config
 record, and nothing else -- a forecast of the day's high is not a probability,
-a bps/min quantity is not one either, and there is no threshold any of them
+a bps/min quantity is not one either, and there is no threshold either of them
 can be compared against. `build_trader` is the seam.
-
-The two range strategies are separate rather than one parameterised by which
-bundle it loads, and the reason is the exits: the day-range rules have no stop
-at all (an early exit on weakness would be a second, unmeasured strategy on top
-of the one that was measured), while the price-range rules have one with a
-fitted optimum and a defined precedence against the target. Folding them
-together would mean a config where half the fields are inert depending on the
-bundle, which is exactly what `config_signature` exists to prevent.
 
 Which symbol, and why it is a setting rather than a name
 --------------------------------------------------------
 `AppleTraderConfig.ticker` names the one symbol a run trades. Everything this
 agent does is a saved model's output, so the instrument is not free the way it
 is for a rule set written on the tape: a model exists for a symbol or it does
-not, and `apple_models` owns that fact. Every notebook project has now been run
-per ticker, but they were not run on the *same* tickers: the three TimeToChange
-projects cover AAPL, GOOGL and INTC, while PriceRange2 covers AAPL, **GOOG** and
-INTC. So AAPL and INTC run all four strategies off their own bundles, GOOGL runs
-the first three, and GOOG runs only the price-range one -- and that is a fact
-about which notebooks have been run against what, not a property of the design.
-The
+not, and `apple_models` owns that fact. All three notebook projects have now
+been re-run per ticker, so AAPL, GOOGL and INTC each run all three strategies
+off their own bundles -- but that is a fact about which notebooks have been
+re-run, not a property of the design, and it was not true a month ago. The
 pairing is still checked before the loop starts (`config_error`) rather than
 discovered as a bundle that would not load, and the picker still offers only
 the models a symbol has, so the first model trained for one ticker ahead of the
@@ -311,19 +295,15 @@ from .agent import stop_agent
 from .rule_agent import BaseTrader
 from .state import append_agent_log as _log
 from .config import (
-    APPLE_TRADER_ALLOW_REENTRY,
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_BUY_THR,
     APPLE_TRADER_CYCLE_SEC,
-    APPLE_TRADER_ENTRY_BUFFER,
     APPLE_TRADER_ENTRY_MODE,
-    APPLE_TRADER_EXIT_BUFFER,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_M1_MULT,
     APPLE_TRADER_MODEL,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_PROB_THRESHOLD,
-    APPLE_TRADER_RANGE_STOP_PCT,
     APPLE_TRADER_REVERSAL_THRESHOLD,
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_SELL_THR,
@@ -439,23 +419,6 @@ class AppleTraderConfig:
     sell_thr: float = APPLE_TRADER_SELL_THR
     m1_mult: float = APPLE_TRADER_M1_MULT
     stop_pct: float = APPLE_TRADER_STOP_PCT
-    # --- the price-range strategy's four. `entry_buffer` and `exit_buffer` are
-    # percentages inside the two predicted edges (bid a little above the low,
-    # offer a little below the high, so a level the price merely touches is one
-    # that fills), `range_stop_pct` the stop below the entry, and
-    # `allow_reentry` whether the buy re-arms after a completed round trip.
-    # See `PriceRangeTrader` and `config.APPLE_TRADER_ENTRY_BUFFER` for what
-    # PriceRange2's 224-cell sweep did and did not establish about them.
-    #
-    # `range_stop_pct` is a separate field from `stop_pct` rather than a shared
-    # one because the two strategies' stops were fitted separately and mean
-    # different things -- 0.5% under a momentum entry, 1.0% under a resting
-    # limit fill. Sharing the field would make retuning one silently retune the
-    # other, and would split the untouched strategy's Results signature.
-    entry_buffer: float = APPLE_TRADER_ENTRY_BUFFER
-    exit_buffer: float = APPLE_TRADER_EXIT_BUFFER
-    range_stop_pct: float = APPLE_TRADER_RANGE_STOP_PCT
-    allow_reentry: bool = APPLE_TRADER_ALLOW_REENTRY
     position_pct: float = APPLE_TRADER_POSITION_PCT
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
 
@@ -493,27 +456,6 @@ class AppleTraderConfig:
                 f"stop_pct {self.stop_pct!r} must be a positive percentage below the "
                 "entry price; a stop at zero is breached by the bar that opened the trade"
             )
-        # Same reasoning for the price-range strategy's own stop, and checked
-        # unconditionally for the same reason.
-        if self.range_stop_pct <= 0:
-            raise ValueError(
-                f"range_stop_pct {self.range_stop_pct!r} must be a positive percentage "
-                "below the entry price; a stop at zero is breached by the bar that "
-                "opened the trade"
-            )
-        # The buffers move the two levels *towards each other* -- the buy up
-        # off the predicted low, the sell down off the predicted high -- so a
-        # negative one would widen the pair rather than tighten it, which is
-        # not what either name means. Zero is legitimate and is the shipped
-        # default for the exit side.
-        for name in ("entry_buffer", "exit_buffer"):
-            value = getattr(self, name)
-            if value < 0:
-                raise ValueError(
-                    f"{name} {value!r} must be zero or a positive percentage; it moves "
-                    "the level inward from the predicted edge, so a negative value "
-                    "would place it outside the forecast rather than inside it"
-                )
 
     @property
     def strategy(self) -> str:
@@ -565,18 +507,6 @@ def config_signature(
         return (
             f"{model.key}_{c.ticker}(buy>={c.buy_thr:g},sell<=-{c.sell_thr:g},"
             f"m1={c.m1_mult:g}θ,stop={c.stop_pct:g}%,size={c.position_pct:g}%)"
-        )
-    if model.strategy == apple_models.STRATEGY_PRICERANGE:
-        # The quantiles are named in the signature even though they are not
-        # configurable, because they are the whole reason this rule differs
-        # from the day-range one: it trades a level the day is 75% likely to
-        # reach, not the most likely level. A future run that made them a knob
-        # would then sign differently, which is correct.
-        reentry = ",reentry" if c.allow_reentry else ""
-        return (
-            f"{model.key}_{c.ticker}(buy=L75+{c.entry_buffer:g}%,"
-            f"sell=H25-{c.exit_buffer:g}%,stop={c.range_stop_pct:g}%{reentry},"
-            f"size={c.position_pct:g}%)"
         )
     threshold = c.prob_threshold if c.prob_threshold is not None else model_threshold
     shown = f"{threshold:g}" if threshold is not None else "model"
@@ -709,19 +639,6 @@ def _momentum_change():
     from . import momentum_change_model
 
     return momentum_change_model
-
-
-def _pricerange():
-    """`agent_stonks.pricerange_model`, imported on first use.
-
-    Kept out of this module's imports for the same reason `_dayrange` is,
-    though the weight is different: this one pulls in LightGBM but no PyTorch,
-    so it costs a fraction of what the day-range bundle does. It is still not
-    something the two momentum strategies should pay for.
-    """
-    from . import pricerange_model
-
-    return pricerange_model
 
 
 def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAULT_TICKER):
@@ -1368,398 +1285,6 @@ class DayRangeTrader(BaseTrader):
 
 
 
-class PriceRangeTrader(BaseTrader):
-    """The price-range rules: one forecast at 09:35, then two resting levels
-    and a stop.
-
-    Shaped like `DayRangeTrader` and different in three ways that matter, all
-    of them PriceRange2's findings rather than choices made here.
-
-    **The levels come from quantile models, not from the point forecast.**
-
-        buy_level  = q75 predicted low  x (1 + entry_buffer)
-        sell_level = q25 predicted high x (1 - exit_buffer)
-
-    A point forecast is the *most likely* low, so price reaches it about half
-    the time and a rule resting there sits unfilled. PriceRange2 swept 224
-    parameter combinations over 400 walk-forward sessions on each of three
-    tickers, and using the median edges made money in **0 of 112 cells, on all
-    three**. The 75th-percentile low and 25th-percentile high lift participation
-    from ~0.56 to ~0.78 and are what makes the rule viable at all. That is the
-    most robust trading result in that project, and it is why `buy_edge` and
-    `sell_edge` rather than `pred_low` and `pred_high` are what the plan reads.
-
-    **There is a stop**, at `range_stop_pct` under the entry, which the
-    day-range rule has none of. The sweep found a genuine interior optimum near
-    1%: tighter and ordinary noise stops the position out, wider and the losses
-    that do arrive are too big to pay for.
-
-    **The buy does not re-arm by default.** `allow_reentry` switches that on;
-    off is the notebook's, and the reasoning is that the forecast is one claim
-    about one day rather than a per-bar signal to be traded repeatedly.
-
-    What this is not
-    ----------------
-    Not a momentum agent. No regime, no probability, no threshold, no trailing
-    stop; `prob_threshold`, `entry_mode`, `trail_pct` and `reversal_threshold`
-    are inert and `config_signature` leaves them out. Not the day-range rules
-    either -- `buy_k` and `sell_k` are inert too, because the levels here are
-    quantiles rather than multiples of an average daily range.
-
-    Against the notebook
-    --------------------
-    `tests/test_pricerange_model.py` pins the forecast itself: the mirrored
-    feature code reproduces PriceRange2's shipped panel to 0.00e+00 on all
-    1,164 sessions of all three tickers, and `forecast_session` reproduces its
-    predicted levels and quantile edges to 0.00e+00 too.
-
-    The *fills* are a different matter, and the difference runs one way --
-    against this ledger:
-
-    * **the fill price**. `simulate.py` rests limit orders and fills a buy at
-      `max(buy_level, bar_open)` -- a touch fills *at* the level. Here the loop
-      sees the bar after it closed and sends a market order, which fills near
-      that bar's close. On a bar that dipped to the level and recovered, the
-      notebook buys at the level and this buys higher. Not a modelling choice:
-      `DecisionTracker` has no limit orders.
-    * **the stop-versus-target tie**. When one bar's range contains both, the
-      notebook takes the stop, on the grounds that minute bars do not record
-      the order events happened in. This does the same, and for the same
-      reason -- see `_exit_reason`, where the ordering of the two checks *is*
-      the rule.
-    * **the flatten**. The notebook closes on the 15:59 bar; here
-      `flatten_before_close_min` applies as it does to every agent, so at the
-      default of 5 the position closes around 15:55.
-
-    And what the rule is worth, stated as PriceRange2 states it: **it has no
-    edge over holding.** Across three tickers `corr(buy-and-hold return, the
-    rule's outperformance) = -0.78` -- it beats holding exactly when holding
-    does badly, which is reduced exposure rather than skill. Its nested
-    out-of-sample decay is -90% on INTC. The forecast is the asset; this rule
-    is a consumer of it and a thing to re-test in SimLab, not a thing to
-    believe.
-    """
-
-    ENTRY_TRIGGER_TEXT = "Buy level touched"
-
-    def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
-        super().__init__(config or AppleTraderConfig())
-        # The session's forecast and the levels derived from it, or None before
-        # 09:35. Keyed by date so a multi-day run re-forecasts each morning.
-        self.plan: "dict | None" = None
-        # Whether the buy is still available this session. Set False after a
-        # completed round trip unless `allow_reentry`.
-        self.armed = True
-
-    # --- one cycle --------------------------------------------------------
-
-    def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
-        """Read the newest closed bar and act on it. Returns a short outcome
-        tag ("bought", "sold", "hold", "warming_up", "closed", "no_data")."""
-        sym_state, refused = self.preflight(state)
-        if refused is not None:
-            return refused
-
-        today = _pricerange().market_date()
-        self._roll_session(today)
-
-        frame = persistence_model.minute_frame(sym_state)
-        if not len(frame):
-            _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
-            return "no_data"
-
-        want = _pricerange().opening_minutes(bundle)
-        if self.plan is None:
-            if self.blocked is not None:
-                return "no_data"
-            if len(frame) < want:
-                _log(
-                    state,
-                    {
-                        "type": "status",
-                        "text": (
-                            f"{len(frame)} of the first {want} {self.ticker} minutes are "
-                            "in; today's range cannot be forecast until the opening "
-                            "window closes."
-                        ),
-                    },
-                )
-                return "warming_up"
-            if not self._plan_session(bundle, state, frame, today, want):
-                return "no_data"
-
-        last = frame.iloc[-1]
-        ts = frame.index[-1]
-        fresh_bar = ts != self.last_bar_ts
-        if fresh_bar:
-            self.last_bar_ts = ts
-
-        position = tracker.position_for(self.ticker)
-        if position > 0 and self.entry is None:
-            # A position without a remembered entry (agent restarted onto an
-            # existing ledger): adopt it. Unlike the day-range rules this does
-            # change a decision -- the stop is measured from the entry price --
-            # so the adopted price is the current bar's close and the stop it
-            # implies is stated in the log rather than left to be inferred.
-            self.entry = {"price": float(last["close"]), "bars": 0}
-        if position <= 0:
-            self.entry = None
-        if fresh_bar and self.entry is not None:
-            self.entry["bars"] += 1
-
-        _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position)})
-
-        # The forecast does not exist before the opening window closes, and the
-        # bar it was built on is the last bar *of* that window, so it is never
-        # traded. This is `simulate.simulate_session`'s `index.time >= 09:35`.
-        if ts <= self.plan["opening_end"]:
-            return "warming_up"
-
-        if position > 0:
-            reason = self._exit_reason(last)
-            if reason is not None:
-                self._sell(state, tracker, position, last, reason)
-                return "sold"
-            return "hold"
-
-        if fresh_bar and self.armed and float(last["low"]) <= self.plan["buy_level"]:
-            if self.closing_soon():
-                _log(
-                    state,
-                    {
-                        "type": "status",
-                        "text": (
-                            f"The {ts:%H:%M} bar traded down to the buy level, but the "
-                            f"session is inside its last "
-                            f"{self.config.flatten_before_close_min} min and any position "
-                            "would be flattened straight back out. Standing down."
-                        ),
-                    },
-                )
-                return "hold"
-            return "bought" if self._buy(state, tracker, last) else "hold"
-        return "hold"
-
-    def _roll_session(self, today) -> None:
-        """Forget yesterday's forecast at the start of a new session."""
-        if self.plan is not None and self.plan["date"] != today:
-            self.plan = None
-            self.entry = None
-            self.last_bar_ts = None
-            self.armed = True
-        if self.blocked is not None and self.blocked["date"] != today:
-            self.blocked = None
-
-    # --- the forecast ------------------------------------------------------
-
-    def _plan_session(
-        self, bundle: dict, state: AppState, frame, today, want: int
-    ) -> bool:
-        """Forecast the day and set the levels. False if it cannot be done.
-
-        Every failure here is fatal for the session rather than for the bar --
-        a daily history that is too short at 09:35 is still too short at 14:00,
-        and a cross-asset series that is missing does not arrive later -- so it
-        is recorded in `self.blocked` and reported once.
-        """
-        pricerange = _pricerange()
-        try:
-            opening = self._opening_window(state, frame, want)
-            history = pricerange.daily_frame_from_bars(
-                historical.fetch_daily_ohlc_bars(
-                    self.ticker, days=pricerange.DAILY_HISTORY_DAYS
-                )
-            )
-            forecast = pricerange.forecast_session(
-                bundle, history, opening, today,
-                cross=pricerange.fetch_cross_frame(today),
-                open_price=historical.fetch_session_open(self.ticker),
-                opening_volume=pricerange.fetch_opening_volume_history(
-                    self.ticker, today, state.api_key, state.api_secret,
-                    getattr(state, "feed", "iex") or "iex",
-                ),
-            )
-        except Exception as exc:
-            self.blocked = {"date": today, "reason": str(exc)}
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": (
-                        f"Apple Trader cannot forecast today's {self.ticker} range, so "
-                        f"it will not trade this session: {exc}"
-                    ),
-                },
-            )
-            return False
-
-        if forecast["buy_edge"] is None or forecast["sell_edge"] is None:
-            self.blocked = {"date": today, "reason": "no quantile models"}
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": (
-                        f"The {self.ticker} bundle has no quantile models, and this "
-                        "strategy trades the 75th-percentile low and 25th-percentile "
-                        "high rather than the point forecast — the median edges made "
-                        "money in none of PriceRange2's 112 sweep cells. Not trading "
-                        "this session."
-                    ),
-                },
-            )
-            return False
-
-        buy_level = forecast["buy_edge"] * (1 + self.config.entry_buffer / 100.0)
-        sell_level = forecast["sell_edge"] * (1 - self.config.exit_buffer / 100.0)
-        self.plan = {
-            "date": today,
-            "opening_end": opening.index[-1],
-            "buy_level": buy_level,
-            "sell_level": sell_level,
-            **forecast,
-        }
-
-        if sell_level <= buy_level:
-            # The notebook's "levels crossed" refusal. It happens when the
-            # forecast band is narrower than the two buffers together, which is
-            # a real forecast about a very quiet day rather than a bug -- but a
-            # buy above the sell would round-trip on every bar.
-            self.blocked = {"date": today, "reason": "levels crossed"}
-            self.plan = None
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": (
-                        f"The {self.ticker} buy level ${buy_level:,.2f} is at or above "
-                        f"the sell level ${sell_level:,.2f} — the forecast band is "
-                        "narrower than the buffers applied to it. Not trading this "
-                        "session."
-                    ),
-                },
-            )
-            return False
-
-        warning = pricerange.volume_scale_warning(getattr(state, "feed", None))
-        if warning:
-            _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
-        _log(state, {"type": "analysis", "text": self._plan_summary()})
-        return True
-
-    def _opening_window(self, state: AppState, frame, want: int):
-        return fetch_opening_window(state, frame, want, ticker=self.ticker)
-
-    # --- the check on an open position -------------------------------------
-
-    def _exit_reason(self, bar) -> "str | None":
-        """Why this long should be closed on this bar, or None to keep holding.
-
-        The stop is checked **before** the target, and the order is the rule
-        rather than an implementation detail. When one minute bar's range
-        contains both levels, a minute bar does not record which came first,
-        and assuming the good one is how a backtest invents money. PriceRange2
-        takes the stop; so does this.
-        """
-        entry_price = (self.entry or {}).get("price") or 0.0
-        price = float(bar["close"])
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
-        stop = entry_price * (1 - self.config.range_stop_pct / 100.0)
-
-        if entry_price and float(bar["low"]) <= stop:
-            return (
-                f"Stop: the bar traded down to ${float(bar['low']):,.2f}, at or through "
-                f"the ${stop:,.2f} stop ({self.config.range_stop_pct:g}% under the "
-                f"${entry_price:,.2f} entry). Selling at market ({pnl_pct:+.2f}%)."
-            )
-
-        if float(bar["high"]) >= self.plan["sell_level"]:
-            return (
-                f"Target: the bar traded up to ${float(bar['high']):,.2f}, at or through "
-                f"the ${self.plan['sell_level']:,.2f} sell level (the 25th-percentile "
-                f"predicted high, less {self.config.exit_buffer:g}%). Selling at market "
-                f"({pnl_pct:+.2f}%)."
-            )
-
-        if self.closing_soon():
-            to_close = market_hours.seconds_to_close() or 0.0
-            return (
-                f"Session ends in {to_close / 60:.0f} min and the day never came back up "
-                f"to ${self.plan['sell_level']:,.2f}. The forecast is a statement about "
-                f"today only, so the position is flattened rather than carried overnight "
-                f"({pnl_pct:+.2f}%)."
-            )
-        return None
-
-    # --- orders ------------------------------------------------------------
-
-    def _buy(self, state: AppState, tracker: DecisionTracker, bar) -> bool:
-        filled = self.buy(state, tracker, float(bar["close"]), self._entry_reasoning(bar))
-        # Disarmed on the *entry*, which is where `simulate.simulate_session`
-        # does it -- and only on one that actually filled. Disarming on the exit
-        # instead would spend the session's one trade on a sell that was
-        # refused, and disarming on a buy that bought nothing would spend it on
-        # no trade at all.
-        if filled and not self.config.allow_reentry:
-            self.armed = False
-        return filled
-
-    def _entry_reasoning(self, bar) -> str:
-        plan = self.plan
-        return (
-            f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
-            f"${plan['buy_level']:,.2f} buy level — the 75th-percentile predicted low "
-            f"(${plan['buy_edge']:,.2f}) plus {self.config.entry_buffer:g}%. The model "
-            f"put today's range at {plan['pred_range_pct']:.2%} of the ${plan['ref']:,.2f} "
-            f"price it was trading at when the forecast was made, with the low around "
-            f"${plan['pred_low']:,.2f}; the 75th percentile is used instead because a "
-            f"level the day only just reaches is one the order mostly misses. Exit is a "
-            f"resting sell at ${plan['sell_level']:,.2f}, a "
-            f"{self.config.range_stop_pct:g}% stop, or the closing bell."
-        )
-
-    def _sell(
-        self, state: AppState, tracker: DecisionTracker, quantity: float, bar, reasoning: str
-    ) -> None:
-        self.sell(state, tracker, quantity, reasoning)
-
-    # --- logging -----------------------------------------------------------
-
-    def _plan_summary(self) -> str:
-        plan = self.plan
-        return (
-            f"{self.ticker} forecast for the session, made at "
-            f"{plan['opening_end']:%H:%M} against the ${plan['ref']:,.2f} traded then: "
-            f"high ${plan['pred_high']:,.2f}, low ${plan['pred_low']:,.2f}, range "
-            f"{plan['pred_range_pct']:.2%}. Trading the quantile edges instead — buy at "
-            f"${plan['buy_level']:,.2f} (75th-percentile low ${plan['buy_edge']:,.2f} "
-            f"+ {self.config.entry_buffer:g}%), sell at ${plan['sell_level']:,.2f} "
-            f"(25th-percentile high ${plan['sell_edge']:,.2f} − "
-            f"{self.config.exit_buffer:g}%), stop {self.config.range_stop_pct:g}% under "
-            f"the entry."
-        )
-
-    def _read_summary(self, bar, ts, position: float) -> str:
-        price = float(bar["close"])
-        plan = self.plan
-        parts = [f"{self.ticker} {ts:%H:%M} ${price:,.2f}"]
-        if position > 0 and self.entry:
-            entry_price = self.entry["price"]
-            stop = entry_price * (1 - self.config.range_stop_pct / 100.0)
-            pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
-            parts += [
-                f"sell ${plan['sell_level']:,.2f} ({price - plan['sell_level']:+.2f})",
-                f"stop ${stop:,.2f} ({price - stop:+.2f})",
-                f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%), "
-                f"{self.entry['bars']} bars",
-            ]
-        elif self.armed:
-            parts.append(f"buy ${plan['buy_level']:,.2f} ({price - plan['buy_level']:+.2f})")
-        else:
-            parts.append("flat, buy spent for the session")
-        return " · ".join(parts)
-
-
 class MomentumChangeTrader(BaseTrader):
     """The delta-momentum rules: the tape says which regime, the model says
     which way it is about to move.
@@ -2068,10 +1593,10 @@ def build_trader(config: AppleTraderConfig, bundle: dict):
 
     The one place the strategy split turns into an object. Every launch path --
     the live loop below, SimLab's `rule_agents._build_apple` -- goes through
-    here, so a fifth strategy is added in one place rather than in whichever
+    here, so a fourth strategy is added in one place rather than in whichever
     entry points were remembered.
 
-    All four returned objects expose `run_cycle(bundle, state, tracker)` and
+    All three returned objects expose `run_cycle(bundle, state, tracker)` and
     nothing else that a caller needs.
     """
     strategy = apple_models.get(config.model_key).strategy
@@ -2079,8 +1604,6 @@ def build_trader(config: AppleTraderConfig, bundle: dict):
         return DayRangeTrader(config)
     if strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
         return MomentumChangeTrader(config)
-    if strategy == apple_models.STRATEGY_PRICERANGE:
-        return PriceRangeTrader(config)
     return AppleTrader(config, model_threshold=persistence_model.model_threshold(bundle))
 
 
@@ -2089,30 +1612,10 @@ def build_trader(config: AppleTraderConfig, bundle: dict):
 def _armed_summary(config: AppleTraderConfig, model, bundle: dict, trader) -> str:
     """The one line the log opens a run with: which model, and what it will do.
 
-    Per strategy, because the four have nothing in common to summarise -- one
-    is a probability against a threshold on every bar, two are price levels set
-    once (off different quantities), and one is a signed bps/min forecast read
-    against a printed regime.
+    Per strategy, because the three have nothing in common to summarise -- one
+    is a probability against a threshold on every bar, one is two price levels
+    set once, one is a signed bps/min forecast read against a printed regime.
     """
-    if config.strategy == apple_models.STRATEGY_PRICERANGE:
-        metadata = bundle.get("metadata") or {}
-        walkforward = (metadata.get("walkforward_scores") or {}).get("walkforward") or {}
-        skill = walkforward.get("skill_vs_baseline")
-        quality = (
-            f", {skill:.1%} of a 21-day baseline's error removed over "
-            f"{walkforward.get('n', '?')} walk-forward sessions"
-            if skill else ""
-        )
-        return (
-            f"Apple Trader armed on {model.label} (fitted "
-            f"{bundle.get('trained_at', 'unknown')}{quality}): at 09:35 it forecasts both "
-            f"edges of today's {config.ticker} session, then rests a buy at the "
-            f"75th-percentile predicted low +{config.entry_buffer:g}% and a sell at the "
-            f"25th-percentile predicted high −{config.exit_buffer:g}%, with a "
-            f"{config.range_stop_pct:g}% stop, until the closing flatten. Note that "
-            "PriceRange2 measured this rule as reduced exposure rather than an edge — the "
-            "forecast is what was validated, not the trading around it."
-        )
     if config.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
         metrics = bundle.get("metrics") or {}
         sign = metrics.get("holdout_sign_hit_rate_on_changes")

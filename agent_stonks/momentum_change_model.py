@@ -22,19 +22,27 @@ keeping them separate:
 
     AAPL    Ridge                R2 0.66 validation / 0.48 holdout week,
                                  sign right on 94% of holdout changes
-    GOOGL   RandomForest         R2 0.48 / 0.19, sign right on 91%
     INTC    HistGradientBoosting R2 0.63 / 0.45, sign right on 86%
 
-All three beat the predict-zero baseline on days used neither for fitting nor
-for selection, which is the claim worth making about them.
+Both beat the predict-zero baseline on days used neither for fitting nor for
+selection, which is the claim worth making about them.
+
+**GOOGL was a third, and is not wired up.** It selected a RandomForest and
+scored R2 0.48 / 0.19 with the sign right on 91% of holdout changes -- the
+weakest of the three on the holdout week, and the one whose R2 fell furthest
+from validation to holdout. Its bundle was withdrawn from `Code/Models`, so
+`apple_models.MOMENTUM_CHANGE_TICKERS` no longer lists it: a model in the
+registry with no file behind it is not a wider menu, it is an agent that
+reports itself broken whenever somebody picks it. Re-adding it is one entry
+there plus the retrain below.
 
 Note the AAPL bundle here is **not** notebook 03's. That one is the project's
 demo -- a month of yfinance bars, no reserved holdout week, metrics from the
 same days its estimator was chosen on -- and it still sits in
 `FinNotebooks/Models` because notebooks 04 and 05 were executed against it.
 The bundle this module loads is trained by `scripts/train_ticker.py` on the
-same weekly CSV archive and under the same held-out-week protocol as GOOGL and
-INTC, so all three carry the same metrics schema and mean the same thing.
+same weekly CSV archive and under the same held-out-week protocol as INTC, so
+both carry the same metrics schema and mean the same thing.
 
 What "the direction holds, the timing does not" means
 -----------------------------------------------------
@@ -56,8 +64,10 @@ which a 1.7.2 `SimpleImputer` raises on `transform` and a 1.7.2
 *this* project's interpreter:
 
     cd FinNotebooks/TimeToChange && \\
-      ../../AgentStonks/.venv/bin/python scripts/train_ticker.py GOOGL INTC \\
+      ../../AgentStonks/.venv/bin/python scripts/train_ticker.py AAPL INTC \\
       --model-dir ../../Models
+
+(add `GOOGL` to that list to bring the third one back.)
 
 Same data (the Data Collection weekly CSV archive), same code, same split, same
 estimator chosen for each ticker; the metrics move in the third decimal. The
@@ -114,9 +124,12 @@ The notebooks' switch for this is `confirm_lag`, and **the live equivalent is
 to pass when comparing anything here against momlib. `confirm_lag=N` re-stamps
 an event at the bar N later and `_event_history_features` then takes events
 *strictly* before the current bar, so N models a lag of N+1. Off by one, and it
-hides easily: on the two tree bundles the wrong value still agrees with the
-live path on most bars, because a RandomForest quantises a small feature
-difference away. AAPL's Ridge does not, which is how it was caught.
+hides easily: on a tree bundle the wrong value still agrees with the live path
+on most bars, because a tree quantises a small feature difference away -- it
+was invisible on both of the tree-based tickers fitted at the time (GOOGL's
+RandomForest and INTC's HistGradientBoosting). AAPL's Ridge does not quantise,
+which is how it was caught, and is why the Ridge is the bundle to re-check this
+against.
 `tests/test_momentum_change_model.py` now pins both halves -- that `persist-1`
 matches exactly, and that `persist` does not.
 
@@ -535,8 +548,8 @@ def _build_bundle(path: Path) -> "dict | None":
 
 
 # One file per ticker, because TimeToChange fits and *selects* per ticker --
-# GOOGL's RandomForest and INTC's HistGradientBoosting are not the same model
-# with different weights.
+# AAPL's Ridge and INTC's HistGradientBoosting are not the same model with
+# different weights.
 #
 # The file name is `momlib.model.model_path`'s, deliberately: the model this
 # mirrors is the one the notebooks save, and the two stores agreeing means a

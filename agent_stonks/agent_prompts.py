@@ -1055,7 +1055,17 @@ PREMARKET_PERSONALITY = "premarket"
 # Personalities that stay wired (prompt, tools, avatar, past run labels) but are
 # switched off: not offered in the app or SimLab, and never picked by the
 # Automatic orchestrator. Re-enabling one is a one-line change here.
-DISABLED_PERSONALITIES: frozenset[str] = frozenset({"smart_money"})
+#
+# They stay wired rather than being deleted because a personality key is also
+# the identity of every run that used it. `data/simlab/experiments` holds
+# records naming both of these, and `ui._personality_label` falls back to the
+# *default* for a key it does not recognise -- so deleting an entry would not
+# error, it would quietly relabel finished Volume Signal Detective runs as
+# Momentum Trader in Results. Disabling costs one frozenset entry and keeps the
+# record honest; that is the whole reason this set exists.
+DISABLED_PERSONALITIES: frozenset[str] = frozenset(
+    {"smart_money", "volume_detective"}
+)
 
 
 def selectable_personalities() -> list[str]:

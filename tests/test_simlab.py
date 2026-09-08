@@ -1030,7 +1030,11 @@ class TestMomentumChangeEngine:
     regime it traded would be wrong.
     """
 
-    SYMBOL = "GOOGL"
+    # Any symbol the delta-momentum model still covers -- the estimator is
+    # stubbed, so what the symbol has to satisfy is `model_ticker_error`, which
+    # refuses a pairing the registry does not carry before the run starts. It
+    # was GOOGL until that bundle was withdrawn from `Code/Models`.
+    SYMBOL = "INTC"
     # 09:30 ET on six quiet sessions, then the one that trades. Short days: the
     # rules need twenty bars of warm-up and nothing here needs a real session,
     # so `MIN_BARS_PER_DAY` is lowered to match rather than writing 2,700 bars.
@@ -1182,7 +1186,9 @@ class TestMomentumChangeEngine:
         result = self._run(monkeypatch)
         assert result.error is None
         assert result.config_summary["rule_config"]["ticker"] == self.SYMBOL
-        assert result.config_summary["model"].startswith("momentum_change_GOOGL(")
+        assert result.config_summary["model"].startswith(
+            f"momentum_change_{self.SYMBOL}("
+        )
 
     def test_a_missing_bundle_fails_loudly(self, momentum_change_store, monkeypatch):
         momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
@@ -1195,7 +1201,7 @@ class TestMomentumChangeEngine:
         )
         result = SimulationEngine(market, config).run()
         error = result.error or ""
-        assert "momentum_change_GOOGL.joblib" in error
+        assert f"momentum_change_{self.SYMBOL}.joblib" in error
 
 
 
