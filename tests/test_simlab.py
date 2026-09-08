@@ -1754,6 +1754,151 @@ class TestInstrumentBreakdown:
         assert "instrument" in sim_app._BREAKDOWN_DIMENSIONS.values()
 
 
+class TestMLModelBreakdown:
+    """Which saved model produced a run's decisions.
+
+    A different axis from `model`, which is the LLM (or the rule set's
+    signature). Three kinds of run answer it three ways, and the point of the
+    tests is that each lands somewhere honest: one model, a decoded set of
+    them, or -- for an LLM, which loads none -- its provider.
+    """
+
+    def _llm(self, provider="openai", **extra):
+        return {
+            "run_id": "r1", "dataset": "ds1",
+            "config_summary": {
+                "provider": provider, "model": "gpt-a", "personality": "momentum",
+                "symbols": ["AAPL"], **extra,
+            },
+            "summary": {"return_pct": 1.0, "profit_efficiency": 0.5},
+        }
+
+    def _apple(self, model_key="nbeats", return_pct=1.0):
+        return {
+            "run_id": "r1", "dataset": "ds1",
+            "config_summary": {
+                "provider": "rules", "model": "sig", "personality": APPLE_TRADER_KEY,
+                "symbols": ["AAPL"], "rule_based": True,
+                "rule_config": {"model_key": model_key, "ticker": "AAPL"},
+            },
+            "summary": {"return_pct": return_pct, "profit_efficiency": 0.5},
+        }
+
+    def _apple2(self, fields=(), return_pct=1.0):
+        """An Apple Trader 2 run whose one rule reads the given signal fields."""
+        rules = {"items": [{
+            "action": "buy", "size_mode": "pct", "size": 50.0,
+            "conditions": [{"field": f, "op": "above", "value": 0.0} for f in fields],
+            "join": "all", "enabled": True,
+        }]}
+        return {
+            "run_id": "r1", "dataset": "ds1",
+            "config_summary": {
+                "provider": "rules", "model": "sig", "personality": APPLE_TRADER2_KEY,
+                "symbols": ["AAPL"], "rule_based": True,
+                "rule_config": {"rules": rules, "ticker": "AAPL"},
+            },
+            "summary": {"return_pct": return_pct, "profit_efficiency": 0.5},
+        }
+
+    def test_apple_trader_is_the_model_it_names(self):
+        assert sim_results.ml_model_key(self._apple("dayrange")) == "dayrange"
+
+    def test_an_llm_run_is_grouped_by_provider(self):
+        assert sim_results.ml_model_key(self._llm("anthropic")) == (
+            sim_results.LLM_MODEL_PREFIX + "anthropic"
+        )
+
+    def test_two_llm_models_from_one_provider_share_a_row(self):
+        """The whole point of grouping LLMs by provider on this axis: the rows
+        compare approaches, and one row per LLM model would swamp the four ML
+        ones."""
+        runs = [self._llm("openai"), self._llm("openai")]
+        runs[1]["config_summary"]["model"] = "gpt-b"
+        rows = sim_results.breakdown(runs, by="ml_model")
+        assert len(rows) == 1 and rows[0]["runs"] == 2
+
+    def test_apple_trader_2_reads_its_conditions(self):
+        assert sim_results.ml_model_key(
+            self._apple2(["dayrange.pred_high_dip_adr"])
+        ) == "dayrange"
+
+    def test_a_rule_set_naming_several_models_is_one_row(self):
+        """A whole-run return counted under two models would double it, so the
+        set is the group -- joined in registry order, so the same combination
+        is always the same key."""
+        key = sim_results.ml_model_key(
+            self._apple2(["dayrange.pred_high_dip_adr", "persistence.proba"])
+        )
+        assert key == "persistence" + sim_results.ML_MODEL_JOIN + "dayrange"
+        assert sim_results.ml_model_key(
+            self._apple2(["persistence.proba", "dayrange.pred_high_dip_adr"])
+        ) == key
+
+    def test_a_tape_only_rule_set_is_its_own_answer(self):
+        """Not a missing value: a set on price and the position is a complete
+        strategy, and it is the row that says what the models are worth."""
+        assert sim_results.ml_model_key(
+            self._apple2(["bar.price", "pos.shares"])
+        ) == sim_results.NO_ML_MODEL
+
+    def test_an_undecodable_rule_set_is_not_lost(self):
+        record = self._apple2([])
+        record["config_summary"]["rule_config"]["rules"] = {"items": "not a list"}
+        assert sim_results.ml_model_key(record) == sim_results.UNKNOWN_INSTRUMENT
+
+    def test_every_run_lands_in_exactly_one_group(self):
+        runs = [
+            self._llm("openai"), self._llm("gemini"),
+            self._apple("nbeats"), self._apple("persistence"),
+            self._apple2(["persistence.proba"]), self._apple2(["bar.price"]),
+        ]
+        rows = sim_results.breakdown(runs, by="ml_model")
+        assert sum(r["runs"] for r in rows) == len(runs)
+
+    def test_the_winning_run_names_its_ml_model(self):
+        rows = sim_results.breakdown(
+            [self._apple("nbeats", return_pct=1.0),
+             self._apple("dayrange", return_pct=9.0)],
+            by="agent",
+        )
+        assert rows[0]["best_run"]["ml_model"] == "dayrange"
+
+
+class TestMLModelLabels:
+    """The row labels. Keys are stored; labels are rendered, so a model renamed
+    in `apple_models` moves its row without touching stored runs."""
+
+    def test_a_model_key_becomes_its_registry_name(self):
+        assert sim_app._ml_model_label("nbeats") == "N-BEATS forecast"
+        assert sim_app._ml_model_label("persistence") == "Persistence classifier"
+
+    def test_a_provider_is_marked_as_an_llm(self):
+        assert sim_app._ml_model_label("llm:openai") == "openai (LLM)"
+
+    def test_a_combination_joins_both_names(self):
+        assert sim_app._ml_model_label("persistence+dayrange") == (
+            "Persistence classifier + Day-range forecast"
+        )
+
+    def test_sentinels_are_shown_as_they_are(self):
+        for key in (sim_results.NO_ML_MODEL, sim_results.UNKNOWN_INSTRUMENT):
+            assert sim_app._ml_model_label(key) == key
+
+    def test_an_unknown_key_is_never_shown_as_a_real_model(self):
+        """`apple_models.get` falls back to the default model for an unknown
+        key so a stored run still replays. Printing that model's name over a
+        key that is not one would be a quiet lie about which model ran."""
+        assert sim_app._ml_model_label("") == sim_results.UNKNOWN_INSTRUMENT
+        assert sim_app._ml_model_label("retired_model") == "retired_model"
+
+    def test_labels_stay_short_enough_for_the_table(self):
+        """The breakdown table does not wrap, so every label a real run can
+        produce has to fit a first column."""
+        for key in list(apple_models.MODELS) + ["llm:anthropic", "persistence+dayrange"]:
+            assert len(sim_app._ml_model_label(key)) <= 48
+
+
 class TestTopRuns:
     def _run(self, run_id="r1", return_pct=1.0, efficiency=0.5, **config):
         return {

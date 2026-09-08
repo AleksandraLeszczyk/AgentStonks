@@ -38,6 +38,19 @@ MULTI_INSTRUMENT = "(multi-instrument)"
 # file is JSON on disk and a breakdown should not lose a run to a missing key.
 UNKNOWN_INSTRUMENT = "(unknown)"
 
+# A rule run whose rules name no saved model -- a set written on price, the
+# momentum regime, the position and the clock is a complete strategy and
+# deliberately loads nothing. It is a real answer to "which ML model", not a
+# missing one, and it is the row that says what the models are worth.
+NO_ML_MODEL = "(no model — tape rules)"
+# An LLM run has no saved model at all, so on this axis it is grouped by
+# provider. Prefixed so the two kinds of thing sharing the axis stay
+# distinguishable: `results` keeps the key, the UI renders the label.
+LLM_MODEL_PREFIX = "llm:"
+# Several models in one rule set join with this, in `apple_models` registry
+# order so the same combination always produces the same key.
+ML_MODEL_JOIN = "+"
+
 
 # ---------------------------------------------------------------------------
 # Scoring
@@ -246,15 +259,69 @@ def filter_runs(
     ]
 
 
-BREAKDOWN_DIMENSIONS = ("model", "dataset", "agent", "instrument")
+def ml_model_key(record: dict) -> str:
+    """Which saved ML model a stored run's decisions came out of.
+
+    A different question from `model_key`, which is the *LLM* behind a run (and
+    the rule set's signature where there is no LLM). This one asks what the app
+    actually loaded out of `Code/Models`, and the three kinds of run answer it
+    differently:
+
+    * **Apple Trader** is one model by construction -- the model it names is
+      the strategy, and picking a different one changes which rules exist. Its
+      `model_key` is the answer.
+    * **Apple Trader 2** names models per *condition*, so a rule set reads
+      however many it mentions: none (price and momentum alone), one, or
+      several. The set is the key, joined in registry order so the same
+      combination is always the same row.
+    * an **LLM agent** loads no saved model at all. Grouping every LLM run into
+      one row would hide the comparison worth making on this axis, so they are
+      grouped by **provider** -- which is the closest thing an LLM run has to
+      "which model produced this", at a granularity that stays readable beside
+      four ML rows.
+
+    Rule sets are decoded rather than string-matched, so a condition renamed in
+    `apple_rules` moves this key with it instead of silently mis-filing runs.
+    Nothing heavy is imported: `apple_rules` reaches `apple_models` for the
+    registry and neither pulls in PyTorch.
+    """
+    config = record.get("config_summary") or {}
+    if not config.get("rule_based"):
+        provider = str(config.get("provider") or "?").strip() or "?"
+        return f"{LLM_MODEL_PREFIX}{provider}"
+
+    rule_config = config.get("rule_config") or {}
+    # Apple Trader: one named model, and it is the whole strategy.
+    named = str(rule_config.get("model_key") or "").strip()
+    if named:
+        return named
+    # Apple Trader 2: whatever its enabled conditions name.
+    if "rules" in rule_config:
+        try:
+            from agent_stonks.apple_rules import RuleSet
+
+            models = RuleSet.from_record(rule_config["rules"]).models()
+        except Exception:
+            # A stored record is JSON on disk and may predate a rule schema.
+            # An undecodable set is still a run that happened; losing it from
+            # the breakdown would be worse than filing it as unknown.
+            return UNKNOWN_INSTRUMENT
+        if models:
+            return ML_MODEL_JOIN.join(models)
+        return NO_ML_MODEL
+    return UNKNOWN_INSTRUMENT
+
+
+BREAKDOWN_DIMENSIONS = ("model", "dataset", "agent", "instrument", "ml_model")
 
 
 def breakdown(runs: list[dict], by: str) -> list[dict]:
     """Aggregate stored runs along one dimension: ``model`` (provider/model),
-    ``dataset``, ``agent`` (personality), or ``instrument`` (the symbol the run
-    traded). Averages skip runs where a metric is unavailable (no judge report,
-    oracle ceiling of 0). Each row also carries ``best_run`` -- the identity
-    (model, agent, dataset, instrument, run id) of the single run behind
+    ``dataset``, ``agent`` (personality), ``instrument`` (the symbol the run
+    traded), or ``ml_model`` (the saved model behind its decisions, with LLM
+    runs grouped by provider). Averages skip runs where a metric is unavailable
+    (no judge report, oracle ceiling of 0). Each row also carries ``best_run``
+    -- the identity (model, agent, dataset, instrument, run id) of the run behind
     ``best_return_pct``, since the other dimensions are invisible in a
     breakdown along one of them.
 
@@ -277,6 +344,8 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
             key = dataset_key(record)
         elif by == "instrument":
             key = instrument_key(record)
+        elif by == "ml_model":
+            key = ml_model_key(record)
         else:
             key = config.get("personality") or "?"
         group = groups.setdefault(
@@ -295,6 +364,7 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
                     "personality": config.get("personality") or "",
                     "dataset": record.get("dataset") or "",
                     "instrument": instrument_key(record),
+                    "ml_model": ml_model_key(record),
                 }
         if summary.get("profit_efficiency") is not None:
             group["efficiencies"].append(float(summary["profit_efficiency"]))

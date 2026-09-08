@@ -2050,10 +2050,48 @@ def render_simulate_tab() -> None:
 # the symbol a run traded, which is a dimension in its own right here: the same
 # rule set over AAPL and over INTC is two configurations, and whether a result
 # is the strategy or the tape is exactly what comparing them answers.
+# "LLM / rules" is what used to be called "Model". It was renamed when "ML
+# model" arrived beside it: the old name covered the LLM behind a personality
+# *and* the rule set behind a rule agent, which is a different axis entirely
+# from which saved artifact out of `Code/Models` produced the decisions, and
+# two adjacent buttons both reading "Model" would have made the page unusable.
 _BREAKDOWN_DIMENSIONS = {
-    "Agent": "agent", "Model": "model", "Dataset": "dataset",
-    "Instrument": "instrument",
+    "Agent": "agent", "LLM / rules": "model", "Dataset": "dataset",
+    "Instrument": "instrument", "ML model": "ml_model",
 }
+
+
+def _ml_model_label(key: str) -> str:
+    """One ML-model breakdown row, named for a reader rather than for the store.
+
+    Three shapes, because `results.ml_model_key` produces three: a provider for
+    an LLM run, a set of `apple_models` keys for a rule run, and the sentinels
+    for a rule set that names none. Model names come from the registry, so
+    renaming a model there moves the row label with it.
+
+    The names are shortened to what identifies the model -- the breakdown table
+    does not wrap, and a rule set naming two models would otherwise put a
+    hundred characters in the first column.
+    """
+    if key.startswith(sim_results.LLM_MODEL_PREFIX):
+        return f"{key[len(sim_results.LLM_MODEL_PREFIX):]} (LLM)"
+    if not key or key in (sim_results.NO_ML_MODEL, sim_results.UNKNOWN_INSTRUMENT):
+        return key or sim_results.UNKNOWN_INSTRUMENT
+
+    def _short(model_key: str) -> str:
+        # Membership, not `apple_models.get`: that deliberately falls back to
+        # the default model for an unknown key so a stored run still replays,
+        # which here would print a real model's name over a key that is not
+        # one. A key this does not recognise is shown as itself.
+        model = apple_models.MODELS.get(model_key)
+        if model is None:
+            return model_key
+        label = model.label
+        for cut in (" (", " →"):
+            label = label.split(cut)[0]
+        return label.strip() or model_key
+
+    return " + ".join(_short(k) for k in key.split(sim_results.ML_MODEL_JOIN))
 
 # Ranking metrics for the top-runs cards, mapped to their `summary` keys.
 _TOP_RUN_METRICS = {"Best return": "return_pct", "Profit efficiency": "profit_efficiency"}
@@ -2093,6 +2131,7 @@ def _best_run_tooltip(best: "dict | None") -> str:
         # along any one dimension the rest are invisible, and which symbol
         # produced a number is not a detail on this page.
         f"Instrument: {best.get('instrument') or '?'}",
+        "ML model: " + _ml_model_label(best.get("ml_model") or ""),
     ]
     if best.get("run_id"):
         lines.append(f"Run: {best['run_id']}")
@@ -2273,13 +2312,27 @@ def render_summary_tab() -> None:
     st.markdown("##### Breakdown")
     dim_label = st.segmented_control(
         "Break down by", list(_BREAKDOWN_DIMENSIONS), default="Agent",
-        key="results_breakdown_dim",
+        # Keyed apart from the pre-"ML model" control: that one stored the
+        # chosen *label*, and "Model" is no longer one of the options.
+        key="results_breakdown_dim_v2",
     ) or "Agent"
     dimension = _BREAKDOWN_DIMENSIONS[dim_label]
     rows = sim_results.breakdown(runs, dimension)
-    if dimension == "agent":
+    # Both of these group on a stable key and render a human label, so a
+    # renamed agent or model moves the row without rewriting stored runs.
+    relabel = {"agent": _agent_label, "ml_model": _ml_model_label}.get(dimension)
+    if relabel:
         for row in rows:
-            row["group"] = _agent_label(row["group"])
+            row["group"] = relabel(row["group"])
+    if dimension == "ml_model":
+        st.caption(
+            ":material/info: What the run's decisions actually came out of. Apple "
+            "Trader names one model and that model *is* its strategy; Apple Trader 2 "
+            "names them per condition, so a rule set reads none, one or several and "
+            "the set is the row. An LLM agent loads no saved model at all, so those "
+            "runs are grouped by **provider** — the rows are comparable as "
+            "*approaches*, not as one model against another."
+        )
     _render_breakdown_table(rows, dim_label)
     col_eff, col_score = st.columns(2)
     eff_rows = [r for r in rows if r["avg_profit_efficiency"] is not None]
