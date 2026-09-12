@@ -62,7 +62,9 @@ from .config import (
     CHART_POLL_SEC,
     DATA_SOURCES,
     DEFAULT_DATA_SOURCE,
+    DEFAULT_HISTORY_FEED,
     FEEDS,
+    HISTORY_FEEDS,
     MAX_BARS,
     NEWS_IMPACT_COLORS,
     OPTIONS_POLL_SEC,
@@ -109,6 +111,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
+from . import bar_history
 from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
     analyze_intraday,
@@ -659,7 +662,8 @@ def _live_chart_controls() -> None:
                     try:
                         added, source = backfill_bars(
                             sym_state.symbol, state.api_key, state.api_secret,
-                            state.feed, sym_state, state.timeframe,
+                            state.history_feed_resolved or state.history_feed,
+                            sym_state, state.timeframe,
                         )
                     except Exception as exc:
                         st.error(f"Backfill failed for {sym_state.symbol}: {exc}")
@@ -1846,6 +1850,7 @@ def _agent_panel(
     feed: str = "iex",
     data_source: str = DEFAULT_DATA_SOURCE,
     finnhub_token: str = "",
+    history_feed: str = DEFAULT_HISTORY_FEED,
 ) -> None:
     state = _get_state()
     st.caption(
@@ -2011,6 +2016,7 @@ def _agent_panel(
                     stream_ready = _start_live_session(
                         state, syms, key, secret, feed, timeframe,
                         data_source=data_source, finnhub_token=finnhub_token,
+                        history_feed=history_feed,
                     )
         if stream_ready:
             if not market_hours.is_market_open():
@@ -2287,6 +2293,7 @@ def _start_live_session(
     timeframe: str,
     data_source: str = DEFAULT_DATA_SOURCE,
     finnhub_token: str = "",
+    history_feed: str = DEFAULT_HISTORY_FEED,
 ) -> bool:
     """Load history for every symbol and launch the bars + news streams.
 
@@ -2302,15 +2309,20 @@ def _start_live_session(
     state.api_key = key
     state.api_secret = secret
     state.finnhub_token = finnhub_token
+    state.history_feed = history_feed
+    # Resolved once, here, and reused by the backfill and the fallback poll: the
+    # whole buffer has to carry one set of volume units (see bar_history).
+    state.history_feed_resolved = bar_history.resolve_history_feed(
+        history_feed, syms[0], key, secret, timeframe
+    )
     loaded: list[str] = []
     for sym in syms:
         sym_state = state.sym(sym)
         with st.spinner(f"Loading history for {sym}…"):
             try:
-                historical_bars = fetch_bars(sym, timeframe, MAX_BARS, key, secret, feed)
-                log_fetch(
-                    "bars (initial load)", "Alpaca REST", symbol=sym,
-                    detail=f"{len(historical_bars)} {timeframe} bars",
+                historical_bars, _ = bar_history.fetch_and_log(
+                    sym, timeframe, key, secret, state.history_feed_resolved,
+                    limit=MAX_BARS, what="bars (initial load)",
                 )
                 historical_trades = fetch_trades(sym, key, secret, feed)
                 log_fetch(
@@ -2360,6 +2372,7 @@ def _start_live_session(
     launch_stream(
         syms, key, secret, feed, state, timeframe,
         data_source=data_source, finnhub_token=finnhub_token,
+        history_feed=state.history_feed_resolved,
     )
     launch_stream_news(
         syms, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", "")
@@ -2416,8 +2429,30 @@ def build_ui() -> None:
                 FEEDS,
                 index=0,
                 help=(
-                    "Which Alpaca feed the REST history, backfill and quote poll read — and, "
-                    "when the source above is Alpaca, what the live socket streams."
+                    "Which Alpaca feed the live socket streams when the source above is "
+                    "Alpaca, and which feed the bid/ask quote poll reads. Historical bars "
+                    "have their own setting below."
+                ),
+            )
+            history_feed = st.selectbox(
+                "History / backfill source",
+                HISTORY_FEEDS,
+                index=0,
+                help=(
+                    "Where REST bars come from — the initial history load, the timeframe "
+                    "reload, the periodic backfill and the stream-down fallback poll, which "
+                    "all fill the same buffer the live socket fills.\n\n"
+                    "**IEX carries under 4% of consolidated volume** (measured on AAPL: 1.56M "
+                    "vs 41.6M shares over the same 390 minutes), so IEX history next to a "
+                    "consolidated live stream puts a ~26x volume step mid-series that "
+                    "relative volume, the volume profile and the models' volume features all "
+                    "sum across.\n\n"
+                    "**auto** (recommended) uses Alpaca SIP — real-time on a paid plan, or "
+                    "held back 16 minutes on a free/basic plan, which refuses only the "
+                    "trailing 15 minutes. Delayed SIP is still the right backfill source: "
+                    "backfill repairs *holes*, and the live stream already owns the recent "
+                    "window. Failing that it uses yfinance (within 1.5% of SIP, free, ~15 min "
+                    "delayed, ~7 days of minute history), and IEX only when neither answers."
                 ),
             )
             api_key = st.text_input(
@@ -2464,8 +2499,13 @@ def build_ui() -> None:
                 for sym_state in state.iter_symbol_states():
                     sym = sym_state.symbol
                     try:
-                        historical_bars = fetch_bars(
-                            sym, timeframe, MAX_BARS, state.api_key, state.api_secret, state.feed
+                        historical_bars, _ = bar_history.fetch_and_log(
+                            sym, timeframe, state.api_key, state.api_secret,
+                            bar_history.resolve_history_feed(
+                                state.history_feed, sym, state.api_key,
+                                state.api_secret, timeframe,
+                            ),
+                            limit=MAX_BARS, what="bars (timeframe reload)",
                         )
                     except Exception as exc:
                         log_fetch_failure(
@@ -2504,6 +2544,7 @@ def build_ui() -> None:
                 _start_live_session(
                     state, syms, key, secret, feed, timeframe,
                     data_source=data_source, finnhub_token=finnhub_token,
+                    history_feed=history_feed,
                 )
 
         if stop_clicked:
@@ -2552,6 +2593,7 @@ def build_ui() -> None:
             feed=feed,
             data_source=data_source,
             finnhub_token=finnhub_token,
+            history_feed=history_feed,
         )
 
     with tab_models:

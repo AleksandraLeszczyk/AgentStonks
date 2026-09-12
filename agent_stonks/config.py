@@ -21,6 +21,31 @@ FINNHUB_STREAM_URL = "wss://ws.finnhub.io?token={token}"
 DATA_SOURCES = ["finnhub", "alpaca"]
 DEFAULT_DATA_SOURCE = "finnhub"
 
+# Where REST bars come from: the initial history load, the timeframe reload, the
+# periodic backfill and the stream-down fallback poll all fill the same buffer
+# the live socket is filling, so they share one setting (see
+# agent_stonks.bar_history for the measurements behind it).
+#
+# IEX carries under 4% of consolidated volume -- 1.56M vs 41.6M shares over the
+# same 390 AAPL minutes -- so pairing IEX history with a consolidated live stream
+# puts a ~26x volume step in the middle of the series that every volume-derived
+# read then sums across. "auto" therefore means the consolidated tape wherever
+# one is reachable: Alpaca SIP if the key is subscribed, else yfinance (within
+# 1.5% of SIP, free, but ~15 minutes delayed and only ~7 days of minute
+# history), and IEX only when neither can answer.
+HISTORY_FEEDS = ["auto", "sip", "yfinance", "iex"]
+DEFAULT_HISTORY_FEED = "auto"
+
+# Alpaca's free/basic plans grant SIP only outside a trailing 15-minute window:
+# a request whose `end` reaches into it is refused with 403 "subscription does
+# not permit querying recent SIP data", while the same request ending 16 minutes
+# back returns the full consolidated tape. That is a real entitlement worth
+# using -- the backfill repairs *holes*, and a hole 16 minutes old still needs
+# filling -- so a key like that is served SIP with the window held back by this
+# many minutes rather than being demoted to yfinance. The live socket owns the
+# recent window either way.
+SIP_DELAY_MIN = 16
+
 # How often the Finnhub aggregator checks whether the bar it is filling has run
 # past its bucket. A bar must close on the clock rather than on the next trade,
 # or a symbol that stops printing freezes `previous_minute_close` -- the field

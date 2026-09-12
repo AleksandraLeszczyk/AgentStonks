@@ -1,4 +1,4 @@
-from agent_stonks import stream
+from agent_stonks import bar_history, stream
 from agent_stonks.state import AppState
 
 
@@ -30,7 +30,7 @@ def test_fallback_bars_loop_updates_state_from_rest_when_disconnected(monkeypatc
     app.bars_connected = False
     bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
 
-    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(bar_history, "fetch_bars", lambda *a, **k: bars)
     monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(1))
@@ -54,7 +54,7 @@ def test_fallback_bars_loop_polls_every_symbol(monkeypatch):
         polled.append(symbol)
         return bars
 
-    monkeypatch.setattr(stream, "fetch_bars", _fetch_bars)
+    monkeypatch.setattr(bar_history, "fetch_bars", _fetch_bars)
     monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
 
     stream._fallback_bars_loop(["AAPL", "TSLA"], "k", "s", "iex", app, "1Min", _StopAfter(1))
@@ -69,7 +69,7 @@ def test_fallback_bars_loop_refreshes_quote_when_disconnected(monkeypatch):
     app.bars_connected = False
     bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
 
-    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(bar_history, "fetch_bars", lambda *a, **k: bars)
     monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
     monkeypatch.setattr(
         stream, "fetch_latest_quote", lambda *a, **k: {"bp": 1.55, "bs": 10, "ap": 1.57, "as": 20}
@@ -103,7 +103,7 @@ def test_fallback_bars_loop_keeps_last_quote_when_quote_fetch_fails(monkeypatch)
     state.ask_price = 1.6
     bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
 
-    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(bar_history, "fetch_bars", lambda *a, **k: bars)
     monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
 
     def _raise(*a, **k):
@@ -126,7 +126,7 @@ def test_fallback_bars_loop_backfills_instead_of_polling_when_stream_connected(m
     live_bar = {"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}
     missed_bar = {"t": "2024-01-01T14:01:00Z", "o": 1.5, "h": 1.6, "l": 1.4, "c": 1.6, "v": 50}
     state.bars.append(live_bar)
-    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: [dict(live_bar, c=9.9), missed_bar])
+    monkeypatch.setattr(bar_history, "fetch_bars", lambda *a, **k: [dict(live_bar, c=9.9), missed_bar])
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(2))
 
@@ -143,8 +143,8 @@ def test_fallback_bars_loop_falls_back_to_yfinance_when_rest_fails(monkeypatch):
     def _raise(*a, **k):
         raise RuntimeError("Alpaca down")
 
-    monkeypatch.setattr(stream, "fetch_bars", _raise)
-    monkeypatch.setattr(stream, "fetch_intraday_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(bar_history, "fetch_bars", _raise)
+    monkeypatch.setattr(bar_history, "fetch_intraday_bars", lambda *a, **k: bars)
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(1))
 
@@ -277,7 +277,7 @@ def test_fallback_bars_loop_fires_volume_alert(monkeypatch):
     state.alerts = [{"symbol": "AAPL", "field": "day_volume", "condition": "above", "value": 50.0}]
     bars = [{"t": "2024-01-01T14:00:00Z", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 100}]
 
-    monkeypatch.setattr(stream, "fetch_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(bar_history, "fetch_bars", lambda *a, **k: bars)
     monkeypatch.setattr(stream, "fetch_trades", lambda *a, **k: [{"p": 1.6}])
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(1))
@@ -331,13 +331,13 @@ class TestBackfillBars:
         _, state = _app()
         state.bars.append(_bar("2024-01-01T14:00:00Z"))
         monkeypatch.setattr(
-            stream, "fetch_bars", lambda *a, **k: [_bar("2024-01-01T14:01:00Z")]
+            bar_history, "fetch_bars", lambda *a, **k: [_bar("2024-01-01T14:01:00Z")]
         )
 
-        added, source = stream.backfill_bars("AAPL", "k", "s", "iex", state, "1Min")
+        added, source = stream.backfill_bars("AAPL", "k", "s", "sip", state, "1Min")
 
         assert added == 1
-        assert source == "Alpaca REST"
+        assert source == bar_history.SOURCE_LABELS["sip"]
 
     def test_falls_back_to_yfinance_when_rest_fails(self, monkeypatch):
         _, state = _app()
@@ -345,19 +345,19 @@ class TestBackfillBars:
         def _boom(*a, **k):
             raise RuntimeError("REST down")
 
-        monkeypatch.setattr(stream, "fetch_bars", _boom)
+        monkeypatch.setattr(bar_history, "fetch_bars", _boom)
         seen = {}
 
         def _yf(symbol, interval="1m"):
             seen["interval"] = interval
             return [_bar("2024-01-01T14:00:00Z")]
 
-        monkeypatch.setattr(stream, "fetch_intraday_bars", _yf)
+        monkeypatch.setattr(bar_history, "fetch_intraday_bars", _yf)
 
-        added, source = stream.backfill_bars("AAPL", "k", "s", "iex", state, "5Min")
+        added, source = stream.backfill_bars("AAPL", "k", "s", "yfinance", state, "5Min")
 
         assert added == 1
-        assert source == "yfinance (delayed)"
+        assert source == bar_history.SOURCE_LABELS["yfinance"]
         assert seen["interval"] == "5m"
 
 

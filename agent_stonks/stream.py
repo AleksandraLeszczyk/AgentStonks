@@ -23,11 +23,13 @@ from .config import (
     BACKFILL_POLL_SEC,
     BARS_STREAM_URL,
     DEFAULT_DATA_SOURCE,
+    DEFAULT_HISTORY_FEED,
     FALLBACK_POLL_SEC,
     MAX_BARS,
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
 )
+from . import bar_history
 from . import finnhub_stream
 from . import scoring
 from . import stream_common
@@ -57,45 +59,30 @@ _YF_INTERVALS: dict[str, str] = {
 
 
 def backfill_bars(
-    symbol: str, key: str, secret: str, feed: str, state: SymbolState, timeframe: str
+    symbol: str, key: str, secret: str, history_feed: str, state: SymbolState, timeframe: str
 ) -> tuple[int, str]:
     """Repair holes in one symbol's live bar series from a slower-but-complete source.
 
     The WS stream never re-delivers bars that closed while the socket was down,
-    and on the IEX feed a minute without an IEX trade produces no bar at all --
-    both leave permanent gaps in state.bars. Primary source is Alpaca REST
-    (same feed as the stream, so volumes stay comparable); if that fails,
-    delayed consolidated yfinance bars are used where the timeframe has an
-    equivalent. Only missing timestamps are inserted -- streamed bars are never
-    overwritten. Returns (bars_added, source_name).
+    and a minute without a trade on the streamed venue produces no bar at all --
+    both leave permanent gaps in state.bars. Only missing timestamps are
+    inserted, so streamed bars are never overwritten.
+
+    `history_feed` is the session's resolved REST bar source, NOT the stream's
+    feed -- the two are deliberately separate. Repairing a consolidated live
+    series with IEX bars would fill the holes with bars carrying under 4% of the
+    volume of the ones around them, which is worse than leaving the hole: a gap
+    is visible, a 26x-understated bar is not. See `agent_stonks.bar_history`.
+
+    Returns (bars_added, source_name).
     """
-    failures: list[tuple[str, object]] = []
-    consequence = "gaps in the bar series stay unrepaired until the next backfill"
     try:
-        fetched = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
-        source = "Alpaca REST"
-    except Exception as exc:
-        failures.append(("Alpaca REST", exc))
-        yf_interval = _YF_INTERVALS.get(timeframe)
-        if yf_interval is None:
-            log_fetch_failure(
-                "bar backfill",
-                failures,
-                symbol=symbol,
-                consequence=f"no yfinance equivalent for {timeframe}; {consequence}",
-            )
-            raise
-        try:
-            fetched = fetch_intraday_bars(symbol, interval=yf_interval)
-        except Exception as exc2:
-            log_fetch_failure(
-                "bar backfill",
-                failures + [("yfinance", exc2)],
-                symbol=symbol,
-                consequence=consequence,
-            )
-            raise
-        source = "yfinance (delayed)"
+        fetched, source, failures = bar_history.fetch_history_bars(
+            symbol, timeframe, key, secret, history_feed, what="bar backfill"
+        )
+    except Exception:
+        # fetch_history_bars already logged every source it tried.
+        raise
     added = merge_missing_bars(state, fetched)
     log_fetch(
         "bar backfill",
@@ -108,26 +95,32 @@ def backfill_bars(
 
 
 def _backfill_quietly(
-    symbol: str, key: str, secret: str, feed: str, state: SymbolState, timeframe: str
+    symbol: str, key: str, secret: str, history_feed: str, state: SymbolState, timeframe: str
 ) -> None:
     """backfill_bars wrapped for background use: swallow failures (already logged)."""
     try:
-        backfill_bars(symbol, key, secret, feed, state, timeframe)
+        backfill_bars(symbol, key, secret, history_feed, state, timeframe)
     except Exception:
         pass
 
 
 def _backfill_all_quietly(
-    symbols: list[str], key: str, secret: str, feed: str, app: AppState, timeframe: str
+    symbols: list[str], key: str, secret: str, history_feed: str, app: AppState, timeframe: str
 ) -> None:
     for symbol in symbols:
         sym_state = app.sym(symbol)
         if sym_state is not None:
-            _backfill_quietly(symbol, key, secret, feed, sym_state, timeframe)
+            _backfill_quietly(symbol, key, secret, history_feed, sym_state, timeframe)
 
 
 def _start_stream(
-    symbols: list[str], key: str, secret: str, feed: str, app: AppState, timeframe: str = "1Min"
+    symbols: list[str],
+    key: str,
+    secret: str,
+    feed: str,
+    app: AppState,
+    timeframe: str = "1Min",
+    history_feed: str = DEFAULT_HISTORY_FEED,
 ) -> None:
     """Open one Alpaca WebSocket and stream real-time bars/trades/quotes for
     every subscribed symbol into its SymbolState."""
@@ -164,7 +157,7 @@ def _start_stream(
                 # down is gone unless fetched again, so repair the holes now.
                 threading.Thread(
                     target=_backfill_all_quietly,
-                    args=(symbols, key, secret, feed, app, timeframe),
+                    args=(symbols, key, secret, history_feed, app, timeframe),
                     daemon=True,
                 ).start()
                 continue
@@ -293,27 +286,30 @@ def _start_stream(
 
 
 def _poll_symbol_via_rest(
-    symbol: str, key: str, secret: str, feed: str, state: SymbolState, timeframe: str
+    symbol: str,
+    key: str,
+    secret: str,
+    feed: str,
+    state: SymbolState,
+    timeframe: str,
+    history_feed: str = DEFAULT_HISTORY_FEED,
 ) -> "str | None":
     """One REST fallback refresh of a single symbol's bars/price/quote.
+
+    This one *replaces* the whole bar buffer rather than merging into it, so the
+    feed it reads decides the volume units of the entire series until the socket
+    comes back -- all the more reason for it to be the same consolidated source
+    the rest of the session uses. Quotes and the latest trade still come off the
+    Alpaca `feed`, which is the only place either is available.
+
     Returns the bar source name on success, None when no bars were available."""
-    bar_failures: list[tuple[str, object]] = []
     try:
-        bars = fetch_bars(symbol, timeframe, MAX_BARS, key, secret, feed, lookback_hours=16)
-        source = "Alpaca REST"
-    except Exception as exc:
-        bar_failures.append(("Alpaca REST", exc))
-        try:
-            bars = fetch_intraday_bars(symbol)
-            source = "yfinance (delayed)"
-        except Exception as exc2:
-            log_fetch_failure(
-                "bars",
-                bar_failures + [("yfinance", exc2)],
-                symbol=symbol,
-                consequence="no price data this cycle",
-            )
-            return None
+        bars, source, bar_failures = bar_history.fetch_history_bars(
+            symbol, timeframe, key, secret, history_feed, what="bars"
+        )
+    except Exception:
+        # fetch_history_bars already logged every source it tried.
+        return None
     if not bars:
         log_fetch(
             "bars", source, symbol=symbol, detail="0 bars returned", failures=bar_failures
@@ -439,6 +435,7 @@ def _fallback_bars_loop(
     timeframe: str,
     stop_event: threading.Event,
     data_source: str = DEFAULT_DATA_SOURCE,
+    history_feed: str = DEFAULT_HISTORY_FEED,
 ) -> None:
     """REST-polling fallback that keeps prices flowing for every symbol while the
     bars/trades WS isn't connected. Alpaca's per-key streaming connection limit
@@ -462,7 +459,7 @@ def _fallback_bars_loop(
             now = time.monotonic()
             if now - last_backfill >= BACKFILL_POLL_SEC:
                 last_backfill = now
-                _backfill_all_quietly(symbols, key, secret, feed, app, timeframe)
+                _backfill_all_quietly(symbols, key, secret, history_feed, app, timeframe)
             if data_source == "finnhub":
                 _refresh_quotes_via_rest(symbols, key, secret, feed, app)
             continue
@@ -471,7 +468,9 @@ def _fallback_bars_loop(
             sym_state = app.sym(symbol)
             if sym_state is None:
                 continue
-            source = _poll_symbol_via_rest(symbol, key, secret, feed, sym_state, timeframe)
+            source = _poll_symbol_via_rest(
+                symbol, key, secret, feed, sym_state, timeframe, history_feed
+            )
             if source:
                 polled_sources.append(source)
         if polled_sources:
@@ -503,6 +502,7 @@ def launch_stream(
     timeframe: str = "1Min",
     data_source: str = DEFAULT_DATA_SOURCE,
     finnhub_token: str = "",
+    history_feed: str = "",
 ) -> None:
     """Close any existing bars/trades stream and start a new background thread
     streaming every symbol over one socket, plus a REST-polling fallback that
@@ -513,9 +513,19 @@ def launch_stream(
     ready-made bars, trades and quotes from the chosen `feed`. Either way the
     Alpaca credentials are still required -- the REST fallback, the backfill and
     (under Finnhub) the quote poll all run on them.
+
+    `history_feed` is the already-resolved REST bar source; passing "" resolves
+    it here (and caches it on the app) for callers that did not. It is resolved
+    once rather than per fetch so the whole session's buffer keeps one set of
+    volume units -- see `agent_stonks.bar_history`.
     """
     source = resolve_data_source(data_source, finnhub_token)
     app.data_source = source
+    if not history_feed:
+        history_feed = app.history_feed_resolved or bar_history.resolve_history_feed(
+            app.history_feed, symbols[0] if symbols else "AAPL", key, secret, timeframe
+        )
+    app.history_feed_resolved = history_feed
     if app.ws:
         try:
             app.ws.close()
@@ -537,11 +547,13 @@ def launch_stream(
         finnhub_stream.launch(symbols, finnhub_token, app, timeframe, stop_event)
     else:
         threading.Thread(
-            target=_start_stream, args=(symbols, key, secret, feed, app, timeframe), daemon=True
+            target=_start_stream,
+            args=(symbols, key, secret, feed, app, timeframe, history_feed),
+            daemon=True,
         ).start()
     threading.Thread(
         target=_fallback_bars_loop,
-        args=(symbols, key, secret, feed, app, timeframe, stop_event, source),
+        args=(symbols, key, secret, feed, app, timeframe, stop_event, source, history_feed),
         daemon=True,
     ).start()
 

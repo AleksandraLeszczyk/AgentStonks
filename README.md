@@ -25,7 +25,8 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - **ML predicted profile** — overlay of where today's volume is predicted to trade, from a LightGBM quantile-function (density/EMD) model trained on the LevelsML workflow at the 9:30 open; the mixture fit can target either the live volume or this predicted curve. Needs the optional `lightgbm` dependency and the trained pack at `../Models/open_profile_lgbm.json.gz` (retrain with `Models/train_open_profile.py`; override the location with `OPEN_PROFILE_MODEL`)
 - **Model predictions on the chart** — a *Model Predictions* picker in Chart Settings draws what the trained models say about today, in the idiom each answer calls for. **Predicted day range** (TimeToChange3, made once at 09:35) and **predicted price profile range** (the LevelsML density model's outer quantiles and point of control) are horizontal lines, drawn in the candle chart *and* across the volume profile beside it, with a semi-transparent band over the session they cover. **Momentum regime changes** (TimeToChange2 — pick which of the two bundles answers) mark every change the session made with an icon, and a change the model expects to *persist* also gets a vertical line and a shaded window over the bars it should hold for; on a forecasting bundle the newest bar carries the turn probability, and its window reaches past the last bar, which is the one thing that widens the time axis. Each overlay is offered only for the symbols its model was fitted on, and a missing bundle or too little history is reported as a caption under the chart rather than a silently empty overlay
 - **Multi-timeframe** — 1Min, 5Min, 15Min, 30Min, 1Hour, 1Day
-- **IEX and SIP feeds** — switch between free (IEX) and paid (SIP) Alpaca data. Note that a Finnhub-streamed bar counts the consolidated tape while a backfilled IEX bar counts one venue, so volumes differ across that seam (the Finnhub numbers are the closer of the two to the market's real volume)
+- **IEX and SIP feeds** — switch between free (IEX) and paid (SIP) Alpaca data for the live socket and the bid/ask quote poll
+- **Consolidated bar history** — historical bars have their own source setting, separate from the stream's feed, because **IEX carries under 4% of consolidated volume** (measured on AAPL: 1.56M vs 41.6M shares over the same 390 one-minute bars). Pairing IEX history with a consolidated live stream would put a ~26x volume step mid-series that relative volume, the volume profile and the models' volume features all sum straight across. `auto` therefore prefers Alpaca SIP — real-time on a paid plan, or held back 16 minutes on a free/basic plan, which refuses only the trailing 15 minutes; delayed SIP is still the right backfill source, since backfill repairs *holes* and the live stream owns the recent window. Failing that it uses yfinance (within 1.5% of SIP, per-minute correlation 0.96), and IEX only when neither can answer
 
 ### 📰 News tab
 - Latest headlines from Alpaca news (falling back to WorldNews API), with orange vertical markers on the Live chart and optional LLM impact scoring, filterable per symbol
@@ -172,7 +173,7 @@ docker run -p 8501:8501 --env-file .env agentstonks
 
 Credentials can also be entered directly in the sidebar (Alpaca) or the Agent tab (LLM provider); env vars are used as fallback. At least one LLM provider key is required to use the Agent tab or LLM news impact scoring.
 
-> **Note:** Free Alpaca accounts have access to the IEX feed only during US market hours (9:30–16:00 ET).
+> **Note:** Free Alpaca accounts stream the IEX feed only, and only during US market hours (9:30–16:00 ET). They *do* get the consolidated SIP tape over REST outside a trailing 15-minute window, which is what the history/backfill source uses by default — IEX's ~4% share of consolidated volume makes it a poor match for a consolidated live stream.
 
 ## Project layout
 
@@ -192,6 +193,10 @@ agent_stonks/
                   the next trade
   stream_common.py — what both live sources do once a tick lands: alert/tactics sweep, bar-close
                   publication, volume-alert latch, timestamp bucketing and bar de-duplication
+  bar_history.py — the one place that decides where REST bars come from, shared by the initial
+                  load, the timeframe reload, the backfill and the stream-down fallback poll so
+                  one buffer never mixes feeds whose volumes differ by 26x; probes the key's SIP
+                  tier (real-time / 15min-delayed / none) and degrades consolidated-first
   datalog.py    — de-duplicated console logging of which data source served each fetch
                   (WebSocket, Alpaca REST, yfinance, WorldNews) and which fallbacks were tried
   historical.py — yfinance-based historical prices, dividends, earnings dates, static analysis

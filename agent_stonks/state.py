@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 from . import clock
 from .config import (
     DEFAULT_DATA_SOURCE,
+    DEFAULT_HISTORY_FEED,
     MAX_BARS,
     PAPER_STARTING_CASH,
     TACTICS_MOMENTUM_WINDOW_MIN,
@@ -207,6 +208,8 @@ _DEFAULTS: dict[str, object] = {
     "feed": "iex",
     "data_source": DEFAULT_DATA_SOURCE,
     "finnhub_token": "",
+    "history_feed": DEFAULT_HISTORY_FEED,
+    "history_feed_resolved": "",
     "api_key": "",
     "api_secret": "",
     "status": "Idle",
@@ -272,6 +275,13 @@ class AppState:
         # fallback, the bar backfill and the Finnhub quote poll all use them.
         self.data_source: str = DEFAULT_DATA_SOURCE
         self.finnhub_token: str = ""
+        # Where REST bars come from: `history_feed` is the configured choice
+        # ("auto" by default), `history_feed_resolved` the concrete feed the
+        # session settled on. Resolved once and reused, so the initial load, the
+        # backfill and the fallback poll can't fill one buffer from feeds whose
+        # volumes differ by 26x (see agent_stonks.bar_history).
+        self.history_feed: str = DEFAULT_HISTORY_FEED
+        self.history_feed_resolved: str = ""
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"
