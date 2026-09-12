@@ -8,9 +8,14 @@ rest load the real checkpoint and are skipped when it is not on this machine;
 what they pin is the bundle's *contract* with `persistence_model`, which is the
 thing that makes the model swappable at all.
 
-The numbers themselves were checked against notebook 07 at wiring time: given
-the notebook's own sequences for 2026-07-27, this module reproduces its four
-decisions and their probabilities (0.620 / 0.688 / 0.000 / 0.682) exactly.
+The bridge itself was checked against notebook 07 at wiring time: given the
+notebook's own sequences for 2026-07-27, this module reproduced its four
+decisions and their probabilities (0.620 / 0.688 / 0.000 / 0.682) exactly. That
+check pinned the *arithmetic*, and it still does -- but it was made against the
+AAPL checkpoint trained on the 19-session yfinance cache, which has since been
+replaced by one trained on the 36-session CSV archive (2026-09-09). The four
+probabilities above therefore describe a checkpoint no longer on disk; only the
+pure tests below still pin numbers this module computes today.
 """
 
 import numpy as np
@@ -160,7 +165,14 @@ class TestBundle:
     def test_the_threshold_is_the_one_picked_on_the_validation_events(self):
         # Not comparable to the classifier's: `p_full` is a survival
         # probability times a hard gate, and 0.5 means nothing on it.
-        assert pm.model_threshold(BUNDLE) == pytest.approx(0.05)
+        #
+        # Pinned deliberately, and it moves whenever AAPL is retrained -- it
+        # was 0.05 while the checkpoint came from the 19-session yfinance
+        # cache. Read the current value out of
+        # `Models/timetochange2_nbeats_AAPL.json` (`metrics.persistence.
+        # threshold`) rather than guessing when this fails; a threshold that
+        # changed without a retrain means a different model is on the path.
+        assert pm.model_threshold(BUNDLE) == pytest.approx(0.21)
 
     def test_residuals_are_the_training_windows_only(self):
         assert BUNDLE["n_residual_rows"] > 1000
@@ -347,7 +359,7 @@ class TestAppleModelsRegistry:
     @needs_model
     def test_loads_the_named_model_and_not_the_default(self):
         assert apple_models.load("nbeats") is BUNDLE
-        assert apple_models.threshold("nbeats") == pytest.approx(0.05)
+        assert apple_models.threshold("nbeats") == pytest.approx(0.21)
 
 
 @needs_model

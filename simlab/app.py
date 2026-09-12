@@ -805,15 +805,61 @@ def _price_chart(
 
 
 
+@st.cache_data(show_spinner=False)
+def _overlay_day(
+    _market: "SimMarket",
+    feed: str,
+    symbol: str,
+    day: date,
+    selected: tuple,
+    momentum_model: "str | None",
+) -> dict:
+    """One replayed day's overlay items, computed once per tape and selection.
+
+    Now that the run's own model is pre-selected, this runs on merely *opening*
+    a run rather than on asking for it, and it runs again on every rerun the
+    page does -- a filter change, a tab, the delete button. Scoring five
+    sessions through the N-BEATS bundle each time would make Results feel
+    broken, and the answer cannot move: a stored day's bars and a trained
+    model are both fixed. Same reasoning as `model_overlays.live_overlays`'
+    per-bar cache, a different lifetime.
+
+    The key is the tape (feed + symbol + day), not the run: two runs over the
+    same session get the same forecast, because the forecast is about the
+    session and never about who traded it. `_market` is excluded from the key
+    (Streamlit skips underscore-prefixed arguments) since it is a reader for
+    exactly that tape and holds nothing else the answer depends on.
+    """
+    t = _market.session_open(day) + timedelta(minutes=1)
+    return model_overlays.compute(
+        list(selected),
+        symbol,
+        _market.series[symbol].minute_bars,
+        daily_bars=_market.completed_daily_bars(symbol, t),
+        session_date=day,
+        open_price=_market.session_open_price(symbol, t),
+        momentum_model=momentum_model,
+    )
+
+
 def _run_overlay_controls(
     record: dict, market: "SimMarket", symbol: str, days: "list[date]"
 ) -> dict:
     """Pick which model predictions to draw over a replayed day, and compute them.
 
-    Deliberately available on *every* run, not only the ones a model drove: the
-    interesting question in Results is usually what a model would have said
-    about a day, and an LLM agent's tape is as good a place to ask it as a rule
-    agent's. Nothing here reads the run's own decisions.
+    **The run's own model is pre-selected.** Reading a result means asking
+    whether the model was right, and that question is one chart away only if
+    the chart already shows what the model said -- so a run driven by the
+    day-range forecast opens with that forecast over its candles, and a
+    momentum run opens with the regime marks of the very bundle it traded
+    (`simlab.results.ml_models` -> `model_overlays.for_models`). This is the
+    one place in the page that reads the run's configuration to decide what to
+    draw; everything below still just draws what is selected.
+
+    The picker stays, and stays available on *every* run, including the ones no
+    model drove: "what would the day-range model have said about this LLM
+    agent's tape" is the other question worth asking here, and an empty default
+    is the honest starting point when nothing in the run can answer it.
 
     Each day is scored on its own, from the state of the world at its 9:31 --
     completed daily bars strictly before it (`SimMarket.completed_daily_bars`)
@@ -825,43 +871,59 @@ def _run_overlay_controls(
     if not available:
         return {"items": [], "notes": []}
 
+    # What the run itself loaded, in the terms the overlay catalogue uses. A
+    # symbol tab the run's model was never fitted on drops out here rather than
+    # being offered as a default the picker has no option for.
+    ran = model_overlays.for_models(sim_results.ml_models(record) or [], symbol)
+
     run_id = record.get("run_id") or "run"
     selected = st.multiselect(
         "Model predictions",
         available,
+        default=ran["keys"],
         format_func=model_overlays.label,
         key=f"sim_overlays_{run_id}_{symbol}",
         help="What the trained models predicted for this session, drawn over "
         "the replayed tape: predicted ranges as horizontal lines, momentum "
         "changes as marked moments, time-spanning predictions as a shaded "
-        "background.",
+        "background. The model this run traded on is selected for you; add or "
+        "remove any of the others.",
     )
+    notes: list[str] = []
+    for key in ran["unmatched"]:
+        # Named off the registry rather than through `apple_models.get`, which
+        # answers an unknown key with the default model -- and a record can
+        # name a model that has since been renamed or retired. Saying the key
+        # back is honest; calling a retired model "Persistence classifier" is
+        # not.
+        model = apple_models.MODELS.get(key)
+        notes.append(
+            f"This run traded on {model.label if model else key}, and no overlay "
+            "draws what it predicts — so the chart shows the tape it traded, not "
+            "its forecasts."
+        )
     if not selected:
-        return {"items": [], "notes": []}
+        return {"items": [], "notes": notes}
 
     momentum_model = None
     if model_overlays.MOMENTUM_KEY in selected:
         momentum_keys = [k for k in apple_models.keys() if apple_models.is_momentum(k)]
+        # Defaulted to the bundle the run actually asked, so the marks on the
+        # chart are the numbers behind its trades rather than the other model's
+        # opinion of the same bars.
+        ran_momentum = ran["momentum_model"]
         momentum_model = st.selectbox(
             "Momentum model",
             momentum_keys,
+            index=momentum_keys.index(ran_momentum) if ran_momentum in momentum_keys else 0,
             format_func=lambda key: apple_models.get(key).label,
             key=f"sim_overlay_model_{run_id}_{symbol}",
         )
 
     items: list[dict] = []
-    notes: list[str] = []
-    bars = market.series[symbol].minute_bars
     for day in days:
-        t = market.session_open(day) + timedelta(minutes=1)
-        result = model_overlays.compute(
-            selected,
-            symbol,
-            bars,
-            daily_bars=market.completed_daily_bars(symbol, t),
-            session_date=day,
-            open_price=market.session_open_price(symbol, t),
-            momentum_model=momentum_model,
+        result = _overlay_day(
+            market, market.feed, symbol, day, tuple(selected), momentum_model
         )
         items.extend(result["items"])
         for note in result["notes"]:

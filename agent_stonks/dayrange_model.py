@@ -18,26 +18,49 @@ rather than a per-bar signal -- see `apple_trader.DayRangeTrader`.
 What "best model" means here
 ----------------------------
 TimeToChange3 fitted three predictors on the same daily features and blends
-them equally, then adds a second stage and a constraint. All four parts are in
-the saved bundle and all four are loaded:
+them equally, then adds a second stage and a constraint:
 
 1. **LightGBM**, **N-BEATS** and **N-HiTS** each predict both targets from the
    daily table (and, for the two networks, a 32-day lookback of eight per-day
-   channels). Equal-weight blend.
+   channels). Equal-weight blend. Always present.
 2. An **opening ridge** learns what the first five minutes add on top of the
-   daily prediction, fitted to its residuals over the 20 sessions where minute
-   data existed.
+   daily prediction, fitted to its residuals over the sessions where minute
+   data exists. **Optional, and it is missing on INTC** -- see below.
 3. The prediction is **clipped to contain the observed 5-minute range** -- the
-   day's high cannot come in below a high that has already printed.
+   day's high cannot come in below a high that has already printed. Always
+   applied.
 
-On a 129-session test window the blend's mean absolute error is 0.0077 in log
-units ($2.12), against 0.0110 for a 14-day rolling baseline and 0.0135 for
-persistence -- 30% of the baseline's error removed, and the ordering holds
-across all four walk-forward refits. That is the number worth quoting, and it
-is a statement about the *width* of the day. Notebook 3 showed direction is not
-predictable here before any model was fitted, and the feature importances
-agreed afterwards; the trading rule is built as a mean-reversion bet for
-exactly that reason.
+Whether part 2 ships is decided per ticker by a leave-one-out test in the
+notebook, and a bundle that failed it carries `correction=None`. `DayRangeModel`
+skips the term when it is absent, so both shapes load and predict; do not read
+a missing ridge as a broken file. As of the August 2026 retrain **AAPL and
+GOOGL have one and INTC does not** (its ridge measured -4.8% under
+leave-one-out, so it was dropped).
+
+Accuracy is per ticker, on a ~130-session test window ending where the minute
+data starts, never seen in training. Blend against a 14-day rolling baseline:
+
+    AAPL   0.0077 log units ($2.11)   30% of the baseline's error removed
+    GOOGL  0.0082 log units ($2.75)   39%
+    INTC   0.0216 log units ($1.72)   43%
+
+The dollar figures track share price more than skill -- INTC's is the smallest
+because it is a $100 stock, while its log error is the largest of the three.
+The ordering holds across all four walk-forward refits for every ticker.
+
+That is a statement about the *width* of the day. Notebook 3 showed direction is
+not predictable here before any model was fitted, and the feature importances
+agreed afterwards; the trading rule is built as a mean-reversion bet for exactly
+that reason.
+
+One caveat worth carrying: those test numbers are unaffected by how much minute
+data exists, because the test window ends where the minute data begins. The
+minute collection grew from 21 sessions to 31-36 in the August 2026 retrain and
+the daily metrics did not move at all. What moved was the opening stage --
+AAPL's measured benefit fell from +16.8% to +5.9% and INTC's rejection eased
+from -13.2% to -4.8%. Both extremes were small-sample artefacts, and the ridge
+is still fitted on only 30-35 rows. Treat part 2 as a small, uncertain
+adjustment, not as a second opinion of equal weight.
 
 The blend is the model, so a missing PyTorch makes this bundle unavailable
 rather than quietly degrading to LightGBM alone -- two of the three voters
@@ -84,6 +107,12 @@ bar carries roughly 4% of that, which moves the feature by about log(0.04) =
 -3.2 -- far outside anything it saw in training. `volume_scale_warning`
 reports it; the fix is to run the live stream and any SimLab dataset on a
 consolidated tape (`yfinance` or `sip`), not to patch the number.
+
+That feature only ever reaches the opening ridge, so on a bundle without one
+(**INTC**) it is computed, finiteness-checked and then unused -- the warning is
+harmless there rather than wrong. `volume_scale_warning` keys off the feed
+alone and does not know the ticker, so it will still fire; on INTC it can be
+ignored.
 """
 
 from __future__ import annotations
@@ -824,6 +853,11 @@ def volume_scale_warning(feed: "str | None") -> "str | None":
     range the ridge was fitted over, so its contribution stops being a
     correction and becomes a constant bias. SIP and yfinance are consolidated
     and fine.
+
+    This takes the feed and not the ticker, so it answers "is this tape on the
+    fitted scale", not "does this forecast use the feature". On a bundle with no
+    opening ridge (INTC as of the August 2026 retrain) nothing reads
+    `or_volume_share` and the warning is moot.
     """
     if str(feed or "").lower() != "iex":
         return None

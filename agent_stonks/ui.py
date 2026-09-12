@@ -60,6 +60,8 @@ from .config import (
     AGENT_PERFORMANCE_POLL_SEC,
     APPLE_TRADER_CYCLE_SEC,
     CHART_POLL_SEC,
+    DATA_SOURCES,
+    DEFAULT_DATA_SOURCE,
     FEEDS,
     MAX_BARS,
     NEWS_IMPACT_COLORS,
@@ -1838,7 +1840,12 @@ def _apple_trader2_params(symbols: list[str]) -> AppleTrader2Config:
 
 
 def _agent_panel(
-    symbols: list[str], alpaca_key: str = "", alpaca_secret: str = "", feed: str = "iex"
+    symbols: list[str],
+    alpaca_key: str = "",
+    alpaca_secret: str = "",
+    feed: str = "iex",
+    data_source: str = DEFAULT_DATA_SOURCE,
+    finnhub_token: str = "",
 ) -> None:
     state = _get_state()
     st.caption(
@@ -2002,7 +2009,8 @@ def _agent_panel(
                 else:
                     timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
                     stream_ready = _start_live_session(
-                        state, syms, key, secret, feed, timeframe
+                        state, syms, key, secret, feed, timeframe,
+                        data_source=data_source, finnhub_token=finnhub_token,
                     )
         if stream_ready:
             if not market_hours.is_market_open():
@@ -2271,18 +2279,29 @@ def _premarket_panel(symbols: list[str]) -> None:
 
 
 def _start_live_session(
-    state: AppState, syms: list[str], key: str, secret: str, feed: str, timeframe: str
+    state: AppState,
+    syms: list[str],
+    key: str,
+    secret: str,
+    feed: str,
+    timeframe: str,
+    data_source: str = DEFAULT_DATA_SOURCE,
+    finnhub_token: str = "",
 ) -> bool:
     """Load history for every symbol and launch the bars + news streams.
 
     Shared by the sidebar ▶ Start and the agent panel's ▶ Start Agent (which
     starts the stream itself when it isn't running yet). Returns True when the
-    streams were launched, False when loading any symbol failed."""
+    streams were launched, False when loading any symbol failed.
+
+    History, news and daily bars come from Alpaca REST whichever live source is
+    chosen; `data_source` only decides which WebSocket takes over from there."""
     state.set_symbols(syms)
     state.feed = feed
     state.timeframe = timeframe
     state.api_key = key
     state.api_secret = secret
+    state.finnhub_token = finnhub_token
     loaded: list[str] = []
     for sym in syms:
         sym_state = state.sym(sym)
@@ -2338,7 +2357,10 @@ def _start_live_session(
             except Exception as exc:
                 state.status = f"News impact scoring failed for {sym}: {exc}"
     state.status = "Connecting WebSocket…"
-    launch_stream(syms, key, secret, feed, state, timeframe)
+    launch_stream(
+        syms, key, secret, feed, state, timeframe,
+        data_source=data_source, finnhub_token=finnhub_token,
+    )
     launch_stream_news(
         syms, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", "")
     )
@@ -2365,7 +2387,39 @@ def build_ui() -> None:
             "analyses, and the trading agent cover every listed symbol.",
         )
         with st.expander("Connection"):
-            feed = st.selectbox("Feed", FEEDS, index=0)
+            data_source = st.selectbox(
+                "Live data source",
+                DATA_SOURCES,
+                index=0,
+                format_func=lambda s: {
+                    "finnhub": "Finnhub (trades → local candles)",
+                    "alpaca": "Alpaca (bars + quotes)",
+                }.get(s, s),
+                help=(
+                    "Which WebSocket fills the live bar series. **Finnhub** streams the "
+                    "consolidated trade tape and the candles are built from it here, so the "
+                    "newest candle is the minute in progress rather than the last one to "
+                    "close; it needs FINNHUB_API_KEY. **Alpaca** streams ready-made bars off "
+                    "the feed below and is the only one of the two that also streams "
+                    "bid/ask. Alpaca credentials are required either way — the REST "
+                    "fallback, the bar backfill and (under Finnhub) the quote poll all run "
+                    "on them."
+                ),
+            )
+            finnhub_token_input = st.text_input(
+                "Finnhub API Key",
+                type="password",
+                placeholder="From env FINNHUB_API_KEY if blank",
+            )
+            feed = st.selectbox(
+                "Alpaca feed",
+                FEEDS,
+                index=0,
+                help=(
+                    "Which Alpaca feed the REST history, backfill and quote poll read — and, "
+                    "when the source above is Alpaca, what the live socket streams."
+                ),
+            )
             api_key = st.text_input(
                 "Alpaca API Key",
                 type="password",
@@ -2376,6 +2430,7 @@ def build_ui() -> None:
                 type="password",
                 placeholder="From env ALPACA_SECRET if blank",
             )
+    finnhub_token = finnhub_token_input.strip() or os.getenv("FINNHUB_API_KEY", "")
     state = _get_state()
     symbols = _effective_symbols(state, symbols_input)
 
@@ -2388,7 +2443,11 @@ def build_ui() -> None:
 
     with tab_live:
         st.caption(
-            "⚠️ Free Alpaca accounts: IEX feed available during US market hours (9:30–16:00 ET). "
+            "Live candles are built locally from the Finnhub trade tape by default, so the "
+            "newest candle is the minute in progress. Bid/ask, the bar backfill and the "
+            "stream-down fallback still come from Alpaca REST — and on a free Alpaca "
+            "account the IEX feed only serves US market hours (9:30–16:00 ET). "
+            "Switch sources in the sidebar's Connection expander."
         )
         timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
 
@@ -2428,6 +2487,8 @@ def build_ui() -> None:
                     launch_stream(
                         list(state.symbols), state.api_key, state.api_secret,
                         state.feed, state, timeframe,
+                        data_source=state.data_source,
+                        finnhub_token=state.finnhub_token,
                     )
 
         if start_clicked:
@@ -2440,7 +2501,10 @@ def build_ui() -> None:
             elif not key or not secret:
                 st.error("API key and secret are required.")
             else:
-                _start_live_session(state, syms, key, secret, feed, timeframe)
+                _start_live_session(
+                    state, syms, key, secret, feed, timeframe,
+                    data_source=data_source, finnhub_token=finnhub_token,
+                )
 
         if stop_clicked:
             if state.bars_fallback_stop_event:
@@ -2481,7 +2545,14 @@ def build_ui() -> None:
         _options_walls_panel(symbols)
 
     with tab_agent:
-        _agent_panel(symbols, alpaca_key=api_key, alpaca_secret=api_secret, feed=feed)
+        _agent_panel(
+            symbols,
+            alpaca_key=api_key,
+            alpaca_secret=api_secret,
+            feed=feed,
+            data_source=data_source,
+            finnhub_token=finnhub_token,
+        )
 
     with tab_models:
         model_catalogue_panel()

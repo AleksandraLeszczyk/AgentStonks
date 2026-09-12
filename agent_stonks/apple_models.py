@@ -30,8 +30,8 @@ The four on offer
                the smoothed momentum score have shifted fifteen bars from now.
                Not a probability -- a signed quantity, whose sign is the
                reliable half (right on 94% / 86% of the holdout week's changes
-               on AAPL / INTC, against timing that is barely better than
-               chance).
+               on the two tickers it is wired up for, AAPL / INTC, against
+               timing that is barely better than chance).
 
 The first two are graded against each other on the same 35 events, and the gap
 is real but small -- notebook 07 replayed one held-out session through both and
@@ -57,9 +57,9 @@ of the model rather than of the app:
     momentum_change       AAPL and INTC -- TimeToChange trains and *selects*
                           per ticker off the same weekly bar archive, and the
                           selection genuinely differs: Ridge on AAPL,
-                          HistGradientBoosting on INTC. It was fitted for GOOGL
-                          too, but that bundle has been withdrawn from
-                          `Code/Models` and the ticker with it.
+                          HistGradientBoosting on INTC. GOOGL was fitted the
+                          same way (a RandomForest) and its bundle is installed
+                          again, but the ticker is not listed here yet.
 
 So the four models do **not** all cover the same symbols: AAPL and INTC carry
 every one, GOOGL carries the first three. That is exactly the state `keys_for`
@@ -128,11 +128,13 @@ DEFAULT_TICKER = "AAPL"
 # the symbol they were fitted on.
 #
 # Note that these are not the same set, and `keys_for` exists for exactly that
-# reason. The delta-momentum regressor no longer covers GOOGL: its bundle was
-# withdrawn from `Code/Models`, and a model listed here with no file behind it
-# is not a narrower menu, it is an agent that reports itself broken every time
-# somebody picks it. Re-adding GOOGL is one entry here plus the retrain named
-# in `momentum_change_model`'s docstring.
+# reason. The delta-momentum regressor does not cover GOOGL here even though a
+# GOOGL bundle is back in `Code/Models` (the refit on the full weekly archive
+# restored it): listing a ticker whose file is missing is the failure this
+# guards against, but the reverse -- a file no entry points at -- costs nothing
+# and is reversible in one line. Adding it back is that line plus the tests
+# that currently use the AAPL/INTC-vs-GOOGL split as their narrowed-menu
+# fixture; see `momentum_change_model`'s docstring for the numbers.
 MOMENTUM_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 MOMENTUM_CHANGE_TICKERS = (DEFAULT_TICKER, "INTC")
@@ -432,16 +434,18 @@ def threshold(
     """The cut-off the named momentum model chose on its own validation block.
 
     Not comparable across models: the classifier's is a posterior and N-BEATS'
-    is a survival probability times a hard gate, so 0.07 and 0.05 are the same
-    kind of number only by coincidence. And not defined at all outside
+    is a survival probability times a hard gate, so AAPL's 0.05 and 0.21 are
+    the same kind of number only by coincidence. And not defined at all outside
     `STRATEGY_MOMENTUM` -- a day-range forecast is a price, so there is no
     probability to cut. Callers should gate on `is_momentum` rather than read
     the 0.5 that a bundle without a threshold falls back to.
 
     **Not comparable across symbols either**, which is why `ticker` is here:
-    each is picked on that symbol's own validation events, so AAPL's 0.07 is
-    not GOOGL's. Omitting it answers for `DEFAULT_TICKER`, which was harmless
-    while TimeToChange2 had been run on AAPL alone and is a wrong number now.
+    each is picked on that symbol's own validation events, so N-BEATS' 0.21 on
+    AAPL is not its 0.41 on GOOGL or its 0.05 on INTC. Omitting it answers for
+    `DEFAULT_TICKER`, which was harmless while TimeToChange2 had been run on
+    AAPL alone and is a wrong number now. Every one of these moves when a
+    symbol is retrained; they are read from the bundle, never hard-coded here.
     """
     return persistence_model.model_threshold(
         bundle if bundle is not None else load(key, ticker)

@@ -320,6 +320,44 @@ def _persistence_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _nbeats_caveat(ticker: str, hard: dict) -> str:
+    """What choosing this model over the classifier does and does not buy.
+
+    Quoted from the checkpoint's *own* recorded hard half rather than from a
+    constant, because the constant went stale: notebook 6 measured 0.67 +/- 0.07
+    across four walk-forward folds on AAPL, and the AAPL checkpoint that number
+    described was retrained on 2026-09-09 against a larger archive, on which the
+    ordering against the classifier reverses. A caveat that keeps advertising a
+    superseded number is worse than none.
+    """
+    auc, n = hard.get("roc_auc"), hard.get("n")
+    scored = isinstance(auc, (int, float)) and isinstance(n, (int, float))
+    measured = (
+        f"On {ticker} this checkpoint scores **{auc:.2f}** on the hard half — the "
+        f"changes already passing pre-dwell ≥ 15 — on {int(n)} events of a single "
+        "held-out split, which is not a walk-forward. "
+        if scored
+        else ""
+    )
+    # The reversal is AAPL's alone; repeating it on a symbol it is not about
+    # reads as if the classifier beat this model there too.
+    verdict = (
+        "Notebook 6 adopted this route as the only entrant above chance on that "
+        "half across four walk-forward folds (0.67 ± 0.07), but it measured the "
+        "AAPL checkpoint retired on 2026-09-09; on the retrained one the incumbent "
+        "classifier scores higher (0.56 against 0.45), so on this symbol it is the "
+        "weaker of the two on the evidence available. "
+        if ticker.upper() == "AAPL"
+        else "The incumbent classifier scores below it on the same events, which is "
+        "the case for choosing it here. "
+    )
+    return (
+        f"{measured}{verdict}"
+        "The probability is a Monte-Carlo estimate (~0.015 SE at 500 paths), so a "
+        "candidate sitting on the threshold can move between runs."
+    )
+
+
 def _nbeats_spec(ticker: str) -> ModelSpec:
     path = _saved_path("APPLE_NBEATS_MODEL", "timetochange2_nbeats_{ticker}.pt", ticker)
     files = (
@@ -389,12 +427,7 @@ def _nbeats_spec(ticker: str) -> ModelSpec:
         requires=apple_models.get(apple_models.NBEATS_KEY).requires,
         available=available,
         unavailable_reason=reason,
-        caveat=(
-            "0.67 ± 0.07 on the hard half across four walk-forward folds — a real but "
-            "small effect measured on ~35 events, and the only entrant above chance on "
-            "all four. The probability is a Monte-Carlo estimate (~0.015 SE at 500 "
-            "paths), so a candidate sitting on the threshold can move between runs."
-        ),
+        caveat=_nbeats_caveat(ticker, hard),
     )
 
 

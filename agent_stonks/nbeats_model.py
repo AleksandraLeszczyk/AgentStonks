@@ -7,9 +7,9 @@ puts in the driver's seat instead -- a *forecaster*, which answers the same
 question by a longer route:
 
 1. **Point forecast.** Five seeds of N-BEATS each predict the next 15 bars of
-   the momentum score; the ensemble is their mean. On 19 sessions the gap
-   between two seeds is comparable to the gap between two architectures, so a
-   single seed is noise and the ensemble *is* the model.
+   the momentum score; the ensemble is their mean. On a month of sessions the
+   gap between two seeds is comparable to the gap between two architectures, so
+   a single seed is noise and the ensemble *is* the model.
 2. **Sample paths.** N-BEATS emits a point, not a distribution, so it gets one
    the way every point model in notebook 6 did: whole **rows** of its training
    residuals are resampled and added. Rows, not cells -- forecast errors are
@@ -28,10 +28,30 @@ of the problem that matters -- the changes that already pass the observable
 `pre_dwell >= 15` pre-condition -- and that this model is not: 0.67 +/- 0.07 on
 that hard half across four walk-forward folds, the only entrant above chance on
 all four, and the only one whose bootstrap interval on the held-out split
-excludes chance (0.713, 95% CI [0.52, 0.89]). That is a real but small effect
-measured on 35 events. It is the reason this model is offered, and the size of
-the interval is the reason it is offered as an *option* rather than as the new
-default.
+excluded chance (0.713, 95% CI [0.52, 0.89]). That is a real but small effect
+measured on 35 events, and it is the reason this model exists.
+
+**It is also, for AAPL, no longer the model that finding was measured on.**
+Notebook 6 trained on a 19-session yfinance cache; every checkpoint in
+`Code/Models` was retrained on 2026-09-09 against the 32-36 session Data
+Collection archive, and on AAPL the ordering reverses -- hard-half AUC 0.45 for
+this model against the classifier's 0.56, on 36 events of one held-out split.
+Scored on the same unseen events, the old and new AAPL checkpoints are
+indistinguishable (0.780 full-label both), so the reversal is not damage done by
+retraining; it says the 0.713 was one small test block and did not survive a
+larger, later one. GOOGL and INTC still favour this route (0.67 vs 0.44 and 0.68
+vs 0.61 on the hard half).
+
+So per symbol, on a single held-out split each:
+
+    AAPL   nbeats 0.45   classifier 0.56   (36 events)  <- reversed
+    GOOGL  nbeats 0.67   classifier 0.44   (38 events)
+    INTC   nbeats 0.68   classifier 0.61   (31 events)
+
+None of that is a four-fold walk-forward, which is the only evidence notebook 6
+would have accepted and which has not been rerun on the archive. Offer this
+model as an *option*, which it already is; do not describe it as the better
+model on AAPL until a walk-forward on the current data says so.
 
 What it shares with the incumbent, exactly
 ------------------------------------------

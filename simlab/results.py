@@ -232,6 +232,46 @@ def instrument_key(record: dict) -> str:
     return MULTI_INSTRUMENT
 
 
+def ml_models(record: dict) -> "list[str] | None":
+    """The `apple_models` keys a stored run actually loaded, or None when the
+    record cannot say.
+
+    The list behind `ml_model_key`, kept separate because two callers want two
+    different things out of the same fact. That one wants a *group*: one string
+    per run, with an answer for every run so none falls out of a breakdown.
+    This one wants the models themselves, so the Results chart can draw what
+    they predicted (`model_overlays.for_models`), and there an honest "I don't
+    know" is better than a sentinel -- an LLM run and a record whose rule set
+    no longer decodes both mean "do not claim a model made these trades".
+
+    `[]` is a real answer and a different one: a rule set written on price, the
+    regime and the clock loaded no model at all.
+
+    Rule sets are decoded rather than string-matched, so a condition renamed in
+    `apple_rules` moves this answer with it instead of silently naming a model
+    that is no longer read. Nothing heavy is imported: `apple_rules` reaches
+    `apple_models` for the registry and neither pulls in PyTorch.
+    """
+    config = record.get("config_summary") or {}
+    if not config.get("rule_based"):
+        return None
+    rule_config = config.get("rule_config") or {}
+    # Apple Trader: one named model, and it is the whole strategy.
+    named = str(rule_config.get("model_key") or "").strip()
+    if named:
+        return [named]
+    # Apple Trader 2: whatever its enabled conditions name.
+    if "rules" in rule_config:
+        try:
+            from agent_stonks.apple_rules import RuleSet
+
+            return RuleSet.from_record(rule_config["rules"]).models()
+        except Exception:
+            # A stored record is JSON on disk and may predate a rule schema.
+            return None
+    return None
+
+
 def ml_model_key(record: dict) -> str:
     """Which saved ML model a stored run's decisions came out of.
 
@@ -253,36 +293,23 @@ def ml_model_key(record: dict) -> str:
       "which model produced this", at a granularity that stays readable beside
       four ML rows.
 
-    Rule sets are decoded rather than string-matched, so a condition renamed in
-    `apple_rules` moves this key with it instead of silently mis-filing runs.
-    Nothing heavy is imported: `apple_rules` reaches `apple_models` for the
-    registry and neither pulls in PyTorch.
+    Which models a rule run loaded is `ml_models`' answer; this adds the
+    grouping rules on top of it -- the join, and a name for the two cases that
+    have no model to name.
     """
     config = record.get("config_summary") or {}
     if not config.get("rule_based"):
         provider = str(config.get("provider") or "?").strip() or "?"
         return f"{LLM_MODEL_PREFIX}{provider}"
 
-    rule_config = config.get("rule_config") or {}
-    # Apple Trader: one named model, and it is the whole strategy.
-    named = str(rule_config.get("model_key") or "").strip()
-    if named:
-        return named
-    # Apple Trader 2: whatever its enabled conditions name.
-    if "rules" in rule_config:
-        try:
-            from agent_stonks.apple_rules import RuleSet
-
-            models = RuleSet.from_record(rule_config["rules"]).models()
-        except Exception:
-            # A stored record is JSON on disk and may predate a rule schema.
-            # An undecodable set is still a run that happened; losing it from
-            # the breakdown would be worse than filing it as unknown.
-            return UNKNOWN_INSTRUMENT
-        if models:
-            return ML_MODEL_JOIN.join(models)
-        return NO_ML_MODEL
-    return UNKNOWN_INSTRUMENT
+    models = ml_models(record)
+    # An unreadable configuration is still a run that happened; losing it from
+    # the breakdown would be worse than filing it as unknown.
+    if models is None:
+        return UNKNOWN_INSTRUMENT
+    if models:
+        return ML_MODEL_JOIN.join(models)
+    return NO_ML_MODEL
 
 
 def agent_key(record: dict) -> str:

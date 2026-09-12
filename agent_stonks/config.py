@@ -3,6 +3,31 @@ from datetime import datetime, timezone
 DATA_REST = "https://data.alpaca.markets"
 BARS_STREAM_URL = "wss://stream.data.alpaca.markets/v2/{feed}"
 NEWS_STREAM_URL = "wss://stream.data.alpaca.markets/v1beta1/news"
+
+# Finnhub's real-time socket. It authenticates in the query string rather than
+# with an auth frame, and for US equities it serves the trade tape only -- no
+# bars and no book. Candles are aggregated from those trades locally
+# (agent_stonks.finnhub_stream), which is why it can be the default source
+# despite carrying less than Alpaca's stream does: what it *does* carry is the
+# consolidated tape rather than one venue's, so the price and volume it prints
+# are the market's rather than IEX's ~2% slice of it, and it keeps working
+# outside the hours a free Alpaca key can stream.
+FINNHUB_STREAM_URL = "wss://ws.finnhub.io?token={token}"
+
+# Live bar/trade sources, best first. Alpaca stays available as the fallback
+# choice because it is the only one of the two that also streams quotes, and
+# because its bar volumes match the REST bars the buffer is seeded and
+# backfilled with.
+DATA_SOURCES = ["finnhub", "alpaca"]
+DEFAULT_DATA_SOURCE = "finnhub"
+
+# How often the Finnhub aggregator checks whether the bar it is filling has run
+# past its bucket. A bar must close on the clock rather than on the next trade,
+# or a symbol that stops printing freezes `previous_minute_close` -- the field
+# every alert and rule trader reads -- for as long as the quiet lasts. Small
+# enough that a closed minute is published within a couple of seconds of ending,
+# which is well inside APPLE_TRADER_BAR_LAG_SEC.
+FINNHUB_BAR_FLUSH_SEC = 2.0
 # Full regular session is 390 one-minute bars; 420 keeps the 09:30 ET open in
 # the buffer through the close (plus a little premarket) so session-anchored
 # reads (opening range, VWAP) never silently lose their anchor mid-afternoon.
@@ -90,9 +115,11 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # uses the cut-off the chosen model picked on its own validation block, which is
 # the intended setting because those cut-offs are not on a shared scale -- and
 # since TimeToChange2 was re-run per ticker, not on a shared scale across
-# symbols either. On AAPL they are 0.07 (the classifier's posterior) and 0.05
+# symbols either. On AAPL they are 0.05 (the classifier's posterior) and 0.21
 # (N-BEATS' gated survival probability); on GOOGL 0.43 and 0.41; on INTC 0.22
-# and 0.05. Each is picked on that symbol's own validation events, so a number
+# and 0.05. Every one of them moved when the symbol was last retrained, so this
+# list is an illustration and the bundle is the authority. Each is picked on
+# that symbol's own validation events, so a number
 # typed here means something different on each instrument, and None is the only
 # setting that means the same thing everywhere.
 #
@@ -109,7 +136,11 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # 0.30 is NOT a tuned number -- nothing in TimeToChange2 ever grid-searched an
 # exit -- but it is not a guess either. It was measured on **AAPL only**, and
 # nothing re-measured it when the forecaster was fitted for GOOGL and INTC, so
-# on those two it is a borrowed default rather than a placed one. Over 428
+# on those two it is a borrowed default rather than a placed one. It is now a
+# borrowed default on AAPL too: the curve below was read off the AAPL
+# checkpoint retired on 2026-09-09, and retraining moved the forecast fan the
+# reversal probability is drawn from. Re-measure before treating 0.30 as
+# placed on any symbol. Over 428
 # positive-regime bars on five AAPL sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) the reversal
 # probability separates bars within 3 of the end of a positive run from bars
 # with 8+ bars still to go at AUC 0.89, and the cut-off picks where on that

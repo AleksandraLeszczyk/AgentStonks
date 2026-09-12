@@ -22,27 +22,43 @@ keeping them separate:
 
     AAPL    Ridge                R2 0.66 validation / 0.48 holdout week,
                                  sign right on 94% of holdout changes
-    INTC    HistGradientBoosting R2 0.63 / 0.45, sign right on 86%
+    GOOGL   RandomForest         R2 0.48 / 0.19, sign right on 91%
+    INTC    HistGradientBoosting R2 0.60 / 0.43, sign right on 86%
 
-Both beat the predict-zero baseline on days used neither for fitting nor for
-selection, which is the claim worth making about them.
+All three beat the predict-zero baseline on days used neither for fitting nor
+for selection, which is the claim worth making about them.
 
-**GOOGL was a third, and is not wired up.** It selected a RandomForest and
-scored R2 0.48 / 0.19 with the sign right on 91% of holdout changes -- the
-weakest of the three on the holdout week, and the one whose R2 fell furthest
-from validation to holdout. Its bundle was withdrawn from `Code/Models`, so
-`apple_models.MOMENTUM_CHANGE_TICKERS` no longer lists it: a model in the
-registry with no file behind it is not a wider menu, it is an agent that
-reports itself broken whenever somebody picks it. Re-adding it is one entry
-there plus the retrain below.
+Read the holdout column, not the validation one. GOOGL's is the weakest of the
+three and it is also the one that falls furthest from its own validation score
+-- a 0.48 that becomes 0.19 is the split doing its job, and the reason the
+estimator is chosen on validation days and then reported on a week neither step
+touched.
+
+**GOOGL has a bundle again but is still not wired up.** It was withdrawn once,
+when there was no file behind it; the refit on the full archive put the file
+back, so `Code/Models/momentum_change_GOOGL.joblib` loads and the numbers above
+are real. `apple_models.MOMENTUM_CHANGE_TICKERS` deliberately still omits it.
+The rule that motivated the withdrawal only runs one way -- a ticker in the
+registry with no bundle is an agent that reports itself broken whenever
+somebody picks it, whereas a bundle no entry points at costs nothing. Re-adding
+it is one entry there, plus the three test modules that currently use
+`momentum_change` on GOOGL as their "this pairing was never fitted" fixture.
+
+**Every bundle is fitted on the whole weekly CSV archive**, not on the ~30-day
+yfinance window the notebooks started from. AAPL gets 36 sessions (its archive
+reaches a week further back), GOOGL and INTC 31 each; after the reserved week
+and the 70/30 day split that is 22 training days for AAPL and 19 for the other
+two. AAPL's Ridge in particular is a different model from the RandomForest the
+demo fitted on 14 days of yfinance bars, and it is the archive, not a change of
+method, that moved it.
 
 Note the AAPL bundle here is **not** notebook 03's. That one is the project's
 demo -- a month of yfinance bars, no reserved holdout week, metrics from the
 same days its estimator was chosen on -- and it still sits in
 `FinNotebooks/Models` because notebooks 04 and 05 were executed against it.
 The bundle this module loads is trained by `scripts/train_ticker.py` on the
-same weekly CSV archive and under the same held-out-week protocol as INTC, so
-both carry the same metrics schema and mean the same thing.
+weekly CSV archive and under the held-out-week protocol, the same as the other
+two, so all three carry the same metrics schema and mean the same thing.
 
 What "the direction holds, the timing does not" means
 -----------------------------------------------------
@@ -64,10 +80,8 @@ which a 1.7.2 `SimpleImputer` raises on `transform` and a 1.7.2
 *this* project's interpreter:
 
     cd FinNotebooks/TimeToChange && \\
-      ../../AgentStonks/.venv/bin/python scripts/train_ticker.py AAPL INTC \\
+      ../../AgentStonks/.venv/bin/python scripts/train_ticker.py AAPL GOOGL INTC \\
       --model-dir ../../Models
-
-(add `GOOGL` to that list to bring the third one back.)
 
 Same data (the Data Collection weekly CSV archive), same code, same split, same
 estimator chosen for each ticker; the metrics move in the third decimal. The

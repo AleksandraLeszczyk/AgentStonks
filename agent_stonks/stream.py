@@ -1,6 +1,18 @@
+"""Alpaca's WebSocket data source, plus the REST safety nets every source shares.
+
+Two jobs live here. The first is the Alpaca socket itself: bars, trades and
+quotes arrive ready-made and go straight into `SymbolState`. The second is
+source-independent and serves whichever socket is running -- the REST fallback
+that keeps prices flowing while no socket is connected, the periodic backfill
+that repairs holes in the bar series while one is, and the quote poll that gives
+the Finnhub source a book it does not otherwise have.
+
+`launch_stream` is the entry point for both sources; which socket it opens is
+`data_source` (see `agent_stonks.finnhub_stream` for the other one). The pieces
+both sockets share on the tick path live in `agent_stonks.stream_common`.
+"""
 import json
 import logging
-import socket
 import threading
 import time
 from typing import Any
@@ -10,144 +22,32 @@ import websocket
 from .config import (
     BACKFILL_POLL_SEC,
     BARS_STREAM_URL,
+    DEFAULT_DATA_SOURCE,
     FALLBACK_POLL_SEC,
     MAX_BARS,
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
 )
-from . import clock
+from . import finnhub_stream
 from . import scoring
+from . import stream_common
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
 from .news import fetch_news_with_fallback
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
-from .state import (
-    AppState,
-    SymbolState,
-    alert_field_value,
-    alert_triggered,
-    current_volume_ratio,
-    format_alert,
-    today_daily_volume,
-)
+from .state import AppState, SymbolState
+from .stream_common import merge_missing_bars  # noqa: F401  (re-export)
 
 logger = logging.getLogger(__name__)
 
-
-def _fire_due_alerts(sym_state: SymbolState) -> None:
-    """Check every pending condition alert (across ALL streamed symbols) against
-    current state and, if any is met, clear the set and wake the agent early.
-    Called after each kind of tick (bars, trades, quotes) so an alert on any
-    continuously-updated field -- price, bid/ask, spread, day volume, volume
-    ratio, portfolio value -- fires as soon as its field crosses the threshold,
-    regardless of which symbol's tick moved it (a trade on one symbol moves the
-    shared portfolio value, for instance).
-
-    Armed tactics ride the same tick: the ticking symbol's executor is nudged so
-    a conditional trade fires as soon as its conditions are met, not on its slow
-    fallback poll.
-    """
-    executor = sym_state.tactics_executor
-    if executor is not None and sym_state.tactics is not None:
-        executor.notify()
-    app = sym_state.app
-    pairs = app.iter_alerts()
-    if not pairs:
-        return
-    hit = next(((ss, a) for ss, a in pairs if alert_triggered(ss, a)), None)
-    if hit is not None:
-        ss_hit, alert = hit
-        app.clear_alerts()
-        value = alert_field_value(ss_hit, alert.get("field"))
-        value_str = f"{value:,.4f}" if isinstance(value, (int, float)) else "n/a"
-        app.agent_wake_reason = f"Alert hit: {format_alert(alert)} (now {value_str})."
-        app.agent_wake_event.set()
-
-
-def _apply_quote(state: SymbolState, quote: dict) -> None:
-    """Copy an Alpaca quote (WS message or REST payload -- same field names)
-    into the symbol's state. Caller must hold state.lock.
-
-    Alpaca reports a one-sided book as bp/ap = 0; store None for that side so
-    a bogus 0.0 never reaches the spread computation or a bid/ask alert. The
-    quote timestamp is kept so consumers can tell a live quote from an
-    hours-old off-session snapshot.
-    """
-    if "bp" in quote:
-        price = float(quote["bp"])
-        state.bid_price = price if price > 0 else None
-    if "bs" in quote:
-        state.bid_size = float(quote["bs"])
-    if "ap" in quote:
-        price = float(quote["ap"])
-        state.ask_price = price if price > 0 else None
-    if "as" in quote:
-        state.ask_size = float(quote["as"])
-    if "t" in quote:
-        state.quote_ts = str(quote["t"])
-
-
-_TF_MINUTES: dict[str, int] = {
-    "1Min": 1, "5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60, "1Day": 1440,
-}
-
-
-def _keepalive_sockopt() -> list[tuple]:
-    """TCP keepalive options so a silently-dead connection (NAT/proxy idle
-    timeout dropping the TCP session without a FIN/close frame) is detected
-    and torn down in seconds rather than leaving the stream hung until the
-    next read happens to fail. Names differ by OS -- Linux exposes
-    TCP_KEEPIDLE, macOS exposes TCP_KEEPALIVE instead -- so probe for both.
-    """
-    opts = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
-    idle_opt = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
-    if idle_opt is not None:
-        opts.append((socket.IPPROTO_TCP, idle_opt, 30))
-    if hasattr(socket, "TCP_KEEPINTVL"):
-        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10))
-    if hasattr(socket, "TCP_KEEPCNT"):
-        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3))
-    return opts
-
-
-def _floor_ts(ts: str, minutes: int) -> str:
-    """Floor an ISO timestamp to the nearest N-minute bucket.
-
-    Emits the same 'Z'-suffixed RFC-3339 format Alpaca uses for bar timestamps,
-    so a bucket built here compares equal to a REST bar for the same period
-    (isoformat()'s '+00:00' suffix broke that, duplicating buckets after a
-    fallback refresh).
-    """
-    dt = clock.parse_iso_strict(ts)
-    total = dt.hour * 60 + dt.minute
-    floored = (total // minutes) * minutes
-    dt = dt.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _bar_ts_key(ts: object) -> str:
-    """Normalize a bar timestamp for cross-source comparison ('Z' vs '+00:00')."""
-    return clock.parse_iso_strict(ts).isoformat()
-
-
-def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:
-    """Insert fetched bars whose timestamps are absent from state.bars.
-
-    On a timestamp collision the existing (streamed) bar always wins, so a
-    live in-progress bar is never clobbered by an older REST snapshot.
-    Returns the number of bars added.
-    """
-    if not fetched:
-        return 0
-    with state.lock:
-        have = {_bar_ts_key(b["t"]) for b in state.bars if "t" in b}
-        missing = [b for b in fetched if "t" in b and _bar_ts_key(b["t"]) not in have]
-        if not missing:
-            return 0
-        merged = sorted(list(state.bars) + missing, key=lambda b: _bar_ts_key(b["t"]))
-        state.bars.clear()
-        state.bars.extend(merged[-MAX_BARS:])
-    return len(missing)
+# The shared tick-path helpers used to live in this module and are still reached
+# through it by callers and tests; `stream_common` is where they are defined.
+_fire_due_alerts = stream_common.fire_due_alerts
+_apply_quote = stream_common.apply_quote
+_keepalive_sockopt = stream_common.keepalive_sockopt
+_floor_ts = stream_common.floor_ts
+_bar_ts_key = stream_common.bar_ts_key
+_TF_MINUTES = stream_common.TF_MINUTES
 
 
 # yfinance equivalents of Alpaca timeframes, for the secondary backfill source.
@@ -305,45 +205,15 @@ def _start_stream(
                             last["v"] = new_v
                         else:
                             state.bars.append({**bar, "t": bucket})
-                with state.lock:
-                    if "h" in bar:
-                        state.previous_minute_high = bar["h"]
-                    if "l" in bar:
-                        state.previous_minute_low = bar["l"]
-                    if "c" in bar:
-                        state.previous_minute_close = bar["c"]
-                    if "v" in bar:
+                if "v" in bar:
+                    with state.lock:
                         state.day_volume = (state.day_volume or 0.0) + float(bar["v"])
-                    day_volume = state.day_volume
-                    vol_triggered = state.volume_alert_triggered
-                    daily_bars = state.daily_bars
-                vol_enabled = app.volume_alert_enabled
-                vol_multiplier = app.volume_alert_multiplier
 
-                # Session profit-potential tracking: the bar's low/high bound
-                # what an oracle could have traded this minute. Order within
-                # the bar is unknown; low-then-high assumes the optimistic
-                # buy-low-sell-high ordering.
-                if "l" in bar:
-                    scoring.record_price(app, symbol, bar["l"])
-                if "h" in bar:
-                    scoring.record_price(app, symbol, bar["h"])
-
-                # High-volume alert: today's cumulative volume crossing
-                # multiplier x average daily volume. Latched per symbol
-                # (vol_triggered) so it fires once per session rather than on
-                # every later bar.
-                if vol_enabled and not vol_triggered and day_volume is not None:
-                    ratio, baseline = current_volume_ratio(day_volume, daily_bars)
-                    if ratio is not None and ratio >= vol_multiplier:
-                        state.volume_alert_triggered = True
-                        state.volume_alert_ratio = ratio
-                        app.agent_wake_reason = (
-                            f"High-volume alert for {symbol}: today's volume {day_volume:,.0f} is "
-                            f"{ratio:.2f}x average daily volume ({baseline:,.0f}), above "
-                            f"the {vol_multiplier:.2f}x threshold."
-                        )
-                        app.agent_wake_event.set()
+                # Every bar Alpaca pushes has already closed, so it is always the
+                # "last completed bar" -- publish it as such and let the
+                # profit-potential tracker see its extremes.
+                stream_common.record_bar_close(state, bar)
+                stream_common.check_volume_alert(state)
 
                 # Generic condition alerts: a bar moves previous_minute_high/low/day_volume
                 # (and the derived volume_ratio), so re-check after every bar.
@@ -517,6 +387,49 @@ def _poll_symbol_via_rest(
     return source
 
 
+def _refresh_quotes_via_rest(
+    symbols: list[str], key: str, secret: str, feed: str, app: AppState
+) -> None:
+    """Refresh every symbol's bid/ask from Alpaca REST.
+
+    Only the Finnhub source needs this: its socket carries the trade tape and
+    nothing else, so `bid_price`, `ask_price`, their sizes and the derived
+    spread have no live source at all while it is running. Alerts and tactic
+    conditions on any of those would sit on whatever the initial load left
+    behind -- silently stale rather than visibly absent -- so they are polled
+    here instead, at the fallback cadence. Failures are logged and skipped: a
+    missed poll leaves the last known quote in place, which is exactly what the
+    Alpaca path does when its quote fetch fails.
+    """
+    if not key or not secret:
+        return
+    for symbol in symbols:
+        state = app.sym(symbol)
+        if state is None:
+            continue
+        try:
+            quote = fetch_latest_quote(symbol, key, secret, feed)
+        except Exception as exc:
+            log_fetch_failure(
+                "ask/bid price",
+                [("Alpaca REST /quotes/latest", exc)],
+                symbol=symbol,
+                consequence="the Finnhub tape carries no quotes; keeping last known bid/ask",
+            )
+            continue
+        if not quote:
+            continue
+        log_fetch(
+            "ask/bid price",
+            "Alpaca REST /quotes/latest",
+            symbol=symbol,
+            detail=f"bid={quote.get('bp')}, ask={quote.get('ap')}",
+        )
+        with state.lock:
+            _apply_quote(state, quote)
+        _fire_due_alerts(state)
+
+
 def _fallback_bars_loop(
     symbols: list[str],
     key: str,
@@ -525,19 +438,23 @@ def _fallback_bars_loop(
     app: AppState,
     timeframe: str,
     stop_event: threading.Event,
+    data_source: str = DEFAULT_DATA_SOURCE,
 ) -> None:
     """REST-polling fallback that keeps prices flowing for every symbol while the
     bars/trades WS isn't connected. Alpaca's per-key streaming connection limit
     doesn't apply to REST calls, so this keeps working even while `_start_stream`
     is stuck retrying a rejected socket (e.g. another session/tab holding the one
-    streaming slot Alpaca allows per key).
+    streaming slot Alpaca allows per key) -- and it is the safety net under the
+    Finnhub socket too, since neither socket's outage affects Alpaca REST.
 
     Falls back further to yfinance (no API key, delayed quotes) if Alpaca's REST
     API itself is also unavailable.
 
-    While the WS *is* connected this loop instead runs a periodic backfill
-    (every BACKFILL_POLL_SEC) that merges only-missing bars, repairing holes
-    left by reconnects and by feed minutes without any trade.
+    While a WS *is* connected this loop instead maintains what that socket
+    doesn't deliver: a periodic backfill (every BACKFILL_POLL_SEC) that merges
+    only-missing bars, repairing holes left by reconnects and by feed minutes
+    without any trade, plus -- on the Finnhub source only -- a quote refresh on
+    every tick, because that socket carries no book.
     """
     last_backfill = 0.0
     while not stop_event.wait(FALLBACK_POLL_SEC):
@@ -546,6 +463,8 @@ def _fallback_bars_loop(
             if now - last_backfill >= BACKFILL_POLL_SEC:
                 last_backfill = now
                 _backfill_all_quietly(symbols, key, secret, feed, app, timeframe)
+            if data_source == "finnhub":
+                _refresh_quotes_via_rest(symbols, key, secret, feed, app)
             continue
         polled_sources: list[str] = []
         for symbol in symbols:
@@ -562,12 +481,41 @@ def _fallback_bars_loop(
             )
 
 
+def resolve_data_source(data_source: str, finnhub_token: str) -> str:
+    """Which live source will actually be used, given the token situation.
+
+    Finnhub is the default and needs a token; without one there is nothing to
+    connect to, so the choice silently degrades to Alpaca rather than leaving
+    the app on a socket that can only fail. Kept separate from `launch_stream`
+    so the UI can say which source is running before anything is launched.
+    """
+    if data_source == "finnhub" and not finnhub_token:
+        return "alpaca"
+    return data_source if data_source in ("finnhub", "alpaca") else DEFAULT_DATA_SOURCE
+
+
 def launch_stream(
-    symbols: list[str], key: str, secret: str, feed: str, app: AppState, timeframe: str = "1Min"
+    symbols: list[str],
+    key: str,
+    secret: str,
+    feed: str,
+    app: AppState,
+    timeframe: str = "1Min",
+    data_source: str = DEFAULT_DATA_SOURCE,
+    finnhub_token: str = "",
 ) -> None:
     """Close any existing bars/trades stream and start a new background thread
     streaming every symbol over one socket, plus a REST-polling fallback that
-    activates whenever the WS stream isn't connected."""
+    activates whenever the WS stream isn't connected.
+
+    `data_source` picks the socket: "finnhub" (the default) streams the
+    consolidated trade tape and builds candles locally; "alpaca" streams
+    ready-made bars, trades and quotes from the chosen `feed`. Either way the
+    Alpaca credentials are still required -- the REST fallback, the backfill and
+    (under Finnhub) the quote poll all run on them.
+    """
+    source = resolve_data_source(data_source, finnhub_token)
+    app.data_source = source
     if app.ws:
         try:
             app.ws.close()
@@ -580,35 +528,20 @@ def launch_stream(
     app.bars_connected = False
 
     for state in app.iter_symbol_states():
-        with state.lock:
-            if state.bars:
-                state.prev_close = state.bars[-1].get("c")
-            last_bar = state.bars[-1] if state.bars else None
-            state.previous_minute_high = last_bar.get("h") if last_bar else None
-            state.previous_minute_low = last_bar.get("l") if last_bar else None
-            state.previous_minute_close = last_bar.get("c") if last_bar else None
-            # Seed today's running volume from today's partial daily bar (0 if the
-            # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
-            # one-shot alert latch for the new session.
-            state.day_volume = today_daily_volume(state.daily_bars)
-            state.volume_alert_triggered = False
-            state.volume_alert_ratio = None
-            state.last_price = None
-            state.bid_price = None
-            state.bid_size = None
-            state.ask_price = None
-            state.ask_size = None
-            state.quote_ts = None
+        stream_common.reset_symbol_for_new_stream(state)
 
     stop_event = threading.Event()
     app.bars_fallback_stop_event = stop_event
 
-    threading.Thread(
-        target=_start_stream, args=(symbols, key, secret, feed, app, timeframe), daemon=True
-    ).start()
+    if source == "finnhub":
+        finnhub_stream.launch(symbols, finnhub_token, app, timeframe, stop_event)
+    else:
+        threading.Thread(
+            target=_start_stream, args=(symbols, key, secret, feed, app, timeframe), daemon=True
+        ).start()
     threading.Thread(
         target=_fallback_bars_loop,
-        args=(symbols, key, secret, feed, app, timeframe, stop_event),
+        args=(symbols, key, secret, feed, app, timeframe, stop_event, source),
         daemon=True,
     ).start()
 

@@ -2072,6 +2072,58 @@ class TestMLModelBreakdown:
         )
         assert rows[0]["best_run"]["ml_model"] == "dayrange"
 
+    # `ml_models` is the same extraction without the grouping rules, and it is
+    # what the Results chart reads to draw the run's own forecasts over its
+    # tape. The difference that matters is the two "no answer" cases: a
+    # breakdown must file every run somewhere, a chart must not claim a model
+    # made trades it cannot name.
+
+    def test_ml_models_lists_the_bundles_a_rule_run_loaded(self):
+        assert sim_results.ml_models(self._apple("dayrange")) == ["dayrange"]
+        assert sim_results.ml_models(
+            self._apple2(["dayrange.pred_high_dip_adr", "persistence.proba"])
+        ) == ["persistence", "dayrange"]
+
+    def test_ml_models_is_empty_for_a_rule_set_that_loaded_none(self):
+        """Empty, not unknown: a set on price and the position is a complete
+        strategy that simply has no forecast to draw."""
+        assert sim_results.ml_models(self._apple2(["bar.price"])) == []
+
+    def test_ml_models_refuses_to_guess_where_the_record_cannot_say(self):
+        undecodable = self._apple2([])
+        undecodable["config_summary"]["rule_config"]["rules"] = {"items": "not a list"}
+        assert sim_results.ml_models(undecodable) is None
+        # An LLM run loads no saved model, and its provider -- which is what
+        # the breakdown files it under -- is not one.
+        assert sim_results.ml_models(self._llm("openai")) is None
+
+    def test_the_chart_preselects_what_the_run_traded_on(self):
+        """The two halves joined: a stored run in, the overlay selection its
+        chart opens with out. This is the whole feature, and it lives in two
+        modules that know nothing about each other."""
+        from agent_stonks import model_overlays
+
+        ran = model_overlays.for_models(
+            sim_results.ml_models(self._apple("dayrange")), "AAPL"
+        )
+        assert ran["keys"] == [model_overlays.DAY_RANGE_KEY]
+
+        ran = model_overlays.for_models(
+            sim_results.ml_models(self._apple("nbeats")), "AAPL"
+        )
+        assert ran["keys"] == [model_overlays.MOMENTUM_KEY]
+        assert ran["momentum_model"] == "nbeats"
+
+    def test_an_llm_run_preselects_nothing(self):
+        """Nothing in it can answer "was the model right", so the chart opens
+        as it always did and the picker is there to ask anyway."""
+        from agent_stonks import model_overlays
+
+        ran = model_overlays.for_models(
+            sim_results.ml_models(self._llm("openai")) or [], "AAPL"
+        )
+        assert ran["keys"] == [] and ran["momentum_model"] is None
+
 
 class TestMLModelLabels:
     """The row labels. Keys are stored; labels are rendered, so a model renamed

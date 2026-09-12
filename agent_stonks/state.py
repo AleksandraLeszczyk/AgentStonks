@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 from . import clock
 from .config import (
+    DEFAULT_DATA_SOURCE,
     MAX_BARS,
     PAPER_STARTING_CASH,
     TACTICS_MOMENTUM_WINDOW_MIN,
@@ -160,6 +161,10 @@ class SymbolState:
         return self.app.feed
 
     @property
+    def data_source(self) -> str:
+        return self.app.data_source
+
+    @property
     def timeframe(self) -> str:
         return self.app.timeframe
 
@@ -200,6 +205,8 @@ _DEFAULTS: dict[str, object] = {
     "symbols": [],
     "symbol_states": {},
     "feed": "iex",
+    "data_source": DEFAULT_DATA_SOURCE,
+    "finnhub_token": "",
     "api_key": "",
     "api_secret": "",
     "status": "Idle",
@@ -259,6 +266,12 @@ class AppState:
         self.symbols: list[str] = []
         self.symbol_states: dict[str, SymbolState] = {}
         self.feed: str = "iex"
+        # Which live socket fills the bar series: "finnhub" (consolidated trade
+        # tape, candles built locally) or "alpaca" (ready-made bars/quotes off
+        # `feed`). Alpaca credentials are needed either way -- the REST
+        # fallback, the bar backfill and the Finnhub quote poll all use them.
+        self.data_source: str = DEFAULT_DATA_SOURCE
+        self.finnhub_token: str = ""
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"

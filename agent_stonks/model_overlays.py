@@ -99,11 +99,21 @@ class ModelOverlay:
     # generalises. `profile_range` is the only None: LevelsML's pack was
     # deliberately trained without ticker dummies so it transfers.
     tickers: "tuple[str, ...] | None"
+    # The `apple_models` keys whose predictions this overlay draws -- the seam
+    # that lets a caller holding a run's configuration ask "show me what *that*
+    # model said" without knowing how overlays are carved up. Empty for
+    # `profile_range`, whose pack is not in that registry and drives no agent:
+    # nothing can name it, so nothing auto-selects it.
+    models: "tuple[str, ...]" = ()
 
     def covers(self, ticker: "str | None") -> bool:
         if self.tickers is None:
             return True
         return (ticker or "").upper() in self.tickers
+
+    def draws(self, model_key: "str | None") -> bool:
+        """Whether this overlay is a picture of what the named model predicts."""
+        return (model_key or "") in self.models
 
 
 OVERLAYS: "dict[str, ModelOverlay]" = {
@@ -116,6 +126,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="PyTorch, LightGBM and the day-range bundle",
         tickers=apple_models.DAYRANGE_TICKERS,
+        models=(apple_models.DAYRANGE_KEY,),
     ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
@@ -138,6 +149,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="the momentum bundle (scikit-learn, or PyTorch for N-BEATS)",
         tickers=apple_models.MOMENTUM_TICKERS,
+        # Both momentum bundles answer the same question, so one overlay draws
+        # either -- which of them answers it is `compute`'s `momentum_model`.
+        models=(apple_models.PERSISTENCE_KEY, apple_models.NBEATS_KEY),
     ),
 }
 
@@ -163,6 +177,53 @@ def get(key: "str | None") -> "ModelOverlay | None":
 def label(key: "str | None") -> str:
     overlay = get(key)
     return overlay.label if overlay else str(key)
+
+
+def for_models(
+    model_keys: "list[str] | tuple[str, ...] | None", ticker: "str | None" = None
+) -> dict:
+    """The overlay selection that draws what these saved models predicted.
+
+    The question a chart of a *past* run asks is not "which overlays exist"
+    but "what did the model that made these trades say about this tape" --
+    so a caller that knows which `apple_models` bundles a run loaded (SimLab
+    reads it off the stored configuration; see `simlab.results.ml_models`) can
+    turn that into a selection here instead of hard-coding the mapping at the
+    call site. Which model drove which overlay is this catalogue's business.
+
+    Returns `{"keys": [...], "momentum_model": key | None, "unmatched": [...]}`:
+
+    `keys`         overlays to draw, in picker order. Named a `ticker` they are
+                   filtered to the ones that exist for it -- a run's model
+                   always covers the symbol it traded, but the caller may be
+                   looking at another tab of the same run, where the picker has
+                   no such option to select. `None` asks the question without a
+                   symbol and filters nothing.
+    `momentum_model` which momentum bundle the momentum overlay should ask,
+                   since both answer the same question and only the run knows
+                   which one it used. None when the momentum overlay is not in
+                   `keys`, so there is never an answer to a question nobody is
+                   being asked.
+    `unmatched`    models the run used that no overlay draws. Not an error and
+                   not silence either: the delta-momentum regressor predicts a
+                   signed size over a horizon, which is neither a level, a
+                   moment nor a span, so there is nothing honest to draw -- and
+                   a caller that pre-selected nothing should be able to say why.
+    """
+    named = [str(k) for k in (model_keys or []) if k]
+    keys = [
+        key for key, overlay in OVERLAYS.items()
+        if any(overlay.draws(m) for m in named)
+        and (ticker is None or overlay.covers(ticker))
+    ]
+    momentum = None
+    if MOMENTUM_KEY in keys:
+        momentum = next(m for m in named if OVERLAYS[MOMENTUM_KEY].draws(m))
+    unmatched = [
+        m for m in named
+        if not any(overlay.draws(m) for overlay in OVERLAYS.values())
+    ]
+    return {"keys": keys, "momentum_model": momentum, "unmatched": unmatched}
 
 
 # --- item constructors ------------------------------------------------------

@@ -48,9 +48,10 @@ others narrows the menu again with no code change.
 
 One consequence of per-ticker fitting is worth stating where the rules are
 described: **a model's threshold belongs to its symbol.** The persistence
-classifier picks 0.07 on AAPL, 0.43 on GOOGL and 0.22 on INTC, each on that
+classifier picks 0.05 on AAPL, 0.43 on GOOGL and 0.22 on INTC, each on that
 symbol's own validation events, so `prob_threshold=None` means three different
-numbers and nothing may read one symbol's cut-off for another.
+numbers and nothing may read one symbol's cut-off for another. They move on
+every retrain, so read them from the bundle rather than from this paragraph.
 
 The agent keeps its name. It is the loop that is Apple Trader, not the symbol.
 
@@ -131,6 +132,11 @@ sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) there are 21 positive-regime
 runs and **not one of them ends in negative** -- every single one decays to
 balanced first. On this tape the literal event the rule is named after does not
 happen.
+
+These figures were measured on the AAPL checkpoint retired on 2026-09-09, and
+the retrained one shifts the fan they are read from; the *shape* of the finding
+below is unlikely to move, but the 0.89 and the cut-off table are stale until
+someone re-runs them.
 
 What the number is doing, then, is reading the lower tail of the forecast fan:
 it rises when enough sampled futures fall far enough to cross `-enter_threshold`
@@ -261,10 +267,12 @@ TimeToChange2's own verdict on the incumbent classifier is that it is **a
 filter that separates the impossible from the possible, not the likely from the
 unlikely**: 0.82 out-of-fold AUC over all regime changes, but 0.50 over the
 changes that already pass the observable "the old regime had held 15 bars"
-pre-condition. The N-BEATS option is the one model in its benchmark that beats
-chance on that hard half (0.67 +/- 0.07 over four folds), which is a real
-effect and a small one -- see `apple_models` for what choosing it does and does
-not buy.
+pre-condition. The N-BEATS option was the one model in its benchmark that beat
+chance on that hard half (0.67 +/- 0.07 over four folds), a real effect and a
+small one -- but that was measured on the AAPL checkpoint retired on
+2026-09-09, and on the retrained one the ordering reverses (classifier 0.56,
+N-BEATS 0.45, on 36 events). GOOGL and INTC still favour N-BEATS. See
+`apple_models` and `nbeats_model` for what choosing it does and does not buy.
 
 Either way the entry is best read as "a to-positive change the model did not
 veto".

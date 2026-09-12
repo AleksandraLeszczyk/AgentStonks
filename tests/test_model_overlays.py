@@ -21,7 +21,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
-from agent_stonks import model_overlays as mo
+from agent_stonks import apple_models, model_overlays as mo
 from agent_stonks.charts import add_model_overlays, build_chart, overlay_x_max
 
 SESSION = "2026-08-07"
@@ -74,6 +74,74 @@ class TestCatalogue:
 
     def test_label_falls_back_to_the_key_for_an_unknown_overlay(self):
         assert mo.label("nope") == "nope"
+
+
+class TestForModels:
+    """`for_models` is the seam that lets a chart of a past run open showing
+    what the model behind it said, without the caller knowing which overlay
+    draws which model."""
+
+    def test_the_day_range_model_selects_the_day_range_overlay(self):
+        assert mo.for_models([apple_models.DAYRANGE_KEY], "AAPL")["keys"] == [
+            mo.DAY_RANGE_KEY
+        ]
+
+    def test_either_momentum_bundle_selects_the_momentum_overlay_and_names_itself(self):
+        """One overlay, two bundles that answer its question -- so the answer
+        has to carry which of them to ask, or the chart would draw the other
+        model's opinion of a run it never touched."""
+        for key in (apple_models.PERSISTENCE_KEY, apple_models.NBEATS_KEY):
+            out = mo.for_models([key], "AAPL")
+            assert out["keys"] == [mo.MOMENTUM_KEY]
+            assert out["momentum_model"] == key
+
+    def test_several_models_select_several_overlays_in_picker_order(self):
+        out = mo.for_models(
+            [apple_models.NBEATS_KEY, apple_models.DAYRANGE_KEY], "AAPL"
+        )
+        assert out["keys"] == [mo.DAY_RANGE_KEY, mo.MOMENTUM_KEY]
+        assert out["momentum_model"] == apple_models.NBEATS_KEY
+
+    def test_a_model_no_overlay_draws_is_reported_rather_than_dropped(self):
+        """The delta-momentum regressor predicts a signed size over a horizon,
+        which is neither a level, a moment nor a span. A caller that
+        pre-selects nothing should be able to say why it did."""
+        out = mo.for_models([apple_models.MOMENTUM_CHANGE_KEY], "AAPL")
+        assert out["keys"] == []
+        assert out["unmatched"] == [apple_models.MOMENTUM_CHANGE_KEY]
+
+    def test_an_overlay_is_never_selected_for_a_symbol_it_has_no_model_for(self):
+        """A rule run's stored symbol list can be wider than the one instrument
+        it traded, so this is asked about tabs the model was never fitted on --
+        where the picker has no such option to select."""
+        out = mo.for_models([apple_models.NBEATS_KEY], "MSFT")
+        assert out["keys"] == []
+        # ...and no bundle to ask, since there is no overlay asking.
+        assert out["momentum_model"] is None
+        assert mo.for_models([apple_models.DAYRANGE_KEY], "MSFT")["keys"] == []
+
+    def test_no_symbol_asks_the_question_without_one(self):
+        """The default is "which overlays draw these models", not "none" --
+        filtering is what naming a symbol adds."""
+        assert mo.for_models([apple_models.DAYRANGE_KEY])["keys"] == [
+            mo.DAY_RANGE_KEY
+        ]
+
+    def test_the_transferable_profile_model_is_never_auto_selected(self):
+        """It drives no agent and is not in `apple_models`, so nothing can name
+        it -- selecting it would be the chart's opinion, not the run's."""
+        for key in apple_models.keys():
+            assert mo.PROFILE_RANGE_KEY not in mo.for_models([key], "AAPL")["keys"]
+
+    def test_no_models_is_no_selection(self):
+        for empty in ([], None, [""]):
+            out = mo.for_models(empty, "AAPL")
+            assert out == {"keys": [], "momentum_model": None, "unmatched": []}
+
+    def test_a_retired_model_key_is_unmatched_not_a_crash(self):
+        """Records are JSON on disk and outlive the registry."""
+        out = mo.for_models(["retired_model"], "AAPL")
+        assert out["keys"] == [] and out["unmatched"] == ["retired_model"]
 
 
 class TestCompute:
