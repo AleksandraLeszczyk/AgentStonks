@@ -228,6 +228,9 @@ agent_stonks/
                   by the session phase it runs in (pre-open / intraday / post-close / weekend)
   llm.py        — unified chat-completions client over Gemini, OpenAI, and Anthropic
   observability.py — optional Langfuse tracing for the LLM pipeline (no-op if unconfigured)
+  trade_sound.py — optional audible cue on a fill: an inline Custom Component v2 that
+                  synthesises a two-note chime with the Web Audio API (rising for a buy,
+                  falling for a sell). No audio asset, no visible player. Off by default
   decisions.py  — independent decision ledger; fetches its own fill price per trade. On a
                   simulated broker it owns the cash balance; on a real one the Alpaca account
                   does, and the ledger is written from an account read after each order

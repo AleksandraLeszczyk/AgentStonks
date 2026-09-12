@@ -17,6 +17,7 @@ from .config import (
     MAX_BARS,
     PAPER_STARTING_CASH,
     TACTICS_MOMENTUM_WINDOW_MIN,
+    TRADE_SOUND_VOLUME,
     VOLUME_ADV_MIN_DAYS,
     VOLUME_ADV_WINDOW,
     VOLUME_ALERT_DEFAULT_MULTIPLIER,
@@ -263,6 +264,8 @@ _DEFAULTS: dict[str, object] = {
     "premarket_generated_at": None,
     "trading_mode": "local",
     "trading_status": "",
+    "trade_sound_enabled": False,
+    "trade_sound_volume": TRADE_SOUND_VOLUME,
 }
 
 
@@ -366,6 +369,11 @@ class AppState:
         # being traded rather than which one was asked for.
         self.trading_mode: str = "local"
         self.trading_status: str = ""
+        # Audible cue on a fill (see agent_stonks.trade_sound). Off by default:
+        # a dashboard that makes noise without being asked is a worse default
+        # than one that stays quiet, and the agent can run unattended for hours.
+        self.trade_sound_enabled: bool = False
+        self.trade_sound_volume: float = TRADE_SOUND_VOLUME
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

@@ -53,9 +53,7 @@ SIP_DELAY_MIN = 16
 # enough that a closed minute is published within a couple of seconds of ending,
 # which is well inside APPLE_TRADER_BAR_LAG_SEC.
 FINNHUB_BAR_FLUSH_SEC = 2.0
-# Full regular session is 390 one-minute bars; 420 keeps the 09:30 ET open in
-# the buffer through the close (plus a little premarket) so session-anchored
-# reads (opening range, VWAP) never silently lose their anchor mid-afternoon.
+
 # Alpaca's Trading API (orders, positions, account) -- a different host from the
 # market-data API above, and a different key pair per venue. See
 # agent_stonks.trading_rest.
@@ -90,6 +88,14 @@ LIVE_TRADING_CONFIRM_PHRASE = "TRADE LIVE"
 ORDER_FILL_TIMEOUT_SEC = 20.0
 ORDER_POLL_SEC = 0.5
 
+# Audible cue when an order fills (see agent_stonks.trade_sound). A raw Web
+# Audio gain multiplier, not decibels: loud enough to hear from across a room,
+# quiet enough not to startle on the twentieth fill of a session.
+TRADE_SOUND_VOLUME = 0.22
+
+# Full regular session is 390 one-minute bars; 420 keeps the 09:30 ET open in
+# the buffer through the close (plus a little premarket) so session-anchored
+# reads (opening range, VWAP) never silently lose their anchor mid-afternoon.
 MAX_BARS = 420
 POLL_SEC = 3
 CHART_POLL_SEC = 30

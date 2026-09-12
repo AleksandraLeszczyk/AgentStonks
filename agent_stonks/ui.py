@@ -122,6 +122,7 @@ from .state import (
 )
 from .tactics import tactic_price_levels, tactics_summaries
 from . import bar_history
+from .trade_sound import next_trade_cue, play_trade_sound
 from .trading_mode import MODE_LABELS, live_trading_enabled, resolve_broker
 from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
@@ -1421,6 +1422,31 @@ def _current_tactics_html(state: AppState) -> str:
 
 
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
+def _trade_sound_fragment() -> None:
+    """Poll the ledger and chime once per newly filled trade.
+
+    On its own fragment because the trade happens on a background thread that
+    the Streamlit script never waits for: the only way the page learns about a
+    fill is by looking. It renders nothing visible, and it is mounted from the
+    Agent tab — which Streamlit executes even when another tab is on screen, so
+    the cue still fires for a user who has navigated away.
+    """
+    state = _get_state()
+    tracker = state.decision_tracker
+    if tracker is None or not state.trade_sound_enabled:
+        # Forget the position in the ledger while sound is off, so switching it
+        # back on adopts the trades that happened meanwhile instead of firing a
+        # chime for each of them.
+        st.session_state.pop("trade_sound_seen", None)
+        return
+    cue, seen = next_trade_cue(
+        tracker.snapshot()["decisions"], st.session_state.get("trade_sound_seen")
+    )
+    st.session_state["trade_sound_seen"] = seen
+    play_trade_sound(cue, volume=state.trade_sound_volume)
+
+
+@st.fragment(run_every=AGENT_LOG_POLL_SEC)
 def _agent_identity_panel() -> None:
     """Avatar card for the personality currently in charge. Under Automatic the
     face shown is the strategy Automatic activated, not Automatic itself; while
@@ -2027,6 +2053,26 @@ def _agent_panel(
 
     trading_mode_choice, live_confirm = _execution_controls()
 
+    sound_col, vol_col = st.columns([1, 2])
+    state.trade_sound_enabled = sound_col.toggle(
+        "Trade sound",
+        value=state.trade_sound_enabled,
+        key="agent_trade_sound_enabled",
+        help="Play a short chime whenever an order fills — rising for a buy, "
+        "falling for a sell. Off by default. Your browser only allows sound "
+        "after you interact with the page, which starting the agent satisfies.",
+    )
+    if state.trade_sound_enabled:
+        state.trade_sound_volume = vol_col.slider(
+            "Sound volume",
+            min_value=0.05,
+            max_value=0.60,
+            value=state.trade_sound_volume,
+            step=0.05,
+            key="agent_trade_sound_volume",
+            help="Loudness of the chime, relative to your system volume.",
+        )
+
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
         "Starting budget ($)",
@@ -2195,6 +2241,7 @@ def _agent_panel(
         else ""
     )
     st.caption(f"Status: {status}{watching}")
+    _trade_sound_fragment()
 
     # The venue stays on screen for as long as the agent runs, not just at the
     # moment Start was pressed. Someone coming back to a session left running
