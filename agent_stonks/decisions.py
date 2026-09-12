@@ -136,6 +136,9 @@ class DecisionTracker:
 
         price = self.broker.get_current_price(symbol, key, secret, feed)
 
+        if not self.broker.is_simulated:
+            return self._record_live_trade(symbol, action, quantity, reasoning, price)
+
         with self.lock:
             position = self.positions.get(symbol, 0.0)
             filled_qty = 0.0
@@ -177,6 +180,116 @@ class DecisionTracker:
             )
             self.decisions.append(decision)
         return decision
+
+    def _record_live_trade(
+        self, symbol: str, action: str, quantity: float, reasoning: str, price: float
+    ) -> Decision:
+        """Route one order to a real venue and record what it did.
+
+        The shape is deliberately the inverse of the simulated path. There, the
+        ledger decides what is affordable, fills it at the quoted price, and the
+        broker is told afterwards. Here the venue decides everything: how much
+        buying power there really is, whether the symbol takes a fractional
+        quantity, what price the order actually got, and whether it filled at
+        all. The ledger is written *from* the answer.
+
+        So cash and positions come from an account read after the order rather
+        than from arithmetic on the request. That is the only way the two stay
+        in step across the things a real broker does and a simulation never
+        does -- partial fills, slippage, queued orders, and a position that
+        moved because something outside this app touched the same account.
+        """
+        requested = quantity
+        # Ask the venue what it would allow before asking for it, so an
+        # oversized request is trimmed rather than rejected outright.
+        ceiling = self.broker.max_quantity(symbol, action, price)
+        if ceiling is not None:
+            quantity = max(0.0, min(quantity, ceiling))
+
+        if quantity <= 0:
+            reason = (
+                "no buying power at the broker"
+                if action == "buy"
+                else "no position at the broker to sell"
+            )
+            return self._record_broker_decision(
+                symbol, action, requested, 0.0, price, f"{reasoning} [{reason}]", "rejected"
+            )
+
+        report = self.broker.submit_order(symbol, action, quantity, price)
+        filled_qty = float(report.get("filled_qty") or 0.0)
+        fill_price = float(report.get("filled_price") or price)
+        status = "filled" if filled_qty > 0 else "rejected"
+        note = report.get("reason")
+        if note:
+            reasoning = f"{reasoning} [{self.broker.venue}: {note}]"
+
+        return self._record_broker_decision(
+            symbol, action, requested, filled_qty, fill_price, reasoning, status
+        )
+
+    def _record_broker_decision(
+        self,
+        symbol: str,
+        action: str,
+        requested: float,
+        filled_qty: float,
+        price: float,
+        reasoning: str,
+        status: str,
+    ) -> Decision:
+        """Append a decision whose cash and positions come from the venue.
+
+        Falls back to applying the fill to the local ledger only when the
+        account read fails -- an unreachable broker should leave the app with a
+        stale-but-plausible ledger rather than a zeroed one.
+        """
+        snapshot = self.broker.account_snapshot()
+        with self.lock:
+            if snapshot is not None:
+                self.cash = snapshot["cash"]
+                self.positions = dict(snapshot["positions"])
+            elif filled_qty > 0:
+                signed = filled_qty if action == "buy" else -filled_qty
+                self.cash -= signed * price
+                self.positions[symbol] = self.positions.get(symbol, 0.0) + signed
+            decision = Decision(
+                ts=clock.now().isoformat(),
+                symbol=symbol,
+                action=action,
+                requested_quantity=requested,
+                filled_quantity=filled_qty,
+                price=price,
+                reasoning=reasoning,
+                status=status,
+                cash_after=self.cash,
+                position_after=self.positions.get(symbol, 0.0),
+                # Alpaca charges no commission on US equities, and the real
+                # regulatory fees are already inside the cash the account
+                # reports -- modelling TRADE_FIXED_COST on top would double-count
+                # a cost the broker has itself applied.
+                fee=0.0,
+                positions_after=dict(self.positions),
+            )
+            self.decisions.append(decision)
+        return decision
+
+    def sync_from_broker(self) -> bool:
+        """Adopt the venue's cash and positions as the ledger's.
+
+        Called when a real broker is attached, so the app opens on the account's
+        actual balance instead of a configured starting budget, and again on
+        demand -- positions move for reasons this process never sees (a fill
+        from an order left working, a manual trade in Alpaca's own UI, a
+        corporate action). Returns False when the account could not be read.
+        """
+        snapshot = self.broker.account_snapshot()
+        if snapshot is None:
+            return False
+        with self.lock:
+            self.cash = snapshot["cash"]
+            self.positions = dict(snapshot["positions"])
+        return True
 
     def snapshot(self) -> dict:
         with self.lock:

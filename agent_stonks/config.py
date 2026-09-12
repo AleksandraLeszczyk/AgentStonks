@@ -56,6 +56,40 @@ FINNHUB_BAR_FLUSH_SEC = 2.0
 # Full regular session is 390 one-minute bars; 420 keeps the 09:30 ET open in
 # the buffer through the close (plus a little premarket) so session-anchored
 # reads (opening range, VWAP) never silently lose their anchor mid-afternoon.
+# Alpaca's Trading API (orders, positions, account) -- a different host from the
+# market-data API above, and a different key pair per venue. See
+# agent_stonks.trading_rest.
+TRADING_REST_PAPER = "https://paper-api.alpaca.markets"
+TRADING_REST_LIVE = "https://api.alpaca.markets"
+
+# Where a filled decision actually goes:
+#   "local"         the in-memory ledger this app has always kept. Nothing
+#                   leaves the process. Still the only mode SimLab can use.
+#   "alpaca_paper"  real orders against Alpaca's paper account -- real routing,
+#                   real fills, real rejections, fake money.
+#   "alpaca_live"   real orders against the live account. Real money.
+#
+# The default is the paper account rather than the local ledger: the point of
+# routing orders at all is to find out what the broker does with them -- partial
+# fills, rejections, buying-power limits, queued-until-open -- and none of that
+# shows up in a ledger that always says yes.
+TRADING_MODES = ["local", "alpaca_paper", "alpaca_live"]
+DEFAULT_TRADING_MODE = "alpaca_paper"
+
+# Live trading is off unless this environment variable is truthy, and the UI
+# asks for a typed confirmation on top of it. Two independent gates, because
+# the failure mode here is not a crash or a bad chart -- it is real money moved
+# by an automated agent that the user did not intend to have running.
+LIVE_TRADING_ENV_FLAG = "ALPACA_ENABLE_LIVE_TRADING"
+LIVE_TRADING_CONFIRM_PHRASE = "TRADE LIVE"
+
+# A market order is accepted immediately and fills asynchronously. The tracker
+# waits this long for a terminal state before recording whatever filled so far;
+# anything still working is left with the broker rather than cancelled, since
+# cancelling a partially-filled order is a trading decision, not a timeout.
+ORDER_FILL_TIMEOUT_SEC = 20.0
+ORDER_POLL_SEC = 0.5
+
 MAX_BARS = 420
 POLL_SEC = 3
 CHART_POLL_SEC = 30

@@ -261,6 +261,8 @@ _DEFAULTS: dict[str, object] = {
     "premarket_status": "Idle",
     "premarket_phase": "",
     "premarket_generated_at": None,
+    "trading_mode": "local",
+    "trading_status": "",
 }
 
 
@@ -358,6 +360,12 @@ class AppState:
         self.premarket_status: str = "Idle"
         self.premarket_phase: str = ""
         self.premarket_generated_at: "datetime | None" = None
+        # Where this run's orders actually go (see agent_stonks.trading_mode).
+        # The *effective* mode, not what was requested: every refusal there
+        # degrades to "local", and the UI reads this to say which account is
+        # being traded rather than which one was asked for.
+        self.trading_mode: str = "local"
+        self.trading_status: str = ""
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

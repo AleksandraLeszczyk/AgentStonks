@@ -63,8 +63,12 @@ from .config import (
     DATA_SOURCES,
     DEFAULT_DATA_SOURCE,
     DEFAULT_HISTORY_FEED,
+    DEFAULT_TRADING_MODE,
     FEEDS,
     HISTORY_FEEDS,
+    LIVE_TRADING_CONFIRM_PHRASE,
+    LIVE_TRADING_ENV_FLAG,
+    TRADING_MODES,
     MAX_BARS,
     NEWS_IMPACT_COLORS,
     OPTIONS_POLL_SEC,
@@ -118,6 +122,7 @@ from .state import (
 )
 from .tactics import tactic_price_levels, tactics_summaries
 from . import bar_history
+from .trading_mode import MODE_LABELS, live_trading_enabled, resolve_broker
 from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
     analyze_intraday,
@@ -1849,6 +1854,59 @@ def _apple_trader2_params(symbols: list[str]) -> AppleTrader2Config:
     return config
 
 
+def _execution_controls() -> tuple[str, str]:
+    """Where this agent run's orders go. Returns (mode, live_confirmation_phrase).
+
+    Rendered above the Start button rather than tucked in an expander: which
+    account an automated strategy is about to trade is the single most
+    consequential setting on this page, and it should not be possible to press
+    ▶ Start without having seen it.
+    """
+    mode = st.selectbox(
+        "Order execution",
+        TRADING_MODES,
+        index=TRADING_MODES.index(DEFAULT_TRADING_MODE),
+        format_func=lambda m: MODE_LABELS.get(m, m),
+        key="agent_trading_mode",
+        help=(
+            "**Local simulation** keeps the in-memory ledger this app has always "
+            "used — nothing leaves the process.\n\n"
+            "**Alpaca paper** sends real orders to your paper account: real "
+            "routing, real fills, real rejections, fake money. Needs "
+            "`ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_SECRET`.\n\n"
+            "**Alpaca LIVE** sends real orders with real money. Needs "
+            f"`{LIVE_TRADING_ENV_FLAG}=true` in the environment *and* the typed "
+            "confirmation below."
+        ),
+    )
+
+    live_confirm = ""
+    if mode == "alpaca_live":
+        if not live_trading_enabled():
+            st.error(
+                f"Live trading is disabled. Set `{LIVE_TRADING_ENV_FLAG}=true` in your "
+                "environment and restart the app to enable it. Until then this run "
+                "falls back to local simulation."
+            )
+        else:
+            st.warning(
+                "**This will trade real money.** An automated strategy will place "
+                "orders on your live Alpaca account without asking again per trade. "
+                f'Type `{LIVE_TRADING_CONFIRM_PHRASE}` to arm it for this run.'
+            )
+            live_confirm = st.text_input(
+                "Confirm live trading",
+                key="agent_live_confirm",
+                placeholder=LIVE_TRADING_CONFIRM_PHRASE,
+            )
+    elif mode == "alpaca_paper":
+        st.caption(
+            "Orders go to your Alpaca **paper** account — no real money, but real "
+            "order routing, so rejections and partial fills are real too."
+        )
+    return mode, live_confirm
+
+
 def _agent_panel(
     symbols: list[str],
     alpaca_key: str = "",
@@ -1967,6 +2025,8 @@ def _agent_panel(
         _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
     )
 
+    trading_mode_choice, live_confirm = _execution_controls()
+
     c1, c2, c3 = st.columns([1.2, 1, 1])
     starting_budget = c1.number_input(
         "Starting budget ($)",
@@ -1974,6 +2034,9 @@ def _agent_panel(
         value=PAPER_STARTING_CASH,
         step=100.0,
         key="agent_starting_budget",
+        help="Only used by local simulation. On an Alpaca account the balance is "
+        "the account's own and this is ignored.",
+        disabled=trading_mode_choice != "local",
     )
     start_clicked = c2.button("▶ Start Agent", type="primary", width='stretch', key="agent_start")
     stop_clicked = c3.button("⏹ Stop Agent", width='stretch', key="agent_stop")
@@ -2040,8 +2103,49 @@ def _agent_panel(
                         else ""
                     )
                 )
+            # Resolve the venue before anything starts. Every refusal inside
+            # resolve_broker degrades to local simulation and says so, so a
+            # misconfigured or blocked account can never silently become a
+            # different account than the one the user picked.
+            live_broker, effective_mode, broker_message = resolve_broker(
+                trading_mode_choice, live_confirm
+            )
+            state.trading_mode = effective_mode
+            state.trading_status = broker_message
+            if effective_mode != trading_mode_choice:
+                st.warning(broker_message)
+            elif effective_mode == "alpaca_live":
+                st.error(f"🔴 LIVE TRADING ARMED — {broker_message}")
+            else:
+                st.success(broker_message)
+
             state.starting_budget = starting_budget
-            state.decision_tracker = DecisionTracker(starting_cash=starting_budget, trade_cost=TRADE_FIXED_COST)
+            state.decision_tracker = DecisionTracker(
+                starting_cash=starting_budget,
+                broker=live_broker,
+                # A real venue applies its own costs inside the cash it reports;
+                # the modelled per-trade cost belongs to the simulation only.
+                trade_cost=TRADE_FIXED_COST if effective_mode == "local" else 0.0,
+            )
+            if effective_mode != "local":
+                # Open on the account's real balance and holdings rather than a
+                # configured budget, and surface a position the app did not open
+                # (left over from a previous run, or placed in Alpaca directly).
+                if state.decision_tracker.sync_from_broker():
+                    snap = state.decision_tracker.snapshot()
+                    state.starting_budget = snap["cash"]
+                    held = {s: q for s, q in snap["positions"].items() if q}
+                    if held:
+                        st.info(
+                            "Existing positions on this account: "
+                            + ", ".join(f"{s} {q:g}" for s, q in held.items())
+                            + " — the agent starts from these, not from flat."
+                        )
+                else:
+                    st.warning(
+                        "Could not read the account balance; the ledger starts from "
+                        "the configured budget and will reconcile on the first order."
+                    )
             state.agent_log = []
             state.agent_start_time = datetime.now(tz=timezone.utc)
             state.agent_equity_history = []
@@ -2091,6 +2195,17 @@ def _agent_panel(
         else ""
     )
     st.caption(f"Status: {status}{watching}")
+
+    # The venue stays on screen for as long as the agent runs, not just at the
+    # moment Start was pressed. Someone coming back to a session left running
+    # should be able to tell at a glance whether it is moving real money.
+    if state.agent_running:
+        if state.trading_mode == "alpaca_live":
+            st.error(f"🔴 **LIVE** — orders are going to your real Alpaca account. {state.trading_status}")
+        elif state.trading_mode == "alpaca_paper":
+            st.info(f"📝 Orders routed to your Alpaca **paper** account. {state.trading_status}")
+        else:
+            st.caption("💻 Local simulation — no orders are being sent.")
     _agent_identity_panel()
 
     _agent_performance_panel(symbols)

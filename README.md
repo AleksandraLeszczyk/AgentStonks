@@ -154,6 +154,9 @@ docker run -p 8501:8501 --env-file .env agentstonks
 |---|---|
 | `ALPACA_API_KEY` | Alpaca API key ID |
 | `ALPACA_SECRET` | Alpaca secret key |
+| `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_SECRET` | (optional) Alpaca **paper** trading keys. Orders default to the paper account; if `ALPACA_API_KEY` is already a paper key these are unnecessary — paper falls back to it |
+| `ALPACA_ENABLE_LIVE_TRADING` | Set truthy to make **live** trading selectable at all. Off by default; the app also requires a typed confirmation per run |
+| `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET` | (optional) Alpaca **live** trading keys — real money. Never inherited from the data or paper variables |
 | `FINNHUB_API_KEY` | Finnhub API key — powers the default live data source (trades → locally built candles). Without it the app streams bars from Alpaca instead |
 | `GEMINI_API_KEY` | (optional) Gemini key — for LLM news scoring and/or the trading agent |
 | `OPENAI_API_KEY` | (optional) OpenAI key — for LLM news scoring and/or the trading agent |
@@ -184,7 +187,14 @@ agent_stonks/
                   agent log, WebSocket handles, shared paper cash balance)
   market_hours.py — US regular-session clock (09:30-16:00 ET, Mon-Fri), used to gate the
                   Premarket Analyst and Automatic orchestrator's pre-open handoff
-  rest.py       — Alpaca REST helpers (fetch_bars, fetch_trades, fetch_daily_bars, fetch_news)
+  rest.py       — Alpaca market-data REST helpers (fetch_bars, fetch_trades, fetch_daily_bars, fetch_news)
+  trading_rest.py — Alpaca *Trading* API (accounts, positions, orders) — a different host and a
+                  different key pair per venue; the only module that can move money
+  trading_mode.py — picks the venue for a run (local / Alpaca paper / Alpaca live) and refuses
+                  toward simulation on every misconfiguration; live needs an env flag AND a
+                  typed confirmation
+  broker.py     — the Broker abstraction: PaperBroker (invented fills), SimBroker (stored tape),
+                  AlpacaBroker (real orders, real rejections, account is the source of truth)
   stream.py     — Alpaca's WebSocket streaming threads (bars/trades/quotes, news), plus the REST
                   safety nets every source shares: the stream-down fallback poll, the periodic
                   bar backfill, and the quote poll the Finnhub source runs on
@@ -214,11 +224,13 @@ agent_stonks/
                   a smooth density for the Live chart overlay / mixture fit
   news.py       — optional LLM pipeline for news impact scoring (Alpaca + WorldNews sources)
   premarket.py  — LLM synthesis of news/historical/macro/fundamental data into a structured
-                  pre-open briefing (catalysts, technical levels, outlook) per symbol
+                  briefing per symbol, generated automatically when the stream starts and framed
+                  by the session phase it runs in (pre-open / intraday / post-close / weekend)
   llm.py        — unified chat-completions client over Gemini, OpenAI, and Anthropic
   observability.py — optional Langfuse tracing for the LLM pipeline (no-op if unconfigured)
-  broker.py     — order execution abstraction (Broker / PaperBroker)
-  decisions.py  — independent decision ledger; fetches its own fill price per trade
+  decisions.py  — independent decision ledger; fetches its own fill price per trade. On a
+                  simulated broker it owns the cash balance; on a real one the Alpaca account
+                  does, and the ledger is written from an account read after each order
   tactics.py    — standing conditional trade plans (`set_tactics`) and the background
                   TacticsExecutor that arms/fires them against live ticks
   agent.py      — LLM trading agent loop (personalities incl. Premarket Analyst, tool calls,
