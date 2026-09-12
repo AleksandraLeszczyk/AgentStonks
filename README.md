@@ -223,11 +223,17 @@ agent_stonks/
                   daily bars + the opening print, and turns predicted volume-quantiles into
                   a smooth density for the Live chart overlay / mixture fit
   news.py       — optional LLM pipeline for news impact scoring (Alpaca + WorldNews sources)
-  premarket.py  — LLM synthesis of news/historical/macro/fundamental data into a structured
-                  briefing per symbol, generated automatically when the stream starts and framed
-                  by the session phase it runs in (pre-open / intraday / post-close / weekend)
+  premarket.py  — LLM synthesis of news/historical/macro/fundamental/alternative data into a
+                  structured briefing per symbol, generated automatically when the stream starts
+                  and framed by the session phase it runs in (pre-open / intraday / post-close /
+                  weekend). Finnhub's alt-data feeds enter as *structural* context with explicit
+                  instructions not to treat a quarterly filing as an intraday catalyst
   llm.py        — unified chat-completions client over Gemini, OpenAI, and Anthropic
   observability.py — optional Langfuse tracing for the LLM pipeline (no-op if unconfigured)
+  finnhub_rest.py — Finnhub's six alternative-data feeds (insider transactions & sentiment,
+                  US federal contract awards, Senate lobbying, USPTO patents, H-1B visas),
+                  fetched concurrently and summarised for the pre-market briefing; per-dataset
+                  failures degrade rather than losing the rest
   trade_sound.py — optional audible cue on a fill: an inline Custom Component v2 that
                   synthesises a two-note chime with the Web Audio API (rising for a buy,
                   falling for a sell). No audio asset, no visible player. Off by default

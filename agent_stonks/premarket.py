@@ -14,6 +14,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel
 
 from . import clock
+from . import finnhub_rest
 from . import market_hours
 from . import observability as obs
 from .historical import (
@@ -70,6 +71,35 @@ Barclays. Use them to frame upside/downside: little room to the consensus mean
 (or price already above it) argues against chasing a gap-up; a wide gap to the
 mean leaves room to run; price outside the whole high-low range is a valuation
 extreme worth flagging.
+
+You may also have an ALTERNATIVE DATA block: insider transactions and
+sentiment, US federal contract awards, Senate lobbying disclosures, USPTO
+patent filings, and H-1B visa applications.
+
+Weigh it correctly or it will mislead you. All of it is quarterly-to-annual and
+backward-looking; none of it is an intraday catalyst, and it must NOT drive the
+directional bias, appear as a "catalyst", or generate a price level. It is
+there to raise or lower conviction in a thesis you have already built from
+price, news, and flow — and to flag a structural risk worth naming.
+
+How to read each:
+- INSIDER open-market buys are the only genuinely directional item here, and
+  only as a cluster over days-to-weeks. Routine selling by executives is close
+  to meaningless — insiders diversify, and scheduled 10b5-1 plans sell on a
+  calendar regardless of view. Say "insiders sold" ONLY if the open-market
+  selling is unusual in size or breadth, never merely because the number is
+  negative. Compensation mechanics are already excluded from the figures given.
+- MSPR is a ratio, not a dollar flow; treat an extreme reading on few filings
+  as thin data, not conviction.
+- FEDERAL AWARDS and LOBBYING matter in proportion to company size. A few
+  hundred thousand dollars is decisive for a small defence supplier and
+  irrelevant for a mega-cap; if it is immaterial, say nothing about it rather
+  than padding the briefing.
+- PATENTS and H-1B describe investment and hiring intent over years. Use them
+  for the "is this company expanding or retrenching" question only.
+
+If none of it changes your view, omit it entirely. Padding a day-trading
+briefing with a lobbying filing is worse than leaving it out.
 
 You may also have incoming corporate actions (ex-dividend dates, splits,
 mergers, spin-offs) over the next two weeks. Treat them as scheduled catalysts:
@@ -277,6 +307,105 @@ def _intraday_block(
     return "\n".join(lines)
 
 
+def _money(value: float) -> str:
+    """Compact dollars: $1.2B / $45.3M / $112,764."""
+    for cutoff, suffix in ((1e9, "B"), (1e6, "M")):
+        if abs(value) >= cutoff:
+            return f"${value / cutoff:.1f}{suffix}"
+    return f"${value:,.0f}"
+
+
+def _alt_data_block(symbol: str, finnhub_token: str) -> str:
+    """Finnhub's six alternative-data feeds, summarised.
+
+    Structural context about what the company is doing -- insider conviction,
+    federal contracts, lobbying spend, patent output, visa-sponsored hiring --
+    rather than what its stock is doing. All of it is quarterly-to-annual and
+    none of it is an intraday catalyst; `_PHASE_FRAMING` tells the model how to
+    weigh it, and this block labels each line with its horizon so the model
+    cannot mistake a lobbying filing for news.
+
+    Returns "" without a token or when every dataset is empty -- a heading with
+    nothing under it invites the model to speculate about the silence.
+    """
+    if not finnhub_token:
+        return ""
+    try:
+        data = finnhub_rest.fetch_all(symbol, finnhub_token)
+    except Exception:
+        return ""
+    if not data:
+        return ""
+
+    lines: list[str] = [
+        "ALTERNATIVE DATA (Finnhub) — structural, NOT intraday catalysts:"
+    ]
+
+    insider = data.get("insider_transactions") or {}
+    if insider.get("buy_count") or insider.get("sell_count"):
+        lines.append(
+            f"- Insider open-market trades, last 6 months: {insider['buy_count']} buys "
+            f"({_money(insider['buy_value'])}) vs {insider['sell_count']} sells "
+            f"({_money(insider['sell_value'])}); net "
+            f"{insider['net_shares']:+,.0f} shares. Most active: "
+            f"{', '.join(insider['insiders']) or 'n/a'}. Latest {insider['latest_date']}. "
+            f"({insider['other_count']} further filings were grants/vests/option exercises "
+            "and are excluded — those are scheduled compensation, not decisions.)"
+        )
+
+    sentiment = data.get("insider_sentiment") or {}
+    if sentiment:
+        lines.append(
+            f"- Insider sentiment (MSPR, -100..+100): latest {sentiment['latest_mspr']:+.0f} "
+            f"for {sentiment['latest_period']}, {sentiment['mean_mspr']:+.0f} average over "
+            f"{sentiment['months']} months, positive in {sentiment['positive_months']} of them; "
+            f"net {sentiment['net_change']:+,.0f} shares."
+        )
+
+    spending = data.get("usa_spending") or {}
+    if spending:
+        lines.append(
+            f"- US federal contract awards, last 12 months: {spending['award_count']} awards "
+            f"totalling {_money(spending['total_obligated'])} obligated. "
+            f"Agencies: {', '.join(spending['top_agencies'])}. "
+            f"Latest {spending['latest_date']}. Judge materiality against company size — "
+            "this is decisive for a defence contractor and rounding error for a mega-cap."
+        )
+
+    lobbying = data.get("lobbying") or {}
+    if lobbying:
+        per_year = ", ".join(f"{y}: {_money(v)}" for y, v in lobbying["per_year"].items())
+        lines.append(
+            f"- Senate lobbying disclosures: {lobbying['filing_count']} filings, "
+            f"{_money(lobbying['total'])} total ({per_year}). Rising spend usually tracks "
+            "regulatory or antitrust exposure rather than anything directional."
+        )
+
+    patents = data.get("uspto_patents") or {}
+    if patents:
+        per_year = ", ".join(f"{y}: {n}" for y, n in patents["per_year"].items())
+        titles = "; ".join(patents["recent_titles"])
+        lines.append(
+            f"- USPTO patent filings: {patents['filing_count']} in the window ({per_year}); "
+            f"most recent {patents['latest_filing']}. Recent subjects: {titles}. "
+            "NOTE: USPTO publication lags filing by roughly two years, so the absence of "
+            "recent entries says nothing about current R&D."
+        )
+
+    visa = data.get("h1b_visa") or {}
+    if visa:
+        count = f"{visa['filing_count']}+" if visa["capped"] else str(visa["filing_count"])
+        lines.append(
+            f"- H-1B visa applications: {count} filings "
+            f"({visa['certified_count']} certified), median offered wage "
+            f"{_money(visa['median_wage'])}. Top roles: {', '.join(visa['top_titles'])}. "
+            f"Sites: {', '.join(visa['top_sites'])}. A hiring-intent proxy: sustained "
+            "sponsored hiring implies expansion, a sharp drop implies a freeze."
+        )
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def _macro_context(days: int = 30) -> str:
     try:
         mkt = fetch_market_indicators(days=days)
@@ -431,6 +560,7 @@ def generate_premarket_analysis(
     alpaca_key: str = "",
     alpaca_secret: str = "",
     worldnews_key: str = "",
+    finnhub_token: str = "",
     model: Optional[str] = None,
     phase: Optional[str] = None,
     intraday_bars: Optional[list[dict]] = None,
@@ -484,6 +614,7 @@ def generate_premarket_analysis(
     earnings_text = _earnings_block(sym)
     corporate_actions_text = _corporate_actions_block(sym, alpaca_key, alpaca_secret)
     intraday_text = _intraday_block(intraday_bars or [], prev_close, daily_bars)
+    alt_data_text = _alt_data_block(sym, finnhub_token)
     # Anchor the target upside math on the live price when the tape is running,
     # and on the most recent daily close otherwise. Quoting analyst upside
     # against a stale close while the stock is 3% up on the day would misstate
@@ -504,6 +635,7 @@ def generate_premarket_analysis(
         earnings_text,
         corporate_actions_text,
         fundamentals_text,
+        alt_data_text,
         targets_text,
         price_text,
         macro_text,
@@ -537,6 +669,7 @@ def generate_for_symbols(
     alpaca_key: str = "",
     alpaca_secret: str = "",
     worldnews_key: str = "",
+    finnhub_token: str = "",
     model: Optional[str] = None,
 ) -> None:
     """Brief every symbol in turn, publishing each one onto `app` as it lands.
@@ -571,6 +704,7 @@ def generate_for_symbols(
                 alpaca_key=alpaca_key,
                 alpaca_secret=alpaca_secret,
                 worldnews_key=worldnews_key,
+                finnhub_token=finnhub_token,
                 model=model,
                 phase=phase,
                 intraday_bars=bars,
@@ -605,6 +739,7 @@ def launch_premarket_analysis(
     alpaca_key: str = "",
     alpaca_secret: str = "",
     worldnews_key: str = "",
+    finnhub_token: str = "",
     model: Optional[str] = None,
 ) -> bool:
     """Start `generate_for_symbols` on a background thread. Returns False (and
@@ -628,7 +763,7 @@ def launch_premarket_analysis(
     threading.Thread(
         target=generate_for_symbols,
         args=(app, list(symbols), provider, api_key,
-              alpaca_key, alpaca_secret, worldnews_key, model),
+              alpaca_key, alpaca_secret, worldnews_key, finnhub_token, model),
         daemon=True,
     ).start()
     return True

@@ -2413,6 +2413,9 @@ def _launch_premarket(state: AppState, symbols: list[str]) -> None:
         alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
         alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
         worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
+        # Same key the live tape uses; it also unlocks Finnhub's six
+        # alternative-data feeds that the briefing folds in as structural context.
+        finnhub_token=state.finnhub_token or os.getenv("FINNHUB_API_KEY", ""),
         model=model,
     )
 
