@@ -226,22 +226,33 @@ class Scorecard:
         self.price_extremes: dict[str, dict] = {}
         # Closed Automatic activation windows: {strategy, regime, started_at, ended_at}.
         self.activations: list[dict] = []
-        self._open_activation: "dict | None" = None
+        # Under the Automatic orchestrator each ticker gets its own strategy,
+        # so several activation windows are open at once. Keyed by the frozen
+        # set of symbols the window covers, which is what makes them distinct.
+        self._open_activations: "dict[frozenset, dict]" = {}
 
     def runtime_sec(self, now: "datetime | None" = None) -> float:
         started = datetime.fromisoformat(self.started_at)
         return max(0.0, ((now or _utcnow()) - started).total_seconds())
 
     def close_activation(
-        self, ended_at: "str | None" = None, end_value: "float | None" = None
+        self,
+        ended_at: "str | None" = None,
+        end_value: "float | None" = None,
+        symbols: "list[str] | None" = None,
     ) -> None:
+        """Close one activation window, or every open one when `symbols` is None."""
+        key = frozenset(s.upper() for s in symbols) if symbols is not None else None
         with self.lock:
-            if self._open_activation is not None:
-                self._open_activation["ended_at"] = ended_at or _utcnow().isoformat()
+            keys = [key] if key is not None else list(self._open_activations)
+            for k in keys:
+                window = self._open_activations.pop(k, None)
+                if window is None:
+                    continue
+                window["ended_at"] = ended_at or _utcnow().isoformat()
                 if end_value is not None:
-                    self._open_activation["end_value"] = end_value
-                self.activations.append(self._open_activation)
-                self._open_activation = None
+                    window["end_value"] = end_value
+                self.activations.append(window)
 
 
 @_never_raise
@@ -337,31 +348,48 @@ def record_price(state: "AppState", symbol: str, price: "float | None") -> None:
 
 
 @_never_raise
-def record_activation_start(state: "AppState", strategy: str, regime: "str | None") -> None:
-    """Automatic activated `strategy`; a window opens until the strategy stands
-    down (or the orchestrator stops). The portfolio value at activation is
-    captured so the window can be judged on its REALIZED return, not merely on
-    whether it armed anything."""
+def record_activation_start(
+    state: "AppState",
+    strategy: str,
+    regime: "str | None",
+    symbols: "list[str] | None" = None,
+) -> None:
+    """Automatic activated `strategy` for `symbols`; a window opens until that
+    strategy stands down on them (or the orchestrator stops). The portfolio
+    value at activation is captured so the window can be judged on its REALIZED
+    return, not merely on whether it armed anything.
+
+    `symbols` scopes the window. Since the orchestrator assigns per ticker,
+    several windows run at once and overlap in time -- without a symbol scope
+    each would claim every decision made while it happened to be open,
+    including other tickers' trades.
+
+    Opening a window no longer closes the others: a new assignment for one
+    ticker says nothing about a strategy still running on another.
+    """
     card: "Scorecard | None" = state.scorecard
     if card is None:
         return
     value = state.mark_to_market()
-    card.close_activation(end_value=value)
+    key = frozenset(s.upper() for s in (symbols or []))
+    card.close_activation(end_value=value, symbols=list(key) if key else None)
     with card.lock:
-        card._open_activation = {
+        card._open_activations[key] = {
             "strategy": strategy,
             "regime": regime,
+            "symbols": sorted(key),
             "started_at": _utcnow().isoformat(),
             "start_value": value,
         }
 
 
 @_never_raise
-def record_activation_end(state: "AppState") -> None:
+def record_activation_end(state: "AppState", symbols: "list[str] | None" = None) -> None:
+    """Close the window for `symbols`, or every open window when None."""
     card: "Scorecard | None" = state.scorecard
     if card is None:
         return
-    card.close_activation(end_value=state.mark_to_market())
+    card.close_activation(end_value=state.mark_to_market(), symbols=symbols)
 
 
 # --------------------------------------------------------------------------
@@ -403,7 +431,11 @@ def _decision_quality(
     }
 
 
-def _activation_outcomes(activations: list[dict], decisions: list[dict]) -> list[dict]:
+def _activation_outcomes(
+    activations: list[dict],
+    decisions: list[dict],
+    session_symbols: "list[str] | None" = None,
+) -> list[dict]:
     """Attribute the session's decisions to each Automatic activation window
     and judge it on what it actually MADE: `return_pct` is the portfolio change
     over the window, and `effective` means a positive realized return. Merely
@@ -411,11 +443,19 @@ def _activation_outcomes(activations: list[dict], decisions: list[dict]) -> list
     that traded and lost, or watched and did nothing, was not a good pick.
     (Windows from records without start/end values fall back to the old
     armed-anything rule so old journals still aggregate.)"""
+    session_symbols = session_symbols or []
     out = []
     for window in activations:
         in_window = _decisions_in_window(
             decisions, window["started_at"], window.get("ended_at") or "9999"
         )
+        # Under per-ticker assignment several windows are open at the same time,
+        # so a time range alone no longer identifies a window's decisions --
+        # without this filter a reversal agent on TSLA would be credited with a
+        # momentum agent's AAPL fills purely for having overlapped it.
+        scope = {s.upper() for s in (window.get("symbols") or [])}
+        if scope:
+            in_window = [d for d in in_window if str(d.get("symbol", "")).upper() in scope]
         active = sum(
             1
             for d in in_window
@@ -426,7 +466,13 @@ def _activation_outcomes(activations: list[dict], decisions: list[dict]) -> list
         start_value = window.get("start_value")
         end_value = window.get("end_value")
         return_pct = None
-        if start_value and end_value is not None:
+        # Portfolio value is basket-wide and the basket shares one cash balance,
+        # so it cannot be attributed to a window covering only part of it. A
+        # scoped window is judged on what it DID instead; a window covering the
+        # whole session (or a legacy one with no scope) keeps the realized-return
+        # rule it has always used.
+        whole_basket = not scope or scope >= {s.upper() for s in session_symbols}
+        if start_value and end_value is not None and whole_basket:
             return_pct = (end_value / start_value - 1.0) * 100.0
         out.append(
             {
@@ -504,8 +550,8 @@ def _session_record(
     end_value = state.mark_to_market() if state is not None else None
     with card.lock:
         activations = list(card.activations)
-        if card._open_activation is not None:  # still-running Automatic window
-            open_activation = {**card._open_activation, "ended_at": now_iso}
+        for window in card._open_activations.values():  # still-running windows
+            open_activation = {**window, "ended_at": now_iso}
             if end_value is not None:
                 open_activation["end_value"] = end_value
             activations.append(open_activation)
@@ -529,7 +575,7 @@ def _session_record(
             "profit_potential": _profit_potential(
                 card.price_extremes, decision_quality["return_pct"]
             ),
-            "activations": _activation_outcomes(activations, decisions),
+            "activations": _activation_outcomes(activations, decisions, card.symbols),
         }
     return record
 

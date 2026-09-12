@@ -661,6 +661,42 @@ def generate_premarket_analysis(
     )
 
 
+def briefing_to_prompt_text(briefing: PremarketBriefing, symbol: str) -> str:
+    """One briefing as prose, for pasting into a trading agent's system prompt.
+
+    Deliberately sentences rather than the JSON the model produced. The agent
+    reading this is a language model mid-reasoning, not a parser: prose is what
+    it weighs against the tool output it is about to fetch, and a serialised
+    object invites it to quote fields back instead of thinking about them.
+
+    Kept tight -- a handful of items per section -- because this goes into the
+    system prompt of *every* cycle for *every* ticker in the basket, and a
+    five-symbol basket of full briefings would crowd out the live data the agent
+    is supposed to be reacting to.
+    """
+    lines = [
+        f"{symbol}: {briefing.overall_bias} bias, {briefing.confidence} confidence.",
+        f"  Thesis: {briefing.summary}",
+    ]
+    if briefing.catalysts:
+        drivers = "; ".join(
+            f"{c.headline} ({c.impact})" for c in briefing.catalysts[:3]
+        )
+        lines.append(f"  What drove it: {drivers}")
+    if briefing.technical_levels:
+        levels = "; ".join(
+            f"{lvl.level:g} as {lvl.role}" for lvl in briefing.technical_levels[:4]
+        )
+        lines.append(f"  Levels it identified: {levels}")
+    if briefing.risk_factors:
+        lines.append(f"  Risks it named: {'; '.join(briefing.risk_factors[:3])}")
+    if briefing.key_levels_to_watch:
+        lines.append(f"  It said to watch: {'; '.join(briefing.key_levels_to_watch[:3])}")
+    if briefing.macro_context:
+        lines.append(f"  Macro read: {briefing.macro_context}")
+    return "\n".join(lines)
+
+
 def generate_for_symbols(
     app,
     symbols: list[str],

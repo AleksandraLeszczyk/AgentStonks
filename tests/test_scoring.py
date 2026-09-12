@@ -172,13 +172,36 @@ class TestScorecardRecording:
 
     def test_activation_windows_open_and_close(self):
         state = self._state()
-        record_activation_start(state, "momentum", "bullish_trend")
-        record_activation_end(state)
-        record_activation_start(state, "reversal", "ranging")
-        record_activation_start(state, "breakout", "breakout_pending")  # implicitly closes reversal
+        record_activation_start(state, "momentum", "bullish_trend", symbols=["AAPL"])
+        record_activation_end(state, symbols=["AAPL"])
+        record_activation_start(state, "reversal", "ranging", symbols=["AAPL"])
+        # Re-assigning the SAME ticker closes its previous window.
+        record_activation_start(state, "breakout", "breakout_pending", symbols=["AAPL"])
         card = state.scorecard
         assert [a["strategy"] for a in card.activations] == ["momentum", "reversal"]
-        assert card._open_activation["strategy"] == "breakout"
+        assert card._open_activations[frozenset({"AAPL"})]["strategy"] == "breakout"
+
+    def test_windows_for_different_tickers_run_concurrently(self):
+        # Per-ticker assignment means several strategies are active at once;
+        # opening one must not close another's.
+        state = self._state()
+        record_activation_start(state, "momentum", "bullish_trend", symbols=["AAPL"])
+        record_activation_start(state, "reversal", "ranging", symbols=["TSLA"])
+        card = state.scorecard
+        assert card.activations == []
+        assert {frozenset({"AAPL"}), frozenset({"TSLA"})} == set(card._open_activations)
+
+        record_activation_end(state, symbols=["AAPL"])
+        assert [a["strategy"] for a in card.activations] == ["momentum"]
+        assert set(card._open_activations) == {frozenset({"TSLA"})}
+
+    def test_ending_without_symbols_closes_every_window(self):
+        state = self._state()
+        record_activation_start(state, "momentum", "bullish_trend", symbols=["AAPL"])
+        record_activation_start(state, "reversal", "ranging", symbols=["TSLA"])
+        record_activation_end(state)
+        assert len(state.scorecard.activations) == 2
+        assert state.scorecard._open_activations == {}
 
 
 class TestProfitPotential:

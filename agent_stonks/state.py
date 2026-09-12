@@ -254,6 +254,7 @@ _DEFAULTS: dict[str, object] = {
     "automatic_active_strategy": None,
     "automatic_regime": None,
     "automatic_reason": None,
+    "automatic_assignments": {},
     "news_llm_provider": "openai",
     "scorecard": None,
     "premarket_briefings": {},
@@ -346,6 +347,12 @@ class AppState:
         self.automatic_active_strategy: str | None = None
         self.automatic_regime: str | None = None
         self.automatic_reason: str | None = None
+        # Per-ticker strategy assignments under the Automatic orchestrator:
+        # {symbol: {strategy, regime, market_regime, reasoning}}. Different
+        # tickers can be in genuinely different states, so the orchestrator
+        # assigns each one separately; the three fields above hold the dominant
+        # assignment as a summary for consumers that need a single value.
+        self.automatic_assignments: dict[str, dict] = {}
         self.news_llm_provider: str = "openai"
         # Per-session scoring collector (see agent_stonks.scoring); attached by
         # launch_agent/launch_automatic, flushed to the journal at session end.

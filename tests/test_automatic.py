@@ -151,8 +151,10 @@ class TestRunRegimeCycle:
                         "c2",
                         "select_strategy",
                         {
+                            "symbol": "AAPL",
                             "strategy": "momentum",
                             "regime": "bullish_trend",
+                            "market_regime": "volatile",
                             "reasoning": "fresh gap on 3x volume with a catalyst",
                         },
                     )
@@ -160,9 +162,11 @@ class TestRunRegimeCycle:
             ),
         ]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
-        assert selection["strategy"] == "momentum"
-        assert selection["regime"] == "bullish_trend"
+        assignments = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+        assert assignments["AAPL"]["strategy"] == "momentum"
+        assert assignments["AAPL"]["regime"] == "bullish_trend"
+        # The ticker's own regime and the shared market backdrop are separate.
+        assert assignments["AAPL"]["market_regime"] == "volatile"
         assert client.tools_seen[0] is REGIME_TOOLS
         with state.lock:
             types = [e["type"] for e in state.agent_log]
@@ -172,28 +176,27 @@ class TestRunRegimeCycle:
         state = _base_state()
         tracker = DecisionTracker(broker=FakeBroker())
         responses = [
-            _response(tool_calls=[_tool_call("c1", "select_strategy", {"strategy": "scalping", "reasoning": "x"})]),
+            _response(tool_calls=[_tool_call("c1", "select_strategy", {"symbol": "AAPL", "strategy": "scalping", "reasoning": "x"})]),
             _response(
                 tool_calls=[
-                    _tool_call("c2", "select_strategy", {"strategy": "momentum", "regime": "ranging", "reasoning": "mixed"})
+                    _tool_call("c2", "select_strategy", {"symbol": "AAPL", "strategy": "momentum", "regime": "ranging", "reasoning": "mixed"})
                 ]
             ),
         ]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
-        assert selection["strategy"] == "momentum"
+        assignments = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+        assert assignments["AAPL"]["strategy"] == "momentum"
         # the rejected attempt was surfaced back to the model
         second_call = client.calls[1]
         tool_results = [m["content"] for m in second_call if m.get("role") == "tool"]
         assert any("strategy must be one of" in c for c in tool_results)
 
-    def test_returns_none_when_never_selects(self):
+    def test_returns_nothing_when_never_selects(self):
         state = _base_state()
         tracker = DecisionTracker(broker=FakeBroker())
         responses = [_response(content="thinking") for _ in range(3)]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
-        assert selection is None
+        assert run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3) == {}
 
     def test_regime_tools_include_corporate_actions_but_no_trading(self):
         names = {t["function"]["name"] for t in REGIME_TOOLS}
@@ -234,18 +237,18 @@ class TestBreakoutActivationGate:
         responses = [
             _response(
                 tool_calls=[
-                    _tool_call("c1", "select_strategy", {"strategy": "breakout", "regime": "breakout_pending", "reasoning": "x"})
+                    _tool_call("c1", "select_strategy", {"symbol": "AAPL", "strategy": "breakout", "regime": "breakout_pending", "reasoning": "x"})
                 ]
             ),
             _response(
                 tool_calls=[
-                    _tool_call("c2", "select_strategy", {"strategy": "reversal", "regime": "ranging", "reasoning": "adx 15"})
+                    _tool_call("c2", "select_strategy", {"symbol": "AAPL", "strategy": "reversal", "regime": "ranging", "reasoning": "adx 15"})
                 ]
             ),
         ]
         client = FakeClient(responses)
-        selection = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
-        assert selection["strategy"] == "reversal"
+        assignments = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+        assert assignments["AAPL"]["strategy"] == "reversal"
         tool_results = [m["content"] for m in client.calls[1] if m.get("role") == "tool"]
         assert any("not selectable" in c for c in tool_results)
 
@@ -296,3 +299,171 @@ class TestBreakoutActivationGate:
             "bar_count": 15, "avg_volume": 1000.0, "complete": True,
         }
         assert breakout_preconditions(state, ["AAPL"]) is None
+
+
+class TestPerSymbolAssignment:
+    """Different tickers can be in genuinely different states, so each gets its
+    own strategy rather than the basket sharing one pick."""
+
+    def _state(self, *symbols) -> AppState:
+        state = AppState()
+        state.set_symbols(list(symbols))
+        state.api_key = "k"
+        state.api_secret = "s"
+        return state
+
+    def test_assigns_each_ticker_separately(self):
+        state = self._state("AAPL", "TSLA")
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(tool_calls=[
+                _tool_call("c1", "select_strategy", {
+                    "symbol": "AAPL", "strategy": "momentum", "regime": "bullish_trend",
+                    "market_regime": "volatile", "reasoning": "gap on 3x volume"}),
+                _tool_call("c2", "select_strategy", {
+                    "symbol": "TSLA", "strategy": "reversal", "regime": "ranging",
+                    "market_regime": "volatile", "reasoning": "adx 14, stretched from vwap"}),
+            ]),
+        ]
+        client = FakeClient(responses)
+        out = run_regime_cycle(client, "m", ["AAPL", "TSLA"], state, tracker, max_iters=4)
+
+        assert out["AAPL"]["strategy"] == "momentum"
+        assert out["TSLA"]["strategy"] == "reversal"
+        # The market backdrop is shared; the ticker regimes are not.
+        assert out["AAPL"]["market_regime"] == out["TSLA"]["market_regime"] == "volatile"
+        assert out["AAPL"]["regime"] != out["TSLA"]["regime"]
+
+    def test_keeps_going_until_every_ticker_is_assigned(self):
+        state = self._state("AAPL", "TSLA")
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(tool_calls=[_tool_call("c1", "select_strategy", {
+                "symbol": "AAPL", "strategy": "momentum", "reasoning": "x"})]),
+            _response(tool_calls=[_tool_call("c2", "select_strategy", {
+                "symbol": "TSLA", "strategy": "reversal", "reasoning": "y"})]),
+        ]
+        client = FakeClient(responses)
+        out = run_regime_cycle(client, "m", ["AAPL", "TSLA"], state, tracker, max_iters=5)
+        assert set(out) == {"AAPL", "TSLA"}
+
+    def test_a_partial_round_still_trades_what_it_assigned(self):
+        # Three of four assigned should trade those three, not discard the round.
+        state = self._state("AAPL", "TSLA")
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(tool_calls=[_tool_call("c1", "select_strategy", {
+                "symbol": "AAPL", "strategy": "momentum", "reasoning": "x"})]),
+            _response(content="I am done"),
+            _response(content="still done"),
+        ]
+        client = FakeClient(responses)
+        out = run_regime_cycle(client, "m", ["AAPL", "TSLA"], state, tracker, max_iters=3)
+        assert set(out) == {"AAPL"}
+
+    def test_an_unknown_symbol_is_rejected(self):
+        state = self._state("AAPL")
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(tool_calls=[_tool_call("c1", "select_strategy", {
+                "symbol": "NVDA", "strategy": "momentum", "reasoning": "x"})]),
+            _response(tool_calls=[_tool_call("c2", "select_strategy", {
+                "symbol": "AAPL", "strategy": "momentum", "reasoning": "x"})]),
+        ]
+        client = FakeClient(responses)
+        out = run_regime_cycle(client, "m", ["AAPL"], state, tracker, max_iters=4)
+        assert set(out) == {"AAPL"}
+        results = [m["content"] for m in client.calls[1] if m.get("role") == "tool"]
+        assert any("must be one of the tickers" in c for c in results)
+
+    def test_breakout_gate_is_checked_per_ticker(self, monkeypatch):
+        # One ticker lacking a measurable opening range says nothing about
+        # another's, so the gate must be evaluated for the named symbol only.
+        import agent_stonks.automatic as automatic_mod
+
+        seen = []
+
+        def _gate(app, symbols, minutes=15):
+            seen.append(list(symbols))
+            return "no opening range" if symbols == ["TSLA"] else None
+
+        monkeypatch.setattr(automatic_mod, "breakout_preconditions", _gate)
+        state = self._state("AAPL", "TSLA")
+        tracker = DecisionTracker(broker=FakeBroker())
+        responses = [
+            _response(tool_calls=[
+                _tool_call("c1", "select_strategy", {
+                    "symbol": "AAPL", "strategy": "breakout", "reasoning": "x"}),
+                _tool_call("c2", "select_strategy", {
+                    "symbol": "TSLA", "strategy": "breakout", "reasoning": "y"}),
+            ]),
+            _response(tool_calls=[_tool_call("c3", "select_strategy", {
+                "symbol": "TSLA", "strategy": "reversal", "reasoning": "z"})]),
+        ]
+        client = FakeClient(responses)
+        out = run_regime_cycle(client, "m", ["AAPL", "TSLA"], state, tracker, max_iters=4)
+
+        assert seen == [["AAPL"], ["TSLA"]]      # per ticker, never the basket
+        assert out["AAPL"]["strategy"] == "breakout"   # allowed
+        assert out["TSLA"]["strategy"] == "reversal"   # gated, re-picked
+
+
+class TestGroupByStrategy:
+    def test_tickers_sharing_a_strategy_are_traded_together(self):
+        from agent_stonks.automatic import group_by_strategy
+
+        groups = group_by_strategy({
+            "AAPL": {"strategy": "momentum"},
+            "MSFT": {"strategy": "momentum"},
+            "TSLA": {"strategy": "reversal"},
+        })
+        as_dict = dict(groups)
+        assert as_dict["momentum"] == ["AAPL", "MSFT"]
+        assert as_dict["reversal"] == ["TSLA"]
+        # One cycle per distinct strategy, not per ticker.
+        assert len(groups) == 2
+
+    def test_empty_assignments_produce_no_groups(self):
+        from agent_stonks.automatic import group_by_strategy
+
+        assert group_by_strategy({}) == []
+
+
+class TestPublishAssignments:
+    def test_single_strategy_keeps_the_legacy_summary_fields(self):
+        from agent_stonks.automatic import _publish_assignments
+
+        state = AppState()
+        _publish_assignments(state, {
+            "AAPL": {"strategy": "momentum", "regime": "bullish_trend",
+                     "market_regime": "quiet", "reasoning": "gap on volume"},
+        })
+        assert state.automatic_active_strategy == "momentum"
+        assert state.automatic_regime == "quiet"       # the market's, not the ticker's
+        assert state.automatic_reason == "gap on volume"
+
+    def test_mixed_strategies_summarise_as_the_dominant_one(self):
+        from agent_stonks.automatic import _publish_assignments
+
+        state = AppState()
+        _publish_assignments(state, {
+            "AAPL": {"strategy": "momentum", "regime": "bullish_trend",
+                     "market_regime": "quiet", "reasoning": "a"},
+            "MSFT": {"strategy": "momentum", "regime": "bullish_trend",
+                     "market_regime": "quiet", "reasoning": "b"},
+            "TSLA": {"strategy": "reversal", "regime": "ranging",
+                     "market_regime": "quiet", "reasoning": "c"},
+        })
+        assert state.automatic_active_strategy == "momentum"  # covers 2 of 3
+        assert "TSLA" in state.automatic_reason               # per-ticker map instead
+        assert len(state.automatic_assignments) == 3
+
+    def test_clearing_resets_every_field(self):
+        from agent_stonks.automatic import _publish_assignments
+
+        state = AppState()
+        _publish_assignments(state, {"AAPL": {"strategy": "momentum", "reasoning": "a"}})
+        _publish_assignments(state, {})
+        assert state.automatic_assignments == {}
+        assert state.automatic_active_strategy is None
+        assert state.automatic_regime is None

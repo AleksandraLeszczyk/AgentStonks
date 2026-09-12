@@ -1456,14 +1456,24 @@ def _agent_identity_panel() -> None:
     selected = state.llm_personality
     display_key = selected
     note = ""
+    assignments: dict = {}
     if selected == AUTOMATIC_KEY and state.agent_running:
+        assignments = state.automatic_assignments or {}
         active = state.automatic_active_strategy
         if active:
             display_key = active
-            regime = f" — {state.automatic_regime} regime" if state.automatic_regime else ""
-            note = f"🤖 picked by Automatic{regime}"
+            regime = f" — {state.automatic_regime} market" if state.automatic_regime else ""
+            distinct = {a.get("strategy") for a in assignments.values()}
+            note = (
+                # The card can only wear one face; when the orchestrator is
+                # running several strategies at once, say so rather than
+                # letting the dominant one stand for the whole basket.
+                f"🤖 most of the basket — {len(distinct)} strategies running{regime}"
+                if len(distinct) > 1
+                else f"🤖 picked by Automatic{regime}"
+            )
         else:
-            note = "🤖 Automatic is assessing the market regime…"
+            note = "🤖 Automatic is assessing each ticker…"
     avatar = _avatar_data_uri(display_key)
     img = (
         f"<img src='{avatar}' alt='' style='width:56px;height:56px;border-radius:50%;flex:none'/>"
@@ -1485,6 +1495,21 @@ def _agent_identity_panel() -> None:
         f"{note_html}"
         f"</div></div>"
     )
+    # Per-ticker assignments, when the orchestrator split the basket. One line
+    # each, because "which strategy is trading my TSLA" has no answer in the
+    # single-avatar card above once the strategies differ.
+    if len(assignments) > 1:
+        rows = " · ".join(
+            f"<b style='color:{PALETTE['accent']}'>{html.escape(sym)}</b> "
+            f"{html.escape(_personality_label(entry.get('strategy', '')))}"
+            f"<span style='color:{PALETTE['muted']}'> ({html.escape(str(entry.get('regime') or '—'))})</span>"
+            for sym, entry in sorted(assignments.items())
+        )
+        st.html(
+            f"<div style='background:{PALETTE['panel']};border:1px solid {PALETTE['grid']};"
+            f"border-radius:10px;padding:8px 16px;margin:0 0 6px;font-size:0.85rem;"
+            f"color:{PALETTE['text']}'>{rows}</div>"
+        )
 
 
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)

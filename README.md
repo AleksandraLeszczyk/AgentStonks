@@ -242,6 +242,14 @@ agent_stonks/
                   does, and the ledger is written from an account read after each order
   tactics.py    — standing conditional trade plans (`set_tactics`) and the background
                   TacticsExecutor that arms/fires them against live ticks
+  automatic.py  — the orchestrator: reads the broad market once, then each ticker separately,
+                  and assigns EVERY ticker its own strategy (one cycle per distinct strategy,
+                  run sequentially over a shared cash balance). A stand-down re-assesses only
+                  that strategy's tickers
+  agent_prompts.py — what each personality is told, plus the per-run addenda: multi-symbol,
+                  tactics, market-closed, the EXECUTION VENUE (local / Alpaca paper / live —
+                  an agent that thinks its orders are inert reasons differently from one
+                  spending real money), and the day's research briefing rendered as prose
   agent.py      — LLM trading agent loop (personalities incl. Premarket Analyst, tool calls,
                   reasoning, one decision per cycle across the whole symbol basket);
                   `stand_down` tool when run under Automatic

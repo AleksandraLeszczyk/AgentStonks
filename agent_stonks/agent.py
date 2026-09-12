@@ -8,9 +8,12 @@ exactly one `submit_decision` tool call (buy / sell / alert). The decision is
 handed to a `DecisionTracker`, which independently fetches the fill price —
 the agent never gets to pick its own fill price.
 
-Trading is paper-only: `DecisionTracker` defaults to `PaperBroker`. Swapping
-in a live broker later only requires implementing `Broker` and passing it to
-`DecisionTracker` — this module doesn't need to change.
+Where those decisions go is not this module's business: `DecisionTracker` holds
+a `Broker`, which may be the in-process paper ledger, a simulated tape, or a
+real Alpaca account (see `agent_stonks.trading_mode`). The one place the venue
+does reach the agent is its system prompt — an agent that believes its orders
+are inert would reason differently from one spending real money, so
+`execution_venue_addendum` tells it which it is.
 """
 from __future__ import annotations
 
@@ -74,6 +77,8 @@ from .agent_prompts import (  # noqa: F401
     TACTICS_ADDENDUM,
     VOLUME_DETECTIVE_SYSTEM_PROMPT,
     _session_closed_addendum,
+    execution_venue_addendum,
+    premarket_briefing_addendum,
     selectable_personalities,
 )
 from .agent_tools import (  # noqa: F401
@@ -928,6 +933,20 @@ def run_agent_cycle(
         system_prompt
         + MULTI_SYMBOL_ADDENDUM.format(symbols=symbols_label)
         + TACTICS_ADDENDUM
+        # What this run's orders actually do. The venue is a property of the
+        # run, not of the personality, and getting it wrong in the prompt is
+        # the one error here that could cost real money.
+        + execution_venue_addendum(state.trading_mode)
+        # The day's research, if a briefing has been generated for these
+        # tickers. Empty string when none exists (nothing generated yet, a
+        # symbol added mid-session, or a simulation), so the prompt is
+        # unchanged from before in that case.
+        + premarket_briefing_addendum(
+            state.premarket_briefings,
+            symbols,
+            generated_at=state.premarket_generated_at,
+            phase=state.premarket_phase,
+        )
     )
     if personality != PREMARKET_PERSONALITY:
         system_prompt = system_prompt + _session_closed_addendum()

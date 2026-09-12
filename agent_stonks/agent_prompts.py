@@ -23,8 +23,8 @@ from .tactics import TACTIC_CONDITION_FIELDS
 
 MOMENTUM_SYSTEM_PROMPT = """\
 You are an autonomous momentum-trading agent for a basket of equity tickers, \
-operating in a paper-trading sandbox -- no real orders are ever placed, so \
-reason as if real capital is on the line.
+operating in a system whose execution venue is stated below -- reason as if real capital \
+is on the line, because depending on that venue it may be.
 
 Core idea: stocks in motion tend to stay in motion. You are not predicting a \
 new move -- you are jumping on a move already in progress, riding it, and \
@@ -192,8 +192,8 @@ MOMENTUM_SYSTEM_PROMPT = MOMENTUM_SYSTEM_PROMPT + MOMENTUM_ADVANCED_LEVELS_ADDEN
 
 BREAKOUT_SYSTEM_PROMPT = """\
 You are an autonomous breakout-trading agent for a basket of equity tickers, \
-operating in a paper-trading sandbox -- no real orders are ever placed, so \
-reason as if real capital is on the line.
+operating in a system whose execution venue is stated below -- reason as if real capital \
+is on the line, because depending on that venue it may be.
 
 Core idea: the first part of the session sets a level -- the opening range -- \
 and when price finally clears it on a surge in volume, trapped sellers get \
@@ -317,8 +317,8 @@ alert wait is never blind to breaking news.
 
 REVERSAL_SYSTEM_PROMPT = """\
 You are an autonomous VWAP mean-reversion agent for a basket of equity tickers, \
-operating in a paper-trading sandbox -- no real orders are ever placed, so \
-reason as if real capital is on the line.
+operating in a system whose execution venue is stated below -- reason as if real capital \
+is on the line, because depending on that venue it may be.
 
 Core idea: in a ranging session price oscillates around the Volume Weighted \
 Average Price (VWAP), the benchmark institutions execute against. When price \
@@ -421,8 +421,8 @@ alert wait is never blind to breaking news.
 
 SMART_MONEY_SYSTEM_PROMPT = """\
 You are an autonomous Smart Money Concepts (SMC) trading agent for a single \
-equity ticker, operating in a paper-trading sandbox -- no real orders are ever \
-placed, so reason as if real capital is on the line.
+equity ticker, operating in a system whose execution venue is stated below -- reason as if real capital \
+is on the line, because depending on that venue it may be.
 
 Core idea: institutions cannot enter a large position at one price without \
 moving the market against themselves, so they accumulate inside a zone -- an \
@@ -533,8 +533,8 @@ alert wait is never blind to breaking news.
 
 VOLUME_DETECTIVE_SYSTEM_PROMPT = """\
 You are the Volume Signal Detective -- an autonomous support/resistance trading \
-agent for a basket of equity tickers, operating in a paper-trading sandbox -- no \
-real orders are ever placed, so reason as if real capital is on the line.
+agent for a basket of equity tickers, operating in a system whose execution venue is stated below -- reason as if real capital \
+is on the line, because depending on that venue it may be.
 
 Core idea: prices where unusual SIZE changed hands are where institutions built \
 or defended positions, and those prices keep acting as support and resistance \
@@ -796,8 +796,8 @@ previously armed plan.
 
 PREMARKET_SYSTEM_PROMPT = """\
 You are the Premarket Analyst for a basket of equity tickers, operating in a \
-paper-trading sandbox -- no real orders are ever placed, so reason as if real \
-capital is on the line.
+system whose execution venue is stated below -- reason as if real capital \
+is on the line, because depending on that venue it may be.
 
 You are a one-shot specialist: you run ONCE, in the final minutes before the \
 opening bell, and you do not manage the session afterwards. Your entire job is \
@@ -921,6 +921,131 @@ def _session_closed_addendum(now: "datetime | None" = None) -> str:
     open_et = open_dt.astimezone(market_hours.MARKET_TZ)
     return SESSION_CLOSED_ADDENDUM.format(
         open_at=open_et.strftime("%Y-%m-%d %H:%M"), minutes_until_open=minutes
+    )
+
+
+# Every personality used to open by telling the agent it was in a sandbox where
+# "no real orders are ever placed". That stopped being true when Alpaca order
+# routing was added (see agent_stonks.trading_mode): the same prompt now drives
+# a local ledger, a paper brokerage account, or a live one. Telling an agent its
+# orders are inert when they are not is the one falsehood in a prompt that could
+# actually cost money, so the venue is stated per run instead of assumed.
+EXECUTION_VENUE_ADDENDA: dict[str, str] = {
+    "local": """
+
+--- EXECUTION VENUE: LOCAL SIMULATION ---
+Your decisions are recorded in an in-process ledger. No order reaches a broker \
+and no money moves. Reason as if real capital were at stake anyway -- the point \
+of the exercise is the quality of the decision.
+""",
+    "alpaca_paper": """
+
+--- EXECUTION VENUE: ALPACA PAPER ACCOUNT ---
+Your decisions become REAL ORDERS sent to a brokerage paper account. The money \
+is simulated, but the routing is not: orders can be rejected, partially filled, \
+or filled at a worse price than you saw, and buying power is the account's \
+rather than a number chosen for you. Size accordingly and expect a fill to \
+differ from your intent.
+""",
+    "alpaca_live": """
+
+--- EXECUTION VENUE: LIVE BROKERAGE ACCOUNT — REAL MONEY ---
+Your decisions become REAL ORDERS against a LIVE account holding REAL MONEY. \
+Every buy spends actual funds and every sell disposes of an actual holding; \
+losses are real and permanent. Orders can be rejected, partially filled, or \
+filled away from the price you saw. Trade only setups you would genuinely stake \
+capital on, size conservatively, and prefer standing aside over a marginal \
+trade -- an alert costs nothing and a bad fill does not.
+""",
+}
+
+
+def execution_venue_addendum(trading_mode: str) -> str:
+    """What this run's orders actually do, in the agent's own prompt."""
+    return EXECUTION_VENUE_ADDENDA.get(trading_mode, EXECUTION_VENUE_ADDENDA["local"])
+
+
+# Appended when a research briefing exists for the tickers being traded (see
+# agent_stonks.premarket). The agent gets the day's thesis as a starting point
+# instead of re-deriving it from scratch every cycle.
+#
+# The framing does most of the work here. A briefing is a snapshot: it was
+# written once, at a known moment, and the agent reading it may be running six
+# hours later on a tape that has invalidated every level in it. Handed over
+# without that context, a confident-sounding thesis becomes an instruction the
+# agent follows against its own live data -- which is worse than having no
+# briefing at all, because it launders a stale opinion as research.
+PREMARKET_BRIEFING_ADDENDUM = """
+
+--- RESEARCH BRIEFING FOR TODAY ({age}) ---
+An analyst briefing on your tickers was prepared {age} ({phase_note}). It is \
+reproduced below.
+
+Treat it as a PRIOR, not as instructions. It is one analyst's read of a moment \
+that has already passed, and you have something it did not: live tools. Where \
+the briefing and your own tool output disagree, YOUR TOOL OUTPUT WINS -- say so \
+in your reasoning and trade what you see. In particular, any level it quotes may \
+already have been taken out, and its directional bias may have been invalidated \
+by the tape since; check before acting on either.
+
+Use it to start ahead rather than from zero: it already collected the overnight \
+news, the analyst targets, the macro backdrop and the structural context, so you \
+do not need to re-derive them. Its risk list is the most durable part -- those \
+tend to still apply hours later. Its exact price levels are the least durable.
+
+Do NOT trade on the briefing alone. It is never sufficient reason for a \
+decision; it is context for the analysis you run with your own tools.
+
+{briefings}
+"""
+
+
+def premarket_briefing_addendum(
+    briefings: dict,
+    symbols: "list[str]",
+    generated_at: "datetime | None" = None,
+    phase: str = "",
+    now: "datetime | None" = None,
+) -> str:
+    """The briefing addendum for `symbols`, or '' when there is nothing to say.
+
+    `briefings` maps symbol -> PremarketBriefing (AppState.premarket_briefings).
+    Only the tickers this agent actually trades are included; a basket of two
+    should not carry a third symbol's thesis.
+
+    The age is computed here, at cycle time rather than at briefing time, so a
+    long-running agent sees the gap grow instead of reading "generated at 09:12"
+    and having to work out for itself that it is now 15:40.
+    """
+    from .premarket import briefing_to_prompt_text  # local: premarket imports state
+
+    wanted = [s for s in symbols if s in (briefings or {})]
+    if not wanted:
+        return ""
+
+    now = now or clock.now()
+    if generated_at is not None:
+        minutes = max(0, round((now - generated_at).total_seconds() / 60))
+        if minutes < 90:
+            age = f"{minutes} minutes ago" if minutes else "just now"
+        else:
+            age = f"{minutes / 60:.1f} hours ago"
+    else:
+        age = "earlier"
+
+    phase_note = {
+        "premarket": "before today's opening bell, so it describes the session ahead",
+        "open": "while the session was already running, so it describes a tape "
+                "that has moved on since",
+        "after_hours": "after the close, so it describes the previous session",
+        "weekend": "with the market closed, so it describes the last session",
+    }.get(phase, "at an unrecorded point in the session")
+
+    rendered = "\n\n".join(
+        briefing_to_prompt_text(briefings[symbol], symbol) for symbol in wanted
+    )
+    return PREMARKET_BRIEFING_ADDENDUM.format(
+        age=age, phase_note=phase_note, briefings=rendered
     )
 
 
