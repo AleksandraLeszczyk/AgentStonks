@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from .config import DEFAULT_HISTORY_FEED, HISTORY_FEEDS, MAX_BARS, SIP_DELAY_MIN
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
-from .rest import fetch_bars, fetch_bars_window
+from .rest import fetch_bars, fetch_bars_window, fetch_daily_bars
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,62 @@ def fetch_history_bars(
         what, failures, symbol=symbol, consequence="no bar source available this cycle"
     )
     raise RuntimeError(f"every bar source failed for {symbol}: {failures}")
+
+
+def fetch_daily(
+    symbol: str,
+    key: str,
+    secret: str,
+    feed: str,
+    lookback_days: int = 365,
+) -> "tuple[list[dict], str]":
+    """Daily bars from the session's resolved feed, with the same fallbacks.
+
+    The daily series is the *baseline* every volume comparison divides by -- the
+    high-volume alert, the `volume_ratio` and `rvol_pace` alert fields, and the
+    briefing's relative-volume pace all measure today's running total against
+    it. So it has to come from the same tape as the intraday bars: pairing a
+    consolidated intraday series with an IEX daily average divides ~41M shares
+    by a ~1.3M baseline and reports a perfectly ordinary session as 30-40x
+    normal participation.
+
+    Returns (bars, source_label). Falls back to IEX rather than failing, since
+    a wrong baseline is still better than no daily history at all -- but the
+    caller logs which feed answered so the mismatch is visible.
+    """
+    order = ([feed] if feed in CONCRETE_FEEDS else []) + [
+        f for f in CONCRETE_FEEDS if f != feed
+    ]
+    failures: list[tuple[str, object]] = []
+    for candidate in order:
+        # yfinance's intraday helper has no daily equivalent wired up here, and
+        # Alpaca serves the whole daily history under one call either way.
+        if candidate == "yfinance":
+            continue
+        try:
+            if candidate == "sip_delayed":
+                start, end = _sip_window(lookback_days * 24)
+                bars = fetch_bars_window(
+                    symbol, "1Day", start, end, key, secret, "sip", limit=lookback_days + 10
+                )
+            else:
+                bars = fetch_daily_bars(
+                    symbol, key, secret, candidate, lookback_days=lookback_days
+                )
+        except Exception as exc:
+            failures.append((SOURCE_LABELS.get(candidate, candidate), exc))
+            continue
+        label = SOURCE_LABELS.get(candidate, candidate)
+        log_fetch(
+            "daily bars (initial load)", label, symbol=symbol,
+            detail=f"{len(bars)} daily bars", failures=failures,
+        )
+        return bars, label
+    log_fetch_failure(
+        "daily bars (initial load)", failures, symbol=symbol,
+        consequence="no volume baseline; relative-volume reads and the high-volume alert are off",
+    )
+    raise RuntimeError(f"every daily bar source failed for {symbol}: {failures}")
 
 
 def fetch_and_log(

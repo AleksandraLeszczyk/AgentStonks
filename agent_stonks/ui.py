@@ -72,6 +72,7 @@ from .config import (
     PAPER_STARTING_CASH,
     PALETTE,
     POLL_SEC,
+    PREMARKET_POLL_SEC,
     SESSION_START,
     TIMEFRAMES,
     TRADE_FIXED_COST,
@@ -94,7 +95,12 @@ from .historical import (
 )
 from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS, models_for
 from .news import fetch_news_with_fallback, score_news_impacts
-from .premarket import DEFAULT_PREMARKET_MODELS, PremarketBriefing, generate_premarket_analysis
+from .premarket import (
+    DEFAULT_PREMARKET_MODELS,
+    PHASE_TITLES,
+    PremarketBriefing,
+    launch_premarket_analysis,
+)
 from .options import fetch_options_walls_data
 from .performance import compute_equity_curve, decision_markers, summarize
 from .profile_model import predicted_open_profile
@@ -2103,7 +2109,12 @@ _CONF_COLOR: dict[str, str] = {"high": "#26c6a2", "medium": "#fb923c", "low": "#
 _IMPACT_ICON: dict[str, str] = {"positive": "↑", "negative": "↓", "neutral": "→"}
 
 
-def _premarket_briefing_html(briefing: PremarketBriefing, symbol: str) -> str:
+def _premarket_briefing_html(
+    briefing: PremarketBriefing, symbol: str, phase: str = "premarket"
+) -> str:
+    # The card names the phase it was written in: a briefing generated at 11:00
+    # that calls itself "Pre-Market" is claiming to be about something it isn't.
+    title = PHASE_TITLES.get(phase, "Briefing")
     bias = briefing.overall_bias
     b = _BIAS_STYLE.get(bias, _BIAS_STYLE["neutral"])
     conf_color = _CONF_COLOR.get(briefing.confidence, "#888")
@@ -2207,11 +2218,102 @@ def _premarket_briefing_html(briefing: PremarketBriefing, symbol: str) -> str:
     return (
         f'<div style="font-family:Inter,sans-serif;padding:4px 0 16px;">'
         f'<h3 style="color:{PALETTE["text"]};font-size:14px;margin:0 0 10px 0">'
-        f'🌅 Pre-Market Briefing · <b style="color:{PALETTE["accent"]}">{symbol}</b>'
+        f'🌅 {title} · <b style="color:{PALETTE["accent"]}">{symbol}</b>'
         f'</h3>'
         f'{header}{macro}{catalysts_section}{levels_section}{bottom_row}'
         f'</div>'
     )
+
+
+def premarket_llm_settings(state: AppState) -> tuple[str, str, str]:
+    """The provider/key/model the automatic briefing will run on.
+
+    Read from the widgets the user sees in the Pre-Market tab (falling back to
+    the stored provider and the env key), so the sidebar's ▶ Start and the tab's
+    ↻ Regenerate both launch the same configuration.
+    """
+    provider = st.session_state.get("premarket_provider") or state.news_llm_provider
+    if provider not in PROVIDERS:
+        provider = state.news_llm_provider
+    llm_key = os.getenv(ENV_KEYS[provider], "")
+    model = st.session_state.get(f"premarket_model_{provider}") or None
+    return provider, llm_key, model
+
+
+def _launch_premarket(state: AppState, symbols: list[str]) -> None:
+    """Kick off the automatic briefing for `symbols` on a background thread."""
+    provider, llm_key, model = premarket_llm_settings(state)
+    launch_premarket_analysis(
+        state,
+        symbols,
+        provider=provider,
+        api_key=llm_key,
+        alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
+        alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
+        worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
+        model=model,
+    )
+
+
+@st.fragment(run_every=PREMARKET_POLL_SEC)
+def _premarket_results(symbols: list[str], llm_key: str) -> None:
+    """Render whatever the background briefing has produced so far.
+
+    On its own re-run loop because the briefing arrives symbol by symbol from a
+    thread the Streamlit script does not wait on: the tab has to be able to fill
+    in while the user is looking at it. The Regenerate control lives in here
+    too -- outside the fragment its disabled-while-busy state would freeze at
+    whatever the last full script run saw, leaving the button greyed out long
+    after the briefing had finished.
+    """
+    state = _get_state()
+    briefings = state.premarket_briefings or {}
+    errors = state.premarket_errors or {}
+    pending = state.premarket_pending or []
+
+    if symbols:
+        # A refresh, not the old generate-on-demand step: the first briefing has
+        # already run by the time this appears. It exists because the briefing is
+        # a snapshot of one moment, and a trader who has been streaming since
+        # before the bell needs a midday read without restarting the stream.
+        if st.button(
+            f"↻ Regenerate now ({', '.join(symbols)})",
+            key="premarket_regenerate",
+            disabled=bool(pending) or not llm_key,
+            help="Re-take the briefing against the market as it stands right now.",
+        ):
+            _launch_premarket(state, symbols)
+            st.rerun(scope="fragment")
+        if pending:
+            st.caption("A briefing is already running…")
+
+    if state.premarket_generated_at is not None:
+        generated_et = state.premarket_generated_at.astimezone(market_hours.MARKET_TZ)
+        title = PHASE_TITLES.get(state.premarket_phase, "Briefing")
+        st.caption(
+            f"**{title}** — generated {generated_et.strftime('%Y-%m-%d %H:%M')} ET, "
+            "from the market situation at that moment. Restart the stream (or ↻ Regenerate) "
+            "for a fresh read."
+        )
+    elif pending:
+        st.caption(f"⏳ {state.premarket_status}")
+    elif state.premarket_status and state.premarket_status != "Idle":
+        st.caption(state.premarket_status)
+
+    for sym in pending:
+        st.caption(f"⏳ Briefing {sym}…")
+    for sym, briefing in briefings.items():
+        st.html(_premarket_briefing_html(briefing, sym, state.premarket_phase))
+    for sym, message in errors.items():
+        st.warning(f"Briefing failed for {sym}: {message}")
+
+    if not briefings and not pending and not errors:
+        st.info(
+            "The briefing is generated automatically when you press ▶ Start in the sidebar. "
+            "It reflects the market situation at that moment — before the bell it is a "
+            "pre-market briefing, and if you start mid-session it reports where the stock "
+            "stands in today's range instead."
+        )
 
 
 def _premarket_panel(symbols: list[str]) -> None:
@@ -2219,7 +2321,9 @@ def _premarket_panel(symbols: list[str]) -> None:
 
     st.caption(
         "Synthesizes recent news, historical price action, macro indicators, and fundamentals "
-        "into a structured morning briefing per symbol. Works any time — no live stream needed."
+        "into a structured briefing per symbol. Generated automatically when the data stream "
+        "starts, and framed by the moment it runs in: a pre-market briefing before the bell, "
+        "an intraday situation briefing once the session is underway."
     )
 
     c1, c2 = st.columns([1, 2])
@@ -2238,50 +2342,19 @@ def _premarket_panel(symbols: list[str]) -> None:
             st.caption(f"⚠️ {env_var} is not set.")
         default_model = DEFAULT_PREMARKET_MODELS.get(provider, DEFAULT_NEWS_MODELS[provider])
         premarket_models = models_for(provider, default=default_model)
-        model_override = st.selectbox(
+        st.selectbox(
             "Model",
             premarket_models,
             index=0,
             key=f"premarket_model_{provider}",
-            help=f"Default: {default_model}",
+            help=f"Default: {default_model}. Applies to the next briefing — the one ▶ Start "
+            "launches, or ↻ Regenerate below.",
         )
     with c2:
         if not symbols:
             st.info("Enter symbols in the sidebar first.")
-        else:
-            generate_clicked = st.button(
-                f"🌅 Generate Pre-Market Analysis ({', '.join(symbols)})",
-                key="premarket_generate",
-                type="primary",
-            )
-            if generate_clicked:
-                if not llm_key:
-                    st.error(f"{env_var} is not set.")
-                else:
-                    briefings: dict[str, PremarketBriefing] = {}
-                    for sym in symbols:
-                        with st.spinner(f"Generating pre-market briefing for {sym}…"):
-                            try:
-                                briefing = generate_premarket_analysis(
-                                    symbol=sym,
-                                    provider=provider,
-                                    api_key=llm_key,
-                                    alpaca_key=state.api_key or os.getenv("ALPACA_API_KEY", ""),
-                                    alpaca_secret=state.api_secret or os.getenv("ALPACA_SECRET", ""),
-                                    worldnews_key=os.getenv("WORLD_NEWS_API_KEY", ""),
-                                    model=model_override or None,
-                                )
-                            except Exception as exc:
-                                st.error(f"Pre-market analysis failed for {sym}: {exc}")
-                            else:
-                                if briefing is not None:
-                                    briefings[sym] = briefing
-                    if briefings:
-                        st.session_state["premarket_briefings"] = briefings
 
-    briefings = st.session_state.get("premarket_briefings") or {}
-    for sym, briefing in briefings.items():
-        st.html(_premarket_briefing_html(briefing, sym))
+    _premarket_results(symbols, llm_key)
 
 
 def _start_live_session(
@@ -2332,10 +2405,12 @@ def _start_live_session(
                 news = fetch_news_with_fallback(
                     sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
                 )
-                daily_bars = fetch_daily_bars(sym, key, secret, feed)
-                log_fetch(
-                    "daily bars (initial load)", "Alpaca REST", symbol=sym,
-                    detail=f"{len(daily_bars)} daily bars",
+                # Same feed as the intraday bars: this series is the baseline
+                # every volume comparison divides by, so an IEX daily average
+                # under a consolidated intraday series reports an ordinary
+                # session as 30-40x normal participation.
+                daily_bars, _ = bar_history.fetch_daily(
+                    sym, key, secret, state.history_feed_resolved
                 )
             except Exception as exc:
                 log_fetch_failure(
@@ -2377,6 +2452,12 @@ def _start_live_session(
     launch_stream_news(
         syms, key, secret, state, worldnews_key=os.getenv("WORLD_NEWS_API_KEY", "")
     )
+    # The briefing rides the same click that starts the tape, on its own thread:
+    # it is several seconds of LLM work per symbol and the stream must not wait
+    # for it. What it says is anchored to *this* moment -- before the bell that
+    # is a pre-market briefing, mid-session it reports where the stock stands in
+    # today's range instead (see agent_stonks.premarket).
+    _launch_premarket(state, syms)
     return True
 
 

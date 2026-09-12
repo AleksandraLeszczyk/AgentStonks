@@ -59,6 +59,11 @@ FINNHUB_BAR_FLUSH_SEC = 2.0
 MAX_BARS = 420
 POLL_SEC = 3
 CHART_POLL_SEC = 30
+# How often the Pre-Market tab re-reads the briefing the stream start kicked
+# off. Briefing a basket is several seconds of LLM time per symbol and results
+# land one symbol at a time, so this only has to be fast enough that a finished
+# symbol appears promptly.
+PREMARKET_POLL_SEC = 3
 
 # REST-polling fallback for bars/trades and news, used only while the
 # corresponding WebSocket stream is not connected (e.g. Alpaca's

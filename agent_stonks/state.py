@@ -255,6 +255,12 @@ _DEFAULTS: dict[str, object] = {
     "automatic_reason": None,
     "news_llm_provider": "openai",
     "scorecard": None,
+    "premarket_briefings": {},
+    "premarket_errors": {},
+    "premarket_pending": [],
+    "premarket_status": "Idle",
+    "premarket_phase": "",
+    "premarket_generated_at": None,
 }
 
 
@@ -339,6 +345,19 @@ class AppState:
         # Per-session scoring collector (see agent_stonks.scoring); attached by
         # launch_agent/launch_automatic, flushed to the journal at session end.
         self.scorecard = None  # "scoring.Scorecard | None"
+        # Automatic briefing (see agent_stonks.premarket), generated on a
+        # background thread when the data stream starts. It is a snapshot of one
+        # moment, so `premarket_phase` and `premarket_generated_at` record which
+        # moment -- a briefing written before the bell and one written at 11:00
+        # are about different things. Symbols land one at a time, so the panel
+        # can render the finished ones while `premarket_pending` still has names
+        # in it.
+        self.premarket_briefings: dict = {}
+        self.premarket_errors: dict[str, str] = {}
+        self.premarket_pending: list[str] = []
+        self.premarket_status: str = "Idle"
+        self.premarket_phase: str = ""
+        self.premarket_generated_at: "datetime | None" = None
 
     def __getattr__(self, name: str) -> object:
         # Provide defaults for attributes missing on old cached session-state instances.

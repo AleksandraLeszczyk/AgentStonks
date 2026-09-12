@@ -28,6 +28,30 @@ def is_market_open(now: "datetime | None" = None) -> bool:
     return et.weekday() < 5 and MARKET_OPEN <= et.time() < MARKET_CLOSE
 
 
+def session_phase(now: "datetime | None" = None) -> str:
+    """Where `now` sits relative to the regular session:
+
+        "open"        the bell has rung and the session is running
+        "premarket"   a weekday before 09:30 ET
+        "after_hours" a weekday after 16:00 ET
+        "weekend"     Saturday or Sunday
+
+    Used to decide what a briefing is actually *about*. Before the open (or on a
+    day with no session left) the honest subject is the session that has not
+    started yet; once the tape is running, it is the session in progress, and a
+    briefing that still talks about "the open" is describing something that
+    already happened.
+    """
+    et = _as_market_time(now)
+    if et.weekday() >= 5:
+        return "weekend"
+    if et.time() < MARKET_OPEN:
+        return "premarket"
+    if et.time() >= MARKET_CLOSE:
+        return "after_hours"
+    return "open"
+
+
 def next_market_open(now: "datetime | None" = None) -> datetime:
     """The next regular-session open strictly after `now`, in UTC.
 

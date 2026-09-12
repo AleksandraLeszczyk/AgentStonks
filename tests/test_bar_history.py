@@ -21,6 +21,7 @@ def _no_network(monkeypatch):
     default, and each test overrides only the ones it is about."""
     monkeypatch.setattr(bar_history, "fetch_bars", _raiser)
     monkeypatch.setattr(bar_history, "fetch_bars_window", _raiser)
+    monkeypatch.setattr(bar_history, "fetch_daily_bars", _raiser)
     monkeypatch.setattr(bar_history, "fetch_intraday_bars", _raiser)
 
 
@@ -295,3 +296,53 @@ class TestSessionConsistency:
 
         assert seen["feed"] == "sip"
         assert added == 1
+
+
+class TestDailyBaseline:
+    """The daily series is the denominator of every volume comparison -- the
+    high-volume alert, the volume_ratio/rvol_pace alert fields, and the
+    briefing's relative-volume pace. It has to come off the same tape as the
+    intraday bars or all three are wrong by the feeds' ratio."""
+
+    def test_uses_the_sessions_feed(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            bar_history, "fetch_daily_bars",
+            lambda symbol, key, secret, feed, **kw: seen.update(feed=feed) or [_bar("t")],
+        )
+        bars, source = bar_history.fetch_daily("AAPL", "k", "s", "iex")
+        assert seen["feed"] == "iex"
+        assert source == bar_history.SOURCE_LABELS["iex"]
+
+    def test_delayed_sip_holds_the_window_back(self, monkeypatch):
+        import datetime as _dt
+
+        seen = {}
+
+        def _window(symbol, timeframe, start, end, key, secret, feed="iex", limit=200):
+            seen.update(timeframe=timeframe, feed=feed, end=end)
+            return [_bar("t")]
+
+        monkeypatch.setattr(bar_history, "fetch_bars_window", _window)
+        _, source = bar_history.fetch_daily("AAPL", "k", "s", "sip_delayed")
+
+        assert seen["timeframe"] == "1Day"
+        assert seen["feed"] == "sip"
+        assert _dt.datetime.now(_dt.timezone.utc) - seen["end"] >= _dt.timedelta(
+            minutes=bar_history.SIP_DELAY_MIN - 1
+        )
+        assert source == bar_history.SOURCE_LABELS["sip_delayed"]
+
+    def test_falls_back_to_iex_rather_than_leaving_no_baseline(self, monkeypatch):
+        monkeypatch.setattr(
+            bar_history, "fetch_daily_bars",
+            lambda symbol, key, secret, feed, **kw: (
+                [_bar("t")] if feed == "iex" else _raiser()
+            ),
+        )
+        _, source = bar_history.fetch_daily("AAPL", "k", "s", "sip")
+        assert source == bar_history.SOURCE_LABELS["iex"]
+
+    def test_raises_when_every_source_failed(self, monkeypatch):
+        with pytest.raises(RuntimeError):
+            bar_history.fetch_daily("AAPL", "k", "s", "sip")
