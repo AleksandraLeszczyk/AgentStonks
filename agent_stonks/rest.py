@@ -70,6 +70,50 @@ def fetch_bars_window(
     return r.json().get("bars", {}).get(symbol, [])
 
 
+def fetch_bars_range(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime,
+    key: str,
+    secret: str,
+    feed: str = "sip",
+    adjustment: str = "raw",
+    page_limit: int = 10000,
+) -> list[dict]:
+    """Every bar in [start, end) from Alpaca, following `next_page_token`.
+
+    `fetch_bars_window` returns a single page, which is enough for a
+    session-anchored slice; weeks of minute bars are several pages. Raises on
+    HTTP error.
+    """
+    params = dict(
+        symbols=symbol,
+        timeframe=timeframe,
+        start=start.astimezone(timezone.utc).isoformat(),
+        end=end.astimezone(timezone.utc).isoformat(),
+        limit=page_limit,
+        feed=feed,
+        adjustment=adjustment,
+        sort="asc",
+    )
+    bars: list[dict] = []
+    while True:
+        r = requests.get(
+            f"{DATA_REST}/v2/stocks/bars",
+            headers=_headers(key, secret),
+            params=params,
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        bars.extend((payload.get("bars") or {}).get(symbol) or [])
+        token = payload.get("next_page_token")
+        if not token:
+            return bars
+        params["page_token"] = token
+
+
 def fetch_trades(
     symbol: str,
     key: str,

@@ -530,19 +530,22 @@ class TacticsExecutor:
                     cond.value = new_stop
 
     def _resolve_quantity(self, action: TacticAction) -> float:
+        """Whole shares this action trades now (see `decisions.whole_shares`)."""
+        from .decisions import whole_shares
+
         if action.quantity is not None:
-            return action.quantity
+            return whole_shares(action.quantity)
         snap = self.tracker.snapshot()
         frac = (action.quantity_pct or 0.0) / 100.0
         if action.action == "sell":
-            return snap["positions"].get(self.state.symbol, 0.0) * frac
+            return whole_shares(snap["positions"].get(self.state.symbol, 0.0) * frac)
         # Percent-of-cash buy: sized off available cash at the last seen price;
         # record_trade re-fetches the fill price and clamps to affordable anyway.
         with self.state.lock:
             price = self.state.last_price
         if not price or price <= 0:
             return 0.0
-        return max(0.0, (snap["cash"] - self.tracker.trade_cost)) * frac / price
+        return whole_shares(max(0.0, (snap["cash"] - self.tracker.trade_cost)) * frac / price)
 
     def _drop_action(self, tactics: Tactics, action: TacticAction,
                      summary: str, conds: str) -> None:
@@ -566,7 +569,10 @@ class TacticsExecutor:
             "tactic": summary,
             "triggered_by": conds,
             "status": "skipped",
-            "error": "resolved quantity is 0 (no position to sell / no cash to buy)",
+            "error": (
+                "resolved quantity is 0 whole shares "
+                "(no whole share to sell / no cash for one share)"
+            ),
         }
         app = self.state.app
         with app.lock:

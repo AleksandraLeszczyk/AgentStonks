@@ -12,6 +12,7 @@ positions are held per symbol.
 """
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import asdict, dataclass, field
 from typing import Optional
@@ -19,6 +20,19 @@ from typing import Optional
 from . import clock
 from .broker import Broker, PaperBroker
 from .config import TRADE_FIXED_COST
+
+
+def whole_shares(quantity: float) -> float:
+    """`quantity` rounded down to a whole number of shares (0.0 when not positive).
+
+    Every agent trades whole shares only. Down, never to nearest: rounding up
+    would buy with cash the sizing did not allow for, or sell shares that are
+    not held. The epsilon keeps float noise such as 30% of 10 = 2.9999999999999996
+    from losing a share.
+    """
+    if not quantity or not quantity > 0:
+        return 0.0
+    return float(math.floor(quantity + 1e-9))
 
 
 @dataclass
@@ -130,7 +144,11 @@ class DecisionTracker:
     ) -> Decision:
         """Record a buy/sell decision for one symbol. Fetches the fill price
         independently via `broker`. Cash is shared across symbols; the position
-        change applies to `symbol` only."""
+        change applies to `symbol` only.
+
+        Only whole shares are ever traded: the request, and every clamp applied
+        to it (affordable cash, position held, venue ceiling), is rounded down
+        with `whole_shares`. A request below one share is rejected."""
         if action not in ("buy", "sell"):
             raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
 
@@ -147,7 +165,7 @@ class DecisionTracker:
             if action == "buy":
                 affordable_cash = max(0.0, self.cash - self.trade_cost)
                 affordable = affordable_cash / price if price > 0 else 0.0
-                filled_qty = max(0.0, min(quantity, affordable))
+                filled_qty = whole_shares(min(quantity, affordable))
                 if filled_qty > 0:
                     self.broker.submit_order(symbol, "buy", filled_qty, price)
                     fee = self.trade_cost
@@ -155,7 +173,7 @@ class DecisionTracker:
                     position += filled_qty
                     status = "filled"
             else:  # sell
-                filled_qty = max(0.0, min(quantity, position))
+                filled_qty = whole_shares(min(quantity, position))
                 if filled_qty > 0:
                     self.broker.submit_order(symbol, "sell", filled_qty, price)
                     fee = self.trade_cost
@@ -200,18 +218,20 @@ class DecisionTracker:
         moved because something outside this app touched the same account.
         """
         requested = quantity
+        quantity = whole_shares(quantity)
         # Ask the venue what it would allow before asking for it, so an
         # oversized request is trimmed rather than rejected outright.
         ceiling = self.broker.max_quantity(symbol, action, price)
-        if ceiling is not None:
-            quantity = max(0.0, min(quantity, ceiling))
+        if ceiling is not None and quantity > 0:
+            quantity = whole_shares(min(quantity, ceiling))
 
         if quantity <= 0:
-            reason = (
-                "no buying power at the broker"
-                if action == "buy"
-                else "no position at the broker to sell"
-            )
+            if whole_shares(requested) <= 0:
+                reason = "less than one whole share requested"
+            elif action == "buy":
+                reason = "no buying power at the broker for one whole share"
+            else:
+                reason = "no whole share held at the broker to sell"
             return self._record_broker_decision(
                 symbol, action, requested, 0.0, price, f"{reasoning} [{reason}]", "rejected"
             )

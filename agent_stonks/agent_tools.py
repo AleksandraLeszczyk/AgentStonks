@@ -424,8 +424,11 @@ _TOOL_SUBMIT_DECISION = {
                     ),
                 },
                 "quantity": {
-                    "type": "number",
-                    "description": "Shares to buy/sell. Ignored for alert. Must be > 0 for buy/sell.",
+                    "type": "integer",
+                    "description": (
+                        "Whole shares to buy/sell (an integer; fractions are rounded down). "
+                        "Ignored for alert. Must be at least 1 for buy/sell."
+                    ),
                 },
                 "regime": {
                     "type": "string",
@@ -517,15 +520,19 @@ _TOOL_SET_TACTICS = {
                         "properties": {
                             "action": {"type": "string", "enum": ["buy", "sell"]},
                             "quantity": {
-                                "type": "number",
-                                "description": "Shares to trade. Provide exactly one of quantity or quantity_pct.",
+                                "type": "integer",
+                                "description": (
+                                    "Whole shares to trade (an integer; fractions are rounded "
+                                    "down). Provide exactly one of quantity or quantity_pct."
+                                ),
                             },
                             "quantity_pct": {
                                 "type": "number",
                                 "description": (
                                     "Percent (0-100] resolved at execution time: of the current "
-                                    "position for a sell, of available cash for a buy. E.g. sell "
-                                    "20% of shares, or buy with 50% of cash."
+                                    "position for a sell, of available cash for a buy, rounded "
+                                    "down to whole shares. E.g. sell 20% of shares, or buy with "
+                                    "50% of cash."
                                 ),
                             },
                             "conditions": {

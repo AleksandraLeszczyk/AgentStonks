@@ -1063,8 +1063,9 @@ conditions are met, through the exact same paper-fill path as your own buy/sell 
 (real fetched fill price, same fee, logged and charted identically).
 
 set_tactics takes a list of actions. Each action is a buy or sell with a size -- \
-'quantity' in shares, or 'quantity_pct' as a percent of your current position \
-(sell) or available cash (buy), resolved at execution time -- plus one or more \
+'quantity' in whole shares, or 'quantity_pct' as a percent of your current position \
+(sell) or available cash (buy), resolved at execution time and rounded down to \
+whole shares -- plus one or more \
 conditions that must ALL hold at the same moment for it to fire (so 'buy 10 if \
 last_price below 180 AND vix below 20' is one action with two conditions). \
 Provide several actions to bracket a position: an entry, a stop-loss, and a \

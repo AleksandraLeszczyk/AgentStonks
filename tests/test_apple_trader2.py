@@ -194,12 +194,20 @@ class TestSizing:
         item = ActionItem(action=ar.SELL, size_mode=ar.SIZE_SHARES, size=200.0)
         assert ar.resolve_quantity(item, price=100.0, cash=0.0, shares=50.0) == 50.0
 
-    def test_selling_everything_leaves_no_rounding_sliver(self):
-        """A remainder of 0.0001 shares is not a position anybody meant to hold,
-        and leaving it makes 'sell 100%' look like it did not work."""
-        item = ActionItem(action=ar.SELL, size_mode=ar.SIZE_PCT, size=100.0)
-        shares = 33.333333
-        assert ar.resolve_quantity(item, price=100.0, cash=0.0, shares=shares) == shares
+    def test_sizes_are_rounded_down_to_whole_shares(self):
+        buy = ActionItem(action=ar.BUY, size_mode=ar.SIZE_PCT, size=95.0)
+        assert ar.resolve_quantity(buy, price=99.0, cash=10_000.0, shares=0) == 95.0
+        half = ActionItem(action=ar.SELL, size_mode=ar.SIZE_PCT, size=50.0)
+        assert ar.resolve_quantity(half, price=100.0, cash=0.0, shares=95.0) == 47.0
+        # 30% of 10 is 2.9999999999999996 in floats -- still three shares.
+        thirty = ActionItem(action=ar.SELL, size_mode=ar.SIZE_PCT, size=30.0)
+        assert ar.resolve_quantity(thirty, price=100.0, cash=0.0, shares=10.0) == 3.0
+        everything = ActionItem(action=ar.SELL, size_mode=ar.SIZE_PCT, size=100.0)
+        assert ar.resolve_quantity(everything, price=100.0, cash=0.0, shares=33.4) == 33.0
+
+    def test_less_than_one_share_resolves_to_nothing(self):
+        item = ActionItem(action=ar.SELL, size_mode=ar.SIZE_PCT, size=50.0)
+        assert ar.resolve_quantity(item, price=100.0, cash=0.0, shares=1.0) == 0.0
 
     def test_a_rule_that_cannot_transact_resolves_to_nothing(self):
         sell = ActionItem(action=ar.SELL, size_mode=ar.SIZE_PCT, size=100.0)
@@ -725,7 +733,7 @@ class TestCycle:
         assert trader.run_cycle(state, tracker) == "hold"
         tape.bar(99.0)
         assert trader.run_cycle(state, tracker) == "bought"
-        assert tracker.position_for(TICKER) == pytest.approx(95.95, abs=0.05)
+        assert tracker.position_for(TICKER) == 95.0
 
     def test_the_reasoning_names_the_rule_and_the_number(self, state, market_open, monkeypatch):
         broker = FakeBroker(99.0)
@@ -782,7 +790,8 @@ class TestCycle:
         bought = tracker.position_for(TICKER)
         tape.bar(102.0)
         assert trader.run_cycle(state, tracker) == "sold"
-        assert tracker.position_for(TICKER) == pytest.approx(bought / 2, abs=0.01)
+        # Half of an odd share count rounds the sale down: 47 of 95 sold.
+        assert tracker.position_for(TICKER) == bought - (bought // 2)
         # The trailing peak and the entry price survive a partial exit: taking
         # half off does not restart the stop on the rest.
         assert trader.entry is not None

@@ -40,12 +40,29 @@ class TestRecordTradeBuy:
         assert tracker.cash == 500.0
         assert tracker.positions["AAPL"] == 5.0
 
-    def test_buy_clamps_to_affordable_quantity(self):
+    def test_buy_clamps_to_affordable_whole_shares(self):
         tracker = DecisionTracker(starting_cash=250.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
         decision = tracker.record_trade("AAPL", "buy", 10, "go big", "k", "s")
-        assert decision.filled_quantity == 2.5
-        assert tracker.cash == 0.0
-        assert tracker.positions["AAPL"] == 2.5
+        assert decision.filled_quantity == 2.0
+        assert tracker.cash == 50.0
+        assert tracker.positions["AAPL"] == 2.0
+
+    def test_fractional_request_is_rounded_down_to_whole_shares(self):
+        broker = FakeBroker(price=100.0)
+        tracker = DecisionTracker(starting_cash=1000.0, broker=broker, trade_cost=0.0)
+        decision = tracker.record_trade("AAPL", "buy", 3.9, "x", "k", "s")
+        assert decision.requested_quantity == 3.9
+        assert decision.filled_quantity == 3.0
+        assert broker.orders == [("AAPL", "buy", 3.0, 100.0)]
+        assert tracker.positions["AAPL"] == 3.0
+
+    def test_request_below_one_share_is_rejected(self):
+        broker = FakeBroker(price=100.0)
+        tracker = DecisionTracker(starting_cash=1000.0, broker=broker, trade_cost=0.0)
+        decision = tracker.record_trade("AAPL", "buy", 0.7, "x", "k", "s")
+        assert decision.status == "rejected"
+        assert decision.filled_quantity == 0
+        assert broker.orders == []
 
     def test_buy_with_zero_cash_is_rejected(self):
         tracker = DecisionTracker(starting_cash=0.0, broker=FakeBroker(price=100.0))
@@ -63,6 +80,13 @@ class TestRecordTradeSell:
         assert decision.filled_quantity == 3.0
         assert tracker.positions.get("AAPL", 0.0) == 0.0
         assert tracker.cash == 300.0
+
+    def test_sell_of_a_fractional_position_sells_only_whole_shares(self):
+        tracker = DecisionTracker(starting_cash=0.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        tracker.positions["AAPL"] = 3.6
+        decision = tracker.record_trade("AAPL", "sell", 10, "take profit", "k", "s")
+        assert decision.filled_quantity == 3.0
+        assert tracker.positions["AAPL"] == pytest.approx(0.6)
 
     def test_sell_with_no_position_is_rejected(self):
         tracker = DecisionTracker(starting_cash=0.0, broker=FakeBroker(price=100.0))

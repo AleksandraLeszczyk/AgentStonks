@@ -61,15 +61,17 @@ NO_DATA = "no_data"
 
 
 def order_quantity(cash: float, price: float, position_pct: float) -> float:
-    """Shares that `position_pct` of `cash` buys at `price`, rounded down.
+    """Whole shares that `position_pct` of `cash` buys at `price`, rounded down.
 
     How much to deploy is a property of the agent, not of the rule that decided
     to deploy it, so every strategy sizes through here.
     """
+    from .decisions import whole_shares
+
     if price <= 0:
         return 0.0
     budget = cash * position_pct / 100.0
-    return math.floor(budget / price * 1e4) / 1e4
+    return whole_shares(budget / price)
 
 
 class BaseTrader:

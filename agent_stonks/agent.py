@@ -35,6 +35,7 @@ from .config import (
     QUOTE_STALE_SEC,
     QUOTE_WIDE_SPREAD_PCT,
 )
+from .decisions import whole_shares
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 from .rest import fetch_bars_window, fetch_corporate_actions, fetch_news_window
 from .state import (
@@ -1049,7 +1050,9 @@ def run_agent_cycle(
 
             if name == "submit_decision":
                 action = args.get("action", "")
-                quantity = float(args.get("quantity") or 0)
+                # Whole shares only: a fractional request is rounded down here,
+                # so the model is told when that leaves nothing to trade.
+                quantity = whole_shares(float(args.get("quantity") or 0))
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
                 default_symbol = symbols[0] if len(symbols) == 1 else None
@@ -1091,8 +1094,9 @@ def run_agent_cycle(
                     _reject(
                         messages,
                         tc.id,
-                        f"action '{action}' requires a quantity greater than 0. Call "
-                        "submit_decision again with a positive quantity, or use action "
+                        f"action '{action}' requires a quantity of at least 1 whole "
+                        "share (quantities are rounded down to whole shares). Call "
+                        "submit_decision again with a positive integer quantity, or use action "
                         "'alert' with one or more conditions to watch if you don't want "
                         "to trade right now.",
                     )

@@ -67,7 +67,6 @@ close the book overnight would be a bug wearing the costume of a strategy.
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
@@ -102,11 +101,6 @@ SIZE_LABEL = {
     SIZE_CASH: "$ (spend on a buy, sell that much stock)",
     SIZE_SHARES: "shares",
 }
-
-# Orders are placed in fractional shares, floored to this many decimals -- the
-# same rounding `apple_trader._order_quantity` uses, so a 95%-of-cash rule here
-# and the original agent's 95% position size buy the same quantity.
-SHARE_DECIMALS = 4
 
 
 @dataclass(frozen=True)
@@ -554,7 +548,15 @@ def resolve_quantity(
     set portable across starting balances, and 0 here is what makes a rule
     dormant rather than an error -- a sell is simply skipped while flat, exactly
     as an armed tactic is.
+
+    Orders are whole shares only, rounded down -- the same rounding
+    `rule_agent.order_quantity` and the ledger use, so a 95%-of-cash rule here
+    and the original agent's 95% position size buy the same quantity, and a
+    rule that resolves to under one share is dormant here rather than a
+    rejected order later.
     """
+    from .decisions import whole_shares
+
     if price <= 0:
         return 0.0
     if item.action == BUY:
@@ -564,7 +566,7 @@ def resolve_quantity(
             budget = min(item.size, cash)
         else:
             budget = min(item.size * price, cash)
-        return _floor_shares(max(budget, 0.0) / price)
+        return whole_shares(max(budget, 0.0) / price)
     if shares <= 0:
         return 0.0
     if item.size_mode == SIZE_PCT:
@@ -573,16 +575,7 @@ def resolve_quantity(
         wanted = item.size / price
     else:
         wanted = item.size
-    # A sell that would leave a sliver behind takes the sliver with it: a
-    # rounding remainder of 0.0001 shares is not a position anybody meant to
-    # hold, and leaving it makes "sell 100%" look like it did not work.
-    if wanted >= shares - 10 ** -SHARE_DECIMALS:
-        return shares
-    return _floor_shares(max(wanted, 0.0))
-
-
-def _floor_shares(quantity: float) -> float:
-    return math.floor(quantity * 10**SHARE_DECIMALS) / 10**SHARE_DECIMALS
+    return whole_shares(min(wanted, shares))
 
 
 @dataclass

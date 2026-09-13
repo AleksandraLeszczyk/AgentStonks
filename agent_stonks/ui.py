@@ -121,7 +121,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
-from . import bar_history
+from . import bar_history, newsimpact_model
 from .trade_sound import next_trade_cue, play_trade_sound
 from .trading_mode import MODE_LABELS, live_trading_enabled, resolve_broker
 from .stream import backfill_bars, launch_stream, launch_stream_news
@@ -251,26 +251,41 @@ _IMPACT_STYLE: dict[str, dict[str, str]] = {
 }
 
 
-def _impact_badge(impact: str) -> str:
+def _impact_badge(impact: str, detail: Optional[dict] = None) -> str:
     cfg = _IMPACT_STYLE.get(impact, _IMPACT_STYLE["unknown"])
+    label = cfg["label"]
+    title = ""
+    if detail and detail.get("source") == newsimpact_model.SOURCE_MODEL:
+        # Say which estimator spoke, and put its numbers -- or why it could not
+        # score the article -- in the tooltip.
+        if detail.get("status") != newsimpact_model.STATUS_SCORED:
+            label = detail.get("short") or "unknown"
+        label = f"{label} · model"
+        title = f' title="{html.escape(detail.get("reason", ""), quote=True)}"'
     return (
-        f'<span style="display:inline-flex;align-items:center;gap:5px;'
+        f'<span{title} style="display:inline-flex;align-items:center;gap:5px;'
         f'padding:3px 9px;border-radius:12px;background:{cfg["bg"]};'
         f'border:1px solid {cfg["border"]};font-size:10px;font-weight:600;'
         f'color:{cfg["text"]};white-space:nowrap;letter-spacing:0.02em;">'
         f'<span style="width:6px;height:6px;border-radius:50%;'
         f'background:{cfg["dot"]};display:inline-block;flex-shrink:0;"></span>'
-        f'{cfg["label"]}</span>'
+        f'{html.escape(label)}</span>'
     )
 
 
-def _news_html(news: list[dict], symbol: str, impacts: Optional[dict] = None) -> str:
+def _news_html(
+    news: list[dict],
+    symbol: str,
+    impacts: Optional[dict] = None,
+    details: Optional[dict] = None,
+) -> str:
     if not news:
         return (
             f"<p style='color:{PALETTE['muted']};padding:12px'>"
             f"No recent news for {symbol}.</p>"
         )
     impacts = impacts or {}
+    details = details or {}
     cards = []
     for item in news[:12]:
         ts = pd.to_datetime(item.get("created_at")).strftime("%b %d  %H:%M")
@@ -281,7 +296,7 @@ def _news_html(news: list[dict], symbol: str, impacts: Optional[dict] = None) ->
         url = html.escape(item.get("url", "#"))
         news_id = str(item.get("id", ""))
         impact = impacts.get(news_id)
-        badge = _impact_badge(impact) if impact else _impact_badge("unknown")
+        badge = _impact_badge(impact or "unknown", details.get(news_id))
         cards.append(
             f"""
         <div style="background:{PALETTE['panel']}; border-radius:8px; padding:12px 14px;
@@ -804,41 +819,107 @@ def _volume_alert_controls() -> None:
     state.volume_alert_multiplier = multiplier
 
 
+def _news_model_credentials(state: AppState) -> "tuple[str, str, str]":
+    """Alpaca key, secret and bar feed for the news-impact model's bar fetches."""
+    return (
+        state.api_key or os.getenv("ALPACA_API_KEY", ""),
+        state.api_secret or os.getenv("ALPACA_SECRET", ""),
+        state.history_feed_resolved or state.history_feed,
+    )
+
+
+def _refresh_model_impacts(state: AppState) -> None:
+    """Keep model-scored symbols' badges current; drop them where the model is off.
+
+    Runs on every news-panel poll. A refresh only starts when some article has
+    no settled verdict (a new one from the stream, or one waiting for its
+    bars), and it runs on a background thread: the first one of the day
+    downloads weeks of minute bars.
+    """
+    key, secret, feed = _news_model_credentials(state)
+    for sym_state in state.iter_symbol_states():
+        if not sym_state.news:
+            continue
+        if newsimpact_model.uses_model(sym_state.symbol, state.news_impact_method):
+            newsimpact_model.launch_refresh(sym_state, key, secret, feed)
+        else:
+            newsimpact_model.clear_model_impacts(sym_state)
+
+
 def _news_analysis_controls(symbols: list[str]) -> None:
     state = _get_state()
-    provider = st.selectbox(
-        "Provider",
-        PROVIDERS,
-        index=PROVIDERS.index(state.news_llm_provider),
-        key="news_llm_provider_select",
-        help=f"Model used: {', '.join(f'{p}={m}' for p, m in DEFAULT_NEWS_MODELS.items())}",
+    methods = list(newsimpact_model.IMPACT_METHODS)
+    method = st.selectbox(
+        "Impact estimate",
+        methods,
+        index=methods.index(state.news_impact_method) if state.news_impact_method in methods else 0,
+        format_func=newsimpact_model.IMPACT_METHODS.get,
+        key="news_impact_method_select",
+        help=(
+            "The news-impact model reads the price's momentum over the 15 minutes before an "
+            "intraday release and estimates the momentum state over the 15 minutes after it; "
+            "it does not read the article's text. Releases outside regular hours (or in the "
+            "first 15 minutes) stay unknown. It is used for symbols that have their own model "
+            "and scores new articles automatically; every other symbol uses the LLM."
+        ),
     )
-    state.news_llm_provider = provider
+    state.news_impact_method = method
+    states = [s for s in state.iter_symbol_states() if s.symbol in symbols] or list(
+        state.iter_symbol_states()
+    )
+    model_states = [s for s in states if newsimpact_model.uses_model(s.symbol, method)]
+    llm_states = [s for s in states if s not in model_states]
+    if model_states:
+        caption = f"Model: {', '.join(s.symbol for s in model_states)}"
+        if llm_states:
+            caption += f" · LLM: {', '.join(s.symbol for s in llm_states)}"
+        st.caption(caption)
+        for sym_state in model_states:
+            if sym_state.news_impact_error:
+                st.caption(f"⚠️ News-impact model for {sym_state.symbol}: {sym_state.news_impact_error}")
+
+    provider = state.news_llm_provider
+    llm_key = ""
     env_var = ENV_KEYS[provider]
-    llm_key = os.getenv(env_var, "")
-    if not llm_key:
-        st.caption(f"⚠️ {env_var} is not set.")
+    if llm_states or not states:
+        provider = st.selectbox(
+            "Provider",
+            PROVIDERS,
+            index=PROVIDERS.index(state.news_llm_provider),
+            key="news_llm_provider_select",
+            help=f"Model used: {', '.join(f'{p}={m}' for p, m in DEFAULT_NEWS_MODELS.items())}",
+        )
+        state.news_llm_provider = provider
+        env_var = ENV_KEYS[provider]
+        llm_key = os.getenv(env_var, "")
+        if not llm_key:
+            st.caption(f"⚠️ {env_var} is not set.")
 
     analyze_clicked = st.button("🔍 Analyze News", key="news_analyze_btn")
     if analyze_clicked:
-        states = [s for s in state.iter_symbol_states() if s.symbol in symbols] or list(
-            state.iter_symbol_states()
-        )
         if not any(s.news for s in states):
             st.warning("No news loaded yet. Start the Live stream for the symbols first.")
-        elif not llm_key:
+            return
+        key, secret, feed = _news_model_credentials(state)
+        for sym_state in model_states:
+            if sym_state.news:
+                newsimpact_model.launch_refresh(sym_state, key, secret, feed, force=True)
+        llm_targets = [s for s in llm_states if s.news]
+        if llm_targets and not llm_key:
             st.error(f"{env_var} is not set; news analysis needs an LLM key.")
-        else:
+        elif llm_targets:
             with st.spinner("Scoring news impact…"):
-                for sym_state in states:
-                    if not sym_state.news:
-                        continue
+                for sym_state in llm_targets:
                     try:
-                        sym_state.news_impacts = score_news_impacts(
+                        impacts = score_news_impacts(
                             sym_state.symbol, sym_state.news, provider, llm_key
                         )
                     except Exception as exc:
                         st.error(f"News impact scoring failed for {sym_state.symbol}: {exc}")
+                        continue
+                    with sym_state.lock:
+                        sym_state.news_impacts = impacts
+                        sym_state.news_impact_details = {}
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
@@ -846,10 +927,18 @@ def _news_panel(symbols: list[str]) -> None:
     state = _get_state()
     if state.news_status not in ("Idle", state.status):
         st.caption(f"News: {state.news_status}")
+    _refresh_model_impacts(state)
     _news_analysis_controls(symbols)
     rendered = False
     for sym_state in state.iter_symbol_states():
-        st.html(_news_html(sym_state.news, sym_state.symbol, sym_state.news_impacts))
+        st.html(
+            _news_html(
+                sym_state.news,
+                sym_state.symbol,
+                sym_state.news_impacts,
+                sym_state.news_impact_details,
+            )
+        )
         rendered = True
     if not rendered:
         st.info("Start the Live stream to load news for your symbols.")
@@ -2618,14 +2707,27 @@ def _start_live_session(
                 sym_state.trades.extend(historical_trades)
             sym_state.news = news
             sym_state.news_impacts = {}
+            sym_state.news_impact_details = {}
             loaded.append(sym)
 
+    # A symbol with its own news-impact model is scored by it, on a background
+    # thread (its first run downloads weeks of minute bars, which must not hold
+    # up the stream); the rest go to the LLM.
+    model_syms = [
+        sym for sym in loaded
+        if newsimpact_model.uses_model(sym, state.news_impact_method)
+    ]
+    for sym in model_syms:
+        if state.sym(sym).news:
+            newsimpact_model.launch_refresh(
+                state.sym(sym), key, secret, state.history_feed_resolved, force=True
+            )
     news_llm_provider = state.news_llm_provider
     llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
     if llm_key:
         for sym in loaded:
             sym_state = state.sym(sym)
-            if not sym_state.news:
+            if not sym_state.news or sym in model_syms:
                 continue
             try:
                 sym_state.news_impacts = score_news_impacts(

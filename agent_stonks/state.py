@@ -104,6 +104,15 @@ class SymbolState:
         self.trades: list[dict] = []
         self.news: list[dict] = []
         self.news_impacts: dict[str, str] = {}
+        # The news-impact model's verdict per article id (see
+        # agent_stonks.newsimpact_model): status, probabilities and the badge
+        # tooltip. LLM-scored ids have no entry. `news_impact_scoring` guards
+        # the background refresh, `news_impact_retry_at` (monotonic) backs it
+        # off after a failure, whose message is `news_impact_error`.
+        self.news_impact_details: dict[str, dict] = {}
+        self.news_impact_scoring: bool = False
+        self.news_impact_retry_at: float = 0.0
+        self.news_impact_error: str | None = None
         self.status: str = "Idle"
         self.news_status: str = "Idle"
         self.last_price: float | None = None
@@ -256,6 +265,7 @@ _DEFAULTS: dict[str, object] = {
     "automatic_reason": None,
     "automatic_assignments": {},
     "news_llm_provider": "openai",
+    "news_impact_method": "auto",
     "scorecard": None,
     "premarket_briefings": {},
     "premarket_errors": {},
@@ -354,6 +364,10 @@ class AppState:
         # assignment as a summary for consumers that need a single value.
         self.automatic_assignments: dict[str, dict] = {}
         self.news_llm_provider: str = "openai"
+        # How news impact is estimated (newsimpact_model.IMPACT_METHODS):
+        # "auto" scores a symbol with its own news-impact model when one is
+        # fitted and with the LLM otherwise; "llm" uses the LLM for all.
+        self.news_impact_method: str = "auto"
         # Per-session scoring collector (see agent_stonks.scoring); attached by
         # launch_agent/launch_automatic, flushed to the journal at session end.
         self.scorecard = None  # "scoring.Scorecard | None"
