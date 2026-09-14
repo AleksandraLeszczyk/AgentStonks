@@ -2120,8 +2120,7 @@ def _agent_panel(
                 "below the predicted high and a sell just under it for the rest of the "
                 "day. It trades **one symbol**, picked below out of the ones a model was "
                 "fitted on — every rule here is a model's output, so the instrument and "
-                "the model constrain each other. The provider/model settings below do "
-                "not apply to it."
+                "the model constrain each other."
             )
         if personality == APPLE_TRADER2_KEY:
             st.caption(
@@ -2134,29 +2133,33 @@ def _agent_panel(
                 "book is flattened before the close whatever the list says. Unlike Apple "
                 "Trader it picks **which symbol** it trades: the saved models decide "
                 "which forecasts are offered for it, and on a symbol none was fitted on "
-                "the rules read the tape alone. The provider/model settings below do not "
-                "apply to it."
+                "the rules read the tape alone."
             )
-        provider = st.selectbox(
-            "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
-        )
-        default_model = DEFAULT_AGENT_MODELS[provider]
-        model_options = models_for(provider, default=default_model)
-        current_model = state.llm_model if state.llm_model in model_options else default_model
-        model = st.selectbox(
-            "Model",
-            model_options,
-            index=model_options.index(current_model),
-            # Key is provider-scoped so switching providers rebuilds the widget
-            # instead of carrying a stale value that isn't in the new options.
-            key=f"agent_llm_model_{provider}",
-            help=f"Default: {default_model}",
-        )
-        state.llm_provider = provider
-        state.llm_model = model
-        env_var = ENV_KEYS[provider]
-        if not os.getenv(env_var) and personality not in RULE_AGENT_KEYS:
-            st.caption(f"⚠️ {env_var} is not set.")
+        if personality in RULE_AGENT_KEYS:
+            # No LLM in the loop, so no LLM settings on screen. The stored
+            # choice is left untouched for when an LLM personality is picked again.
+            provider, model = state.llm_provider, state.llm_model
+        else:
+            provider = st.selectbox(
+                "Provider", PROVIDERS, index=PROVIDERS.index(state.llm_provider), key="agent_llm_provider"
+            )
+            default_model = DEFAULT_AGENT_MODELS[provider]
+            model_options = models_for(provider, default=default_model)
+            current_model = state.llm_model if state.llm_model in model_options else default_model
+            model = st.selectbox(
+                "Model",
+                model_options,
+                index=model_options.index(current_model),
+                # Key is provider-scoped so switching providers rebuilds the widget
+                # instead of carrying a stale value that isn't in the new options.
+                key=f"agent_llm_model_{provider}",
+                help=f"Default: {default_model}",
+            )
+            state.llm_provider = provider
+            state.llm_model = model
+            env_var = ENV_KEYS[provider]
+            if not os.getenv(env_var):
+                st.caption(f"⚠️ {env_var} is not set.")
 
     apple_config = (
         _apple_trader_params(symbols) if personality == APPLE_TRADER_KEY else None
@@ -2843,10 +2846,10 @@ def build_ui() -> None:
     symbols = _effective_symbols(state, symbols_input)
 
     (
-        tab_live, tab_news, tab_premarket, tab_historical, tab_analysis,
-        tab_smart_money, tab_walls, tab_agent, tab_models,
+        tab_agent, tab_live, tab_news, tab_premarket, tab_historical, tab_analysis,
+        tab_smart_money, tab_walls, tab_models,
     ) = st.tabs(
-        ["📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🤖 Agent", "🧠 ML Models"]
+        ["🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🧠 ML Models"]
     )
 
     with tab_live:
