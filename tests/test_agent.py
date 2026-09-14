@@ -27,6 +27,7 @@ from agent_stonks.agent import (
     _tool_vwap_reversion_geometry,
     _wait_for_next_cycle,
     run_agent_cycle,
+    sell_everything_and_stop,
 )
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
@@ -1044,3 +1045,62 @@ class TestParticipationUnification:
         result = _tool_analyze_volume(state)
         assert result["rvol_pace_armable"] is None
         assert "Armed tactic conditions" not in (result.get("summary") or "")
+
+
+class TestSellEverythingAndStop:
+    def _running(self, positions, broker=None):
+        app, _ = _app("AAPL", "MSFT")
+        tracker = DecisionTracker(
+            starting_cash=10_000.0, broker=broker or FakeBroker(100.0), trade_cost=0.0
+        )
+        tracker.positions = dict(positions)
+        app.decision_tracker = tracker
+        app.agent_running = True
+        app.agent_stop_event = threading.Event()
+        return app, tracker
+
+    def test_stops_the_agent_and_sells_every_open_position(self):
+        app, tracker = self._running({"AAPL": 5.0, "MSFT": 2.0})
+        decisions, errors = sell_everything_and_stop(app)
+        assert errors == []
+        assert app.agent_running is False and app.agent_stop_event.is_set()
+        assert {(d.symbol, d.filled_quantity, d.status) for d in decisions} == {
+            ("AAPL", 5.0, "filled"), ("MSFT", 2.0, "filled"),
+        }
+        assert tracker.snapshot()["positions"] == {"AAPL": 0.0, "MSFT": 0.0}
+        assert "sold 2 of 2" in app.agent_log[-1]["text"]
+
+    def test_a_flat_book_just_stops(self):
+        app, _ = self._running({"AAPL": 0.0})
+        assert sell_everything_and_stop(app) == ([], [])
+        assert app.agent_running is False
+        assert "no open positions" in app.agent_log[-1]["text"]
+
+    def test_without_a_ledger_it_only_stops(self):
+        app, _ = _app()
+        app.agent_running = True
+        assert sell_everything_and_stop(app) == ([], [])
+        assert app.agent_running is False
+
+    def test_a_cycle_still_in_flight_cannot_buy_back_in(self):
+        """Stopping only asks the loop to stop; an order already on its way must
+        not reopen the book that was just flattened."""
+        app, tracker = self._running({"AAPL": 5.0})
+        sell_everything_and_stop(app)
+        late = tracker.record_trade("AAPL", "buy", 3, "late cycle", "k", "s")
+        assert late.status == "rejected" and late.filled_quantity == 0
+        assert "not placed" in late.reasoning
+        assert tracker.position_for("AAPL") == 0.0
+
+    def test_one_symbol_failing_does_not_keep_the_rest_from_selling(self):
+        class NoAaplQuote(FakeBroker):
+            def get_current_price(self, symbol, key, secret, feed="iex"):
+                if symbol == "AAPL":
+                    raise RuntimeError("no quote")
+                return self.price
+
+        app, tracker = self._running({"AAPL": 5.0, "MSFT": 2.0}, broker=NoAaplQuote())
+        decisions, errors = sell_everything_and_stop(app)
+        assert [d.symbol for d in decisions] == ["MSFT"]
+        assert len(errors) == 1 and "AAPL" in errors[0]
+        assert tracker.position_for("MSFT") == 0.0

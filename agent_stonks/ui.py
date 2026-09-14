@@ -24,6 +24,7 @@ from .agent import (
     PREMARKET_PERSONALITY,
     launch_agent,
     selectable_personalities,
+    sell_everything_and_stop,
     stop_agent,
 )
 from .apple_trader import (
@@ -2079,7 +2080,7 @@ def _agent_panel(
             help="Loudness of the chime, relative to your system volume.",
         )
 
-    c1, c2, c3 = st.columns([1.2, 1, 1])
+    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.3])
     starting_budget = c1.number_input(
         "Starting budget ($)",
         min_value=0.0,
@@ -2092,6 +2093,15 @@ def _agent_panel(
     )
     start_clicked = c2.button("▶ Start Agent", type="primary", width='stretch', key="agent_start")
     stop_clicked = c3.button("⏹ Stop Agent", width='stretch', key="agent_stop")
+    sell_all_clicked = c4.button(
+        "Sell everything and stop",
+        width='stretch',
+        key="agent_sell_all_stop",
+        disabled=state.decision_tracker is None,
+        help="Stops the agent, then sells every open position at market. On an "
+        "Alpaca account that is everything the account holds, not only what this "
+        "session bought.",
+    )
 
     env_var = ENV_KEYS[provider]
     llm_key = os.getenv(env_var, "")
@@ -2239,6 +2249,26 @@ def _agent_panel(
 
     if stop_clicked:
         stop_agent(state)
+
+    if sell_all_clicked:
+        sold, errors = sell_everything_and_stop(state)
+        filled = [d for d in sold if d.status == "filled"]
+        refused = [d for d in sold if d.status != "filled"]
+        if filled:
+            st.success(
+                "Agent stopped and sold "
+                + ", ".join(
+                    f"{d.filled_quantity:g} {d.symbol} @ ${d.price:,.2f}" for d in filled
+                )
+                + "."
+            )
+        if refused or errors:
+            st.error(
+                "Not sold: "
+                + "; ".join([f"{d.symbol} ({d.reasoning})" for d in refused] + errors)
+            )
+        if not sold and not errors:
+            st.info("Agent stopped. There were no open positions to sell.")
 
     status = "🟢 running" if state.agent_running else "⚪ idle"
     watching = (

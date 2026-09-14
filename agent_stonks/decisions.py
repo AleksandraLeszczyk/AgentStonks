@@ -72,10 +72,20 @@ class DecisionTracker:
         self.positions: dict[str, float] = {}
         self.trade_cost = trade_cost
         self.decisions: list[Decision] = []
+        # Set once the book has been sold off on request (`halt_buys`). Stopping
+        # an agent only asks its loop to stop, so a cycle already past that
+        # check must not be able to buy straight back in. A new run builds a new
+        # tracker, which is what lifts it.
+        self.buys_halted: "str | None" = None
 
     def position_for(self, symbol: str) -> float:
         with self.lock:
             return self.positions.get(symbol, 0.0)
+
+    def halt_buys(self, reason: str) -> None:
+        """Refuse every buy from here on, whoever asks; sells still go through."""
+        with self.lock:
+            self.buys_halted = reason
 
     def _noop_decision(self, symbol: str, action: str, reasoning: str, **extra) -> Decision:
         return Decision(
@@ -151,6 +161,16 @@ class DecisionTracker:
         with `whole_shares`. A request below one share is rejected."""
         if action not in ("buy", "sell"):
             raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
+
+        if action == "buy" and self.buys_halted:
+            with self.lock:
+                decision = self._noop_decision(
+                    symbol, action, f"{reasoning} [not placed: {self.buys_halted}]",
+                    status="rejected",
+                )
+                decision.requested_quantity = quantity
+                self.decisions.append(decision)
+            return decision
 
         price = self.broker.get_current_price(symbol, key, secret, feed)
 

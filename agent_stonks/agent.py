@@ -1464,3 +1464,69 @@ def stop_agent(state: "AppState") -> None:
     # Push any buffered traces from the cycle(s) that just ran to Langfuse
     # before the background flusher would otherwise get to them.
     obs.flush()
+
+
+def sell_everything_and_stop(state: "AppState") -> "tuple[list, list[str]]":
+    """Stop the agent, then sell every open position at market.
+
+    Returns the sell decisions, plus one message per position whose order could
+    not even be sent (no quote, an unreachable broker) -- a failure on one
+    symbol does not keep the rest from being sold.
+
+    Buys are halted on the tracker before the first sell: `stop_agent` only asks
+    the loop to stop, and a cycle already past that check would otherwise buy
+    straight back into the book this is flattening. On a real account the
+    positions are read from the account first, so "everything" is what the
+    broker holds rather than what this session happened to open.
+    """
+    stop_agent(state)
+    tracker = state.decision_tracker
+    if tracker is None:
+        return [], []
+    tracker.halt_buys("the agent was stopped and every position sold on request")
+    if not tracker.broker.is_simulated:
+        tracker.sync_from_broker()
+
+    decisions: list = []
+    errors: list[str] = []
+    for symbol, quantity in sorted(tracker.snapshot()["positions"].items()):
+        if quantity <= 0:
+            continue
+        try:
+            decision = tracker.record_trade(
+                symbol, "sell", quantity,
+                "Sell everything and stop: closing the whole position at market on request.",
+                state.api_key, state.api_secret, state.feed,
+            )
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+            _log(state, {"type": "error", "text": f"Could not sell {symbol}: {exc}"})
+            continue
+        decisions.append(decision)
+        _log(
+            state,
+            {
+                "type": "decision",
+                "action": decision.action,
+                "symbol": decision.symbol,
+                "status": decision.status,
+                "price": decision.price,
+                "quantity": decision.filled_quantity,
+                "reasoning": decision.reasoning,
+            },
+        )
+
+    attempted = len(decisions) + len(errors)
+    sold = sum(1 for d in decisions if d.status == "filled")
+    _log(
+        state,
+        {
+            "type": "status",
+            "text": (
+                f"Agent stopped; sold {sold} of {attempted} open positions."
+                if attempted
+                else "Agent stopped; there were no open positions to sell."
+            ),
+        },
+    )
+    return decisions, errors
