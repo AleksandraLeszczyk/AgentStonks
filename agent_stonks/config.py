@@ -240,20 +240,33 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 #     buy_level  = H - BUY_K  * A
 #     sell_level = H - SELL_K * A
 #
-# 0.75 and 0.10 are the notebook's own settings, and they were specified rather
-# than fitted -- which is the honest reason to leave them alone here. Notebook
-# 05.9 swept both over five sessions: the week total peaks away from them, but
-# the *count* of profitable sessions is flat at three in five across the whole
-# region where the rule trades at all. Moving the levels changes the price paid
-# on the same winning days, not how often the rule is right, and the grid's
-# best cell beats the specified one without winning a single extra day. Five
-# sessions across a 195-cell grid is selection noise; sweep them in SimLab
-# before believing any peak.
+# The notebook specifies 0.75 and 0.10 and only ever swept them over five
+# sessions. The levels used here are per instrument instead, because the stocks
+# do not dip alike: notebook 05's own grid (buy 0.30..1.30, sell 0.05..0.50,
+# step 0.05) re-run with its own fill rules over *every* session each ticker has
+# minute bars and a forecast for. `TimeToChange3/scripts/sweep_levels.py`
+# reproduces the table. A cell is eligible only if it trades on at least half
+# the sessions -- otherwise the deepest buy distances "win" on a handful of
+# fills -- and the pick is the eligible cell with the best 3x3 neighbourhood
+# mean: the middle of a profitable plateau rather than its sharpest cell.
 #
-# What the sweep does establish is the shape: out to a buy distance of about
-# 0.85 every session trades and deeper entries simply fill better; past 0.90
-# days start dropping out entirely and the totals turn erratic on a handful of
-# trades. 0.75 sits inside the first regime, on the rising part of it.
+#   ticker  days  buy   sell  total  traded  up  1st half  2nd half  at 0.75/0.10
+#   AAPL     36   0.40  0.25  +1230    34    22    +1001     +229       +1077
+#   GOOGL    31   0.65  0.05   +534    23    14     +244     +291        +146
+#   INTC     31   0.50  0.05   +403    28    15    -1444    +1847        -258
+#
+# Dollars on $10,000 per session, limit fills, no costs, and picked on the same
+# sessions it is scored on. How far to trust each differs: AAPL's whole grid is
+# profitable and the pick sits on a broad plateau; GOOGL's holds up in both
+# halves; INTC's flips sign between halves, so it is the best cell of a surface
+# that is mostly noise. GOOGL and INTC both pick the grid's smallest sell
+# distance, so their optimum may lie past the edge that was searched. ORCL was
+# swept too (it is not wired up) and no cell makes money.
+#
+# The live ledger fills at market rather than at the level (see
+# `DayRangeTrader`), so expect less than these totals. A symbol with no entry
+# falls back to the notebook's 0.75 / 0.10, which is also what a SimLab record
+# written without the two fields replays at.
 #
 # The "momentum_change" model is the third strategy and ignores both blocks above. It
 # predicts how far the momentum score will move over the next fifteen bars, in
@@ -265,8 +278,8 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 #     SELL  momentum falls below M1_MULT x theta  (the momentum floor)
 #     SELL  price falls STOP_PCT below the entry
 #
-# 0.30 / 0.30 / -2.0 / 0.5% are the notebook's, and like the day-range pair they
-# were specified rather than fitted. `scripts/simulate_week.py` sweeps all four
+# 0.30 / 0.30 / -2.0 / 0.5% are the notebook's, and like notebook 05's day-range
+# pair they were specified rather than fitted. `scripts/simulate_week.py` sweeps all four
 # over the reserved holdout week of each ticker, and what it establishes is
 # mostly negative: on GOOGL and INTC alike the model's *exits* are the only
 # profitable component, the momentum floor churns one-minute round trips
@@ -278,6 +291,12 @@ APPLE_TRADER_ENTRY_MODE = "anticipate"
 APPLE_TRADER_MODEL = "nbeats"
 APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
+# (buy_k, sell_k) per instrument -- see the day-range block above.
+APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
+    "AAPL": (0.40, 0.25),
+    "GOOGL": (0.65, 0.05),
+    "INTC": (0.50, 0.05),
+}
 APPLE_TRADER_BUY_THR = 0.30
 APPLE_TRADER_SELL_THR = 0.30
 APPLE_TRADER_M1_MULT = -2.0

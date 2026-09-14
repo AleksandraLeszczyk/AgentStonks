@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional
 
 from agent_stonks import apple_models
+from agent_stonks.config import APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K
 from agent_stonks.apple_trader import (
     APPLE_TRADER_AVATAR,
     APPLE_TRADER_KEY,
@@ -154,6 +155,11 @@ _APPLE_LEGACY = {
     # replaying it under today's default would file a different strategy in
     # Results beside the original.
     "reversal_threshold": None,
+    # Before the day-range levels were per instrument every run used the
+    # notebook's pair, so a record without them replays at that pair rather
+    # than at today's per-ticker default.
+    "buy_k": APPLE_TRADER_BUY_K,
+    "sell_k": APPLE_TRADER_SELL_K,
 }
 
 

@@ -1647,7 +1647,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "today's high **H** will land; the buy rests `buy × ADR` below it and the sell "
             "`sell × ADR` below it, with ADR the trailing 14-day average daily range in "
             "dollars. Each distinct pair is its own configuration in Results, so sweeping "
-            "them here is the intended use — notebook 05 only ever swept five sessions."
+            "them here is the intended use — the defaults are each instrument's best "
+            "plateau over the notebook's sessions, which is still only a month or two of days."
         ),
         "momentum_change": (
             "The model predicts how far the momentum score moves over the next 15 bars, "
@@ -1682,19 +1683,18 @@ _APPLE_TRADER_COPY_FIELDS = dict(
     },
     help={
         "buy_k": (
-            "The notebook's 0.75 was specified, not fitted, and its own sweep says "
-            "why not to trust a peak: over five sessions the week total climbs "
-            "steadily from $70 at 0.30 to $339 at 0.85 as deeper entries fill better, "
-            "then turns erratic past 0.90 as whole days stop trading. Through all of "
-            "it the count of profitable sessions is flat at three in five. The levels "
-            "change the price paid on the same winning days, not how often the rule "
-            "is right — and the best cell of a 195-cell grid on five sessions is "
-            "mostly selection noise."
+            "Starts at {buy_k} on {ticker}. Notebook 05 specified 0.75 and only swept "
+            "it over five sessions; this default comes from the same 195-cell grid "
+            "swept over every session with a forecast, keeping cells that trade on at "
+            "least half of them and taking the middle of the best 3×3 plateau rather "
+            "than its sharpest cell. It is still in-sample, and how well it holds up "
+            "differs by instrument — `config.APPLE_TRADER_DAYRANGE_LEVELS` records each "
+            "ticker's two halves."
         ),
         "sell_k": (
-            "Where the exit rests below the same predicted high — the smaller of the "
-            "two numbers, since it is the higher price. A day that never reaches it "
-            "is held to the closing flatten."
+            "Where the exit rests below the same predicted high — {sell_k} on {ticker} "
+            "by the same sweep, and the smaller of the two numbers, since it is the "
+            "higher price. A day that never reaches it is held to the closing flatten."
         ),
         "buy_thr": (
             "How large an upward move the model has to predict before a negative "

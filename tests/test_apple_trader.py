@@ -895,7 +895,9 @@ class TestCycleTiming:
 DAYRANGE_BUNDLE = {"opening_minutes": 5}
 
 # The forecast the stub returns: a $10 average daily range around a predicted
-# high of $110, so at the shipped 0.75 / 0.10 the levels land on round numbers.
+# high of $110, so at the notebook's 0.75 / 0.10 -- which `dayrange_config`
+# pins, whatever an instrument's own default is -- the levels land on round
+# numbers.
 FORECAST = {
     "pred_high": 110.0,
     "pred_low": 95.0,
@@ -961,6 +963,8 @@ class Tape:
 
 
 def dayrange_config(**kwargs) -> AppleTraderConfig:
+    kwargs.setdefault("buy_k", 0.75)
+    kwargs.setdefault("sell_k", 0.10)
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
 
@@ -1618,6 +1622,34 @@ UNMODELLED = "MSFT"
 ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
 # What GOOGL has, in registry order.
 GOOGL_MODELS = ["persistence", "nbeats", "dayrange"]
+
+
+class TestDayRangeLevelDefaults:
+    """Each instrument starts from its own swept pair, not the notebook's."""
+
+    def test_each_instrument_starts_from_its_own_pair(self):
+        for ticker, (buy_k, sell_k) in at.APPLE_TRADER_DAYRANGE_LEVELS.items():
+            config = AppleTraderConfig(model_key="dayrange", ticker=ticker.lower())
+            assert (config.buy_k, config.sell_k) == (buy_k, sell_k)
+
+    def test_every_ticker_the_model_is_wired_up_for_has_a_pair(self):
+        assert set(apple_models.DAYRANGE_TICKERS) <= set(at.APPLE_TRADER_DAYRANGE_LEVELS)
+
+    def test_a_symbol_never_swept_falls_back_to_the_notebook_pair(self):
+        assert at.dayrange_levels("ZZZZ") == (0.75, 0.10)
+        config = AppleTraderConfig(model_key="momentum_change", ticker="ZZZZ")
+        assert (config.buy_k, config.sell_k) == (0.75, 0.10)
+
+    def test_a_level_given_explicitly_wins_and_the_other_keeps_its_default(self):
+        _, googl_sell = at.dayrange_levels("GOOGL")
+        config = AppleTraderConfig(model_key="dayrange", ticker="GOOGL", buy_k=0.9)
+        assert (config.buy_k, config.sell_k) == (0.9, googl_sell)
+
+    def test_the_default_pair_signs_the_run(self):
+        buy_k, sell_k = at.dayrange_levels("AAPL")
+        assert config_signature(AppleTraderConfig(model_key="dayrange")) == (
+            f"dayrange_AAPL(buy=H-{buy_k:g}A,sell=H-{sell_k:g}A,size=95%)"
+        )
 
 
 class TestInstrument:

@@ -37,6 +37,7 @@ from .apple_trader import (
     ENTRY_MODE_SUMMARY,
     ENTRY_MODES,
     AppleTraderConfig,
+    dayrange_levels,
 )
 
 
@@ -153,18 +154,27 @@ def model_label(key: str) -> str:
 def dayrange_params(
     defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy
 ) -> AppleTraderConfig:
-    """The day-range rules: two resting levels below the predicted high."""
+    """The day-range rules: two resting levels below the predicted high.
+
+    Both start from the instrument's own swept pair, and the widget keys carry
+    the ticker so that switching instrument re-seeds them with that symbol's
+    pair rather than carrying the last symbol's numbers across.
+    """
     _caption(copy.intro.get("dayrange"))
+    default_buy, default_sell = dayrange_levels(ticker)
+    levels = dict(ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}")
     col_a, col_b = st.columns(2)
     buy_k = col_a.number_input(
         "Buy distance (× ADR below H)",
-        min_value=0.05, max_value=3.0, value=defaults.buy_k, step=0.05, format="%.2f",
-        key=copy.key("buy_k"), help=copy.help.get("buy_k"),
+        min_value=0.05, max_value=3.0, value=default_buy, step=0.05, format="%.2f",
+        key=copy.key(f"buy_k_{ticker}"),
+        help=copy.help.get("buy_k", "").format(**levels),
     )
     sell_k = col_b.number_input(
         "Sell distance (× ADR below H)",
-        min_value=0.0, max_value=3.0, value=defaults.sell_k, step=0.05, format="%.2f",
-        key=copy.key("sell_k"), help=copy.help.get("sell_k"),
+        min_value=0.0, max_value=3.0, value=default_sell, step=0.05, format="%.2f",
+        key=copy.key(f"sell_k_{ticker}"),
+        help=copy.help.get("sell_k", "").format(**levels),
     )
     position_pct = col_a.number_input(
         "Position size (% of cash)",

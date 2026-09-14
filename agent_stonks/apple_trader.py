@@ -306,6 +306,7 @@ from .config import (
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_BUY_THR,
     APPLE_TRADER_CYCLE_SEC,
+    APPLE_TRADER_DAYRANGE_LEVELS,
     APPLE_TRADER_ENTRY_MODE,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_M1_MULT,
@@ -367,6 +368,20 @@ ENTRY_MODE_PROB_LABEL = {
 }
 
 
+def dayrange_levels(ticker: str) -> "tuple[float, float]":
+    """The day-range `(buy_k, sell_k)` a run on this symbol starts from.
+
+    Per instrument, from re-running notebook 05's grid over every session with
+    a forecast -- `config.APPLE_TRADER_DAYRANGE_LEVELS` carries the table and
+    how far each pair deserves trust. A symbol never swept gets the notebook's
+    specified pair.
+    """
+    return APPLE_TRADER_DAYRANGE_LEVELS.get(
+        (ticker or DEFAULT_TICKER).strip().upper(),
+        (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K),
+    )
+
+
 @dataclass
 class AppleTraderConfig:
     """Tunables of the loop, for both strategies.
@@ -414,10 +429,11 @@ class AppleTraderConfig:
     # `reversal_exit_error`.
     reversal_threshold: Optional[float] = APPLE_TRADER_REVERSAL_THRESHOLD
     # --- the day-range strategy's two levels, in average daily ranges below
-    # the predicted high. See `DayRangeTrader`; `config.APPLE_TRADER_BUY_K`
-    # carries what the notebook's sweep did and did not establish about them.
-    buy_k: float = APPLE_TRADER_BUY_K
-    sell_k: float = APPLE_TRADER_SELL_K
+    # the predicted high. See `DayRangeTrader`. None -> the instrument's own
+    # swept pair (`dayrange_levels`), filled in by `__post_init__`, so after
+    # construction both are always floats.
+    buy_k: Optional[float] = None
+    sell_k: Optional[float] = None
     # --- the delta-momentum strategy's four. `buy_thr` and `sell_thr` are
     # cut-offs on the predicted move in bps/min (both stated positive: the sell
     # side compares against its negation), `m1_mult` is the momentum floor as a
@@ -432,6 +448,13 @@ class AppleTraderConfig:
 
     def __post_init__(self) -> None:
         self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
+        # Resolved per field, so a config that names only one level still
+        # gets the instrument's default for the other.
+        default_buy, default_sell = dayrange_levels(self.ticker)
+        if self.buy_k is None:
+            self.buy_k = default_buy
+        if self.sell_k is None:
+            self.sell_k = default_sell
         if self.entry_mode not in ENTRY_MODES:
             raise ValueError(
                 f"unknown entry_mode {self.entry_mode!r}; expected one of {ENTRY_MODES}"

@@ -1890,18 +1890,18 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
     },
     help={
         "buy_k": (
-            "How far under the predicted high the entry rests. The notebook's 0.75 was "
-            "specified rather than fitted. Sweeping it over five sessions: out to about "
-            "0.85 every session still trades and deeper entries simply fill better; past "
-            "0.90 whole days stop trading and the totals turn erratic on a handful of "
-            "fills. Moving it does not change how *often* the rule is right — three days "
-            "in five across the whole usable range — only the price it pays on the same "
-            "days."
+            "How far under the predicted high the entry rests. {ticker} starts at "
+            "{buy_k}: re-running notebook 05's grid over every {ticker} session with a "
+            "forecast, it is the middle of the most profitable stretch among settings "
+            "that traded on at least half the days. Shallower entries fill on more days; "
+            "deeper ones pay a better price on fewer. It was picked on the same sessions "
+            "it was scored on, so it is the best-evidenced starting point, not an edge."
         ),
         "sell_k": (
-            "Where the exit rests, as a distance below the same predicted high. It must "
-            "sit above the buy level, i.e. be the smaller number. Anything the day never "
-            "reaches is held to the closing flatten."
+            "Where the exit rests, as a distance below the same predicted high — {sell_k} "
+            "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
+            "the smaller number. Anything the day never reaches is held to the closing "
+            "flatten."
         ),
         "buy_thr": (
             "How large an upward move the model has to predict before a negative regime "

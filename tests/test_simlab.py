@@ -844,9 +844,9 @@ class TestDayRangeEngine:
     yfinance.
     """
 
-    # 105.50 predicted high on a $4 average daily range puts the shipped
-    # 0.75 / 0.10 levels at 102.50 and 105.10, which the tape below crosses in
-    # that order.
+    # 105.50 predicted high on a $4 average daily range puts the notebook's
+    # 0.75 / 0.10 levels (pinned by `_run`) at 102.50 and 105.10, which the tape
+    # below crosses in that order.
     FORECAST = {
         "pred_high": 105.5, "pred_low": 99.0, "prev_avg": 102.0,
         "adr14_abs": 4.0, "or_high": 104.1, "or_low": 103.9,
@@ -907,7 +907,10 @@ class TestDayRangeEngine:
 
     def _run(self, monkeypatch, rule_config: "dict | None" = None, symbol: str = "AAPL"):
         seen = self._stub_model(monkeypatch)
-        rules = {"model_key": "dayrange", "ticker": symbol, **(rule_config or {})}
+        rules = {
+            "model_key": "dayrange", "ticker": symbol, "buy_k": 0.75, "sell_k": 0.10,
+            **(rule_config or {}),
+        }
         market = SimMarket([symbol], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
