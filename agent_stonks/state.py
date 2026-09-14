@@ -324,11 +324,8 @@ class AppState:
         self.mixture_max_components: int = 0
         self.mixture_fit_target: str = "live"
         self.show_predicted_profile: bool = False
-        # Which model predictions the price chart draws (model_overlays keys),
-        # and which momentum bundle answers the persistence question when the
-        # momentum overlay is on.
+        # Which model predictions the price chart draws (model_overlays keys).
         self.model_overlay_keys: list[str] = []
-        self.overlay_momentum_model: "str | None" = None
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False

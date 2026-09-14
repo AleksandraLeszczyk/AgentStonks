@@ -15,7 +15,6 @@ from . import (
     apple_models,
     market_hours,
     model_overlays,
-    momentum_change_model,
 )
 from . import apple_trader_ui
 from .model_catalogue_ui import model_catalogue_panel
@@ -579,7 +578,7 @@ def _chart_panel() -> None:
             else None
         )
         overlays = model_overlays.live_overlays(
-            sym_state, bars, state.model_overlay_keys, state.overlay_momentum_model
+            sym_state, bars, state.model_overlay_keys
         )
 
         fig = build_chart(
@@ -673,7 +672,7 @@ def _live_chart_controls() -> None:
             help="Which profile the Gaussian/Cauchy mixture is fitted to.",
         )
 
-        overlay_keys, overlay_momentum_model = _model_overlay_controls(state)
+        overlay_keys = _model_overlay_controls(state)
 
         st.markdown("**Data**")
         backfill_clicked = st.button(
@@ -719,28 +718,22 @@ def _live_chart_controls() -> None:
         else "live"
     )
     state.model_overlay_keys = overlay_keys
-    state.overlay_momentum_model = overlay_momentum_model
 
 
 
-def _model_overlay_controls(state: AppState) -> "tuple[list[str], str | None]":
+def _model_overlay_controls(state: AppState) -> "list[str]":
     """Which model predictions the price chart draws.
 
     Offered per the symbols being streamed rather than globally: the day-range
-    and momentum models were each fitted on a fixed set of tickers, and an
-    overlay no chart here could show is a checkbox that does nothing. The
-    profile model claims to transfer, so it is always on the list.
+    model was fitted on a fixed set of tickers, and an overlay no chart here
+    could show is a checkbox that does nothing. The profile model claims to
+    transfer, so it is always on the list.
 
-    The momentum picker is a second question and only appears with the momentum
-    overlay selected: the persistence probability drawn on a change bar is
-    whichever bundle answered it, and the two are not comparable numbers (see
-    `apple_models.threshold`), so the chart has to say which one it asked.
-
-    Both widgets are driven by `key=` alone rather than by `default=`/`index=`.
-    A default that changes with the selection re-creates the widget on the next
-    run and loses it, and the streamed symbols can change under a stored
-    selection -- so the session value is seeded once and then pruned to what is
-    still on offer.
+    The widget is driven by `key=` alone rather than by `default=`. A default
+    that changes with the selection re-creates the widget on the next run and
+    loses it, and the streamed symbols can change under a stored selection --
+    so the session value is seeded once and then pruned to what is still on
+    offer.
     """
     available: list[str] = []
     for sym in state.symbols or []:
@@ -760,35 +753,14 @@ def _model_overlay_controls(state: AppState) -> "tuple[list[str], str | None]":
         format_func=model_overlays.label,
         key="model_overlay_keys",
         help="Draws what the trained models predict for this session: price "
-        "ranges as horizontal lines (in the candles and in the profile beside "
-        "them), momentum changes as marked moments, and anything that spans "
-        "time as a shaded background.",
+        "ranges as horizontal lines, in the candles and in the profile beside "
+        "them.",
     )
     for key in selected:
         overlay = model_overlays.get(key)
         if overlay:
             st.caption(f"{overlay.label} — {overlay.summary}")
-
-    momentum_model = state.overlay_momentum_model
-    if model_overlays.MOMENTUM_KEY in selected:
-        momentum_keys = [
-            key for key in apple_models.keys() if apple_models.is_momentum(key)
-        ]
-        if st.session_state.get("overlay_momentum_model") not in momentum_keys:
-            st.session_state["overlay_momentum_model"] = (
-                apple_models.DEFAULT_MODEL
-                if apple_models.DEFAULT_MODEL in momentum_keys
-                else momentum_keys[0]
-            )
-        momentum_model = st.selectbox(
-            "Momentum model",
-            momentum_keys,
-            format_func=lambda key: apple_models.get(key).label,
-            key="overlay_momentum_model",
-            help="Which bundle answers 'will this change hold?'. Only a "
-            "forecasting one also marks a turn that has not happened yet.",
-        )
-    return selected, momentum_model
+    return selected
 
 
 def _volume_alert_controls() -> None:
@@ -1740,7 +1712,6 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     fill_gaps=state.fill_gaps,
                     model_overlays=model_overlays.live_overlays(
                         sym_state, bars, state.model_overlay_keys,
-                        state.overlay_momentum_model,
                     )["items"],
                 ),
             )
@@ -1851,11 +1822,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "symbols in the sidebar before starting."
     ),
     model_help=(
-        "Which saved model the agent runs on — and, with it, which rules. The "
-        "two TimeToChange2 models answer the same question about the momentum "
-        "regime on every bar and differ only in how; the TimeToChange3 "
-        "day-range forecast and the TimeToChange delta-momentum regressor are "
-        "each a different strategy that happens to live in the same agent. "
+        "Which saved model the agent runs on — and, with it, which rules. "
         "Only the models fitted on the instrument above are listed."
     ),
     intro={
@@ -1866,26 +1833,12 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Both are distances in **average daily ranges** (the trailing 14-day ADR in "
             "dollars), so they scale with how wide the sessions have been."
         ),
-        "momentum_change": (
-            "The model predicts how far the momentum score moves over the next 15 minutes, "
-            "in **bps/min**. It buys a minute whose regime is still **negative** and that "
-            "the model expects to turn up, and sells a **positive** one it expects to turn "
-            "down — the tape picks the situation, the model picks the direction. Two risk "
-            "exits sit underneath: a momentum floor and a fixed stop."
-        ),
     },
     outro={
         "dayrange": (
             ":material/info: No trailing stop and no probability here — the forecast is made "
             "once and the rule is the two levels. The trade closes at the sell level, or at "
             "the closing flatten if the day never gets there."
-        ),
-        "momentum_change": (
-            ":material/history: Alone among these models this one reads the sessions *before* "
-            f"today — {momentum_change_model.HISTORY_SESSIONS} of them, fetched once each morning — "
-            "because the regime threshold is yesterday's minute volatility. If they cannot be "
-            "had, the agent says so and stands down for the day rather than scoring on a "
-            "threshold it invented."
         ),
     },
     help={
@@ -1902,64 +1855,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
             "the smaller number. Anything the day never reaches is held to the closing "
             "flatten."
-        ),
-        "buy_thr": (
-            "How large an upward move the model has to predict before a negative regime "
-            "is bought. The notebook's 0.30 was specified rather than fitted, and its "
-            "own ablation is blunt: the entry filter is the part that earns least."
-        ),
-        "sell_thr": (
-            "Stated positive and compared against its negation: at 0.30 an open position "
-            "is sold when the model predicts −0.30 bps/min or worse on a positive minute. "
-            "On both tickers this exit is where the strategy's profit came from."
-        ),
-        "m1_mult": (
-            "A hard exit when momentum drops below this multiple of the day's regime "
-            "threshold θ. Entries only happen below −θ, so anything above −1 is already "
-            "breached at entry and turns the rule into one-minute round trips."
-        ),
-        "stop_pct": (
-            "A fixed stop measured from the entry price. Not the trailing stop of the "
-            "momentum rules — that knob belongs to a different strategy and is not read "
-            "here."
-        ),
-        "entry_mode": (
-            "**Anticipate** buys while the regime is still negative or balanced, on "
-            "the model's forecast that it turns positive next bar. **Confirm** waits "
-            "for the change to print — by which point the momentum score has already "
-            "crossed its threshold, so the entry lands after the move that produced "
-            "the signal. Only a forecasting model can anticipate."
-        ),
-        "anticipate_error": (
-            "{label} was fitted on regime-change bars only, so it cannot "
-            "forecast a change that has not happened yet. Pick a forecasting model "
-            "or switch the entry to \u201cConfirm the turn\u201d."
-        ),
-        "prob_threshold": (
-            "How sure the model has to be before the bar is bought. The default "
-            "{threshold} is the cut-off this model chose on its own "
-            "validation block — but it was picked on the *confirm* question, so on "
-            "“Anticipate” treat it as a starting point and re-tune it in SimLab."
-        ),
-        "trail_pct": (
-            "Sell once price is this far below the highest price seen since the entry. "
-            "The peak only ratchets up, so this starts as a stop under the entry and "
-            "becomes a profit lock as the move runs."
-        ),
-        "sells_on_reversal": (
-            "The trailing stop waits for the give-back to happen. This sells while "
-            "price may still be at its high, on the model's own forecast that the "
-            "positive regime is about to break down — the same forecast the entry was "
-            "taken on, read the other way. Only a forecasting model can be asked."
-        ),
-        "reversal_threshold": (
-            "How much of the forecast has to fall into negative territory before the "
-            "position is closed. Measured over five AAPL sessions: 0.20 fires on ~11% "
-            "of held bars, 0.30 on ~2.6%, 0.40 on ~0.9%. Roughly half of those "
-            "firings land within three bars of the positive run ending, against a "
-            "15% base rate — a real signal, and a thin one. Whether acting on it "
-            "pays is untested: on those same sessions it moved the result by less "
-            "than the noise. Nothing validated this cut-off; sweep it in SimLab."
         ),
     },
 )
@@ -2071,7 +1966,7 @@ def _agent_panel(
         "orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}. "
         "The exceptions are the two Apple Traders, which have no LLM at all: one is a "
-        "fixed loop over a saved momentum-persistence model, the other runs a list of "
+        "fixed loop over a saved day-range forecast, the other runs a list of "
         "buy/sell rules written in this panel."
     )
     with st.expander("LLM", expanded=True):
@@ -2109,18 +2004,12 @@ def _agent_panel(
             )
         if personality == APPLE_TRADER_KEY:
             st.caption(
-                "🍎 Apple Trader runs no LLM, and the model chosen below decides which "
-                "of two strategies it runs. On the **momentum** models it reads the bar "
-                "that just closed once a minute and asks one question about the momentum "
-                "regime — by default, whether a regime that is still balanced or negative "
-                "is about to turn positive — buying if the answer is yes and selling on a "
-                "trailing stop, or on the model expecting that regime to flip negative. "
-                "On the **day-range** model it asks nothing per bar: at 9:35 it forecasts "
-                "where the whole session's high and low will land, then rests a buy well "
-                "below the predicted high and a sell just under it for the rest of the "
-                "day. It trades **one symbol**, picked below out of the ones a model was "
-                "fitted on — every rule here is a model's output, so the instrument and "
-                "the model constrain each other."
+                "🍎 Apple Trader runs no LLM. It trades the **day-range** model's rules: "
+                "at 9:35 it forecasts where the whole session's high and low will land, "
+                "then rests a buy well below the predicted high and a sell just under it "
+                "for the rest of the day. It trades **one symbol**, picked below out of "
+                "the ones the model was fitted on — every rule here is a model's output, "
+                "so the instrument and the model constrain each other."
             )
         if personality == APPLE_TRADER2_KEY:
             st.caption(

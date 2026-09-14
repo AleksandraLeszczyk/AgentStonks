@@ -1025,8 +1025,8 @@ def add_model_overlays(
     if not events:
         return
 
-    # One trace per overlay key rather than one per event: the legend then says
-    # "Momentum regime changes" once, and clicking it hides the whole set.
+    # One trace per overlay key rather than one per event: the legend then names
+    # the overlay once, and clicking it hides the whole set.
     for key in dict.fromkeys(e["key"] for e in events):
         group = [e for e in events if e["key"] == key]
         fig.add_trace(

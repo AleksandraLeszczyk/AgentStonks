@@ -1,17 +1,15 @@
 """Where a saved model lives on disk, and how it is loaded once.
 
-Four modules here (`persistence_model`, `nbeats_model`, `dayrange_model`,
-`momentum_change_model`) wrap a bundle the FinNotebooks projects produce, and
+The model modules here wrap a bundle the FinNotebooks projects produce, and
 each had grown its own identical copy of the same three concerns: resolve a
 ticker to a path under two environment overrides, load it behind a lock, and
 cache the result -- including the failure -- so a loop that asks every minute
 does not re-hit the filesystem. This is that code, once.
 
 What is NOT here is what each bundle *is*. A `ModelStore` is handed a `build`
-callable and never inspects what comes back, because the four differ in every
-way that matters: one unpickles a scikit-learn pipeline, one assembles five
-networks and a residual matrix, one needs two `.pt` checkpoints beside its
-joblib. Validation lives with the module that knows what a valid bundle looks
+callable and never inspects what comes back, because the bundles differ in
+every way that matters -- the day-range one, for instance, needs two `.pt`
+checkpoints beside its joblib. Validation lives with the module that knows what a valid bundle looks
 like -- returning None from `build` is how it refuses.
 
 The two environment overrides
@@ -60,7 +58,7 @@ class ModelStore:
     """One model family's files, resolved per ticker and loaded at most once.
 
     `filename` is a template taking `{ticker}` (already upper-cased), e.g.
-    ``"timetochange2_persistence_{ticker}.joblib"``. It deliberately mirrors
+    ``"timetochange3_dayrange_{ticker}.joblib"``. It deliberately mirrors
     the name the notebook saves under -- the two stores agreeing is what makes
     a retrain visible to the app with no further step.
     """

@@ -10,8 +10,7 @@ the opening-range arithmetic matching the notebook's group-by form.
 The one that needs both pins the *mirror itself*, against the number notebook
 05 recorded for 2026-08-07. That is the test that would fail if
 `dayrange/features.py` changed and this copy did not, and it is exact to the
-last decimal rather than approximate -- the same contract
-`tests/test_persistence_model.py` holds with `mshift`.
+last decimal rather than approximate.
 """
 
 from datetime import datetime, timezone

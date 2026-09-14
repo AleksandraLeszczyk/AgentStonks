@@ -162,77 +162,13 @@ SCORING_MIN_TOTAL_RUNTIME_SEC = 3600
 PREMARKET_LEAD_SEC = 120
 PREMARKET_WAIT_POLL_SEC = 30.0
 
-# Apple Trader: the rule-based (non-LLM) loop that watches every closed minute
-# bar of its configured symbol for a momentum-regime change into positive and
-# asks a saved model about it (see agent_stonks.apple_trader).
+# Apple Trader: the rule-based (non-LLM) loop that trades its configured symbol
+# off a saved model's forecast (see agent_stonks.apple_trader).
 #
-# ENTRY_MODE decides *when* it asks, and it is the setting that changes what the
-# agent does most:
-#   "anticipate"  buy while the regime is still negative or balanced, on the
-#                 model's forecast that it turns positive on the next bar. Needs
-#                 a forecasting model, so only "nbeats" can run it.
-#   "confirm"     buy the bar the change has already happened on, if the model
-#                 rates it likely to hold. Either model can run this, and it is
-#                 what the agent did before anticipation existed -- but by then
-#                 momentum has already crossed the enter threshold, so the entry
-#                 lands after the move that produced the signal.
+# MODEL names the model it runs on -- a key of agent_stonks.apple_models.MODELS,
+# of which "dayrange" is the only one.
 #
-# MODEL names which of the saved models answers that question -- a key of
-# agent_stonks.apple_models.MODELS ("nbeats", the forecast-derived one, or
-# "persistence", the incumbent classifier). It defaults to the forecaster
-# because the default entry mode is one only the forecaster can answer.
-# PROB_THRESHOLD is the probability a candidate has to clear to be bought; None
-# uses the cut-off the chosen model picked on its own validation block, which is
-# the intended setting because those cut-offs are not on a shared scale -- and
-# since TimeToChange2 was re-run per ticker, not on a shared scale across
-# symbols either. On AAPL they are 0.05 (the classifier's posterior) and 0.21
-# (N-BEATS' gated survival probability); on GOOGL 0.43 and 0.41; on INTC 0.22
-# and 0.05. Every one of them moved when the symbol was last retrained, so this
-# list is an illustration and the bundle is the authority. Each is picked on
-# that symbol's own validation events, so a number
-# typed here means something different on each instrument, and None is the only
-# setting that means the same thing everywhere.
-#
-# There are two exits, and either one closes the position. TRAIL_PCT is the
-# price rule: sell once price is that far below the highest price seen since
-# the entry. REVERSAL_THRESHOLD is the model rule: sell once the forecaster
-# puts the positive regime at that probability or better of flipping to
-# negative inside its 15-bar horizon -- the trailing stop waits for the
-# give-back to happen, this one acts on the same forecast the entry was taken
-# on. None switches it off, which is the only setting the incumbent classifier
-# can run: like "anticipate", it is a question about bars that are not regime
-# changes, so only a forecaster can be asked it.
-#
-# 0.30 is NOT a tuned number -- nothing in TimeToChange2 ever grid-searched an
-# exit -- but it is not a guess either. It was measured on **AAPL only**, and
-# nothing re-measured it when the forecaster was fitted for GOOGL and INTC, so
-# on those two it is a borrowed default rather than a placed one. It is now a
-# borrowed default on AAPL too: the curve below was read off the AAPL
-# checkpoint retired on 2026-09-09, and retraining moved the forecast fan the
-# reversal probability is drawn from. Re-measure before treating 0.30 as
-# placed on any symbol. Over 428
-# positive-regime bars on five AAPL sessions (2026-07-27 SIP, 2026-08-03..06 yfinance) the reversal
-# probability separates bars within 3 of the end of a positive run from bars
-# with 8+ bars still to go at AUC 0.89, and the cut-off picks where on that
-# curve to sit:
-#
-#     >= 0.20   11.2% of held bars (~10/session)   52% land near the run's end
-#     >= 0.30    2.6% of held bars (~2/session)    55%
-#     >= 0.40    0.9% of held bars (~1/session)    75%
-#
-# against a 14.7% base rate. 0.30 is the knee: a few signals a session at ~3.7x
-# base-rate precision, well past the 0.21 ninetieth percentile of the whole
-# distribution, so it stays an outlier rather than becoming a second trailing
-# stop. Lower exits earlier and far more often; much above 0.40 the rule stops
-# firing at all.
-#
-# That the rule fires in the right places is measured. That it *helps* is not:
-# A/B-ing those same five sessions moved the SIP day +0.140% -> +0.042% and the
-# four-day yfinance run -0.577% -> -0.637%, i.e. nothing either way on six and
-# twelve round trips. Sweep it in SimLab before trusting it, and treat None as
-# a live option rather than the old behaviour.
-# The "dayrange" model is the odd one out and ignores everything above. It
-# forecasts where the whole session's high and low will land, once, at 9:35,
+# The day-range model forecasts where the whole session's high and low will land, once, at 9:35,
 # and the rules built on it are TimeToChange3 notebook 05's: two resting levels
 # a fixed number of average daily ranges below the predicted high H, with A the
 # 14-day average daily range in dollars.
@@ -268,27 +204,7 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 # falls back to the notebook's 0.75 / 0.10, which is also what a SimLab record
 # written without the two fields replays at.
 #
-# The "momentum_change" model is the third strategy and ignores both blocks above. It
-# predicts how far the momentum score will move over the next fifteen bars, in
-# bps/min, and TimeToChange notebook 05's rules read that number as a direction
-# call on a regime the tape has already printed:
-#
-#     BUY   the previous minute's regime is negative and pred >=  BUY_THR
-#     SELL  the previous minute's regime is positive and pred <= -SELL_THR
-#     SELL  momentum falls below M1_MULT x theta  (the momentum floor)
-#     SELL  price falls STOP_PCT below the entry
-#
-# 0.30 / 0.30 / -2.0 / 0.5% are the notebook's, and like notebook 05's day-range
-# pair they were specified rather than fitted. `scripts/simulate_week.py` sweeps all four
-# over the reserved holdout week of each ticker, and what it establishes is
-# mostly negative: on GOOGL and INTC alike the model's *exits* are the only
-# profitable component, the momentum floor churns one-minute round trips
-# whenever it sits above -theta (entries only happen while momentum is below
-# -theta, so a floor above it is already breached at entry), and 0.5 bp per
-# side turns both tickers negative. Sweep them in SimLab before believing any
-# cell; five sessions per ticker is a sanity check, not an edge.
-APPLE_TRADER_ENTRY_MODE = "anticipate"
-APPLE_TRADER_MODEL = "nbeats"
+APPLE_TRADER_MODEL = "dayrange"
 APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
 # (buy_k, sell_k) per instrument -- see the day-range block above.
@@ -297,18 +213,11 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
     "GOOGL": (0.65, 0.05),
     "INTC": (0.50, 0.05),
 }
-APPLE_TRADER_BUY_THR = 0.30
-APPLE_TRADER_SELL_THR = 0.30
-APPLE_TRADER_M1_MULT = -2.0
-# Percent, like APPLE_TRADER_TRAIL_PCT -- the notebook's 0.005 fraction.
-APPLE_TRADER_STOP_PCT = 0.5
 APPLE_TRADER_CYCLE_SEC = 60
-APPLE_TRADER_PROB_THRESHOLD: "float | None" = None
-APPLE_TRADER_TRAIL_PCT = 0.5
-APPLE_TRADER_REVERSAL_THRESHOLD: "float | None" = 0.30
 APPLE_TRADER_POSITION_PCT = 95.0
-# Flatten this many minutes before the close: momentum, regimes and the model's
-# whole feature set are intraday, and none of it survives the overnight gap.
+# Flatten this many minutes before the close: the day-range forecast is a
+# statement about one session, and the momentum regime does not survive the
+# overnight gap either.
 APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN = 5
 # Seconds after a minute boundary to score, giving the stream time to deliver
 # the bar that just closed.
@@ -360,17 +269,11 @@ SESSION_MARKER_COLOR = "#5b6478"
 
 # Model-prediction overlays on the price chart (see model_overlays.py). One
 # color per overlay, so a level, its band and its label are recognisably the
-# same prediction; the momentum marks borrow the up/down palette because they
-# name a direction.
+# same prediction.
 MODEL_OVERLAY_COLORS: dict[str, str] = {
     "day_range":     "#22d3ee",  # cyan, as the ML predicted profile curve
     "profile_range": "#a78bfa",  # violet
     "profile_poc":   "#f472b6",  # pink -- one number inside the violet band
-    "momentum_up":   "#26c6a2",
-    "momentum_down": "#ef5350",
-    "momentum_flat": "#888",
-    "momentum_hold": "#26c6a2",
-    "momentum_turn": "#fbbf24",  # amber: the one mark about the future
 }
 
 # Alpha for the semi-transparent backgrounds overlays paint behind the candles.

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agent_stonks import apple_models, clock, persistence_model
+from agent_stonks import apple_models, clock
 from agent_stonks.agent import MOMENTUM_SYSTEM_PROMPT
 from agent_stonks.apple_trader import (
     APPLE_TRADER_KEY,
@@ -617,221 +617,37 @@ class TestEngine:
         )
 
 
-class TestRuleAgentEngine:
-    """The rule-based Apple Trader replays on the engine's other day loop: no
-    LLM client, no prompt, no tools, one decision per closed bar."""
+class TestRuleAgentRecords:
+    """Stored Apple Trader records outlive the strategies they were run on.
 
-    @pytest.fixture()
-    def apple_store(self, tmp_path, monkeypatch):
-        """A stored AAPL session shaped like the setup the agent trades.
+    A record on a model that has been removed still decodes -- Results reads it
+    -- but it is refused rather than replayed on the model that is left, which
+    would file one strategy's numbers under another's name."""
 
-        60 minutes alternating 100.00 / 100.01 -- enough volatility for the
-        momentum score to be defined, no net drift, so the regime stays
-        *balanced*; then a steady climb that pushes momentum through the +0.90
-        entry threshold (the one bar the model is ever asked about, and it lands
-        well clear of the 30-bar opening warm-up); then a give-back steep enough
-        to take out a trailing stop. Volume varies bar to bar because several
-        features z-score it, and a constant would leave them undefined.
-        """
-        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
-        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
-        prices = (
-            [100.0 + 0.01 * (i % 2) for i in range(60)]
-            + [100.0 + 0.03 * (i + 1) for i in range(40)]
-            + [101.2 - 0.06 * (i + 1) for i in range(20)]
-        )
-        bars = [
-            _bar(OPEN_UTC + timedelta(minutes=i), price, volume=1000.0 + 37 * (i % 13))
-            for i, price in enumerate(prices)
-        ]
-        sim_data._write_gz(sim_data.bars_path("AAPL", DAY), bars)
-        sim_data._write_gz(sim_data.daily_path("AAPL"), {
-            "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15", "bars": [],
+    def test_a_record_on_a_removed_model_decodes_but_will_not_build(self):
+        agent = rule_agent(APPLE_TRADER_KEY)
+        config = agent.from_record({
+            "model_key": "nbeats", "entry_mode": "anticipate", "prob_threshold": 0.5,
+            "trail_pct": 0.5, "reversal_threshold": 0.3, "ticker": "AAPL",
         })
-        return tmp_path
+        assert config.model_key == "nbeats"
+        with pytest.raises(RuntimeError, match="removed"):
+            agent.build(config)
 
-    @staticmethod
-    def _bundle(proba: float = 0.9) -> dict:
-        class Pipeline:
-            def predict_proba(self, X):
-                import numpy as np
-
-                return np.column_stack(
-                    [np.full(len(X), 1 - proba), np.full(len(X), proba)]
-                )
-
-        return {
-            "pipeline": Pipeline(),
-            "feature_columns": list(persistence_model.FEATURE_COLUMNS),
-            "seq_len": 20,
-            "threshold": 0.07,
-            "settings": {"momentum": dict(persistence_model.MOMENTUM_DEFAULTS)},
-            "metrics": {"roc_auc": 0.84},
-        }
-
-    # The stub bundle above is a classifier, so these runs pin the `confirm`
-    # entry -- the one it can answer. `anticipate`, the default, needs a
-    # forecasting bundle and is covered by its own case below.
-    CONFIRM = {"model_key": "persistence", "entry_mode": "confirm"}
-
-    def _run(self, monkeypatch, rule_config: dict, proba: float = 0.9):
-        monkeypatch.setattr(
-            persistence_model, "load_bundle", lambda *a, **k: self._bundle(proba)
-        )
-        rules = {**self.CONFIRM, **rule_config}
-        market = SimMarket(["AAPL"], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
-            model=config_signature(), api_key="", symbols=["AAPL"], days=[DAY],
-            starting_cash=10_000.0, rule_config=rules,
-        )
-        engine = SimulationEngine(market, config)
-        return market, engine, engine.run()
-
-    def test_reads_every_session_bar_and_needs_no_llm(self, apple_store, monkeypatch):
-        # No client is passed and none is built: a rule run that quietly tried
-        # to reach an LLM would raise here instead.
-        _, engine, result = self._run(monkeypatch, {"prob_threshold": 0.5})
-        assert result.error is None
-        assert engine.rule_based
-        # 120 stored bars complete at 09:31..11:30 ET -- every one inside the
-        # session, so every one is read.
-        assert result.cycles_run == 120
-        assert not clock.is_simulated()
-
-    def test_buys_the_backed_change_then_trails_out_of_it(self, apple_store, monkeypatch):
-        _, _, result = self._run(monkeypatch, {"prob_threshold": 0.5, "trail_pct": 0.5})
-        actions = [(d["action"], d["status"]) for d in result.decisions]
-        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
-        buy, sell = result.decisions[0], result.decisions[1]
-        assert "-> positive" in buy["reasoning"] and "90%" in buy["reasoning"]
-        assert "Trailing stop" in sell["reasoning"]
-        # Bought early in the climb, held it all the way up -- the stop only
-        # trails -- and sold into the give-back, below the $101.20 peak but
-        # well above the entry: the profit lock, not the initial stop.
-        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
-        assert 100.0 < float(buy["price"]) < 100.5
-        assert float(buy["price"]) < float(sell["price"]) < 101.2
-
-    def test_a_change_the_model_vetoes_is_never_bought(self, apple_store, monkeypatch):
-        _, _, result = self._run(
-            monkeypatch, {"prob_threshold": 0.5}, proba=0.01  # below the cut-off
-        )
-        assert result.error is None
-        assert [d for d in result.decisions if d["action"] in ("buy", "sell")] == []
-
-    def test_records_its_rules_instead_of_a_prompt(self, apple_store, monkeypatch):
-        rules = {"prob_threshold": 0.5, "trail_pct": 0.5}
-        _, _, result = self._run(monkeypatch, rules)
-        assert result.prompt_used is None
-        assert result.tool_names == []
-        assert result.config_summary["rule_based"] is True
-        assert result.config_summary["rule_config"] == {**self.CONFIRM, **rules}
-
-    def test_a_dataset_without_the_ticker_fails_loudly(self, store, monkeypatch):
-        monkeypatch.setattr(persistence_model, "load_bundle", lambda *a, **k: self._bundle())
-        market = SimMarket(["TEST"], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["TEST"], days=[DAY], rule_config=dict(self.CONFIRM),
-        )
-        result = SimulationEngine(market, config).run()
-        assert "only trades AAPL" in (result.error or "")
-
-    def test_a_missing_model_fails_loudly(self, apple_store, monkeypatch):
-        monkeypatch.setattr(persistence_model, "load_bundle", lambda *a, **k: None)
-        market = SimMarket(["AAPL"], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["AAPL"], days=[DAY], rule_config=dict(self.CONFIRM),
-        )
-        result = SimulationEngine(market, config).run()
-        # Names the file and the dependency: a run that simply never traded
-        # would read like a strategy result rather than a setup problem.
-        error = result.error or ""
-        assert "timetochange2_persistence_AAPL.joblib" in error
-        assert "scikit-learn" in error
-
-    def test_anticipating_on_a_model_that_cannot_forecast_fails_loudly(
-        self, apple_store, monkeypatch
-    ):
-        """The default entry needs a forecaster. Paired with the classifier the
-        run would otherwise finish clean and empty -- `read_latest` leaves
-        `turn_proba` None on every bar -- which reads like a strategy that
-        found nothing rather than a rule set that could never fire.
-        """
-        monkeypatch.setattr(persistence_model, "load_bundle", lambda *a, **k: self._bundle())
-        market = SimMarket(["AAPL"], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["AAPL"], days=[DAY],
-            rule_config={"model_key": "persistence", "entry_mode": "anticipate"},
-        )
-        result = SimulationEngine(market, config).run()
-        error = result.error or ""
-        assert "cannot forecast" in error
-        assert "'confirm'" in error
-
-    def test_the_named_model_is_the_one_loaded(self, apple_store, monkeypatch):
-        """`model_key` selects which saved model answers the entry question.
-
-        A record naming a model that cannot be assembled must fail on *that*
-        model rather than quietly falling back to the one that can.
-        """
-        monkeypatch.setattr(
-            apple_models, "load", lambda key, ticker=None: None if key == "nbeats" else self._bundle()
-        )
-        market = SimMarket(["AAPL"], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["AAPL"], days=[DAY],
-            rule_config={"model_key": "nbeats", "prob_threshold": 0.5},
-        )
-        result = SimulationEngine(market, config).run()
-        assert "timetochange2_nbeats_AAPL.pt" in (result.error or "")
-
-    def test_the_model_leads_the_configuration_signature(self):
-        """Results groups runs on this string, so two models are two
-        configurations even when every other knob matches."""
-        rules = dict(prob_threshold=0.2, trail_pct=0.5)
-        classifier = config_signature(AppleTraderConfig(model_key="persistence", **rules))
-        forecaster = config_signature(AppleTraderConfig(model_key="nbeats", **rules))
-        assert classifier != forecaster
-        assert classifier.startswith("persistence_AAPL(")
-        assert forecaster.startswith("nbeats_AAPL(")
-
-    def test_rules_recorded_before_a_field_existed_decode_to_what_they_ran(self):
-        """Records written when there was one model and one entry carry neither
-        `model_key` nor `entry_mode`.
-
-        They decode to the behaviour of the day they were written, NOT to
-        today's defaults: a stored record describes a run that already
-        happened, and replaying it as anticipate-on-N-BEATS would file a
-        different strategy's numbers in Results beside the original as though
-        they matched. (It would also refuse to build at all, since the model
-        those records name cannot anticipate.)
-        """
+    def test_a_record_without_a_model_key_is_the_persistence_run_it_was(self):
+        """Records from before the field existed ran the persistence
+        classifier, so they are refused too rather than decoding to today's
+        default."""
         agent = rule_agent(APPLE_TRADER_KEY)
         config = agent.from_record({"prob_threshold": 0.5})
-        assert (config.model_key, config.entry_mode) == ("persistence", "confirm")
-        assert config.prob_threshold == pytest.approx(0.5)
-        # The trailing stop was the only exit then, so replaying such a record
-        # must not sell on a forecast the run it describes never consulted.
-        assert config.reversal_threshold is None
-        assert not config.sells_on_reversal
+        assert config.model_key == "persistence"
+        with pytest.raises(RuntimeError, match="removed"):
+            agent.build(config)
 
-        # A record that does name them is taken at its word.
-        newer = agent.from_record(
-            {"prob_threshold": 0.5, "entry_mode": "anticipate", "model_key": "nbeats"}
+    def test_a_removed_model_signs_as_itself(self):
+        assert config_signature(AppleTraderConfig(model_key="nbeats")).startswith(
+            "nbeats_AAPL("
         )
-        assert (newer.model_key, newer.entry_mode) == ("nbeats", "anticipate")
-
-    def test_the_reversal_exit_survives_a_round_trip_through_the_record(self):
-        agent = rule_agent(APPLE_TRADER_KEY)
-        armed = AppleTraderConfig(model_key="nbeats", reversal_threshold=0.3)
-        assert agent.from_record(agent.to_record(armed)).reversal_threshold == pytest.approx(0.3)
-        off = AppleTraderConfig(model_key="nbeats", reversal_threshold=None)
-        assert agent.from_record(agent.to_record(off)).reversal_threshold is None
 
 
 class TestDayRangeEngine:
@@ -962,19 +778,6 @@ class TestDayRangeEngine:
         assert opening.index[0].strftime("%H:%M") == "09:30"
         assert opening.index[-1].strftime("%H:%M") == "09:34"
 
-    def test_the_entry_mode_and_reversal_defaults_do_not_block_the_run(
-        self, dayrange_store, monkeypatch
-    ):
-        """A day-range record carries `anticipate` and a reversal threshold
-        because one dataclass serves both strategies. Neither means anything
-        here, and neither may stop the run the way they would on a classifier.
-        """
-        _, result = self._run(
-            monkeypatch, {"entry_mode": "anticipate", "reversal_threshold": 0.3}
-        )
-        assert result.error is None
-        assert [d for d in result.decisions if d["action"] == "buy"]
-
     def test_a_missing_bundle_fails_loudly(self, dayrange_store, monkeypatch):
         dayrange = pytest.importorskip("agent_stonks.dayrange_model")
         monkeypatch.setattr(dayrange, "load_bundle", lambda ticker=None: None)
@@ -1007,20 +810,16 @@ class TestDayRangeEngine:
         assert len(seen["history"]) == 30
         assert len(seen["opening"]) == 5
 
-    def test_a_momentum_model_cannot_be_pointed_at_another_symbol(
+    def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
         self, dayrange_store, monkeypatch
     ):
         """The pairing check reaches SimLab through the same `config_error`
-        the live loop uses, so a record naming one cannot be replayed.
-
-        MSFT rather than GOOGL: since TimeToChange2 was re-run per ticker every
-        shipped model covers every shipped symbol, so an unmodelled symbol is
-        now the only pairing the registry refuses."""
+        the live loop uses, so a record naming one cannot be replayed."""
         market = SimMarket(["MSFT"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
             api_key="", symbols=["MSFT"], days=[DAY],
-            rule_config={"model_key": "nbeats", "ticker": "MSFT"},
+            rule_config={"model_key": "dayrange", "ticker": "MSFT"},
         )
         error = SimulationEngine(market, config).run().error or ""
         assert "cannot trade MSFT" in error and "AAPL, GOOGL, INTC only" in error
@@ -1046,194 +845,6 @@ class TestDayRangeEngine:
         assert config_signature(
             AppleTraderConfig(model_key="dayrange")
         ).startswith("dayrange_AAPL(buy=")
-
-
-class TestMomentumChangeEngine:
-    """The delta-momentum rules replayed end to end on the engine.
-
-    The estimator is stubbed -- `tests/test_momentum_change_model.py` pins the model
-    against momlib itself -- so what this covers is the wiring, and one part of
-    it exists nowhere else in the app: this is the only strategy that reads
-    **minute bars from days before the one being simulated**. Live that is six
-    yfinance downloads; inside a run it has to be the dataset's stored bars,
-    reached through the patched `fetch_intraday_bars_for_date`. A run that
-    quietly fetched wall-clock history instead would still trade, and every
-    regime it traded would be wrong.
-    """
-
-    # Any symbol the delta-momentum model still covers -- the estimator is
-    # stubbed, so what the symbol has to satisfy is `model_ticker_error`, which
-    # refuses a pairing the registry does not carry before the run starts. It
-    # was GOOGL until that bundle was withdrawn from `Code/Models`.
-    SYMBOL = "INTC"
-    # 09:30 ET on six quiet sessions, then the one that trades. Short days: the
-    # rules need twenty bars of warm-up and nothing here needs a real session,
-    # so `MIN_BARS_PER_DAY` is lowered to match rather than writing 2,700 bars.
-    HISTORY_DAYS = [date(2026, 6, d) for d in (5, 8, 9, 10, 11, 12)]
-    BARS_PER_HISTORY_DAY = 40
-
-    def _prices(self) -> list[float]:
-        """Flat, then a slide into a negative regime, then a recovery through
-        balanced into positive -- the two bars the rules are written for."""
-        return (
-            [100.0] * 22
-            + [100.0 - 0.02 * (i + 1) for i in range(18)]
-            + [99.64 + 0.04 * (i + 1) for i in range(25)]
-        )
-
-    @pytest.fixture()
-    def momentum_change_store(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
-        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
-        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
-        monkeypatch.setattr(momentum_change, "MIN_BARS_PER_DAY", 20)
-        momentum_change.reset_history_cache()
-
-        for day in self.HISTORY_DAYS:
-            open_utc = datetime.combine(
-                day, datetime.min.time(), tzinfo=timezone.utc
-            ).replace(hour=13, minute=30)
-            # A gentle wiggle rather than a flat line: `theta` is 0.4 times the
-            # previous session's minute volatility, and a session with none
-            # would make every regime threshold zero.
-            bars = [
-                _bar(open_utc + timedelta(minutes=i), 100.0 * (1 + 0.0002 * ((-1) ** i)))
-                for i in range(self.BARS_PER_HISTORY_DAY)
-            ]
-            sim_data._write_gz(sim_data.bars_path(self.SYMBOL, day), bars)
-
-        sim_data._write_gz(
-            sim_data.bars_path(self.SYMBOL, DAY),
-            [
-                _bar(OPEN_UTC + timedelta(minutes=i), price)
-                for i, price in enumerate(self._prices())
-            ],
-        )
-        sim_data._write_gz(sim_data.daily_path(self.SYMBOL), {
-            "symbol": self.SYMBOL, "start": "2026-05-16", "end": "2026-06-15", "bars": [],
-        })
-        return self.SYMBOL
-
-    def _stub_bundle(self, monkeypatch) -> dict:
-        """A bundle whose estimator reads the regime out of the feature row.
-
-        Deterministic and direction-aware, which is what makes both rules
-        reachable on one tape: a turn called up out of the negative regime, and
-        the same regime called over once it is positive.
-        """
-        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
-
-        class Scripted:
-            def predict(self, X):
-                regime = X["regime_before"].to_numpy(float)
-                return np.where(regime < 0, 0.9, np.where(regime > 0, -0.9, 0.0))
-
-        bundle = {
-            "estimator": Scripted(),
-            "feature_cols": list(momentum_change.FEATURE_COLS),
-            "pipeline_params": dict(momentum_change.PIPELINE_DEFAULTS),
-            "model_name": "Scripted",
-            "metrics": {},
-            "saved_at": "2026-09-07",
-        }
-        monkeypatch.setattr(momentum_change, "load_bundle", lambda ticker=None: bundle)
-        return bundle
-
-    def _run(self, monkeypatch, days: "list[date] | None" = None, **overrides):
-        self._stub_bundle(monkeypatch)
-        rules = {
-            "model_key": "momentum_change", "ticker": self.SYMBOL,
-            # The two risk exits are pinned by the unit tests; widened here so
-            # this one is about the wiring rather than about which rule fires
-            # first on a synthetic slide.
-            "m1_mult": -6.0, "stop_pct": 5.0,
-            **overrides,
-        }
-        run_days = self.HISTORY_DAYS + [DAY] if days is None else days
-        market = SimMarket([self.SYMBOL], run_days)
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER,
-            model=config_signature(AppleTraderConfig(**rules)), api_key="",
-            symbols=[self.SYMBOL], days=run_days, starting_cash=10_000.0,
-            rule_config=rules,
-        )
-        return SimulationEngine(market, config).run()
-
-    def test_it_buys_the_called_turn_and_sells_the_called_top(
-        self, momentum_change_store, monkeypatch
-    ):
-        result = self._run(monkeypatch)
-        assert result.error is None
-        actions = [(d["action"], d["status"]) for d in result.decisions]
-        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
-        buy, sell = result.decisions[0], result.decisions[1]
-        assert "negative momentum regime" in buy["reasoning"]
-        assert "Model exit" in sell["reasoning"]
-        assert parse_ts(sell["ts"]) > parse_ts(buy["ts"])
-        # Bought into the slide and sold into the recovery, which is the shape
-        # of the rule rather than an accident of the tape.
-        assert float(sell["price"]) > float(buy["price"])
-
-    def test_the_previous_sessions_come_from_the_dataset_not_the_network(
-        self, momentum_change_store, monkeypatch
-    ):
-        """The one leak this strategy could have. `fetch_intraday_bars_for_date`
-        live is a yfinance download for a wall-clock date; unpatched inside a
-        run it would hand the model six real sessions from 2026-09 while the
-        simulated day is 2026-06-15."""
-        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
-        calls: list = []
-        real = momentum_change.history_bars
-
-        def spy(ticker, session_date, **kwargs):
-            bars = real(ticker, session_date, **kwargs)
-            calls.append((str(session_date)[:10], len(bars)))
-            return bars
-
-        monkeypatch.setattr(momentum_change, "history_bars", spy)
-        result = self._run(monkeypatch)
-        assert result.error is None
-
-        fetched = dict(calls)
-        assert fetched[str(DAY)] == len(self.HISTORY_DAYS) * self.BARS_PER_HISTORY_DAY
-        # Every session the model saw is one the dataset holds, and all of them
-        # finished before the simulated day.
-        assert max(d for d, _ in calls) == str(DAY)
-
-    def test_a_dataset_with_nothing_behind_it_refuses_rather_than_trades(
-        self, momentum_change_store, monkeypatch
-    ):
-        """The regime threshold is yesterday's volatility, so the first day of
-        a dataset has nothing to build one from. Scoring anyway would produce
-        confident numbers off a threshold the model never saw -- so the day is
-        skipped, once, in the log."""
-        result = self._run(monkeypatch, days=[DAY])
-        assert result.error is None
-        assert not [d for d in result.decisions if d["action"] == "buy"]
-
-    def test_the_run_is_filed_under_its_own_signature(
-        self, momentum_change_store, monkeypatch
-    ):
-        result = self._run(monkeypatch)
-        assert result.error is None
-        assert result.config_summary["rule_config"]["ticker"] == self.SYMBOL
-        assert result.config_summary["model"].startswith(
-            f"momentum_change_{self.SYMBOL}("
-        )
-
-    def test_a_missing_bundle_fails_loudly(self, momentum_change_store, monkeypatch):
-        momentum_change = pytest.importorskip("agent_stonks.momentum_change_model")
-        monkeypatch.setattr(momentum_change, "load_bundle", lambda ticker=None: None)
-        market = SimMarket([self.SYMBOL], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=[self.SYMBOL], days=[DAY],
-            rule_config={"model_key": "momentum_change", "ticker": self.SYMBOL},
-        )
-        result = SimulationEngine(market, config).run()
-        error = result.error or ""
-        assert f"momentum_change_{self.SYMBOL}.joblib" in error
-
 
 
 class TestAppleTrader2Engine:
@@ -1984,7 +1595,7 @@ class TestMLModelBreakdown:
             "summary": {"return_pct": 1.0, "profit_efficiency": 0.5},
         }
 
-    def _apple(self, model_key="nbeats", return_pct=1.0):
+    def _apple(self, model_key="dayrange", return_pct=1.0):
         return {
             "run_id": "r1", "dataset": "ds1",
             "config_summary": {
@@ -2034,17 +1645,12 @@ class TestMLModelBreakdown:
             self._apple2(["dayrange.pred_high_dip_adr"])
         ) == "dayrange"
 
-    def test_a_rule_set_naming_several_models_is_one_row(self):
-        """A whole-run return counted under two models would double it, so the
-        set is the group -- joined in registry order, so the same combination
-        is always the same key."""
-        key = sim_results.ml_model_key(
-            self._apple2(["dayrange.pred_high_dip_adr", "persistence.proba"])
-        )
-        assert key == "persistence" + sim_results.ML_MODEL_JOIN + "dayrange"
+    def test_a_rule_set_naming_a_removed_models_signal_is_not_lost(self):
+        """A stored rule set reading a signal the catalogue no longer has cannot
+        be decoded, so it is filed as unknown rather than dropped."""
         assert sim_results.ml_model_key(
-            self._apple2(["persistence.proba", "dayrange.pred_high_dip_adr"])
-        ) == key
+            self._apple2(["persistence.proba"])
+        ) == sim_results.UNKNOWN_INSTRUMENT
 
     def test_a_tape_only_rule_set_is_its_own_answer(self):
         """Not a missing value: a set on price and the position is a complete
@@ -2084,8 +1690,8 @@ class TestMLModelBreakdown:
     def test_ml_models_lists_the_bundles_a_rule_run_loaded(self):
         assert sim_results.ml_models(self._apple("dayrange")) == ["dayrange"]
         assert sim_results.ml_models(
-            self._apple2(["dayrange.pred_high_dip_adr", "persistence.proba"])
-        ) == ["persistence", "dayrange"]
+            self._apple2(["dayrange.pred_high_dip_adr", "bar.price"])
+        ) == ["dayrange"]
 
     def test_ml_models_is_empty_for_a_rule_set_that_loaded_none(self):
         """Empty, not unknown: a set on price and the position is a complete
@@ -2111,12 +1717,6 @@ class TestMLModelBreakdown:
         )
         assert ran["keys"] == [model_overlays.DAY_RANGE_KEY]
 
-        ran = model_overlays.for_models(
-            sim_results.ml_models(self._apple("nbeats")), "AAPL"
-        )
-        assert ran["keys"] == [model_overlays.MOMENTUM_KEY]
-        assert ran["momentum_model"] == "nbeats"
-
     def test_an_llm_run_preselects_nothing(self):
         """Nothing in it can answer "was the model right", so the chart opens
         as it always did and the picker is there to ask anyway."""
@@ -2125,7 +1725,7 @@ class TestMLModelBreakdown:
         ran = model_overlays.for_models(
             sim_results.ml_models(self._llm("openai")) or [], "AAPL"
         )
-        assert ran["keys"] == [] and ran["momentum_model"] is None
+        assert ran["keys"] == []
 
 
 class TestMLModelLabels:
@@ -2133,15 +1733,17 @@ class TestMLModelLabels:
     in `apple_models` moves its row without touching stored runs."""
 
     def test_a_model_key_becomes_its_registry_name(self):
-        assert sim_app._ml_model_label("nbeats") == "N-BEATS forecast"
-        assert sim_app._ml_model_label("persistence") == "Persistence classifier"
+        assert sim_app._ml_model_label("dayrange") == "Day-range forecast"
+        # A removed model is not in the registry any more, so a stored run on
+        # it shows its key rather than borrowing a real model's name.
+        assert sim_app._ml_model_label("nbeats") == "nbeats"
 
     def test_a_provider_is_marked_as_an_llm(self):
         assert sim_app._ml_model_label("llm:openai") == "openai (LLM)"
 
     def test_a_combination_joins_both_names(self):
         assert sim_app._ml_model_label("persistence+dayrange") == (
-            "Persistence classifier + Day-range forecast"
+            "persistence + Day-range forecast"
         )
 
     def test_sentinels_are_shown_as_they_are(self):
@@ -2650,8 +2252,8 @@ class TestRuleCombinations:
 
     def test_one_combination_per_setup_per_dataset(self):
         setups = self.setups(
-            AppleTraderConfig(trail_pct=0.35),
-            AppleTraderConfig(trail_pct=0.50),
+            AppleTraderConfig(buy_k=0.35),
+            AppleTraderConfig(buy_k=0.50),
         )
         combos, _ = sim_app._rule_combinations(setups, ["ds1", "ds2"])
         assert len(combos) == 4
@@ -2659,21 +2261,21 @@ class TestRuleCombinations:
 
     def test_each_setup_gets_its_own_signature(self):
         setups = self.setups(
-            AppleTraderConfig(trail_pct=0.35),
-            AppleTraderConfig(trail_pct=0.50),
+            AppleTraderConfig(buy_k=0.35),
+            AppleTraderConfig(buy_k=0.50),
         )
         combos, _ = sim_app._rule_combinations(setups, ["ds1"])
         assert len({c[2] for c in combos}) == 2
 
     def test_a_combination_maps_back_to_the_settings_that_made_it(self):
-        slow, fast = AppleTraderConfig(trail_pct=0.35), AppleTraderConfig(trail_pct=0.50)
+        slow, fast = AppleTraderConfig(buy_k=0.35), AppleTraderConfig(buy_k=0.50)
         combos, by_combo = sim_app._rule_combinations(self.setups(slow, fast), ["ds1"])
-        assert [by_combo[c].trail_pct for c in combos] == [0.35, 0.50]
+        assert [by_combo[c].buy_k for c in combos] == [0.35, 0.50]
 
     def test_two_identical_setups_are_one_experiment(self):
         """Identical settings are the same configuration; Results would file
         the two runs as one row whatever this did."""
-        same = AppleTraderConfig(trail_pct=0.35)
+        same = AppleTraderConfig(buy_k=0.35)
         combos, _ = sim_app._rule_combinations(self.setups(same, same), ["ds1"])
         assert len(combos) == 1
 
@@ -2709,8 +2311,8 @@ class TestRuleCombinations:
         combos, _ = sim_app._rule_combinations(
             {
                 APPLE_TRADER_KEY: [
-                    AppleTraderConfig(trail_pct=0.35),
-                    AppleTraderConfig(trail_pct=0.50),
+                    AppleTraderConfig(buy_k=0.35),
+                    AppleTraderConfig(buy_k=0.50),
                 ],
                 APPLE_TRADER2_KEY: [AppleTrader2Config()],
             },
@@ -2871,8 +2473,8 @@ class TestRuleSetupTickerCheck:
     def test_one_symbol_is_reported_once_however_many_setups_use_it(self):
         missing = sim_app._rule_agents_missing_ticker(
             {APPLE_TRADER_KEY: [
-                AppleTraderConfig(ticker="AAPL", trail_pct=0.35),
-                AppleTraderConfig(ticker="AAPL", trail_pct=0.50),
+                AppleTraderConfig(ticker="AAPL", buy_k=0.35),
+                AppleTraderConfig(ticker="AAPL", buy_k=0.50),
             ]},
             self.datasets(ds1=["SPY"]), ["ds1"],
         )

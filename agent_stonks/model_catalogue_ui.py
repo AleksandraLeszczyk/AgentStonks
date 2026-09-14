@@ -68,9 +68,9 @@ def _model_overview_html(grouped: "dict[str, list[model_catalogue.ModelSpec]]") 
     """Every (model, instrument) pair in one table.
 
     One row per pair rather than per model, because that is the unit that was
-    fitted: AAPL's delta-momentum regressor is a Ridge and INTC's is a
-    HistGradientBoosting, and a single row would have to pick one to be true
-    about.
+    fitted: each symbol's day-range bundle has its own daily models, opening
+    ridge and held-out error, and a single row would have to pick one to be
+    true about.
     """
     rows = []
     for specs in grouped.values():
@@ -286,7 +286,7 @@ def model_catalogue_panel() -> None:
     st.markdown(_model_overview_html(grouped), unsafe_allow_html=True)
     st.caption(
         ":material/info: The headline metrics are **not comparable across rows** — a "
-        "persistence AUC, a day-range MAE in log units, an R² on bps/min and an EMD in "
+        "day-range MAE in log units and an EMD in "
         "bps answer different questions on different data. Read each model's own "
         "section for what its number does and does not say."
     )
@@ -300,16 +300,7 @@ def model_catalogue_panel() -> None:
         st.markdown(f"### {specs[0].label}")
         st.markdown(specs[0].summary)
         if registry is not None:
-            st.caption(
-                f":material/rule: Drives the **{registry.strategy}** strategy · "
-                + (
-                    "can be asked about a change that has not happened yet"
-                    if registry.anticipates
-                    else "answers only about a change the tape has printed"
-                    if registry.strategy == apple_models.STRATEGY_MOMENTUM
-                    else "not a per-bar momentum signal"
-                )
-            )
+            st.caption(f":material/rule: Drives the **{registry.strategy}** strategy.")
         else:
             st.caption(
                 ":material/rule: Drives no trading strategy — it is read by the "

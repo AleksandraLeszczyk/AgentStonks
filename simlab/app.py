@@ -22,8 +22,6 @@ from agent_stonks import (
     apple_models,
     clock,
     model_overlays,
-    momentum_change_model,
-    persistence_model,
 )
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
@@ -264,11 +262,10 @@ def _render_apple2_rules() -> None:
 
     st.markdown("##### The signals a condition can read")
     st.caption(
-        "The models are here as *signals*, not as strategies: `nbeats.turn_proba` and "
-        "`persistence.proba` are two models answering the same question and a rule set "
-        "may name both. What each number is worth is the same open question it is under "
-        "Apple Trader — see that agent's page, and read the AUC caveats there before "
-        "building a rule on one. This is the full catalogue, which is what "
+        "The day-range model is here as *signals*, not as a strategy: a rule set can "
+        "read its forecast without adopting Apple Trader's two levels. What the "
+        "forecast is worth is the same open question it is under Apple Trader — see "
+        "that agent's page. This is the full catalogue, which is what "
         f"{apple_models.DEFAULT_TICKER} offers; every other instrument gets the subset "
         "its models cover — "
         + "; ".join(
@@ -284,23 +281,16 @@ def _render_apple2_rules() -> None:
     signal_catalogue()
 
     st.info(
-        ":material/lightbulb: Apple Trader's two strategies are both expressible here, "
-        "and ship as presets — so a rule set can be compared against the thing it was "
-        "meant to improve on rather than against an intuition. What the vocabulary adds "
-        "beyond them is partial exits, scaled entries, and conditions from one model "
-        "crossed with another's."
+        ":material/lightbulb: Apple Trader's strategy is expressible here, and ships as "
+        "a preset — so a rule set can be compared against the thing it was meant to "
+        "improve on rather than against an intuition. What the vocabulary adds beyond "
+        "it is partial exits, scaled entries, and the forecast crossed with the tape's "
+        "momentum regime."
     )
 
 
 def _render_apple_rules() -> None:
-    """What Apple Trader does, plus the provenance of the bundles it needs.
-
-    Two strategies, and the model picked per simulation decides which runs.
-    They are described separately because they have nothing in common: one
-    asks a question on every bar, the other asks one at 9:35 and then works
-    two price levels.
-    """
-    ticker = rule_agent(APPLE_TRADER_KEY).default_ticker
+    """What Apple Trader does, plus the provenance of the bundles it needs."""
     st.markdown(
         "A fixed loop over one symbol's minute bars with no LLM anywhere in it. Which "
         "rules it runs is decided by which saved model it is pointed at, and which "
@@ -317,34 +307,7 @@ def _render_apple_rules() -> None:
             + ", ".join(apple_models.get(k).label for k in apple_models.keys_for(symbol))
             for symbol in apple_models.tickers()
         )
-        + ". TimeToChange2 was only ever fitted on "
-        f"{ticker}; TimeToChange3 was run per ticker."
-    )
-
-    st.markdown("##### The momentum rules — `persistence`, `nbeats`")
-    st.markdown(
-        f"Once a minute it reads the bar that just closed (**{ticker}** only — see "
-        "above) and "
-        "tracks the momentum regime — a Schmitt trigger over a volatility-normalised "
-        "momentum score, so a value hovering near the line cannot emit a burst of fake "
-        "changes:\n"
-        "- **Buy** on **the entry mode**'s question, given the 20 bars leading into that "
-        "bar. On *Anticipate* (the default) the regime is still negative or balanced and "
-        "the model forecasts that it turns positive on the next bar; on *Confirm* the "
-        "change has already printed and the model rates it likely to hold. The second is "
-        "the notebook's rule, and it is structurally late — the momentum score has "
-        "already crossed its threshold by then, so the fill lands after the move that "
-        "produced the signal.\n"
-        "- **Sell** on either of two triggers. Price falling **the trailing stop** below "
-        "the highest price seen since the entry — the peak only ratchets up, so the rule "
-        "starts as a stop under the entry and becomes a profit lock as the move runs. Or, "
-        "if it is armed, **the forecast reversal**: the model putting the positive regime "
-        "at the configured probability or better of flipping negative, which can close the "
-        "position while price is still at its high. The stop waits for the give-back; the "
-        "reversal acts before it.\n"
-        "- Nothing else closes the position but the closing bell: every feature the model "
-        "uses is intraday, so the book is flattened before the close rather than carried "
-        "overnight."
+        + ". TimeToChange3 was run per ticker."
     )
 
     st.markdown("##### The day-range rules — `dayrange`")
@@ -374,15 +337,6 @@ def _render_apple_rules() -> None:
     )
 
     st.markdown("##### Models")
-    st.caption(
-        "The momentum question can be put to either of two saved TimeToChange2 models. "
-        "Everything before the question — bars, momentum, regimes, all 25 features, the "
-        "20-bar window — is identical for both, so a dataset run through each on the "
-        "*Confirm* entry is a comparison of the models and nothing else. *Anticipate* "
-        "asks about a bar that is not a regime change, which only a forecaster can "
-        "answer. The day-range model is not on that scale and its numbers below are not "
-        "comparable to theirs."
-    )
     for model in (apple_models.get(key) for key in apple_models.keys()):
         with st.expander(model.label, expanded=model.key == AppleTraderConfig().model_key):
             st.markdown(model.summary)
@@ -397,11 +351,6 @@ def _render_apple_rules() -> None:
                          "this model can be run on."
                 )
             )
-            if model.strategy == apple_models.STRATEGY_MOMENTUM and not model.anticipates:
-                st.caption(
-                    ":material/block: Fitted on regime-change bars only, so it runs the "
-                    "*Confirm* entry and not *Anticipate*."
-                )
             # One provenance block per symbol: the numbers below are that
             # bundle's own, and quoting AAPL's for a GOOGL run would be a
             # different model's held-out error under the right heading.
@@ -415,45 +364,14 @@ def _render_apple_rules() -> None:
                         f"naming this model on {symbol} will fail until it is available."
                     )
                     continue
-                if model.strategy == apple_models.STRATEGY_DAYRANGE:
-                    _render_dayrange_bundle(bundle)
-                    continue
-                if model.strategy == apple_models.STRATEGY_MOMENTUM_CHANGE:
-                    _render_momentum_change_bundle(bundle)
-                    continue
-                metrics = bundle.get("metrics") or {}
-                cols = st.columns(4)
-                cols[0].metric("Sequence", f"{bundle['seq_len']} bars")
-                cols[1].metric("Features", len(bundle.get("feature_columns") or []))
-                cols[2].metric("Held-out AUC", f"{metrics.get('roc_auc', float('nan')):.2f}")
-                cols[3].metric(
-                    "Own threshold", f"{persistence_model.model_threshold(bundle):g}"
-                )
-                st.caption(
-                    f"Fitted {bundle.get('trained_at', '?')}, excluding sessions from "
-                    f"{bundle.get('excluded_sessions_from', '?')} onwards. "
-                    f"{bundle.get('notes', '')}"
-                )
-                st.json(
-                    {"settings": bundle.get("settings"), "metrics": metrics},
-                    expanded=False,
-                )
-    st.warning(
-        ":material/warning: Those AUCs cover *all* regime changes, and roughly half of "
-        "them are decided by one observable boolean — the old regime had already held 15 "
-        "bars. On the changes that pass it the classifier scores ~0.50 and N-BEATS ~0.67, "
-        "and the interval on that 0.67 only just excludes chance. Either momentum entry is "
-        "best read as a change the model did not veto, which is why the exit does not "
-        "consult it at all."
-    )
+                _render_dayrange_bundle(bundle)
 
 
 def _render_dayrange_bundle(bundle: dict) -> None:
     """The day-range bundle's provenance, in its own units.
 
-    Nothing here shares a scale with the momentum models: the error is dollars
-    of misprediction on a price, not an AUC on a label, and there is no
-    threshold at all.
+    The error is dollars of misprediction on a price, not an AUC on a label,
+    and there is no threshold at all.
     """
     metadata = bundle.get("metadata") or {}
     test = metadata.get("test_metrics_ensemble") or {}
@@ -469,51 +387,13 @@ def _render_dayrange_bundle(bundle: dict) -> None:
         f"{metadata.get('daily_fit_through', '?')}; the opening ridge on "
         f"{metadata.get('opening_fit_sessions', '?')} sessions after that, with "
         f"{metadata.get('held_out', '?')} held out of everything. The error is the mean "
-        "absolute miss on the day's high and low over a 129-session test window — a "
-        "number about prices, not about a label, so it cannot be compared to the AUCs "
-        "above."
+        "absolute miss on the day's high and low over a 129-session test window."
     )
     st.json(
         {"test_metrics": test, "constraint": metadata.get("constraint"),
          "opening_correction_gain": metadata.get("opening_correction_loo_gain")},
         expanded=False,
     )
-
-
-def _render_momentum_change_bundle(bundle: dict) -> None:
-    """The delta-momentum bundle's provenance, in its own units.
-
-    Two things this panel is careful about. The headline numbers are the
-    **holdout week's** -- five sessions removed before the estimator was fitted
-    *or* chosen -- rather than the validation days the selection ran on, because
-    the latter are only out-of-sample for fitting. And the R2 is on a bps/min
-    quantity, so it shares no scale with the AUCs above or the dollars below.
-    """
-    metrics = bundle.get("metrics") or {}
-    days = bundle.get("train_days") or []
-    cols = st.columns(4)
-    cols[0].metric("Estimator", bundle.get("model_name", "?"))
-    cols[1].metric("Holdout R²", f"{metrics.get('holdout_r2', float('nan')):.2f}")
-    cols[2].metric(
-        "Sign on changes", f"{metrics.get('holdout_sign_hit_rate_on_changes', float('nan')):.0%}"
-    )
-    cols[3].metric(
-        "MAE vs predict-zero",
-        f"{metrics.get('holdout_mae', float('nan')):.2f}",
-        delta=f"{metrics.get('holdout_mae', 0) - metrics.get('holdout_mae_predict_zero', 0):+.2f}",
-        delta_color="inverse",
-    )
-    st.caption(
-        f"{bundle.get('model_name', '?')} chosen on validation days and fitted "
-        f"{bundle.get('saved_at', '?')} on {len(days)} training days "
-        f"({days[0] if days else '?'} … {days[-1] if days else '?'}). The figures above "
-        f"are from the {int(metrics.get('n_holdout_days', 0))} reserved sessions, used "
-        "neither for fitting nor for selection. Target is Δ momentum in bps/min, so the "
-        "R² is not comparable to the AUCs above or the dollar errors below. "
-        f"{bundle.get('notes', '')}"
-    )
-    st.json({"metrics": metrics, "pipeline_params": bundle.get("pipeline_params")},
-            expanded=False)
 
 
 def render_agents_tab() -> None:
@@ -812,14 +692,13 @@ def _overlay_day(
     symbol: str,
     day: date,
     selected: tuple,
-    momentum_model: "str | None",
 ) -> dict:
     """One replayed day's overlay items, computed once per tape and selection.
 
     Now that the run's own model is pre-selected, this runs on merely *opening*
     a run rather than on asking for it, and it runs again on every rerun the
-    page does -- a filter change, a tab, the delete button. Scoring five
-    sessions through the N-BEATS bundle each time would make Results feel
+    page does -- a filter change, a tab, the delete button. Forecasting five
+    sessions through the day-range bundle each time would make Results feel
     broken, and the answer cannot move: a stored day's bars and a trained
     model are both fixed. Same reasoning as `model_overlays.live_overlays`'
     per-bar cache, a different lifetime.
@@ -838,7 +717,6 @@ def _overlay_day(
         daily_bars=_market.completed_daily_bars(symbol, t),
         session_date=day,
         open_price=_market.session_open_price(symbol, t),
-        momentum_model=momentum_model,
     )
 
 
@@ -850,8 +728,7 @@ def _run_overlay_controls(
     **The run's own model is pre-selected.** Reading a result means asking
     whether the model was right, and that question is one chart away only if
     the chart already shows what the model said -- so a run driven by the
-    day-range forecast opens with that forecast over its candles, and a
-    momentum run opens with the regime marks of the very bundle it traded
+    day-range forecast opens with that forecast over its candles
     (`simlab.results.ml_models` -> `model_overlays.for_models`). This is the
     one place in the page that reads the run's configuration to decide what to
     draw; everything below still just draws what is selected.
@@ -905,25 +782,10 @@ def _run_overlay_controls(
     if not selected:
         return {"items": [], "notes": notes}
 
-    momentum_model = None
-    if model_overlays.MOMENTUM_KEY in selected:
-        momentum_keys = [k for k in apple_models.keys() if apple_models.is_momentum(k)]
-        # Defaulted to the bundle the run actually asked, so the marks on the
-        # chart are the numbers behind its trades rather than the other model's
-        # opinion of the same bars.
-        ran_momentum = ran["momentum_model"]
-        momentum_model = st.selectbox(
-            "Momentum model",
-            momentum_keys,
-            index=momentum_keys.index(ran_momentum) if ran_momentum in momentum_keys else 0,
-            format_func=lambda key: apple_models.get(key).label,
-            key=f"sim_overlay_model_{run_id}_{symbol}",
-        )
-
     items: list[dict] = []
     for day in days:
         result = _overlay_day(
-            market, market.feed, symbol, day, tuple(selected), momentum_model
+            market, market.feed, symbol, day, tuple(selected)
         )
         items.extend(result["items"])
         for note in result["notes"]:
@@ -1632,14 +1494,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         "configurations in Results, never one averaged row."
     ),
     model_help=(
-        "On the confirm entry the two momentum models are handed the same "
-        "20 bars on the same tape and return one probability, so running a "
-        "dataset through both is a straight comparison. Neither the day-range "
-        "forecast nor the delta-momentum regressor is on that scale, and "
-        "neither is comparable to them by number — each is a different "
-        "strategy on the same symbol, and the way to compare them is to run "
-        "the same dataset through each. Only the models fitted on the "
-        "instrument above are listed."
+        "Which saved model the run trades on, and with it which rules. Only the "
+        "models fitted on the instrument above are listed."
     ),
     intro={
         "dayrange": (
@@ -1650,35 +1506,12 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "them here is the intended use — the defaults are each instrument's best "
             "plateau over the notebook's sessions, which is still only a month or two of days."
         ),
-        "momentum_change": (
-            "The model predicts how far the momentum score moves over the next 15 bars, "
-            "in **bps/min**. The rules read that as a direction call on a regime the tape "
-            "has already printed: buy a *negative* minute the model expects to turn up, "
-            "sell a *positive* one it expects to turn down, and cut on either risk exit. "
-            "The notebook's own ablation says the exits carry the P&L — sweeping all four "
-            "here is the intended use."
-        ),
-        "momentum": (
-            "Four knobs decide everything: **when** the saved model is asked about a "
-            "regime change, how sure it has to be, how much of the run the trade gives "
-            "back before selling, and whether the model also gets to call the exit. Each "
-            "distinct rule set is tracked as its own configuration in Results, so moving "
-            "the entry, retuning the stop or arming the reversal exit is a new test "
-            "rather than a repeat of one already run."
-        ),
     },
     outro={
         "dayrange": (
             ":material/info: No entry mode, no probability, no trailing stop — none of them "
             "mean anything to a forecast of the day's range, and the run's signature leaves "
             "them out so a day-range result is never filed beside a momentum one."
-        ),
-        "momentum_change": (
-            ":material/warning: This is the only model here that reads days *before* the "
-            f"one being simulated: {momentum_change_model.HISTORY_SESSIONS} previous sessions of "
-            "minute bars, because the regime threshold is yesterday's volatility. A dataset "
-            "whose first days have nothing behind them will log a refusal to trade for "
-            "those sessions rather than trading them blind."
         ),
     },
     help={
@@ -1695,71 +1528,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Where the exit rests below the same predicted high — {sell_k} on {ticker} "
             "by the same sweep, and the smaller of the two numbers, since it is the "
             "higher price. A day that never reaches it is held to the closing flatten."
-        ),
-        "buy_thr": (
-            "How large an upward move the model has to predict before a negative "
-            "regime is bought. 0.30 is the notebook's, specified rather than fitted; "
-            "0 buys every negative minute the model does not call down, which is the "
-            "\"no model entry filter\" ablation."
-        ),
-        "sell_thr": (
-            "Stated positive and compared against its negation: at 0.30 a held "
-            "position is sold when the model predicts −0.30 bps/min or worse on a "
-            "positive minute. This is the exit the ablation says does the work on "
-            "both tickers."
-        ),
-        "m1_mult": (
-            "A hard exit when momentum falls below this multiple of the day's regime "
-            "threshold θ. Entries only happen while momentum is below −θ, so anything "
-            "above −1 is already breached at entry and churns one-minute round trips; "
-            "the notebook's sweep runs through that region deliberately."
-        ),
-        "stop_pct": (
-            "A fixed stop measured from the entry price — not a trailing one. The "
-            "momentum rules' trailing stop is a different strategy's knob and is not "
-            "read here."
-        ),
-        "entry_mode": (
-            "The setting that moves the fill most. On the 2026-07-27 SIP tape "
-            "“Confirm” bought 337.45 / 338.67 / 336.35 and “Anticipate” bought the "
-            "same three episodes at 336.56 / 338.20 / 335.99 — one to six bars "
-            "earlier, while the regime was still balanced, taking the session from "
-            "−0.41% to +0.08%. That is three trades on one day: a check that the "
-            "wiring works, not a measurement of the edge."
-        ),
-        "anticipate_error": (
-            "{label} was fitted on regime-change bars only, so it cannot "
-            "forecast a change that has not happened yet. Pick a forecasting model "
-            "or switch the entry to \u201cConfirm the turn\u201d; this pairing stops the run "
-            "rather than producing an empty ledger."
-        ),
-        "prob_threshold": (
-            "Default {threshold} is the cut-off this model chose on its own "
-            "validation block — on the *confirm* question. On “Anticipate” it is a "
-            "starting point rather than a tuned setting, and it is the first thing "
-            "worth sweeping here: it decides how early in the build-up the entry "
-            "fires."
-        ),
-        "trail_pct": (
-            "Sell once price is this far below the highest price seen since the "
-            "entry. The peak only ratchets up, so this starts as a stop under the "
-            "entry and becomes a profit lock as the move runs."
-        ),
-        "sells_on_reversal": (
-            "Closes the position when the model puts the positive regime at the "
-            "probability below or better of flipping negative — while price may "
-            "still be at its high, rather than waiting for the trailing stop's "
-            "give-back. Only a forecasting model can be asked."
-        ),
-        "reversal_threshold": (
-            "Over five AAPL sessions this separates bars within three of a positive "
-            "run's end from bars with 8+ to go at 0.89 AUC, and the cut-off picks "
-            "where to sit on it: 0.20 fires on 11% of held bars, 0.30 on 2.6%, 0.40 "
-            "on 0.9%, with about half of each landing near the end against a 15% "
-            "base rate. It fires in the right places; whether that pays is untested "
-            "— A/B-ing those same sessions moved them +0.14%→+0.04% and "
-            "−0.58%→−0.64%, which is noise on 6 and 12 round trips. No notebook ever "
-            "tuned an exit, so this is the thing most worth sweeping here."
         ),
     },
 )

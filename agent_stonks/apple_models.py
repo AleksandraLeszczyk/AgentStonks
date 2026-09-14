@@ -1,105 +1,42 @@
 """The models Apple Trader can run on, behind one interface.
 
-*Which* saved model the agent trades on is a choice, and the notebooks have
-produced more than one answer. This module is where that choice lives, so the
-trader, the loop, SimLab and the UI ask for "the model named X" and never
-branch on which one they got.
+*Which* saved model the agent trades on is a choice, and this module is where
+that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
+named X" and never branch on which one they got. Today there is one:
 
-The four on offer
------------------
-`persistence`  the incumbent: a gradient-boosted classifier trained on the
-               momentum-persistence label directly (TimeToChange2 notebook 04).
-               Out-of-fold AUC 0.82 over all regime changes, **0.50** over the
-               ones that already pass the observable `pre_dwell >= 15`
-               pre-condition. A filter that separates the impossible from the
-               possible.
-`nbeats`       a five-seed N-BEATS ensemble that forecasts the next 15 bars of
-               momentum, replays the regime trigger over 500 sampled futures
-               and reports the fraction that survive (TimeToChange2 notebooks
-               06-07). 0.91 full-label AUC and **0.67 +/- 0.07** on that same
-               hard half -- the only entrant above chance on all four
-               walk-forward folds.
-`dayrange`     a different question entirely: TimeToChange3's blend of
-               LightGBM, N-BEATS and N-HiTS, plus an opening ridge, forecasting
-               where the *whole session's* high and low will land, once, from
-               the first five minutes. 30% of a 14-day rolling baseline's error
-               removed over 129 test sessions.
-`momentum_change`
-               TimeToChange's regressor on the *size* of the next momentum
-               move: given the minute that just closed, how many bps/min will
-               the smoothed momentum score have shifted fifteen bars from now.
-               Not a probability -- a signed quantity, whose sign is the
-               reliable half (right on 94% / 86% of the holdout week's changes
-               on the two tickers it is wired up for, AAPL / INTC, against
-               timing that is barely better than chance).
+`dayrange`     TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus an
+               opening ridge, forecasting where the *whole session's* high and
+               low will land, once, from the first five minutes. 30% of a
+               14-day rolling baseline's error removed over 129 test sessions.
 
-The first two are graded against each other on the same 35 events, and the gap
-is real but small -- notebook 07 replayed one held-out session through both and
-they made *identical* trades. So `nbeats` is a switch, not a promotion.
-
-`dayrange` and `momentum_change` are not on that scale at all and cannot be
-compared to them by number. Each answers a different question, on a different
-horizon, and each brings its own trading rules with it.
+The persistence classifier, the N-BEATS persistence forecaster and the
+delta-momentum regressor used to sit beside it and have been removed. Their
+bundles may still be in `Code/Models`, but nothing here reads them, and a
+stored SimLab record naming one is refused rather than replayed on another
+model (`apple_trader.model_ticker_error`).
 
 Which symbols a model exists for
 --------------------------------
 A model is fitted on one ticker and the notebooks make no claim that any of
 them transfers, so "which model" and "which instrument" are one question rather
 than two. `AppleModel.tickers` is the answer, and it is deliberately a property
-of the model rather than of the app:
+of the model rather than of the app.
 
-    persistence, nbeats   AAPL, GOOGL and INTC -- TimeToChange2's recipe was
-                          re-run per ticker (notebook 08), so each symbol has
-                          its own classifier, its own validation threshold and
-                          its own five-seed ensemble.
-    dayrange              AAPL, GOOGL and INTC -- TimeToChange3's pipeline was
-                          run per ticker, and each run produced its own bundle.
-    momentum_change       AAPL and INTC -- TimeToChange trains and *selects*
-                          per ticker off the same weekly bar archive, and the
-                          selection genuinely differs: Ridge on AAPL,
-                          HistGradientBoosting on INTC. GOOGL was fitted the
-                          same way (a RandomForest) and its bundle is installed
-                          again, but the ticker is not listed here yet.
-
-So the four models do **not** all cover the same symbols: AAPL and INTC carry
-every one, GOOGL carries the first three. That is exactly the state `keys_for`
-exists for, it was different a month ago and will be different again, and
-nothing downstream may assume otherwise.
-
-Everything downstream reads `models_for(ticker)` instead of `MODELS`, which is
+Everything downstream reads `keys_for(ticker)` instead of `MODELS`, which is
 what makes an instrument with no model at all a supported choice rather than a
-broken one: the agent that reads no model still has the tape, the momentum
-regime, the position and the clock, and those are the same everywhere. Adding a
-ticker to a model here (plus its bundle in `Code/Models`) is the whole change
-needed to offer it -- ORCL, for instance, is trained in `FinNotebooks/Models`
-and is one entry away.
+broken one: a rule set written on the tape, the momentum regime, the position
+and the clock needs no model. Adding a ticker to a model here (plus its bundle
+in `Code/Models`) is the whole change needed to offer it -- ORCL, for instance,
+is trained in `FinNotebooks/Models` and is one entry away.
 
-What "one interface" means, and where it stops
-----------------------------------------------
-`persistence` and `nbeats` share everything before the scoring step: bars,
-sessions, momentum, regimes, all 25 features and the 20-bar window come from
-`persistence_model` either way, so the two are handed the same array on the
-same bars and differ only in what they do with it. Both bundles carry
-`feature_columns`, `seq_len`, `threshold`, `settings` and `metrics`. That is
-what `strategy == STRATEGY_MOMENTUM` means.
+`AppleModel.strategy` names which rule set a model drives, and
+`apple_trader.build_trader` turns it into a state machine. With one model there
+is one strategy, but the seam is kept: a second model is a registry entry and a
+trader class, not an edit to every caller.
 
-`dayrange` and `momentum_change` share none of it. A forecast of the day's high is
-not a probability and there is no threshold to compare it against; the rules
-built on it are resting price levels rather than a per-bar signal. A predicted
-delta momentum *is* per-bar, but it is a signed quantity in bps/min whose
-useful cut-offs are two-sided and unbounded, and it runs its own momentum and
-regime pipeline (per-day adaptive threshold, six sessions of history) that
-`persistence_model` shares none of. Pretending otherwise -- one `read_latest`,
-one probability, one trailing stop -- would have meant a `turn_proba` that is
-really a price or a bps/min figure, and a threshold that means nothing.
-So the seam is drawn at the strategy instead: `AppleModel.strategy` names which
-rule set a model drives, `apple_trader.build_trader` turns that into the right
-state machine, and everything downstream of it (the config record, the Results
-signature, both UIs) branches on the strategy rather than on the model key.
-
-Every model is optional in the same way the rest of the ML surface is: a
-missing file or a missing dependency makes it *unavailable*, reported as such,
-rather than an agent that silently never trades.
+Every model is optional: a missing file or a missing dependency makes it
+*unavailable*, reported as such, rather than an agent that silently never
+trades.
 """
 
 from __future__ import annotations
@@ -108,36 +45,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from . import persistence_model
 from .config import APPLE_TRADER_MODEL
 
 
-# The rule sets a model can drive. A model does not merely answer a question --
-# it decides which question is worth asking, and the two here are not variants
-# of one another (see the module docstring).
-STRATEGY_MOMENTUM = "momentum"
+# The rule sets a model can drive.
 STRATEGY_DAYRANGE = "dayrange"
-STRATEGY_MOMENTUM_CHANGE = "momentum_change"
 
-# The symbol everything here defaults to: the one with the most models behind
-# it, and what a config or a stored record arriving without one means.
+# The symbol everything here defaults to, and what a config or a stored record
+# arriving without one means.
 DEFAULT_TICKER = "AAPL"
 
-# Which symbols each model was fitted on. Each really is its own model: the
-# split, the validation threshold and the ensemble's residuals all belong to
-# the symbol they were fitted on.
-#
-# Note that these are not the same set, and `keys_for` exists for exactly that
-# reason. The delta-momentum regressor does not cover GOOGL here even though a
-# GOOGL bundle is back in `Code/Models` (the refit on the full weekly archive
-# restored it): listing a ticker whose file is missing is the failure this
-# guards against, but the reverse -- a file no entry points at -- costs nothing
-# and is reversible in one line. Adding it back is that line plus the tests
-# that currently use the AAPL/INTC-vs-GOOGL split as their narrowed-menu
-# fixture; see `momentum_change_model`'s docstring for the numbers.
-MOMENTUM_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
+# Which symbols the day-range model was fitted on. Each really is its own
+# model: TimeToChange3's pipeline was run per ticker, and each run produced its
+# own bundle.
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
-MOMENTUM_CHANGE_TICKERS = (DEFAULT_TICKER, "INTC")
 
 
 @dataclass(frozen=True)
@@ -151,16 +72,8 @@ class AppleModel:
     # What has to be installed for `load` to be able to return anything.
     requires: str
     # Which rule set this model drives -- `apple_trader.build_trader` turns it
-    # into a state machine, and every caller that needs to know which knobs
-    # apply reads this rather than the key.
+    # into a state machine.
     strategy: str
-    # Whether it can be asked about a change that has not happened yet, which
-    # is what Apple Trader's `anticipate` entry needs. Only a momentum
-    # forecaster can: see `persistence_model.anticipates`, which is the
-    # authority at run time (it reads the loaded bundle). This flag is the same
-    # fact available before a 200 MB dependency is imported, so a picker can
-    # label the choice. Meaningless outside `STRATEGY_MOMENTUM`.
-    anticipates: bool
     # The symbols this model was fitted on. A model is not available for
     # anything else -- see the module docstring -- and `load`/`path` are only
     # ever called with one of these.
@@ -175,51 +88,14 @@ class AppleModel:
         return (ticker or DEFAULT_TICKER).upper() in self.tickers
 
 
-def _load_persistence(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The incumbent bundle for one ticker.
-
-    A wrapper rather than `persistence_model.load_bundle` itself, so the lookup
-    happens when the model is asked for. Binding the function object into the
-    registry at import time would freeze it past any later replacement -- which
-    is exactly what a test that stubs out a missing model does.
-    """
-    return persistence_model.load_bundle(ticker)
-
-
-def _persistence_path(ticker: str = DEFAULT_TICKER) -> Path:
-    return persistence_model.model_path(ticker)
-
-
-def _load_nbeats(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The N-BEATS bundle, or None if torch is not installed.
-
-    Imported here rather than at module scope so that `import apple_models`
-    stays free of PyTorch: the incumbent model needs none of it, and the
-    default configuration must not require a 200 MB dependency to start.
-    """
-    try:
-        from . import nbeats_model
-    except ImportError:
-        return None
-    return nbeats_model.load_bundle(ticker)
-
-
-def _nbeats_path(ticker: str = DEFAULT_TICKER) -> Path:
-    try:
-        from . import nbeats_model
-    except ImportError:
-        return Path(f"timetochange2_nbeats_{(ticker or DEFAULT_TICKER).upper()}.pt")
-    return nbeats_model.model_path(ticker)
-
-
 def _load_dayrange(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """The TimeToChange3 bundle for one ticker, or None if torch/LightGBM are
     not installed.
 
-    Imported here rather than at module scope for the same reason `nbeats` is,
-    and one more: this module pulls LightGBM in ahead of torch on purpose, and
-    doing that at `import apple_models` time would impose the ordering on every
-    process that only wanted to list the model names.
+    Imported here rather than at module scope: the module pulls LightGBM in
+    ahead of torch on purpose, and doing that at `import apple_models` time
+    would impose a 200 MB dependency, and the ordering, on every process that
+    only wanted to list the model names.
     """
     try:
         from . import dayrange_model
@@ -236,65 +112,9 @@ def _dayrange_path(ticker: str = DEFAULT_TICKER) -> Path:
     return dayrange_model.model_path(ticker)
 
 
-def _load_momentum_change(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The TimeToChange delta-momentum bundle for one ticker, or None.
-
-    Imported here rather than at module scope for the same reason the other two
-    are: it reaches for scikit-learn and joblib, and listing the model names
-    should not require them.
-    """
-    try:
-        from . import momentum_change_model
-    except ImportError:
-        return None
-    return momentum_change_model.load_bundle(ticker)
-
-
-def _momentum_change_path(ticker: str = DEFAULT_TICKER) -> Path:
-    try:
-        from . import momentum_change_model
-    except ImportError:
-        return Path(f"momentum_change_{(ticker or DEFAULT_TICKER).upper()}.joblib")
-    return momentum_change_model.model_path(ticker)
-
-
-PERSISTENCE_KEY = "persistence"
-NBEATS_KEY = "nbeats"
 DAYRANGE_KEY = "dayrange"
-MOMENTUM_CHANGE_KEY = "momentum_change"
 
 MODELS: "dict[str, AppleModel]" = {
-    PERSISTENCE_KEY: AppleModel(
-        key=PERSISTENCE_KEY,
-        label="Persistence classifier (HGB)",
-        summary=(
-            "Gradient-boosted classifier trained on the persistence label directly "
-            "(TimeToChange2 notebook 04). Strong at rejecting changes that cannot "
-            "hold, no better than a coin flip at ranking the ones that can."
-        ),
-        requires="scikit-learn and joblib",
-        strategy=STRATEGY_MOMENTUM,
-        anticipates=False,
-        tickers=MOMENTUM_TICKERS,
-        load=_load_persistence,
-        path=_persistence_path,
-    ),
-    NBEATS_KEY: AppleModel(
-        key=NBEATS_KEY,
-        label="N-BEATS forecast → persistence",
-        summary=(
-            "Five seeds of N-BEATS forecast the next 15 bars of momentum; 500 "
-            "sampled futures are run through the real regime trigger and the "
-            "fraction that survive is the probability (notebooks 06-07). The only "
-            "entrant above chance on all four walk-forward folds of the hard half."
-        ),
-        requires="PyTorch, plus the residual sidecar beside the checkpoint",
-        strategy=STRATEGY_MOMENTUM,
-        anticipates=True,
-        tickers=MOMENTUM_TICKERS,
-        load=_load_nbeats,
-        path=_nbeats_path,
-    ),
     DAYRANGE_KEY: AppleModel(
         key=DAYRANGE_KEY,
         label="Day-range forecast (TimeToChange3)",
@@ -309,36 +129,13 @@ MODELS: "dict[str, AppleModel]" = {
         ),
         requires="PyTorch, LightGBM, scikit-learn and joblib, plus both .pt checkpoints",
         strategy=STRATEGY_DAYRANGE,
-        # Not applicable: nothing here forecasts a momentum regime. The entry
-        # mode is not part of this strategy's configuration at all.
-        anticipates=False,
         tickers=DAYRANGE_TICKERS,
         load=_load_dayrange,
         path=_dayrange_path,
     ),
-    MOMENTUM_CHANGE_KEY: AppleModel(
-        key=MOMENTUM_CHANGE_KEY,
-        label="Delta-momentum regressor (TimeToChange)",
-        summary=(
-            "Predicts how far the momentum score moves over the next 15 bars, in "
-            "bps/min — a signed size rather than a probability. Its sign is right on "
-            "86–94% of the holdout week's regime changes; its timing barely beats "
-            "chance, so the rules gate on a regime the tape has already printed and "
-            "use the model only for direction."
-        ),
-        requires="scikit-learn and joblib, plus six sessions of minute-bar history",
-        strategy=STRATEGY_MOMENTUM_CHANGE,
-        # Not applicable: this strategy has no entry mode. It is always reading
-        # a regime that has already printed, and the model's answer is a size
-        # rather than a claim about a change that has not happened.
-        anticipates=False,
-        tickers=MOMENTUM_CHANGE_TICKERS,
-        load=_load_momentum_change,
-        path=_momentum_change_path,
-    ),
 }
 
-DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else PERSISTENCE_KEY
+DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else DAYRANGE_KEY
 
 
 def keys() -> "list[str]":
@@ -380,8 +177,10 @@ def get(key: "str | None") -> AppleModel:
     """The named model, falling back to the default for an unknown key.
 
     Unknown keys reach here from experiment records written before a model
-    existed or after one was renamed; a stored run should still replay on the
-    default rather than crash the Results page.
+    existed or after one was removed; the Results page should still render
+    rather than crash. Anything about to *run* a config checks membership in
+    `MODELS` first (`apple_trader.model_ticker_error`), so the fallback never
+    turns a removed model into a different one.
     """
     return MODELS.get(key or DEFAULT_MODEL) or MODELS[DEFAULT_MODEL]
 
@@ -419,34 +218,3 @@ def unavailable_reason(key: "str | None", ticker: "str | None" = None) -> str:
 def strategy(key: "str | None") -> str:
     """Which rule set the named model drives."""
     return get(key).strategy
-
-
-def is_momentum(key: "str | None") -> bool:
-    """Whether the named model drives the momentum-regime rules -- i.e. whether
-    the entry mode, the probability threshold, the trailing stop and the
-    reversal exit mean anything for it."""
-    return get(key).strategy == STRATEGY_MOMENTUM
-
-
-def threshold(
-    key: "str | None", bundle: "dict | None" = None, ticker: "str | None" = None
-) -> float:
-    """The cut-off the named momentum model chose on its own validation block.
-
-    Not comparable across models: the classifier's is a posterior and N-BEATS'
-    is a survival probability times a hard gate, so AAPL's 0.05 and 0.21 are
-    the same kind of number only by coincidence. And not defined at all outside
-    `STRATEGY_MOMENTUM` -- a day-range forecast is a price, so there is no
-    probability to cut. Callers should gate on `is_momentum` rather than read
-    the 0.5 that a bundle without a threshold falls back to.
-
-    **Not comparable across symbols either**, which is why `ticker` is here:
-    each is picked on that symbol's own validation events, so N-BEATS' 0.21 on
-    AAPL is not its 0.41 on GOOGL or its 0.05 on INTC. Omitting it answers for
-    `DEFAULT_TICKER`, which was harmless while TimeToChange2 had been run on
-    AAPL alone and is a wrong number now. Every one of these moves when a
-    symbol is retrained; they are read from the bundle, never hard-coded here.
-    """
-    return persistence_model.model_threshold(
-        bundle if bundle is not None else load(key, ticker)
-    )

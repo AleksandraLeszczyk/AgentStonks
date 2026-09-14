@@ -74,8 +74,7 @@ and the inference half of `dayrange/modeling.py` from
 `FinNotebooks/TimeToChange3`. It has to be: the saved model is a function of
 those exact column definitions, and a mirror that drifts produces confident
 numbers off a different feature. If `dayrange` changes, retrain **and** update
-this module -- the same contract `persistence_model` has with `mshift` and
-`profile_model` has with `levelsml`.
+this module -- the same contract `profile_model` has with `levelsml`.
 
 Two consequences of that copy being here rather than imported:
 
@@ -87,8 +86,7 @@ Two consequences of that copy being here rather than imported:
 * **LightGBM is imported before torch.** Both wheels bundle their own OpenMP
   runtime and this environment has no system `libomp`; loading a LightGBM model
   in a process that imported torch first segfaults with no traceback. This
-  bundle needs both in one process, which no other model here does, so the
-  ordering matters more than it does in `nbeats_model` -- same fix.
+  bundle needs both in one process, which no other model here does.
 
 What the live path has to supply, and where it can go wrong
 -----------------------------------------------------------
@@ -146,7 +144,7 @@ import torch.nn as nn  # noqa: E402
 # parallel takes the process down instead. It is not exotic -- `MaxPool1d` on a
 # (1, 8, 32) tensor is enough, which is exactly what an N-HiTS block does on
 # every forecast. Unlike the import order this one cannot be fixed by being
-# careful here, because `nbeats_model` may already have imported both by the
+# careful here, because another module may already have imported both by the
 # time anything asks for this model, so the cap is applied at runtime where it
 # works regardless of who imported what.
 #
@@ -930,7 +928,7 @@ def forecast_session(
 def session_bars(frame: pd.DataFrame, session_date) -> pd.DataFrame:
     """Regular-session minute bars belonging to one date.
 
-    `persistence_model.minute_frame` already restricts the live buffer to
+    `momentum_regime.minute_frame` already restricts the live buffer to
     09:30-15:59 of today, so this is a no-op there; it earns its keep on a
     frame assembled from stored bars.
     """

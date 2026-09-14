@@ -398,7 +398,8 @@ def filter_runs(
 # tag at all -- the reason itself is always shown, so a trader whose wording
 # changes loses the headline and never gains a wrong one.
 _DECISION_TRIGGERS: "tuple[tuple[str, str], ...]" = (
-    # --- Apple Trader, momentum strategy (TimeToChange2) ---
+    # --- Apple Trader's removed momentum strategy: kept so stored runs keep
+    # their tags (the trailing stop is also what Apple Trader 2 rules write) ---
     ("trailing stop:", "Trailing stop"),
     ("forecast reversal:", "ML forecast — reversal"),
     ("momentum regime is still", "ML forecast — anticipated turn"),
@@ -406,12 +407,12 @@ _DECISION_TRIGGERS: "tuple[tuple[str, str], ...]" = (
     # --- Apple Trader, day-range strategy (TimeToChange3) ---
     ("the bar traded down to", "Predicted-range buy level"),
     ("target:", "Predicted-range sell level"),
-    # --- Apple Trader, delta-momentum strategy (TimeToChange) ---
+    # --- Apple Trader's removed delta-momentum strategy, for stored runs ---
     ("stop:", "Stop loss"),
     ("momentum floor:", "Momentum floor"),
     ("model exit:", "ML forecast — move over"),
     ("the model puts the next 15 bars at", "ML forecast — turn upwards"),
-    # --- shared by all three: the closing bell, not a signal ---
+    # --- every Apple Trader strategy: the closing bell, not a signal ---
     ("session ends in", "Flattened at the close"),
     # --- Apple Trader 2: the rule set says which rule, and its label says why ---
     ("rule ", "Rule fired"),

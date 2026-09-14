@@ -21,7 +21,7 @@ from agent_stonks import apple_models
 from agent_stonks import apple_rules as ar
 from agent_stonks import apple_trader2 as at2
 from agent_stonks import rule_agent
-from agent_stonks import clock, persistence_model
+from agent_stonks import clock, momentum_regime
 from agent_stonks.apple_rules import ActionItem, Condition, RuleSet
 from agent_stonks.apple_trader2 import (
     DEFAULT_TICKER as TICKER,
@@ -77,7 +77,7 @@ def state() -> AppState:
 def frame(closes: "list[float]", *, end=MIDSESSION, highs=None, lows=None):
     """A minute frame of `closes` ending on the bar that closed at `end`.
 
-    Built through `persistence_model.frame_from_bars` so it carries the same
+    Built through `momentum_regime.frame_from_bars` so it carries the same
     session bookkeeping the live buffer does -- the momentum pipeline reads
     those columns.
     """
@@ -94,7 +94,7 @@ def frame(closes: "list[float]", *, end=MIDSESSION, highs=None, lows=None):
                 "v": 1000.0,
             }
         )
-    return persistence_model.frame_from_bars(bars)
+    return momentum_regime.frame_from_bars(bars)
 
 
 def values(mapping: dict):
@@ -134,13 +134,13 @@ class TestConditions:
             join=ar.JOIN_ANY,
             conditions=[
                 Condition("pos.drawdown_pct", ar.OP_BELOW, -0.5),
-                Condition("nbeats.reversal_proba", ar.OP_ABOVE, 0.3),
+                Condition("mom.score", ar.OP_ABOVE, 0.3),
             ],
         )
         assert ar.item_matches(item, values({"pos.drawdown_pct": -0.7}))
-        assert ar.item_matches(item, values({"nbeats.reversal_proba": 0.4}))
+        assert ar.item_matches(item, values({"mom.score": 0.4}))
         assert not ar.item_matches(
-            item, values({"pos.drawdown_pct": -0.1, "nbeats.reversal_proba": 0.1})
+            item, values({"pos.drawdown_pct": -0.1, "mom.score": 0.1})
         )
 
     def test_an_absent_signal_never_matches_in_either_join(self):
@@ -151,7 +151,7 @@ class TestConditions:
             item = ActionItem(
                 action=ar.SELL,
                 join=join,
-                conditions=[Condition("nbeats.reversal_proba", ar.OP_ABOVE, 0.3)],
+                conditions=[Condition("mom.score", ar.OP_ABOVE, 0.3)],
             )
             assert not ar.item_matches(item, values({}))
 
@@ -295,27 +295,9 @@ class TestValidation:
         """Left unchecked this is the quiet failure: the signal stays None, None
         never matches, and the run finishes clean with an empty ledger that
         reads like a strategy result."""
-        rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
-        error = ar.ruleset_error(rules, {"nbeats": None})
-        assert "nbeats.turn_proba" in error or "turn_proba" in error
-
-    def test_a_classifier_cannot_be_asked_to_forecast(self, monkeypatch):
-        """`persistence.proba` is a question about a change bar; there is no
-        `persistence.turn_proba` in the catalogue at all."""
-        assert "persistence.turn_proba" not in ar.SIGNALS
-        assert "nbeats.turn_proba" in ar.SIGNALS
-
-        rules = RuleSet(
-            items=[
-                ActionItem(
-                    action=ar.BUY, size_mode=ar.SIZE_PCT, size=95.0,
-                    conditions=[Condition("nbeats.turn_proba", ar.OP_ABOVE, 0.05)],
-                )
-            ]
-        )
-        monkeypatch.setattr(persistence_model, "anticipates", lambda bundle: False)
-        error = ar.ruleset_error(rules, {"nbeats": {"model": "not a forecaster"}})
-        assert "cannot answer" in error
+        rules = ar.preset("Day range — two levels below the predicted high")
+        error = ar.ruleset_error(rules, {"dayrange": None})
+        assert "dayrange.pred_high" in error
 
     def test_the_shipped_presets_all_validate(self):
         """Every preset has to be launchable given its models, or it is not a
@@ -323,9 +305,7 @@ class TestValidation:
         for name in ar.PRESETS:
             rules = ar.preset(name)
             bundles = {key: {"stub": True} for key in rules.models()}
-            monkey = ar.ruleset_error(rules, bundles)
-            # The only thing a stub bundle cannot satisfy is the forecast check.
-            assert monkey is None or "cannot answer" in monkey
+            assert ar.ruleset_error(rules, bundles) is None, name
 
 
 # ----------------------------------------------------------------- instrument
@@ -335,82 +315,56 @@ class TestValidation:
 # case the tape-only half of the catalogue exists for.
 
 UNMODELLED = "MSFT"
-# A symbol that carries most models but not all: it used to be the narrowing
-# case because TimeToChange2 was AAPL-only until 2026-09-07, and it is one
-# again for the opposite reason -- its delta-momentum bundle was withdrawn from
-# `Code/Models`, so the catalogue offers it three models rather than four.
+# A symbol the day-range model covers other than the default one.
 DAYRANGE_ONLY = "GOOGL"
-
-ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
-GOOGL_MODELS = ["persistence", "nbeats", "dayrange"]
+DAYRANGE_PRESET = "Day range — two levels below the predicted high"
 
 
 class TestInstrument:
     def test_the_models_on_offer_follow_the_symbol(self):
-        for symbol in (TICKER, "INTC"):
-            assert apple_models.keys_for(symbol) == ALL_MODELS
-        assert apple_models.keys_for(DAYRANGE_ONLY) == GOOGL_MODELS
+        for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
+            assert apple_models.keys_for(symbol) == ["dayrange"]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_is_not_loaded_for_a_symbol_it_was_not_fitted_on(self, monkeypatch):
         """Cheaper than the file check and more honest: there is no MSFT
-        N-BEATS file to be missing, because there is no MSFT N-BEATS model."""
+        day-range file to be missing, because there is no MSFT day-range model."""
         called: list = []
         monkeypatch.setitem(
-            apple_models.MODELS, "nbeats",
-            replace(apple_models.MODELS["nbeats"], load=called.append),
+            apple_models.MODELS, "dayrange",
+            replace(apple_models.MODELS["dayrange"], load=called.append),
         )
-        assert apple_models.load("nbeats", UNMODELLED) is None
+        assert apple_models.load("dayrange", UNMODELLED) is None
         assert called == []
         # ...and the loader is still reached for a symbol it does cover.
-        apple_models.load("nbeats", TICKER)
+        apple_models.load("dayrange", TICKER)
         assert called == [TICKER]
-        reason = apple_models.unavailable_reason("nbeats", UNMODELLED)
+        reason = apple_models.unavailable_reason("dayrange", UNMODELLED)
         assert "no" in reason.lower() and UNMODELLED in reason
 
-    def test_the_catalogue_narrows_but_never_below_the_tape(self, monkeypatch):
+    def test_the_catalogue_narrows_but_never_below_the_tape(self):
         """A symbol nothing was fitted on keeps the model-free half and loses
-        every model signal; a symbol one model skipped loses only that one.
-
-        The second case is stubbed: every shipped model covers every shipped
-        symbol today, and the narrowing machinery would otherwise be untested
-        until the next model arrives for one ticker ahead of the others."""
+        every model signal."""
         every = set(ar.signals_for(TICKER))
         unmodelled = set(ar.signals_for(UNMODELLED))
         assert every == set(ar.SIGNALS)
-        assert not any("." in key and key.split(".")[0] in apple_models.MODELS
-                       for key in unmodelled)
         # The model-free half is identical on every symbol: it is computed from
         # bars, and bars are bars.
         tape = {key for key, spec in ar.SIGNALS.items() if spec.model is None}
         assert unmodelled == tape and tape < every
 
-        monkeypatch.setitem(
-            apple_models.MODELS, "nbeats",
-            replace(apple_models.MODELS["nbeats"], tickers=(TICKER,)),
-        )
-        narrowed = set(ar.signals_for(DAYRANGE_ONLY))
-        assert "nbeats.turn_proba" not in narrowed
-        assert "persistence.proba" in narrowed        # a different model, untouched
-        assert "dayrange.pred_high_dip_adr" in narrowed
-        assert tape < narrowed < every
-
     def test_a_rule_naming_an_absent_model_is_refused_with_the_signal_named(self):
-        rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
+        rules = ar.preset(DAYRANGE_PRESET)
         error = ar.ruleset_error(rules, {}, UNMODELLED)
-        assert "nbeats.turn_proba" in error and UNMODELLED in error
-        # ...and on AAPL the same rules get past this check, on to the ones
-        # about the bundle itself (which a stub cannot satisfy).
-        assert "cannot be read on" not in (
-            ar.ruleset_error(rules, {"nbeats": {"stub": True}}, TICKER) or ""
-        )
+        assert "dayrange.pred_high" in error and UNMODELLED in error
+        # ...and on AAPL the same rules get past every check.
+        assert ar.ruleset_error(rules, {"dayrange": {"stub": True}}, TICKER) is None
 
     def test_the_missing_model_is_reported_before_the_missing_file(self):
-        """Two different problems: 'MSFT has no N-BEATS model' sends the reader
-        to the instrument picker, 'the file is not installed' sends them looking
-        for a file that was never meant to exist."""
-        rules = ar.preset("Momentum — anticipate the turn (Apple Trader's default)")
-        error = ar.ruleset_error(rules, {"nbeats": None}, UNMODELLED)
+        """Two different problems: 'MSFT has no day-range model' sends the
+        reader to the instrument picker, 'the file is not installed' sends them
+        looking for a file that was never meant to exist."""
+        error = ar.ruleset_error(ar.preset(DAYRANGE_PRESET), {"dayrange": None}, UNMODELLED)
         assert "cannot be read on" in error and "not installed" not in error
 
     def test_every_preset_offered_for_a_symbol_runs_on_it(self):
@@ -420,20 +374,18 @@ class TestInstrument:
             for name in offered:
                 rules = ar.preset(name, symbol)
                 bundles = {key: {"stub": True} for key in rules.models()}
-                error = ar.ruleset_error(rules, bundles, symbol)
-                assert error is None or "cannot answer" in error, (symbol, name, error)
+                assert ar.ruleset_error(rules, bundles, symbol) is None, (symbol, name)
 
     def test_an_unmodelled_symbol_still_has_somewhere_to_start(self):
-        assert ar.presets_for(UNMODELLED) == [ar.MODEL_FREE_PRESET]
+        assert ar.MODEL_FREE_PRESET in ar.presets_for(UNMODELLED)
+        assert DAYRANGE_PRESET not in ar.presets_for(UNMODELLED)
         assert ar.default_preset(UNMODELLED) == ar.MODEL_FREE_PRESET
         assert ar.preset(None, UNMODELLED).models() == []
 
     def test_a_preset_that_does_not_apply_falls_back_rather_than_failing(self):
         """The picker can be pointed at a symbol while holding another's preset
         name; the fallback is what keeps that from producing an unrunnable set."""
-        rules = ar.preset(
-            "Momentum — anticipate the turn (Apple Trader's default)", UNMODELLED
-        )
+        rules = ar.preset(DAYRANGE_PRESET, UNMODELLED)
         assert rules.unreadable_on(UNMODELLED) == []
 
     def test_the_bundles_loaded_are_the_configs_symbols(self, monkeypatch):
@@ -500,7 +452,7 @@ class TestRecordAndSignature:
     def test_the_signature_carries_the_numbers(self):
         signature = at2.config_signature(AppleTrader2Config(rules=ar.preset()))
         assert signature.startswith("apple2_AAPL(")
-        assert "nbeats.turn_proba>=0.05" in signature
+        assert "dayrange.pred_high_dip_adr>=0.75" in signature
 
     def test_the_same_rules_on_another_symbol_are_another_configuration(self):
         """Two tapes are two experiments; filing them together would average
@@ -569,7 +521,7 @@ class TestSignalBus:
     def _bus(self, closes=None, **kwargs):
         closes = closes or [100.0 + i * 0.01 for i in range(60)]
         defaults = dict(
-            bundles={}, params=persistence_model.momentum_params(None),
+            bundles={}, params=dict(momentum_regime.MOMENTUM_DEFAULTS),
             position=0.0, entry=None, cash=10_000.0,
         )
         defaults.update(kwargs)
@@ -590,7 +542,7 @@ class TestSignalBus:
         assert bus.value("mom.bars_in_regime") >= 0
 
     def test_a_model_signal_is_absent_without_its_bundle(self, market_open):
-        assert self._bus().value("nbeats.turn_proba") is None
+        assert self._bus().value("dayrange.pred_high") is None
 
     def test_position_signals_are_absent_while_flat(self, market_open):
         bus = self._bus()
@@ -697,7 +649,7 @@ class Tape:
         self.closes: list[float] = []
         self.highs: list[float] = []
         monkeypatch.setattr(
-            at2.persistence_model, "minute_frame",
+            at2.momentum_regime, "minute_frame",
             lambda *a, **k: frame(
                 self.closes, end=self.end + timedelta(minutes=len(self.closes) - 1),
                 highs=self.highs, lows=self.closes,

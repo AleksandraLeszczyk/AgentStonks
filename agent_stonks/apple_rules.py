@@ -1,19 +1,18 @@
 """The rule language Apple Trader 2 is configured in.
 
-Apple Trader (the first one) ships two *whole strategies*, and picking a model
-picks which of them runs -- the momentum rules or the day-range rules, each with
-its own fixed shape of entry and exit. That is a good way to reproduce a
+Apple Trader (the first one) ships a *whole strategy* -- the day-range rules,
+with one fixed shape of entry and exit. That is a good way to reproduce a
 notebook and a bad way to ask a question the notebook did not ask. There is no
-way to buy the anticipated turn but exit on the day-range model's predicted
-high, or to scale into a dip in three pieces, or to take half off at the target
-and trail the rest, because none of those is one of the two shapes.
+way to buy a momentum turn but exit on the day-range model's predicted high, or
+to scale into a dip in three pieces, or to take half off at the target and
+trail the rest, because none of those is that shape.
 
-This module is the other end of that trade-off: instead of two strategies it
+This module is the other end of that trade-off: instead of one strategy it
 defines a **vocabulary**, and a strategy is whatever list of rules is written in
 it.
 
     signal          a named number read off the tape, a model, the position or
-                    the clock -- `bar.price`, `nbeats.turn_proba`,
+                    the clock -- `bar.price`, `mom.to_positive`,
                     `dayrange.pred_high_dip_adr`, `pos.drawdown_pct`. `SIGNALS`
                     is the whole catalogue and nothing outside it can be named.
     condition       one signal against one number: `above` (>=) or `below` (<=).
@@ -26,18 +25,17 @@ it.
 The catalogue is one thing; what is *readable on a given instrument* is
 another. Every model here was fitted on specific symbols and none of the
 notebooks claims transfer, so `signals_for(ticker)` is the list a builder
-offers: on the symbols every notebook project has been re-run for -- AAPL,
-GOOGL and INTC today -- it is everything; on a symbol some model skipped it
-drops that model's signals and keeps the rest; and on a symbol nothing was
-fitted on it is the model-free half -- the bar, the momentum regime, the
-position and the clock, which are computed from the tape and mean the same
-thing on every symbol. `ruleset_error` re-checks the same fact, so a rule set
-carried over from another instrument is refused with the signal named rather
-than quietly running with that condition permanently unmet.
+offers: on a symbol the day-range model was fitted for -- AAPL, GOOGL and
+INTC today -- it is everything; on any other it is the model-free half -- the
+bar, the momentum regime, the position and the clock, which are computed from
+the tape and mean the same thing on every symbol. `ruleset_error` re-checks the
+same fact, so a rule set carried over from another instrument is refused with
+the signal named rather than quietly running with that condition permanently
+unmet.
 
-What that buys, concretely: the two shipped strategies both come out of it as
-ordinary rule sets (see `PRESETS`), so the vocabulary is at least as expressive
-as what it replaces -- and everything between and around them is now sayable.
+What that buys, concretely: Apple Trader's strategy comes out of it as an
+ordinary rule set (see `PRESETS`), so the vocabulary is at least as expressive
+as what it replaces -- and everything around it is now sayable.
 
 Deliberate limits
 -----------------
@@ -70,7 +68,7 @@ import hashlib
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
-from . import apple_models, persistence_model
+from . import apple_models
 
 # --- conditions -------------------------------------------------------------
 
@@ -118,9 +116,6 @@ class Signal:
     # position or the clock. This is what makes a rule set that names no model
     # runnable with nothing installed.
     model: Optional[str] = None
-    # Whether the bundle must be able to forecast (as opposed to score a change
-    # bar). Checked against the loaded bundle by `ruleset_error`.
-    needs_forecast: bool = False
     # 1/0 valued: the builder offers true/false instead of a number.
     flag: bool = False
     # What the builder seeds a fresh condition's value with.
@@ -129,7 +124,6 @@ class Signal:
 
 GROUP_BAR = "Bar"
 GROUP_MOMENTUM = "Momentum"
-GROUP_MODEL = "Model forecasts"
 GROUP_DAYRANGE = "Day range"
 GROUP_POSITION = "Position"
 GROUP_CLOCK = "Clock"
@@ -171,8 +165,7 @@ def _tape_signals() -> "dict[str, Signal]":
                    "How long the current regime has run as of this bar.", default=15.0),
             Signal("mom.pre_dwell", "Bars the old regime held", GROUP_MOMENTUM, "bars",
                    "On a bar the regime changed on: how long the regime it left had "
-                   "run. Absent on every other bar. This is the observable gate that "
-                   "decides half of what the persistence models know.", default=15.0),
+                   "run. Absent on every other bar.", default=15.0),
             Signal("mom.regime_change", "Regime changed on this bar", GROUP_MOMENTUM, "",
                    "1 on a bar the regime changed, 0 otherwise.", flag=True),
             Signal("mom.to_positive", "Changed INTO positive", GROUP_MOMENTUM, "",
@@ -218,56 +211,6 @@ def _tape_signals() -> "dict[str, Signal]":
                    default=30.0),
         )
     }
-
-
-def _model_signals() -> "dict[str, Signal]":
-    """One namespace per saved model, so a condition names *which* model.
-
-    `persistence.proba` and `nbeats.proba` are the same question put to two
-    models, and a rule set may ask both -- the cost is one loaded bundle each,
-    paid only if some enabled condition names it. That is the whole reason the
-    keys are namespaced rather than there being a single `proba` plus a
-    model-key setting on the agent: "model A predicts X" is the condition, not
-    the configuration.
-
-    Only forecasting models get `turn_proba` and `reversal_proba`, because a
-    classifier fitted on regime-change bars has nothing to say about a bar that
-    is not one. `apple_models.AppleModel.anticipates` is the cheap flag used
-    here; `ruleset_error` re-checks it against the bundle that actually loaded.
-    """
-    out: "dict[str, Signal]" = {}
-    for model in apple_models.MODELS.values():
-        if model.strategy != apple_models.STRATEGY_MOMENTUM:
-            continue
-        out[f"{model.key}.proba"] = Signal(
-            f"{model.key}.proba", f"{model.label}: change holds", GROUP_MODEL, "prob",
-            "On a bar the regime changed INTO positive: the model's probability that "
-            "the change persists. Absent on every other bar -- this is the one "
-            "question the models were fitted on.",
-            model=model.key, default=0.5,
-        )
-        if not model.anticipates:
-            continue
-        out[f"{model.key}.turn_proba"] = Signal(
-            f"{model.key}.turn_proba", f"{model.label}: turns positive next bar",
-            GROUP_MODEL, "prob",
-            "While the regime is still negative or balanced: the forecast probability "
-            "that it turns positive on the very next bar and then holds. Absent once "
-            "the regime IS positive. Buying on this is the original agent's "
-            "'anticipate' entry, and it is selective -- most bars score near zero.",
-            model=model.key, needs_forecast=True, default=0.05,
-        )
-        out[f"{model.key}.reversal_proba"] = Signal(
-            f"{model.key}.reversal_proba", f"{model.label}: flips negative",
-            GROUP_MODEL, "prob",
-            "While the regime is positive: the forecast probability that it flips all "
-            "the way to negative somewhere inside the 15-bar horizon. Read it as an "
-            "early warning that the positive run is ending rather than a forecast of a "
-            "downtrend -- on measured tape the literal flip almost never prints. Costs "
-            "a full forecast on every positive bar it is asked on.",
-            model=model.key, needs_forecast=True, default=0.30,
-        )
-    return out
 
 
 def _dayrange_signals() -> "dict[str, Signal]":
@@ -321,13 +264,12 @@ def _dayrange_signals() -> "dict[str, Signal]":
 
 SIGNALS: "dict[str, Signal]" = {
     **_tape_signals(),
-    **_model_signals(),
     **_dayrange_signals(),
 }
 
 # The builder renders the catalogue in this order.
 SIGNAL_GROUPS = (
-    GROUP_BAR, GROUP_MOMENTUM, GROUP_MODEL, GROUP_DAYRANGE, GROUP_POSITION, GROUP_CLOCK,
+    GROUP_BAR, GROUP_MOMENTUM, GROUP_DAYRANGE, GROUP_POSITION, GROUP_CLOCK,
 )
 
 # The symbol every ticker-aware entry point here defaults to, so the whole
@@ -470,7 +412,7 @@ class RuleSet:
         """The signals this rule set names that do not exist for this symbol.
 
         Non-empty means the set was written for a different instrument: a
-        `nbeats.turn_proba` condition carried onto GOOGL would never be met and
+        `dayrange.pred_high_dip_adr` condition carried onto MSFT would never be met and
         the run would finish clean and empty, which reads like a strategy result.
         `ruleset_error` turns this into a refusal.
         """
@@ -480,18 +422,12 @@ class RuleSet:
         """Whether anything here depends on the momentum pipeline warming up.
 
         A rule set written on price, the position and the clock is decidable on
-        the session's first bar; one that reads a regime or a model is not, and
+        the session's first bar; one that reads a regime is not, and
         the agent reports itself as warming up rather than as holding. Only the
         status tag depends on this -- an unwarmed signal is None either way, and
         None never fires a rule.
         """
-        for key in self.fields():
-            spec = SIGNALS[key]
-            if key.startswith("mom."):
-                return True
-            if spec.model is not None and apple_models.is_momentum(spec.model):
-                return True
-        return False
+        return any(key.startswith("mom.") for key in self.fields())
 
     def to_record(self) -> dict:
         return asdict(self)
@@ -690,17 +626,6 @@ def ruleset_error(
             return (
                 f"{apple_models.unavailable_reason(key, symbol)} {named} cannot be read."
             )
-        for field_key in ruleset.fields():
-            spec = SIGNALS[field_key]
-            if spec.model != key or not spec.needs_forecast:
-                continue
-            if not persistence_model.anticipates(bundle):
-                return (
-                    f"{apple_models.get(key).label} was fitted on regime-change bars "
-                    f"only, so it cannot answer `{field_key}` -- that question is about "
-                    "a bar which is not a change. Use a forecasting model's signal "
-                    "instead."
-                )
     return None
 
 
@@ -723,7 +648,7 @@ def format_size(item: ActionItem) -> str:
 
 
 def format_item(item: ActionItem) -> str:
-    """One line: 'buy 95% of cash when nbeats.turn_proba >= 0.05'."""
+    """One line: 'buy 95% of cash when mom.to_positive is true'."""
     joiner = f" {JOIN_WORD[item.join]} "
     conds = joiner.join(format_condition(c) for c in item.conditions) or "never"
     text = f"{item.action} {format_size(item)} when {conds}"
@@ -786,82 +711,10 @@ def digest(ruleset: RuleSet) -> str:
 
 # --- presets -----------------------------------------------------------------
 #
-# The two strategies Apple Trader ships (three configurations of them), written
-# in this vocabulary, plus one that could not be written before. They are here
-# to be loaded and edited: a strategy nobody can reproduce is a strategy nobody
-# can compare against, and these are the comparison.
-#
-# All three reproductions were checked rather than asserted: replayed against
-# `apple_trader` on the 2026-07-27 SIP session, through the real saved bundles,
-# each preset produced the *same trades* -- same minutes, same quantities, same
-# fills (6, 6 and 2 orders respectively). If one of these is edited, that is the
-# check to re-run before believing the new one is still a reproduction.
-
-
-def _momentum_anticipate() -> RuleSet:
-    """Apple Trader's default rules: `anticipate`, 0.5% trail, reversal exit.
-
-    Exactly the shipped configuration -- `nbeats,anticipate,p>=0.05,trail=0.5%,
-    rev>=0.30,size=95%` -- and it is worth reading as three separate claims,
-    because in this form they can be switched off one at a time. Sell first, buy
-    second: an exit that lost a race with an entry would re-enter the position
-    it was closing.
-
-    The `pos.shares <= 0` condition on the entry is what the original agent gets
-    for free by checking the position before it ever looks at a signal. Without
-    it this is a subtly different strategy -- 95% of cash, then 95% of what is
-    left, on every later bar the forecast clears the threshold -- so it is
-    written down rather than assumed.
-    """
-    return RuleSet(
-        items=[
-            ActionItem(
-                action=SELL, size_mode=SIZE_PCT, size=100.0, join=JOIN_ANY,
-                label="Trailing stop or forecast reversal",
-                conditions=[
-                    Condition("pos.drawdown_pct", OP_BELOW, -0.5),
-                    Condition("nbeats.reversal_proba", OP_ABOVE, 0.30),
-                ],
-            ),
-            ActionItem(
-                action=BUY, size_mode=SIZE_PCT, size=95.0,
-                label="Buy the anticipated turn, while flat",
-                conditions=[
-                    Condition("pos.shares", OP_BELOW, 0.0),
-                    Condition("nbeats.turn_proba", OP_ABOVE, 0.05),
-                ],
-            ),
-        ]
-    )
-
-
-def _momentum_confirm() -> RuleSet:
-    """The notebook's rule: buy the printed change, trail out.
-
-    `mom.to_positive` is not redundant next to `persistence.proba` -- the
-    probability is only ever non-None on a change bar, so the flag adds nothing
-    to the *machine*. It is in the rule because the rule is meant to be read,
-    and "buy when the regime turned positive and the model rates it 0.07+" is
-    what this strategy is.
-    """
-    return RuleSet(
-        items=[
-            ActionItem(
-                action=SELL, size_mode=SIZE_PCT, size=100.0,
-                label="Trailing stop",
-                conditions=[Condition("pos.drawdown_pct", OP_BELOW, -0.5)],
-            ),
-            ActionItem(
-                action=BUY, size_mode=SIZE_PCT, size=95.0,
-                label="Buy the confirmed change, while flat",
-                conditions=[
-                    Condition("pos.shares", OP_BELOW, 0.0),
-                    Condition("mom.to_positive", OP_ABOVE, 0.5),
-                    Condition("persistence.proba", OP_ABOVE, 0.07),
-                ],
-            ),
-        ]
-    )
+# The strategy Apple Trader ships, written in this vocabulary, plus two it
+# cannot say. They are here to be loaded and edited: a strategy nobody can
+# reproduce is a strategy nobody can compare against, and these are the
+# comparison.
 
 
 def _dayrange_levels() -> RuleSet:
@@ -894,7 +747,7 @@ def _dayrange_levels() -> RuleSet:
 
 
 def _scale_in_take_half() -> RuleSet:
-    """Neither of the above: scale in twice, take half off, trail the rest.
+    """Not Apple Trader's: scale in twice, take half off, trail the rest.
 
     Not a recommendation and not measured -- it is here because it is the
     shortest rule set that says something the first Apple Trader structurally
@@ -917,26 +770,21 @@ def _scale_in_take_half() -> RuleSet:
             ),
             ActionItem(
                 action=BUY, size_mode=SIZE_PCT, size=40.0, cooldown_bars=5,
-                label="Scale into the anticipated turn",
-                conditions=[Condition("nbeats.turn_proba", OP_ABOVE, 0.05)],
+                label="Scale into a change into positive",
+                conditions=[Condition("mom.to_positive", OP_ABOVE, 0.5)],
             ),
         ]
     )
 
 
 def _tape_turn_trail() -> RuleSet:
-    """The same idea as the notebook's rule with the model taken out: buy the
-    printed change into positive, trail out.
+    """Buy the printed change into positive, trail out -- no model at all.
 
     The one preset that names no model, and therefore the one that runs on
-    *any* instrument. What it drops is the whole question the models answer --
-    whether this particular change is likely to hold — so it takes every change
-    into positive rather than the rated ones, which is a materially different
-    (and untested) strategy rather than a cheaper version of the same one. It is
-    here because an instrument with no saved model still needs somewhere to
-    start, and because it makes the models' contribution measurable: run this
-    against `Momentum — confirm the turn` on AAPL and the difference is what the
-    classifier is worth.
+    *any* instrument. It takes every change into positive whose old regime had
+    held 15 bars, which is an untested strategy rather than a recommendation;
+    it is here because an instrument with no saved model still needs somewhere
+    to start.
     """
     return RuleSet(
         items=[
@@ -959,14 +807,12 @@ def _tape_turn_trail() -> RuleSet:
 
 
 PRESETS: "dict[str, Callable[[], RuleSet]]" = {
-    "Momentum — anticipate the turn (Apple Trader's default)": _momentum_anticipate,
-    "Momentum — confirm the turn (the notebook's rule)": _momentum_confirm,
     "Day range — two levels below the predicted high": _dayrange_levels,
     "Scale in, take half off, trail the rest": _scale_in_take_half,
     "Tape only — buy the regime turn, trail out (no model)": _tape_turn_trail,
 }
 
-DEFAULT_PRESET = "Momentum — anticipate the turn (Apple Trader's default)"
+DEFAULT_PRESET = "Day range — two levels below the predicted high"
 # What every instrument can run, whatever is installed and whatever was fitted.
 MODEL_FREE_PRESET = "Tape only — buy the regime turn, trail out (no model)"
 
@@ -975,9 +821,8 @@ def presets_for(ticker: "str | None" = None) -> "list[str]":
     """The presets whose signals all exist on this instrument.
 
     A preset is a starting point, and one that cannot run on the instrument it
-    is offered for is a trap rather than a starting point -- on GOOGL that is
-    the day-range pair and the model-free one, on an unmodelled symbol only the
-    model-free one.
+    is offered for is a trap rather than a starting point -- on an unmodelled
+    symbol that leaves the ones written on the tape alone.
     """
     return [
         name for name, build in PRESETS.items()
@@ -990,7 +835,7 @@ def default_preset(ticker: "str | None" = None) -> str:
     available = presets_for(ticker)
     if DEFAULT_PRESET in available:
         return DEFAULT_PRESET
-    return available[0] if available else MODEL_FREE_PRESET
+    return MODEL_FREE_PRESET
 
 
 def preset(name: "str | None" = None, ticker: "str | None" = None) -> RuleSet:

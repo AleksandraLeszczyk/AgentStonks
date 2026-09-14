@@ -1,16 +1,15 @@
 """What the saved models predict, in the shape a price chart can draw.
 
 The ML surface of this app is a set of models that answer questions about a
-session -- where its volume will trade, how wide it will be, whether a momentum
-regime change will hold. Each of them already has a consumer (`profile_model`
+session -- where its volume will trade, how wide it will be. Each of them already has a consumer (`profile_model`
 feeds the profile curve, `apple_models` feeds the traders), but until now the
 only way to see what a model said was to read a trader's log. This module is
 the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Three overlays, because there are three shapes of answer
--------------------------------------------------------
+Two overlays
+------------
 `day_range`      TimeToChange3's forecast of where the session's high and low
                  will land, made once from the first five minutes. Two price
                  levels and the band between them -- the model's claim about
@@ -21,11 +20,6 @@ Three overlays, because there are three shapes of answer
                  separately by `charts._plot_price_distribution`; this is the
                  same prediction as horizontal levels, so it can be read
                  against the candles rather than only against the histogram.
-`momentum`       TimeToChange2's read of the momentum regime: every change the
-                 session actually made, the model's probability that a change
-                 into positive will *hold*, and -- on a forecasting bundle --
-                 whether the newest bar is about to turn. Moments rather than
-                 levels, so they are drawn on the time axis.
 
 The three item kinds, and why they are exactly three
 ----------------------------------------------------
@@ -52,9 +46,7 @@ An overlay drawn on a past session must show what the model *could have said
 that morning*, not what it would say knowing how the day ended. Both models
 that see daily history are given completed days only, and today's row is
 assembled from the opening window exactly as the traders assemble it
-(`dayrange_model.session_daily_frame` is the shared seam). The momentum
-overlay never looks forward at all: it scores each change bar off the 20 bars
-behind it, one sequence per change, the same window `read_latest` builds live.
+(`dayrange_model.session_daily_frame` is the shared seam).
 
 Every model is optional in the same way it is everywhere else: a missing file
 or a missing dependency produces a note explaining why an overlay is empty,
@@ -69,7 +61,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from . import apple_models, market_hours, persistence_model, profile_model
+from . import apple_models, market_hours, momentum_regime, profile_model
 from .config import MODEL_OVERLAY_COLORS
 
 
@@ -77,12 +69,6 @@ from .config import MODEL_OVERLAY_COLORS
 
 DAY_RANGE_KEY = "day_range"
 PROFILE_RANGE_KEY = "profile_range"
-MOMENTUM_KEY = "momentum"
-
-# How long a momentum change has to survive to count as "persistent". The
-# label the two TimeToChange2 models were trained on; a bundle carries its own
-# in `settings`, and this is the value used when it does not.
-DEFAULT_MIN_DWELL = 15
 
 
 @dataclass(frozen=True)
@@ -139,20 +125,6 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         requires="LightGBM and the open-profile pack",
         tickers=None,
     ),
-    MOMENTUM_KEY: ModelOverlay(
-        key=MOMENTUM_KEY,
-        label="Momentum regime changes",
-        summary=(
-            "Every momentum regime change in the session, with TimeToChange2's "
-            "probability that a change into positive will hold. Changes it expects "
-            "to persist carry a shaded window over the bars they should hold for."
-        ),
-        requires="the momentum bundle (scikit-learn, or PyTorch for N-BEATS)",
-        tickers=apple_models.MOMENTUM_TICKERS,
-        # Both momentum bundles answer the same question, so one overlay draws
-        # either -- which of them answers it is `compute`'s `momentum_model`.
-        models=(apple_models.PERSISTENCE_KEY, apple_models.NBEATS_KEY),
-    ),
 }
 
 
@@ -191,7 +163,7 @@ def for_models(
     turn that into a selection here instead of hard-coding the mapping at the
     call site. Which model drove which overlay is this catalogue's business.
 
-    Returns `{"keys": [...], "momentum_model": key | None, "unmatched": [...]}`:
+    Returns `{"keys": [...], "unmatched": [...]}`:
 
     `keys`         overlays to draw, in picker order. Named a `ticker` they are
                    filtered to the ones that exist for it -- a run's model
@@ -199,16 +171,10 @@ def for_models(
                    looking at another tab of the same run, where the picker has
                    no such option to select. `None` asks the question without a
                    symbol and filters nothing.
-    `momentum_model` which momentum bundle the momentum overlay should ask,
-                   since both answer the same question and only the run knows
-                   which one it used. None when the momentum overlay is not in
-                   `keys`, so there is never an answer to a question nobody is
-                   being asked.
     `unmatched`    models the run used that no overlay draws. Not an error and
-                   not silence either: the delta-momentum regressor predicts a
-                   signed size over a horizon, which is neither a level, a
-                   moment nor a span, so there is nothing honest to draw -- and
-                   a caller that pre-selected nothing should be able to say why.
+                   not silence either: a model whose answer is neither a level,
+                   a moment nor a span has nothing honest to draw -- and a
+                   caller that pre-selected nothing should be able to say why.
     """
     named = [str(k) for k in (model_keys or []) if k]
     keys = [
@@ -216,14 +182,11 @@ def for_models(
         if any(overlay.draws(m) for m in named)
         and (ticker is None or overlay.covers(ticker))
     ]
-    momentum = None
-    if MOMENTUM_KEY in keys:
-        momentum = next(m for m in named if OVERLAYS[MOMENTUM_KEY].draws(m))
     unmatched = [
         m for m in named
         if not any(overlay.draws(m) for overlay in OVERLAYS.values())
     ]
-    return {"keys": keys, "momentum_model": momentum, "unmatched": unmatched}
+    return {"keys": keys, "unmatched": unmatched}
 
 
 # --- item constructors ------------------------------------------------------
@@ -340,21 +303,17 @@ def compute(
     daily_bars: "list[dict] | None" = None,
     session_date=None,
     open_price: "float | None" = None,
-    momentum_model: "str | None" = None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
     `bars` are the session's 1-minute bars (`{"t","o","h","l","c","v"}`, the
     shape both the live buffer and SimLab's store carry) and `daily_bars` the
     daily history behind it -- rows dated on or after the session are ignored
-    by the models that read it, so a caller may pass the whole store. Only
-    `momentum` works without daily history.
+    by the models that read it, so a caller may pass the whole store.
 
     `session_date` names the day being drawn; it defaults to the last bar's,
     which is what a live caller wants and what a single-day replay wants too.
-    `open_price` is the official opening print when the caller has one, and
-    `momentum_model` picks which of the two momentum bundles answers the
-    persistence question (defaults to the configured one).
+    `open_price` is the official opening print when the caller has one.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -367,7 +326,7 @@ def compute(
         return {"items": items, "notes": notes}
 
     symbol = (ticker or "").upper()
-    frame = persistence_model.frame_from_bars(bars)
+    frame = momentum_regime.frame_from_bars(bars)
     if not len(frame):
         return {"items": items, "notes": ["No regular-session bars to draw on."]}
 
@@ -385,7 +344,6 @@ def compute(
         PROFILE_RANGE_KEY: lambda: _profile_range_items(
             session, daily_bars or [], day
         ),
-        MOMENTUM_KEY: lambda: _momentum_items(symbol, session, momentum_model),
     }
 
     for key in wanted:
@@ -547,206 +505,6 @@ def _profile_range_items(
     )
 
 
-# --- momentum regime changes (TimeToChange2) --------------------------------
-
-
-def _min_dwell(bundle: dict) -> int:
-    """How many bars a change has to survive to count as persistent.
-
-    The label both momentum models were trained on, read off the bundle that
-    carries it so a retrained one with a different horizon shades the right
-    window.
-    """
-    settings = (bundle or {}).get("settings") or {}
-    persistence = settings.get("persistence") or {}
-    try:
-        return int(persistence.get("min_dwell", DEFAULT_MIN_DWELL))
-    except (TypeError, ValueError):
-        return DEFAULT_MIN_DWELL
-
-
-def _bar_step(session: pd.DataFrame) -> timedelta:
-    if len(session) < 2:
-        return timedelta(minutes=1)
-    deltas = pd.Series(session.index).diff().dropna()
-    step = deltas.median()
-    return step.to_pytimedelta() if pd.notna(step) else timedelta(minutes=1)
-
-
-def _momentum_items(
-    symbol: str, session: pd.DataFrame, momentum_model: "str | None"
-) -> "tuple[list[dict], str]":
-    """Regime changes, their persistence probabilities, and the turn forecast.
-
-    Three kinds of mark, and they answer the three questions
-    `persistence_model.read_latest` answers -- asked here of every bar in the
-    session instead of only the newest one:
-
-    * every regime change the tape made, as an event. A change is a fact about
-      the bars, not a prediction, and it is drawn because the predictions are
-      unreadable without it.
-    * on each change **into positive**, the model's probability that it holds.
-      Above the bundle's own threshold the change gets a shaded window over the
-      `min_dwell` bars it is predicted to hold for -- the prediction is about a
-      stretch of time, so it is drawn as one.
-    * on the newest bar, if the bundle forecasts (N-BEATS does, the classifier
-      does not) and the regime is not positive yet: the probability that it is
-      about to turn, with the shaded window running forward past the last bar.
-
-    Every sequence is the 20 bars ending at the bar being scored, so a change
-    at 10:20 is scored on 10:01-10:20 and nothing later. Sequences are scored
-    in one batch, which for N-BEATS means its bootstrap draws come off one RNG
-    pass -- the same Monte-Carlo wobble a whole-day scoring has against a
-    bar-by-bar one, and immaterial at chart resolution.
-    """
-    overlay = OVERLAYS[MOMENTUM_KEY]
-    key = momentum_model or apple_models.DEFAULT_MODEL
-    if not apple_models.is_momentum(key):
-        key = apple_models.PERSISTENCE_KEY
-    bundle = apple_models.load(key, symbol)
-    if bundle is None:
-        return [], f"{overlay.label}: " + apple_models.unavailable_reason(key, symbol)
-
-    params = persistence_model.momentum_params(bundle)
-    if len(session) < params["horizon"] + 2:
-        return [], (
-            f"{overlay.label}: momentum needs {params['horizon'] + 2} bars and "
-            f"{len(session)} have closed."
-        )
-    scored = persistence_model.add_momentum_regimes(session, params)
-    features = persistence_model.compute_features(scored)
-    seq_len = int(bundle["seq_len"])
-    columns = bundle["feature_columns"]
-    threshold = persistence_model.model_threshold(bundle)
-    dwell = _min_dwell(bundle)
-    step = _bar_step(session)
-
-    changed = scored["regime_change"].fillna(False).to_numpy(dtype=bool)
-    regimes = scored["regime"].to_numpy()
-    positions = np.flatnonzero(changed)
-
-    # One sequence per change into positive -- the exact bars TimeToChange2's
-    # own simulator scores -- collected first so the model is called once.
-    pending: "list[tuple[int, np.ndarray]]" = []
-    for i in positions:
-        if int(regimes[i]) != 1:
-            continue
-        sequence = persistence_model.build_sequence(
-            features.iloc[: i + 1], columns, seq_len
-        )
-        if sequence is not None:
-            pending.append((int(i), sequence))
-
-    probabilities: "dict[int, float]" = {}
-    if pending:
-        batch = np.stack([seq for _, seq in pending])
-        values = persistence_model.predict_proba(bundle, batch)
-        probabilities = {i: float(v) for (i, _), v in zip(pending, values)}
-
-    items: "list[dict]" = []
-    for i in positions:
-        ts = scored.index[i]
-        regime = int(regimes[i])
-        to_positive = regime == 1
-        color = MODEL_OVERLAY_COLORS[
-            "momentum_up" if to_positive else
-            "momentum_down" if regime == -1 else "momentum_flat"
-        ]
-        name = persistence_model.regime_name(regime)
-        proba = probabilities.get(int(i))
-        if proba is None:
-            label_ = f"→ {name}"
-            note = f"regime change into {name}" + (
-                " (no complete 20-bar window to score)" if to_positive else ""
-            )
-        else:
-            label_ = f"→ {name} {proba:.0%}"
-            verdict = "holds" if proba >= threshold else "fades"
-            note = (
-                f"change into {name}; the model gives it {proba:.0%} of lasting "
-                f"{dwell}+ bars vs a {threshold:.0%} cut-off — {verdict}"
-            )
-        backed = proba is not None and proba >= threshold
-        items.append(
-            _event(
-                MOMENTUM_KEY, label_, ts, color,
-                icon="▲" if to_positive else "▼" if regime == -1 else "■",
-                price=float(scored["close"].iloc[i]),
-                note=note,
-                # Only a change the model expects to persist is a prediction;
-                # the rest are the context it is read against.
-                line=backed,
-            )
-        )
-        if backed:
-            items.append(
-                _span(
-                    MOMENTUM_KEY, f"Predicted to hold {dwell} bars",
-                    ts, ts + dwell * step,
-                    MODEL_OVERLAY_COLORS["momentum_hold"],
-                    note=f"{proba:.0%} that the positive regime lasts {dwell}+ bars",
-                    forward=True,
-                )
-            )
-
-    items.extend(_turn_items(bundle, features, scored, columns, seq_len, threshold,
-                             dwell, step))
-    return items, ""
-
-
-def _turn_items(
-    bundle: dict,
-    features: pd.DataFrame,
-    scored: pd.DataFrame,
-    columns: "list[str]",
-    seq_len: int,
-    threshold: float,
-    dwell: int,
-    step: timedelta,
-) -> "list[dict]":
-    """The forecast for the newest bar: is the regime about to turn positive?
-
-    The only genuinely forward-looking mark on the chart, and the only one that
-    extends past the last bar -- which is why `charts.build_chart` widens its x
-    range to whatever the overlays reach. Asked on exactly the bars Apple
-    Trader's `anticipate` entry mode asks it on: a bundle that forecasts, and a
-    bar that has not turned positive yet.
-    """
-    if not persistence_model.anticipates(bundle) or not len(scored):
-        return []
-    if int(scored["regime"].iloc[-1]) == 1:
-        return []
-    sequence = persistence_model.build_sequence(features, columns, seq_len)
-    if sequence is None:
-        return []
-    proba = float(persistence_model.predict_turn_proba(bundle, sequence[None, ...])[0])
-
-    ts = scored.index[-1]
-    color = MODEL_OVERLAY_COLORS["momentum_turn"]
-    verdict = "expected" if proba >= threshold else "below the cut-off"
-    items = [
-        _event(
-            MOMENTUM_KEY, f"Turn {proba:.0%}", ts, color, icon="⤴",
-            price=float(scored["close"].iloc[-1]), dash="dash",
-            note=(
-                f"{proba:.0%} that momentum turns positive from here and lasts "
-                f"{dwell}+ bars, vs a {threshold:.0%} cut-off — {verdict}"
-            ),
-            forward=True,
-        )
-    ]
-    if proba >= threshold:
-        items.append(
-            _span(
-                MOMENTUM_KEY, f"Predicted turn + {dwell} bars",
-                ts, ts + dwell * step, color,
-                note=f"{proba:.0%} that the turn happens here and holds {dwell}+ bars",
-                forward=True,
-            )
-        )
-    return items
-
-
 # --- callers' helpers -------------------------------------------------------
 
 
@@ -762,22 +520,21 @@ def live_overlays(
     sym_state,
     bars: "list[dict]",
     overlay_keys: "list[str] | None",
-    momentum_model: "str | None" = None,
 ) -> dict:
     """`compute` for the live app, cached on the SymbolState until a new bar.
 
     The chart fragment re-runs every few seconds and nothing about these
     answers changes between bars: a day-range forecast is made once at 09:35
-    and never updated, and the momentum read is a function of the closed bars.
-    Scoring a whole session through the N-BEATS bundle on every poll would cost
-    seconds for a picture that did not move, so the result is held against the
+    and never updated, and the profile range is a function of the closed bars.
+    Recomputing them on every poll would cost seconds for a picture that did
+    not move, so the result is held against the
     newest bar's timestamp and the selection that produced it.
     """
     wanted = [k for k in (overlay_keys or []) if k in OVERLAYS]
     if not wanted or not bars:
         return {"items": [], "notes": []}
 
-    key = (bars[-1].get("t"), tuple(wanted), momentum_model, len(bars))
+    key = (bars[-1].get("t"), tuple(wanted), len(bars))
     cached = getattr(sym_state, "model_overlay_cache", None)
     if cached and cached.get("key") == key:
         return cached["result"]
@@ -788,7 +545,6 @@ def live_overlays(
         bars,
         daily_bars=list(sym_state.daily_bars or []),
         session_date=session_date_of(bars),
-        momentum_model=momentum_model,
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}
     return result

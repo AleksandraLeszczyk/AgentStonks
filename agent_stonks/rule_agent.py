@@ -1,16 +1,16 @@
 """What every rule-based (non-LLM) agent does the same way.
 
-Four state machines live in `apple_trader` and `apple_trader2`, and they trade
-on four unrelated ideas: a momentum-persistence probability, a day-range
-forecast, a delta-momentum regressor, and a user-written rule list. What they
-do *around* the idea is identical, and was written out four times -- the same
+Two state machines live in `apple_trader` and `apple_trader2`, and they trade
+on unrelated ideas: a day-range forecast and a user-written rule list. What
+they do *around* the idea is identical, and was once written out per agent --
+the same
 pre-flight guards, the same position sizing, the same order and log calls, the
 same clock-aligned loop, the same launcher.
 
 That shared half is here. The split is deliberate and narrow: this module owns
 nothing about *when to trade*. It never inspects a bar, a probability or a
 level. A subclass that overrode nothing would place no orders at all, because
-`run_cycle` is not implemented here -- the four cycles read different frames,
+`run_cycle` is not implemented here -- the cycles read different frames,
 roll their sessions on different clocks and ask different questions, and one
 template method over them would have been an abstraction over a coincidence.
 

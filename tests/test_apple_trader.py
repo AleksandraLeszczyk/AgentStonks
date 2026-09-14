@@ -1,6 +1,6 @@
-"""Apple Trader: the rule-based loop over the momentum-persistence model.
+"""Apple Trader: the rule-based loop over the day-range forecast.
 
-Every cycle is driven through a stubbed model read, so these pin the RULES --
+Every cycle is driven through a stubbed forecast, so these pin the RULES --
 when it buys, when it refuses to, and every way it gets back out -- without
 depending on the saved artifact or on live market data.
 """
@@ -17,15 +17,13 @@ from agent_stonks import apple_trader as at
 from agent_stonks import clock
 from agent_stonks import rule_agent
 from agent_stonks.apple_trader import DEFAULT_TICKER as TICKER
-from agent_stonks.apple_trader import AppleTrader, AppleTraderConfig, config_signature
+from agent_stonks.apple_trader import AppleTraderConfig, config_signature
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
 
 # 10:30 ET on a Tuesday: mid-session, well clear of both the open and the close.
 MIDSESSION = datetime(2026, 7, 21, 14, 30, tzinfo=timezone.utc)
-
-BUNDLE = {"pipeline": None, "feature_columns": [], "seq_len": 20, "threshold": 0.07}
 
 
 class FakeBroker(Broker):
@@ -58,809 +56,6 @@ def state() -> AppState:
     return state
 
 
-class Reads:
-    """Feeds the trader a scripted sequence of model reads, one per cycle."""
-
-    def __init__(self, monkeypatch, broker: "FakeBroker | None" = None):
-        self.broker = broker
-        self.minute = 0
-        self.next_read: dict = {}
-        monkeypatch.setattr(
-            at.persistence_model, "minute_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
-        )
-        monkeypatch.setattr(at.persistence_model, "read_latest", lambda *a, **k: self.next_read)
-
-    def set(
-        self,
-        *,
-        price: float = 100.0,
-        high: "float | None" = None,
-        mom: float = 1.2,
-        regime: int = 1,
-        prev_regime: "int | None" = 0,
-        change: bool = False,
-        proba: "float | None" = None,
-        turn_proba: "float | None" = None,
-        reversal_proba: "float | None" = None,
-        pre_dwell: "int | None" = 20,
-        bars_in_regime: int = 20,
-        bars_today: int = 200,
-        warming_up: bool = False,
-        advance: bool = True,
-    ) -> dict:
-        """Stage the next bar. `advance=False` replays the SAME timestamp, the
-        way a cycle that runs before a new bar has closed would see it."""
-        if advance:
-            self.minute += 1
-        if self.broker is not None:
-            self.broker.price = price
-        self.next_read = {
-            "ts": pd.Timestamp("2026-07-21 10:30", tz="America/New_York")
-            + pd.Timedelta(minutes=self.minute),
-            "price": price,
-            "high": price if high is None else high,
-            "mom": mom,
-            "regime": regime,
-            "prev_regime": prev_regime,
-            "regime_change": change,
-            "to_positive": change and regime == 1,
-            "pre_dwell": pre_dwell if change else None,
-            "bars_in_regime": bars_in_regime,
-            "proba": proba,
-            "turn_proba": turn_proba,
-            "reversal_proba": reversal_proba,
-            "bars_today": bars_today,
-            "warming_up": warming_up,
-        }
-        return self.next_read
-
-    def to_positive(self, *, proba: float, **kwargs) -> dict:
-        """The bar `confirm` acts on: a change into positive, already printed."""
-        return self.set(regime=1, prev_regime=0, change=True, proba=proba, **kwargs)
-
-    def pre_turn(self, *, turn_proba: "float | None", regime: int = 0, **kwargs) -> dict:
-        """The bar `anticipate` acts on: the regime has NOT turned positive, and
-        the forecaster has been asked whether it is about to.
-
-        `read_latest` only fills `turn_proba` in on such a bar, so a stub that
-        set it beside `regime=1` would be testing a state the pipeline cannot
-        produce.
-        """
-        return self.set(regime=regime, prev_regime=regime, turn_proba=turn_proba, **kwargs)
-
-
-def confirm_config(**kwargs) -> AppleTraderConfig:
-    """A rule set on the `confirm` entry, which is no longer the default.
-
-    The trailing stop, the flatten rule and the guards are shared by both entry
-    modes, so the suites below pin them through the mode whose trigger is the
-    notebook's and whose stub is a single scripted bar.
-    """
-    return AppleTraderConfig(entry_mode=at.ENTRY_CONFIRM, **kwargs)
-
-
-class TestEntry:
-    """The `confirm` trigger: buy a change into positive that has already
-    printed, if the model rates it likely to hold."""
-
-    def _trader(self, **kwargs) -> AppleTrader:
-        return AppleTrader(confirm_config(**kwargs), model_threshold=0.07)
-
-    def test_buys_a_to_positive_change_the_model_backs(self, state, market_open, monkeypatch):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.5)
-
-        reads.to_positive(proba=0.62)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        assert tracker.position_for(TICKER) > 0
-        assert "62%" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_a_probability_below_the_threshold_is_not_a_buy(self, state, market_open, monkeypatch):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.5)
-
-        reads.to_positive(proba=0.49)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_the_bundles_own_threshold_applies_when_none_is_configured(
-        self, state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = AppleTrader(confirm_config(prob_threshold=None), model_threshold=0.07)
-        assert trader.prob_threshold == pytest.approx(0.07)
-
-        reads.to_positive(proba=0.10)  # under any sane default, over this model's
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-
-    def test_a_change_out_of_positive_is_not_an_entry(self, state, market_open, monkeypatch):
-        """Only changes INTO the positive regime are ever traded; the model is
-        not even asked about the others, so `proba` is None on them."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.5)
-
-        for regime, prev in ((0, 1), (-1, 1)):
-            reads.set(regime=regime, prev_regime=prev, change=True, proba=None)
-            assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_sitting_in_the_positive_regime_is_not_a_change(self, state, market_open, monkeypatch):
-        """The signal is the transition, not the state: momentum can be
-        strongly positive for an hour without the loop ever buying."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.5)
-
-        for _ in range(5):
-            reads.set(regime=1, change=False, mom=2.5, proba=0.99)
-            assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_an_unscoreable_change_is_not_a_buy(self, state, market_open, monkeypatch):
-        """A change whose 20-bar feature window hasn't warmed up leaves `proba`
-        None. An unasked model is not a yes."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.5)
-
-        reads.to_positive(proba=None)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_does_not_trade_during_the_models_warm_up(self, state, market_open, monkeypatch):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.5)
-
-        reads.to_positive(proba=None, warming_up=True, bars_today=12)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "warming_up"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_re_reading_the_same_bar_does_not_re_enter(self, state, market_open, monkeypatch):
-        """One closed bar is one decision. A cycle that runs before the next bar
-        has arrived must not act on the same change twice."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.5, trail_pct=0.5)
-
-        reads.to_positive(proba=0.9)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        # Same bar, deeper drawdown than the stop allows: the exit fires...
-        reads.to_positive(proba=0.9, price=99.0, advance=False)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        # ...and the stale bar cannot immediately buy the same change back.
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_position_size_follows_the_configured_share_of_cash(
-        self, state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0), trade_cost=0.0)
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.5, position_pct=50.0)
-
-        reads.to_positive(proba=0.9, price=100.0)
-        trader.run_cycle(BUNDLE, state, tracker)
-        assert tracker.position_for(TICKER) == pytest.approx(50.0)
-
-    def test_no_entry_inside_the_closing_flatten_window(self, state, market_open, monkeypatch):
-        """The notebook's simulator makes no decision on the last bar of a
-        session; the same reasoning ends this loop's entries once the flatten
-        rule is in force, since the position would be sold straight back."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.5, flatten_before_close_min=5)
-
-        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))  # 15:57 ET
-        reads.to_positive(proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-        assert any("Standing down" in e.get("text", "") for e in state.agent_log)
-
-    def test_a_signal_just_before_the_window_still_trades(self, state, market_open, monkeypatch):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.5, flatten_before_close_min=5)
-
-        clock.set_simulated(datetime(2026, 7, 21, 19, 54, tzinfo=timezone.utc))  # 15:54 ET
-        reads.to_positive(proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-
-    def test_no_second_entry_while_already_long(self, state, market_open, monkeypatch):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.5)
-
-        reads.to_positive(proba=0.9)
-        trader.run_cycle(BUNDLE, state, tracker)
-        size = tracker.position_for(TICKER)
-        for _ in range(3):
-            reads.to_positive(proba=0.9, price=100.5)
-            trader.run_cycle(BUNDLE, state, tracker)
-        assert tracker.position_for(TICKER) == size
-
-
-class TestAnticipateEntry:
-    """The default trigger: buy while the regime is still negative or balanced,
-    on the forecast that it turns positive next bar.
-
-    The whole point of this mode is *where in the transition* the order goes
-    in, so these pin which bars can and cannot produce one -- not just the
-    threshold arithmetic.
-    """
-
-    def _trader(self, **kwargs) -> AppleTrader:
-        return AppleTrader(
-            AppleTraderConfig(entry_mode=at.ENTRY_ANTICIPATE, **kwargs),
-            model_threshold=0.05,
-        )
-
-    def test_buys_a_balanced_bar_the_forecast_expects_to_turn(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.2)
-
-        reads.pre_turn(turn_proba=0.45, regime=0, mom=0.8)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        assert tracker.position_for(TICKER) > 0
-
-    def test_buys_out_of_the_negative_regime_too(self, state, market_open, monkeypatch):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.2)
-
-        reads.pre_turn(turn_proba=0.31, regime=-1, mom=-0.5)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        assert tracker.position_for(TICKER) > 0
-
-    def test_the_regime_is_not_yet_positive_when_the_order_goes_in(
-        self, state, market_open, monkeypatch
-    ):
-        """The regression this mode exists for. `confirm` can only ever buy a
-        bar whose regime has already turned positive, which puts the entry
-        after the momentum score has crossed its threshold and after the move
-        that pushed it there. Here the ledger records a bar that has not."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.2)
-
-        read = reads.pre_turn(turn_proba=0.45, regime=0, mom=0.8, bars_in_regime=44)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        assert read["regime"] != 1
-        reasoning = tracker.snapshot()["decisions"][-1].reasoning
-        assert "still balanced" in reasoning
-        assert "held 44 bars" in reasoning
-        assert "45%" in reasoning
-
-    def test_a_forecast_below_the_threshold_is_not_a_buy(
-        self, state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.2)
-
-        reads.pre_turn(turn_proba=0.19)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_an_unscoreable_bar_is_not_a_buy(self, state, market_open, monkeypatch):
-        """A bar whose 20-bar window hasn't warmed up, or a bundle that cannot
-        forecast at all, leaves `turn_proba` None. An unasked model is not a
-        yes -- and it must not fall through to the persistence answer."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.2)
-
-        reads.pre_turn(turn_proba=None, proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_the_confirmed_change_is_no_longer_an_entry(
-        self, state, market_open, monkeypatch
-    ):
-        """Once the change has printed, this mode has missed it and says so by
-        standing aside -- it does not chase the bar `confirm` would have
-        bought."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = Reads(monkeypatch)
-        trader = self._trader(prob_threshold=0.2)
-
-        reads.to_positive(proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_no_entry_inside_the_closing_flatten_window(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.2, flatten_before_close_min=5)
-
-        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))  # 15:57 ET
-        reads.pre_turn(turn_proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_re_reading_the_same_bar_does_not_re_enter(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.2, trail_pct=0.5)
-
-        reads.pre_turn(turn_proba=0.9)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        reads.pre_turn(turn_proba=0.9, price=99.0, advance=False)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) == 0
-
-    def test_the_trailing_stop_is_the_exit_here_too(
-        self, state, market_open, monkeypatch
-    ):
-        """Nothing about the exit changes with the entry mode: once the
-        position is on, only price decides when it comes off."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = self._trader(prob_threshold=0.2, trail_pct=0.5)
-
-        reads.pre_turn(turn_proba=0.9, price=100.0)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        reads.set(price=102.0, regime=1)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        reads.set(price=101.4, regime=1)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-
-
-def _enter(state, tracker, reads, config) -> AppleTrader:
-    """Take a long at $100 so the exit rule has something to act on."""
-    trader = AppleTrader(config, model_threshold=0.07)
-    reads.to_positive(proba=0.9, price=100.0)
-    assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-    return trader
-
-
-class TestTrailingStop:
-    def test_sells_once_price_gives_back_the_configured_percent(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
-
-        reads.set(price=99.6)  # -0.4% from the peak: still inside the give-back
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        reads.set(price=99.5)  # -0.5%: at the line
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        assert tracker.position_for(TICKER) == 0
-        assert "Trailing stop" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_stop_trails_the_high_since_entry_not_the_entry(
-        self, state, market_open, monkeypatch
-    ):
-        """A drop that would be harmless measured from the entry still sells
-        once the position has been further ahead than that."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
-
-        reads.set(price=102.0)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        # +1.4% on the trade, but 0.6% off the $102.00 peak.
-        reads.set(price=101.4)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        exit_reason = tracker.snapshot()["decisions"][-1].reasoning
-        assert "102.00 high" in exit_reason and "+1.40%" in exit_reason
-
-    def test_the_peak_ratchets_up_and_never_down(self, state, market_open, monkeypatch):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=1.0))
-
-        for price in (101.0, 100.4, 103.0, 102.5):
-            reads.set(price=price)
-            assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert trader.entry["peak"] == pytest.approx(103.0)
-
-    def test_the_peak_comes_from_the_bar_high_not_its_close(
-        self, state, market_open, monkeypatch
-    ):
-        """The stop trails the highest price the position actually traded at,
-        so a bar that spiked and gave most of it back still raises the peak."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
-
-        reads.set(price=100.5, high=100.6)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert trader.entry["peak"] == pytest.approx(100.6)
-        # Still above the entry and only -0.45% off the last close: nothing but
-        # the $100.60 print inside the previous bar explains this exit.
-        reads.set(price=100.05, high=100.05)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        assert "100.60 high" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_entry_bars_own_high_is_not_part_of_the_peak(
-        self, state, market_open, monkeypatch
-    ):
-        """A spike earlier in the change bar happened before the position
-        existed, so the stop does not trail from it."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = AppleTrader(confirm_config(trail_pct=0.5), model_threshold=0.07)
-
-        reads.to_positive(proba=0.9, price=100.0, high=102.0)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        assert trader.entry["peak"] == pytest.approx(100.0)
-        reads.set(price=99.7, high=99.9)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-
-    def test_before_any_new_high_the_stop_sits_under_the_entry(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=0.5))
-
-        reads.set(price=99.51)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        reads.set(price=99.4)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-
-    def test_momentum_turning_negative_does_not_close_the_position(
-        self, state, market_open, monkeypatch
-    ):
-        """The regime *having* turned is not an exit -- only price and the
-        model's forecast are, and this bar carries neither.
-
-        Momentum that has already gone negative is exactly the give-back the
-        trailing stop is measuring, so acting on it as well would be the same
-        rule twice at a worse level. What the forecast exit acts on is the bar
-        *before* this one, which is the whole distinction (see TestReversalExit).
-        """
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=2.0))
-
-        for _ in range(5):
-            reads.set(price=99.5, mom=-1.5, regime=-1, prev_regime=0, change=True)
-            assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) > 0
-
-    def test_flattens_before_the_close(self, state, market_open, monkeypatch):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, confirm_config(trail_pct=5.0))
-
-        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))  # 15:57 ET
-        reads.set(price=100.2)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        assert "flattened" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_adopts_a_position_it_did_not_open(self, state, market_open, monkeypatch):
-        """Restarted onto a ledger that already holds shares: the stop has no
-        peak it ever saw, so it starts trailing from the current price."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        tracker.record_trade(TICKER, "buy", 10, "seeded", "k", "s")
-        reads = Reads(monkeypatch, broker)
-        trader = AppleTrader(confirm_config(trail_pct=0.5), model_threshold=0.07)
-
-        reads.set(price=100.0)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert trader.entry["peak"] == pytest.approx(100.0)
-        reads.set(price=99.4)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-
-
-def reversal_config(**kwargs) -> AppleTraderConfig:
-    """A rule set whose forecast exit is armed, on the `confirm` entry so the
-    position can be taken with one scripted bar."""
-    kwargs.setdefault("reversal_threshold", 0.30)
-    return confirm_config(**kwargs)
-
-
-class TestReversalExit:
-    """The second exit: the model calling the end of the regime it bought.
-
-    The stub supplies `reversal_proba` the way `read_latest` does -- filled in
-    only on a positive bar reached while holding, and None everywhere else --
-    so these pin the rule without depending on a 200 MB forecaster.
-    """
-
-    def test_sells_when_the_forecast_clears_the_threshold(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, reversal_config(trail_pct=5.0))
-
-        reads.set(price=101.0, reversal_proba=0.29)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        reads.set(price=101.0, reversal_proba=0.30)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        assert tracker.position_for(TICKER) == 0
-        assert "Forecast reversal" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_sells_at_the_high_before_any_give_back(
-        self, state, market_open, monkeypatch
-    ):
-        """The point of the rule: out while the trade is still at its peak,
-        which the trailing stop can never do by construction."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, reversal_config(trail_pct=0.5))
-
-        reads.set(price=103.0, reversal_proba=0.9)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        reasoning = tracker.snapshot()["decisions"][-1].reasoning
-        assert "+3.00%" in reasoning and "90%" in reasoning
-
-    def test_off_by_default_for_records_that_never_had_it(
-        self, state, market_open, monkeypatch
-    ):
-        """`reversal_threshold=None` is the pre-existing strategy exactly: the
-        forecast is ignored however loud it gets."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(
-            state, tracker, reads, confirm_config(trail_pct=5.0, reversal_threshold=None)
-        )
-
-        reads.set(price=101.0, reversal_proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) > 0
-
-    def test_an_unasked_model_is_not_a_sell(self, state, market_open, monkeypatch):
-        """`read_latest` leaves the number None on any bar that does not pose
-        the question. An absent probability is not a quiet zero *or* a quiet
-        yes -- it is a bar with nothing to say."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, reversal_config(trail_pct=5.0))
-
-        reads.set(price=101.0, reversal_proba=None)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "hold"
-        assert tracker.position_for(TICKER) > 0
-
-    def test_the_trailing_stop_still_wins_a_bar_they_both_fire_on(
-        self, state, market_open, monkeypatch
-    ):
-        """Both exits close the position, so the only thing at stake is the
-        ledger's account of why -- and a give-back that actually happened is a
-        better explanation than a forecast that agreed with it."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch, broker)
-        trader = _enter(state, tracker, reads, reversal_config(trail_pct=0.5))
-
-        reads.set(price=99.0, reversal_proba=0.99)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "sold"
-        assert "Trailing stop" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_question_is_only_asked_while_holding(
-        self, state, market_open, monkeypatch
-    ):
-        """Every ask costs a full forecast and nothing acts on the answer with
-        the book flat, so `run_cycle` must not pay for it when it is not long."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        asked: list[bool] = []
-        monkeypatch.setattr(
-            at.persistence_model, "minute_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
-        )
-        reads = Reads(monkeypatch, broker)
-
-        def spy(bundle, frame, holding=False):
-            asked.append(holding)
-            return reads.next_read
-
-        monkeypatch.setattr(at.persistence_model, "read_latest", spy)
-        trader = AppleTrader(reversal_config(trail_pct=5.0), model_threshold=0.07)
-
-        reads.set(price=100.0)  # flat
-        trader.run_cycle(BUNDLE, state, tracker)
-        reads.to_positive(proba=0.9, price=100.0)
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        reads.set(price=101.0)  # long
-        trader.run_cycle(BUNDLE, state, tracker)
-        assert asked == [False, False, True]
-
-    def test_a_disarmed_rule_never_pays_for_the_forecast(
-        self, state, market_open, monkeypatch
-    ):
-        """Holding is not enough: with the rule off the question is pointless,
-        and asking it would make switching the rule off cost the same as
-        leaving it on."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        asked: list[bool] = []
-        monkeypatch.setattr(
-            at.persistence_model, "minute_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
-        )
-        reads = Reads(monkeypatch, broker)
-
-        def spy(bundle, frame, holding=False):
-            asked.append(holding)
-            return reads.next_read
-
-        monkeypatch.setattr(at.persistence_model, "read_latest", spy)
-        trader = _enter(
-            state, tracker, reads, confirm_config(trail_pct=5.0, reversal_threshold=None)
-        )
-        reads.set(price=101.0)
-        trader.run_cycle(BUNDLE, state, tracker)
-        assert asked == [False, False]
-
-    def test_an_out_of_range_threshold_is_refused(self):
-        with pytest.raises(ValueError, match="not a probability"):
-            AppleTraderConfig(reversal_threshold=1.5)
-
-
-class TestGuards:
-    def test_does_nothing_when_the_market_is_closed(self, state, monkeypatch):
-        clock.set_simulated(datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc))  # 22:00 ET Monday
-        try:
-            tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-            reads = Reads(monkeypatch)
-            reads.to_positive(proba=0.99)
-            assert AppleTrader().run_cycle(BUNDLE, state, tracker) == "closed"
-            assert tracker.position_for(TICKER) == 0
-        finally:
-            clock.clear()
-
-    def test_reports_when_the_ticker_is_not_streamed(self, market_open, monkeypatch):
-        state = AppState()
-        state.set_symbols(["MSFT"])
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        Reads(monkeypatch)
-        assert AppleTrader().run_cycle(BUNDLE, state, tracker) == "no_data"
-        assert any(e["type"] == "error" for e in state.agent_log)
-
-    def test_reports_when_there_is_not_enough_history(self, state, market_open, monkeypatch):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(
-            at.persistence_model, "minute_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
-        )
-        monkeypatch.setattr(at.persistence_model, "read_latest", lambda *a, **k: None)
-        assert AppleTrader().run_cycle(BUNDLE, state, tracker) == "no_data"
-
-    def test_missing_model_stops_the_loop_instead_of_trading(self, state, monkeypatch):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.persistence_model, "load_bundle", lambda *a, **k: None)
-        stop_event = threading.Event()
-        at._apple_trader_loop(
-            state, tracker, confirm_config(model_key="persistence"), 60, stop_event
-        )
-        assert state.agent_running is False
-        assert any("cannot run without it" in e.get("text", "") for e in state.agent_log)
-
-    def test_anticipating_on_a_model_that_cannot_forecast_stops_the_loop(
-        self, state, monkeypatch
-    ):
-        """The failure this prevents is the quiet one: `read_latest` leaves
-        `turn_proba` None on a classifier, every bar reads as "not a buy", and
-        the run finishes clean with an empty ledger that looks like a result."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: BUNDLE)
-        config = AppleTraderConfig(
-            model_key="persistence", entry_mode=at.ENTRY_ANTICIPATE
-        )
-        at._apple_trader_loop(state, tracker, config, 60, threading.Event())
-        assert state.agent_running is False
-        assert any(
-            "cannot forecast" in e.get("text", "") and e["type"] == "error"
-            for e in state.agent_log
-        )
-
-    def test_the_reversal_exit_on_a_model_that_cannot_forecast_stops_the_loop(
-        self, state, monkeypatch
-    ):
-        """Quieter than the entry version and caught for the same reason: the
-        run would trade normally and exit everything on the trailing stop,
-        which is indistinguishable from a rule that just never triggered."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: BUNDLE)
-        config = confirm_config(model_key="persistence", reversal_threshold=0.3)
-        at._apple_trader_loop(state, tracker, config, 60, threading.Event())
-        assert state.agent_running is False
-        assert any(
-            "cannot forecast the breakdown" in e.get("text", "") and e["type"] == "error"
-            for e in state.agent_log
-        )
-
-    def test_clearing_the_reversal_exit_lets_that_model_run(self, state, monkeypatch):
-        """The classifier is not disqualified -- only that one rule is."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: BUNDLE)
-        config = confirm_config(model_key="persistence", reversal_threshold=None)
-        assert at.config_error(config, BUNDLE) is None
-        stop = threading.Event()
-        stop.set()
-        at._apple_trader_loop(state, tracker, config, 60, stop)
-        assert not any(e["type"] == "error" for e in state.agent_log)
-
-    def test_the_loop_loads_the_model_the_config_names(self, state, monkeypatch):
-        """A config naming an unavailable model stops on *that* model rather
-        than quietly running the one that happens to be loadable."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        monkeypatch.setattr(
-            at.apple_models, "load", lambda key, ticker=None: None if key == "nbeats" else BUNDLE
-        )
-        at._apple_trader_loop(
-            state, tracker, AppleTraderConfig(model_key="nbeats"), 60, threading.Event()
-        )
-        assert state.agent_running is False
-        assert any(
-            "timetochange2_nbeats_AAPL.pt" in e.get("text", "") for e in state.agent_log
-        )
-
-
-class TestConfigSignature:
-    def test_every_rule_that_changes_behaviour_is_in_the_signature(self):
-        base = config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5))
-        assert base != config_signature(AppleTraderConfig(prob_threshold=0.3, trail_pct=0.5))
-        assert base != config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.8))
-        assert base != config_signature(
-            AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5, model_key="persistence")
-        )
-        # The same model answering the other question is a different experiment.
-        assert base != config_signature(
-            confirm_config(prob_threshold=0.2, trail_pct=0.5)
-        )
-        assert base == config_signature(AppleTraderConfig(prob_threshold=0.2, trail_pct=0.5))
-
-    def test_arming_the_reversal_exit_is_a_new_configuration(self):
-        off = config_signature(AppleTraderConfig(prob_threshold=0.2, reversal_threshold=None))
-        armed = config_signature(AppleTraderConfig(prob_threshold=0.2, reversal_threshold=0.3))
-        assert off != armed
-        assert "rev>=0.3" in armed
-        # Retuning it is a new configuration too.
-        assert armed != config_signature(
-            AppleTraderConfig(prob_threshold=0.2, reversal_threshold=0.4)
-        )
-
-    def test_a_rule_set_without_it_signs_as_it_always_did(self):
-        """Runs recorded before this exit existed and runs configured without
-        it now are the same strategy, so Results must go on grouping them."""
-        off = config_signature(AppleTraderConfig(prob_threshold=0.2, reversal_threshold=None))
-        assert off == "nbeats_AAPL(anticipate,p>=0.2,trail=0.5%,size=95%)"
-
-    def test_an_unset_threshold_names_the_model_that_supplies_it(self):
-        config = AppleTraderConfig(prob_threshold=None)
-        assert "p>=model" in config_signature(config)
-        assert "p>=0.07" in config_signature(config, model_threshold=0.07)
-
-
 class TestCycleTiming:
     """The bar-aligned cadence, now shared by every rule agent."""
 
@@ -885,10 +80,9 @@ class TestCycleTiming:
 # --------------------------------------------------------------------------
 # The day-range rules (TimeToChange3): one forecast, two resting levels.
 #
-# Driven through a stubbed forecast for the same reason the momentum suites
-# stub the model read: these pin the RULES -- when a level is a buy, when it is
-# a sell, and what the opening window and the closing bell override -- without
-# depending on the saved bundle. `tests/test_dayrange_model.py` pins the
+# Driven through a stubbed forecast: these pin the RULES -- when a level is a
+# buy, when it is a sell, and what the opening window and the closing bell
+# override -- without depending on the saved bundle. `tests/test_dayrange_model.py` pins the
 # forecast itself.
 # --------------------------------------------------------------------------
 
@@ -929,7 +123,7 @@ class Tape:
 
         dayrange = at._dayrange()
         monkeypatch.setattr(
-            at.persistence_model, "minute_frame", lambda *a, **k: self.frame()
+            at.momentum_regime, "minute_frame", lambda *a, **k: self.frame()
         )
         monkeypatch.setattr(at.historical, "fetch_daily_ohlc_bars", lambda *a, **k: [])
         monkeypatch.setattr(at.historical, "fetch_session_open", lambda *a, **k: None)
@@ -1210,392 +404,17 @@ class TestDayRangeGuards:
         assert tape.forecast_calls == 2
 
 
-# ------------------------------------------------------- the delta-momentum rules
-#
-# The third strategy: a signed bps/min forecast read against the regime the tape
-# has already printed. The stub below feeds `momentum_change_model.read_latest`
-# directly, exactly as `Reads` does for the momentum rules -- these pin the
-# RULES, and `tests/test_momentum_change_model.py` pins the model behind them.
-
-# A symbol the delta-momentum model still covers. These tests pin the rules
-# rather than the pairing, so any covered one does -- but a fixture built on a
-# pairing `model_ticker_error` refuses would be describing a run the app will
-# not start. It was GOOGL until that bundle was withdrawn from `Code/Models`.
-MOMENTUM_CHANGE_TICKER = "INTC"
-MOMENTUM_CHANGE_BUNDLE = {
-    "estimator": None,
-    "feature_cols": ["mom_15"],
-    "pipeline_params": {"persist": 15},
-    "model_name": "HistGradientBoosting",
-}
-
-
-class MomReads:
-    """Feeds `MomentumChangeTrader` a scripted sequence of reads, one per cycle."""
-
-    def __init__(self, monkeypatch, broker: "FakeBroker | None" = None):
-        self.broker = broker
-        self.minute = 0
-        self.next_read: "dict | None" = {}
-        self.history_problem: "str | None" = None
-        self.history_calls = 0
-        momentum_change = at._momentum_change()
-
-        def require_history(frame, session_date):
-            self.history_calls += 1
-            return self.history_problem
-
-        monkeypatch.setattr(
-            momentum_change, "session_frame", lambda *a, **k: pd.DataFrame({"x": [1]})
-        )
-        monkeypatch.setattr(momentum_change, "require_history", require_history)
-        monkeypatch.setattr(momentum_change, "read_latest", lambda *a, **k: self.next_read)
-
-    def set(
-        self,
-        *,
-        price: float = 100.0,
-        pred: "float | None" = 0.0,
-        mom: "float | None" = -1.0,
-        theta: "float | None" = 0.5,
-        regime: int = -1,
-        regime_before: "int | None" = -1,
-        bars_today: int = 200,
-        warming_up: bool = False,
-        advance: bool = True,
-    ) -> dict:
-        """Stage the next bar. `advance=False` replays the SAME timestamp, the
-        way a cycle running before a new bar has closed would see it."""
-        if advance:
-            self.minute += 1
-        if self.broker is not None:
-            self.broker.price = price
-        self.next_read = {
-            "ts": pd.Timestamp("2026-07-21 10:30", tz="America/New_York")
-            + pd.Timedelta(minutes=self.minute),
-            "price": price,
-            "pred": pred,
-            "mom": mom,
-            "theta": theta,
-            "regime": regime,
-            "regime_before": regime_before,
-            "bars_today": bars_today,
-            "warming_up": warming_up,
-        }
-        return self.next_read
-
-    def turn_up(self, *, pred: float = 0.9, **kwargs) -> dict:
-        """The bar the entry acts on: the previous minute was still negative
-        and the model calls the move upwards."""
-        return self.set(regime_before=-1, regime=-1, pred=pred, **kwargs)
-
-
-def momentum_change_config(**kwargs) -> AppleTraderConfig:
-    kwargs.setdefault("ticker", MOMENTUM_CHANGE_TICKER)
-    return AppleTraderConfig(model_key="momentum_change", **kwargs)
-
-
-@pytest.fixture
-def momentum_change_state() -> AppState:
-    state = AppState()
-    state.set_symbols([MOMENTUM_CHANGE_TICKER])
-    state.api_key = "k"
-    state.api_secret = "s"
-    state.feed = "yfinance"
-    return state
-
-
-class TestMomentumChangeEntry:
-    def _trader(self, **kwargs):
-        return at.MomentumChangeTrader(momentum_change_config(**kwargs))
-
-    def test_a_negative_minute_the_model_calls_up_is_bought(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = self._trader()
-
-        reads.turn_up(pred=0.9)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "bought"
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) > 0
-        reasoning = tracker.snapshot()["decisions"][-1].reasoning
-        assert "+0.90 bps/min" in reasoning and "negative momentum regime" in reasoning
-
-    def test_a_prediction_below_the_threshold_is_not_a_buy(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = MomReads(monkeypatch)
-        trader = self._trader(buy_thr=0.5)
-
-        reads.turn_up(pred=0.49)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
-
-    @pytest.mark.parametrize("regime_before", [0, 1])
-    def test_only_a_negative_regime_is_bought(
-        self, momentum_change_state, market_open, monkeypatch, regime_before
-    ):
-        """The model's timing is the weak half; the tape picks the situation.
-        A large prediction on a balanced or positive minute is not a trade."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = MomReads(monkeypatch)
-        trader = self._trader()
-
-        reads.set(regime_before=regime_before, regime=regime_before, pred=5.0)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
-
-    def test_a_bar_with_no_prediction_yet_is_not_a_buy(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = MomReads(monkeypatch)
-        trader = self._trader()
-
-        reads.set(pred=None, warming_up=True)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "warming_up"
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
-
-    def test_a_replayed_bar_does_not_buy_twice(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = self._trader()
-
-        reads.turn_up(pred=0.9)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "bought"
-        held = tracker.position_for(MOMENTUM_CHANGE_TICKER)
-        reads.turn_up(pred=0.9, advance=False)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == held
-
-
-def _mom_entered(state, tracker, reads, **kwargs):
-    trader = at.MomentumChangeTrader(momentum_change_config(**kwargs))
-    reads.turn_up(pred=0.9)
-    assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, state, tracker) == "bought"
-    return trader
-
-
-class TestMomentumChangeExit:
-    def test_the_stop_is_measured_from_the_entry_and_does_not_trail(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        """Unlike the momentum rules' trailing stop, a run-up does not move
-        this floor: it stays `stop_pct` under the price that was paid."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = _mom_entered(momentum_change_state, tracker, reads, stop_pct=0.5)
-
-        reads.set(price=105.0)   # a run-up the stop must ignore
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        reads.set(price=99.6)    # 0.4% down: still above the floor
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        reads.set(price=99.4)    # 0.6% down: through it
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
-        assert "Stop" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_momentum_floor_scales_with_the_days_threshold(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        """`m1_mult` is a multiple of theta rather than a number of bps,
-        because theta is set from yesterday's volatility."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = _mom_entered(momentum_change_state, tracker, reads, m1_mult=-2.0)
-
-        reads.set(price=100.0, mom=-0.9, theta=0.5)   # floor -1.0
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        reads.set(price=100.0, mom=-1.1, theta=0.5)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
-        assert "Momentum floor" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_model_closes_a_positive_regime_it_calls_over(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = _mom_entered(momentum_change_state, tracker, reads, sell_thr=0.3)
-
-        reads.set(price=100.5, regime_before=1, regime=1, mom=1.2, pred=-0.2)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        reads.set(price=100.5, regime_before=1, regime=1, mom=1.2, pred=-0.4)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
-        assert "Model exit" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_model_exit_needs_a_positive_regime(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        """A large negative prediction on a still-negative minute is the entry
-        question read backwards, not an exit."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = _mom_entered(momentum_change_state, tracker, reads)
-
-        reads.set(price=100.5, regime_before=-1, regime=-1, mom=-0.4, pred=-2.0)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-
-    def test_a_bar_where_two_exits_fire_is_reported_as_the_stop(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        """The notebook tests all three independently and exits on any, so the
-        order only decides what the ledger is told -- and a fact about price
-        beats a prediction."""
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = _mom_entered(momentum_change_state, tracker, reads, stop_pct=0.5)
-
-        reads.set(price=99.0, regime_before=1, regime=1, mom=1.2, pred=-2.0)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
-        assert "Stop" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_the_position_is_flattened_before_the_close(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = MomReads(monkeypatch, broker)
-        trader = _mom_entered(momentum_change_state, tracker, reads)
-
-        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))
-        reads.set(price=100.2)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "sold"
-        assert "Session ends" in tracker.snapshot()["decisions"][-1].reasoning
-
-
-class TestMomentumChangeGuards:
-    def test_no_entry_inside_the_closing_flatten_window(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = MomReads(monkeypatch)
-        trader = at.MomentumChangeTrader(momentum_change_config())
-
-        clock.set_simulated(datetime(2026, 7, 21, 19, 57, tzinfo=timezone.utc))
-        reads.turn_up(pred=0.9)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "hold"
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
-
-    def test_a_history_it_cannot_get_stops_the_day_rather_than_the_bar(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        """Six sessions missing at 09:31 are still missing at 14:00, so the
-        refusal is logged once and the session is skipped -- not retried every
-        minute for six and a half hours."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = MomReads(monkeypatch)
-        reads.history_problem = "only 2 of the 6 previous sessions"
-        trader = at.MomentumChangeTrader(momentum_change_config())
-
-        for _ in range(4):
-            reads.turn_up(pred=0.9)
-            assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "no_data"
-        assert reads.history_calls == 1
-        assert tracker.position_for(MOMENTUM_CHANGE_TICKER) == 0
-        errors = [e for e in momentum_change_state.agent_log if e.get("type") == "error"]
-        assert len(errors) == 1 and "2 of the 6" in errors[0]["text"]
-
-    def test_a_new_session_tries_the_history_again(
-        self, momentum_change_state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        reads = MomReads(monkeypatch)
-        reads.history_problem = "only 2 of the 6 previous sessions"
-        trader = at.MomentumChangeTrader(momentum_change_config())
-        reads.turn_up(pred=0.9)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "no_data"
-
-        clock.set_simulated(datetime(2026, 7, 22, 14, 30, tzinfo=timezone.utc))
-        reads.history_problem = None
-        reads.turn_up(pred=0.9)
-        assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "bought"
-        assert reads.history_calls == 2
-
-    def test_does_nothing_when_the_market_is_closed(self, momentum_change_state, monkeypatch):
-        clock.set_simulated(datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc))
-        try:
-            tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-            reads = MomReads(monkeypatch)
-            reads.turn_up(pred=0.9)
-            trader = at.MomentumChangeTrader(momentum_change_config())
-            assert trader.run_cycle(MOMENTUM_CHANGE_BUNDLE, momentum_change_state, tracker) == "closed"
-        finally:
-            clock.clear()
-
-    def test_a_stop_at_zero_is_refused_by_the_config(self):
-        """It would be breached by the bar that opened the trade, on every
-        bar -- a rule that sells everything it buys."""
-        with pytest.raises(ValueError, match="stop_pct"):
-            AppleTraderConfig(stop_pct=0.0)
-
-
-class TestMomentumChangeSignature:
-    def test_every_knob_that_changes_behaviour_is_in_the_signature(self):
-        base = config_signature(momentum_change_config())
-        for changed in (
-            momentum_change_config(buy_thr=0.4),
-            momentum_change_config(sell_thr=0.4),
-            momentum_change_config(m1_mult=-1.5),
-            momentum_change_config(stop_pct=0.8),
-            momentum_change_config(position_pct=50.0),
-            # The other symbol this model covers: the same levels over a
-            # different tape are a different experiment, not a repeat.
-            momentum_change_config(ticker="AAPL"),
-        ):
-            assert config_signature(changed) != base
-
-    def test_the_momentum_knobs_are_left_out(self):
-        """They are inert here, and a signature carrying them would split one
-        strategy's runs into two configurations the first time somebody moved
-        a knob that changes nothing."""
-        base = config_signature(momentum_change_config())
-        assert base == config_signature(momentum_change_config(trail_pct=9.0))
-        assert base == config_signature(momentum_change_config(prob_threshold=0.9))
-        assert base == config_signature(momentum_change_config(buy_k=1.5, sell_k=0.9))
-        assert "trail" not in base and "buy=H-" not in base
-
-    def test_it_is_not_confusable_with_the_other_strategies(self):
-        assert config_signature(momentum_change_config()).startswith(
-            f"momentum_change_{MOMENTUM_CHANGE_TICKER}("
-        )
-        assert config_signature(dayrange_config()).startswith("dayrange_AAPL(")
-
-
 class TestStrategySelection:
     def test_the_model_chooses_the_state_machine(self):
         assert isinstance(
             at.build_trader(dayrange_config(), DAYRANGE_BUNDLE), at.DayRangeTrader
         )
-        assert isinstance(
-            at.build_trader(momentum_change_config(), MOMENTUM_CHANGE_BUNDLE), at.MomentumChangeTrader
-        )
-        assert isinstance(at.build_trader(AppleTraderConfig(), BUNDLE), AppleTrader)
 
-    def test_the_momentum_pairing_checks_do_not_fire_on_the_other_strategy(self):
-        """`anticipate` and the reversal exit are momentum concepts. A
-        day-range config carries their defaults and must not be rejected for
-        them -- the bundle it runs on cannot answer either question and is
-        never asked."""
-        assert at.config_error(dayrange_config(), DAYRANGE_BUNDLE) is None
-
-    def test_the_levels_are_the_signature_and_the_momentum_knobs_are_not(self):
+    def test_the_levels_are_the_signature(self):
         base = config_signature(dayrange_config())
         assert base == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         assert base != config_signature(dayrange_config(buy_k=0.8))
         assert base != config_signature(dayrange_config(sell_k=0.2))
-        # Inert knobs must not split one strategy's runs into two
-        # configurations in Results.
-        assert base == config_signature(dayrange_config(trail_pct=2.0, prob_threshold=0.9))
 
     def test_a_sell_level_below_the_buy_level_is_refused(self):
         """Both are distances *below* the predicted high, so the sell distance
@@ -1610,18 +429,10 @@ class TestStrategySelection:
 # ----------------------------------------------------------------- instrument
 #
 # Which symbol a run trades, and the one thing that constrains it: a model was
-# fitted on a symbol or it was not. The registry narrows in both directions on
-# its own again: the delta-momentum bundle for GOOGL was withdrawn from
-# `Code/Models`, so GOOGL runs the other three models and `momentum_change` is
-# simply not on its menu. `UNMODELLED` is still the case where nothing is.
+# fitted on a symbol or it was not. `UNMODELLED` is the case where nothing is.
 
 NON_AAPL = "GOOGL"
-DAYRANGE_ONLY = NON_AAPL  # kept for the tests written before there were two
 UNMODELLED = "MSFT"
-
-ALL_MODELS = ["persistence", "nbeats", "dayrange", "momentum_change"]
-# What GOOGL has, in registry order.
-GOOGL_MODELS = ["persistence", "nbeats", "dayrange"]
 
 
 class TestDayRangeLevelDefaults:
@@ -1637,7 +448,7 @@ class TestDayRangeLevelDefaults:
 
     def test_a_symbol_never_swept_falls_back_to_the_notebook_pair(self):
         assert at.dayrange_levels("ZZZZ") == (0.75, 0.10)
-        config = AppleTraderConfig(model_key="momentum_change", ticker="ZZZZ")
+        config = AppleTraderConfig(ticker="ZZZZ")
         assert (config.buy_k, config.sell_k) == (0.75, 0.10)
 
     def test_a_level_given_explicitly_wins_and_the_other_keeps_its_default(self):
@@ -1654,23 +465,9 @@ class TestDayRangeLevelDefaults:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        # AAPL and INTC are the two every project was run on and still has a
-        # bundle for.
-        for symbol in (TICKER, "INTC"):
-            assert apple_models.keys_for(symbol) == ALL_MODELS
+        for symbol in (TICKER, NON_AAPL, "INTC"):
+            assert apple_models.keys_for(symbol) == ["dayrange"]
         assert apple_models.keys_for(UNMODELLED) == []
-
-    def test_a_withdrawn_bundle_narrows_that_symbols_menu(self):
-        """GOOGL lost the delta-momentum regressor when its bundle was removed.
-
-        The menu narrowing is the *correct* outcome and the one worth pinning:
-        a model left in the registry with no file behind it does not give the
-        user a wider choice, it gives them an agent that reports itself broken
-        every time they pick it.
-        """
-        assert apple_models.keys_for(NON_AAPL) == GOOGL_MODELS
-        assert "momentum_change" not in apple_models.keys_for(NON_AAPL)
-        assert not apple_models.covers("momentum_change", NON_AAPL)
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
         self, monkeypatch
@@ -1678,44 +475,18 @@ class TestInstrument:
         """The check that keeps 'Apple Trader on GOOGL' from meaning a model
         fitted on a different stock's tape.
 
-        Stubbed back to AAPL-only, because every shipped model now covers every
-        shipped symbol and the machinery would otherwise go untested until the
-        next model arrives for one ticker ahead of the others."""
+        Stubbed back to AAPL-only, because the shipped model covers every
+        shipped symbol and the machinery would otherwise go untested."""
         monkeypatch.setitem(
-            apple_models.MODELS, "nbeats",
-            replace(apple_models.MODELS["nbeats"], tickers=(TICKER,)),
+            apple_models.MODELS, "dayrange",
+            replace(apple_models.MODELS["dayrange"], tickers=(TICKER,)),
         )
         error = at.model_ticker_error(
-            AppleTraderConfig(model_key="nbeats", ticker=DAYRANGE_ONLY)
+            AppleTraderConfig(model_key="dayrange", ticker=NON_AAPL)
         )
         assert error is not None
-        assert "AAPL only" in error and DAYRANGE_ONLY in error
-        # ...and it names what that symbol *can* run.
-        assert "Day-range forecast" in error
-
-    def test_every_model_covers_the_symbols_it_still_has_a_bundle_for(self):
-        """Each project was re-run per ticker; the pairings that survive are
-        the ones whose bundle is still installed."""
-        for key in ALL_MODELS:
-            for symbol in (TICKER, "INTC"):
-                config = AppleTraderConfig(model_key=key, ticker=symbol)
-                assert at.model_ticker_error(config) is None
-        for key in GOOGL_MODELS:
-            config = AppleTraderConfig(model_key=key, ticker=NON_AAPL)
-            assert at.model_ticker_error(config) is None
-
-    def test_the_withdrawn_pairing_is_refused_before_any_file_is_opened(self):
-        """`momentum_change` on GOOGL now reads as "never fitted", not "file
-        missing" -- which is the distinction `model_ticker_error` exists for,
-        and it sends the reader somewhere useful rather than hunting a path."""
-        error = at.model_ticker_error(
-            AppleTraderConfig(model_key="momentum_change", ticker=NON_AAPL)
-        )
-        assert error is not None
-        assert "AAPL, INTC only" in error and NON_AAPL in error
+        assert "AAPL only" in error and NON_AAPL in error
         assert ".joblib" not in error
-        # ...and it names what GOOGL *can* run instead.
-        assert "Day-range forecast" in error
 
     def test_an_unmodelled_symbol_is_refused_with_no_alternative_offered(self):
         error = at.model_ticker_error(
@@ -1723,11 +494,35 @@ class TestInstrument:
         )
         assert error is not None and "pick another instrument" in error
 
+    def test_a_removed_model_is_refused_rather_than_replaced(self):
+        """A stored config naming a model that has been taken out of the app
+        must not run as the model that is left -- that would file one strategy's
+        numbers under another's name."""
+        for key in ("persistence", "nbeats", "momentum_change"):
+            error = at.model_ticker_error(AppleTraderConfig(model_key=key))
+            assert error is not None and key in error and "removed" in error
+
+    def test_the_loop_refuses_a_removed_model_before_it_loads_anything(
+        self, state, monkeypatch
+    ):
+        loaded: list = []
+        monkeypatch.setattr(
+            at.apple_models, "load",
+            lambda key, ticker=None: loaded.append(key) or DAYRANGE_BUNDLE,
+        )
+        at._apple_trader_loop(
+            state, tracker_for_loop(), AppleTraderConfig(model_key="nbeats"), 60,
+            threading.Event(),
+        )
+        assert loaded == []
+        assert state.agent_running is False
+        assert any("removed" in e.get("text", "") for e in state.agent_log)
+
     def test_the_pairing_is_part_of_config_error(self):
         """One call is what every launch path checks, so the pairing cannot be
         enforced in the live loop and forgotten in SimLab."""
-        config = AppleTraderConfig(model_key="nbeats", ticker=UNMODELLED)
-        assert "cannot trade" in (at.config_error(config, BUNDLE) or "")
+        config = AppleTraderConfig(model_key="dayrange", ticker=UNMODELLED)
+        assert "cannot trade" in (at.config_error(config, DAYRANGE_BUNDLE) or "")
 
     def test_a_ticker_is_normalised(self):
         assert AppleTraderConfig(ticker=" googl ").ticker == "GOOGL"
@@ -1736,54 +531,26 @@ class TestInstrument:
         """The same levels over two tapes are two experiments; filing them
         together would average them into one row in Results."""
         aapl = config_signature(AppleTraderConfig(model_key="dayrange"))
-        googl = config_signature(
-            AppleTraderConfig(model_key="dayrange", ticker=DAYRANGE_ONLY)
-        )
+        googl = config_signature(AppleTraderConfig(model_key="dayrange", ticker=NON_AAPL))
         assert aapl.startswith("dayrange_AAPL(") and googl.startswith("dayrange_GOOGL(")
         assert aapl != googl
 
-    def test_a_record_written_before_the_instrument_existed_is_an_aapl_run(self):
-        assert AppleTraderConfig(model_key="persistence").ticker == TICKER
-
-    def test_the_configured_symbol_is_the_one_traded(self, market_open, monkeypatch):
-        """Every read, order and log line follows the config, not the module."""
-        state = AppState()
-        state.set_symbols([DAYRANGE_ONLY])
-        state.api_key, state.api_secret, state.feed = "k", "s", "iex"
-        broker = FakeBroker(100.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        reads = Reads(monkeypatch)
-        reads.to_positive(proba=0.99)
-
-        trader = AppleTrader(confirm_config(ticker=DAYRANGE_ONLY))
-        assert trader.run_cycle(BUNDLE, state, tracker) == "bought"
-        assert tracker.position_for(DAYRANGE_ONLY) > 0
-        assert tracker.position_for(TICKER) == 0
-        assert broker.orders[0][0] == DAYRANGE_ONLY
-
-    def test_a_symbol_that_is_not_streamed_says_so(self, market_open, monkeypatch):
-        state = AppState()
-        state.set_symbols([TICKER])
-        state.api_key, state.api_secret, state.feed = "k", "s", "iex"
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
-        Reads(monkeypatch)
-        trader = AppleTrader(confirm_config(ticker=DAYRANGE_ONLY))
-        assert trader.run_cycle(BUNDLE, state, tracker) == "no_data"
-        assert DAYRANGE_ONLY in state.agent_log[-1]["text"]
+    def test_a_config_without_a_symbol_is_an_aapl_run(self):
+        assert AppleTraderConfig(model_key="dayrange").ticker == TICKER
 
     def test_the_loop_refuses_the_pairing_before_it_loads_anything(
         self, state, monkeypatch
     ):
-        """'There is no MSFT N-BEATS model' rather than 'the file is missing':
-        different problems, different fixes."""
+        """'There is no MSFT day-range model' rather than 'the file is
+        missing': different problems, different fixes."""
         loaded: list = []
         monkeypatch.setattr(
             at.apple_models, "load",
-            lambda key, ticker=None: loaded.append((key, ticker)) or BUNDLE,
+            lambda key, ticker=None: loaded.append((key, ticker)) or DAYRANGE_BUNDLE,
         )
         at._apple_trader_loop(
             state, tracker_for_loop(), AppleTraderConfig(
-                model_key="nbeats", ticker=UNMODELLED
+                model_key="dayrange", ticker=UNMODELLED
             ), 60, threading.Event(),
         )
         assert loaded == []
@@ -1800,10 +567,10 @@ class TestInstrument:
         )
         at._apple_trader_loop(
             state, tracker_for_loop(), AppleTraderConfig(
-                model_key="dayrange", ticker=DAYRANGE_ONLY
+                model_key="dayrange", ticker=NON_AAPL
             ), 60, threading.Event(),
         )
-        assert asked == [("dayrange", DAYRANGE_ONLY)]
+        assert asked == [("dayrange", NON_AAPL)]
 
 
 def tracker_for_loop() -> DecisionTracker:

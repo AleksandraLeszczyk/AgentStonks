@@ -21,7 +21,7 @@ single-symbol per run, which is what the dataset check depends on.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any, Callable, Optional
 
 from agent_stonks import apple_models
@@ -30,7 +30,6 @@ from agent_stonks.apple_trader import (
     APPLE_TRADER_AVATAR,
     APPLE_TRADER_KEY,
     APPLE_TRADER_LABEL,
-    ENTRY_CONFIRM,
     AppleTraderConfig,
     build_trader,
     config_error,
@@ -101,8 +100,7 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     clear failure.
 
     Which state machine is `build_trader`'s decision, not this module's: the
-    model a config names decides whether the run is the momentum rules or the
-    day-range ones. A missing bundle would otherwise surface as a run that
+    model a config names decides which rules run. A missing bundle would otherwise surface as a run that
     simply never trades, which reads like a strategy result rather than the
     installation problem it is.
     """
@@ -124,37 +122,16 @@ def _build_apple(config: AppleTraderConfig) -> _BundleBound:
     return _BundleBound(build_trader(config, bundle), bundle)
 
 
-def _apple_signature(config: AppleTraderConfig) -> str:
-    # `prob_threshold=None` means "whatever cut-off the model chose", so the
-    # signature needs that model to name the configuration it actually ran --
-    # but only where a cut-off is a thing that exists. The day-range rules have
-    # no threshold, and asking for one would load a 200 MB bundle to answer a
-    # question its signature never asks.
-    # The ticker has to be passed: since TimeToChange2 was re-run per symbol
-    # each bundle picks its own cut-off, so asking without one would sign a
-    # GOOGL run with AAPL's threshold -- while the trader, which reads the
-    # bundle it actually loaded, ran on GOOGL's.
-    threshold = (
-        apple_models.threshold(config.model_key, ticker=config.ticker)
-        if apple_models.is_momentum(config.model_key)
-        else None
-    )
-    return apple_config_signature(config, model_threshold=threshold)
-
-
 # What Apple Trader's rule set meant before a field existed to say otherwise.
 # A stored record is a description of a run that already happened, so a missing
 # key has to decode to the behaviour of the day it was written -- not to
 # today's default, which would silently replay a record under a different
 # strategy and file it in Results beside the original as though it matched.
 _APPLE_LEGACY = {
+    # Before this key existed Apple Trader only ran the persistence classifier.
+    # That model has since been removed, and a record naming it is refused
+    # (`model_ticker_error`) rather than replayed on the model that is left.
     "model_key": "persistence",
-    "entry_mode": ENTRY_CONFIRM,
-    # Before this key existed the trailing stop was the only exit, so a record
-    # without it describes a run that did not sell on a forecast reversal --
-    # replaying it under today's default would file a different strategy in
-    # Results beside the original.
-    "reversal_threshold": None,
     # Before the day-range levels were per instrument every run used the
     # notebook's pair, so a record without them replays at that pair rather
     # than at today's per-ticker default.
@@ -163,8 +140,16 @@ _APPLE_LEGACY = {
 }
 
 
+# A record may still carry fields of a strategy that has been removed -- an
+# entry mode, a trailing stop, a delta-momentum threshold. They describe a run
+# that already happened and mean nothing to today's config, so they are dropped
+# on the way in; the model key they came with is what gets the run refused.
+_APPLE_FIELDS = {f.name for f in fields(AppleTraderConfig)}
+
+
 def _apple_from_record(raw: "dict | None") -> AppleTraderConfig:
-    return AppleTraderConfig(**{**_APPLE_LEGACY, **(raw or {})})
+    merged = {**_APPLE_LEGACY, **(raw or {})}
+    return AppleTraderConfig(**{k: v for k, v in merged.items() if k in _APPLE_FIELDS})
 
 
 # ---------------------------------------------------------- Apple Trader 2
@@ -203,7 +188,7 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         ticker=lambda config: config.ticker,
         default_ticker=APPLE_TRADER_TICKER,
         build=_build_apple,
-        signature=_apple_signature,
+        signature=apple_config_signature,
         to_record=asdict,
         from_record=_apple_from_record,
     ),

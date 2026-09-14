@@ -1,22 +1,23 @@
 """Apple Trader 2 -- the same loop, with the strategy taken out of the code.
 
-Apple Trader runs one of two hard-coded strategies and picks between them by
-picking a model. This one runs whatever list of rules it is handed. The tape,
+Apple Trader runs one hard-coded strategy, the day-range rules. This one runs
+whatever list of rules it is handed. The tape,
 the ledger, the fill path, the flatten-before-close and the once-a-minute
 cadence are identical; the only difference is where the decision comes from --
 `agent_stonks.apple_rules`, which defines the vocabulary, and a `RuleSet`, which
 is the strategy.
 
     signals   `SignalBus` turns the bar that just closed, the momentum regime,
-              the models a rule names, the open position and the clock into
+              the day-range forecast, the open position and the clock into
               named numbers.
     rules     `apple_rules.first_match` walks the list in order and returns the
               first rule that both matches and can transact.
     orders    one market order per bar at most, through the same
               `DecisionTracker` as every other personality.
 
-It also picks its own instrument, which Apple Trader cannot. There the strategy
-*is* a saved AAPL model, so the symbol is not a choice; here a model is one
+It also picks its instrument more freely than Apple Trader does. There the
+strategy *is* a saved model, so the symbol is one that model was fitted on;
+here a model is one
 signal among many, and the rest of the vocabulary is computed from bars and
 means the same thing on every symbol. So the config names a ticker, the
 catalogue narrows to what exists for it (`apple_rules.signals_for`) and a rule
@@ -46,15 +47,15 @@ behave predictably rather than merely expressively:
 What this does not do
 ---------------------
 It does not tune anything, and it does not know which rule sets are any good.
-The four presets in `apple_rules` include the two shipped strategies precisely
-so that a rule set written here can be compared against them in SimLab rather
-than against an intuition -- and the honest summary of what those two are worth
-is in `apple_trader`'s docstring, which this agent does nothing to improve.
+The presets in `apple_rules` include Apple Trader's strategy precisely so that
+a rule set written here can be compared against it in SimLab rather than
+against an intuition -- and the honest summary of what that one is worth is in
+`DayRangeTrader`'s docstring, which this agent does nothing to improve.
 
 Rules are also not backtested by construction: the vocabulary makes it easy to
 write a set that fires on every bar, ladders a balance in over ten minutes, or
 holds a position no exit can reach. `apple_rules.ruleset_error` catches the ones
-that cannot work at all (no buy, no conditions, a model that cannot answer);
+that cannot work at all (no buy, no conditions, a model that is not installed);
 everything else is a strategy, and finding out whether it is a good one is what
 the simulator is for.
 """
@@ -71,7 +72,7 @@ from . import (
     apple_rules,
     historical,
     market_hours,
-    persistence_model,
+    momentum_regime,
     rule_agent,
 )
 from .agent import stop_agent
@@ -93,7 +94,7 @@ APPLE_TRADER2_LABEL = "Apple Trader 2 (adjustable rules)"
 APPLE_TRADER2_AVATAR = "Multiavatar-088d131670fd0343f5.png"
 
 # The symbol a run trades unless its config says otherwise. Unlike Apple Trader
-# (which is AAPL-only because both its strategies *are* a saved model) the
+# (limited to its model's symbols, because its strategy *is* a saved model) the
 # instrument here is configuration: a rule set written on the bar, the momentum
 # regime, the position and the clock is computed from the tape and means the
 # same thing on any symbol, and the models that are not symbol-agnostic are
@@ -265,20 +266,18 @@ class SignalBus:
     """Every number a condition can name, computed on demand for one bar.
 
     On demand is the whole design. The catalogue spans a bar's close (free), a
-    Schmitt-triggered momentum regime (one pass over the session), a 25-feature
-    window run through a saved model (a forecast, per bar, per model) and a
+    Schmitt-triggered momentum regime (one pass over the session) and a
     day-range forecast (a year of daily history plus a network fetch). Computing
     all of it every minute to answer a rule set that reads three of them would
     make a cheap strategy pay a forecaster's bill -- so nothing is computed
     until `value` is asked for it, and every answer is cached until the bus is
     replaced on the next bar.
 
-    A signal that does not apply is None, never a placeholder: the persistence
-    question is only asked on a bar the regime changed into positive, the turn
-    question only while it has not, the reversal question only while it has, and
-    every day-range signal only after the opening window closes. That is the
-    same gating `persistence_model.read_latest` applies -- a model asked about a
-    bar it was not fitted for would answer, and the answer would mean nothing.
+    A signal that does not apply is None, never a placeholder: no momentum
+    number before the trailing window has warmed up, no `pre_dwell` off a change
+    bar, and no day-range signal before the opening window closes -- a forecast
+    read on a bar it does not cover would answer, and the answer would mean
+    nothing.
     """
 
     def __init__(
@@ -304,8 +303,6 @@ class SignalBus:
         self._plan_fn = plan_fn
         self._plan = _UNSET
         self._scored_frame = _UNSET
-        self._features = _UNSET
-        self._sequences: dict = {}
         self._cache: "dict[str, float | None]" = {}
 
         self.last = frame.iloc[-1]
@@ -333,7 +330,7 @@ class SignalBus:
             elif namespace == apple_models.DAYRANGE_KEY:
                 value = self._dayrange(name)
             else:
-                value = self._model(namespace, name)
+                value = None
         except Exception:
             # A signal that blows up is a signal that is not available. Letting
             # it escape would take the whole cycle down, and a rule that cannot
@@ -375,7 +372,7 @@ class SignalBus:
         if self._scored_frame is _UNSET:
             self._scored_frame = None
             if len(self.frame) >= self.params["horizon"] + 2:
-                scored = persistence_model.add_momentum_regimes(self.frame, self.params)
+                scored = momentum_regime.add_momentum_regimes(self.frame, self.params)
                 if not pd.isna(scored.iloc[-1]["mom"]):
                     self._scored_frame = scored
         return self._scored_frame
@@ -398,56 +395,6 @@ class SignalBus:
         if name == "to_positive":
             return 1.0 if bool(last["regime_change"]) and int(last["regime"]) == 1 else 0.0
         return None
-
-    # --- the models --------------------------------------------------------
-
-    def _sequence(self, model_key: str, bundle: dict):
-        """The 20-bar feature window this model scores, or None if it is not
-        complete. Cached per model because two bundles can want different
-        columns, and the feature frame under them is shared."""
-        if model_key not in self._sequences:
-            if self._features is _UNSET:
-                scored = self._scored()
-                self._features = (
-                    None if scored is None else persistence_model.compute_features(scored)
-                )
-            self._sequences[model_key] = (
-                None
-                if self._features is None
-                else persistence_model.build_sequence(
-                    self._features, bundle["feature_columns"], int(bundle["seq_len"])
-                )
-            )
-        return self._sequences[model_key]
-
-    def _model(self, model_key: str, name: str) -> "float | None":
-        bundle = self.bundles.get(model_key)
-        scored = self._scored()
-        if bundle is None or scored is None:
-            return None
-        last = scored.iloc[-1]
-        regime = int(last["regime"])
-        to_positive = bool(last["regime_change"]) and regime == 1
-
-        if name == "proba":
-            if not to_positive:
-                return None
-            predict = persistence_model.predict_proba
-        elif name == "turn_proba":
-            if regime == 1 or not persistence_model.anticipates(bundle):
-                return None
-            predict = persistence_model.predict_turn_proba
-        elif name == "reversal_proba":
-            if regime != 1 or not persistence_model.forecasts_reversal(bundle):
-                return None
-            predict = persistence_model.predict_reversal_proba
-        else:
-            return None
-
-        sequence = self._sequence(model_key, bundle)
-        if sequence is None:
-            return None
-        return float(predict(bundle, sequence[None, ...])[0])
 
     # --- the day-range forecast --------------------------------------------
 
@@ -553,12 +500,8 @@ class AppleTrader2(BaseTrader):
     ) -> None:
         super().__init__(config or AppleTrader2Config())
         self.bundles = bundles or {}
-        # The momentum settings every regime signal is computed with. They come
-        # from whichever momentum bundle the rules named -- the two carry the
-        # same numbers -- and fall back to the shipped defaults when no rule
-        # names one, which is what lets a price-only rule set run with no model
-        # files present at all.
-        self.params = persistence_model.momentum_params(self._momentum_bundle())
+        # The momentum settings every regime signal is computed with.
+        self.params = dict(momentum_regime.MOMENTUM_DEFAULTS)
         self.forecaster = SessionForecaster(self.ticker)
         # The last buy that filled, and the highest price seen since it did --
         # the anchor `pos.since_buy_pct` measures from. Deliberately NOT the
@@ -575,12 +518,6 @@ class AppleTrader2(BaseTrader):
         self.fired_at: "dict[int, int]" = {}
         self.session_date = None
 
-    def _momentum_bundle(self) -> "dict | None":
-        for key, bundle in self.bundles.items():
-            if bundle is not None and apple_models.is_momentum(key):
-                return bundle
-        return None
-
     # --- one cycle --------------------------------------------------------
 
     def run_cycle(self, state: AppState, tracker: DecisionTracker) -> str:
@@ -590,7 +527,7 @@ class AppleTrader2(BaseTrader):
         if refused is not None:
             return refused
 
-        frame = persistence_model.minute_frame(sym_state)
+        frame = momentum_regime.minute_frame(sym_state)
         if not len(frame):
             _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
             return "no_data"

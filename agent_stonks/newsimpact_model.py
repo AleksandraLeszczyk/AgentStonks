@@ -69,12 +69,12 @@ notebook only ever saw completed sessions), today's close is the bell, not its
 last bar so far, and two `to_numpy()` calls take `copy=True` because this venv's
 pandas 3 hands back read-only views where the notebooks' pandas 2 copied. If
 NewsImpact's windows, volatility profile or beta
-change, retrain AND update this module -- the contract `persistence_model` has
-with `mshift` and `dayrange_model` with `dayrange`.
+change, retrain AND update this module -- the contract `dayrange_model` has
+with `dayrange`.
 `tests/test_newsimpact_model.py` pins it against the notebook's own events.
 
-The pickle was written by scikit-learn 1.7.2 and this app runs 1.9.0. Unlike
-`momentum_change_model`'s bundles this one crosses the gap cleanly -- a
+The pickle was written by scikit-learn 1.7.2 and this app runs 1.9.0. It
+crosses the gap cleanly -- a
 OneHotEncoder, a StandardScaler and a LogisticRegression -- and its
 probabilities were checked identical (max abs difference 0.0) to the
 notebooks' venv on sampled rows, so the version warnings are silenced at load.

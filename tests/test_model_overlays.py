@@ -1,9 +1,8 @@
 """Tests for the model-prediction chart overlays (agent_stonks/model_overlays.py).
 
 Two halves. The first drives `compute` with stubbed models, so what is pinned
-is the *shape* of the answer -- which item kinds each overlay produces, which
-bars the momentum model is asked about, and that a missing model becomes a note
-rather than an exception. The second drives the renderer, so what is pinned is
+is the *shape* of the answer -- which item kinds each overlay produces, and that a
+missing model becomes a note rather than an exception. The second drives the renderer, so what is pinned is
 that each kind reaches the figure the way its idiom requires: a level as a line
 in the price panel AND in the profile beside it, a time span as a
 semi-transparent background, a moment as a vertical line plus a marker.
@@ -31,9 +30,7 @@ SESSION_START = datetime(2026, 8, 7, 13, 25, tzinfo=timezone.utc)
 def minute_bars(n=180, seed=7, base=200.0):
     """A session of 1-minute bars starting at the 09:30 open.
 
-    Momentum is a volatility-normalised trailing return, so a tape with no
-    swings has no regime changes and the momentum overlay would have nothing to
-    draw. The sine wave is there to guarantee some.
+    A random walk with a sine wave on top, so the session has a real range.
     """
     rng = np.random.default_rng(seed)
     start = pd.Timestamp(f"{SESSION} 09:30", tz="America/New_York")
@@ -61,13 +58,11 @@ class TestCatalogue:
 
     def test_each_overlay_follows_its_models_tickers(self):
         """The catalogue reads `apple_models`, so re-running a notebook for a
-        new symbol widens the picker without a change here. Since TimeToChange2
-        was re-run per ticker (2026-09-07) the momentum overlay covers GOOGL
-        and INTC too; only a symbol nothing was fitted on is excluded."""
-        for key in (mo.DAY_RANGE_KEY, mo.MOMENTUM_KEY):
-            for symbol in ("AAPL", "GOOGL", "INTC"):
-                assert mo.OVERLAYS[key].covers(symbol), (key, symbol)
-            assert not mo.OVERLAYS[key].covers("MSFT")
+        new symbol widens the picker without a change here; only a symbol
+        nothing was fitted on is excluded."""
+        for symbol in ("AAPL", "GOOGL", "INTC"):
+            assert mo.OVERLAYS[mo.DAY_RANGE_KEY].covers(symbol), symbol
+        assert not mo.OVERLAYS[mo.DAY_RANGE_KEY].covers("MSFT")
         # ...except the one model that claims to transfer, which covers every
         # symbol because it was fitted without ticker dummies.
         assert mo.OVERLAYS[mo.PROFILE_RANGE_KEY].covers("MSFT")
@@ -86,38 +81,10 @@ class TestForModels:
             mo.DAY_RANGE_KEY
         ]
 
-    def test_either_momentum_bundle_selects_the_momentum_overlay_and_names_itself(self):
-        """One overlay, two bundles that answer its question -- so the answer
-        has to carry which of them to ask, or the chart would draw the other
-        model's opinion of a run it never touched."""
-        for key in (apple_models.PERSISTENCE_KEY, apple_models.NBEATS_KEY):
-            out = mo.for_models([key], "AAPL")
-            assert out["keys"] == [mo.MOMENTUM_KEY]
-            assert out["momentum_model"] == key
-
-    def test_several_models_select_several_overlays_in_picker_order(self):
-        out = mo.for_models(
-            [apple_models.NBEATS_KEY, apple_models.DAYRANGE_KEY], "AAPL"
-        )
-        assert out["keys"] == [mo.DAY_RANGE_KEY, mo.MOMENTUM_KEY]
-        assert out["momentum_model"] == apple_models.NBEATS_KEY
-
-    def test_a_model_no_overlay_draws_is_reported_rather_than_dropped(self):
-        """The delta-momentum regressor predicts a signed size over a horizon,
-        which is neither a level, a moment nor a span. A caller that
-        pre-selects nothing should be able to say why it did."""
-        out = mo.for_models([apple_models.MOMENTUM_CHANGE_KEY], "AAPL")
-        assert out["keys"] == []
-        assert out["unmatched"] == [apple_models.MOMENTUM_CHANGE_KEY]
-
     def test_an_overlay_is_never_selected_for_a_symbol_it_has_no_model_for(self):
         """A rule run's stored symbol list can be wider than the one instrument
         it traded, so this is asked about tabs the model was never fitted on --
         where the picker has no such option to select."""
-        out = mo.for_models([apple_models.NBEATS_KEY], "MSFT")
-        assert out["keys"] == []
-        # ...and no bundle to ask, since there is no overlay asking.
-        assert out["momentum_model"] is None
         assert mo.for_models([apple_models.DAYRANGE_KEY], "MSFT")["keys"] == []
 
     def test_no_symbol_asks_the_question_without_one(self):
@@ -136,7 +103,7 @@ class TestForModels:
     def test_no_models_is_no_selection(self):
         for empty in ([], None, [""]):
             out = mo.for_models(empty, "AAPL")
-            assert out == {"keys": [], "momentum_model": None, "unmatched": []}
+            assert out == {"keys": [], "unmatched": []}
 
     def test_a_retired_model_key_is_unmatched_not_a_crash(self):
         """Records are JSON on disk and outlive the registry."""
@@ -155,177 +122,37 @@ class TestCompute:
         assert mo.compute(["nope"], "AAPL", minute_bars())["items"] == []
 
     def test_a_symbol_the_model_does_not_cover_is_a_note_not_an_error(self):
-        result = mo.compute([mo.MOMENTUM_KEY], "MSFT", minute_bars())
+        result = mo.compute([mo.DAY_RANGE_KEY], "MSFT", minute_bars())
         assert result["items"] == []
         assert "MSFT" in result["notes"][0]
         assert "fitted on" in result["notes"][0]
 
     def test_a_missing_bundle_is_a_note_not_an_exception(self, monkeypatch):
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())
+        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars())
         assert result["items"] == []
-        assert result["notes"] and "Momentum regime changes" in result["notes"][0]
+        assert result["notes"] and "Predicted day range" in result["notes"][0]
 
     def test_a_model_that_raises_is_a_note_not_an_exception(self, monkeypatch):
         def boom(*_a, **_k):
             raise RuntimeError("the checkpoint is corrupt")
 
         monkeypatch.setattr(mo.apple_models, "load", boom)
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())
+        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars())
         assert result["items"] == []
         assert "the checkpoint is corrupt" in result["notes"][0]
 
     def test_bars_from_another_day_produce_a_note(self):
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars(),
+        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
                             session_date="2026-08-06")
         assert result["items"] == []
         assert "2026-08-06" in result["notes"][0]
 
 
-def stub_momentum_bundle(monkeypatch, proba=0.9, turn=None, threshold=0.05,
-                         min_dwell=15):
-    """A momentum bundle that answers every sequence with a fixed number.
-
-    The point of the momentum overlay is *which bars get asked* and what the
-    answer becomes on the chart, not what the answer is -- so the model is a
-    constant and the two TimeToChange2 bundles' own tests keep the numbers
-    honest.
-    """
-    from agent_stonks import persistence_model as pm
-
-    bundle = {
-        "feature_columns": pm.FEATURE_COLUMNS,
-        "seq_len": 20,
-        "threshold": threshold,
-        "settings": {"persistence": {"min_dwell": min_dwell}},
-        "asked": [],
-    }
-    monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: bundle)
-    monkeypatch.setattr(
-        mo.persistence_model, "predict_proba",
-        lambda b, X: np.full(len(np.atleast_3d(X)), proba),
-    )
-    monkeypatch.setattr(mo.persistence_model, "anticipates", lambda b: turn is not None)
-    monkeypatch.setattr(
-        mo.persistence_model, "predict_turn_proba", lambda b, X: np.array([turn])
-    )
-    return bundle
-
-
-class TestMomentumOverlay:
-    def test_marks_every_regime_change_as_an_event(self, monkeypatch):
-        from agent_stonks import persistence_model as pm
-
-        stub_momentum_bundle(monkeypatch)
-        bars = minute_bars()
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", bars)
-
-        frame = pm.frame_from_bars(bars)
-        scored = pm.add_momentum_regimes(frame, pm.momentum_params(None))
-        expected = int(scored["regime_change"].fillna(False).sum())
-
-        events = [i for i in result["items"] if i["kind"] == "event"]
-        assert expected > 0
-        assert len(events) == expected
-
-    def test_a_backed_change_into_positive_shades_the_bars_it_should_hold(
-        self, monkeypatch
-    ):
-        stub_momentum_bundle(monkeypatch, proba=0.9, threshold=0.05, min_dwell=15)
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())
-        spans = [i for i in result["items"] if i["kind"] == "span"]
-        assert spans, "a change the model backs should carry a hold window"
-        span = spans[0]
-        assert span["forward"] is True
-        assert span["y0"] is None and span["y1"] is None  # full height, a moment
-        length = pd.Timestamp(span["x1"]) - pd.Timestamp(span["x0"])
-        assert length == pd.Timedelta(minutes=15)
-
-    def test_only_a_prediction_gets_a_vertical_line(self, monkeypatch):
-        """A regime change is context; a change the model backs is a claim.
-
-        On a chart covering several sessions the difference is between a
-        readable picture and forty vertical rules.
-        """
-        stub_momentum_bundle(monkeypatch, proba=0.9, threshold=0.05)
-        items = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())["items"]
-        for event in (i for i in items if i["kind"] == "event"):
-            backed = "%" in event["label"]
-            assert event["line"] is backed, event["label"]
-
-    def test_a_change_below_the_threshold_gets_no_hold_window(self, monkeypatch):
-        stub_momentum_bundle(monkeypatch, proba=0.01, threshold=0.5)
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())
-        assert not [i for i in result["items"] if i["kind"] == "span"]
-        assert any("fades" in i.get("note", "") for i in result["items"])
-
-    def test_only_changes_into_positive_are_scored(self, monkeypatch):
-        stub_momentum_bundle(monkeypatch, proba=0.9)
-        items = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())["items"]
-        for item in items:
-            if item["kind"] != "event":
-                continue
-            if "positive" not in item["label"]:
-                assert "%" not in item["label"], "a non-positive change has no probability"
-
-    def test_a_classifier_bundle_never_forecasts_a_turn(self, monkeypatch):
-        stub_momentum_bundle(monkeypatch, turn=None)
-        items = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars())["items"]
-        assert not [i for i in items if i.get("icon") == "⤴"]
-
-    def test_a_forecasting_bundle_marks_the_newest_bar_when_it_is_not_positive(
-        self, monkeypatch
-    ):
-        from agent_stonks import persistence_model as pm
-
-        stub_momentum_bundle(monkeypatch, turn=0.8, threshold=0.05)
-        bars = minute_bars()
-        scored = pm.add_momentum_regimes(
-            pm.frame_from_bars(bars), pm.momentum_params(None)
-        )
-        if int(scored["regime"].iloc[-1]) == 1:
-            pytest.skip("this tape ends in the positive regime; nothing to anticipate")
-
-        items = mo.compute([mo.MOMENTUM_KEY], "AAPL", bars)["items"]
-        turns = [i for i in items if i.get("icon") == "⤴"]
-        assert len(turns) == 1
-        assert turns[0]["forward"] is True
-        assert pd.Timestamp(turns[0]["ts"]) == pd.Timestamp(bars[-1]["t"])
-
-    def test_too_few_bars_to_have_momentum_is_a_note(self, monkeypatch):
-        stub_momentum_bundle(monkeypatch)
-        result = mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars(n=5))
-        assert result["items"] == []
-        assert "bars" in result["notes"][0]
-
-    def test_the_momentum_model_choice_is_passed_through(self, monkeypatch):
-        seen = {}
-
-        def load(key, ticker=None):
-            seen["key"] = key
-            return None
-
-        monkeypatch.setattr(mo.apple_models, "load", load)
-        mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars(), momentum_model="nbeats")
-        assert seen["key"] == "nbeats"
-
-    def test_a_non_momentum_model_choice_falls_back_to_the_classifier(self, monkeypatch):
-        seen = {}
-
-        def load(key, ticker=None):
-            seen["key"] = key
-            return None
-
-        monkeypatch.setattr(mo.apple_models, "load", load)
-        mo.compute([mo.MOMENTUM_KEY], "AAPL", minute_bars(),
-                   momentum_model=mo.apple_models.DAYRANGE_KEY)
-        assert seen["key"] == mo.apple_models.PERSISTENCE_KEY
-
-
 class TestProfileRangeOverlay:
     """The LevelsML pack reduced to levels.
 
-    `profile_model` is stubbed here for the same reason the momentum bundle is:
+    `profile_model` is stubbed here for the same reason the day-range forecast is:
     its own tests pin the quantiles, and these pin what the chart does with
     them.
     """
@@ -457,11 +284,11 @@ class TestLiveOverlays:
         bars = minute_bars(n=40)
         state = self.make_state(bars)
 
-        mo.live_overlays(state, bars, [mo.MOMENTUM_KEY])
-        mo.live_overlays(state, bars, [mo.MOMENTUM_KEY])
+        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY])
         assert len(calls) == 1
 
-        mo.live_overlays(state, bars + minute_bars(n=1, base=210.0), [mo.MOMENTUM_KEY])
+        mo.live_overlays(state, bars + minute_bars(n=1, base=210.0), [mo.DAY_RANGE_KEY])
         assert len(calls) == 2
 
     def test_changing_the_selection_recomputes(self, monkeypatch):
@@ -471,8 +298,8 @@ class TestLiveOverlays:
         )
         bars = minute_bars(n=40)
         state = self.make_state(bars)
-        mo.live_overlays(state, bars, [mo.MOMENTUM_KEY])
-        mo.live_overlays(state, bars, [mo.MOMENTUM_KEY, mo.PROFILE_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY, mo.PROFILE_RANGE_KEY])
         assert len(calls) == 2
 
     def test_nothing_selected_does_not_touch_the_models(self, monkeypatch):
@@ -513,8 +340,8 @@ def window(forward=True):
 
 
 def moment():
-    return {"kind": "event", "key": mo.MOMENTUM_KEY,
-            "group": mo.OVERLAYS[mo.MOMENTUM_KEY].label,
+    return {"kind": "event", "key": "m",
+            "group": "Moments",
             "label": "→ positive 90%", "ts": BARS[50]["t"],
             "color": "#26c6a2", "icon": "▲", "price": 200.0, "dash": "dot",
             "note": "why", "forward": False}
@@ -606,7 +433,7 @@ class TestRenderer:
         assert len(marks) == 1
         assert len(marks[0].x) == 2
         # Named for the overlay, not for whichever moment happened to be first.
-        assert marks[0].name == "Momentum regime changes"
+        assert marks[0].name == "Moments"
 
     def test_a_forward_span_widens_the_time_axis_to_show_it(self):
         fig = self.chart([window(forward=True)])

@@ -3,9 +3,9 @@
 Three things are worth pinning, and they are the three ways this module can be
 wrong without anyone noticing.
 
-**The mirrored paths.** `model_catalogue` reads the N-BEATS and day-range
-sidecars without importing the modules that own them, because those modules
-import PyTorch at module scope and a tab that lists model names must not drag a
+**The mirrored paths.** `model_catalogue` reads the day-range sidecar
+without importing the module that owns it, because that module imports
+PyTorch at module scope and a tab that lists model names must not drag a
 200 MB dependency into the process. The price of that is a copy of their
 `model_path` lookup, and the copy has to keep agreeing -- a renamed file or a
 new env override would otherwise show a user a path nothing reads. These tests
@@ -37,29 +37,11 @@ from agent_stonks import apple_models, model_catalogue as mc
 # --- the mirrored paths -----------------------------------------------------
 
 @pytest.mark.parametrize("ticker", ["AAPL", "GOOGL", "INTC"])
-def test_nbeats_path_mirrors_the_real_one(ticker):
-    torch_model = pytest.importorskip("agent_stonks.nbeats_model")
-    assert mc._saved_path(
-        "APPLE_NBEATS_MODEL", "timetochange2_nbeats_{ticker}.pt", ticker
-    ) == torch_model.model_path(ticker)
-
-
-@pytest.mark.parametrize("ticker", ["AAPL", "GOOGL", "INTC"])
 def test_dayrange_path_mirrors_the_real_one(ticker):
     dayrange = pytest.importorskip("agent_stonks.dayrange_model")
     assert mc._saved_path(
         "APPLE_DAYRANGE_MODEL", "timetochange3_dayrange_{ticker}.joblib", ticker
     ) == dayrange.model_path(ticker)
-
-
-def test_nbeats_sidecar_paths_mirror_the_real_ones():
-    torch_model = pytest.importorskip("agent_stonks.nbeats_model")
-    spec = mc.spec(apple_models.NBEATS_KEY, "AAPL")
-    by_role = {f.role: f.path for f in spec.files}
-    real = torch_model.model_path("AAPL")
-    assert by_role["checkpoint"] == real
-    assert by_role["residual sidecar"] == torch_model.residuals_path(real)
-    assert by_role["metadata"] == torch_model.metadata_path(real)
 
 
 def test_dayrange_sidecar_paths_mirror_the_real_ones():
@@ -76,119 +58,17 @@ def test_dayrange_sidecar_paths_mirror_the_real_ones():
 def test_per_ticker_env_override_does_not_answer_for_other_symbols(monkeypatch, tmp_path):
     """The distinction each model module is careful about: the bare env var names
     one file, so it can only mean the default ticker's."""
-    monkeypatch.setenv("APPLE_NBEATS_MODEL", str(tmp_path / "only_aapl.pt"))
-    pattern = "timetochange2_nbeats_{ticker}.pt"
-    assert mc._saved_path("APPLE_NBEATS_MODEL", pattern, "AAPL").name == "only_aapl.pt"
-    assert mc._saved_path("APPLE_NBEATS_MODEL", pattern, "GOOGL").name == (
-        "timetochange2_nbeats_GOOGL.pt"
+    monkeypatch.setenv("APPLE_DAYRANGE_MODEL", str(tmp_path / "only_aapl.joblib"))
+    pattern = "timetochange3_dayrange_{ticker}.joblib"
+    assert mc._saved_path("APPLE_DAYRANGE_MODEL", pattern, "AAPL").name == "only_aapl.joblib"
+    assert mc._saved_path("APPLE_DAYRANGE_MODEL", pattern, "GOOGL").name == (
+        "timetochange3_dayrange_GOOGL.joblib"
     )
-    monkeypatch.setenv("APPLE_NBEATS_MODEL_GOOGL", str(tmp_path / "googl.pt"))
-    assert mc._saved_path("APPLE_NBEATS_MODEL", pattern, "GOOGL").name == "googl.pt"
+    monkeypatch.setenv("APPLE_DAYRANGE_MODEL_GOOGL", str(tmp_path / "googl.joblib"))
+    assert mc._saved_path("APPLE_DAYRANGE_MODEL", pattern, "GOOGL").name == "googl.joblib"
 
 
 # --- reading a spec off the files -------------------------------------------
-
-NBEATS_SIDECAR = {
-    "model": "nbeats",
-    "n_seeds": 5,
-    "trained_on": {
-        "momentum": {"horizon": 15, "enter_threshold": 0.9, "exit_threshold": 0.4},
-        "dataset": {"seq_len": 20},
-    },
-    "excluded_sessions_from": "2026-08-24",
-    "train_sessions": ["2026-07-13", "2026-07-14"],
-    "valid_sessions": ["2026-08-10"],
-    "test_sessions": ["2026-08-18"],
-    "metrics": {
-        "persistence": {"threshold": 0.41, "roc_auc": 0.85, "brier": 0.147},
-        "forecast": {"mae": 0.42, "mase": 0.696},
-        "hard_half": {"n": 38.0, "roc_auc": 0.666},
-    },
-    "torch_version": "2.13.0",
-}
-
-
-def _write_nbeats(tmp_path, monkeypatch, *, sidecar=True, residuals=True):
-    checkpoint = tmp_path / "nbeats_TEST.pt"
-    checkpoint.write_bytes(b"not a real checkpoint")
-    if residuals:
-        (tmp_path / "nbeats_TEST_residuals.npz").write_bytes(b"residuals")
-    if sidecar:
-        (tmp_path / "nbeats_TEST.json").write_text(json.dumps(NBEATS_SIDECAR))
-    monkeypatch.setenv("APPLE_NBEATS_MODEL_AAPL", str(checkpoint))
-    return checkpoint
-
-
-def test_nbeats_spec_reads_the_sidecar(tmp_path, monkeypatch):
-    pytest.importorskip("torch")
-    _write_nbeats(tmp_path, monkeypatch)
-    spec = mc.spec(apple_models.NBEATS_KEY, "AAPL")
-
-    assert spec.available and not spec.unavailable_reason
-    assert spec.threshold == pytest.approx(0.41)
-    assert spec.versions == {"torch": "2.13.0"}
-    assert spec.trained_at == "2026-07-13, 2026-07-14"
-    # The hard half is the number worth quoting, and it wins the headline
-    # whenever the training run recorded one.
-    assert spec.headline == ("hard-half ROC AUC", "0.666")
-    assert spec.metrics["persistence · roc_auc"] == 0.85
-    assert spec.metrics["forecast · mae"] == 0.42
-    assert spec.metrics["hard half · ROC AUC"] == 0.666
-    assert "2026-08-24" in spec.data_note
-
-
-def test_nbeats_spec_without_its_residual_sidecar_is_unavailable(tmp_path, monkeypatch):
-    """A checkpoint alone is not a model: `nbeats_model` refuses to assemble one
-    without the residuals its sampling step needs."""
-    pytest.importorskip("torch")
-    _write_nbeats(tmp_path, monkeypatch, residuals=False)
-    spec = mc.spec(apple_models.NBEATS_KEY, "AAPL")
-
-    assert not spec.available
-    assert "residual sidecar" in spec.unavailable_reason
-
-
-def test_missing_metadata_leaves_a_spec_described_but_not_broken(tmp_path, monkeypatch):
-    """Metadata is descriptive, so losing it costs the metrics and nothing else --
-    the estimator beside it would still trade."""
-    pytest.importorskip("torch")
-    _write_nbeats(tmp_path, monkeypatch, sidecar=False)
-    spec = mc.spec(apple_models.NBEATS_KEY, "AAPL")
-
-    assert not spec.available  # the metadata file is one of the model's files
-    assert spec.metrics == {}
-    assert spec.label and spec.predicts and spec.consumers
-
-
-def test_momentum_change_spec_reads_its_json_sidecar(tmp_path, monkeypatch):
-    bundle = tmp_path / "momentum_change_TEST.joblib"
-    bundle.write_bytes(b"stub")
-    (tmp_path / "momentum_change_TEST.json").write_text(
-        json.dumps(
-            {
-                "ticker": "AAPL",
-                "target": "mom_delta",
-                "target_units": "bps/min (momentum 15 bars after)",
-                "model_name": "Ridge",
-                "feature_cols": ["mom_5", "mom_15", "theta"],
-                "pipeline_params": {"window": 15, "smooth_halflife": 8.0, "c": 0.4},
-                "train_days": ["2026-07-10", "2026-08-10"],
-                "metrics": {"r2_test": 0.65, "holdout_r2": 0.478},
-                "saved_at": "2026-09-07T21:34:50",
-                "sklearn_version": "1.9.0",
-            }
-        )
-    )
-    monkeypatch.setenv("APPLE_MOMENTUM_CHANGE_MODEL_AAPL", str(bundle))
-    spec = mc.spec(apple_models.MOMENTUM_CHANGE_KEY, "AAPL")
-
-    assert spec.available
-    assert spec.algorithm.startswith("Ridge")
-    assert spec.features == ("mom_5", "mom_15", "theta")
-    assert spec.headline == ("R² (holdout week)", "0.478")
-    assert "2 training days" in spec.data_note
-    assert spec.versions["scikit-learn"] == "1.9.0"
-
 
 def test_open_profile_spec_reads_the_gzipped_pack():
     """The one model fitted across a universe rather than on a symbol, so its
