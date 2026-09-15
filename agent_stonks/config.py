@@ -213,6 +213,21 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
     "GOOGL": (0.65, 0.05),
     "INTC": (0.50, 0.05),
 }
+# The day-range managed exit, on top of the sell level and the closing flatten
+# (`DayRangeTrader._exit`). Unlike the levels these were never swept: they are
+# specified starting points, and none of them is in the notebook's numbers.
+#   stop       sell everything once a bar's low is STOP_K x ADR under the fill,
+#              and take no new entry for the rest of the session
+#   take       once the momentum score has fallen MOMENTUM_DROP sigmas from its
+#              best since the entry with the position in profit, sell
+#              TAKE_FRACTION of it ...
+#   runner     ... and keep the rest for the sell level only if that is still
+#              HOLD_MIN_GAIN_K x ADR above the fill (otherwise sell it all);
+#              a runner is sold if the price comes back to the fill
+APPLE_TRADER_STOP_K = 0.20
+APPLE_TRADER_MOMENTUM_DROP = 1.0
+APPLE_TRADER_TAKE_FRACTION = 0.70
+APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Flatten this many minutes before the close: the day-range forecast is a

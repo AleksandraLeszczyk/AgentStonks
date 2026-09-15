@@ -192,7 +192,10 @@ class BaseTrader:
         quantity: float,
         reasoning: str,
         log_extra: "dict | None" = None,
-    ) -> None:
+    ):
+        """Sell `quantity` and forget the entry once it fills. Returns the
+        decision, so a strategy that sold only part of its position can tell
+        how much went and put back what it remembers about the rest."""
         decision = tracker.record_trade(
             self.ticker, "sell", quantity, reasoning,
             state.api_key, state.api_secret, state.feed,
@@ -200,6 +203,7 @@ class BaseTrader:
         self.log_decision(state, decision, log_extra)
         if decision.status == "filled":
             self.entry = None
+        return decision
 
     def log_decision(
         self, state: "AppState", decision, extra: "dict | None" = None

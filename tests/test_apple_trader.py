@@ -109,11 +109,18 @@ class Tape:
 
     The first five bars are the 09:30 opening window the forecast is built on;
     everything after them is a tradable bar the test appends one at a time.
+
+    The momentum score is scripted per bar (`append(..., mom=)`, NaN when not
+    given, as it is while the score warms up), so the exit rules can be pinned
+    without engineering a price path that produces a particular score. Pass
+    `real_momentum=True` to have the trader compute it from the closes instead.
     """
 
     OPEN = pd.Timestamp("2026-07-21 09:30", tz="America/New_York")
 
-    def __init__(self, monkeypatch, broker=None, minutes: int = 5):
+    def __init__(
+        self, monkeypatch, broker=None, minutes: int = 5, real_momentum: bool = False
+    ):
         self.broker = broker
         self.rows: list[dict] = []
         self.index: list[pd.Timestamp] = []
@@ -125,6 +132,10 @@ class Tape:
         monkeypatch.setattr(
             at.momentum_regime, "minute_frame", lambda *a, **k: self.frame()
         )
+        if not real_momentum:
+            monkeypatch.setattr(
+                at.momentum_regime, "compute_momentum", lambda frame, *a, **k: frame
+            )
         monkeypatch.setattr(at.historical, "fetch_daily_ohlc_bars", lambda *a, **k: [])
         monkeypatch.setattr(at.historical, "fetch_session_open", lambda *a, **k: None)
         monkeypatch.setattr(dayrange, "forecast_session", self._forecast)
@@ -133,7 +144,7 @@ class Tape:
         self.forecast_calls += 1
         return dict(FORECAST)
 
-    def append(self, close: float, low=None, high=None, offset=None):
+    def append(self, close: float, low=None, high=None, offset=None, mom=None):
         """One more closed bar. `offset` is minutes from the open; without it
         the bar lands at 10:30, comfortably past the opening window."""
         if offset is None:
@@ -146,14 +157,18 @@ class Tape:
                 "low": close if low is None else low,
                 "close": close,
                 "volume": 1.0e5,
-                "minutes_from_open": float(offset),
+                "mom": float("nan") if mom is None else float(mom),
             }
         )
         if self.broker is not None:
             self.broker.price = close
 
     def frame(self) -> pd.DataFrame:
-        return pd.DataFrame(self.rows, index=pd.DatetimeIndex(self.index))
+        # The same session bookkeeping `minute_frame` attaches, which is what
+        # the momentum score groups on.
+        return at.momentum_regime.add_session_columns(
+            pd.DataFrame(self.rows, index=pd.DatetimeIndex(self.index))
+        )
 
 
 def dayrange_config(**kwargs) -> AppleTraderConfig:
@@ -281,18 +296,68 @@ class TestDayRangeExit:
         assert tracker.position_for(TICKER) == 0
         assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
 
-    def test_a_position_that_never_reaches_the_target_is_simply_held(
+    def test_a_trade_that_goes_the_wrong_way_is_stopped_out(
         self, state, market_open, monkeypatch
     ):
-        """No stop, by design: the forecast says where the day tops out, and
-        bailing on weakness would be a second, unmeasured rule."""
+        """Filled at 103 on a $10 ADR, the default 0.2 stop sits at 101.00 --
+        a touch, like the levels, so the low decides."""
         broker = FakeBroker(103.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tape = Tape(monkeypatch, broker)
         trader = self._entered(state, tracker, tape)
 
-        for price in (101.0, 99.0, 96.0, 94.0):
-            tape.append(price)
+        tape.append(101.5, low=101.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(101.2, low=100.99)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "Stop loss" in reasoning and "101.00" in reasoning
+
+    def test_the_stop_is_a_distance_in_adrs_from_the_fill(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape, stop_k=0.5)  # 103 - 5 = 98
+
+        tape.append(99.0, low=98.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(98.0, low=97.9)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert "98.00" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_after_a_stop_the_session_buys_nothing_more(
+        self, state, market_open, monkeypatch
+    ):
+        """The buy level is right above a stopped-out price, so re-arming it
+        would buy the same slide again, one stop lower each time."""
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape)
+
+        tape.append(100.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        for _ in range(3):
+            tape.append(100.0, low=BUY_LEVEL - 3)
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_with_the_exit_switched_off_a_losing_position_is_simply_held(
+        self, state, market_open, monkeypatch
+    ):
+        """Notebook 05's rule as specified, and what a record written before
+        the managed exit existed replays as: no stop and no momentum take,
+        however far the price and the score fall."""
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape, stop_k=0.0, momentum_drop=0.0)
+
+        for price, mom in ((104.0, 2.0), (104.5, 0.5), (99.0, -1.0), (94.0, -2.5)):
+            tape.append(price, mom=mom)
             assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
         assert tracker.position_for(TICKER) > 0
 
@@ -324,6 +389,144 @@ class TestDayRangeExit:
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
         fills = [d for d in tracker.snapshot()["decisions"] if d.status == "filled"]
         assert [d.action for d in fills] == ["buy", "sell", "buy"]
+
+
+class TestDayRangeMomentumTake:
+    """Banking gains short of the target when the move carrying them fades.
+
+    Every test fills at 103 on the $10 ADR, so the 109 sell level is 0.6 ADR
+    above the fill -- past the 0.3 worth keeping a runner for -- and the stop
+    sits at 101. The momentum score is scripted per bar, except in the last
+    test, which computes it from the closes.
+    """
+
+    def _entered(self, state, monkeypatch, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker, real_momentum=kwargs.pop("real_momentum", False))
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        tape.append(103.0, low=BUY_LEVEL - 0.01, mom=0.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        return trader, tracker, tape
+
+    def _taken(self, state, monkeypatch, **kwargs):
+        trader, tracker, tape = self._entered(state, monkeypatch, **kwargs)
+        held = tracker.position_for(TICKER)
+        tape.append(105.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(105.2, mom=0.9)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        return trader, tracker, tape, held
+
+    def test_a_fading_move_in_profit_banks_most_and_keeps_a_runner(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._entered(state, monkeypatch)
+        held = tracker.position_for(TICKER)
+
+        tape.append(105.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(105.5, mom=1.2)  # 0.8σ off the peak: a wobble, not a fade
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(105.2, mom=0.9)  # 1.1σ
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+
+        runner = tracker.position_for(TICKER)
+        assert held - runner == int(held * 0.7)
+        assert 0 < runner < held
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "Momentum take" in reasoning and "Banking" in reasoning
+
+    def test_the_share_taken_is_configurable(self, state, market_open, monkeypatch):
+        _, tracker, _, held = self._taken(state, monkeypatch, take_fraction=0.5)
+        assert tracker.position_for(TICKER) == held - int(held * 0.5)
+
+    def test_the_runner_is_not_trimmed_again_and_waits_for_the_sell_level(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape, _ = self._taken(state, monkeypatch)
+        runner = tracker.position_for(TICKER)
+
+        tape.append(104.0, mom=-2.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == runner
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_runner_is_sold_if_the_price_comes_back_to_the_fill(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape, _ = self._taken(state, monkeypatch)
+
+        tape.append(103.5, low=103.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(103.2, low=102.99)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Breakeven" in tracker.snapshot()["decisions"][-1].reasoning
+
+        # A breakeven is not a stop: the forecast was not proven wrong, so the
+        # buy level re-arms as it does after the target.
+        tape.append(102.6, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_a_target_too_close_to_wait_for_is_sold_whole(
+        self, state, market_open, monkeypatch
+    ):
+        """0.6 ADR left to the sell level, under a 0.7 threshold."""
+        trader, tracker, tape = self._entered(state, monkeypatch, hold_min_gain_k=0.7)
+
+        tape.append(105.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(104.5, mom=0.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "whole position" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_there_is_no_gain_to_take_under_water(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._entered(state, monkeypatch)
+        held = tracker.position_for(TICKER)
+
+        tape.append(104.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(102.9, mom=-1.0)  # below the fill, above the stop
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == held
+
+    def test_the_peak_is_this_positions_not_the_mornings(
+        self, state, market_open, monkeypatch
+    ):
+        """A surge before the entry is not a move this trade was riding."""
+        trader, tracker, tape = self._entered(state, monkeypatch)
+        held = tracker.position_for(TICKER)
+        for row in tape.rows[:-1]:
+            row["mom"] = 3.0
+
+        tape.append(104.0, mom=1.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == held
+
+    def test_the_score_is_computed_from_the_tape(self, state, market_open, monkeypatch):
+        """End to end on the real momentum score: a zig-zag climb that never
+        reaches the target, then a turn. The climb alone moves the smoothed
+        score about 0.8σ off its first peak, under the 1σ trigger; the turn
+        crosses it at 105.30, and the runner goes back out at the fill."""
+        trader, tracker, tape = self._entered(state, monkeypatch, real_momentum=True)
+        price = 103.0
+        for step in [0.3, -0.1] * 15 + [-0.3, 0.1] * 15:
+            price += step
+            tape.append(round(price, 2))
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        fills = [d for d in tracker.snapshot()["decisions"] if d.status == "filled"]
+        assert [d.action for d in fills] == ["buy", "sell", "sell"]
+        buy, take, breakeven = fills
+        assert "Momentum take" in take.reasoning and take.price == pytest.approx(105.3)
+        assert take.filled_quantity == int(buy.filled_quantity * 0.7)
+        assert "Breakeven" in breakeven.reasoning
+        assert tracker.position_for(TICKER) == 0
 
 
 class TestDayRangeGuards:
@@ -411,10 +614,39 @@ class TestStrategySelection:
         )
 
     def test_the_levels_are_the_signature(self):
-        base = config_signature(dayrange_config())
+        base = config_signature(dayrange_config(stop_k=0.0, momentum_drop=0.0))
         assert base == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
-        assert base != config_signature(dayrange_config(buy_k=0.8))
-        assert base != config_signature(dayrange_config(sell_k=0.2))
+        assert base != config_signature(
+            dayrange_config(buy_k=0.8, stop_k=0.0, momentum_drop=0.0)
+        )
+        assert base != config_signature(
+            dayrange_config(sell_k=0.2, stop_k=0.0, momentum_drop=0.0)
+        )
+
+    def test_the_exit_is_in_the_signature_only_while_switched_on(self):
+        on = config_signature(dayrange_config())
+        assert on == (
+            "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%,"
+            "stop=E-0.2A,take=70%@mom-1,runner>=0.3A)"
+        )
+        for field, value in (
+            ("stop_k", 0.3), ("momentum_drop", 1.5),
+            ("take_fraction", 0.5), ("hold_min_gain_k", 0.5),
+        ):
+            assert config_signature(dayrange_config(**{field: value})) != on, field
+        # With the take off its two knobs trade nothing, so they sign nothing.
+        off = dayrange_config(momentum_drop=0.0)
+        assert config_signature(off) == config_signature(
+            replace(off, take_fraction=0.5, hold_min_gain_k=0.9)
+        )
+
+    def test_exit_distances_cannot_be_negative_and_the_take_is_a_share(self):
+        for field in ("stop_k", "momentum_drop", "hold_min_gain_k"):
+            with pytest.raises(ValueError, match=field):
+                dayrange_config(**{field: -0.1})
+        for fraction in (0.0, 1.5):
+            with pytest.raises(ValueError, match="take_fraction"):
+                dayrange_config(take_fraction=fraction)
 
     def test_a_sell_level_below_the_buy_level_is_refused(self):
         """Both are distances *below* the predicted high, so the sell distance
@@ -458,8 +690,8 @@ class TestDayRangeLevelDefaults:
 
     def test_the_default_pair_signs_the_run(self):
         buy_k, sell_k = at.dayrange_levels("AAPL")
-        assert config_signature(AppleTraderConfig(model_key="dayrange")) == (
-            f"dayrange_AAPL(buy=H-{buy_k:g}A,sell=H-{sell_k:g}A,size=95%)"
+        assert config_signature(AppleTraderConfig(model_key="dayrange")).startswith(
+            f"dayrange_AAPL(buy=H-{buy_k:g}A,sell=H-{sell_k:g}A,size=95%"
         )
 
 

@@ -321,9 +321,14 @@ def _render_apple_rules() -> None:
         "expected to top out.\n"
         "- **Sell** when a bar's high reaches `H − sell × A`, just under it. Then it can "
         "buy again, as often as the day allows.\n"
-        "- Anything still open is flattened before the close. There is no stop: the "
-        "forecast is a statement about where today tops out, so leaving early on weakness "
-        "would be a second, unmeasured strategy on top of this one.\n\n"
+        "- Anything still open is flattened before the close.\n"
+        "- A **managed exit** sits on top, every distance measured from the fill: a "
+        "**stop** when a bar's low falls `stop × A` under it (after which the session takes "
+        "no new entry); a **take** of part of the position once the momentum score fades "
+        "`drop` σ off its best since the entry while the trade is in profit; and the rest "
+        "kept as a **runner** only if the sell level is still `hold × A` above the fill, "
+        "sold if the price comes back to the fill. It is not in the notebook's numbers, "
+        "and a stored run from before it existed replays with it off.\n\n"
         "It is a mean-reversion bet, and deliberately so — what the model forecasts well "
         "is the *width* of the day, not its direction. On a day that never dips to the buy "
         "level it does nothing at all."
@@ -1506,12 +1511,19 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "them here is the intended use — the defaults are each instrument's best "
             "plateau over the notebook's sessions, which is still only a month or two of days."
         ),
+        "dayrange_exits": (
+            "The managed exit, every distance measured from the fill in the same ADR. Each "
+            "switched-on knob is part of the signature, so sweeping the stop or the fade "
+            "queues its own configuration; 0 switches the stop or the take off."
+        ),
     },
     outro={
         "dayrange": (
-            ":material/info: No entry mode, no probability, no trailing stop — none of them "
-            "mean anything to a forecast of the day's range, and the run's signature leaves "
-            "them out so a day-range result is never filed beside a momentum one."
+            ":material/info: No entry mode and no probability — neither means anything to a "
+            "forecast of the day's range, and the signature leaves them out so a day-range "
+            "result is never filed beside a momentum one. The exit knobs appear in it only "
+            "while switched on, so a run with both off files beside the records made before "
+            "the exit existed, which replay that way."
         ),
     },
     help={

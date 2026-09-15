@@ -1834,12 +1834,20 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Both are distances in **average daily ranges** (the trailing 14-day ADR in "
             "dollars), so they scale with how wide the sessions have been."
         ),
+        "dayrange_exits": (
+            "How a position gets out before the sell level. Every distance is measured from "
+            "the fill, in the same ADR: a stop underneath it, a partial take when momentum "
+            "fades while the trade is in profit, and a runner kept for the sell level only "
+            "when that is still far enough away — sold if the price comes back to the fill. "
+            "None of this is in the notebook's results."
+        ),
     },
     outro={
         "dayrange": (
-            ":material/info: No trailing stop and no probability here — the forecast is made "
-            "once and the rule is the two levels. The trade closes at the sell level, or at "
-            "the closing flatten if the day never gets there."
+            ":material/info: The forecast is made once. A trade closes at the sell level, the "
+            "stop, a momentum take (its runner at the sell level or back at the fill), or the "
+            "closing flatten. After a stop the agent buys nothing more that day — the session "
+            "has not gone the way the forecast said."
         ),
     },
     help={
@@ -1856,6 +1864,30 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
             "the smaller number. Anything the day never reaches is held to the closing "
             "flatten."
+        ),
+        "stop_k": (
+            "Sells everything when a bar's low reaches this many ADRs under the fill price. "
+            "After a stop the agent buys nothing more that day, because the session has not "
+            "gone the way the forecast said. 0 switches the stop off, leaving the position "
+            "to the sell level or the flatten."
+        ),
+        "momentum_drop": (
+            "How far the momentum score — the tape's drift in sigmas — must fall from its "
+            "best since the entry, while the position is in profit, before gains are taken "
+            "short of the sell level. Smaller fires on any wobble; larger waits for a real "
+            "turn. 0 switches the take off, and with it the runner."
+        ),
+        "take_fraction": (
+            "How much of the position a momentum take sells when the rest is kept as a "
+            "runner. Whole shares, rounded down, and at least one."
+        ),
+        "hold_min_gain_k": (
+            "Keep a runner only if the sell level is still this many ADRs above the fill; "
+            "otherwise a momentum take sells everything. The fill is at or above the buy "
+            "level, so the gap is at most buy − sell — 0.15 on AAPL's default pair, 0.60 on "
+            "GOOGL's — which means 0.30 keeps a runner on GOOGL and INTC and never on AAPL. "
+            "A runner is sold at the sell level, at the flatten, or if the price comes back "
+            "to the fill."
         ),
     },
 )

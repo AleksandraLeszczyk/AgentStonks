@@ -649,6 +649,19 @@ class TestRuleAgentRecords:
             "nbeats_AAPL("
         )
 
+    def test_a_record_from_before_the_managed_exit_replays_without_it(self):
+        """A position used to leave only at the sell level or the flatten, so a
+        record without the exit fields must neither pick up today's stop and
+        momentum take nor sign as a run that had them."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
+        assert (old.stop_k, old.momentum_drop) == (0.0, 0.0)
+        assert agent.signature(old) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
+
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        assert today.stop_k > 0 and today.momentum_drop > 0
+        assert agent.signature(today) != agent.signature(replace(today, stop_k=0.0))
+
 
 class TestDayRangeEngine:
     """The day-range rules replayed end to end on the engine.
@@ -846,6 +859,20 @@ class TestDayRangeEngine:
             AppleTraderConfig(model_key="dayrange")
         ).startswith("dayrange_AAPL(buy=")
 
+    def test_the_managed_exit_reaches_the_trader_through_the_record(
+        self, dayrange_store, monkeypatch
+    ):
+        """A record with the exit on replays with it -- the momentum score
+        computed over the stored session -- and still trades the tape."""
+        _, result = self._run(
+            monkeypatch, {"stop_k": 0.2, "momentum_drop": 1.0, "hold_min_gain_k": 0.3}
+        )
+        assert result.error is None
+        assert result.config_summary["rule_config"]["stop_k"] == 0.2
+        fills = [d for d in result.decisions if d["status"] == "filled"]
+        assert fills[0]["action"] == "buy"
+        assert fills[-1]["action"] == "sell"
+
 
 class TestAppleTrader2Engine:
     """Apple Trader 2 on the same rule day loop, driven by a rule list.
@@ -1005,6 +1032,7 @@ class TestRuleAgentRegistry:
         )
         for field, value in (
             ("buy_k", 0.2), ("sell_k", 0.3), ("position_pct", 50.0),
+            ("stop_k", 0.5), ("momentum_drop", 2.0),
         ):
             other = replace(base, **{field: value})
             assert agent.signature(other) != agent.signature(base), field

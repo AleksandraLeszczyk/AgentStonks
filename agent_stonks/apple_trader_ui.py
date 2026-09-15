@@ -167,6 +167,7 @@ def dayrange_params(
             f"predicted high must be the smaller of the two — using {sell_k:g} until the "
             "buy distance is raised."
         )
+    stop_k, momentum_drop, take_fraction, hold_min_gain_k = exit_params(defaults, copy)
     _caption(copy.outro.get("dayrange"))
     return AppleTraderConfig(
         model_key=model_key,
@@ -174,7 +175,53 @@ def dayrange_params(
         buy_k=float(buy_k),
         sell_k=float(sell_k),
         position_pct=float(position_pct),
+        stop_k=stop_k,
+        momentum_drop=momentum_drop,
+        take_fraction=take_fraction,
+        hold_min_gain_k=hold_min_gain_k,
     )
+
+
+def exit_params(
+    defaults: AppleTraderConfig, copy: FormCopy
+) -> "tuple[float, float, float, float]":
+    """The managed exit: a stop under the fill, a momentum take, and a runner.
+
+    Not keyed by ticker, unlike the levels: none of these was swept per
+    instrument, so there is no per-symbol default for a switch to re-seed. The
+    two knobs that only mean something once the take is on are greyed out while
+    it is off rather than hidden, so turning it back on finds them where they were.
+    """
+    _caption(copy.intro.get("dayrange_exits"))
+    col_a, col_b = st.columns(2)
+    stop_k = col_a.number_input(
+        "Stop loss (× ADR below the fill)",
+        min_value=0.0, max_value=3.0, value=defaults.stop_k, step=0.05, format="%.2f",
+        key=copy.key("stop_k"),
+        help=copy.help.get("stop_k"),
+    )
+    momentum_drop = col_b.number_input(
+        "Momentum fade to take gains (σ off its peak)",
+        min_value=0.0, max_value=5.0, value=defaults.momentum_drop, step=0.1, format="%.1f",
+        key=copy.key("momentum_drop"),
+        help=copy.help.get("momentum_drop"),
+    )
+    take_pct = col_a.number_input(
+        "Take on a fade (% of shares)",
+        min_value=1.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
+        key=copy.key("take_pct"),
+        help=copy.help.get("take_fraction"),
+        disabled=not momentum_drop,
+    )
+    hold_min_gain_k = col_b.number_input(
+        "Keep a runner if the target is ≥ (× ADR above the fill)",
+        min_value=0.0, max_value=3.0, value=defaults.hold_min_gain_k, step=0.05,
+        format="%.2f",
+        key=copy.key("hold_min_gain_k"),
+        help=copy.help.get("hold_min_gain_k"),
+        disabled=not momentum_drop,
+    )
+    return float(stop_k), float(momentum_drop), float(take_pct) / 100.0, float(hold_min_gain_k)
 
 
 def _caption(text: "str | None") -> None:

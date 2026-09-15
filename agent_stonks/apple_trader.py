@@ -28,6 +28,7 @@ The agent keeps its name. It is the loop that is Apple Trader, not the symbol.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from datetime import timedelta
@@ -43,11 +44,15 @@ from .config import (
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_DAYRANGE_LEVELS,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
+    APPLE_TRADER_HOLD_MIN_GAIN_K,
     APPLE_TRADER_MODEL,
+    APPLE_TRADER_MOMENTUM_DROP,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_SELL_K,
+    APPLE_TRADER_STOP_K,
+    APPLE_TRADER_TAKE_FRACTION,
 )
-from .decisions import DecisionTracker
+from .decisions import DecisionTracker, whole_shares
 from .state import AppState
 
 APPLE_TRADER_KEY = "apple_trader"
@@ -103,8 +108,35 @@ class AppleTraderConfig:
     sell_k: Optional[float] = None
     position_pct: float = APPLE_TRADER_POSITION_PCT
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
+    # The managed exit on top of the sell level and the flatten -- see
+    # `DayRangeTrader._exit`. Distances are in the same average daily range the
+    # levels are written in, but measured from the fill rather than from H.
+    #
+    # How far under the fill a bar's low may reach before the trade is taken to
+    # have gone the wrong way. 0 switches the stop off.
+    stop_k: float = APPLE_TRADER_STOP_K
+    # How far (in momentum sigmas) the score has to fall from its best since the
+    # entry, with the position in profit, to take gains short of the sell level.
+    # 0 switches the take off, and with it the runner and its breakeven.
+    momentum_drop: float = APPLE_TRADER_MOMENTUM_DROP
+    # The share of the position that take sells when a runner is kept.
+    take_fraction: float = APPLE_TRADER_TAKE_FRACTION
+    # The gain still left to the sell level, in ADRs above the fill, that is
+    # worth keeping a runner for. Short of it the take sells everything.
+    hold_min_gain_k: float = APPLE_TRADER_HOLD_MIN_GAIN_K
 
     def __post_init__(self) -> None:
+        for name in ("stop_k", "momentum_drop", "hold_min_gain_k"):
+            if getattr(self, name) < 0:
+                raise ValueError(
+                    f"{name} {getattr(self, name)!r} is a distance and cannot be negative "
+                    "(0 is how the stop or the momentum take is switched off)"
+                )
+        if not 0 < self.take_fraction <= 1:
+            raise ValueError(
+                f"take_fraction {self.take_fraction!r} must be a share of the position, "
+                "above 0 and at most 1"
+            )
         self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
         # Resolved per field, so a config that names only one level still
         # gets the instrument's default for the other.
@@ -142,11 +174,24 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     `apple_models.get`, which falls back to the default for a key it does not
     know -- a record naming a removed model should sign as that model, not as
     the one that is left.
+
+    The managed exit is written only while switched on -- the stop when
+    `stop_k` is set, the take and its runner threshold when `momentum_drop` is
+    -- so a config with both off signs exactly as a run recorded before the
+    exit existed, and `take_fraction` never splits two runs that cannot differ.
     """
     c = config or AppleTraderConfig()
+    exits = ""
+    if c.stop_k:
+        exits += f",stop=E-{c.stop_k:g}A"
+    if c.momentum_drop:
+        exits += (
+            f",take={c.take_fraction * 100:g}%@mom-{c.momentum_drop:g},"
+            f"runner>={c.hold_min_gain_k:g}A"
+        )
     return (
         f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}A,sell=H-{c.sell_k:g}A,"
-        f"size={c.position_pct:g}%)"
+        f"size={c.position_pct:g}%{exits})"
     )
 
 
@@ -272,8 +317,13 @@ class DayRangeTrader(BaseTrader):
     sells just under it, and on a day that never dips that far it simply does
     nothing.
 
-    There is no regime, no probability, no threshold and no trailing stop. The
-    two things that change what it does are `buy_k` and `sell_k`.
+    The entry is those two levels and nothing else -- no regime, no
+    probability. The exit has more to it (`_exit`): on top of the sell level
+    and the flatten there is a stop under the fill, a momentum take that banks
+    most of a fading gain short of the target, and a breakeven on the runner
+    that take leaves. That half is not the notebook's and has not been measured
+    against it; `stop_k = momentum_drop = 0` switches it off and gives notebook
+    05's rule back.
 
     Against the notebook
     --------------------
@@ -369,10 +419,11 @@ class DayRangeTrader(BaseTrader):
         position = tracker.position_for(self.ticker)
         if position > 0 and self.entry is None:
             # A position without a remembered entry (agent restarted onto an
-            # existing ledger): adopt it, so the log reads honestly. The exit
-            # is a fixed price level rather than a trailing one, so nothing about
-            # the decision depends on this.
-            self.entry = {"price": float(last["close"]), "bars": 0}
+            # existing ledger): adopt it at this bar. The real fill is not
+            # known, so the stop, the breakeven and the momentum peak are all
+            # measured from here -- an approximation, but a stop measured from
+            # nothing would be worse.
+            self.entry = {"price": float(last["close"]), "bars": 0, "ts": ts}
         if position <= 0:
             self.entry = None
         if fresh_bar and self.entry is not None:
@@ -387,10 +438,17 @@ class DayRangeTrader(BaseTrader):
             return "warming_up"
 
         if position > 0:
-            reason = self._exit_reason(last)
-            if reason is not None:
-                self._sell(state, tracker, position, last, reason)
+            exit_ = self._exit(frame, position)
+            if exit_ is not None:
+                quantity, reason, kind = exit_
+                self._sell(state, tracker, quantity, last, reason, kind)
                 return "sold"
+            return "hold"
+
+        # A stop means the day did not go the way the forecast said, and the
+        # buy level is by then usually just above the price -- re-arming it
+        # would buy the same slide again, one stop lower each time.
+        if self.plan.get("stopped_out"):
             return "hold"
 
         if fresh_bar and float(last["low"]) <= self.plan["buy_level"]:
@@ -479,58 +537,208 @@ class DayRangeTrader(BaseTrader):
 
     # --- the check on an open position -------------------------------------
 
-    def _exit_reason(self, bar) -> "str | None":
-        """Why this long should be closed on this bar, or None to keep holding.
+    # Which rule closed (or trimmed) a position -- carried on the log entry.
+    EXIT_BREAKEVEN = "breakeven"
+    EXIT_STOP = "stop"
+    EXIT_TARGET = "target"
+    EXIT_FLATTEN = "flatten"
+    EXIT_TAKE = "momentum_take"
 
-        Two ways out, and neither is a stop: the level the position was opened
-        to reach, and the closing bell. A day that never comes back up to the
-        sell level is held to the flatten, which is the rule as specified --
-        the forecast says where the day tops out, so an early exit on weakness
-        would be a second, unmeasured strategy sitting on top of this one.
+    def _exit(self, frame, position: float) -> "tuple[float, str, str] | None":
+        """What to sell on this bar, why, and under which rule -- or None to hold.
+
+        Returns `(quantity, reasoning, kind)`. The checks run in a fixed order
+        and the first that applies takes the bar:
+
+        1. **breakeven** -- a runner (what a momentum take left behind) is sold
+           once a bar's low comes back to the fill. It was kept to wait for the
+           sell level, not to hand back the gain the take already banked.
+        2. **stop** -- a bar's low at `fill - stop_k x ADR`: the day went the
+           other way from the forecast. Everything is sold, and `run_cycle`
+           takes no new entry for the rest of the session.
+        3. **target** -- a bar's high at the sell level. Everything.
+        4. **flatten** -- the closing bell. Everything.
+        5. **momentum take** -- see `_momentum_take`.
+
+        The price rules trigger on a touch -- the low for the two stops, the
+        high for the target -- like the resting levels the entry already
+        models; the momentum take reads the close. The stops come before the
+        target because a bar wide enough to touch both says nothing about which
+        came first, so it is read the careful way.
+
+        With `stop_k` and `momentum_drop` both 0 only the target and the
+        flatten are left, which is notebook 05's rule as specified.
         """
-        entry_price = (self.entry or {}).get("price") or 0.0
-        price = float(bar["close"])
+        config, plan = self.config, self.plan
+        bar = frame.iloc[-1]
+        entry = self.entry or {}
+        entry_price = entry.get("price") or 0.0
+        price, low, high = float(bar["close"]), float(bar["low"]), float(bar["high"])
         pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
 
-        if float(bar["high"]) >= self.plan["sell_level"]:
-            return (
-                f"Target: the bar traded up to ${float(bar['high']):,.2f}, at or through the "
-                f"${self.plan['sell_level']:,.2f} sell level "
-                f"(H − {self.config.sell_k:g} × ADR). Selling at market ({pnl_pct:+.2f}%)."
-            )
+        if entry.get("runner") and low <= entry_price:
+            return position, (
+                f"Breakeven: the runner the momentum take left traded back down to "
+                f"${low:,.2f}, at or under the ${entry_price:,.2f} fill. It was kept for the "
+                f"${plan['sell_level']:,.2f} sell level, not to give the gain back, so the "
+                f"rest is sold at market ({pnl_pct:+.2f}%)."
+            ), self.EXIT_BREAKEVEN
+
+        if config.stop_k and entry_price:
+            stop = entry_price - config.stop_k * plan["adr14_abs"]
+            if low <= stop:
+                return position, (
+                    f"Stop loss: the bar traded down to ${low:,.2f}, at or through the "
+                    f"${stop:,.2f} stop ({config.stop_k:g} × ADR under the "
+                    f"${entry_price:,.2f} fill). The day is not going the way the forecast "
+                    f"said, so the position is closed at market ({pnl_pct:+.2f}%) and "
+                    "nothing more is bought this session."
+                ), self.EXIT_STOP
+
+        if high >= plan["sell_level"]:
+            return position, (
+                f"Target: the bar traded up to ${high:,.2f}, at or through the "
+                f"${plan['sell_level']:,.2f} sell level "
+                f"(H − {config.sell_k:g} × ADR). Selling at market ({pnl_pct:+.2f}%)."
+            ), self.EXIT_TARGET
 
         if self.closing_soon():
             to_close = market_hours.seconds_to_close() or 0.0
-            return (
+            return position, (
                 f"Session ends in {to_close / 60:.0f} min and the day never came back up to "
-                f"${self.plan['sell_level']:,.2f}. The forecast is a statement about today "
+                f"${plan['sell_level']:,.2f}. The forecast is a statement about today "
                 f"only, so the position is flattened rather than carried overnight "
                 f"({pnl_pct:+.2f}%)."
-            )
-        return None
+            ), self.EXIT_FLATTEN
+
+        return self._momentum_take(frame, position, entry_price, price)
+
+    def _momentum_take(
+        self, frame, position: float, entry_price: float, price: float
+    ) -> "tuple[float, str, str] | None":
+        """Bank gains short of the target when the move carrying them fades.
+
+        Fires when the position is in profit and the momentum score has fallen
+        `momentum_drop` sigmas from its best since the entry bar. The peak is
+        taken over this position's bars only: a morning surge before the entry
+        is not a move this trade was riding.
+
+        What it sells depends on how much the forecast still promises. If the
+        sell level is `hold_min_gain_k x ADR` or more above the fill,
+        `take_fraction` of the shares go and the rest is kept as a runner --
+        left to the sell level, the flatten, or the breakeven. Short of that the
+        target is too close to be worth the wait and everything goes. Once per
+        position: a runner is never trimmed again.
+
+        The score is recomputed over the session on each call rather than
+        tracked bar by bar, so a cycle that missed a bar still sees its peak.
+        Only reached with a profitable, untrimmed position and the rule on.
+        """
+        config, plan = self.config, self.plan
+        entry = self.entry or {}
+        if (
+            not config.momentum_drop
+            or entry.get("runner")
+            or not entry_price
+            or price <= entry_price
+        ):
+            return None
+
+        mom = momentum_regime.compute_momentum(frame)["mom"]
+        now = float(mom.iloc[-1])
+        since = mom[frame.index >= entry.get("ts", frame.index[-1])].dropna()
+        if math.isnan(now) or not len(since):
+            return None
+        peak = float(since.max())
+        if peak - now < config.momentum_drop:
+            return None
+
+        adr = plan["adr14_abs"]
+        left = plan["sell_level"] - entry_price
+        pnl_pct = (price / entry_price - 1) * 100
+        fade = (
+            f"Momentum take: the momentum score has fallen from {peak:+.2f}σ, its best since "
+            f"the entry, to {now:+.2f}σ ({config.momentum_drop:g}σ is the trigger), with the "
+            f"price at ${price:,.2f} — above the ${entry_price:,.2f} fill but short of the "
+            f"${plan['sell_level']:,.2f} sell level"
+        )
+        to_target = f"${left:,.2f} ({left / adr:.2f} × ADR)"
+
+        if left < config.hold_min_gain_k * adr:
+            return position, (
+                f"{fade}. The sell level is only {to_target} above the fill, under the "
+                f"{config.hold_min_gain_k:g} × ADR worth keeping a runner for, so the whole "
+                f"position is sold at market ({pnl_pct:+.2f}%)."
+            ), self.EXIT_TAKE
+
+        quantity = min(position, max(1.0, whole_shares(position * config.take_fraction)))
+        if quantity >= position:
+            return position, (
+                f"{fade}. The sell level is still {to_target} above the fill, but "
+                f"{config.take_fraction:.0%} of {position:g} shares leaves no whole share to "
+                f"keep, so the whole position is sold at market ({pnl_pct:+.2f}%)."
+            ), self.EXIT_TAKE
+        return quantity, (
+            f"{fade}. Banking {quantity:g} of {position:g} shares at market "
+            f"({pnl_pct:+.2f}%). The sell level is still {to_target} above the fill — at "
+            f"least the {config.hold_min_gain_k:g} × ADR worth waiting for — so the other "
+            f"{position - quantity:g} ride on to it or the closing flatten, and are sold if "
+            "the price comes back to the fill."
+        ), self.EXIT_TAKE
 
     # --- orders ------------------------------------------------------------
 
     def _buy(self, state: AppState, tracker: DecisionTracker, bar) -> bool:
-        return self.buy(
+        bought = self.buy(
             state, tracker, float(bar["close"]), self._entry_reasoning(bar)
         )
+        if bought:
+            # Where the momentum take starts looking for this position's peak.
+            self.entry["ts"] = bar.name
+        return bought
 
     def _entry_reasoning(self, bar) -> str:
-        plan = self.plan
+        plan, config = self.plan, self.config
+        exits = [f"a resting sell at ${plan['sell_level']:,.2f}"]
+        if config.stop_k:
+            exits.append(
+                f"a stop {config.stop_k:g} × ADR (${config.stop_k * plan['adr14_abs']:,.2f}) "
+                "under the fill"
+            )
+        if config.momentum_drop:
+            exits.append(
+                f"a momentum take if the move fades {config.momentum_drop:g}σ short of it"
+            )
         return (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
-            f"${plan['buy_level']:,.2f} buy level — {self.config.buy_k:g} average daily "
+            f"${plan['buy_level']:,.2f} buy level — {config.buy_k:g} average daily "
             f"ranges (${plan['adr14_abs']:,.2f} each) below the ${plan['pred_high']:,.2f} "
             f"high the model forecast for today at the open. Buying the dip below where "
-            f"the day is expected to top out; the exit is a resting sell at "
-            f"${plan['sell_level']:,.2f}, or the closing bell."
+            f"the day is expected to top out; the exit is {', '.join(exits)}, or the "
+            "closing bell."
         )
 
     def _sell(
-        self, state: AppState, tracker: DecisionTracker, quantity: float, bar, reasoning: str
+        self,
+        state: AppState,
+        tracker: DecisionTracker,
+        quantity: float,
+        bar,
+        reasoning: str,
+        kind: str,
     ) -> None:
-        self.sell(state, tracker, quantity, reasoning)
+        entry = self.entry
+        decision = self.sell(state, tracker, quantity, reasoning, log_extra={"exit": kind})
+        if decision.status != "filled":
+            return
+        if kind == self.EXIT_STOP:
+            self.plan["stopped_out"] = True
+        if entry is not None and tracker.position_for(self.ticker) > 0:
+            # `sell` forgets the entry on any fill, but what is left is still this
+            # position -- same fill, same peak. After a momentum take it is the
+            # runner; after any other exit that did not fill in full it is
+            # whatever it was.
+            self.entry = {**entry, "runner": entry.get("runner") or kind == self.EXIT_TAKE}
 
     # --- logging -----------------------------------------------------------
 
@@ -560,6 +768,13 @@ class DayRangeTrader(BaseTrader):
                 f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%), "
                 f"{self.entry['bars']} bars"
             )
+            if self.entry.get("runner"):
+                parts.append(f"runner, out at ${entry_price:,.2f}")
+            elif self.config.stop_k:
+                stop = entry_price - self.config.stop_k * plan["adr14_abs"]
+                parts.append(f"stop ${stop:,.2f}")
+        elif plan.get("stopped_out"):
+            parts.append("stopped out, no new entries today")
         return " · ".join(parts)
 
 
@@ -582,12 +797,26 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     metadata = bundle.get("metadata") or {}
     mae = (metadata.get("test_metrics_ensemble") or {}).get("mae_usd_mean")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
+    exits = []
+    if config.stop_k:
+        exits.append(
+            f"a stop {config.stop_k:g} ADR under the fill, after which it buys nothing more "
+            "that day"
+        )
+    if config.momentum_drop:
+        exits.append(
+            f"a {config.take_fraction:.0%} take once momentum fades "
+            f"{config.momentum_drop:g}σ in profit, the rest kept for the sell level only if "
+            f"it is {config.hold_min_gain_k:g} ADR or more above the fill and sold if the "
+            "price comes back to it"
+        )
+    managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
     return (
         f"Apple Trader armed on {model.label} (fitted "
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
         f"today's {config.ticker} high and low will land, then rests a buy "
         f"{config.buy_k:g} average daily ranges below the predicted high and a sell "
-        f"{config.sell_k:g} below it, until the closing flatten."
+        f"{config.sell_k:g} below it, until the closing flatten.{managed}"
     )
 
 

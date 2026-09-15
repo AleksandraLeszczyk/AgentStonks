@@ -137,6 +137,11 @@ _APPLE_LEGACY = {
     # than at today's per-ticker default.
     "buy_k": APPLE_TRADER_BUY_K,
     "sell_k": APPLE_TRADER_SELL_K,
+    # Before the managed exit existed a position left only at the sell level or
+    # the closing flatten. Zero switches the stop and the momentum take off, so
+    # such a record replays -- and signs -- exactly as it was run.
+    "stop_k": 0.0,
+    "momentum_drop": 0.0,
 }
 
 
