@@ -280,15 +280,10 @@ class SimulationEngine:
         self._last_step = t
 
     def _day_volume(self, symbol: str, t: datetime) -> float:
-        series = self.market.series[symbol]
-        today = t.astimezone(MARKET_TZ).date()
-        total = 0.0
-        for bar, ts in zip(series.minute_bars, series.minute_ts):
-            if ts + timedelta(seconds=BAR_SEC) > t:
-                break
-            if ts.astimezone(MARKET_TZ).date() == today:
-                total += float(bar.get("v") or 0.0)
-        return total
+        # A bisection over the market's per-day running totals. The scan this
+        # replaced walked every stored bar on every step, which made a day
+        # quadratic in its bars -- a fifth of a rule replay's time.
+        return self.market.day_volume(symbol, t)
 
     def _check_wake(self, prev_t: datetime, t: datetime) -> Optional[str]:
         """Evaluate tactics, alerts, and news at step `t`. Returns the wake

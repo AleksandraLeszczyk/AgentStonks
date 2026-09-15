@@ -53,6 +53,53 @@ class _SymbolSeries:
         self.news.sort(key=lambda a: str(a.get("created_at") or ""))
         self.news_ts: list[Optional[datetime]] = [parse_ts(a.get("created_at")) for a in self.news]
 
+        # Per exchange-local day, built once: the bar times and the running
+        # open/high/low/close/volume of that day's tape. Every "as of t" read of
+        # today's partial daily bar or volume is then one bisection, where it
+        # used to be a scan of the whole stored tape on every simulated minute
+        # -- which made a replay quadratic in its bars and a tuning grid of them
+        # impractical. Accumulated in tape order, so the sums are the same
+        # floats the scans produced.
+        self.day_index: "dict[date, dict]" = {}
+        for bar, ts in zip(self.minute_bars, self.minute_ts):
+            day = ts.astimezone(MARKET_TZ).date()
+            entry = self.day_index.get(day)
+            high, low = float(bar["h"]), float(bar["l"])
+            volume = float(bar.get("v") or 0.0)
+            if entry is None:
+                entry = self.day_index[day] = {
+                    "ts": [], "open": float(bar["o"]), "high": [], "low": [],
+                    "close": [], "volume": [],
+                }
+            else:
+                high = max(entry["high"][-1], high)
+                low = min(entry["low"][-1], low)
+                volume = entry["volume"][-1] + volume
+            entry["ts"].append(ts)
+            entry["high"].append(high)
+            entry["low"].append(low)
+            entry["close"].append(float(bar["c"]))
+            entry["volume"].append(volume)
+        self._prior_daily: "dict[str, list[dict]]" = {}
+
+    def completed_in_day(self, day: date, t: datetime) -> "tuple[dict | None, int]":
+        """That day's index entry and how many of its bars are completed by `t`."""
+        entry = self.day_index.get(day)
+        if entry is None:
+            return None, 0
+        return entry, bisect_right(entry["ts"], t - timedelta(seconds=BAR_SEC))
+
+    def prior_daily(self, today: str) -> "list[dict]":
+        """Stored daily bars dated strictly before `today` (ISO), cached per date.
+
+        Callers get the cached list itself and must copy before mutating.
+        """
+        cached = self._prior_daily.get(today)
+        if cached is None:
+            cached = [b for b in self.daily_bars if str(b.get("t", ""))[:10] < today]
+            self._prior_daily[today] = cached
+        return cached
+
 
 class SimMarket:
     """Dataset-backed market data for one simulation run.
@@ -145,30 +192,38 @@ class SimMarket:
     def daily_bars_at(self, symbol: str, t: datetime) -> list[dict]:
         """Daily bars visible at `t`: completed days strictly before t's
         trading date, plus today's partial bar rebuilt from the minute tape --
-        mirroring what the live REST daily fetch shows mid-session."""
-        today = t.astimezone(MARKET_TZ).date().isoformat()
+        mirroring what the live REST daily fetch shows mid-session.
+
+        Read off the series' per-day index (`_SymbolSeries.day_index`) rather
+        than rebuilt by scanning the tape, which this used to do on every
+        simulated minute. `tests/test_tuning.py` pins it against that scan.
+        """
+        today = t.astimezone(MARKET_TZ).date()
         series = self._series(symbol)
         if series is None:
             return []
-        out = [b for b in series.daily_bars if str(b.get("t", ""))[:10] < today]
-        todays = [
-            b
-            for b, ts in zip(series.minute_bars, series.minute_ts)
-            if ts.astimezone(MARKET_TZ).date().isoformat() == today
-            and ts + timedelta(seconds=BAR_SEC) <= t
-        ]
-        if todays:
+        out = list(series.prior_daily(today.isoformat()))
+        entry, done = series.completed_in_day(today, t)
+        if done:
             out.append(
                 {
-                    "t": f"{today}T05:00:00Z",
-                    "o": float(todays[0]["o"]),
-                    "h": max(float(b["h"]) for b in todays),
-                    "l": min(float(b["l"]) for b in todays),
-                    "c": float(todays[-1]["c"]),
-                    "v": sum(float(b.get("v") or 0.0) for b in todays),
+                    "t": f"{today.isoformat()}T05:00:00Z",
+                    "o": entry["open"],
+                    "h": entry["high"][done - 1],
+                    "l": entry["low"][done - 1],
+                    "c": entry["close"][done - 1],
+                    "v": entry["volume"][done - 1],
                 }
             )
         return out
+
+    def day_volume(self, symbol: str, t: datetime) -> float:
+        """Volume of `t`'s trading day in the bars completed by `t`."""
+        series = self._series(symbol)
+        if series is None:
+            return 0.0
+        entry, done = series.completed_in_day(t.astimezone(MARKET_TZ).date(), t)
+        return entry["volume"][done - 1] if done else 0.0
 
     def completed_daily_bars(self, symbol: str, t: datetime) -> list[dict]:
         """Stored daily bars for days that finished strictly before t's date.
@@ -183,7 +238,7 @@ class SimMarket:
         series = self._series(symbol)
         if series is None:
             return []
-        return [b for b in series.daily_bars if str(b.get("t", ""))[:10] < today]
+        return list(series.prior_daily(today))
 
     def session_open_price(self, symbol: str, t: datetime) -> Optional[float]:
         """Today's official opening print from the stored daily bar, or None.
@@ -218,7 +273,7 @@ class SimMarket:
         series = self._series(symbol)
         if series is None:
             return None
-        prior = [b for b in series.daily_bars if str(b.get("t", ""))[:10] < today]
+        prior = series.prior_daily(today)
         if not prior:
             return None
         try:

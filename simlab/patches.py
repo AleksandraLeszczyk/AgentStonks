@@ -27,6 +27,10 @@ duration of a simulation:
   stored daily bars for days that finished before the simulated one, plus
   the simulated day's own auction open, which is fixed at 9:30 and therefore
   point-in-time honest
+- ``momentum_regime.minute_frame`` (not a fetch: a faster route to the same
+  answer) -> today's frame sliced out of one frame per replayed day, instead
+  of rebuilt from the bar buffer on every cycle. Same rows; it is what makes a
+  tuning grid of rule replays affordable
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead
 of silently leaking real-time data into simulated sessions.
@@ -40,7 +44,7 @@ from typing import Iterator
 import pandas as pd
 
 from agent_stonks import agent as agent_mod
-from agent_stonks import clock, historical
+from agent_stonks import clock, historical, momentum_regime
 from agent_stonks.market_hours import MARKET_TZ
 
 from .market import BAR_SEC, SimMarket
@@ -132,7 +136,35 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
     def fake_session_open(symbol, ttl_sec=0):
         return market.session_open_price(str(symbol).upper(), clock.now())
 
+    # Not a fetch: a faster route to the same frame. The rule agents rebuild
+    # today's minute frame from the bar buffer on every cycle, a DataFrame of up
+    # to 1,200 dicts once per simulated minute -- a quarter of a replay's time.
+    # The replay holds the whole tape already, so each day is framed once and
+    # sliced to the bars completed by the pinned clock, which is exactly what
+    # the engine's buffer holds (a stored day is ~960 bars, under SIM_MAX_BARS).
+    # Pinned row for row against the original by `tests/test_tuning.py`.
+    original_minute_frame = momentum_regime.minute_frame
+    day_frames: "dict[str, dict]" = {}
+
+    def fast_minute_frame(sym_state):
+        symbol = str(getattr(sym_state, "symbol", "") or "").upper()
+        series = market.series.get(symbol)
+        if series is None:
+            return original_minute_frame(sym_state)
+        by_day = day_frames.get(symbol)
+        if by_day is None:
+            full = momentum_regime.frame_from_bars(series.minute_bars)
+            by_day = {day: frame for day, frame in full.groupby(full.index.date)} if len(full) else {}
+            day_frames[symbol] = by_day
+        now = clock.now()
+        frame = by_day.get(now.astimezone(MARKET_TZ).date())
+        if frame is None:
+            return original_minute_frame(sym_state)
+        cutoff = pd.Timestamp(now - timedelta(seconds=BAR_SEC))
+        return frame.iloc[: frame.index.searchsorted(cutoff, side="right")].copy()
+
     patches = [
+        (momentum_regime, "minute_frame", fast_minute_frame),
         (agent_mod, "fetch_bars_window", fake_bars_window),
         (agent_mod, "fetch_corporate_actions", fake_corporate_actions),
         (historical, "fetch_market_indicators", fake_market_indicators),
