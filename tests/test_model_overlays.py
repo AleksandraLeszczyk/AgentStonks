@@ -267,6 +267,136 @@ class TestDayRangeOverlay:
         assert "first 5 minutes" in result["notes"][0]
 
 
+INTRAVOL = {
+    "shape": {
+        "params": {"a": 0.6, "b": 3.0, "alpha": 0.45, "c": 0.5, "kappa": 12.0},
+        "t_domain": [2.5, 387.5],
+    },
+    "day_range": {
+        "coef": {"const": -1.0, "lr_d": 0.2, "lr_w": 0.3, "lr_m": 0.3, "abs_gap": 5.0},
+    },
+}
+
+
+def daily_history(n=30, width=0.02, close=200.0):
+    days = pd.bdate_range(end=pd.Timestamp(SESSION) - pd.Timedelta(days=1), periods=n)
+    return [
+        {"t": str(d.date()), "o": close, "h": close * (1 + width), "l": close, "c": close}
+        for d in days
+    ]
+
+
+def stub_intravol(monkeypatch, model=INTRAVOL):
+    monkeypatch.setattr(mo.intraday_vol_model, "load", lambda ticker=None: model)
+
+
+def the_band(items):
+    return next(i for i in items if i["kind"] == "band")
+
+
+def et(stamp):
+    return pd.Timestamp(stamp).tz_convert("America/New_York")
+
+
+class TestIntradayRangeOverlay:
+    """IntradayVolatility alone: its own day-range forecast, shaped by time of day."""
+
+    def compute(self, bars=None, **kwargs):
+        kwargs.setdefault("daily_bars", daily_history())
+        return mo.compute([mo.INTRADAY_RANGE_KEY], "AAPL", bars or minute_bars(),
+                          session_date=SESSION, **kwargs)
+
+    def test_is_one_band_over_the_whole_session(self, monkeypatch):
+        stub_intravol(monkeypatch)
+        items = self.compute()["items"]
+        assert [i["kind"] for i in items] == ["band"]
+        band = items[0]
+        assert len(band["t"]) == len(band["upper"]) == len(band["lower"]) == 391
+        assert (et(band["t"][0]).hour, et(band["t"][0]).minute) == (9, 30)
+        assert (et(band["t"][-1]).hour, et(band["t"][-1]).minute) == (16, 0)
+        assert band["forward"] is False
+
+    def test_it_is_widest_at_the_open_and_narrows_through_midday(self, monkeypatch):
+        stub_intravol(monkeypatch)
+        band = the_band(self.compute()["items"])
+        width = np.array(band["upper"]) - np.array(band["lower"])
+        assert int(np.argmax(width)) == 0
+        assert width[180] < 0.5 * width[0]
+
+    def test_it_splits_its_forecast_range_evenly_around_the_open(self, monkeypatch):
+        stub_intravol(monkeypatch)
+        bars = minute_bars()
+        band = the_band(self.compute(bars)["items"])
+        assert band["upper"][0] * band["lower"][0] == pytest.approx(bars[0]["o"] ** 2)
+
+    def test_the_official_opening_print_is_the_centre_when_supplied(self, monkeypatch):
+        stub_intravol(monkeypatch)
+        band = the_band(self.compute(open_price=205.0)["items"])
+        assert band["upper"][0] * band["lower"][0] == pytest.approx(205.0 ** 2)
+
+    def test_too_little_daily_history_is_a_note(self, monkeypatch):
+        stub_intravol(monkeypatch)
+        result = self.compute(daily_bars=daily_history(n=5))
+        assert result["items"] == []
+        assert "22 completed daily bars" in result["notes"][0]
+
+    def test_a_missing_export_is_a_note_that_says_how_to_make_one(self, monkeypatch):
+        stub_intravol(monkeypatch, model=None)
+        result = self.compute()
+        assert result["items"] == []
+        assert "Predicted intraday range" in result["notes"][0]
+        assert "export_app_model.py" in result["notes"][0]
+
+    def test_bars_that_miss_the_open_with_no_opening_print_are_a_note(self, monkeypatch):
+        stub_intravol(monkeypatch)
+        result = self.compute(minute_bars()[30:])
+        assert result["items"] == []
+        assert "09:30 open" in result["notes"][0]
+
+
+class TestIntradayDayRangeOverlay:
+    """The same curve, stretched to TimeToChange3's predicted high and low."""
+
+    def stub(self, monkeypatch, high=210.0, low=198.0):
+        pytest.importorskip("agent_stonks.dayrange_model")
+        stub_intravol(monkeypatch)
+        TestDayRangeOverlay().stub_forecast(monkeypatch, high=high, low=low)
+
+    def test_it_tops_out_at_the_predicted_high_and_bottoms_out_at_the_low(
+        self, monkeypatch
+    ):
+        self.stub(monkeypatch)
+        items = mo.compute([mo.INTRADAY_DAYRANGE_KEY], "AAPL", minute_bars(),
+                           daily_bars=[], session_date=SESSION)["items"]
+        band = the_band(items)
+        assert max(band["upper"]) == pytest.approx(210.0)
+        assert min(band["lower"]) == pytest.approx(198.0)
+        width = np.array(band["upper"]) - np.array(band["lower"])
+        assert int(np.argmax(width)) == 0 and width[180] < width[0]
+
+    def test_selecting_both_day_range_overlays_forecasts_once(self, monkeypatch):
+        import agent_stonks.dayrange_model as dr
+
+        self.stub(monkeypatch)
+        calls = []
+        forecast = dr.forecast_session
+        monkeypatch.setattr(
+            dr, "forecast_session", lambda *a, **k: calls.append(1) or forecast(*a, **k)
+        )
+        items = mo.compute([mo.DAY_RANGE_KEY, mo.INTRADAY_DAYRANGE_KEY], "AAPL",
+                           minute_bars(), daily_bars=[], session_date=SESSION)["items"]
+        assert len(calls) == 1
+        assert {i["kind"] for i in items} == {"level", "span", "band"}
+
+    def test_no_forecast_is_a_note_naming_this_overlay(self, monkeypatch):
+        self.stub(monkeypatch)
+        monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)
+        result = mo.compute([mo.INTRADAY_DAYRANGE_KEY], "AAPL", minute_bars(),
+                            daily_bars=[], session_date=SESSION)
+        assert result["items"] == []
+        assert result["notes"][0].startswith("Predicted intraday range × day range:")
+
+
 class TestLiveOverlays:
     def make_state(self, bars):
         return SimpleNamespace(
@@ -345,6 +475,18 @@ def moment():
             "label": "→ positive 90%", "ts": BARS[50]["t"],
             "color": "#26c6a2", "icon": "▲", "price": 200.0, "dash": "dot",
             "note": "why", "forward": False}
+
+
+def envelope(start=0, stop=60, extra_minutes=0):
+    """A band over BARS[start:stop], optionally running on past the last bar."""
+    stamps = [pd.Timestamp(b["t"]) for b in BARS[start:stop]]
+    stamps += [stamps[-1] + pd.Timedelta(minutes=m + 1) for m in range(extra_minutes)]
+    mid = np.linspace(1.0, 0.3, len(stamps))
+    return {"kind": "band", "key": "iv", "label": "Pred. intraday range",
+            "group": "Predicted intraday range",
+            "t": [s.isoformat() for s in stamps],
+            "upper": list(200.0 + 2.0 * mid), "lower": list(200.0 - 1.5 * mid),
+            "color": "#facc15", "dash": "dot", "note": "why", "forward": False}
 
 
 class TestRenderer:
@@ -478,6 +620,51 @@ class TestRenderer:
         )
         assert len(fig.layout.shapes) == 4  # level, band, window, event line
         assert [t.name for t in fig.data if getattr(t, "mode", None) == "markers+text"]
+
+    def test_a_band_is_two_edges_with_the_range_between_them_tinted(self):
+        fig = self.chart([envelope()])
+        edges = [t for t in fig.data if t.legendgroup == "iv"]
+        assert len(edges) == 2
+        upper, lower = edges
+        assert upper.fill in (None, "none") and lower.fill == "tonexty"
+        assert float(lower.fillcolor.rsplit(",", 1)[1].rstrip(")")) < 0.2
+
+    def test_a_band_is_drawn_behind_the_candles(self):
+        """The live chart's candle bodies are a bar trace named for the symbol."""
+        fig = self.chart([envelope()])
+        candles = next(i for i, t in enumerate(fig.data) if t.name == "AAPL")
+        band_at = [i for i, t in enumerate(fig.data) if t.legendgroup == "iv"]
+        assert max(band_at) < candles
+        assert band_at == [band_at[0], band_at[0] + 1]  # the fill needs them adjacent
+
+    def test_bands_of_one_overlay_share_a_single_legend_entry(self):
+        """A replay draws one band per session; the legend names the overlay once."""
+        first, second = envelope(0, 30), envelope(30, 60)
+        fig = self.chart([first, second])
+        edges = [t for t in fig.data if t.legendgroup == "iv"]
+        assert len(edges) == 4
+        assert sum(bool(t.showlegend) for t in edges) == 1
+
+    def test_a_band_is_clipped_to_the_bars_in_hand(self):
+        """Like a day-range span: a curve about 16:00 must not widen a live chart."""
+        fig = self.chart([envelope(0, 60, extra_minutes=90)])
+        upper = next(t for t in fig.data if t.legendgroup == "iv")
+        # Plotly keeps datetimes as naive UTC wall clock, as it does the candles'.
+        last_bar = pd.Timestamp(BARS[-1]["t"]).tz_convert("UTC").tz_localize(None)
+        assert pd.Timestamp(max(upper.x)) <= last_bar
+        assert pd.Timestamp(fig.layout.xaxis.range[1]) == pd.Timestamp(BARS[-1]["t"])
+
+    def test_a_band_draws_on_simlabs_plain_figure(self):
+        fig = go.Figure(
+            go.Candlestick(
+                x=[b["t"] for b in BARS],
+                open=[b["o"] for b in BARS], high=[b["h"] for b in BARS],
+                low=[b["l"] for b in BARS], close=[b["c"] for b in BARS],
+            )
+        )
+        add_model_overlays([envelope()], fig, pd.Timestamp(BARS[0]["t"]),
+                           pd.Timestamp(BARS[-1]["t"]), row=None, col=None)
+        assert [t.type for t in fig.data] == ["scatter", "scatter", "candlestick"]
 
     def test_overlay_x_max_ignores_items_that_do_not_reach_forward(self):
         last = pd.Timestamp(BARS[-1]["t"])

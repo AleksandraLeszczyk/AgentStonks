@@ -8,24 +8,37 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Two overlays
-------------
-`day_range`      TimeToChange3's forecast of where the session's high and low
-                 will land, made once from the first five minutes. Two price
-                 levels and the band between them -- the model's claim about
-                 the *width* of the day. See `dayrange_model`.
-`profile_range`  the LevelsML density model's predicted price profile, reduced
-                 to the three numbers a price axis can carry: its outer
-                 quantiles and its point of control. The curve itself is drawn
-                 separately by `charts._plot_price_distribution`; this is the
-                 same prediction as horizontal levels, so it can be read
-                 against the candles rather than only against the histogram.
+Four overlays
+-------------
+`day_range`          TimeToChange3's forecast of where the session's high and
+                     low will land, made once from the first five minutes. Two
+                     price levels and the band between them -- the model's
+                     claim about the *width* of the day. See `dayrange_model`.
+`profile_range`      the LevelsML density model's predicted price profile,
+                     reduced to the three numbers a price axis can carry: its
+                     outer quantiles and its point of control. The curve itself
+                     is drawn separately by `charts._plot_price_distribution`;
+                     this is the same prediction as horizontal levels, so it can
+                     be read against the candles rather than only against the
+                     histogram.
+`intraday_range`     IntradayVolatility's time-of-day volatility curve as a
+                     price envelope around the open, scaled to that model's own
+                     daily-bar forecast of the day's range. See
+                     `intraday_vol_model`, including why that forecast is weak.
+`intraday_dayrange`  the same curve stretched so its peak is TimeToChange3's
+                     predicted high and its trough the predicted low. The one
+                     forecast is shared with `day_range` within a call.
 
-The three item kinds, and why they are exactly three
-----------------------------------------------------
-A prediction is about a price, a moment, or a stretch of time, and the chart
-draws each one differently. So `compute` returns a flat list of items, each of
-which is one of:
+Both envelopes are widest at 09:30, narrow to roughly a fifth of that by
+midday and open again into the close. They are a picture of *how far the day
+usually swings at this time*, scaled to a forecast's extremes -- not a coverage
+band, and price routinely leaves the midday part of it.
+
+The four item kinds
+-------------------
+A prediction is about a price, a moment, a stretch of time, or a range that
+changes through the day, and the chart draws each one differently. So
+`compute` returns a flat list of items, each of which is one of:
 
     level   a price with no time extent      -> a horizontal line, drawn in the
                                                 candle chart AND in the price
@@ -34,6 +47,10 @@ which is one of:
     event   a moment with no price extent    -> a vertical line plus an icon.
     span    a stretch of time, optionally    -> a semi-transparent background,
             bounded in price                    behind the candles.
+    band    an upper and a lower price per   -> two edges with the range
+            timestamp                           between them tinted, behind the
+                                                candles; no profile mirror, as
+                                                a curve has no single price.
 
 Nothing here knows about plotly: `charts.add_model_overlays` is the only
 renderer, and SimLab draws the same items into a different figure. Nothing here
@@ -61,7 +78,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from . import apple_models, market_hours, momentum_regime, profile_model
+from . import apple_models, intraday_vol_model, market_hours, momentum_regime, profile_model
 from .config import MODEL_OVERLAY_COLORS
 
 
@@ -69,6 +86,8 @@ from .config import MODEL_OVERLAY_COLORS
 
 DAY_RANGE_KEY = "day_range"
 PROFILE_RANGE_KEY = "profile_range"
+INTRADAY_RANGE_KEY = "intraday_range"
+INTRADAY_DAYRANGE_KEY = "intraday_dayrange"
 
 
 @dataclass(frozen=True)
@@ -124,6 +143,31 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="LightGBM and the open-profile pack",
         tickers=None,
+    ),
+    INTRADAY_RANGE_KEY: ModelOverlay(
+        key=INTRADAY_RANGE_KEY,
+        label="Predicted intraday range",
+        summary=(
+            "IntradayVolatility's time-of-day volatility curve around the open, scaled "
+            "to its own forecast of the day's range: widest at 09:30, narrowest at "
+            "midday, opening up again into the close. Known at the open."
+        ),
+        requires="the IntradayVolatility export (intravol_<TICKER>.json)",
+        tickers=intraday_vol_model.TICKERS,
+    ),
+    INTRADAY_DAYRANGE_KEY: ModelOverlay(
+        key=INTRADAY_DAYRANGE_KEY,
+        label="Predicted intraday range × day range",
+        summary=(
+            "The same time-of-day curve, stretched so it tops out at TimeToChange3's "
+            "predicted high and bottoms out at its predicted low. Made at 09:35."
+        ),
+        requires=(
+            "the IntradayVolatility export plus PyTorch, LightGBM and the day-range bundle"
+        ),
+        tickers=tuple(
+            t for t in apple_models.DAYRANGE_TICKERS if intraday_vol_model.covers(t)
+        ),
     ),
 }
 
@@ -280,6 +324,35 @@ def _span(key: str, label_: str, x0, x1, color: str,
     }
 
 
+def _band(key: str, label_: str, ts, lower, upper, color: str,
+          dash: str = "dot", note: str = "") -> dict:
+    """A price range that changes through the session.
+
+    Where a `span` is one rectangle, a band is a pair of curves over the same
+    timestamps -- a prediction of how wide the price can swing *at each time of
+    day*. It is drawn as two edges with the range between them tinted, behind
+    the candles, and like any non-forward span it is clipped to the bars in
+    hand. There is no profile mirror: a curve through time has no single price
+    to put on that axis.
+    """
+    stamps = pd.DatetimeIndex(ts)
+    if stamps.tz is None:
+        stamps = stamps.tz_localize(market_hours.MARKET_TZ)
+    return {
+        "kind": "band",
+        "key": key,
+        "label": label_,
+        "group": OVERLAYS[key].label if key in OVERLAYS else key,
+        "t": [stamp.isoformat() for stamp in stamps.tz_convert("UTC")],
+        "lower": [float(v) for v in lower],
+        "upper": [float(v) for v in upper],
+        "color": color,
+        "dash": dash,
+        "note": note,
+        "forward": False,
+    }
+
+
 def _iso(ts) -> str:
     """A timestamp in the one form every consumer here accepts.
 
@@ -337,12 +410,26 @@ def compute(
     if not len(session):
         return {"items": items, "notes": [f"No bars for {day.date()}."]}
 
+    # Asked for at most once per call, however many overlays draw it.
+    memo: dict = {}
+
+    def day_range_forecast() -> dict:
+        if "result" not in memo:
+            memo["result"] = _day_range_forecast(
+                symbol, session, daily_bars or [], day, open_price
+            )
+        return memo["result"]
+
     builders = {
-        DAY_RANGE_KEY: lambda: _day_range_items(
-            symbol, session, daily_bars or [], day, open_price
-        ),
+        DAY_RANGE_KEY: lambda: _day_range_items(day_range_forecast(), day),
         PROFILE_RANGE_KEY: lambda: _profile_range_items(
             session, daily_bars or [], day
+        ),
+        INTRADAY_RANGE_KEY: lambda: _intraday_range_items(
+            symbol, session, daily_bars or [], day, open_price
+        ),
+        INTRADAY_DAYRANGE_KEY: lambda: _intraday_dayrange_items(
+            symbol, session, day, open_price, day_range_forecast()
         ),
     }
 
@@ -380,45 +467,61 @@ def _session_close(day: pd.Timestamp) -> pd.Timestamp:
     )
 
 
-def _day_range_items(
+def _day_range_forecast(
     symbol: str,
     session: pd.DataFrame,
     daily_bars: "list[dict]",
     day: pd.Timestamp,
     open_price: "float | None",
-) -> "tuple[list[dict], str]":
+) -> dict:
+    """TimeToChange3's forecast for the session, or why there is none.
+
+    Returns `{"forecast": dict | None, "made_at": Timestamp | None, "problem":
+    str}`. Two overlays draw this one forecast -- the day range itself, and the
+    intraday envelope stretched between its high and low -- so `compute` asks
+    for it once per call and each overlay names itself in the note. Selecting
+    both must not run three networks twice.
+    """
+    def failed(problem: str) -> dict:
+        return {"forecast": None, "made_at": None, "problem": problem}
+
+    try:
+        bundle = apple_models.load(apple_models.DAYRANGE_KEY, symbol)
+        if bundle is None:
+            return failed(apple_models.unavailable_reason(apple_models.DAYRANGE_KEY, symbol))
+
+        from . import dayrange_model  # heavy (torch + LightGBM); only once it is needed
+
+        want = dayrange_model.opening_minutes(bundle)
+        if len(session) < want:
+            return failed(
+                f"the forecast is built on the first {want} minutes and only "
+                f"{len(session)} bars have closed."
+            )
+        opening = session.iloc[:want]
+        if float(opening["minutes_from_open"].iloc[0]) >= 1.0:
+            return failed(
+                f"these bars start at {session.index[0]:%H:%M}, not the 09:30 open, so "
+                "the first five minutes the forecast needs are not here."
+            )
+        history = dayrange_model.daily_frame_from_bars(daily_bars)
+        forecast = dayrange_model.forecast_session(
+            bundle, history, opening, day, open_price=open_price
+        )
+    except Exception as exc:  # a decoration must never take the chart down
+        return failed(str(exc))
+    return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
+
+
+def _day_range_items(result: dict, day: pd.Timestamp) -> "tuple[list[dict], str]":
     """The predicted high and low, and the band between them."""
     overlay = OVERLAYS[DAY_RANGE_KEY]
-    bundle = apple_models.load(apple_models.DAYRANGE_KEY, symbol)
-    if bundle is None:
-        return [], (
-            f"{overlay.label}: "
-            + apple_models.unavailable_reason(apple_models.DAYRANGE_KEY, symbol)
-        )
-
-    from . import dayrange_model  # heavy (torch + LightGBM); only once it is needed
-
-    want = dayrange_model.opening_minutes(bundle)
-    if len(session) < want:
-        return [], (
-            f"{overlay.label}: the forecast is built on the first {want} minutes and "
-            f"only {len(session)} bars have closed."
-        )
-    opening = session.iloc[:want]
-    if float(opening["minutes_from_open"].iloc[0]) >= 1.0:
-        return [], (
-            f"{overlay.label}: these bars start at "
-            f"{session.index[0]:%H:%M}, not the 09:30 open, so the first five "
-            "minutes the forecast needs are not here."
-        )
-
-    history = dayrange_model.daily_frame_from_bars(daily_bars)
-    forecast = dayrange_model.forecast_session(
-        bundle, history, opening, day, open_price=open_price
-    )
+    forecast = result["forecast"]
+    if forecast is None:
+        return [], f"{overlay.label}: {result['problem']}"
 
     color = MODEL_OVERLAY_COLORS[DAY_RANGE_KEY]
-    x0 = opening.index[-1]
+    x0 = result["made_at"]
     x1 = _session_close(day)
     high, low = forecast["pred_high"], forecast["pred_low"]
     made_at = f"forecast at {pd.Timestamp(x0):%H:%M}"
@@ -436,6 +539,112 @@ def _day_range_items(
         ],
         "",
     )
+
+
+# --- intraday range (IntradayVolatility) ------------------------------------
+
+
+def _intraday_model(symbol: str, label_: str) -> "tuple[dict | None, str]":
+    model = intraday_vol_model.load(symbol)
+    if model is None:
+        return None, (
+            f"{label_}: no IntradayVolatility model at "
+            f"{intraday_vol_model.model_path(symbol)} — export it with "
+            "FinNotebooks/IntradayVolatility/scripts/export_app_model.py."
+        )
+    return model, ""
+
+
+def _session_open_price(
+    session: pd.DataFrame, open_price: "float | None"
+) -> "tuple[float | None, str]":
+    """The price the envelope is centred on: the official print, else the
+    first bar's open -- but only if that bar really is 09:30's."""
+    if open_price:
+        return float(open_price), ""
+    if float(session["minutes_from_open"].iloc[0]) >= 1.0:
+        return None, (
+            f"these bars start at {session.index[0]:%H:%M}, not the 09:30 open, and no "
+            "opening print was supplied to centre the range on."
+        )
+    return float(session["open"].iloc[0]), ""
+
+
+def _session_band(
+    key: str, label_: str, model: dict, day: pd.Timestamp,
+    open_px: float, high: float, low: float, note: str,
+) -> dict:
+    """The envelope for one session, one point per minute from 09:30 to 16:00.
+
+    Drawn over the whole session, the first minutes included, even when the
+    extremes came from a forecast made at 09:35: it is a claim about the shape
+    of the day, and its maximum is at the open.
+    """
+    minutes = np.arange(intraday_vol_model.SESSION_MINUTES + 1)
+    upper, lower = intraday_vol_model.envelope(model, open_px, high, low, minutes)
+    start = pd.Timestamp(day).tz_localize(market_hours.MARKET_TZ) + timedelta(
+        hours=market_hours.MARKET_OPEN.hour, minutes=market_hours.MARKET_OPEN.minute
+    )
+    stamps = start + pd.to_timedelta(minutes, unit="min")
+    return _band(key, label_, stamps, lower, upper, MODEL_OVERLAY_COLORS[key], note=note)
+
+
+def _intraday_range_items(
+    symbol: str,
+    session: pd.DataFrame,
+    daily_bars: "list[dict]",
+    day: pd.Timestamp,
+    open_price: "float | None",
+) -> "tuple[list[dict], str]":
+    """IntradayVolatility alone: its day-range forecast, shaped by time of day."""
+    overlay = OVERLAYS[INTRADAY_RANGE_KEY]
+    model, why = _intraday_model(symbol, overlay.label)
+    if model is None:
+        return [], why
+    open_px, why = _session_open_price(session, open_price)
+    if open_px is None:
+        return [], f"{overlay.label}: {why}"
+    try:
+        high, low = intraday_vol_model.predicted_extremes(model, daily_bars, day, open_px)
+    except ValueError as exc:
+        return [], f"{overlay.label}: {exc}"
+    note = (
+        f"{100 * (high / low - 1):.2f}% day range forecast at the open "
+        f"({low:.2f} – {high:.2f})"
+    )
+    return [
+        _session_band(INTRADAY_RANGE_KEY, "Pred. intraday range", model, day,
+                      open_px, high, low, note)
+    ], ""
+
+
+def _intraday_dayrange_items(
+    symbol: str,
+    session: pd.DataFrame,
+    day: pd.Timestamp,
+    open_price: "float | None",
+    result: dict,
+) -> "tuple[list[dict], str]":
+    """The time-of-day curve stretched to TimeToChange3's high and low."""
+    overlay = OVERLAYS[INTRADAY_DAYRANGE_KEY]
+    model, why = _intraday_model(symbol, overlay.label)
+    if model is None:
+        return [], why
+    forecast = result["forecast"]
+    if forecast is None:
+        return [], f"{overlay.label}: {result['problem']}"
+    open_px, why = _session_open_price(session, open_price)
+    if open_px is None:
+        return [], f"{overlay.label}: {why}"
+    high, low = forecast["pred_high"], forecast["pred_low"]
+    note = (
+        f"between the predicted high {high:.2f} and low {low:.2f} "
+        f"(forecast at {pd.Timestamp(result['made_at']):%H:%M})"
+    )
+    return [
+        _session_band(INTRADAY_DAYRANGE_KEY, "Pred. intraday × day range", model, day,
+                      open_px, high, low, note)
+    ], ""
 
 
 # --- predicted profile range (LevelsML) -------------------------------------

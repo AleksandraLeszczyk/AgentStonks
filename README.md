@@ -23,7 +23,7 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - **Fibonacci levels** — session high/low retracement levels
 - **Price profile fit** — fit a Gaussian or Cauchy mixture model to the volume profile (1–5 components), with optional centers shown on the candle chart
 - **ML predicted profile** — overlay of where today's volume is predicted to trade, from a LightGBM quantile-function (density/EMD) model trained on the LevelsML workflow at the 9:30 open; the mixture fit can target either the live volume or this predicted curve. Needs the optional `lightgbm` dependency and the trained pack at `../Models/open_profile_lgbm.json.gz` (retrain with `Models/train_open_profile.py`; override the location with `OPEN_PROFILE_MODEL`)
-- **Model predictions on the chart** — a *Model Predictions* picker in Chart Settings draws what the trained models say about today, in the idiom each answer calls for. **Predicted day range** (TimeToChange3, made once at 09:35) and **predicted price profile range** (the LevelsML density model's outer quantiles and point of control) are horizontal lines, drawn in the candle chart *and* across the volume profile beside it, with a semi-transparent band over the session they cover. Each overlay is offered only for the symbols its model was fitted on, and a missing bundle or too little history is reported as a caption under the chart rather than a silently empty overlay
+- **Model predictions on the chart** — a *Model Predictions* picker in Chart Settings draws what the trained models say about today, in the idiom each answer calls for. **Predicted day range** (TimeToChange3, made once at 09:35) and **predicted price profile range** (the LevelsML density model's outer quantiles and point of control) are horizontal lines, drawn in the candle chart *and* across the volume profile beside it, with a semi-transparent band over the session they cover. **Predicted intraday range** draws a price envelope that changes with the time of day: IntradayVolatility's volatility curve (power-law decay from the open, flat midday, a short ramp into the close) around the open, widest at 09:30. On its own it is scaled to that model's daily-bar forecast of the day's range; **× day range** stretches the same curve so it tops out exactly at TimeToChange3's predicted high and bottoms out at its predicted low — the better choice, since the daily-bar range forecast is weak out of sample. Export the model with `FinNotebooks/IntradayVolatility/scripts/export_app_model.py`, which writes `../Models/intravol_<TICKER>.json` (override with `INTRAVOL_MODEL_<TICKER>`). Each overlay is offered only for the symbols its model was fitted on, and a missing bundle or too little history is reported as a caption under the chart rather than a silently empty overlay
 - **Multi-timeframe** — 1Min, 5Min, 15Min, 30Min, 1Hour, 1Day
 - **IEX and SIP feeds** — switch between free (IEX) and paid (SIP) Alpaca data for the live socket and the bid/ask quote poll
 - **Consolidated bar history** — historical bars have their own source setting, separate from the stream's feed, because **IEX carries under 4% of consolidated volume** (measured on AAPL: 1.56M vs 41.6M shares over the same 390 one-minute bars). Pairing IEX history with a consolidated live stream would put a ~26x volume step mid-series that relative volume, the volume profile and the models' volume features all sum straight across. `auto` therefore prefers Alpaca SIP — real-time on a paid plan, or held back 16 minutes on a free/basic plan, which refuses only the trailing 15 minutes; delayed SIP is still the right backfill source, since backfill repairs *holes* and the live stream owns the recent window. Failing that it uses yfinance (within 1.5% of SIP, per-minute correlation 0.96), and IEX only when neither can answer
@@ -241,11 +241,15 @@ agent_stonks/
   dayrange_model.py — the model behind Apple Trader (FinNotebooks/TimeToChange3):
                   mirrors dayrange's daily/opening features and blends LightGBM + N-BEATS + N-HiTS
                   into one forecast of the session's high and low, made once at 09:35
+  intraday_vol_model.py — IntradayVolatility's export: the time-of-day volatility curve (power
+                  decay + close ramp) and a daily-bar HAR forecast of the day's range, plus the
+                  envelope between a day's high and low that follows that curve. JSON + numpy
   model_overlays.py — what the saved models predict, as drawing instructions: one catalogue of
-                  chart overlays (day range, predicted profile range),
-                  each computed from bars the caller supplies, so the live chart and SimLab's
-                  replay chart draw the same items. Three item kinds — a price level, a moment,
-                  a stretch of time — and `charts.add_model_overlays` is the only renderer
+                  chart overlays (day range, predicted profile range, intraday range alone and
+                  × day range), each computed from bars the caller supplies, so the live chart
+                  and SimLab's replay chart draw the same items. Four item kinds — a price
+                  level, a moment, a stretch of time, a price range that changes with the time
+                  of day — and `charts.add_model_overlays` is the only renderer
   apple_models.py — the registry of models Apple Trader can run on, so the loop, SimLab and the UI
                   ask for a model by name; each names the rule set it drives, which is the one
                   thing callers do branch on

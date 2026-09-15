@@ -103,6 +103,10 @@ def test_specs_cover_every_registered_model_and_ticker():
         (key, ticker)
         for key, model in apple_models.MODELS.items()
         for ticker in model.tickers
+    } | {
+        # Not a registry model -- it drives only the chart overlays -- but it is
+        # per ticker too, and the tab lists one card per exported file.
+        (mc.INTRADAY_VOL_KEY, ticker) for ticker in mc.intraday_vol_model.TICKERS
     }
     found = {(s.key, s.ticker) for s in mc.specs() if s.key != mc.OPEN_PROFILE_KEY}
     assert found == expected

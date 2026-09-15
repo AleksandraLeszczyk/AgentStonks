@@ -289,6 +289,10 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     "day_range":     "#22d3ee",  # cyan, as the ML predicted profile curve
     "profile_range": "#a78bfa",  # violet
     "profile_poc":   "#f472b6",  # pink -- one number inside the violet band
+    # The two time-of-day envelopes: yellow for IntradayVolatility alone, teal
+    # for its shape stretched to the day-range forecast (a sibling of that cyan).
+    "intraday_range":    "#facc15",
+    "intraday_dayrange": "#2dd4bf",
 }
 
 # Alpha for the semi-transparent backgrounds overlays paint behind the candles.

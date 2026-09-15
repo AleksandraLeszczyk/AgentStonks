@@ -755,7 +755,8 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
         key="model_overlay_keys",
         help="Draws what the trained models predict for this session: price "
         "ranges as horizontal lines, in the candles and in the profile beside "
-        "them.",
+        "them, and time-of-day ranges as a shaded envelope that is widest at the "
+        "open and narrows through midday.",
     )
     for key in selected:
         overlay = model_overlays.get(key)

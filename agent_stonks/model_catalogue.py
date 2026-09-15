@@ -48,13 +48,15 @@ from dataclasses import dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
 
-from . import apple_models, model_store
+from . import apple_models, intraday_vol_model, model_store
 
 # The shared store beside the AgentStonks checkout, where every model family
 # resolves its files from (see `model_store.ModelStore`).
 MODEL_DIR = model_store.MODEL_DIR
 
 OPEN_PROFILE_KEY = "open_profile"
+# Not an `apple_models` key: it drives no agent, only the chart overlays.
+INTRADAY_VOL_KEY = "intraday_vol"
 
 
 @dataclass(frozen=True)
@@ -416,8 +418,106 @@ def _open_profile_spec() -> ModelSpec:
     )
 
 
+def _intraday_vol_spec(ticker: str) -> ModelSpec:
+    """IntradayVolatility's export: a time-of-day curve plus a day-range HAR.
+
+    Read straight from the model module's path -- `intraday_vol_model` is pure
+    JSON and numpy, so unlike the day-range bundle there is no torch import to
+    mirror around.
+    """
+    path = intraday_vol_model.model_path(ticker)
+    files = (ModelFile("model", path),)
+    available, reason = _availability(files)
+    raw = _read_json(path) if path.exists() else {}
+    shape = raw.get("shape") or {}
+    day_range = raw.get("day_range") or {}
+    params = shape.get("params") or {}
+    pooled = day_range.get("walk_forward_pooled") or {}
+
+    metrics: "dict[str, object]" = {}
+    if shape.get("profile_r2") is not None:
+        metrics["time-of-day profile R²"] = shape["profile_r2"]
+    for name, field_ in (
+        ("day range walk-forward R² (log)", "r2"),
+        ("22-day mean walk-forward R²", "r2_mean22"),
+        ("skill vs 22-day mean (MSE)", "skill_vs_mean22"),
+    ):
+        if pooled.get(field_) is not None:
+            metrics[name] = pooled[field_]
+    if day_range.get("r2_in_sample") is not None:
+        metrics["day range in-sample R²"] = day_range["r2_in_sample"]
+    for year, row in (day_range.get("walk_forward") or {}).items():
+        metrics[f"walk-forward R² · {year}"] = (row or {}).get("r2")
+
+    def _sample(block: dict) -> str:
+        return " → ".join(block.get("sample") or ["?", "?"])
+
+    return ModelSpec(
+        key=INTRADAY_VOL_KEY,
+        label="Intraday volatility (IntradayVolatility)",
+        summary=(
+            "How volatile each minute of the session usually is — a five-parameter "
+            "power-law curve, widest at the open, flat through midday, with a short "
+            "ramp into the close — plus a daily-bar forecast of how wide the whole day "
+            "will be. Drawn on the charts as a time-of-day price envelope, on its own "
+            "or stretched to the day-range model's high and low."
+        ),
+        ticker=ticker,
+        ticker_note="",
+        project="IntradayVolatility, exported by `scripts/export_app_model.py`",
+        predicts=(
+            "**The shape of volatility through the session** — relative volatility at "
+            "each minute, fitted to the 5-minute diurnal variance factor — and **the "
+            "day's log high-low range**, from yesterday's, the week's and the month's "
+            "ranges plus today's gap. Everything is known at the open and fixed for "
+            "the day."
+        ),
+        target="√s(t) = a + b(1+t)^−α + c·e^−(390−t)/κ  ·  log ln(H/L)",
+        algorithm=(
+            f"power decay + close ramp (α {params.get('alpha', float('nan')):.2f}, "
+            f"κ {params.get('kappa', float('nan')):.1f} min) by least squares; "
+            "log-HAR on daily ranges by OLS"
+        ),
+        family="Power-law profile + HAR",
+        consumers=(
+            "Chart overlay — predicted intraday range",
+            "Chart overlay — intraday range × day range",
+        ),
+        features=tuple((day_range.get("features") or {}).keys()),
+        inputs="22 completed daily bars plus today's opening print",
+        metrics=metrics,
+        headline=("day range walk-forward R²", format_metric(pooled.get("r2"))),
+        files=files,
+        trained_at=str(raw.get("created") or ""),
+        data_note=(
+            f"Profile fitted on {shape.get('sessions', '?')} sessions, {_sample(shape)}; "
+            f"day-range HAR on {day_range.get('sessions', '?')} sessions, "
+            f"{_sample(day_range)}, walk-forward over "
+            f"{', '.join(day_range.get('walk_forward') or {}) or '?'}"
+            if raw
+            else ""
+        ),
+        versions={},
+        threshold=None,
+        requires="nothing beyond numpy",
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            f"The time-of-day shape is the strong half (profile R² "
+            f"{format_metric(shape.get('profile_r2'))}, and notebook 03 found it stable "
+            "across years). The day-range forecast is the weak half: refitted on daily "
+            "bars because the app keeps no minute history, it explains "
+            f"{format_metric(pooled.get('r2'))} of a test year's variance in log range "
+            f"and removes {format_metric(pooled.get('skill_vs_mean22'))} of a 22-day "
+            "mean's error — so for the band's width, prefer the day-range model's high "
+            "and low. Nothing here updates during the session."
+        ),
+    )
+
+
 _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
+    INTRADAY_VOL_KEY: _intraday_vol_spec,
 }
 
 
@@ -445,6 +545,8 @@ def specs() -> "list[ModelSpec]":
             found = spec(key, ticker)
             if found is not None:
                 out.append(found)
+    for ticker in intraday_vol_model.TICKERS:
+        out.append(_intraday_vol_spec(ticker))
     out.append(_open_profile_spec())
     return out
 

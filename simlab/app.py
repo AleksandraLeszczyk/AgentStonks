@@ -766,9 +766,9 @@ def _run_overlay_controls(
         format_func=model_overlays.label,
         key=f"sim_overlays_{run_id}_{symbol}",
         help="What the trained models predicted for this session, drawn over "
-        "the replayed tape: predicted ranges as horizontal lines, momentum "
-        "changes as marked moments, time-spanning predictions as a shaded "
-        "background. The model this run traded on is selected for you; add or "
+        "the replayed tape: predicted ranges as horizontal lines, time-of-day "
+        "ranges as a shaded envelope that follows the session's volatility, "
+        "time-spanning predictions as a shaded background. The model this run traded on is selected for you; add or "
         "remove any of the others.",
     )
     notes: list[str] = []

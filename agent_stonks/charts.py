@@ -905,6 +905,72 @@ def _as_tz_of(value, reference: pd.Timestamp) -> pd.Timestamp:
     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert(reference.tz)
 
 
+def _add_bands(
+    bands: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: Optional[int],
+    col: Optional[int],
+) -> None:
+    """Price ranges that change through the session (`model_overlays._band`).
+
+    Each band is two line traces -- its upper edge, then its lower edge filled
+    up to it -- clipped to the visible span like any non-forward span, so a
+    curve about 16:00 does not stretch a two-hour live chart. Traces rather than
+    shapes because a shape cannot follow a curve.
+
+    They are moved to the front of `fig.data` once added, which is what puts
+    them behind the candles: plotly draws traces in order, and a tinted fill
+    over the bars would wash them out. The pair stays adjacent, which
+    `fill="tonexty"` depends on. One legend entry per overlay key, however many
+    sessions a replay draws.
+    """
+    first = len(fig.data)
+    shown: set = set()
+    for item in bands:
+        stamps = pd.to_datetime(pd.Series(item.get("t") or [], dtype=object), utc=True)
+        if len(stamps) < 2:
+            continue
+        stamps = (
+            stamps.dt.tz_localize(None) if x0.tzinfo is None
+            else stamps.dt.tz_convert(x0.tz)
+        )
+        visible = ((stamps >= x0) & (stamps <= x1)).to_numpy()
+        if visible.sum() < 2:
+            continue
+        xs = stamps[visible]
+        upper = np.asarray(item.get("upper") or [], float)[visible]
+        lower = np.asarray(item.get("lower") or [], float)[visible]
+        color = item.get("color") or PALETTE["accent"]
+        key = item.get("key")
+        name = item.get("group") or item.get("label", key)
+        line = dict(color=color, width=1.2, dash=item.get("dash", "dot"))
+        note = [item.get("note", "")] * len(xs)
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=upper, mode="lines", line=line, name=name,
+                legendgroup=key, showlegend=key not in shown, customdata=note,
+                hovertemplate=f"<b>{item.get('label', '')}</b> upper %{{y:.2f}}"
+                "<br>%{x|%H:%M} · %{customdata}<extra></extra>",
+            ),
+            row=row, col=col,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=lower, mode="lines", line=line, name=name,
+                fill="tonexty", fillcolor=_rgba(color, MODEL_OVERLAY_BAND_ALPHA),
+                legendgroup=key, showlegend=False, customdata=note,
+                hovertemplate=f"<b>{item.get('label', '')}</b> lower %{{y:.2f}}"
+                "<br>%{x|%H:%M} · %{customdata}<extra></extra>",
+            ),
+            row=row, col=col,
+        )
+        shown.add(key)
+    if len(fig.data) > first:
+        fig.data = fig.data[first:] + fig.data[:first]
+
+
 def add_model_overlays(
     overlays: list[dict],
     fig: go.Figure,
@@ -943,6 +1009,7 @@ def add_model_overlays(
         return
 
     events: list[dict] = []
+    bands: list[dict] = []
     for item in overlays:
         kind = item.get("kind")
         color = item.get("color") or PALETTE["accent"]
@@ -1021,6 +1088,12 @@ def add_model_overlays(
                     row=row, col=col,
                 )
             events.append({**item, "_ts": ts})
+
+        elif kind == "band":
+            bands.append(item)
+
+    if bands:
+        _add_bands(bands, fig, pd.Timestamp(x0), pd.Timestamp(x1), row, col)
 
     if not events:
         return
