@@ -73,12 +73,14 @@ never an exception and never a fabricated line.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
-from . import apple_models, intraday_vol_model, market_hours, momentum_regime, profile_model
+from . import (
+    apple_models, historical, intraday_vol_model, market_hours, momentum_regime, profile_model,
+)
 from .config import MODEL_OVERLAY_COLORS
 
 
@@ -376,6 +378,7 @@ def compute(
     daily_bars: "list[dict] | None" = None,
     session_date=None,
     open_price: "float | None" = None,
+    dayrange_daily_bars: "list[dict] | None" = None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
@@ -387,6 +390,9 @@ def compute(
     `session_date` names the day being drawn; it defaults to the last bar's,
     which is what a live caller wants and what a single-day replay wants too.
     `open_price` is the official opening print when the caller has one.
+    `dayrange_daily_bars` is the day-range forecast's own daily history, for a
+    caller whose `daily_bars` cannot serve it (see `live_overlays`); it
+    defaults to `daily_bars`.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -412,11 +418,14 @@ def compute(
 
     # Asked for at most once per call, however many overlays draw it.
     memo: dict = {}
+    dayrange_history = (
+        (daily_bars or []) if dayrange_daily_bars is None else dayrange_daily_bars
+    )
 
     def day_range_forecast() -> dict:
         if "result" not in memo:
             memo["result"] = _day_range_forecast(
-                symbol, session, daily_bars or [], day, open_price
+                symbol, session, dayrange_history, day, open_price
             )
         return memo["result"]
 
@@ -748,12 +757,45 @@ def live_overlays(
     if cached and cached.get("key") == key:
         return cached["result"]
 
+    session_date = session_date_of(bars)
     result = compute(
         wanted,
         sym_state.symbol,
         bars,
         daily_bars=list(sym_state.daily_bars or []),
-        session_date=session_date_of(bars),
+        session_date=session_date,
+        **_live_dayrange_inputs(sym_state.symbol, wanted, session_date),
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}
     return result
+
+
+# The overlays that run TimeToChange3's forecast, and so need its inputs.
+_DAYRANGE_DRIVEN = (DAY_RANGE_KEY, INTRADAY_DAYRANGE_KEY)
+
+
+def _live_dayrange_inputs(
+    symbol: str, wanted: "list[str]", session_date: "datetime | None"
+) -> dict:
+    """The day-range forecast's inputs, fetched the way Apple Trader fetches them.
+
+    The live `SymbolState.daily_bars` is the volume baseline: 365 calendar days
+    off the stream's feed, which is about 250 completed sessions -- short of the
+    253 `dayrange_model.require_history` demands, so every live forecast was
+    refused and the overlay drew nothing. It is also not the unadjusted yfinance
+    series the model was fitted on. So the forecast gets the trader's history
+    (`fetch_daily_ohlc_bars`' 420-day default is `dayrange_model.DAILY_HISTORY_DAYS`)
+    and its official opening print; the other overlays keep the buffer's bars.
+
+    Fetched only when an overlay that needs it is selected for a symbol it
+    covers, and both reads are cached in `historical`. The opening print is
+    today's, so a chart of an earlier session falls back to its first bar.
+    """
+    if not any(k in _DAYRANGE_DRIVEN and OVERLAYS[k].covers(symbol) for k in wanted):
+        return {}
+    today = datetime.now(timezone.utc).astimezone(market_hours.MARKET_TZ).date()
+    is_today = session_date is not None and session_date.date() == today
+    return {
+        "dayrange_daily_bars": historical.fetch_daily_ohlc_bars(symbol),
+        "open_price": historical.fetch_session_open(symbol) if is_today else None,
+    }

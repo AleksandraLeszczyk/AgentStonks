@@ -398,10 +398,64 @@ class TestIntradayDayRangeOverlay:
 
 
 class TestLiveOverlays:
+    LONG_HISTORY = [{"t": "2026-08-06", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}]
+
+    @pytest.fixture(autouse=True)
+    def no_network(self, monkeypatch):
+        self.fetched = []
+        monkeypatch.setattr(
+            mo.historical, "fetch_daily_ohlc_bars",
+            lambda sym, *a, **k: self.fetched.append(sym) or self.LONG_HISTORY,
+        )
+        monkeypatch.setattr(mo.historical, "fetch_session_open", lambda *a, **k: 201.5)
+
     def make_state(self, bars):
         return SimpleNamespace(
             symbol="AAPL", daily_bars=[], bars=bars, model_overlay_cache=None
         )
+
+    def capture_compute(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            mo, "compute",
+            lambda *a, **k: calls.append(k) or {"items": [], "notes": []},
+        )
+        return calls
+
+    def test_the_day_range_forecast_gets_the_traders_long_history(self, monkeypatch):
+        """The live buffer's 365-day baseline is ~250 sessions, under the 253
+        the forecast requires -- the overlay drew nothing live until the
+        forecast was handed the trader's 420-day history instead."""
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)
+        mo.live_overlays(self.make_state(bars), bars, [mo.DAY_RANGE_KEY])
+        assert calls[0]["dayrange_daily_bars"] == self.LONG_HISTORY
+        assert calls[0]["daily_bars"] == []
+        assert self.fetched == ["AAPL"]
+
+    def test_the_opening_print_is_only_used_for_todays_session(self, monkeypatch):
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)  # SESSION is in the past
+        mo.live_overlays(self.make_state(bars), bars, [mo.INTRADAY_DAYRANGE_KEY])
+        assert calls[0]["open_price"] is None
+
+    def test_overlays_without_the_forecast_do_not_fetch_it(self, monkeypatch):
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)
+        mo.live_overlays(self.make_state(bars), bars, [mo.PROFILE_RANGE_KEY])
+        assert "dayrange_daily_bars" not in calls[0]
+        assert self.fetched == []
+
+    def test_compute_hands_the_forecast_its_own_history(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            mo, "_day_range_forecast",
+            lambda symbol, session, daily, *a: seen.append(daily)
+            or {"forecast": None, "made_at": None, "problem": "stub"},
+        )
+        mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
+                   session_date=SESSION, dayrange_daily_bars=self.LONG_HISTORY)
+        assert seen == [self.LONG_HISTORY]
 
     def test_the_answer_is_cached_until_a_new_bar_arrives(self, monkeypatch):
         calls = []
