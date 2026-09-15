@@ -51,6 +51,7 @@ from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_f
 from agent_stonks.market_hours import MARKET_TZ
 
 from . import data as sim_data
+from . import drift as sim_drift
 from . import experiments as sim_experiments
 from . import prompts as sim_prompts
 from . import results as sim_results
@@ -2183,6 +2184,217 @@ def render_results_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab — drift
+# ---------------------------------------------------------------------------
+
+_DRIFT_GROUP_LABELS = {sim_drift.DAY: "Day", sim_drift.WEEK: "Week"}
+
+
+@st.cache_data(show_spinner=False)
+def _drift_result(model_key: str, ticker: str, feed: str, _signature: tuple) -> dict:
+    """One model's per-session metrics on one instrument's stored tape.
+
+    Keyed on what was stored (`drift.store_signature`), so a new download
+    recomputes and nothing else does. Scoring loads the model -- PyTorch for
+    the day-range bundle -- which is why the tab computes on request rather
+    than whenever SimLab reruns.
+    """
+    return sim_drift.MODELS[model_key].evaluate(ticker, feed)
+
+
+def render_drift_tab() -> None:
+    st.caption(
+        "How a saved model's accuracy moves over time on the sessions SimLab has stored, "
+        "session by session or week by week, against the dates its training data ended. "
+        "Every session is scored the way a live run would have seen it — daily history "
+        "strictly before the day, that day's opening print and minutes — and compared with "
+        "what the day actually did. A model is only really being tested to the right of "
+        "its last cutoff."
+    )
+    col_model, col_feed, col_ticker = st.columns([2, 1, 1])
+    model_key = col_model.selectbox(
+        "Model", list(sim_drift.MODELS), format_func=lambda k: sim_drift.MODELS[k].label,
+        key="drift_model",
+    )
+    model = sim_drift.MODELS[model_key]
+    feed = col_feed.selectbox(
+        "Tape", list(sim_data.FEEDS), key="drift_feed",
+        help="Which stored bars to score on. The same day on two tapes is two sets of bars.",
+    )
+    symbols = [
+        s for s in sim_drift.stored_symbols(feed)
+        if model.tickers is None or s in model.tickers
+    ]
+    st.caption(model.summary)
+    if not symbols:
+        st.info(
+            f"Nothing stored on the `{feed}` tape that {model.label} can score"
+            + (f" (it exists for {', '.join(model.tickers)})" if model.tickers else "")
+            + ". Download a dataset in the Datasets tab."
+        )
+        return
+    ticker = col_ticker.selectbox(
+        "Instrument", symbols, key=f"drift_ticker_{model_key}_{feed}"
+    )
+
+    col_metric, col_group = st.columns([3, 1], vertical_alignment="bottom")
+    metrics = {m.key: m for m in model.metrics}
+    metric_key = col_metric.selectbox(
+        "Metric", list(metrics), format_func=lambda k: metrics[k].label,
+        key=f"drift_metric_{model_key}",
+    )
+    metric = metrics[metric_key]
+    by = col_group.segmented_control(
+        "Group by", list(_DRIFT_GROUP_LABELS), format_func=_DRIFT_GROUP_LABELS.get,
+        default=sim_drift.DAY, key="drift_group",
+    ) or sim_drift.DAY
+    if metric.help:
+        st.caption(metric.help)
+
+    request = f"{model_key}|{ticker}|{feed}"
+    requested = st.session_state.setdefault("drift_requested", [])
+    if request not in requested:
+        minute_days = len(sim_drift.stored_minute_days(ticker, feed))
+        st.caption(
+            f"{minute_days} stored session{'s' if minute_days != 1 else ''} with minute bars "
+            f"for {ticker} on `{feed}`"
+            + ("" if model.needs_minute_bars else ", plus every session in its daily history")
+            + ". Scoring loads the model, so it runs when asked."
+        )
+        if st.button("Compute drift", type="primary", icon=":material/monitoring:",
+                     key="drift_compute"):
+            requested.append(request)
+            st.rerun()
+        return
+
+    with st.spinner(f"Scoring {model.label} on {ticker}…"):
+        result = _drift_result(model_key, ticker, feed, sim_drift.store_signature(ticker, feed))
+    training = model.training(ticker)
+    for note in result.get("notes") or []:
+        st.caption(f":material/info: {note}")
+    rows = [r for r in result.get("rows") or [] if r.get(metric.key) is not None]
+    if not rows:
+        st.warning(f"No stored session of {ticker} on `{feed}` could be scored for this metric.")
+        return
+
+    cutoffs = training.get("cutoffs") or []
+    references = [r for r in training.get("references") or [] if r.metric == metric.key]
+    split = sim_drift.split_by_cutoff(rows, metric.key, cutoffs)
+    cards = st.columns(2 + len(references))
+    for col, (name, part) in zip(cards, (
+        ("In training data", split["inside"]), ("After the last cutoff", split["after"]),
+    )):
+        col.metric(
+            name,
+            metric.fmt % part["mean"] if part["n"] else "—",
+            help=f"Mean over {part['n']} session{'s' if part['n'] != 1 else ''}.",
+        )
+    for col, ref in zip(cards[2:], references):
+        col.metric(ref.label, metric.fmt % ref.value, help=ref.note or None)
+
+    groups = sim_drift.aggregate(rows, metric.key, by)
+    st.plotly_chart(
+        _drift_chart(rows, groups, metric, by, cutoffs, references, ticker),
+        key=f"drift_chart_{request}_{metric.key}_{by}",
+    )
+    if cutoffs:
+        st.caption(
+            " · ".join(f"**{c.label}** {c.date}" + (f" — {c.note}" if c.note else "")
+                       for c in cutoffs)
+        )
+
+    table = pd.DataFrame([
+        {
+            "period": g["label"],
+            "sessions": g["n"],
+            "mean": g["mean"],
+            "min": g["min"],
+            "max": g["max"],
+            "data": "in training" if sim_drift.in_training(g["end"], cutoffs) else "after cutoff",
+        }
+        for g in groups
+    ])
+    number = st.column_config.NumberColumn
+    st.dataframe(table, hide_index=True, column_config={
+        "period": _DRIFT_GROUP_LABELS[by],
+        "sessions": "Sessions",
+        "mean": number(f"Mean {metric.unit}".strip(), format=metric.fmt),
+        "min": number("Min", format=metric.fmt),
+        "max": number("Max", format=metric.fmt),
+        "data": "Data",
+    })
+    if st.button("Recompute", icon=":material/refresh:", key="drift_recompute",
+                 help="Score again — needed only if the model file was replaced."):
+        _drift_result.clear()
+        st.rerun()
+
+
+def _drift_chart(
+    rows: list[dict], groups: list[dict], metric, by: str, cutoffs: list,
+    references: list, ticker: str,
+) -> go.Figure:
+    """Per-session values, the day/week means, the training cutoffs and references."""
+    fig = go.Figure()
+    dates = [r["date"] for r in rows]
+    fig.add_trace(go.Scatter(
+        x=dates, y=[r[metric.key] for r in rows],
+        mode="markers" if by == sim_drift.WEEK else "lines+markers",
+        name="Session", opacity=0.45 if by == sim_drift.WEEK else 1.0,
+        marker=dict(size=7, color=PALETTE["accent"]),
+        line=dict(color=PALETTE["accent"], width=1.5),
+        hovertemplate=f"%{{x|%a %d %b}}<br>{metric.label}: %{{y:{metric.hover}}}<extra></extra>",
+    ))
+    if by == sim_drift.WEEK:
+        fig.add_trace(go.Scatter(
+            x=[g["start"] for g in groups], y=[g["mean"] for g in groups],
+            mode="lines+markers", name="Weekly mean",
+            marker=dict(size=11, color=PALETTE["text"]), line=dict(color=PALETTE["text"], width=2.5),
+            customdata=[[g["label"], g["n"]] for g in groups],
+            hovertemplate=(
+                f"%{{customdata[0]}}<br>{metric.label}: %{{y:{metric.hover}}}"
+                "<br>%{customdata[1]} sessions<extra></extra>"
+            ),
+        ))
+    for ref in references:
+        fig.add_hline(y=ref.value, line=dict(color=PALETTE["muted"], dash="dot", width=1.5))
+        fig.add_annotation(
+            xref="paper", x=1.0, y=ref.value, text=ref.label, showarrow=False,
+            xanchor="right", yanchor="bottom", font=dict(color=PALETTE["muted"], size=11),
+        )
+    if cutoffs:
+        start = min([*dates, *(c.date for c in cutoffs)])
+        last = max(c.date for c in cutoffs)
+        fig.add_shape(
+            type="rect", xref="x", yref="paper", x0=start, x1=last, y0=0, y1=1,
+            fillcolor="rgba(148,163,184,0.10)", line_width=0, layer="below",
+        )
+        for i, cutoff in enumerate(sorted(cutoffs, key=lambda c: c.date)):
+            fig.add_shape(
+                type="line", xref="x", yref="paper", x0=cutoff.date, x1=cutoff.date,
+                y0=0, y1=1, line=dict(color=PALETTE["down"], dash="dash", width=1.5),
+            )
+            fig.add_annotation(
+                xref="x", yref="paper", x=cutoff.date, y=1.0 - 0.07 * i,
+                text=f"{cutoff.label} {cutoff.date}", showarrow=False, xanchor="right",
+                yanchor="top", font=dict(color=PALETTE["down"], size=11),
+            )
+    # Fitted to what is drawn: autorange pads a date axis by weeks, which put an
+    # empty month in front of the first cutoff.
+    first = min([*dates, *(c.date for c in cutoffs)])
+    pad = timedelta(days=3)
+    fig.update_xaxes(
+        type="date", rangebreaks=[dict(bounds=["sat", "mon"])],
+        range=[
+            (date.fromisoformat(first) - pad).isoformat(),
+            (date.fromisoformat(max(dates)) + pad).isoformat(),
+        ],
+    )
+    fig.update_yaxes(title=f"{metric.label} {metric.unit}".strip())
+    fig.update_layout(title=f"{ticker} · {metric.label} by {_DRIFT_GROUP_LABELS[by].lower()}")
+    return _chart_layout(fig, height=440)
+
+
+# ---------------------------------------------------------------------------
 # Tab — tuning
 # ---------------------------------------------------------------------------
 
@@ -2823,12 +3035,14 @@ def build_ui() -> None:
     # ML Models sits beside Agents rather than near Results: it describes what
     # an agent *is* before a run, not what one did afterwards. Tuning sits next
     # to Simulate: it is a batch of simulations with a question attached.
+    # Drift sits beside ML Models: both are about the models, one as they were
+    # saved and one as they have held up since.
     (
-        tab_agents, tab_models, tab_datasets, tab_sim, tab_tuning, tab_summary,
-        tab_results,
+        tab_agents, tab_models, tab_drift, tab_datasets, tab_sim, tab_tuning,
+        tab_summary, tab_results,
     ) = st.tabs(
         [":material/smart_toy: Agents", ":material/neurology: ML Models",
-         ":material/database: Datasets",
+         ":material/monitoring: Drift", ":material/database: Datasets",
          ":material/play_circle: Simulate", ":material/tune: Tuning",
          ":material/leaderboard: Summary", ":material/insights: Results"]
     )
@@ -2836,6 +3050,8 @@ def build_ui() -> None:
         render_agents_tab()
     with tab_models:
         model_catalogue_panel()
+    with tab_drift:
+        render_drift_tab()
     with tab_datasets:
         render_datasets_tab()
     with tab_sim:
