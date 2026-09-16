@@ -522,12 +522,17 @@ def breakdown(runs: list[dict], by: str) -> list[dict]:
     return rows
 
 
-def top_runs(runs: list[dict], by: str = "return_pct", limit: int = 3) -> list[dict]:
-    """The best single runs by one summary metric, highest first. Runs missing
-    that metric (an oracle ceiling of 0 leaves no profit efficiency) drop out
-    rather than ranking as zero. Each row carries both metrics plus the run's
-    identity, so a card can show what it was ranked on and what it scored on
-    the other."""
+def top_runs(
+    runs: list[dict], by: str = "return_pct", limit: int = 3, worst: bool = False
+) -> list[dict]:
+    """The best single runs by one summary metric, highest first -- or, with
+    `worst`, the same ranking read from the other end.
+
+    Runs missing that metric (an oracle ceiling of 0 leaves no profit
+    efficiency) drop out rather than ranking as zero, which is what keeps the
+    worst end honest: a run with no profit efficiency is unscored, not bad.
+    Each row carries both metrics plus the run's identity, so a card can show
+    what it was ranked on and what it scored on the other."""
     if by not in ("return_pct", "profit_efficiency"):
         raise ValueError(f"unknown top-run metric: {by}")
     scored = []
@@ -548,7 +553,7 @@ def top_runs(runs: list[dict], by: str = "return_pct", limit: int = 3) -> list[d
             "return_pct": None if return_pct is None else float(return_pct),
             "profit_efficiency": None if efficiency is None else float(efficiency),
         })
-    scored.sort(key=lambda row: -row["value"])
+    scored.sort(key=lambda row: row["value"] if worst else -row["value"])
     return scored[:limit]
 
 

@@ -1904,6 +1904,77 @@ class TestTopRuns:
         with pytest.raises(ValueError):
             sim_results.top_runs([], by="judge_score")
 
+    def test_worst_reads_the_same_ranking_from_the_other_end(self):
+        runs = [
+            self._run(run_id="r1", return_pct=1.0, efficiency=0.9),
+            self._run(run_id="r2", return_pct=5.0, efficiency=0.1),
+            self._run(run_id="r3", return_pct=3.0, efficiency=0.5),
+        ]
+        assert [r["run_id"] for r in sim_results.top_runs(runs, worst=True)] == [
+            "r1", "r3", "r2"
+        ]
+        assert [
+            r["run_id"]
+            for r in sim_results.top_runs(runs, by="profit_efficiency", worst=True)
+        ] == ["r2", "r3", "r1"]
+
+    def test_worst_takes_the_limit_from_the_bottom(self):
+        runs = [self._run(run_id=f"r{i}", return_pct=float(i)) for i in range(5)]
+        top = sim_results.top_runs(runs, by="return_pct", limit=3, worst=True)
+        assert [r["run_id"] for r in top] == ["r0", "r1", "r2"]
+
+    def test_an_unscored_run_is_not_a_bad_one(self):
+        """Dropping runs missing the metric is what keeps the worst end honest:
+        no profit efficiency means unscored, not the worst score there is."""
+        runs = [self._run(run_id="r1", efficiency=None),
+                self._run(run_id="r2", efficiency=0.4)]
+        worst = sim_results.top_runs(runs, by="profit_efficiency", worst=True)
+        assert [r["run_id"] for r in worst] == ["r2"]
+
+    def test_losses_rank_worst_first(self):
+        runs = [self._run(run_id="win", return_pct=2.0),
+                self._run(run_id="small_loss", return_pct=-0.5),
+                self._run(run_id="big_loss", return_pct=-4.0)]
+        worst = sim_results.top_runs(runs, by="return_pct", worst=True)
+        assert [r["run_id"] for r in worst] == ["big_loss", "small_loss", "win"]
+
+
+class TestOpenRunInResults:
+    """The Summary card's click-through. The state it writes is the whole
+    mechanism: the Results picker seeds from `last_run_id`, and the tab bar is
+    a widget whose key names the open tab."""
+
+    @pytest.fixture(autouse=True)
+    def session(self, monkeypatch):
+        state: dict = {}
+        monkeypatch.setattr(sim_app.st, "session_state", state)
+        return state
+
+    def test_it_points_results_at_the_run_and_switches_to_it(self, session):
+        sim_app._open_run_in_results("20260916-165818-da42f5")
+        assert session["last_run_id"] == "20260916-165818-da42f5"
+        assert session[sim_app.TAB_STATE_KEY] == sim_app.TAB_RESULTS
+
+    def test_it_clears_the_filters_results_keeps_of_its_own(self, session):
+        """Summary and Results filter separately, so a run one can see may be
+        one the other has hidden -- and its picker would open something else."""
+        for dimension, *_ in sim_app._RUN_FILTERS:
+            session[f"results_filter_{dimension}"] = ["something"]
+        session["summary_filter_dataset"] = ["kept"]
+
+        sim_app._open_run_in_results("r1")
+
+        assert all(
+            session[f"results_filter_{dimension}"] == []
+            for dimension, *_ in sim_app._RUN_FILTERS
+        )
+        # Summary's own filters are the user's view and are left alone.
+        assert session["summary_filter_dataset"] == ["kept"]
+
+    def test_the_tab_it_opens_is_one_of_the_tabs(self):
+        """A label that is not in the bar would be silently ignored."""
+        assert sim_app.TAB_RESULTS in sim_app.SIMLAB_TABS
+
 
 class TestRunFilters:
     def _run(self, model="gpt-a", dataset="ds1", provider="openai",

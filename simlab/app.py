@@ -1940,9 +1940,6 @@ _apple_model_label = apple_trader_ui.model_label
 
 
 def render_simulate_tab() -> None:
-    _render_pipeline()
-    st.divider()
-
     datasets = sim_data.list_datasets()
     if not datasets:
         st.info("Download a dataset first (Datasets tab).")
@@ -2230,7 +2227,13 @@ def _ml_model_label(key: str) -> str:
     return " + ".join(_short(k) for k in key.split(sim_results.ML_MODEL_JOIN))
 
 # Ranking metrics for the top-runs cards, mapped to their `summary` keys.
-_TOP_RUN_METRICS = {"Best return": "return_pct", "Profit efficiency": "profit_efficiency"}
+# "Return" rather than "Best return": which end of the ranking is shown is a
+# separate control now, and a label claiming "best" while the worst three are
+# on screen would be the one thing on the card that lies.
+_TOP_RUN_METRICS = {"Return": "return_pct", "Profit efficiency": "profit_efficiency"}
+# Which end of that ranking the cards show.
+_TOP_RUN_BEST = "Best"
+_TOP_RUN_WORST = "Worst"
 
 
 # The breakdown table is hand-rolled HTML rather than st.dataframe: only a real
@@ -2400,18 +2403,56 @@ def _short_model(key: str, limit: int = 46) -> str:
     return key if len(key) <= limit else key[: limit - 1].rstrip() + "…"
 
 
+def _open_run_in_results(run_id: str) -> None:
+    """Point the Results tab at `run_id` and switch to it.
+
+    A callback rather than a branch after the button, for two reasons that both
+    come down to *when* it runs. The active tab lives in the tab widget's own
+    session-state key, and Streamlit refuses a write to a widget's key once that
+    widget has been instantiated -- which, by the time a card inside a tab is
+    drawn, it has. `on_click` runs before the script re-executes, while the key
+    is still writable.
+
+    The filters are cleared for the same reason they exist: Results keeps its
+    own set, separate from Summary's, so a run Summary can see may be one
+    Results has filtered out -- and its picker would then quietly open a
+    different run. Clearing them is the reading of "open this run" that cannot
+    be wrong.
+    """
+    st.session_state["last_run_id"] = run_id
+    for dimension, *_ in _RUN_FILTERS:
+        st.session_state[f"results_filter_{dimension}"] = []
+    st.session_state[TAB_STATE_KEY] = TAB_RESULTS
+
+
 def _render_top_runs(runs: list[dict]) -> None:
-    """The three best single runs under the filters, on whichever metric is
-    picked. Return and profit efficiency disagree often -- a big return on an
-    easy tape can be a worse trade than a small one on a flat tape -- so both
-    are always shown, only the ranking changes."""
-    st.markdown("##### Top runs")
+    """The three best -- or worst -- single runs under the filters, on whichever
+    metric is picked.
+
+    Return and profit efficiency disagree often (a big return on an easy tape
+    can be a worse trade than a small one on a flat tape), so both are always
+    shown and only the ranking changes. The worst end is worth the same glance
+    as the best: a configuration that loses reliably is as much a finding as one
+    that wins, and it is the end nobody scrolls a table to find.
+
+    Each card opens its run in the Results tab, which is where the equity curve,
+    the decision ledger and the judge's report are -- a card is a pointer, not a
+    destination.
+    """
+    direction = st.segmented_control(
+        "Show", [_TOP_RUN_BEST, _TOP_RUN_WORST], default=_TOP_RUN_BEST,
+        key="summary_top_direction",
+    ) or _TOP_RUN_BEST
+    worst = direction == _TOP_RUN_WORST
+    st.markdown(f"##### {'Worst' if worst else 'Top'} runs")
     metric_label = st.segmented_control(
-        "Rank by", list(_TOP_RUN_METRICS), default="Best return",
-        key="summary_top_metric",
-    ) or "Best return"
+        # Keyed apart from the control this replaces, whose stored value is a
+        # label ("Best return") that is no longer one of the options.
+        "Rank by", list(_TOP_RUN_METRICS), default="Return",
+        key="summary_top_metric_v2",
+    ) or "Return"
     metric = _TOP_RUN_METRICS[metric_label]
-    top = sim_results.top_runs(runs, by=metric, limit=3)
+    top = sim_results.top_runs(runs, by=metric, limit=3, worst=worst)
     if not top:
         st.caption(f"No runs scored on {metric_label.lower()} yet.")
         return
@@ -2437,6 +2478,13 @@ def _render_top_runs(runs: list[dict]) -> None:
             st.caption(
                 f"{secondary}  \n{_short_model(row['model'])} · {row['dataset']}"
                 f"  \n`{row['run_id']}`"
+            )
+            st.button(
+                "Open in Results", icon=":material/open_in_new:",
+                key=f"summary_open_{row['run_id']}", width="stretch",
+                on_click=_open_run_in_results, args=(row["run_id"],),
+                help="Switches to the Results tab on this run, clearing the "
+                     "filters there so it is reachable.",
             )
 
 
@@ -3403,6 +3451,33 @@ def _render_tuning_results(jobs: list[dict]) -> None:
 
 # ---------------------------------------------------------------------------
 
+# The tab bar, as labels rather than as a literal list at the call site: the
+# active tab is session state now (`TAB_STATE_KEY`), and the value stored there
+# is a label, so anything that switches tabs has to name the exact string.
+#
+# Left to right they follow the order the work happens in. ML Models sits beside
+# Agents rather than near Results: it describes what an agent *is* before a run,
+# not what one did afterwards. Tuning follows it because it answers the same
+# question one step on -- which settings that agent should run -- and Drift
+# follows both, being about the models again, as they have held up rather than
+# as they were saved. Then the datasets, the runs, and what the runs came to:
+# Results one at a time and Summary across all of them, which is the last thing
+# there is to look at.
+TAB_AGENTS = ":material/smart_toy: Agents"
+TAB_MODELS = ":material/neurology: ML Models"
+TAB_TUNING = ":material/tune: Tuning"
+TAB_DRIFT = ":material/monitoring: Drift"
+TAB_DATASETS = ":material/database: Datasets"
+TAB_SIMULATE = ":material/play_circle: Simulate"
+TAB_RESULTS = ":material/insights: Results"
+TAB_SUMMARY = ":material/leaderboard: Summary"
+SIMLAB_TABS = [
+    TAB_AGENTS, TAB_MODELS, TAB_TUNING, TAB_DRIFT,
+    TAB_DATASETS, TAB_SIMULATE, TAB_RESULTS, TAB_SUMMARY,
+]
+TAB_STATE_KEY = "simlab_tab"
+
+
 def build_ui() -> None:
     st.set_page_config(page_title="AgentStonks SimLab", page_icon="🧪", layout="wide")
     st.title("SimLab — strategy testing")
@@ -3410,22 +3485,27 @@ def build_ui() -> None:
         "Replay the trading agents against stored historical sessions: same prompts, same "
         "tools, same execution path as live — hours of tape in minutes of simulation."
     )
-    # Left to right the tabs follow the order the work happens in. ML Models
-    # sits beside Agents rather than near Results: it describes what an agent
-    # *is* before a run, not what one did afterwards. Tuning follows it because
-    # it answers the same question one step on -- which settings that agent
-    # should run -- and Drift follows both, being about the models again, as
-    # they have held up rather than as they were saved. Then the datasets, the
-    # runs, and what the runs came to: Results one at a time and Summary across
-    # all of them, which is the last thing there is to look at.
+    # Above the tabs, not inside Simulate, because the queue is the app's and
+    # not that tab's: `on_change="rerun"` below makes the tabs lazy, and a
+    # pipeline that only renders while Simulate is open is a scheduler that only
+    # ticks while Simulate is open -- so a batch would stall the moment anyone
+    # went to read a result. It is also the honest place for it: experiments run
+    # whatever is on screen.
+    _render_pipeline()
+    st.divider()
     (
         tab_agents, tab_models, tab_tuning, tab_drift, tab_datasets, tab_sim,
         tab_results, tab_summary,
     ) = st.tabs(
-        [":material/smart_toy: Agents", ":material/neurology: ML Models",
-         ":material/tune: Tuning", ":material/monitoring: Drift",
-         ":material/database: Datasets", ":material/play_circle: Simulate",
-         ":material/insights: Results", ":material/leaderboard: Summary"]
+        SIMLAB_TABS, key=TAB_STATE_KEY,
+        # Two things at once, and both are wanted. The active tab becomes
+        # readable and *writable* through `st.session_state[TAB_STATE_KEY]`,
+        # which is how a Summary card opens its run in Results
+        # (`_open_run_in_results`) -- without it the write is accepted and the
+        # frontend ignores it. And tab bodies stop running when they are not
+        # open, so opening SimLab no longer scores every drift model and parses
+        # every stored run before drawing the first tab.
+        on_change="rerun",
     )
     with tab_agents:
         render_agents_tab()
