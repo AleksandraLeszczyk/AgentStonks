@@ -172,8 +172,16 @@ class Tape:
 
 
 def dayrange_config(**kwargs) -> AppleTraderConfig:
+    """The notebook's configuration, whatever the app's defaults happen to be.
+
+    The levels are pinned to 0.75 / 0.10 rather than to AAPL's swept pair for
+    the same reason `breach_update` is pinned off: these tests are about the
+    rule as notebook 05 specified it, and a default that moves would rewrite
+    what they assert. `TestIntradayRangeUpdate` is where the update is on.
+    """
     kwargs.setdefault("buy_k", 0.75)
     kwargs.setdefault("sell_k", 0.10)
+    kwargs.setdefault("breach_update", "off")
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
 
@@ -529,6 +537,204 @@ class TestDayRangeMomentumTake:
         assert tracker.position_for(TICKER) == 0
 
 
+class TestIntradayRangeUpdate:
+    """What a session that trades outside the forecast does to the two levels.
+
+    The forecast is a statement about the width of the day and the levels hang
+    off it, so a day that has traded through it has falsified both. These pin
+    which of the three policies moves what, and when.
+    """
+
+    def _trader(self, policy, **kwargs):
+        return at.DayRangeTrader(dayrange_config(breach_update=policy, **kwargs))
+
+    def _run(self, policy, state, tracker, tape, **kwargs):
+        trader = self._trader(policy, **kwargs)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return trader
+
+    def test_off_holds_the_935_forecast_through_a_breach(
+        self, state, market_open, monkeypatch
+    ):
+        """The notebook's rule: one forecast, two levels, all day."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(112.0, high=112.0)
+        trader = self._run("off", state, tracker, tape)
+
+        assert trader.plan["pred_high"] == FORECAST["pred_high"]
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert trader.plan["sell_level"] == pytest.approx(SELL_LEVEL)
+        assert "range_updates" not in trader.plan
+
+    def test_extreme_moves_the_high_to_the_session_high_and_the_levels_with_it(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(111.5, high=112.0)
+        trader = self._run("extreme", state, tracker, tape)
+
+        assert trader.plan["pred_high"] == pytest.approx(112.0)
+        assert trader.plan["pred_low"] == FORECAST["pred_low"]  # never breached
+        # Both levels are rebuilt from the moved high: the whole point of the
+        # update is that the strategy's numbers follow the forecast's.
+        assert trader.plan["buy_level"] == pytest.approx(112.0 - 0.75 * 10)
+        assert trader.plan["sell_level"] == pytest.approx(112.0 - 0.10 * 10)
+        assert trader.plan["range_updates"] == 1
+
+    def test_a_breach_of_the_low_moves_the_low(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(94.0))
+        tape = Tape(monkeypatch)
+        tape.append(94.5, low=94.0)
+        trader = self._run("extreme", state, tracker, tape)
+
+        assert trader.plan["pred_low"] == pytest.approx(94.0)
+        assert trader.plan["pred_high"] == FORECAST["pred_high"]
+
+    def test_brownian_extends_past_the_extreme(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(111.5, high=112.0)   # the 10:35 bar: 325 minutes to the close
+        trader = self._run("brownian", state, tracker, tape)
+
+        reach = at._dayrange().brownian_reach(10.0, 325.0)
+        assert reach > 0
+        assert trader.plan["pred_high"] == pytest.approx(112.0 + reach)
+        assert trader.plan["buy_level"] == pytest.approx(112.0 + reach - 7.5)
+
+    def test_the_updated_levels_are_what_the_bar_is_then_measured_against(
+        self, state, market_open, monkeypatch
+    ):
+        """The update runs before the rules, not after, so the entry it arms is
+        the one the new high implies. A bar that dipped nowhere near the 9:35 buy
+        level fills against the one its own breach just raised."""
+        broker = FakeBroker(113.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        # Low 113 is $10.50 above the 9:35 buy level and would never have filled;
+        # against a high moved to 121 the buy level is 113.50.
+        tape.append(113.0, low=113.0, high=121.0)
+
+        assert self._run("off", state, tracker, tape).plan["buy_level"] == pytest.approx(
+            BUY_LEVEL
+        )
+        assert tracker.position_for(TICKER) == 0
+
+        trader = self._trader("extreme")
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert trader.plan["buy_level"] == pytest.approx(113.5)
+
+    def test_extreme_still_sells_into_the_breach_but_brownian_holds_through_it(
+        self, state, market_open, monkeypatch
+    ):
+        """The two policies differ where it costs money, and this is where.
+
+        A bar that breaches the high also reaches a sell level moved only to
+        that same high (the gap is `sell_k × ADR`, and the bar is *at* the
+        extreme), so `extreme` banks the trade exactly as `off` does. The
+        Brownian reach is bigger than that gap for most of the day, so the
+        target moves out of the bar's way and the position rides on.
+        """
+        def entered(policy):
+            broker = FakeBroker(103.0)
+            tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+            tape = Tape(monkeypatch, broker)
+            trader = self._trader(policy)
+            tape.append(103.0, low=BUY_LEVEL - 0.01)
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+            tape.append(111.0, high=112.0)
+            return trader, trader.run_cycle(DAYRANGE_BUNDLE, state, tracker), tracker
+
+        for policy in ("off", "extreme"):
+            _, outcome, tracker = entered(policy)
+            assert outcome == "sold", policy
+            assert tracker.position_for(TICKER) == 0
+
+        trader, outcome, tracker = entered("brownian")
+        assert outcome == "hold"
+        assert tracker.position_for(TICKER) > 0
+        assert trader.plan["sell_level"] > 112.0
+
+    def test_the_high_only_ever_ratchets_up(self, state, market_open, monkeypatch):
+        """A level that could walk back towards the price would turn one move
+        into a stream of entries and exits chasing it."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        trader = self._trader("brownian")
+        seen = []
+        for close, high in ((111.5, 112.0), (108.0, 109.0), (105.0, 106.0)):
+            tape.append(close, high=high)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+            seen.append(trader.plan["pred_high"])
+        assert seen == sorted(seen)
+        assert trader.plan["range_updates"] == 1  # only the first bar breached
+
+    def test_the_opening_window_never_triggers_an_update(
+        self, state, market_open, monkeypatch
+    ):
+        """Its extremes are already in the forecast (`apply_open_constraint`),
+        and the bar the plan was built on is not traded either."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(120.0))
+        tape = Tape(monkeypatch, minutes=0)
+        for i in range(5):
+            tape.append(120.0, high=121.0, offset=i)
+        trader = self._trader("extreme")
+
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "warming_up"
+        assert trader.plan["pred_high"] == FORECAST["pred_high"]
+
+    def test_an_update_is_logged_once_with_both_the_old_and_new_levels(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(111.5, high=112.0)
+        self._run("extreme", state, tracker, tape)
+
+        lines = [e["text"] for e in state.agent_log if "forecast updated" in e.get("text", "")]
+        assert len(lines) == 1
+        assert "110.00" in lines[0] and "112.00" in lines[0]        # the high, before and after
+        assert "102.50" in lines[0] and "104.50" in lines[0]        # the buy level, ditto
+
+    def test_a_breach_of_the_low_alone_does_not_claim_the_levels_moved(
+        self, state, market_open, monkeypatch
+    ):
+        """They are built from the predicted high, so a low that moves moves
+        nothing this strategy rests on."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(94.0))
+        tape = Tape(monkeypatch)
+        tape.append(94.5, low=94.0)
+        trader = self._run("extreme", state, tracker, tape)
+
+        line = next(e["text"] for e in state.agent_log if "forecast updated" in e.get("text", ""))
+        assert "they stay" in line and "rebuilt" not in line
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+
+    def test_a_new_session_starts_the_update_over(
+        self, state, market_open, monkeypatch
+    ):
+        """The update is a fact about one session, like the forecast it corrects.
+
+        The tape fixture keeps every bar under one index, so yesterday's breach
+        is still visible to today's frame here -- what this pins is that the
+        plan itself was rebuilt from a second forecast and the count restarted,
+        not carried over. Live, `minute_frame` hands the trader today's bars only.
+        """
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(111.5, high=112.0)
+        trader = self._run("extreme", state, tracker, tape)
+        assert trader.plan["range_updates"] == 1 and tape.forecast_calls == 1
+
+        clock.set_simulated(datetime(2026, 7, 22, 14, 30, tzinfo=timezone.utc))
+        tape.append(104.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert tape.forecast_calls == 2
+        assert trader.plan["date"] == pd.Timestamp("2026-07-22")
+        assert trader.plan["range_updates"] == 1
+
+
 class TestDayRangeGuards:
     def test_no_entry_inside_the_closing_flatten_window(
         self, state, market_open, monkeypatch
@@ -639,6 +845,25 @@ class TestStrategySelection:
         assert config_signature(off) == config_signature(
             replace(off, take_fraction=0.5, hold_min_gain_k=0.9)
         )
+
+    def test_the_intraday_update_is_in_the_signature_only_while_switched_on(self):
+        off = config_signature(dayrange_config(stop_k=0.0, momentum_drop=0.0))
+        assert off == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
+        for policy in ("extreme", "brownian"):
+            signed = config_signature(
+                dayrange_config(stop_k=0.0, momentum_drop=0.0, breach_update=policy)
+            )
+            assert signed == off[:-1] + f",breach={policy})"
+
+    def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
+        """`dayrange_config` pins it off; the app's own default does not."""
+        assert AppleTraderConfig().breach_update == "extreme"
+
+    def test_an_unknown_update_policy_is_refused(self):
+        """Read as "off" once a record carries it, but refused while a config is
+        being built -- the earliest place a typo can be reported is the best one."""
+        with pytest.raises(ValueError, match="breach_update"):
+            dayrange_config(breach_update="mean_reversion")
 
     def test_exit_distances_cannot_be_negative_and_the_take_is_a_share(self):
         for field in ("stop_k", "momentum_drop", "hold_min_gain_k"):

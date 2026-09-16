@@ -316,7 +316,7 @@ def _render_apple_rules() -> None:
     st.markdown(
         "One question, asked once. At **9:35** the model forecasts where the session's "
         "high **H** and low will land, from a year of daily history plus the first five "
-        "minutes, and the rest of the day is two levels derived from it and held fixed "
+        "minutes, and the rest of the day is two levels derived from it "
         "(TimeToChange3 notebook 05), with **A** the trailing 14-day average daily range "
         "in dollars:\n"
         "- **Buy** when a bar's low reaches `H − buy × A`, well under where the day is "
@@ -330,7 +330,14 @@ def _render_apple_rules() -> None:
         "`drop` σ off its best since the entry while the trade is in profit; and the rest "
         "kept as a **runner** only if the sell level is still `hold × A` above the fill, "
         "sold if the price comes back to the fill. It is not in the notebook's numbers, "
-        "and a stored run from before it existed replays with it off.\n\n"
+        "and a stored run from before it existed replays with it off.\n"
+        "- **H** itself can move. The model runs once and cannot be re-run, but a session "
+        "that trades *through* the predicted high has falsified it, so an **intraday "
+        "update** moves the breached side — to the extreme so far, or past it by the "
+        "excursion a driftless walk with ADR-implied volatility would still be expected to "
+        "make — and both levels are rebuilt from it, including under an open position. "
+        "Only outward, never back towards the price. Off gives the notebook's fixed "
+        "levels, which is what a record written before the setting existed replays as.\n\n"
         "It is a mean-reversion bet, and deliberately so — what the model forecasts well "
         "is the *width* of the day, not its direction. On a day that never dips to the buy "
         "level it does nothing at all."
@@ -1513,6 +1520,12 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "them here is the intended use — the defaults are each instrument's best "
             "plateau over the notebook's sessions, which is still only a month or two of days."
         ),
+        "dayrange_breach": (
+            "What a session that trades outside the forecast does to it. Each choice is its "
+            "own configuration in Results, so the honest way to use this is to queue the "
+            "same levels three times and let the datasets say whether either update is worth "
+            "anything — neither has ever been swept."
+        ),
         "dayrange_exits": (
             "The managed exit, every distance measured from the fill in the same ADR. Each "
             "switched-on knob is part of the signature, so sweeping the stop or the fade "
@@ -1520,6 +1533,24 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
     },
     outro={
+        "dayrange_breach_off": (
+            ":material/lock: The 9:35 forecast stands all day. This is what the levels above "
+            "were swept under, and what every record written before this setting existed "
+            "replays as — so a run with it off files beside them."
+        ),
+        "dayrange_breach_extreme": (
+            ":material/trending_up: The breached side moves to the session's own extreme. "
+            "Expect it to trade more days than `off` does: on a day that runs past the "
+            "forecast the buy level chases the high up, which turns sessions that stood aside "
+            "into sessions that entered."
+        ),
+        "dayrange_breach_brownian": (
+            ":material/show_chart: Past the extreme by ADR × √(session left) ÷ 2 — the "
+            "excursion a driftless walk with this ADR's volatility would still be expected "
+            "to make. Wider levels than `extreme` early in the day, converging on it by the "
+            "close; compare the two on the same datasets rather than reasoning about which "
+            "should win."
+        ),
         "dayrange": (
             ":material/info: No entry mode and no probability — neither means anything to a "
             "forecast of the day's range, and the signature leaves them out so a day-range "
@@ -1542,6 +1573,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Where the exit rests below the same predicted high — {sell_k} on {ticker} "
             "by the same sweep, and the smaller of the two numbers, since it is the "
             "higher price. A day that never reaches it is held to the closing flatten."
+        ),
+        "breach_update": (
+            "Whether the predicted high is held all session or moved when the tape trades "
+            "through it, with both levels rebuilt from it each time it does. It is in the "
+            "signature unless it is off, so the three choices queue as three configurations "
+            "over one dataset — which is the only way to find out what it is worth, since "
+            "the levels above were swept with the forecast fixed."
         ),
     },
 )

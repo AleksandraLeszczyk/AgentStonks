@@ -662,6 +662,26 @@ class TestRuleAgentRecords:
         assert today.stop_k > 0 and today.momentum_drop > 0
         assert agent.signature(today) != agent.signature(replace(today, stop_k=0.0))
 
+    def test_a_record_from_before_the_intraday_update_replays_without_it(self):
+        """The two levels used to be set at 9:35 and held all day, whatever the
+        session went on to print. A record without the field describes a run
+        that did that, so it must not pick up today's default -- nor sign as a
+        run whose levels moved."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        old = agent.from_record({
+            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
+            "stop_k": 0.2, "momentum_drop": 1.0,
+        })
+        assert old.breach_update == "off"
+        assert "breach" not in agent.signature(old)
+
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        assert today.breach_update == "extreme"
+        assert agent.signature(today).endswith(",breach=extreme)")
+        assert agent.signature(today) != agent.signature(
+            replace(today, breach_update="brownian")
+        )
+
 
 class TestDayRangeEngine:
     """The day-range rules replayed end to end on the engine.

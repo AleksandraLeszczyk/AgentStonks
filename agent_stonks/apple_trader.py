@@ -40,6 +40,7 @@ from .agent import stop_agent
 from .rule_agent import BaseTrader
 from .state import append_agent_log as _log
 from .config import (
+    APPLE_TRADER_BREACH_UPDATE,
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_DAYRANGE_LEVELS,
@@ -51,6 +52,10 @@ from .config import (
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_K,
     APPLE_TRADER_TAKE_FRACTION,
+    BREACH_BROWNIAN,
+    BREACH_LABELS,
+    BREACH_OFF,
+    BREACH_POLICIES,
 )
 from .decisions import DecisionTracker, whole_shares
 from .state import AppState
@@ -124,6 +129,11 @@ class AppleTraderConfig:
     # The gain still left to the sell level, in ADRs above the fill, that is
     # worth keeping a runner for. Short of it the take sells everything.
     hold_min_gain_k: float = APPLE_TRADER_HOLD_MIN_GAIN_K
+    # What to do when the session trades through the forecast the two levels
+    # are built on -- one of `dayrange_model.BREACH_POLICIES`. "off" is the
+    # notebook's rule (one forecast, held all day); the other two move the
+    # breached side and the levels with it. See `_update_range`.
+    breach_update: str = APPLE_TRADER_BREACH_UPDATE
 
     def __post_init__(self) -> None:
         for name in ("stop_k", "momentum_drop", "hold_min_gain_k"):
@@ -136,6 +146,16 @@ class AppleTraderConfig:
             raise ValueError(
                 f"take_fraction {self.take_fraction!r} must be a share of the position, "
                 "above 0 and at most 1"
+            )
+        # Refused rather than read as "off", unlike `updated_range`'s own
+        # tolerance: that one is reached with a policy some record already
+        # carries, this one is a config being built, and the earliest place a
+        # typo can be reported is the best one.
+        self.breach_update = str(self.breach_update or BREACH_OFF)
+        if self.breach_update not in BREACH_POLICIES:
+            raise ValueError(
+                f"breach_update {self.breach_update!r} is not one of "
+                f"{', '.join(BREACH_POLICIES)}"
             )
         self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
         # Resolved per field, so a config that names only one level still
@@ -179,6 +199,9 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     `stop_k` is set, the take and its runner threshold when `momentum_drop` is
     -- so a config with both off signs exactly as a run recorded before the
     exit existed, and `take_fraction` never splits two runs that cannot differ.
+    The intraday update follows the same rule for the same reason: it appears
+    only when it is not "off", so every record written before it existed (which
+    replays as "off") keeps the signature it was filed under.
     """
     c = config or AppleTraderConfig()
     exits = ""
@@ -189,9 +212,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
             f",take={c.take_fraction * 100:g}%@mom-{c.momentum_drop:g},"
             f"runner>={c.hold_min_gain_k:g}A"
         )
+    breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     return (
         f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}A,sell=H-{c.sell_k:g}A,"
-        f"size={c.position_pct:g}%{exits})"
+        f"size={c.position_pct:g}%{exits}{breach})"
     )
 
 
@@ -298,9 +322,9 @@ class DayRangeTrader(BaseTrader):
 
     TimeToChange3's model says where the session's high and low will land, and
     it says it exactly once -- from the daily history up to yesterday plus the
-    first five minutes of this morning. Nothing about the forecast updates
-    intraday, so the rule built on it cannot be a per-bar signal. It is two
-    price levels, set at 9:35 and held all day, from notebook 05:
+    first five minutes of this morning. The model is never re-run, so the rule
+    built on it cannot be a per-bar signal. It is two price levels, set at 9:35,
+    from notebook 05:
 
         buy_level  = H - buy_k  * A
         sell_level = H - sell_k * A
@@ -309,6 +333,12 @@ class DayRangeTrader(BaseTrader):
     dollars. Buy when the price comes down to the buy level, sell when it comes
     back up to the sell level, repeat as often as the day allows, and flatten
     what is still open before the close.
+
+    `H` is not quite fixed for the day, though the model behind it is. A session
+    that trades *through* the predicted high has falsified it, and the levels
+    hanging off it with it -- so `breach_update` says what happens then, and
+    `_update_range` rebuilds both levels from the moved high. Off, that never
+    happens and this is the notebook's rule exactly.
 
     It is a mean-reversion bet, and the reason it is shaped that way is in the
     model's own results: what TimeToChange3 forecasts well is the *width* of
@@ -429,6 +459,11 @@ class DayRangeTrader(BaseTrader):
         if fresh_bar and self.entry is not None:
             self.entry["bars"] += 1
 
+        # Before the read, so the line below quotes the levels this bar is
+        # actually about to be measured against rather than last bar's.
+        if fresh_bar:
+            self._update_range(state, frame, ts)
+
         _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position)})
 
         # Trading starts after the opening window, since the forecast does not
@@ -517,14 +552,8 @@ class DayRangeTrader(BaseTrader):
             )
             return False
 
-        adr = forecast["adr14_abs"]
-        self.plan = {
-            "date": today,
-            "opening_end": opening.index[-1],
-            "buy_level": forecast["pred_high"] - self.config.buy_k * adr,
-            "sell_level": forecast["pred_high"] - self.config.sell_k * adr,
-            **forecast,
-        }
+        self.plan = {"date": today, "opening_end": opening.index[-1], **forecast}
+        self._set_levels()
 
         warning = _dayrange().volume_scale_warning(getattr(state, "feed", None))
         if warning:
@@ -534,6 +563,120 @@ class DayRangeTrader(BaseTrader):
 
     def _opening_window(self, state: AppState, frame, want: int):
         return fetch_opening_window(state, frame, want, ticker=self.ticker)
+
+    # --- the levels, and the forecast they hang off ------------------------
+
+    def _set_levels(self) -> None:
+        """Rebuild the two resting levels from the plan's current predicted high.
+
+        Called once when the plan is made and again every time `_update_range`
+        moves the high, which is the whole of "the levels follow the forecast":
+        they are never stored independently of it, so there is no way for the
+        two to disagree.
+        """
+        plan, config = self.plan, self.config
+        adr = plan["adr14_abs"]
+        plan["buy_level"] = plan["pred_high"] - config.buy_k * adr
+        plan["sell_level"] = plan["pred_high"] - config.sell_k * adr
+
+    def _update_range(self, state: AppState, frame, ts) -> None:
+        """Move the forecast the session has traded through, and the levels with it.
+
+        The forecast is a statement about the width of the day, made at 9:35 off
+        five minutes of tape. When the session prints a price outside it that
+        statement has been falsified in one direction, and going on measuring
+        against it -- the position's target in particular -- means trading
+        against a number the tape has already disproved. So the breached side is
+        moved (`dayrange_model.updated_range` decides how far; `breach_update`
+        picks the policy) and both levels are rebuilt from the new high.
+
+        Deliberately once per closed bar and only outside the opening window:
+        the bar the plan was built on is the last bar of that window, and its
+        extremes are already in the forecast through `apply_open_constraint`.
+
+        What this does to a run in flight, in both directions. An open position's
+        sell level moves *up*, so a day that is running further than forecast is
+        held for more of it rather than being handed the old target. And the buy
+        level moves up with it -- which on the bar of a breach can put it above
+        where the bar traded, so a strategy that had stood aside all morning can
+        enter on the bar that moved the level. That is the intended reading (the
+        dip is measured from where the day is *now* expected to top out, not from
+        a number it has outgrown) but it is a real change in when the agent
+        trades, and it is why `stop_k` matters more under these policies than
+        under "off": a day that ratchets the high all afternoon will keep
+        re-arming the entry until a stop ends the session's trading.
+        """
+        config, plan = self.config, self.plan
+        if config.breach_update == BREACH_OFF or plan is None:
+            return
+        if ts <= plan["opening_end"]:
+            return
+
+        dayrange = _dayrange()
+        before = {k: float(plan[k]) for k in
+                  ("pred_high", "pred_low", "buy_level", "sell_level")}
+        high, low = dayrange.updated_range(
+            plan,
+            session_high=float(frame["high"].max()),
+            session_low=float(frame["low"].min()),
+            minutes_left=dayrange.minutes_left_at(ts),
+            policy=config.breach_update,
+        )
+        if high == before["pred_high"] and low == before["pred_low"]:
+            return
+
+        plan["pred_high"], plan["pred_low"] = high, low
+        plan["range_updates"] = int(plan.get("range_updates", 0)) + 1
+        self._set_levels()
+        _log(state, {"type": "analysis", "text": self._range_summary(ts, before)})
+
+    def _range_summary(self, ts, before: dict) -> str:
+        """The one line an update writes: what the tape did, and what moved.
+
+        The two levels are built from the predicted *high* alone, so a breach of
+        the low moves the forecast and nothing else. The line says which it was
+        rather than claiming a rebuild either way -- a log that reported levels
+        that had not changed would be the reader's problem on every grinding
+        session, which is exactly when it matters.
+        """
+        plan, config = self.plan, self.config
+        dayrange = _dayrange()
+        moved = []
+        if plan["pred_high"] != before["pred_high"]:
+            moved.append(
+                f"the session has traded up through the ${before['pred_high']:,.2f} "
+                "predicted high"
+            )
+        if plan["pred_low"] != before["pred_low"]:
+            moved.append(
+                f"it has traded down through the ${before['pred_low']:,.2f} predicted low"
+            )
+        if config.breach_update == BREACH_BROWNIAN:
+            left = dayrange.minutes_left_at(ts)
+            reach = dayrange.brownian_reach(plan["adr14_abs"], left)
+            how = (
+                f"the extreme so far, extended by the ${reach:,.2f} a driftless walk with "
+                f"this ADR's volatility is still expected to add over the {left:.0f} min left"
+            )
+        else:
+            how = "the extreme so far"
+        if plan["buy_level"] == before["buy_level"]:
+            # Only the low moved. Nothing this strategy rests on hangs off it.
+            levels = (
+                f"The buy and sell levels are built from the predicted high, so they stay "
+                f"at ${plan['buy_level']:,.2f} and ${plan['sell_level']:,.2f}."
+            )
+        else:
+            levels = (
+                f"Both levels are rebuilt from it: buy ${plan['buy_level']:,.2f} (was "
+                f"${before['buy_level']:,.2f}), sell ${plan['sell_level']:,.2f} (was "
+                f"${before['sell_level']:,.2f})."
+            )
+        return (
+            f"{self.ticker} forecast updated at {ts:%H:%M}: {', and '.join(moved)}. "
+            f"Predicted range is now ${float(plan['pred_low']):,.2f} – "
+            f"${float(plan['pred_high']):,.2f} ({how}). {levels}"
+        )
 
     # --- the check on an open position -------------------------------------
 
@@ -744,13 +887,22 @@ class DayRangeTrader(BaseTrader):
 
     def _plan_summary(self) -> str:
         plan = self.plan
+        held = (
+            "Both are held all day."
+            if self.config.breach_update == BREACH_OFF
+            else (
+                f"If the session trades outside that range the breached side is moved "
+                f"({BREACH_LABELS[self.config.breach_update].lower()}) and both levels "
+                "follow it."
+            )
+        )
         return (
             f"{self.ticker} forecast for the session, from the first "
             f"{plan['opening_end']:%H:%M} minutes: high ${plan['pred_high']:,.2f}, low "
             f"${plan['pred_low']:,.2f} (yesterday's average ${plan['prev_avg']:,.2f}, "
             f"14-day average range ${plan['adr14_abs']:,.2f}). Buy at "
             f"${plan['buy_level']:,.2f} (H − {self.config.buy_k:g} × ADR), sell at "
-            f"${plan['sell_level']:,.2f} (H − {self.config.sell_k:g} × ADR)."
+            f"${plan['sell_level']:,.2f} (H − {self.config.sell_k:g} × ADR). {held}"
         )
 
     def _read_summary(self, bar, ts, position: float) -> str:
@@ -761,6 +913,13 @@ class DayRangeTrader(BaseTrader):
             f"buy ${plan['buy_level']:,.2f} ({price - plan['buy_level']:+.2f})",
             f"sell ${plan['sell_level']:,.2f} ({price - plan['sell_level']:+.2f})",
         ]
+        updates = int(plan.get("range_updates") or 0)
+        if updates:
+            # So a level read off this line is never mistaken for the 9:35 one.
+            parts.append(
+                f"H ${plan['pred_high']:,.2f} / L ${plan['pred_low']:,.2f}, "
+                f"updated ×{updates}"
+            )
         if position > 0 and self.entry:
             entry_price = self.entry["price"]
             pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
@@ -811,12 +970,20 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             "price comes back to it"
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
+    breach = (
+        ""
+        if config.breach_update == BREACH_OFF
+        else (
+            f" A session that trades outside the forecast moves the breached side "
+            f"({BREACH_LABELS[config.breach_update].lower()}) and both levels with it."
+        )
+    )
     return (
         f"Apple Trader armed on {model.label} (fitted "
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
         f"today's {config.ticker} high and low will land, then rests a buy "
         f"{config.buy_k:g} average daily ranges below the predicted high and a sell "
-        f"{config.sell_k:g} below it, until the closing flatten.{managed}"
+        f"{config.sell_k:g} below it, until the closing flatten.{breach}{managed}"
     )
 
 

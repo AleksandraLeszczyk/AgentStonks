@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Callable, Optional
 
 from agent_stonks import apple_models
-from agent_stonks.config import APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K
+from agent_stonks.config import APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K, BREACH_OFF
 from agent_stonks.apple_trader import (
     APPLE_TRADER_AVATAR,
     APPLE_TRADER_KEY,
@@ -142,6 +142,10 @@ _APPLE_LEGACY = {
     # such a record replays -- and signs -- exactly as it was run.
     "stop_k": 0.0,
     "momentum_drop": 0.0,
+    # Before the intraday update existed the 9:35 forecast stood all day and
+    # the two levels never moved. "off" is that rule, and it is left out of the
+    # signature, so such a record replays and files exactly where it did.
+    "breach_update": BREACH_OFF,
 }
 
 

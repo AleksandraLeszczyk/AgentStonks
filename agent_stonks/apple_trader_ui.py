@@ -30,6 +30,7 @@ import streamlit as st
 
 from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels
+from .config import BREACH_LABELS, BREACH_POLICIES
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,7 @@ def dayrange_params(
             f"predicted high must be the smaller of the two — using {sell_k:g} until the "
             "buy distance is raised."
         )
+    breach_update = breach_param(defaults, copy)
     stop_k, momentum_drop, take_fraction, hold_min_gain_k = exit_params(defaults, copy)
     _caption(copy.outro.get("dayrange"))
     return AppleTraderConfig(
@@ -175,11 +177,33 @@ def dayrange_params(
         buy_k=float(buy_k),
         sell_k=float(sell_k),
         position_pct=float(position_pct),
+        breach_update=breach_update,
         stop_k=stop_k,
         momentum_drop=momentum_drop,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
     )
+
+
+def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
+    """What happens when the session trades outside the forecast.
+
+    Not keyed by ticker: it is a rule about the forecast rather than a number
+    swept per instrument, so switching symbol keeps the choice — the same reason
+    the exit knobs below are not keyed either.
+    """
+    _caption(copy.intro.get("dayrange_breach"))
+    options = list(BREACH_POLICIES)
+    choice = st.selectbox(
+        "If the session trades outside the forecast",
+        options,
+        index=options.index(defaults.breach_update),
+        format_func=lambda key: BREACH_LABELS[key],
+        key=copy.key("breach_update"),
+        help=copy.help.get("breach_update"),
+    )
+    _caption(copy.outro.get(f"dayrange_breach_{choice}"))
+    return str(choice)
 
 
 def exit_params(

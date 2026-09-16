@@ -1830,10 +1830,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
     intro={
         "dayrange": (
             "At 9:35 the model forecasts where today's high **H** will land, and the two "
-            "levels below are set from it and held all day — a buy that fills on a dip "
+            "levels below are set from it — a buy that fills on a dip "
             "well under where the day is expected to top out, and a sell just beneath it. "
             "Both are distances in **average daily ranges** (the trailing 14-day ADR in "
             "dollars), so they scale with how wide the sessions have been."
+        ),
+        "dayrange_breach": (
+            "**H** is a forecast, and the day can trade straight through it. What happens "
+            "then is a choice, and it moves both levels above: they are rebuilt from the "
+            "predicted high every time it moves, live, including for a position that is "
+            "already open."
         ),
         "dayrange_exits": (
             "How a position gets out before the sell level. Every distance is measured from "
@@ -1844,8 +1850,25 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         ),
     },
     outro={
+        "dayrange_breach_off": (
+            ":material/lock: The 9:35 forecast stands whatever the tape does — the notebook's "
+            "rule, and the one the buy and sell distances above were swept under."
+        ),
+        "dayrange_breach_extreme": (
+            ":material/trending_up: On a bar that prints outside the range, the breached side "
+            "moves to the session's own high (or low) and the levels follow. It never leads "
+            "the tape, so the level arrives one move late — but it also cannot claim a high "
+            "the day has not already made."
+        ),
+        "dayrange_breach_brownian": (
+            ":material/show_chart: Past the extreme, by the distance a driftless random walk "
+            "with this ADR's volatility would still be expected to cover before the close — "
+            "half an ADR with the whole day left, shrinking with the square root of the time "
+            "remaining, nothing at the bell. It leads the tape rather than following it, and "
+            "pays for that with a sell level the day may never come back up to."
+        ),
         "dayrange": (
-            ":material/info: The forecast is made once. A trade closes at the sell level, the "
+            ":material/info: The model runs once. A trade closes at the sell level, the "
             "stop, a momentum take (its runner at the sell level or back at the fill), or the "
             "closing flatten. After a stop the agent buys nothing more that day — the session "
             "has not gone the way the forecast said."
@@ -1865,6 +1888,15 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
             "the smaller number. Anything the day never reaches is held to the closing "
             "flatten."
+        ),
+        "breach_update": (
+            "The model cannot be re-run intraday — its opening features are a fixed "
+            "five-minute window — but a session that has traded *through* the predicted high "
+            "has already disproved it, and the buy and sell levels hang off that number. "
+            "This picks what to replace it with. Only the breached side moves, and only "
+            "outward: the high never comes back down during a session. Neither of the two "
+            "updating policies has been swept, and the buy/sell distances above were picked "
+            "with the forecast held fixed all day."
         ),
         "stop_k": (
             "Sells everything when a bar's low reaches this many ADRs under the fill price. "

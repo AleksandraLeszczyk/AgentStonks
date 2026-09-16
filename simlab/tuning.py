@@ -187,8 +187,19 @@ def grid(axes: "list[dict]") -> "list[dict]":
 
 
 def make_config(base: dict, overrides: dict) -> AppleTraderConfig:
-    """The base configuration with one cell's values on top (may raise ValueError)."""
-    return AppleTraderConfig(**{**base, **overrides})
+    """The base configuration with one cell's values on top (may raise ValueError).
+
+    Decoded through `rule_agents`, not straight into the dataclass, because a
+    job's `base` is a *stored record* and outlives the fields it was written
+    with. A key that did not exist when the job was saved has to decode to what
+    its absence meant then (`_APPLE_LEGACY`) rather than to today's default --
+    otherwise re-opening a job silently re-signs and re-runs it as a strategy it
+    was never tuned under, and the heatmap already on screen belongs to a
+    different configuration from the one its caption names.
+    """
+    from .rule_agents import rule_agent
+
+    return rule_agent(APPLE_TRADER_KEY).from_record({**base, **overrides})
 
 
 # --- one cell ---------------------------------------------------------------

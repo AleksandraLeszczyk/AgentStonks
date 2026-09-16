@@ -117,6 +117,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import sys
 import types
@@ -156,6 +157,17 @@ import torch.nn as nn  # noqa: E402
 torch.set_num_threads(1)
 
 from . import market_hours, model_store  # noqa: E402
+# The three intraday-update policy names. They live in `config` rather than
+# here because everything that has to *name* one -- the config dataclass, both
+# forms, a stored record -- would otherwise import this module, and with it 200
+# MB of torch, to do it. The arithmetic that gives them meaning is below
+# (`updated_range`), and that is what belongs here.
+from .config import (  # noqa: E402,F401  -- BREACH_POLICIES is re-exported
+    BREACH_BROWNIAN,
+    BREACH_EXTREME,
+    BREACH_OFF,
+    BREACH_POLICIES,
+)
 from .model_store import ModelStore  # noqa: E402
 
 # The shared model store next to the AgentStonks checkout (Code/Models), where
@@ -923,6 +935,137 @@ def forecast_session(
         "or_high": float(row["high5"].iloc[0]),
         "or_low": float(row["low5"].iloc[0]),
     }
+
+
+# --- the intraday update ------------------------------------------------------
+#
+# `forecast_session` says it once, at 9:35, and it is already not a pure model
+# output: `apply_open_constraint` corrects it with what the tape had printed by
+# then, on the grounds that the day's high cannot be below the opening window's
+# high. Nothing carried that reasoning past 9:35, so a session that traded
+# *through* the predicted high at 11:00 spent the rest of the day being measured
+# against a number the tape had already falsified -- and every level derived
+# from it (see `apple_trader.DayRangeTrader`) was wrong by the same amount.
+#
+# These policies extend that one constraint through the session. Three rules
+# hold for all of them, and they are what make the result usable as a trading
+# level rather than as a running statistic:
+#
+# * **only on a breach.** The model is never re-run -- it cannot be, its
+#   opening-ridge features are a fixed five-minute window -- so the only new
+#   information here is the tape, and the only place the tape contradicts the
+#   forecast is where it has traded through it.
+# * **one side at a time.** A high that has been exceeded says nothing about the
+#   low, so the unbreached side keeps the number the model gave it.
+# * **outward only.** Fed its own last answer each bar (which is how
+#   `DayRangeTrader` calls it) each side ratchets: a breach can widen the range
+#   and nothing narrows it. A level that could walk back towards the price would
+#   turn one move into a stream of entries and exits chasing it.
+
+# Minutes in a regular session (09:30-16:00) -- the unit the Brownian extension
+# measures time in, so that a whole session left is tau = 1.
+SESSION_MINUTES = 390
+
+# Where the Brownian extension's one constant comes from. Take price over the
+# rest of the session as a driftless Brownian motion with per-session volatility
+# sigma, run for a fraction tau of a session. Then
+#
+#     E[max]       = sigma * sqrt(2 * tau / pi)
+#     E[max - min] = 2 * E[max] = sigma * sqrt(8 * tau / pi)
+#
+# and the second is exactly what ADR measures -- the average high-to-low range
+# of a whole session, tau = 1. So sigma = ADR * sqrt(pi / 8), and the expected
+# one-sided excursion over the minutes still to come is
+#
+#     ADR * sqrt(pi / 8) * sqrt(2 * tau / pi) = ADR * sqrt(tau) / 2
+#
+# The two constants cancel to one half. They are written out rather than folded
+# into a 0.5 because the halving is a consequence of the model -- the expected
+# range is two expected excursions -- and a bare 0.5 in the code would read like
+# a fudge factor that could be tuned.
+_SIGMA_PER_ADR = math.sqrt(math.pi / 8.0)
+_EXPECTED_MAX_PER_SIGMA = math.sqrt(2.0 / math.pi)
+
+
+def brownian_reach(adr: float, minutes_left: float) -> float:
+    """How much further a driftless walk is expected to run, in dollars.
+
+    `adr` is the trailing 14-day average daily range (`adr14_abs`), which is
+    what implies the volatility; `minutes_left` the minutes to the close. With
+    a whole session left this is half an ADR, and it shrinks with the square
+    root of the time remaining -- 0 at the bell.
+    """
+    if not adr or adr <= 0:
+        return 0.0
+    tau = max(0.0, min(float(minutes_left), SESSION_MINUTES)) / SESSION_MINUTES
+    return float(adr) * _SIGMA_PER_ADR * _EXPECTED_MAX_PER_SIGMA * math.sqrt(tau)
+
+
+def minutes_left_at(ts) -> float:
+    """Minutes from a bar's timestamp to the 16:00 close, never negative.
+
+    Read off the bar rather than off the wall clock, so that a SimLab replay of
+    stored bars and the live session it came from get the same number. The
+    timestamp is the minute the bar opened, so this is one minute long -- the
+    conservative side, and 1/390 of a session under a square root is not a
+    distinction a trading level can carry.
+    """
+    et = pd.Timestamp(ts)
+    et = (
+        et.tz_localize(market_hours.MARKET_TZ)
+        if et.tzinfo is None
+        else et.tz_convert(market_hours.MARKET_TZ)
+    )
+    close = et.normalize() + pd.Timedelta(
+        hours=market_hours.MARKET_CLOSE.hour, minutes=market_hours.MARKET_CLOSE.minute
+    )
+    return max(0.0, (close - et).total_seconds() / 60.0)
+
+
+def updated_range(
+    forecast: dict,
+    *,
+    session_high: "float | None",
+    session_low: "float | None",
+    minutes_left: float,
+    policy: str = BREACH_OFF,
+) -> "tuple[float, float]":
+    """`(pred_high, pred_low)` after what the session has actually printed.
+
+    `forecast` is the current forecast -- today's original under `off`, and
+    under the other two whatever this function last returned, which is what
+    makes each side ratchet. `session_high` and `session_low` are the extremes
+    of the session so far, `minutes_left` the minutes to the close (see
+    `minutes_left_at`).
+
+    Under `extreme` a breached side moves to the extreme itself: the flat
+    statement that the day's high is at least what has already traded, which is
+    `apply_open_constraint`'s rule applied to the whole session instead of to
+    its first five minutes. Under `brownian` it moves past the extreme by
+    `brownian_reach` -- the excursion still expected of a driftless walk with
+    ADR-implied volatility over the time left -- on the grounds that a day whose
+    high has just been printed is very unlikely to have made its high exactly
+    now. The first cannot over-reach and will always be a touch late; the second
+    leads the tape and pays for that with a level the day may never come back to.
+
+    An unknown policy reads as `off`. Callers get their policy from a stored
+    record or a form, and a typo that silently traded a different strategy would
+    be worse than one that traded the notebook's.
+    """
+    high = float(forecast["pred_high"])
+    low = float(forecast["pred_low"])
+    if policy not in (BREACH_EXTREME, BREACH_BROWNIAN):
+        return high, low
+    reach = (
+        brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
+        if policy == BREACH_BROWNIAN
+        else 0.0
+    )
+    if session_high is not None and float(session_high) > high:
+        high = float(session_high) + reach
+    if session_low is not None and float(session_low) < low:
+        low = float(session_low) - reach
+    return high, low
 
 
 def session_bars(frame: pd.DataFrame, session_date) -> pd.DataFrame:

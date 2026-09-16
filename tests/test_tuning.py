@@ -72,6 +72,34 @@ def spec(**overrides):
     return {**base, **overrides}
 
 
+class TestBaseConfiguration:
+    """A job's `base` is a stored record, so it decodes like one.
+
+    A job saved before a field existed has to keep describing the run it
+    actually tuned -- re-opening it must not re-sign or re-run it under
+    whatever the default has since become.
+    """
+
+    def test_overrides_land_on_top_of_the_base(self):
+        config = tu.make_config(spec()["base"], {"buy_k": 0.55})
+        assert config.buy_k == 0.55 and config.ticker == TICKER
+
+    def test_a_field_the_job_predates_decodes_to_what_it_meant_then(self):
+        base = {k: v for k, v in spec()["base"].items() if k != "breach_update"}
+        assert tu.make_config(base, {}).breach_update == "off"
+        assert tu.make_config(spec()["base"], {}).breach_update == (
+            AppleTraderConfig().breach_update
+        )
+
+    def test_a_field_of_a_removed_strategy_is_dropped_rather_than_raising(self):
+        config = tu.make_config({**spec()["base"], "reversal_threshold": 0.3}, {})
+        assert config.ticker == TICKER
+
+    def test_an_impossible_cell_still_raises_for_the_caller_to_mark(self):
+        with pytest.raises(ValueError):
+            tu.make_config(spec()["base"], {"buy_k": 0.1, "sell_k": 0.5})
+
+
 class TestValidation:
     def test_a_sound_spec_passes(self):
         assert tu.validate(spec()) is None

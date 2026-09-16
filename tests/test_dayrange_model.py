@@ -276,6 +276,121 @@ class TestVolumeScaleWarning:
         assert D.volume_scale_warning(feed) is None
 
 
+class TestIntradayUpdate:
+    """The two policies that move the forecast the session has traded through.
+
+    Arithmetic only -- what a trader then does with the moved numbers is pinned
+    in `tests/test_apple_trader.py`.
+    """
+
+    # A $10 average daily range around a 100-110 forecast, so a breach and the
+    # Brownian reach both land on numbers that can be read by eye.
+    FORECAST = {"pred_high": 110.0, "pred_low": 100.0, "adr14_abs": 10.0}
+    NOON = 240.0  # minutes left at 12:00
+
+    def _update(self, policy, high, low, minutes_left=NOON, forecast=None):
+        return D.updated_range(
+            forecast or self.FORECAST,
+            session_high=high, session_low=low,
+            minutes_left=minutes_left, policy=policy,
+        )
+
+    @pytest.mark.parametrize("policy", [D.BREACH_OFF, "nonsense", None])
+    def test_off_and_anything_unrecognised_hold_the_forecast(self, policy):
+        """An unknown policy reads as off rather than as today's default: it
+        arrives from a stored record or a form, and a typo that silently traded
+        a different strategy would be worse than one that traded the notebook's."""
+        assert self._update(policy, 120.0, 90.0) == (110.0, 100.0)
+
+    def test_an_unbreached_forecast_is_untouched(self):
+        """A day trading inside the range is a day the forecast still describes,
+        under every policy."""
+        for policy in (D.BREACH_EXTREME, D.BREACH_BROWNIAN):
+            assert self._update(policy, 109.99, 100.01) == (110.0, 100.0)
+
+    def test_extreme_moves_the_breached_side_to_the_extreme(self):
+        assert self._update(D.BREACH_EXTREME, 112.5, 101.0) == (112.5, 100.0)
+        assert self._update(D.BREACH_EXTREME, 109.0, 97.25) == (110.0, 97.25)
+
+    def test_only_the_breached_side_moves(self):
+        """A high that has been exceeded says nothing about the low."""
+        high, low = self._update(D.BREACH_EXTREME, 112.5, 100.5)
+        assert (high, low) == (112.5, 100.0)
+
+    def test_brownian_extends_past_the_extreme_by_the_expected_excursion(self):
+        # 240 of 390 minutes left -> ADR x sqrt(240/390) / 2 = $3.92.
+        reach = 10.0 * (240 / 390) ** 0.5 / 2
+        high, low = self._update(D.BREACH_BROWNIAN, 112.5, 99.0)
+        assert high == pytest.approx(112.5 + reach)
+        assert low == pytest.approx(99.0 - reach)
+
+    def test_the_brownian_reach_is_half_an_adr_with_a_whole_session_left(self):
+        """The one number worth being able to check by hand: E[range] over a
+        session is two expected one-sided excursions, so each is half an ADR."""
+        assert D.brownian_reach(10.0, D.SESSION_MINUTES) == pytest.approx(5.0)
+
+    def test_the_brownian_reach_shrinks_to_nothing_at_the_bell(self):
+        reaches = [D.brownian_reach(10.0, m) for m in (390, 240, 60, 1, 0)]
+        assert reaches == sorted(reaches, reverse=True)
+        assert reaches[-1] == 0.0
+
+    @pytest.mark.parametrize("adr", [0.0, None, -1.0])
+    def test_a_missing_adr_leaves_the_brownian_policy_at_the_extreme(self, adr):
+        """No volatility to imply an extension from, so it degrades to the
+        weaker claim rather than to a NaN level."""
+        forecast = {**self.FORECAST, "adr14_abs": adr}
+        assert self._update(D.BREACH_BROWNIAN, 112.5, 105.0, forecast=forecast) == (
+            112.5, 100.0
+        )
+
+    @pytest.mark.parametrize("policy", [D.BREACH_EXTREME, D.BREACH_BROWNIAN])
+    def test_fed_its_own_answer_each_bar_the_range_only_widens(self, policy):
+        """The ratchet. A high that could come back down would drag the sell
+        level towards the price and turn one move into a stream of exits."""
+        forecast = dict(self.FORECAST)
+        highs, lows = [], []
+        # A session that runs up, falls back inside, then runs again -- with the
+        # clock (and so the Brownian reach) shrinking all the way.
+        for extreme, minutes in ((111.0, 300), (110.5, 240), (114.0, 120), (113.0, 30)):
+            high, low = self._update(policy, extreme, 101.0, minutes_left=minutes,
+                                     forecast=forecast)
+            forecast = {**forecast, "pred_high": high, "pred_low": low}
+            highs.append(high)
+            lows.append(low)
+        assert highs == sorted(highs)
+        assert lows == sorted(lows, reverse=True)
+
+    def test_a_brownian_high_is_not_re_extended_until_it_is_breached_again(self):
+        """It already anticipates the excursion, so the tape catching up to the
+        extreme it was built on is not new information."""
+        high, _ = self._update(D.BREACH_BROWNIAN, 112.0, 101.0)
+        forecast = {**self.FORECAST, "pred_high": high}
+        assert high > 112.0
+        again, _ = self._update(D.BREACH_BROWNIAN, high - 0.01, 101.0, forecast=forecast)
+        assert again == high
+
+
+class TestMinutesLeft:
+    @staticmethod
+    def _et(stamp):
+        return pd.Timestamp(stamp, tz=D.market_hours.MARKET_TZ)
+
+    def test_counts_down_to_the_four_oclock_close(self):
+        assert D.minutes_left_at(self._et("2026-08-07 12:00")) == 240.0
+        assert D.minutes_left_at(self._et("2026-08-07 09:35")) == 385.0
+
+    def test_a_naive_timestamp_is_read_as_exchange_time(self):
+        assert D.minutes_left_at(pd.Timestamp("2026-08-07 12:00")) == 240.0
+
+    def test_a_utc_timestamp_is_converted_rather_than_taken_at_face_value(self):
+        """The trader's bars are tz-aware; a UTC index read as ET would put the
+        whole session after the close and zero every Brownian reach."""
+        assert D.minutes_left_at(pd.Timestamp("2026-08-07 16:00", tz="UTC")) == 240.0
+
+    def test_never_goes_negative_after_the_close(self):
+        assert D.minutes_left_at(pd.Timestamp("2026-08-07 17:30")) == 0.0
+
+
 class TestMarketDate:
     def test_the_session_date_follows_the_simulated_clock(self):
         # 00:30 UTC is still the previous day in New York, which is the
