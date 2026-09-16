@@ -4,6 +4,7 @@ from agent_stonks.config import MAX_BARS, PAPER_STARTING_CASH, VOLUME_ALERT_DEFA
 from agent_stonks.state import (
     AppState,
     average_daily_volume,
+    bar_tape,
     completed_daily_bars,
     current_volume_ratio,
     today_daily_bar,
@@ -222,3 +223,33 @@ def test_previous_minute_close_is_watchable():
     assert alert_field_value(state, "previous_minute_close") is None
     state.previous_minute_close = 101.25
     assert alert_field_value(state, "previous_minute_close") == 101.25
+
+
+class TestBarTape:
+    """Which tape the buffer's volumes are on -- not which socket fills it.
+
+    The distinction exists because `feed` defaults to "iex" and the live source
+    defaults to Finnhub, so anything reading `feed` reports a single-venue tape
+    for a buffer that is consolidated end to end.
+    """
+
+    def test_the_finnhub_source_is_consolidated_whatever_feed_says(self):
+        s = AppState()
+        s.data_source = "finnhub"
+        s.feed = "iex"
+        assert bar_tape(s) == "finnhub"
+
+    def test_the_alpaca_source_is_whichever_feed_it_streams(self):
+        s = AppState()
+        s.data_source = "alpaca"
+        s.feed = "sip"
+        assert bar_tape(s) == "sip"
+        s.feed = "iex"
+        assert bar_tape(s) == "iex"
+
+    def test_a_replay_names_its_own_tape(self):
+        """SimLab reads a stored dataset: `data_source`/`feed` describe sockets
+        nothing is connected to, so the dataset's feed wins."""
+        s = AppState()
+        s.bar_tape_override = "yfinance"
+        assert bar_tape(s) == "yfinance"

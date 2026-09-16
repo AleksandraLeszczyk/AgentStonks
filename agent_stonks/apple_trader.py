@@ -31,15 +31,16 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, timezone
 from typing import Optional
 
 import pandas as pd
 
 from . import agent as agent_mod
+from . import state as state_mod
 from . import (
-    apple_models, historical, intraday_vol_model, market_hours, momentum_regime,
-    rule_agent,
+    apple_models, bar_history, clock, historical, intraday_vol_model, market_hours,
+    momentum_regime, rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -68,6 +69,7 @@ from .config import (
     LEVELS_INTRADAY,
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
+    SIP_DELAY_MIN,
 )
 from .decisions import DecisionTracker, whole_shares
 from .state import AppState
@@ -356,16 +358,104 @@ def _dayrange():
     return dayrange_model
 
 
-def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAULT_TICKER):
-    """The first `want` regular-session bars of today, or a clear failure.
+def _window_bars(
+    state: AppState, ticker: str, tape: str, start, end
+) -> "list[dict]":
+    """One tape's bars for [start, end), or an exception saying why not.
 
-    The live buffer normally holds them -- it keeps the whole session -- but an
-    agent started after 9:35 has a buffer that begins wherever the stream did,
-    and `frame.iloc[:want]` would then hand the model five bars from the middle
-    of the day as though they were the open. Rather than produce a confident
-    forecast off the wrong five minutes, the 09:30 window is re-fetched, exactly
-    as `agent._opening_range_for` does for the same reason and through the same
-    (simulation-patched) call.
+    The Alpaca tapes go through `agent_mod.fetch_bars_window` -- the same
+    (simulation-patched) call `agent._opening_range_for` recovers an opening
+    range with, so a replay reads its dataset here rather than the network.
+    yfinance serves today's session only, which is all this is asked for, and
+    needs no credentials, so it is the consolidated source a free Alpaca key
+    still has.
+
+    `sip_delayed` is SIP asked for a window a free/basic plan will actually
+    answer: those plans refuse anything reaching into the trailing
+    SIP_DELAY_MIN minutes, so a window that recent is declined here instead of
+    spending a request on a certain 403.
+    """
+    if tape == "yfinance":
+        bars = historical.fetch_intraday_bars(ticker, interval="1m")
+        return [b for b in bars if start <= pd.to_datetime(b["t"], utc=True) < end]
+    if tape == "sip_delayed":
+        if end > clock.now().astimezone(timezone.utc) - timedelta(minutes=SIP_DELAY_MIN):
+            raise ValueError(
+                f"delayed SIP does not serve the trailing {SIP_DELAY_MIN} minutes"
+            )
+        tape = "sip"
+    if not (state.api_key and state.api_secret):
+        raise ValueError("no Alpaca credentials")
+    return agent_mod.fetch_bars_window(
+        ticker, "1Min", start, end, state.api_key, state.api_secret, tape,
+    )
+
+
+def _refetch_opening_window(
+    state: AppState, ticker: str, want: int, consolidated_only: bool = False
+):
+    """The session's first `want` minutes from the best tape that will serve
+    them: `(frame, tape)`, or `(None, "")` when none of them can.
+
+    Ordered by `bar_history.feed_order` from the session's resolved history
+    feed, so this asks the consolidated tape first and reaches IEX only when
+    SIP, delayed SIP and yfinance have all declined -- the same ranking the bar
+    buffer itself is filled by, for the same reason. `consolidated_only` drops
+    IEX from that list, for the caller who already holds the right five minutes
+    on the IEX scale and is here to improve on them: a REST IEX window would
+    return the same numbers for the price of a round trip.
+
+    A tape that answers with a short window, or one that does not start at
+    09:30, has not answered: the forecast is a claim about the opening five
+    minutes and half of them is not a cheaper version of it.
+    """
+    open_utc = market_hours.session_open()
+    if open_utc is None:
+        return None, ""
+    end = open_utc + timedelta(minutes=want)
+    resolved = state.history_feed_resolved or state.history_feed
+    for tape in bar_history.feed_order(resolved):
+        if consolidated_only and not bar_history.is_consolidated(tape):
+            continue
+        try:
+            bars = _window_bars(state, ticker, tape, open_utc, end)
+        except Exception:
+            continue
+        recovered = momentum_regime.frame_from_bars(bars)
+        if len(recovered) >= want and float(recovered["minutes_from_open"].iloc[0]) < 1.0:
+            return recovered.iloc[:want], tape
+    return None, ""
+
+
+def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAULT_TICKER):
+    """The first `want` regular-session bars of today and the tape they are on.
+
+    Returns `(frame, tape)`. The tape is part of the answer because the forecast
+    reads minute *volume* out of these bars (`or_volume_share`), and the ridge
+    that reads it was fitted on consolidated volume -- IEX carries under 4% of
+    it, which is a bias rather than a rounding error. The caller quotes the tape
+    in the caveat it logs, so the caveat describes the bars the forecast was
+    actually built on rather than whichever Alpaca feed the sidebar is holding.
+
+    Two ways the window is wrong if taken straight off the buffer, and both are
+    repaired the same way -- by re-fetching the 09:30 window from the best tape
+    that will serve it (`_refetch_opening_window`):
+
+    * an agent started after 9:35 has a buffer that begins wherever the stream
+      did, and `frame.iloc[:want]` would hand the model five bars from the middle
+      of the day as though they were the open;
+    * a buffer filled from IEX has the right five minutes on the wrong volume
+      scale. A consolidated tape is preferred over it even when the bars are
+      right there, and the IEX bars are kept (with the caveat) only when nothing
+      consolidated will answer -- which is the case before 9:50 on a free key,
+      where every consolidated source is 15 minutes behind.
+
+    A replay has none of that choice: a simulation has exactly one tape, the one
+    its dataset was downloaded on (`AppState.bar_tape_override`), and every
+    source below is patched back to those same stored bars. So there is nothing
+    to shop for, and shopping would be worse than useless -- it would hand back
+    IEX bars under the name of whichever consolidated feed was asked first, and
+    the caveat that should have been logged would not be.
 
     Module-level rather than a method because both day-range consumers need it
     and they are not related by inheritance: `DayRangeTrader` here, and Apple
@@ -373,29 +463,27 @@ def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAUL
     rule asks for it. `ticker` is the symbol the caller trades, and only matters on
     the re-fetch path, since `frame` is already the right symbol's bars.
     """
-    first = frame.iloc[:want]
-    if float(first["minutes_from_open"].iloc[0]) < 1.0:
-        return first
+    buffered = frame.iloc[:want]
+    covers_open = float(buffered["minutes_from_open"].iloc[0]) < 1.0
+    tape = state_mod.bar_tape(state)
+    replayed = str(getattr(state, "bar_tape_override", "") or "")
+    if covers_open and (replayed or bar_history.is_consolidated(tape)):
+        return buffered, tape
 
-    open_utc = market_hours.session_open()
-    window = []
-    if open_utc is not None and state.api_key and state.api_secret:
-        try:
-            window = agent_mod.fetch_bars_window(
-                ticker, "1Min", open_utc,
-                open_utc + timedelta(minutes=want),
-                state.api_key, state.api_secret, state.feed,
-            )
-        except Exception:
-            window = []
-    recovered = momentum_regime.frame_from_bars(window)
-    if len(recovered) < want or float(recovered["minutes_from_open"].iloc[0]) >= 1.0:
-        raise ValueError(
-            f"the first {want} minutes of the session are not in the bar buffer "
-            f"(it starts at {frame.index[0]:%H:%M}) and could not be re-fetched; "
-            "the forecast is built on the 09:30 window and cannot be made without it."
-        )
-    return recovered.iloc[:want]
+    recovered, source = _refetch_opening_window(
+        state, ticker, want, consolidated_only=covers_open
+    )
+    if recovered is not None:
+        return recovered, replayed or source
+    if covers_open:
+        # IEX bars of the right five minutes. Worse than a consolidated tape,
+        # better than no forecast, and the caveat says which one this was.
+        return buffered, tape
+    raise ValueError(
+        f"the first {want} minutes of the session are not in the bar buffer "
+        f"(it starts at {frame.index[0]:%H:%M}) and could not be re-fetched; "
+        "the forecast is built on the 09:30 window and cannot be made without it."
+    )
 
 
 class DayRangeTrader(BaseTrader):
@@ -621,7 +709,7 @@ class DayRangeTrader(BaseTrader):
         -- so it is recorded in `self.blocked` and reported once.
         """
         try:
-            opening = self._opening_window(state, frame, want)
+            opening, tape = self._opening_window(state, frame, want)
             dayrange = _dayrange()
             history = dayrange.daily_frame_from_bars(
                 historical.fetch_daily_ohlc_bars(
@@ -663,7 +751,7 @@ class DayRangeTrader(BaseTrader):
         }
         self._set_levels(opening.index[-1])
 
-        warning = _dayrange().volume_scale_warning(getattr(state, "feed", None))
+        warning = _dayrange().volume_scale_warning(tape)
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
         _log(state, {"type": "analysis", "text": self._plan_summary()})

@@ -138,6 +138,9 @@ class Tape:
             )
         monkeypatch.setattr(at.historical, "fetch_daily_ohlc_bars", lambda *a, **k: [])
         monkeypatch.setattr(at.historical, "fetch_session_open", lambda *a, **k: None)
+        # yfinance is one of the consolidated tapes the opening window falls
+        # back to (`TestOpeningWindowTape`); no test may reach it for real.
+        monkeypatch.setattr(at.historical, "fetch_intraday_bars", lambda *a, **k: [])
         monkeypatch.setattr(dayrange, "forecast_session", self._forecast)
 
     def _forecast(self, *args, **kwargs):
@@ -1247,6 +1250,208 @@ class TestDayRangeGuards:
         tape.append(104.0)
         trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
         assert tape.forecast_calls == 2
+
+
+class TestOpeningWindowTape:
+    """Which tape the forecast's opening five minutes come from.
+
+    `or_volume_share` is the one feature that reads minute volume and it was
+    fitted on consolidated volume, so an IEX window (under 4% of the tape) is a
+    bias in the forecast rather than a rounding error. The rule is: the best
+    tape that will serve the 09:30 window, and IEX only when none of them will.
+    """
+
+    WANT = 5
+
+    def _window(self, monkeypatch, minutes: int = 5):
+        """A Tape whose buffer covers the open (minutes=5) or does not (0).
+
+        With minutes=0 the bars start at 10:30 instead -- an agent launched
+        mid-session, whose first five bars are not the session's first five.
+        """
+        tape = Tape(monkeypatch, minutes=minutes)
+        if minutes == 0:
+            for _ in range(self.WANT + 1):
+                tape.append(103.0)
+        return tape
+
+    def _fetches(self, monkeypatch, answers: dict):
+        """Record every tape asked for; answer from `answers` (feed -> bars)."""
+        asked: list[str] = []
+
+        def alpaca(symbol, timeframe, start, end, key, secret, feed="iex", **kw):
+            asked.append(feed)
+            return answers.get(feed, [])
+
+        def yahoo(symbol, interval="1m"):
+            asked.append("yfinance")
+            return answers.get("yfinance", [])
+
+        monkeypatch.setattr(at.agent_mod, "fetch_bars_window", alpaca)
+        monkeypatch.setattr(at.historical, "fetch_intraday_bars", yahoo)
+        return asked
+
+    def _bars(self, count: int = 5, volume: float = 4.0e5) -> list[dict]:
+        """`count` one-minute bars from the 09:30 open, in Alpaca's REST shape."""
+        open_et = pd.Timestamp("2026-07-21 09:30", tz="America/New_York")
+        return [
+            {
+                "t": (open_et + pd.Timedelta(minutes=i)).tz_convert("UTC").strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "o": 101.0, "h": 101.5, "l": 100.9, "c": 101.0, "v": volume,
+            }
+            for i in range(count)
+        ]
+
+    def test_a_consolidated_buffer_is_used_as_it_stands(self, state, market_open, monkeypatch):
+        """The Finnhub stream is the consolidated tape, so the bars already in
+        hand are the right ones and nothing is fetched."""
+        tape = self._window(monkeypatch)
+        asked = self._fetches(monkeypatch, {})
+        state.data_source = "finnhub"
+
+        window, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert source == "finnhub" and asked == []
+        assert len(window) == self.WANT
+
+    def test_an_iex_buffer_is_replaced_by_a_consolidated_tape(
+        self, state, market_open, monkeypatch
+    ):
+        """The right five minutes on the wrong volume scale. SIP has the same
+        five minutes on the scale the ridge was fitted on, so SIP wins even
+        though the buffer needs no repair at all."""
+        tape = self._window(monkeypatch)
+        asked = self._fetches(monkeypatch, {"sip": self._bars()})
+        state.data_source = "alpaca"
+        state.feed = "iex"
+
+        window, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert source == "sip" and asked == ["sip"]
+        assert float(window["volume"].iloc[0]) == pytest.approx(4.0e5)
+
+    def test_iex_is_asked_last_and_only_after_every_consolidated_tape(
+        self, state, market_open, monkeypatch
+    ):
+        tape = self._window(monkeypatch, minutes=0)
+        asked = self._fetches(monkeypatch, {"iex": self._bars(volume=1.5e4)})
+        state.data_source = "alpaca"
+        state.feed = "iex"
+
+        window, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        # sip_delayed never reaches Alpaca: mid-session at 10:30, the 09:30
+        # window is well outside the trailing 15 minutes a free plan refuses,
+        # so it is asked -- as plain "sip", which is the feed Alpaca knows.
+        assert asked == ["sip", "sip", "yfinance", "iex"]
+        assert source == "iex" and len(window) == self.WANT
+
+    def test_an_iex_buffer_is_kept_when_no_consolidated_tape_answers(
+        self, state, market_open, monkeypatch
+    ):
+        """Before 9:50 on a free key every consolidated source is 15 minutes
+        behind. A biased forecast beats no forecast; the caveat says which."""
+        tape = self._window(monkeypatch)
+        asked = self._fetches(monkeypatch, {})
+        state.data_source = "alpaca"
+        state.feed = "iex"
+
+        window, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert source == "iex" and len(window) == self.WANT
+        # A REST IEX window would hand back the bars already in the buffer, so
+        # the round trip is not spent.
+        assert "iex" not in asked
+
+    def test_a_short_answer_is_not_an_answer(self, state, market_open, monkeypatch):
+        """Three of the five minutes is not a cheaper forecast, so the tape that
+        sent them is passed over rather than trusted."""
+        tape = self._window(monkeypatch, minutes=0)
+        asked = self._fetches(
+            monkeypatch, {"sip": self._bars(count=3), "yfinance": self._bars()}
+        )
+        state.data_source = "alpaca"
+        state.feed = "iex"
+
+        _, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert source == "yfinance" and "iex" not in asked
+
+    def test_delayed_sip_declines_a_window_it_cannot_serve(
+        self, state, market_open, monkeypatch
+    ):
+        """At 9:35 the 09:30 window is inside the trailing 15 minutes a
+        free/basic plan refuses, so delayed SIP never reaches Alpaca -- the
+        request is not spent on a certain 403. The tapes behind it are still
+        tried, in order, and real-time SIP is one of them."""
+        tape = self._window(monkeypatch, minutes=0)
+        asked = self._fetches(monkeypatch, {})
+        clock.set_simulated(datetime(2026, 7, 21, 13, 35, tzinfo=timezone.utc))
+        state.history_feed_resolved = "sip_delayed"
+
+        with pytest.raises(ValueError, match="09:30 window"):
+            at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert asked == ["sip", "yfinance", "iex"]
+
+    def test_a_replay_keeps_its_datasets_tape_and_does_not_shop(
+        self, state, market_open, monkeypatch
+    ):
+        """In simulation every source is patched back to the same stored bars,
+        so asking SIP for an IEX dataset's window would relabel it -- and lose
+        the caveat that dataset had earned."""
+        tape = self._window(monkeypatch)
+        asked = self._fetches(monkeypatch, {"sip": self._bars()})
+        state.bar_tape_override = "iex"
+
+        window, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert source == "iex" and asked == []
+        assert len(window) == self.WANT
+
+    def test_a_replay_recovering_the_window_still_names_its_own_tape(
+        self, state, market_open, monkeypatch
+    ):
+        """A mid-session start inside a replay does re-fetch -- out of the same
+        dataset. The bars are the replay's whichever source name answered."""
+        tape = self._window(monkeypatch, minutes=0)
+        self._fetches(monkeypatch, {"sip": self._bars()})
+        state.bar_tape_override = "iex"
+
+        _, source = at.fetch_opening_window(state, tape.frame(), self.WANT)
+
+        assert source == "iex"
+
+    def test_the_caveat_names_the_tape_the_forecast_was_built_on(
+        self, state, market_open, monkeypatch
+    ):
+        """Not `state.feed`, which the Finnhub default leaves at "iex" while the
+        buffer is consolidated end to end -- a caveat on every clean forecast."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(103.0))
+        tape = Tape(monkeypatch)
+        self._fetches(monkeypatch, {})
+        state.data_source = "finnhub"
+        state.feed = "iex"
+        tape.append(103.0)
+
+        at.DayRangeTrader(dayrange_config()).run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        assert not [e for e in state.agent_log if "Forecast caveat" in e.get("text", "")]
+
+    def test_an_iex_forecast_still_says_so(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(103.0))
+        tape = Tape(monkeypatch)
+        self._fetches(monkeypatch, {})
+        state.data_source = "alpaca"
+        state.feed = "iex"
+        tape.append(103.0)
+
+        at.DayRangeTrader(dayrange_config()).run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        caveats = [e for e in state.agent_log if "Forecast caveat" in e.get("text", "")]
+        assert len(caveats) == 1 and "4% of consolidated" in caveats[0]["text"]
 
 
 class TestStrategySelection:

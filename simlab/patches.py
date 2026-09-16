@@ -15,8 +15,9 @@ duration of a simulation:
   honest "not available in simulation" notes (point-in-time histories of
   these aren't stored; a note keeps the agent reasoning on real data instead
   of on today's targets leaking into the past)
-- ``historical.fetch_intraday_volume_bars`` / ``fetch_intraday_bars_for_date``
-  / ``fetch_daily_volume_bars`` (the volume tools' consolidated-tape reads)
+- ``historical.fetch_intraday_volume_bars`` / ``fetch_intraday_bars`` /
+  ``fetch_intraday_bars_for_date`` / ``fetch_daily_volume_bars`` (the volume
+  tools' and the opening window's consolidated-tape reads)
   -> stored minute/daily bars clipped to the simulated clock. Live these hit
   yfinance for *wall-clock today*, which inside a simulation is a different
   day entirely; and a dated fetch of the simulated day would return bars from
@@ -171,6 +172,7 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
         (historical, "fetch_analyst_targets", fake_analyst_targets),
         (historical, "fetch_smart_money_flow", fake_smart_money_flow),
         (historical, "fetch_intraday_volume_bars", fake_intraday_volume_bars),
+        (historical, "fetch_intraday_bars", fake_intraday_volume_bars),
         (historical, "fetch_intraday_bars_for_date", fake_intraday_bars_for_date),
         (historical, "fetch_daily_volume_bars", fake_daily_volume_bars),
         (historical, "fetch_daily_ohlc_bars", fake_daily_ohlc_bars),

@@ -68,6 +68,32 @@ SOURCE_LABELS: dict[str, str] = {
 CONCRETE_FEEDS: tuple[str, ...] = ("sip", "sip_delayed", "yfinance", "iex")
 
 
+def is_consolidated(feed: str) -> bool:
+    """Whether `feed` names a tape that carries the whole market's volume.
+
+    Everything here but IEX does: SIP (both tiers) is the consolidated tape,
+    yfinance is a rendering of it within 1.5%, and the Finnhub live source
+    streams it too -- which is why "finnhub" answers True despite never being a
+    REST feed. IEX is one venue at under 4%, so a number fitted on consolidated
+    volume is off its scale there.
+    """
+    return str(feed or "").lower() not in ("iex", "")
+
+
+def feed_order(feed: str) -> "list[str]":
+    """`feed` first, then every other concrete source, consolidated before IEX.
+
+    The one ranking of tapes in the app: a consolidated source is replaced by
+    another consolidated source wherever possible and IEX is reached only when
+    nothing else answers. `feed` is filtered against the concrete set because
+    callers may still be holding the unresolved "auto" -- a choice, not a feed,
+    which would reach Alpaca as a literal `feed=auto`.
+    """
+    return ([feed] if feed in CONCRETE_FEEDS else []) + [
+        f for f in CONCRETE_FEEDS if f != feed
+    ]
+
+
 def _sip_window(lookback_hours: int) -> "tuple[datetime, datetime]":
     """The [start, end) a delayed-SIP key is allowed to ask for, ending
     SIP_DELAY_MIN behind now."""
@@ -194,16 +220,7 @@ def fetch_history_bars(
     failures: list[tuple[str, object]] = []
     yf_interval = YF_INTERVALS.get(timeframe)
 
-    # Ordered candidates: the resolved feed first, then the rest in
-    # CONCRETE_FEEDS order (consolidated before IEX), no duplicates. `feed` is
-    # filtered against the concrete set because callers may still be holding the
-    # unresolved "auto" -- a choice, not a feed, which would reach Alpaca as a
-    # literal `feed=auto`.
-    order = ([feed] if feed in CONCRETE_FEEDS else []) + [
-        f for f in CONCRETE_FEEDS if f != feed
-    ]
-
-    for candidate in order:
+    for candidate in feed_order(feed):
         label = SOURCE_LABELS.get(candidate, candidate)
         try:
             if candidate == "yfinance":
@@ -256,11 +273,8 @@ def fetch_daily(
     a wrong baseline is still better than no daily history at all -- but the
     caller logs which feed answered so the mismatch is visible.
     """
-    order = ([feed] if feed in CONCRETE_FEEDS else []) + [
-        f for f in CONCRETE_FEEDS if f != feed
-    ]
     failures: list[tuple[str, object]] = []
-    for candidate in order:
+    for candidate in feed_order(feed):
         # yfinance's intraday helper has no daily equivalent wired up here, and
         # Alpaca serves the whole daily history under one call either way.
         if candidate == "yfinance":

@@ -351,3 +351,33 @@ class TestDailyBaseline:
     def test_raises_when_every_source_failed(self, monkeypatch):
         with pytest.raises(RuntimeError):
             bar_history.fetch_daily("AAPL", "k", "s", "sip")
+
+
+class TestFeedRanking:
+    """The one ranking of tapes: `feed_order` and `is_consolidated`. Every path
+    that picks a source reads them, so the preference is stated once."""
+
+    def test_the_chosen_feed_comes_first_and_the_rest_follow_in_quality_order(self):
+        assert bar_history.feed_order("yfinance") == [
+            "yfinance", "sip", "sip_delayed", "iex"
+        ]
+
+    def test_iex_is_always_last_when_it_was_not_asked_for(self):
+        for feed in ("auto", "sip", "sip_delayed", "yfinance", "nonsense", ""):
+            assert bar_history.feed_order(feed)[-1] == "iex"
+
+    def test_an_unresolved_choice_is_not_passed_through_as_a_feed(self):
+        """"auto" is a choice, not a tape -- Alpaca would take it literally."""
+        assert bar_history.feed_order("auto") == list(bar_history.CONCRETE_FEEDS)
+
+    def test_every_feed_appears_exactly_once(self):
+        order = bar_history.feed_order("iex")
+        assert sorted(order) == sorted(bar_history.CONCRETE_FEEDS)
+
+    @pytest.mark.parametrize("feed", ["sip", "sip_delayed", "yfinance", "finnhub"])
+    def test_the_consolidated_tapes(self, feed):
+        assert bar_history.is_consolidated(feed)
+
+    @pytest.mark.parametrize("feed", ["iex", "IEX", "", None])
+    def test_iex_is_not_consolidated_and_neither_is_an_unknown_tape(self, feed):
+        assert not bar_history.is_consolidated(feed)

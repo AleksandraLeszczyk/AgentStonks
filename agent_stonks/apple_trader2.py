@@ -217,7 +217,7 @@ class SessionForecaster:
         if len(frame) < want:
             return None
         try:
-            opening = fetch_opening_window(state, frame, want, ticker=self.ticker)
+            opening, tape = fetch_opening_window(state, frame, want, ticker=self.ticker)
             history = dayrange.daily_frame_from_bars(
                 historical.fetch_daily_ohlc_bars(
                     self.ticker, days=dayrange.DAILY_HISTORY_DAYS
@@ -242,7 +242,7 @@ class SessionForecaster:
             return None
 
         self.plan = {"date": today, "opening_end": opening.index[-1], **forecast}
-        warning = dayrange.volume_scale_warning(getattr(state, "feed", None))
+        warning = dayrange.volume_scale_warning(tape)
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
         _log(

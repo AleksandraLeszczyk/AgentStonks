@@ -220,6 +220,7 @@ _DEFAULTS: dict[str, object] = {
     "finnhub_token": "",
     "history_feed": DEFAULT_HISTORY_FEED,
     "history_feed_resolved": "",
+    "bar_tape_override": "",
     "api_key": "",
     "api_secret": "",
     "status": "Idle",
@@ -304,6 +305,11 @@ class AppState:
         # volumes differ by 26x (see agent_stonks.bar_history).
         self.history_feed: str = DEFAULT_HISTORY_FEED
         self.history_feed_resolved: str = ""
+        # Names the tape the bar buffer is on when it is not the live wiring's
+        # to derive -- SimLab replays a stored dataset and knows its feed, while
+        # `data_source`/`feed` describe sockets nothing is connected to. Empty
+        # live; see `bar_tape`.
+        self.bar_tape_override: str = ""
         # The Apple Trader configuration the sidebar currently holds, so the
         # chart can draw the levels *this* setup would rest rather than a
         # plausible set (`model_overlays.TRADER_LEVELS_KEY`). None whenever
@@ -484,6 +490,28 @@ class AppState:
             value += position * price
         self.portfolio_value = value
         return value
+
+
+def bar_tape(app: "AppState") -> str:
+    """Which tape the bar buffer's volumes are on -- not which socket fills it.
+
+    A different question from `feed` or `data_source`, and the app gets it wrong
+    if it asks those instead: the Finnhub source streams the *consolidated*
+    trade tape whatever `feed` happens to be set to, and `feed` defaults to
+    "iex", so reading `feed` reports a single-venue tape for a buffer that is
+    consolidated end to end. It matters to anything whose numbers were fitted on
+    a volume scale -- the day-range forecast's `or_volume_share` above all --
+    because IEX carries under 4% of consolidated volume.
+
+    Returns "finnhub", "sip", "iex" or whatever the replay was recorded on; pair
+    it with `bar_history.is_consolidated` rather than comparing to "iex" by hand.
+    """
+    override = str(getattr(app, "bar_tape_override", "") or "")
+    if override:
+        return override
+    if getattr(app, "data_source", "") == "finnhub":
+        return "finnhub"
+    return str(getattr(app, "feed", "") or "")
 
 
 def append_agent_log(state: "AppState", entry: dict) -> None:

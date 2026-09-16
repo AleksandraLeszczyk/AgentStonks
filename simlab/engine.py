@@ -131,6 +131,11 @@ class SimulationEngine:
         # every data path that would use them is dataset-backed in simulation.
         self.app.api_key = "simulated"
         self.app.api_secret = "simulated"
+        # The tape the replayed bars were downloaded on. `data_source`/`feed`
+        # describe sockets nothing is connected to here, so anything that asks
+        # what scale the volumes are on (`state.bar_tape`) would otherwise read
+        # the live defaults -- and report "iex" for a yfinance dataset.
+        self.app.bar_tape_override = market.feed
         self.tracker = DecisionTracker(starting_cash=config.starting_cash, broker=SimBroker(market))
         self.app.decision_tracker = self.tracker
         self.app.starting_budget = config.starting_cash
