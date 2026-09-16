@@ -303,7 +303,18 @@ APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
 # ("one trade a day unless it runs"), not a bug, and the form says so where the
 # two settings disagree. 0 switches it off, which is what every record written
 # before it existed replays as.
+#
+# AAPL is the instrument that disagrees, so it has its own entry: at 0.20 its
+# 0.15-ADR target exit could never clear the bar and every completed trade ended
+# the session. 0.10 leaves a target exit (and anything better) alive and catches
+# what the rule is for -- a breakeven runner, a flatten at the fill, a take that
+# faded early. Per instrument for the same reason the levels are
+# (APPLE_TRADER_DAYRANGE_LEVELS): the number only means something against that
+# symbol's own buy/sell distances.
 APPLE_TRADER_MIN_WIN_K = 0.20
+APPLE_TRADER_MIN_WIN: "dict[str, float]" = {
+    "AAPL": 0.10,
+}
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Flatten this many minutes before the close: the day-range forecast is a
@@ -369,6 +380,10 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     # for its shape stretched to the day-range forecast (a sibling of that cyan).
     "intraday_range":    "#facc15",
     "intraday_dayrange": "#2dd4bf",
+    # Apple Trader's two resting levels. Deliberately not a sibling of the cyan
+    # above: these are an *agent's* orders, not a model's forecast, and reading
+    # the chart means telling the two apart at a glance.
+    "trader_levels": "#fb923c",  # orange
 }
 
 # Alpha for the semi-transparent backgrounds overlays paint behind the candles.

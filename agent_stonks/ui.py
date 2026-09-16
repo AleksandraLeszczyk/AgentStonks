@@ -756,7 +756,9 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
         help="Draws what the trained models predict for this session: price "
         "ranges as horizontal lines, in the candles and in the profile beside "
         "them, and time-of-day ranges as a shaded envelope that is widest at the "
-        "open and narrows through midday.",
+        "open and narrows through midday. **Apple Trader buy/sell levels** is the "
+        "exception — not a forecast but the two orders the agent configured below "
+        "would rest, which follow whatever settings that form is holding.",
     )
     for key in selected:
         overlay = model_overlays.get(key)
@@ -1939,6 +1941,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "with the forecast held fixed all day."
         ),
         "min_win_k": (
+            "{ticker} starts at {min_win_k}, per instrument because the number only means "
+            "something against that symbol's own buy/sell pair. "
             "Once a trade has closed for no more than this many ADRs **per share**, the "
             "agent buys nothing else today — same unit as the levels and the stop, so the "
             "three can be read against each other. Measured over the whole position, so a "
@@ -2168,6 +2172,9 @@ def _agent_panel(
     apple_config = (
         _apple_trader_params(symbols) if personality == APPLE_TRADER_KEY else None
     )
+    # Published for the chart's buy/sell overlay, which is drawn from a
+    # configuration rather than from a model and should show the one on screen.
+    state.apple_trader_config = apple_config
     apple2_config = (
         _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
     )

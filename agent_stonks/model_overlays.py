@@ -8,7 +8,7 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Four overlays
+Five overlays
 -------------
 `day_range`          TimeToChange3's forecast of where the session's high and
                      low will land, made once from the first five minutes. Two
@@ -28,6 +28,12 @@ Four overlays
 `intraday_dayrange`  the same curve stretched so its peak is TimeToChange3's
                      predicted high and its trough the predicted low. The one
                      forecast is shared with `day_range` within a call.
+`trader_levels`      where Apple Trader would rest its buy and its sell, from
+                     the same forecast. The odd one out: every other overlay
+                     draws what a *model* said, this one draws what an *agent*
+                     would do about it, so it takes a configuration and asks
+                     `apple_trader.session_levels` rather than deriving the
+                     levels itself.
 
 Both envelopes are widest at 09:30, narrow to roughly a fifth of that by
 midday and open again into the close. They are a picture of *how far the day
@@ -72,7 +78,7 @@ never an exception and never a fabricated line.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -90,6 +96,7 @@ DAY_RANGE_KEY = "day_range"
 PROFILE_RANGE_KEY = "profile_range"
 INTRADAY_RANGE_KEY = "intraday_range"
 INTRADAY_DAYRANGE_KEY = "intraday_dayrange"
+TRADER_LEVELS_KEY = "trader_levels"
 
 
 @dataclass(frozen=True)
@@ -170,6 +177,23 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         tickers=tuple(
             t for t in apple_models.DAYRANGE_TICKERS if intraday_vol_model.covers(t)
         ),
+    ),
+    TRADER_LEVELS_KEY: ModelOverlay(
+        key=TRADER_LEVELS_KEY,
+        label="Apple Trader buy/sell levels",
+        summary=(
+            "Where the configured Apple Trader rests its two orders: the buy and the "
+            "sell, each a distance in ADRs under the day-range forecast. The only "
+            "overlay here that draws an agent's orders rather than a model's answer."
+        ),
+        requires="PyTorch, LightGBM and the day-range bundle",
+        tickers=apple_models.DAYRANGE_TICKERS,
+        # Deliberately not `models=(DAYRANGE_KEY,)`, though it is built on that
+        # forecast: `for_models` pre-selects what a *model* said, and these are
+        # one agent's orders. Auto-selecting on any run that loaded the bundle
+        # would draw Apple Trader's levels over an Apple Trader 2 run whose
+        # rules merely read the same forecast, which rested nothing of the kind.
+        models=(),
     ),
 }
 
@@ -379,6 +403,7 @@ def compute(
     session_date=None,
     open_price: "float | None" = None,
     dayrange_daily_bars: "list[dict] | None" = None,
+    trader_config=None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
@@ -393,6 +418,13 @@ def compute(
     `dayrange_daily_bars` is the day-range forecast's own daily history, for a
     caller whose `daily_bars` cannot serve it (see `live_overlays`); it
     defaults to `daily_bars`.
+
+    `trader_config` is the `AppleTraderConfig` whose orders `trader_levels`
+    draws. None means the shipped configuration for this instrument, which is
+    the honest default: a chart with nothing configured should show what the
+    agent would do if started now, not the last symbol's numbers. A caller with
+    a real one -- the live form's, or a stored run's -- passes it, and the
+    levels drawn are then that run's rather than a plausible set.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -439,6 +471,9 @@ def compute(
         ),
         INTRADAY_DAYRANGE_KEY: lambda: _intraday_dayrange_items(
             symbol, session, day, open_price, day_range_forecast()
+        ),
+        TRADER_LEVELS_KEY: lambda: _trader_levels_items(
+            symbol, session, day, open_price, day_range_forecast(), trader_config
         ),
     }
 
@@ -656,6 +691,80 @@ def _intraday_dayrange_items(
     ], ""
 
 
+# --- Apple Trader's resting orders ------------------------------------------
+
+
+def _trader_levels_items(
+    symbol: str,
+    session: pd.DataFrame,
+    day: pd.Timestamp,
+    open_price: "float | None",
+    result: dict,
+    config=None,
+) -> "tuple[list[dict], str]":
+    """The buy and the sell, as the configured agent would rest them.
+
+    Flat under the notebook's settings and a moving pair under the others, so
+    the shape of the drawing follows the shape of the strategy: two levels when
+    neither moves all session -- which also mirrors them into the price profile,
+    where a resting order is exactly the kind of thing to read against traded
+    volume -- and a band between them when they do.
+    """
+    from .apple_trader import AppleTraderConfig, session_levels  # heavy-ish, and only here
+
+    overlay = OVERLAYS[TRADER_LEVELS_KEY]
+    forecast = result["forecast"]
+    if forecast is None:
+        return [], f"{overlay.label}: {result['problem']}"
+    if config is None or (config.ticker or "").upper() != symbol:
+        # A configuration for another symbol is not this chart's strategy, and
+        # its distances were swept on that symbol's tape. The shipped ones are.
+        config = AppleTraderConfig(ticker=symbol)
+
+    made_at = result["made_at"]
+    levels = session_levels(config, forecast, session, made_at, open_price=open_price)
+    if not levels:
+        return [], (
+            f"{overlay.label}: the session has no bar after the {pd.Timestamp(made_at):%H:%M} "
+            "forecast yet, so there is nothing resting."
+        )
+
+    color = MODEL_OVERLAY_COLORS[TRADER_LEVELS_KEY]
+    buys = [row["buy"] for row in levels]
+    sells = [row["sell"] for row in levels]
+    how = (
+        f"buy {config.buy_k:g} × ADR and sell {config.sell_k:g} × ADR under "
+        + ("the predicted high" if config.level_source != "intraday"
+           else "the intraday band's upper curve")
+    )
+    moves = min(buys) != max(buys) or min(sells) != max(sells)
+    if not moves:
+        x0, x1 = made_at, _session_close(day)
+        return (
+            [
+                _level(TRADER_LEVELS_KEY, "Buy level", buys[0], color,
+                       note=f"Apple Trader's resting buy — {how}", x0=x0, x1=x1),
+                _level(TRADER_LEVELS_KEY, "Sell level", sells[0], color, dash="dashdot",
+                       note=f"Apple Trader's resting sell — {how}", x0=x0, x1=x1),
+            ],
+            "",
+        )
+    return (
+        [
+            _band(
+                TRADER_LEVELS_KEY, "Buy/sell levels",
+                [row["t"] for row in levels], buys, sells, color,
+                note=(
+                    f"{how}; they move through the session "
+                    f"({buys[0]:.2f} – {sells[0]:.2f} at the forecast, "
+                    f"{buys[-1]:.2f} – {sells[-1]:.2f} now)"
+                ),
+            )
+        ],
+        "",
+    )
+
+
 # --- predicted profile range (LevelsML) -------------------------------------
 
 
@@ -752,7 +861,14 @@ def live_overlays(
     if not wanted or not bars:
         return {"items": [], "notes": []}
 
-    key = (bars[-1].get("t"), tuple(wanted), len(bars))
+    # The agent's configuration is in the key because `trader_levels` is a
+    # picture of it: moving a distance in the sidebar has to move the lines on
+    # the next rerun, not on the next bar.
+    config = getattr(getattr(sym_state, "app", None), "apple_trader_config", None)
+    key = (
+        bars[-1].get("t"), tuple(wanted), len(bars),
+        None if config is None else astuple(config),
+    )
     cached = getattr(sym_state, "model_overlay_cache", None)
     if cached and cached.get("key") == key:
         return cached["result"]
@@ -764,6 +880,7 @@ def live_overlays(
         bars,
         daily_bars=list(sym_state.daily_bars or []),
         session_date=session_date,
+        trader_config=config,
         **_live_dayrange_inputs(sym_state.symbol, wanted, session_date),
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}

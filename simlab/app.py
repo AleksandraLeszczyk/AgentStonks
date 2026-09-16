@@ -59,6 +59,8 @@ from . import tuning as sim_tuning
 from .engine import SimulationConfig, SimulationEngine
 from .market import SimMarket
 from .patches import simulation_context
+from dataclasses import asdict
+
 from .rule_agents import RULE_AGENTS, rule_agent
 
 AVATAR_DIR = Path(__file__).resolve().parent.parent / "data" / "avatars"
@@ -720,6 +722,7 @@ def _overlay_day(
     symbol: str,
     day: date,
     selected: tuple,
+    trader_config: tuple = (),
 ) -> dict:
     """One replayed day's overlay items, computed once per tape and selection.
 
@@ -731,11 +734,13 @@ def _overlay_day(
     model are both fixed. Same reasoning as `model_overlays.live_overlays`'
     per-bar cache, a different lifetime.
 
-    The key is the tape (feed + symbol + day), not the run: two runs over the
-    same session get the same forecast, because the forecast is about the
-    session and never about who traded it. `_market` is excluded from the key
-    (Streamlit skips underscore-prefixed arguments) since it is a reader for
-    exactly that tape and holds nothing else the answer depends on.
+    The key is the tape (feed + symbol + day) plus `trader_config`, and that
+    second half is the exception that proves the first: every *model* overlay is
+    about the session and not about who traded it, so two runs over one tape get
+    one answer -- but `trader_levels` draws an agent's resting orders, which are
+    exactly a property of the run. It arrives as a flat tuple of
+    `(field, value)` pairs rather than the dataclass because this is
+    `st.cache_data` and a key has to hash.
     """
     t = _market.session_open(day) + timedelta(minutes=1)
     return model_overlays.compute(
@@ -745,7 +750,50 @@ def _overlay_day(
         daily_bars=_market.completed_daily_bars(symbol, t),
         session_date=day,
         open_price=_market.session_open_price(symbol, t),
+        trader_config=_apple_config_from(trader_config),
     )
+
+
+def _apple_config_from(pairs: tuple) -> "AppleTraderConfig | None":
+    """Rebuild the configuration `_apple_config_key` flattened, or None.
+
+    The pairs came from an already-decoded config, so this is the plain
+    constructor -- the record's own reading (legacy fields, removed ones) was
+    done on the way in, where it belongs.
+    """
+    if not pairs:
+        return None
+    try:
+        return AppleTraderConfig(**dict(pairs))
+    except Exception:
+        return None
+
+
+def _apple_config_key(record: dict, symbol: str) -> tuple:
+    """The stored run's Apple Trader configuration, as a hashable cache key.
+
+    Decoded through `rule_agents` rather than read field by field: a record
+    predates fields that exist now and carries fields that no longer do, and
+    `from_record` is the one place that knows what each absence meant. Reading
+    `rule_config["ticker"]` directly would also miss the oldest records, which
+    describe an AAPL run by not naming a symbol at all.
+
+    Empty for every other agent, for a configuration that no longer decodes, and
+    for a symbol tab this run did not trade -- drawing one run's levels over
+    another symbol's candles would be a caption that reads right over a picture
+    that is wrong. The overlay then falls back to the shipped configuration,
+    which is what it does everywhere else it is not told otherwise.
+    """
+    summary = record.get("config_summary") or {}
+    if summary.get("personality") != APPLE_TRADER_KEY:
+        return ()
+    try:
+        config = rule_agent(APPLE_TRADER_KEY).from_record(summary.get("rule_config") or {})
+    except Exception:
+        return ()
+    if config.ticker != (symbol or "").upper():
+        return ()
+    return tuple(sorted(asdict(config).items()))
 
 
 def _run_overlay_controls(
@@ -813,7 +861,8 @@ def _run_overlay_controls(
     items: list[dict] = []
     for day in days:
         result = _overlay_day(
-            market, market.feed, symbol, day, tuple(selected)
+            market, market.feed, symbol, day, tuple(selected),
+            _apple_config_key(record, symbol),
         )
         items.extend(result["items"])
         for note in result["notes"]:
@@ -1624,6 +1673,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "(`Models/intravol_<TICKER>.json`); the ticker's own file, not a shared one."
         ),
         "min_win_k": (
+            "{ticker} starts at {min_win_k} — per instrument, since it is only readable "
+            "against that symbol's own `buy − sell`. "
             "The session circuit breaker: after a trade closes for no more than this many "
             "ADRs a share, the run buys nothing else that day. Judged over the whole "
             "position, so a momentum take and its runner count as one trade. Compare it "

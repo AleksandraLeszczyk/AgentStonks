@@ -988,9 +988,21 @@ class TestMinimumWin:
         tape.append(103.0, low=BUY_LEVEL - 0.01)
         return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
 
-    def test_off_by_default_in_these_tests_and_on_in_the_app(self):
-        assert AppleTraderConfig().min_win_k == 0.20
+    def test_off_by_default_in_these_tests_and_per_instrument_in_the_app(self):
         assert dayrange_config().min_win_k == 0.0
+        # Per instrument, and AAPL's is lower on purpose: its levels are only
+        # 0.15 ADR apart, so 0.20 could never be cleared by a target exit.
+        assert AppleTraderConfig(ticker="AAPL").min_win_k == 0.10
+        assert AppleTraderConfig(ticker="GOOGL").min_win_k == 0.20
+        assert AppleTraderConfig(ticker="INTC").min_win_k == 0.20
+
+    def test_every_instruments_default_leaves_its_target_exit_alive(self):
+        """The invariant AAPL's entry exists to keep: a trade that runs all the
+        way to the sell level must clear the bar, or the breaker is really a
+        one-trade-a-day rule wearing its name."""
+        for ticker in apple_models.tickers():
+            config = AppleTraderConfig(ticker=ticker)
+            assert config.min_win_k < config.buy_k - config.sell_k, ticker
 
     def test_a_thin_win_stands_the_session_down(self, state, market_open, monkeypatch):
         # Sell level 109 is $6 over the 103 fill = 0.6 ADR, under the 0.8 bar.

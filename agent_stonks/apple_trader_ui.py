@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import streamlit as st
 
 from . import apple_models
-from .apple_trader import AppleTraderConfig, dayrange_levels
+from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
 from . import intraday_vol_model
 from .config import (
     BREACH_LABELS,
@@ -178,7 +178,7 @@ def dayrange_params(
     level_source = level_source_param(defaults, ticker, copy)
     breach_update = breach_param(defaults, copy)
     stop_k, momentum_drop, take_fraction, hold_min_gain_k = exit_params(defaults, copy)
-    min_win_k = min_win_param(defaults, float(buy_k), float(sell_k), copy)
+    min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), copy)
     _caption(copy.outro.get("dayrange"))
     return AppleTraderConfig(
         model_key=model_key,
@@ -197,7 +197,7 @@ def dayrange_params(
 
 
 def min_win_param(
-    defaults: AppleTraderConfig, buy_k: float, sell_k: float, copy: FormCopy
+    ticker: str, buy_k: float, sell_k: float, copy: FormCopy
 ) -> float:
     """The session circuit breaker, and the one thing worth checking it against.
 
@@ -208,13 +208,19 @@ def min_win_param(
     trade" sounds like, so the two are compared here rather than left for a
     Results row to explain. Stated, not repaired: unlike an inverted buy/sell
     pair this configuration works, it just means something else.
+
+    Keyed by ticker, like the levels and for the same reason: the default is per
+    instrument because it only means something against that symbol's own pair,
+    so switching symbol must re-seed it rather than carry the last one across.
     """
     _caption(copy.intro.get("dayrange_breaker"))
     min_win_k = st.number_input(
         "Stand down after a trade under (× ADR a share)",
-        min_value=0.0, max_value=3.0, value=defaults.min_win_k, step=0.05, format="%.2f",
-        key=copy.key("min_win_k"),
-        help=copy.help.get("min_win_k"),
+        min_value=0.0, max_value=3.0, value=min_win_for(ticker), step=0.05, format="%.2f",
+        key=copy.key(f"min_win_k_{ticker}"),
+        help=copy.help.get("min_win_k", "").format(
+            ticker=ticker, min_win_k=f"{min_win_for(ticker):g}"
+        ),
     )
     target_gain = buy_k - sell_k
     if min_win_k and min_win_k >= target_gain:

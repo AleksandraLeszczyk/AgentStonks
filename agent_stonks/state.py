@@ -304,6 +304,14 @@ class AppState:
         # volumes differ by 26x (see agent_stonks.bar_history).
         self.history_feed: str = DEFAULT_HISTORY_FEED
         self.history_feed_resolved: str = ""
+        # The Apple Trader configuration the sidebar currently holds, so the
+        # chart can draw the levels *this* setup would rest rather than a
+        # plausible set (`model_overlays.TRADER_LEVELS_KEY`). None whenever
+        # another personality is selected and the form is not rendered; the
+        # overlay then falls back to the instrument's shipped configuration.
+        # Read-only to everything but the form -- the running agent holds its
+        # own copy, taken at launch, and is not steered from here.
+        self.apple_trader_config = None
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"

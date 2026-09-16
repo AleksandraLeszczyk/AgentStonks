@@ -52,6 +52,7 @@ from .config import (
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_HOLD_MIN_GAIN_K,
     APPLE_TRADER_LEVEL_SOURCE,
+    APPLE_TRADER_MIN_WIN,
     APPLE_TRADER_MIN_WIN_K,
     APPLE_TRADER_MODEL,
     APPLE_TRADER_MOMENTUM_DROP,
@@ -96,6 +97,18 @@ def dayrange_levels(ticker: str) -> "tuple[float, float]":
     return APPLE_TRADER_DAYRANGE_LEVELS.get(
         (ticker or DEFAULT_TICKER).strip().upper(),
         (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K),
+    )
+
+
+def min_win_for(ticker: str) -> float:
+    """The circuit breaker a run on this symbol starts from, in ADRs a share.
+
+    Per instrument because the number is only readable against that symbol's own
+    `buy_k - sell_k`: the same 0.20 that lets GOOGL stand down on a bad trade
+    would stand AAPL down on its best one. See `config.APPLE_TRADER_MIN_WIN`.
+    """
+    return APPLE_TRADER_MIN_WIN.get(
+        (ticker or DEFAULT_TICKER).strip().upper(), APPLE_TRADER_MIN_WIN_K
     )
 
 
@@ -153,10 +166,17 @@ class AppleTraderConfig:
     level_source: str = APPLE_TRADER_LEVEL_SOURCE
     # The session circuit breaker: a trade that closes for no more than this
     # many ADRs per share stands the agent down for the rest of the day. 0
-    # switches it off. See `_close_out`.
-    min_win_k: float = APPLE_TRADER_MIN_WIN_K
+    # switches it off. None -> the instrument's own default (`min_win_for`),
+    # filled in by `__post_init__`, so after construction it is always a float.
+    # See `_close_out`.
+    min_win_k: Optional[float] = None
 
     def __post_init__(self) -> None:
+        # Resolved before the checks below, which need numbers -- and before
+        # `dayrange_levels`, because all three read the same normalised ticker.
+        self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
+        if self.min_win_k is None:
+            self.min_win_k = min_win_for(self.ticker)
         for name in ("stop_k", "momentum_drop", "hold_min_gain_k", "min_win_k"):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -184,7 +204,6 @@ class AppleTraderConfig:
                 f"level_source {self.level_source!r} is not one of "
                 f"{', '.join(LEVEL_SOURCES)}"
             )
-        self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
         # Resolved per field, so a config that names only one level still
         # gets the instrument's default for the other.
         default_buy, default_sell = dayrange_levels(self.ticker)
@@ -802,11 +821,23 @@ class DayRangeTrader(BaseTrader):
         under "off": a day that ratchets the high all afternoon will keep
         re-arming the entry until a stop ends the session's trading.
         """
+        before = self._move_range(frame, ts)
+        if before is not None:
+            _log(state, {"type": "analysis", "text": self._range_summary(ts, before)})
+
+    def _move_range(self, frame, ts) -> "dict | None":
+        """`_update_range` without the log line: the levels as they were, or None.
+
+        Split out because the chart overlay walks a session through exactly this
+        (`session_levels`) and must not invent a second reading of the same
+        settings -- but it has no agent log to write to, and a decoration that
+        logged would be a decoration with side effects.
+        """
         config, plan = self.config, self.plan
         if config.breach_update == BREACH_OFF or plan is None:
-            return
+            return None
         if ts <= plan["opening_end"]:
-            return
+            return None
 
         dayrange = _dayrange()
         # Re-based to this bar's minute first, so that under a reference which
@@ -824,12 +855,12 @@ class DayRangeTrader(BaseTrader):
             policy=config.breach_update,
         )
         if high == before["pred_high"] and low == before["pred_low"]:
-            return
+            return None
 
         plan["pred_high"], plan["pred_low"] = high, low
         plan["range_updates"] = int(plan.get("range_updates", 0)) + 1
         self._set_levels(ts)
-        _log(state, {"type": "analysis", "text": self._range_summary(ts, before)})
+        return before
 
     def _range_summary(self, ts, before: dict) -> str:
         """The one line an update writes: what the tape did, and what moved.
@@ -1230,6 +1261,65 @@ class DayRangeTrader(BaseTrader):
         elif plan.get("stand_down"):
             parts.append(f"{plan['stand_down']}, no new entries today")
         return " · ".join(parts)
+
+
+def session_levels(
+    config: AppleTraderConfig,
+    forecast: dict,
+    session,
+    opening_end,
+    open_price: "float | None" = None,
+) -> "list[dict]":
+    """The buy and sell levels this configuration would rest, bar by bar.
+
+    For drawing, not for trading. `model_overlays` puts the two levels beside
+    the candles that tested them, and the only honest way to do that is to ask
+    the agent -- so this walks a real `DayRangeTrader` through the session and
+    reads its plan, rather than re-deriving `reference - k x ADR` somewhere the
+    two could drift apart. Every setting that moves a level is therefore
+    accounted for by construction: the breach update ratchets the forecast, the
+    intraday source re-reads it each minute, and a change to either shows up in
+    the picture the same day it shows up in the trades.
+
+    `forecast` is `dayrange_model.forecast_session`'s dict, `session` the day's
+    minute bars and `opening_end` the last bar of the window the forecast was
+    built on -- bars at or before it are skipped, exactly as the loop skips
+    trading them. Returns one `{"t", "buy", "sell", "reference"}` per bar after
+    that, in order.
+
+    No orders, no log and no ledger: nothing here touches `run_cycle`. The
+    circuit breaker and the managed exit are deliberately not modelled -- they
+    are about a position, and this is about where the levels sat.
+    """
+    trader = DayRangeTrader(config)
+    trader.plan = {
+        "date": pd.Timestamp(opening_end).normalize(),
+        "opening_end": opening_end,
+        "open_price": float(
+            open_price if open_price else session["open"].iloc[0]
+        ),
+        "vol_shape": (
+            intraday_vol_model.load(config.ticker)
+            if config.level_source == LEVELS_INTRADAY
+            else None
+        ),
+        **forecast,
+    }
+    out: "list[dict]" = []
+    for ts in session.index:
+        if ts <= opening_end:
+            continue
+        trader._move_range(session[session.index <= ts], ts)
+        trader._set_levels(ts)
+        out.append(
+            {
+                "t": ts,
+                "buy": float(trader.plan["buy_level"]),
+                "sell": float(trader.plan["sell_level"]),
+                "reference": float(trader.plan["reference"]),
+            }
+        )
+    return out
 
 
 def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):

@@ -397,6 +397,144 @@ class TestIntradayDayRangeOverlay:
         assert result["notes"][0].startswith("Predicted intraday range × day range:")
 
 
+class TestTraderLevelsOverlay:
+    """Apple Trader's resting orders, drawn from a configuration.
+
+    The odd overlay out: every other one draws what a model said, this one draws
+    what an agent would do about it. So what is pinned here is that it is the
+    *agent's* answer -- the same levels `DayRangeTrader` would rest, moving when
+    its settings say they move -- rather than a second derivation that could
+    drift from the loop.
+    """
+
+    # 210/198 forecast on a $3 ADR, so the notebook's 0.75/0.10 put the buy at
+    # 207.75 and the sell at 209.70.
+    def stub_forecast(self, monkeypatch, high=210.0, low=198.0):
+        TestDayRangeOverlay().stub_forecast(monkeypatch, high=high, low=low)
+
+    def config(self, **kwargs):
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        kwargs.setdefault("ticker", "AAPL")
+        kwargs.setdefault("buy_k", 0.75)
+        kwargs.setdefault("sell_k", 0.10)
+        kwargs.setdefault("breach_update", "off")
+        return AppleTraderConfig(**kwargs)
+
+    def items(self, monkeypatch, config=None, bars=None):
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        return mo.compute(
+            [mo.TRADER_LEVELS_KEY], "AAPL", bars if bars is not None else minute_bars(),
+            daily_bars=[], session_date=SESSION, trader_config=config,
+        )
+
+    def test_levels_that_never_move_are_drawn_as_two_flat_lines(self, monkeypatch):
+        """Flat is the notebook's shape, and a level (unlike a band) mirrors
+        into the price profile -- where a resting order is exactly the thing to
+        read against traded volume."""
+        items = self.items(monkeypatch, self.config())["items"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Buy level": pytest.approx(207.75),
+                          "Sell level": pytest.approx(209.70)}
+        assert not [i for i in items if i["kind"] == "band"]
+
+    def test_the_two_distances_are_the_configured_ones(self, monkeypatch):
+        items = self.items(monkeypatch, self.config(buy_k=1.0, sell_k=0.5))["items"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Buy level": pytest.approx(207.0),
+                          "Sell level": pytest.approx(208.5)}
+
+    def test_the_flat_lines_run_from_the_forecast_to_the_closing_bell(self, monkeypatch):
+        """Nothing is resting before 09:35 -- the forecast does not exist yet."""
+        items = self.items(monkeypatch, self.config())["items"]
+        buy = next(i for i in items if i["label"] == "Buy level")
+        start = pd.Timestamp(buy["x0"]).tz_convert("America/New_York")
+        close = pd.Timestamp(buy["x1"]).tz_convert("America/New_York")
+        assert (start.hour, start.minute) == (9, 34)
+        assert (close.hour, close.minute) == (16, 0)
+
+    def test_a_reference_that_moves_is_drawn_as_a_band(self, monkeypatch):
+        """Under the intraday source the levels follow the clock, and two flat
+        lines would be a picture of a strategy the run is not using."""
+        monkeypatch.setattr(
+            mo.intraday_vol_model, "load",
+            lambda *a, **k: {
+                "shape": {"params": {"a": 0.2, "b": 0.8, "alpha": 1.0, "c": 0.0,
+                                     "kappa": 30.0},
+                          "t_domain": [0.0, 389.5]},
+                "day_range": {"coef": {}},
+            },
+        )
+        items = self.items(monkeypatch, self.config(level_source="intraday"))["items"]
+        band = next(i for i in items if i["kind"] == "band")
+        assert not [i for i in items if i["kind"] == "level"]
+        assert len(band["t"]) == len(band["lower"]) == len(band["upper"])
+        # Buy under sell at every minute, and the pair pulls in through the day.
+        assert all(lo < up for lo, up in zip(band["lower"], band["upper"]))
+        assert band["lower"][-1] < band["lower"][0]
+
+    def test_a_breach_moves_the_levels_and_switches_it_to_a_band(self, monkeypatch):
+        """The same settings that move the agent's orders move the drawing --
+        which is the whole reason this asks the trader rather than deriving it."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        bars = minute_bars()
+        # Push the last bar clean through the 210.0 predicted high.
+        bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
+
+        flat = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                          session_date=SESSION,
+                          trader_config=self.config(breach_update="off"))["items"]
+        assert all(i["kind"] == "level" for i in flat)
+
+        moved = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                           session_date=SESSION,
+                           trader_config=self.config(breach_update="extreme"))["items"]
+        band = next(i for i in moved if i["kind"] == "band")
+        assert band["lower"][-1] == pytest.approx(215.0 - 0.75 * 3.0)
+
+    def test_no_config_draws_the_instruments_shipped_levels(self, monkeypatch):
+        """A chart with nothing configured shows what the agent would do if
+        started now, which is the only answer that is not a guess."""
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        items = self.items(monkeypatch, None)["items"]
+        shipped = AppleTraderConfig(ticker="AAPL")
+        buy = next(i for i in items if i["label"] == "Buy level")
+        assert buy["value"] == pytest.approx(210.0 - shipped.buy_k * 3.0)
+
+    def test_a_config_for_another_symbol_is_not_used_on_this_chart(self, monkeypatch):
+        """Its distances were swept on that symbol's tape, and the caption would
+        read right over a picture that was wrong."""
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        items = self.items(monkeypatch, self.config(ticker="GOOGL", buy_k=1.5,
+                                                    sell_k=0.05))["items"]
+        shipped = AppleTraderConfig(ticker="AAPL")
+        buy = next(i for i in items if i["label"] == "Buy level")
+        assert buy["value"] == pytest.approx(210.0 - shipped.buy_k * 3.0)
+
+    def test_no_forecast_is_a_note_rather_than_an_empty_chart(self, monkeypatch):
+        monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)
+        result = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(),
+                            daily_bars=[], session_date=SESSION)
+        assert result["items"] == []
+        assert result["notes"] and "Apple Trader" in result["notes"][0]
+
+    def test_a_session_still_inside_the_opening_window_rests_nothing(self, monkeypatch):
+        result = self.items(monkeypatch, self.config(), bars=minute_bars(n=5))
+        assert result["items"] == []
+        assert "nothing is resting" in result["notes"][0] or "nothing resting" in result["notes"][0]
+
+    def test_it_is_never_auto_selected_by_a_runs_model(self):
+        """`for_models` pre-selects what a model said. These are one agent's
+        orders, and an Apple Trader 2 run that merely reads the same forecast
+        rested nothing of the kind."""
+        for key in apple_models.keys():
+            assert mo.TRADER_LEVELS_KEY not in mo.for_models([key], "AAPL")["keys"]
+
+
 class TestLiveOverlays:
     LONG_HISTORY = [{"t": "2026-08-06", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}]
 
@@ -474,6 +612,35 @@ class TestLiveOverlays:
 
         mo.live_overlays(state, bars + minute_bars(n=1, base=210.0), [mo.DAY_RANGE_KEY])
         assert len(calls) == 2
+
+    def test_the_agents_configuration_is_part_of_the_cache_key(self, monkeypatch):
+        """`trader_levels` is a picture of the sidebar, so moving a distance
+        there has to move the lines on the next rerun rather than the next bar."""
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)
+        state = self.make_state(bars)
+        state.app = SimpleNamespace(apple_trader_config=AppleTraderConfig(buy_k=0.5))
+
+        mo.live_overlays(state, bars, [mo.TRADER_LEVELS_KEY])
+        mo.live_overlays(state, bars, [mo.TRADER_LEVELS_KEY])
+        assert len(calls) == 1                     # same bars, same config
+        assert calls[0]["trader_config"].buy_k == 0.5
+
+        state.app.apple_trader_config = AppleTraderConfig(buy_k=0.9)
+        mo.live_overlays(state, bars, [mo.TRADER_LEVELS_KEY])
+        assert len(calls) == 2
+        assert calls[1]["trader_config"].buy_k == 0.9
+
+    def test_no_apple_trader_selected_passes_no_configuration(self, monkeypatch):
+        """Another personality means the form is not rendered; the overlay then
+        falls back to the instrument's shipped levels rather than the last
+        symbol's numbers."""
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)
+        mo.live_overlays(self.make_state(bars), bars, [mo.TRADER_LEVELS_KEY])
+        assert calls[0]["trader_config"] is None
 
     def test_changing_the_selection_recomputes(self, monkeypatch):
         calls = []
