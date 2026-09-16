@@ -3410,33 +3410,36 @@ def build_ui() -> None:
         "Replay the trading agents against stored historical sessions: same prompts, same "
         "tools, same execution path as live — hours of tape in minutes of simulation."
     )
-    # ML Models sits beside Agents rather than near Results: it describes what
-    # an agent *is* before a run, not what one did afterwards. Tuning sits next
-    # to Simulate: it is a batch of simulations with a question attached.
-    # Drift sits beside ML Models: both are about the models, one as they were
-    # saved and one as they have held up since.
+    # Left to right the tabs follow the order the work happens in. ML Models
+    # sits beside Agents rather than near Results: it describes what an agent
+    # *is* before a run, not what one did afterwards. Tuning follows it because
+    # it answers the same question one step on -- which settings that agent
+    # should run -- and Drift follows both, being about the models again, as
+    # they have held up rather than as they were saved. Then the datasets, the
+    # runs, and what the runs came to: Results one at a time and Summary across
+    # all of them, which is the last thing there is to look at.
     (
-        tab_agents, tab_models, tab_drift, tab_datasets, tab_sim, tab_tuning,
-        tab_summary, tab_results,
+        tab_agents, tab_models, tab_tuning, tab_drift, tab_datasets, tab_sim,
+        tab_results, tab_summary,
     ) = st.tabs(
         [":material/smart_toy: Agents", ":material/neurology: ML Models",
-         ":material/monitoring: Drift", ":material/database: Datasets",
-         ":material/play_circle: Simulate", ":material/tune: Tuning",
-         ":material/leaderboard: Summary", ":material/insights: Results"]
+         ":material/tune: Tuning", ":material/monitoring: Drift",
+         ":material/database: Datasets", ":material/play_circle: Simulate",
+         ":material/insights: Results", ":material/leaderboard: Summary"]
     )
     with tab_agents:
         render_agents_tab()
     with tab_models:
         model_catalogue_panel()
+    with tab_tuning:
+        render_tuning_tab()
     with tab_drift:
         render_drift_tab()
     with tab_datasets:
         render_datasets_tab()
     with tab_sim:
         render_simulate_tab()
-    with tab_tuning:
-        render_tuning_tab()
-    with tab_summary:
-        render_summary_tab()
     with tab_results:
         render_results_tab()
+    with tab_summary:
+        render_summary_tab()
