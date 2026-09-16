@@ -175,13 +175,15 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     """The notebook's configuration, whatever the app's defaults happen to be.
 
     The levels are pinned to 0.75 / 0.10 rather than to AAPL's swept pair for
-    the same reason `breach_update` is pinned off: these tests are about the
-    rule as notebook 05 specified it, and a default that moves would rewrite
-    what they assert. `TestIntradayRangeUpdate` is where the update is on.
+    the same reason `breach_update` and `min_win_k` are pinned off: these tests
+    are about the rule as notebook 05 specified it, and a default that moves
+    would rewrite what they assert. `TestIntradayRangeUpdate`,
+    `TestIntradayLevelSource` and `TestMinimumWin` are where each is switched on.
     """
     kwargs.setdefault("buy_k", 0.75)
     kwargs.setdefault("sell_k", 0.10)
     kwargs.setdefault("breach_update", "off")
+    kwargs.setdefault("min_win_k", 0.0)
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
 
@@ -954,6 +956,207 @@ class TestIntradayLevelSourceAvailability:
     def test_an_unknown_level_source_is_refused(self):
         with pytest.raises(ValueError, match="level_source"):
             dayrange_config(level_source="vwap")
+
+
+class TestMinimumWin:
+    """The session circuit breaker: stop buying after a trade that barely paid.
+
+    The forecast's claim is that the day is wide enough for the dip to be worth
+    buying. A round trip that closed for almost nothing is that claim being
+    tested and failing, so the levels are not re-armed on the same tape.
+
+    On the fixture's $10 ADR a 0.2 threshold is $2.00 a share, which the tape's
+    dollar-sized moves sit well under -- so these drive the threshold down
+    rather than engineering huge price swings.
+
+    The reference trade throughout is a 103.00 fill exited on the bar that
+    reaches the 109.00 sell level, which fills at that bar's 108.80 close (the
+    ledger is market-order only): $5.80 a share, 0.58 x ADR.
+    """
+
+    def _entered(self, state, monkeypatch, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        return trader, tracker, tape
+
+    def _rearms(self, trader, tracker, tape, state) -> bool:
+        """Whether the buy level still fills after the position closed."""
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_off_by_default_in_these_tests_and_on_in_the_app(self):
+        assert AppleTraderConfig().min_win_k == 0.20
+        assert dayrange_config().min_win_k == 0.0
+
+    def test_a_thin_win_stands_the_session_down(self, state, market_open, monkeypatch):
+        # Sell level 109 is $6 over the 103 fill = 0.6 ADR, under the 0.8 bar.
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.8)
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+
+        assert trader.plan["stand_down"]
+        assert not self._rearms(trader, tracker, tape, state)
+        assert tracker.position_for(TICKER) == 0
+
+    def test_a_win_over_the_bar_leaves_the_levels_armed(
+        self, state, market_open, monkeypatch
+    ):
+        """The same trade, judged against a bar it clears: 0.6 ADR > 0.5."""
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.5)
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+
+        assert not trader.plan.get("stand_down")
+        assert self._rearms(trader, tracker, tape, state)
+
+    def test_the_bar_is_exclusive_so_exactly_the_threshold_stands_down(
+        self, state, market_open, monkeypatch
+    ):
+        """"profit larger than k x ADR" -- landing exactly on it is not larger."""
+        # Fill 103, target 109: exactly 0.6 ADR.
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.6)
+        tape.append(SELL_LEVEL, high=SELL_LEVEL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["stand_down"]
+
+    def test_zero_switches_it_off_and_the_levels_re_arm_all_day(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.0)
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert not trader.plan.get("stand_down")
+        assert self._rearms(trader, tracker, tape, state)
+
+    def test_a_losing_trade_stands_down_whatever_closed_it(
+        self, state, market_open, monkeypatch
+    ):
+        """A breakeven runner is the case the stop does not already cover: not a
+        loss, but nothing to show for the risk either."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, min_win_k=0.05, stop_k=0.0, momentum_drop=0.0
+        )
+        # Flattened at the close, back at the fill.
+        tape.append(103.0, high=103.0, low=103.0)
+        monkeypatch.setattr(at.market_hours, "seconds_to_close", lambda *a, **k: 60.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["stand_down"]
+
+    def test_a_trade_taken_off_in_two_pieces_is_judged_on_all_of_it(
+        self, state, market_open, monkeypatch
+    ):
+        """A momentum take banks 70% at one price and the runner leaves at
+        another. Judging only the piece that closed the position would call a
+        good trade bad (a runner sold back at the fill nets nothing) or a bad
+        one good."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, min_win_k=0.3, momentum_drop=1.0, take_fraction=0.7,
+        )
+        held = tracker.position_for(TICKER)
+
+        # Take 70% at 108 (+$5 a share), then the runner back at the 103 fill
+        # (+$0). Over the whole position that is 0.7 x 5 = $3.50 a share, 0.35
+        # ADR -- above the 0.3 bar, though the closing piece alone made nothing.
+        tape.append(108.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(108.0, mom=0.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        runner = tracker.position_for(TICKER)
+        assert 0 < runner < held
+
+        tape.append(103.0, low=102.9)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert not trader.plan.get("stand_down")
+
+    def test_a_partial_take_does_not_judge_the_trade_early(
+        self, state, market_open, monkeypatch
+    ):
+        """The position is still open, so there is nothing to judge yet -- and
+        blocking an entry while holding one would be meaningless anyway."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, min_win_k=3.0, momentum_drop=1.0,
+        )
+        tape.append(104.0, mom=2.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        tape.append(104.0, mom=0.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) > 0
+        assert not trader.plan.get("stand_down")
+
+    def test_the_stand_down_is_announced_once_with_the_number(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.8)
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        for _ in range(3):
+            tape.append(103.0, low=BUY_LEVEL - 0.01)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        lines = [
+            e["text"] for e in state.agent_log
+            if "no further entries today" in e.get("text", "")
+        ]
+        assert len(lines) == 1
+        # 0.58, not 0.60: the ledger is market-order only and fills at the
+        # closing 108.80 of the bar that reached the 109.00 level.
+        assert "+0.58 × ADR" in lines[0] and "0.8 × ADR" in lines[0]
+
+    def test_a_stop_still_ends_the_session_with_the_breaker_off(
+        self, state, market_open, monkeypatch
+    ):
+        """The two rules are separate: switching the breaker off must not
+        switch off the older refusal to re-enter after a stop."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, min_win_k=0.0, stop_k=0.2
+        )
+        tape.append(100.9, low=100.9)   # through the 101 stop
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["stand_down"] == "stopped out"
+        assert not self._rearms(trader, tracker, tape, state)
+
+    def test_a_stop_is_not_announced_twice_when_both_rules_agree(
+        self, state, market_open, monkeypatch
+    ):
+        """A stop is a loss, so the breaker would fire on the same fill."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, min_win_k=0.2, stop_k=0.2
+        )
+        tape.append(100.9, low=100.9)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["stand_down"] == "stopped out"
+        lines = [
+            e["text"] for e in state.agent_log
+            if "no further entries today" in e.get("text", "")
+        ]
+        assert len(lines) == 1
+
+    def test_a_new_session_starts_armed_again(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.8)
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["stand_down"]
+
+        clock.set_simulated(datetime(2026, 7, 22, 14, 30, tzinfo=timezone.utc))
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert not trader.plan.get("stand_down")
+
+    def test_the_read_summary_says_why_it_stopped(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.8)
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        tape.append(103.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        reads = [e["text"] for e in state.agent_log if " · " in e.get("text", "")]
+        assert "no new entries today" in reads[-1]
+        assert "+0.58 × ADR" in reads[-1]
 
 
 class TestDayRangeGuards:

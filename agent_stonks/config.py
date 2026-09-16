@@ -289,6 +289,21 @@ LEVEL_SOURCE_LABELS = {
 # (a level that moves with the clock, and can therefore walk a target down
 # towards an open position). Opt in and measure it in SimLab.
 APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
+# The session circuit breaker: once a trade has closed for no more than this
+# many ADRs of profit per share, the agent buys nothing else that day
+# (`apple_trader.DayRangeTrader._close_out`). The reasoning is that a round trip
+# which barely paid is evidence the setup was not there today, and re-arming the
+# same levels on the same tape is how one weak trade becomes five.
+#
+# Read it against the levels above before trusting the default. The most a
+# target exit can net is (buy_k - sell_k) x ADR -- 0.15 on AAPL's swept pair,
+# 0.60 on GOOGL's, 0.45 on INTC's -- so at 0.20 an AAPL run stands down after
+# its first completed trade however well it went, while GOOGL and INTC stand
+# down only on an exit worse than the target. That is a real strategy choice
+# ("one trade a day unless it runs"), not a bug, and the form says so where the
+# two settings disagree. 0 switches it off, which is what every record written
+# before it existed replays as.
+APPLE_TRADER_MIN_WIN_K = 0.20
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Flatten this many minutes before the close: the day-range forecast is a

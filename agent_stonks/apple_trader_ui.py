@@ -178,6 +178,7 @@ def dayrange_params(
     level_source = level_source_param(defaults, ticker, copy)
     breach_update = breach_param(defaults, copy)
     stop_k, momentum_drop, take_fraction, hold_min_gain_k = exit_params(defaults, copy)
+    min_win_k = min_win_param(defaults, float(buy_k), float(sell_k), copy)
     _caption(copy.outro.get("dayrange"))
     return AppleTraderConfig(
         model_key=model_key,
@@ -191,7 +192,41 @@ def dayrange_params(
         momentum_drop=momentum_drop,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
+        min_win_k=min_win_k,
     )
+
+
+def min_win_param(
+    defaults: AppleTraderConfig, buy_k: float, sell_k: float, copy: FormCopy
+) -> float:
+    """The session circuit breaker, and the one thing worth checking it against.
+
+    The most a target exit can net is `buy_k - sell_k` ADRs a share, so a
+    threshold at or above that stands the session down after *every* completed
+    trade however well it went. That is a legitimate setting -- one trade a day
+    unless it runs past the target -- but it is not what "stop after a bad
+    trade" sounds like, so the two are compared here rather than left for a
+    Results row to explain. Stated, not repaired: unlike an inverted buy/sell
+    pair this configuration works, it just means something else.
+    """
+    _caption(copy.intro.get("dayrange_breaker"))
+    min_win_k = st.number_input(
+        "Stand down after a trade under (× ADR a share)",
+        min_value=0.0, max_value=3.0, value=defaults.min_win_k, step=0.05, format="%.2f",
+        key=copy.key("min_win_k"),
+        help=copy.help.get("min_win_k"),
+    )
+    target_gain = buy_k - sell_k
+    if min_win_k and min_win_k >= target_gain:
+        st.warning(
+            f"The buy and sell levels are {target_gain:.2f} × ADR apart, so a trade that "
+            f"runs all the way to the sell level nets at most that — under the "
+            f"{min_win_k:.2f} × ADR above. Every completed trade will stand the session "
+            "down, whatever it made: this is a one-trade-a-day rule rather than a circuit "
+            f"breaker. Set it below {target_gain:.2f} to have it fire only on the weak ones.",
+            icon=":material/info:",
+        )
+    return float(min_win_k)
 
 
 def level_source_param(

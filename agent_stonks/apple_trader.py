@@ -52,6 +52,7 @@ from .config import (
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_HOLD_MIN_GAIN_K,
     APPLE_TRADER_LEVEL_SOURCE,
+    APPLE_TRADER_MIN_WIN_K,
     APPLE_TRADER_MODEL,
     APPLE_TRADER_MOMENTUM_DROP,
     APPLE_TRADER_POSITION_PCT,
@@ -150,9 +151,13 @@ class AppleTraderConfig:
     # time-of-day shape, so the reference moves with the clock. See
     # `_set_levels`, and `config_error` for what it requires.
     level_source: str = APPLE_TRADER_LEVEL_SOURCE
+    # The session circuit breaker: a trade that closes for no more than this
+    # many ADRs per share stands the agent down for the rest of the day. 0
+    # switches it off. See `_close_out`.
+    min_win_k: float = APPLE_TRADER_MIN_WIN_K
 
     def __post_init__(self) -> None:
-        for name in ("stop_k", "momentum_drop", "hold_min_gain_k"):
+        for name in ("stop_k", "momentum_drop", "hold_min_gain_k", "min_win_k"):
             if getattr(self, name) < 0:
                 raise ValueError(
                     f"{name} {getattr(self, name)!r} is a distance and cannot be negative "
@@ -221,9 +226,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     `stop_k` is set, the take and its runner threshold when `momentum_drop` is
     -- so a config with both off signs exactly as a run recorded before the
     exit existed, and `take_fraction` never splits two runs that cannot differ.
-    The intraday update follows the same rule for the same reason: it appears
-    only when it is not "off", so every record written before it existed (which
-    replays as "off") keeps the signature it was filed under.
+    The intraday update and the session circuit breaker follow the same rule for
+    the same reason: each appears only when it is switched on, so every record
+    written before it existed (which replays as off) keeps the signature it was
+    filed under.
     """
     c = config or AppleTraderConfig()
     exits = ""
@@ -234,6 +240,8 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
             f",take={c.take_fraction * 100:g}%@mom-{c.momentum_drop:g},"
             f"runner>={c.hold_min_gain_k:g}A"
         )
+    if c.min_win_k:
+        exits += f",min_win={c.min_win_k:g}A"
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     levels = "" if c.level_source == LEVELS_DAYRANGE else f",levels={c.level_source}"
     # "H" in the two distances is whatever `level_source` says it is, which is
@@ -547,10 +555,11 @@ class DayRangeTrader(BaseTrader):
                 return "sold"
             return "hold"
 
-        # A stop means the day did not go the way the forecast said, and the
-        # buy level is by then usually just above the price -- re-arming it
-        # would buy the same slide again, one stop lower each time.
-        if self.plan.get("stopped_out"):
+        # The session has been stood down: a stop, or a trade that closed for
+        # too little (`_close_out`). Either way the levels have already been
+        # tried today and found not to work, and re-arming them on the same tape
+        # is how one bad trade becomes five.
+        if self.plan.get("stand_down"):
             return "hold"
 
         if fresh_bar and float(last["low"]) <= self.plan["buy_level"]:
@@ -1063,18 +1072,97 @@ class DayRangeTrader(BaseTrader):
         reasoning: str,
         kind: str,
     ) -> None:
-        entry = self.entry
+        entry = self.entry or {}
         decision = self.sell(state, tracker, quantity, reasoning, log_extra={"exit": kind})
         if decision.status != "filled":
             return
         if kind == self.EXIT_STOP:
-            self.plan["stopped_out"] = True
-        if entry is not None and tracker.position_for(self.ticker) > 0:
+            self._stand_down(
+                state,
+                "stopped out",
+                "The day did not go the way the forecast said, and the buy level is by now "
+                "usually just above the price — re-arming it would buy the same slide "
+                "again, one stop lower each time.",
+            )
+
+        # What this position has realised so far, carried across a partial exit
+        # so that a trade taken off in two pieces is judged on the whole of it
+        # rather than on whichever piece happened to close it.
+        banked = float(entry.get("banked") or 0.0)
+        shares = float(entry.get("banked_shares") or 0.0)
+        filled = float(decision.filled_quantity or 0.0)
+        fill = float(decision.price or 0.0)
+        if filled and entry.get("price"):
+            banked += (fill - float(entry["price"])) * filled
+            shares += filled
+
+        if self.entry is None and tracker.position_for(self.ticker) > 0:
             # `sell` forgets the entry on any fill, but what is left is still this
             # position -- same fill, same peak. After a momentum take it is the
             # runner; after any other exit that did not fill in full it is
             # whatever it was.
-            self.entry = {**entry, "runner": entry.get("runner") or kind == self.EXIT_TAKE}
+            self.entry = {
+                **entry,
+                "runner": entry.get("runner") or kind == self.EXIT_TAKE,
+                "banked": banked,
+                "banked_shares": shares,
+            }
+        elif shares:
+            # Flat: the trade is over and can be judged.
+            self._close_out(state, banked, shares)
+
+    def _stand_down(self, state: AppState, headline: str, why: str) -> None:
+        """Take no further entry this session, and say once why.
+
+        One flag for both rules that can end a session's trading, because from
+        the entry's point of view they are the same instruction and a second
+        reason arriving later must not re-announce it.
+        """
+        if self.plan.get("stand_down"):
+            return
+        self.plan["stand_down"] = headline
+        _log(
+            state,
+            {
+                "type": "analysis",
+                "text": (
+                    f"{self.ticker}: {headline} — no further entries today. {why}"
+                ),
+            },
+        )
+
+    def _close_out(self, state: AppState, banked: float, shares: float) -> None:
+        """Judge a finished trade, and stand the session down if it barely paid.
+
+        `min_win_k` is the bar, in ADRs **per share** -- the same unit the levels
+        and the stop are written in, so it can be read against them. A round trip
+        that closed for no more than that is taken as evidence the setup was not
+        there today: the forecast said the day would be wide enough for the dip
+        to be worth buying, and the trade that came out of it says otherwise.
+
+        Measured over the whole position, including a momentum take's piece and
+        the runner it left, so a trade exited twice is judged once and on all of
+        it. Worth reading against `buy_k - sell_k`, which is the most a target
+        exit can net: where `min_win_k` is the larger of the two, *every*
+        completed trade stands the session down, which is a one-trade-a-day rule
+        rather than a circuit breaker. The form says so when they disagree.
+        """
+        config, plan = self.config, self.plan
+        if not config.min_win_k or shares <= 0 or plan.get("stand_down"):
+            return
+        adr = plan["adr14_abs"]
+        per_share = banked / shares
+        if per_share > config.min_win_k * adr:
+            return
+        self._stand_down(
+            state,
+            f"closed for {per_share / adr:+.2f} × ADR",
+            f"The round trip netted ${per_share:,.2f} a share ({per_share / adr:+.2f} × "
+            f"ADR over {shares:g} share(s)), at or under the {config.min_win_k:g} × ADR "
+            f"(${config.min_win_k * adr:,.2f}) this configuration treats as worth "
+            "continuing for. A day whose first trade barely paid is not a day to keep "
+            "buying the same levels on.",
+        )
 
     # --- logging -----------------------------------------------------------
 
@@ -1139,8 +1227,8 @@ class DayRangeTrader(BaseTrader):
             elif self.config.stop_k:
                 stop = entry_price - self.config.stop_k * plan["adr14_abs"]
                 parts.append(f"stop ${stop:,.2f}")
-        elif plan.get("stopped_out"):
-            parts.append("stopped out, no new entries today")
+        elif plan.get("stand_down"):
+            parts.append(f"{plan['stand_down']}, no new entries today")
         return " · ".join(parts)
 
 
@@ -1177,6 +1265,14 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             "price comes back to it"
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
+    breaker = (
+        ""
+        if not config.min_win_k
+        else (
+            f" A trade that closes for no more than {config.min_win_k:g} ADR a share "
+            "stands the agent down for the rest of the session."
+        )
+    )
     breach = (
         ""
         if config.breach_update == BREACH_OFF
@@ -1198,7 +1294,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
         f"today's {config.ticker} high and low will land, then rests a buy "
         f"{config.buy_k:g} average daily ranges below {reference} and a sell "
-        f"{config.sell_k:g} below it, until the closing flatten.{breach}{managed}"
+        f"{config.sell_k:g} below it, until the closing flatten.{breach}{managed}{breaker}"
     )
 
 

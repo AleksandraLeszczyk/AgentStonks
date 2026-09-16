@@ -130,6 +130,10 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 0.60, 0.10),
         ),
         Tunable(
+            "min_win_k", "Stand down under (× ADR a share)", 0.0, 3.0, 0.05,
+            (0.0, 0.40, 0.10),
+        ),
+        Tunable(
             "position_pct", "Position size (% of cash)", 1.0, 100.0, 5.0,
             (25.0, 100.0, 25.0), "%.0f",
         ),

@@ -156,6 +156,10 @@ _APPLE_LEGACY = {
     # nothing today and is here so that it keeps meaning the same thing if the
     # default ever moves.
     "level_source": LEVELS_DAYRANGE,
+    # Before the circuit breaker existed a session kept re-arming its levels
+    # however badly the last trade went, stopping only on a stop. 0 is that
+    # rule, and it is left out of the signature.
+    "min_win_k": 0.0,
 }
 
 

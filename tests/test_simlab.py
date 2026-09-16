@@ -684,6 +684,18 @@ class TestRuleAgentRecords:
         )
 
 
+    def test_a_record_from_before_the_circuit_breaker_keeps_re_arming(self):
+        """A session used to go on buying its levels however badly the last trade
+        went, stopping only on a stop. 0 is that rule, and it signs as it did."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
+        assert old.min_win_k == 0.0
+        assert "min_win" not in agent.signature(old)
+
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        assert today.min_win_k == 0.20
+        assert ",min_win=0.2A" in agent.signature(today)
+
     def test_a_record_from_before_the_level_source_rests_on_the_predicted_high(self):
         """It is the default too, so this changes nothing today -- it is here so
         that the record keeps meaning what it meant if the default ever moves."""

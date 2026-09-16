@@ -331,6 +331,12 @@ def _render_apple_rules() -> None:
         "kept as a **runner** only if the sell level is still `hold × A` above the fill, "
         "sold if the price comes back to the fill. It is not in the notebook's numbers, "
         "and a stored run from before it existed replays with it off.\n"
+        "- **Two things end a session's buying**, not one: the stop above, and a trade "
+        "that closes for no more than `min win × A` a share — measured over the whole "
+        "position, so a momentum take and the runner it left are judged together. The "
+        "reasoning is that a round trip which barely paid is evidence the setup was not "
+        "there today. Note that the most a target exit can net is `(buy − sell) × A`, so a "
+        "threshold at or above that stands the session down after every completed trade.\n"
         "- **H** need not be the predicted high. The *levels measured below* setting can "
         "point the two distances at the upper curve of the **predicted intraday range × "
         "day range** band instead — the same forecast stretched by IntradayVolatility's "
@@ -1540,6 +1546,11 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "same levels three times and let the datasets say whether either update is worth "
             "anything — neither has ever been swept."
         ),
+        "dayrange_breaker": (
+            "And when to stop for the day. Its own axis on the Tuning tab, and worth one: "
+            "it changes how many trades a session takes at all, which is the number most of "
+            "the others only nudge."
+        ),
         "dayrange_exits": (
             "The managed exit, every distance measured from the fill in the same ADR. Each "
             "switched-on knob is part of the signature, so sweeping the stop or the fade "
@@ -1611,6 +1622,14 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "signature unless it is the predicted high, so the two queue as two "
             "configurations. Offered only where the shape has been exported "
             "(`Models/intravol_<TICKER>.json`); the ticker's own file, not a shared one."
+        ),
+        "min_win_k": (
+            "The session circuit breaker: after a trade closes for no more than this many "
+            "ADRs a share, the run buys nothing else that day. Judged over the whole "
+            "position, so a momentum take and its runner count as one trade. Compare it "
+            "against `buy − sell` above — at or over that, every completed trade stands the "
+            "session down, which is a different experiment (one trade a day) from the one "
+            "this reads like. In the signature while it is on, and sweepable."
         ),
         "breach_update": (
             "Whether the predicted high is held all session or moved when the tape trades "

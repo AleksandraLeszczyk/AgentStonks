@@ -1847,6 +1847,11 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "predicted high every time it moves, live, including for a position that is "
             "already open."
         ),
+        "dayrange_breaker": (
+            "And when to stop for the day. A round trip that barely paid is evidence the "
+            "setup was not there this session — the forecast said the day would be wide "
+            "enough for the dip to be worth buying, and the trade says otherwise."
+        ),
         "dayrange_exits": (
             "How a position gets out before the sell level. Every distance is measured from "
             "the fill, in the same ADR: a stop underneath it, a partial take when momentum "
@@ -1894,8 +1899,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "dayrange": (
             ":material/info: The model runs once. A trade closes at the sell level, the "
             "stop, a momentum take (its runner at the sell level or back at the fill), or the "
-            "closing flatten. After a stop the agent buys nothing more that day — the session "
-            "has not gone the way the forecast said."
+            "closing flatten. Two things end the session's buying: a stop — the day has not "
+            "gone the way the forecast said — and a trade that closed for too little to be "
+            "worth repeating."
         ),
     },
     help={
@@ -1931,6 +1937,15 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "outward: the high never comes back down during a session. Neither of the two "
             "updating policies has been swept, and the buy/sell distances above were picked "
             "with the forecast held fixed all day."
+        ),
+        "min_win_k": (
+            "Once a trade has closed for no more than this many ADRs **per share**, the "
+            "agent buys nothing else today — same unit as the levels and the stop, so the "
+            "three can be read against each other. Measured over the whole position, so a "
+            "momentum take and the runner it left are judged together as one trade. A stop "
+            "already ends the session on its own; this catches the trades that were not "
+            "losses but were not worth the risk either, including a runner sold back at "
+            "the fill. 0 switches it off and lets the levels re-arm all day."
         ),
         "stop_k": (
             "Sells everything when a bar's low reaches this many ADRs under the fill price. "
