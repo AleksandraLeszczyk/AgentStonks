@@ -1,8 +1,11 @@
 import pytest
 import requests
 
+from datetime import datetime, timedelta, timezone
+
 from agent_stonks.rest import (
     fetch_bars,
+    fetch_bars_window,
     fetch_corporate_actions,
     fetch_news,
     fetch_trades,
@@ -38,6 +41,71 @@ class TestFetchBars:
         )
         with pytest.raises(requests.HTTPError):
             fetch_bars("AAPL", "1Min", 100, "key", "secret")
+
+    def test_asks_for_the_newest_bars_of_the_window(self, requests_mock):
+        """`limit` is a cap on one page, and a lookback of minute bars routinely
+        exceeds it -- 16 hours is over 600 one-minute bars on a liquid symbol.
+        Ascending (Alpaca's default) would return the *start* of the window and
+        throw away the page token carrying the rest, so a buffer seed or a
+        backfill would stop hours short of now and never fill a recent hole."""
+        requests_mock.get(
+            "https://data.alpaca.markets/v2/stocks/bars", json={"bars": {"AAPL": []}}
+        )
+        fetch_bars("AAPL", "1Min", 420, "key", "secret", "sip", lookback_hours=16)
+        assert requests_mock.last_request.qs["sort"] == ["desc"]
+
+    def test_returns_them_oldest_first_however_they_arrived(self, requests_mock):
+        """Everything downstream reads these ascending -- `bars[-1]` is the
+        latest bar, the volume profile walks the session forward."""
+        requests_mock.get(
+            "https://data.alpaca.markets/v2/stocks/bars",
+            json={"bars": {"AAPL": [
+                {"t": "2024-01-01T14:02:00Z", "c": 3},
+                {"t": "2024-01-01T14:01:00Z", "c": 2},
+                {"t": "2024-01-01T14:00:00Z", "c": 1},
+            ]}},
+        )
+        bars = fetch_bars("AAPL", "1Min", 3, "key", "secret")
+        assert [b["c"] for b in bars] == [1, 2, 3]
+
+
+class TestFetchBarsWindow:
+    """`keep` decides which end of an over-long window survives `limit`."""
+
+    START = datetime(2024, 1, 1, 14, 0, tzinfo=timezone.utc)
+
+    def _window(self, requests_mock, **kwargs):
+        requests_mock.get(
+            "https://data.alpaca.markets/v2/stocks/bars", json={"bars": {"AAPL": []}}
+        )
+        return fetch_bars_window(
+            "AAPL", "1Min", self.START, self.START + timedelta(hours=16),
+            "key", "secret", "sip", limit=420, **kwargs,
+        )
+
+    def test_a_window_anchored_on_its_start_keeps_the_oldest(self, requests_mock):
+        """The default, and what the 09:30 opening range needs: the first five
+        minutes of the session, not the last five of the window."""
+        self._window(requests_mock)
+        assert requests_mock.last_request.qs["sort"] == ["asc"]
+
+    def test_a_window_anchored_on_now_keeps_the_newest(self, requests_mock):
+        self._window(requests_mock, keep="newest")
+        assert requests_mock.last_request.qs["sort"] == ["desc"]
+
+    def test_both_come_back_oldest_first(self, requests_mock):
+        requests_mock.get(
+            "https://data.alpaca.markets/v2/stocks/bars",
+            json={"bars": {"AAPL": [
+                {"t": "2024-01-01T14:01:00Z", "c": 2},
+                {"t": "2024-01-01T14:00:00Z", "c": 1},
+            ]}},
+        )
+        bars = fetch_bars_window(
+            "AAPL", "1Min", self.START, self.START + timedelta(hours=1),
+            "key", "secret", "sip", keep="newest",
+        )
+        assert [b["c"] for b in bars] == [1, 2]
 
 
 class TestFetchTrades:

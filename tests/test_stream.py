@@ -325,6 +325,43 @@ class TestMergeMissingBars:
         _, state = _app()
         assert stream.merge_missing_bars(state, []) == 0
 
+    def test_counts_only_the_bars_that_actually_fit_the_buffer(self):
+        """The buffer is a ring of the newest MAX_BARS. A fetched bar older than
+        everything in a full one is dropped again by the same truncation that
+        bounds the ring -- and must not be reported as restored, because the
+        chart still has a hole where it belongs."""
+        from agent_stonks.config import MAX_BARS
+
+        _, state = _app()
+        # A full buffer of consecutive minutes, none of them missing.
+        state.bars.extend(
+            _bar(f"2024-01-01T{14 + i // 60:02d}:{i % 60:02d}:00Z")
+            for i in range(MAX_BARS)
+        )
+        assert len(state.bars) == MAX_BARS
+
+        older = [_bar("2024-01-01T13:58:00Z"), _bar("2024-01-01T13:59:00Z")]
+        assert stream.merge_missing_bars(state, older) == 0
+        assert "2024-01-01T13:58:00Z" not in [b["t"] for b in state.bars]
+
+    def test_a_newer_bar_still_fits_a_full_buffer_by_ageing_one_out(self):
+        """The ordinary case, and the one the count must not confuse with the
+        above: the ring makes room at the old end and the bar really is added."""
+        from agent_stonks.config import MAX_BARS
+
+        _, state = _app()
+        state.bars.extend(
+            _bar(f"2024-01-01T{14 + i // 60:02d}:{i % 60:02d}:00Z")
+            for i in range(MAX_BARS)
+        )
+        newest = state.bars[-1]["t"]
+
+        added = stream.merge_missing_bars(state, [_bar("2024-01-02T09:30:00Z")])
+        assert added == 1
+        assert state.bars[-1]["t"] == "2024-01-02T09:30:00Z"
+        assert len(state.bars) == MAX_BARS
+        assert newest in [b["t"] for b in state.bars]
+
 
 class TestBackfillBars:
     def test_uses_rest_and_reports_added_count(self, monkeypatch):

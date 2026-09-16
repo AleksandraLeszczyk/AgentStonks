@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from .config import DEFAULT_HISTORY_FEED, HISTORY_FEEDS, MAX_BARS, SIP_DELAY_MIN
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
-from .rest import fetch_bars, fetch_bars_window, fetch_daily_bars
+from .rest import KEEP_NEWEST, fetch_bars, fetch_bars_window, fetch_daily_bars
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +181,15 @@ def fetch_history_bars(
     The fallback order preserves the module's premise: a consolidated source is
     replaced by another consolidated source where possible, and IEX is reached
     only when nothing else answers.
+
+    `limit` is a cap on how many bars come back, and `lookback_hours` of minute
+    bars is routinely more than that -- 16 hours spans a premarket, a session
+    and the previous afternoon, which is over 600 one-minute bars on a liquid
+    symbol by the close against a 420-bar cap. What survives the cap is
+    therefore a real decision and it is made the same way on every Alpaca path:
+    the **newest** bars in the window. A page starting at the window's beginning
+    would stop hours short of now, which is where the holes a backfill exists to
+    repair actually are.
     """
     failures: list[tuple[str, object]] = []
     yf_interval = YF_INTERVALS.get(timeframe)
@@ -203,8 +212,12 @@ def fetch_history_bars(
                 bars = fetch_intraday_bars(symbol, interval=yf_interval)
             elif candidate == "sip_delayed":
                 start, end = _sip_window(lookback_hours)
+                # The newest end of the window, not the oldest: `lookback_hours`
+                # of minute bars is more than `limit` of them for most of a
+                # session, and the half worth having is the recent half.
                 bars = fetch_bars_window(
-                    symbol, timeframe, start, end, key, secret, "sip", limit=limit
+                    symbol, timeframe, start, end, key, secret, "sip",
+                    limit=limit, keep=KEEP_NEWEST,
                 )
             else:
                 bars = fetch_bars(

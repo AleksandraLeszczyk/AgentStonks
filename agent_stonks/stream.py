@@ -74,7 +74,9 @@ def backfill_bars(
     volume of the ones around them, which is worse than leaving the hole: a gap
     is visible, a 26x-understated bar is not. See `agent_stonks.bar_history`.
 
-    Returns (bars_added, source_name).
+    Returns (bars_added, source_name), where `bars_added` is what is in the
+    buffer now and was not before -- see `merge_missing_bars` for why that can
+    be fewer than the holes the fetch covered.
     """
     try:
         fetched, source, failures = bar_history.fetch_history_bars(

@@ -9,6 +9,15 @@ def _headers(key: str, secret: str) -> dict[str, str]:
     return {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
 
 
+# Which end of a window survives `limit` when the window holds more bars than
+# that. Alpaca returns one page of at most `limit` bars plus a page token, and
+# `sort` decides where that page starts -- so on a truncated request this is the
+# difference between getting the start of the window and getting the end of it.
+# See `fetch_bars_window`.
+KEEP_OLDEST = "oldest"
+KEEP_NEWEST = "newest"
+
+
 def fetch_bars(
     symbol: str,
     timeframe: str,
@@ -18,24 +27,19 @@ def fetch_bars(
     feed: str = "iex",
     lookback_hours: int = 6,
 ) -> list[dict]:
-    """Fetch historical OHLCV bars from Alpaca. Raises on HTTP error."""
+    """The most recent `limit` OHLCV bars of the last `lookback_hours`, ascending.
+
+    "Most recent" is the whole contract, and it is why this asks for the end of
+    the window rather than the start: every caller wants the bars nearest now
+    (a live buffer's seed, a stream-down poll, a backfill repairing holes), and
+    `lookback_hours` of minute bars is routinely more than `limit` of them.
+    Raises on HTTP error.
+    """
     end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=lookback_hours)
-    r = requests.get(
-        f"{DATA_REST}/v2/stocks/bars",
-        headers=_headers(key, secret),
-        params=dict(
-            symbols=symbol,
-            timeframe=timeframe,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            limit=limit,
-            feed=feed,
-        ),
-        timeout=10,
+    return fetch_bars_window(
+        symbol, timeframe, end - timedelta(hours=lookback_hours), end,
+        key, secret, feed, limit=limit, keep=KEEP_NEWEST,
     )
-    r.raise_for_status()
-    return r.json().get("bars", {}).get(symbol, [])
 
 
 def fetch_bars_window(
@@ -47,11 +51,27 @@ def fetch_bars_window(
     secret: str,
     feed: str = "iex",
     limit: int = 200,
+    keep: str = KEEP_OLDEST,
 ) -> list[dict]:
-    """Fetch OHLCV bars for an explicit [start, end) window from Alpaca.
+    """One page of OHLCV bars for an explicit [start, end) window from Alpaca.
 
     Used to recover session-anchored windows (e.g. the 09:30 ET opening range)
     that the live bar buffer no longer covers. Raises on HTTP error.
+
+    A window holding more than `limit` bars comes back truncated -- Alpaca
+    returns one page and a `next_page_token` this does not follow (see
+    `fetch_bars_range` for the paginating version) -- so `keep` says which end
+    to truncate from:
+
+        "oldest"  the window's start survives. For a window anchored on its
+                  beginning: the opening range is the first five minutes of the
+                  session and the rest of the window is not wanted.
+        "newest"  the window's end survives. For a window anchored on now: a
+                  backfill repairs the holes nearest the present, and a page
+                  that stops hours short of `end` is exactly the wrong half.
+
+    Bars are returned oldest-first whichever end was kept, so `keep` changes
+    only *which* bars arrive and never the order callers read them in.
     """
     r = requests.get(
         f"{DATA_REST}/v2/stocks/bars",
@@ -63,11 +83,13 @@ def fetch_bars_window(
             end=end.astimezone(timezone.utc).isoformat(),
             limit=limit,
             feed=feed,
+            sort="desc" if keep == KEEP_NEWEST else "asc",
         ),
         timeout=10,
     )
     r.raise_for_status()
-    return r.json().get("bars", {}).get(symbol, [])
+    bars = r.json().get("bars", {}).get(symbol, [])
+    return bars[::-1] if keep == KEEP_NEWEST else bars
 
 
 def fetch_bars_range(

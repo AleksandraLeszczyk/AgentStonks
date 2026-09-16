@@ -181,7 +181,14 @@ def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:
 
     On a timestamp collision the existing (streamed) bar always wins, so a
     live in-progress bar is never clobbered by an older REST snapshot.
-    Returns the number of bars added.
+
+    Returns the number of bars that are in the buffer now and were not before
+    -- which is not always every bar that was missing. The buffer is a ring of
+    the newest `MAX_BARS`, so a fetched bar older than everything already in a
+    full one has nowhere to go and is dropped again by the same truncation that
+    keeps the ring bounded. Counting it as added would tell the caller (and the
+    Backfill button's caption) that a bar had been restored while the chart
+    still had a hole where it belongs.
     """
     if not fetched:
         return 0
@@ -191,9 +198,11 @@ def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:
         if not missing:
             return 0
         merged = sorted(list(state.bars) + missing, key=lambda b: bar_ts_key(b["t"]))
+        kept = merged[-MAX_BARS:]
         state.bars.clear()
-        state.bars.extend(merged[-MAX_BARS:])
-    return len(missing)
+        state.bars.extend(kept)
+        kept_keys = {bar_ts_key(b["t"]) for b in kept}
+        return sum(1 for b in missing if bar_ts_key(b["t"]) in kept_keys)
 
 
 def reset_symbol_for_new_stream(state: SymbolState) -> None:

@@ -139,9 +139,11 @@ class TestFetchHistoryBars:
 
         seen = {}
 
-        def _window(symbol, timeframe, start, end, key, secret, feed="iex", limit=200):
+        def _window(symbol, timeframe, start, end, key, secret, feed="iex", limit=200,
+                    keep="oldest"):
             seen["feed"] = feed
             seen["end"] = end
+            seen["keep"] = keep
             return [_bar("2024-01-01T14:00:00Z")]
 
         monkeypatch.setattr(bar_history, "fetch_bars_window", _window)
@@ -158,6 +160,9 @@ class TestFetchHistoryBars:
         assert seen["feed"] == "sip"  # it is the SIP feed, just held back
         behind = _dt.datetime.now(_dt.timezone.utc) - seen["end"]
         assert behind >= _dt.timedelta(minutes=bar_history.SIP_DELAY_MIN - 1)
+        # A 16-hour window of minute bars overruns the limit for most of a
+        # session, and the end of it is the half a backfill needs.
+        assert seen["keep"] == "newest"
 
     def test_iex_is_the_last_resort_when_yfinance_also_fails(self, monkeypatch):
         tried = []
