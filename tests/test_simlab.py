@@ -21,6 +21,7 @@ from simlab import app as sim_app
 from simlab import data as sim_data
 from simlab import prompts as sim_prompts
 from simlab import results as sim_results
+from simlab import tuning as sim_tuning
 from simlab.engine import SimulationConfig, SimulationEngine
 from simlab.judge import _entry_context, _first_exit_after
 from simlab.market import SimMarket, parse_ts
@@ -2315,6 +2316,73 @@ class TestRuleSetupSlots:
         sim_app._add_rule_slot(APPLE_TRADER_KEY)
         assert len(sim_app._rule_slots(APPLE_TRADER_KEY)) == 2
         assert len(sim_app._rule_slots(APPLE_TRADER2_KEY)) == 1
+
+
+class TestSweptSetupTitles:
+    """How a setup that expands into a grid names itself.
+
+    A plain setup collapses to its signature, which is the string Results
+    groups runs by -- a glance at the collapsed titles answers whether these
+    are different configurations. A swept setup has no single signature, so it
+    reports the count instead.
+    """
+
+    def test_one_configuration_collapses_to_its_signature(self):
+        assert sim_app._setup_title(["dayrange_AAPL(buy=H-0.4A)"]) == (
+            "dayrange_AAPL(buy=H-0.4A)"
+        )
+
+    def test_a_grid_collapses_to_its_count(self):
+        assert sim_app._setup_title(["a", "b", "c"]) == "3 configurations"
+
+    def test_one_signature_is_shown_whole(self):
+        assert sim_app._setup_signatures(["only"]) == "`only`"
+
+    def test_a_grids_signatures_are_truncated(self):
+        text = sim_app._setup_signatures(["a", "b", "c", "d", "e"], show=3)
+        assert "`a`" in text and "`c`" in text and "`d`" not in text
+        assert "and 2 more" in text
+
+    def test_a_setup_that_queues_nothing_says_so(self):
+        assert "nothing" in sim_app._setup_signatures([])
+
+
+class TestSweptSetupsQueueAsConfigurations:
+    """A swept setup reaches `_rule_combinations` flattened, exactly as several
+    hand-added setups would -- the tab has one notion of a configuration."""
+
+    def test_a_grid_queues_one_experiment_per_cell_per_dataset(self):
+        configs, _ = sim_tuning.expand(
+            AppleTraderConfig(ticker="AAPL"),
+            [{"name": "buy_k", "values": [0.5, 0.6, 0.7]}],
+        )
+        combos, by_combo = sim_app._rule_combinations(
+            {APPLE_TRADER_KEY: configs}, ["ds1", "ds2"]
+        )
+        assert len(combos) == 6
+        assert {round(by_combo[c].buy_k, 2) for c in combos} == {0.5, 0.6, 0.7}
+
+    def test_a_grid_and_the_same_setups_added_by_hand_are_the_same_batch(self):
+        axes = [{"name": "breach_update", "values": ["off", "extreme"]}]
+        swept, _ = sim_tuning.expand(AppleTraderConfig(ticker="AAPL"), axes)
+        by_hand = [
+            AppleTraderConfig(ticker="AAPL", breach_update="off"),
+            AppleTraderConfig(ticker="AAPL", breach_update="extreme"),
+        ]
+        one, _ = sim_app._rule_combinations({APPLE_TRADER_KEY: swept}, ["ds1"])
+        two, _ = sim_app._rule_combinations({APPLE_TRADER_KEY: by_hand}, ["ds1"])
+        assert one == two
+
+    def test_a_grid_cell_matching_another_setup_is_queued_once(self):
+        """The signature is the identity: a swept cell and a hand-added setup
+        that sign the same are one experiment, as two hand-added ones are."""
+        axes = [{"name": "buy_k", "values": [0.5, 0.6]}]
+        swept, _ = sim_tuning.expand(AppleTraderConfig(ticker="AAPL"), axes)
+        combos, _ = sim_app._rule_combinations(
+            {APPLE_TRADER_KEY: swept + [AppleTraderConfig(ticker="AAPL", buy_k=0.5)]},
+            ["ds1"],
+        )
+        assert len(combos) == 2
 
 
 class TestRuleCombinations:

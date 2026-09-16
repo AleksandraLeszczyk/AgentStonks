@@ -17,7 +17,7 @@ import pytest
 from agent_stonks import momentum_regime
 from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTraderConfig
 from agent_stonks.market_hours import MARKET_TZ
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from simlab import data as sim_data
 from simlab import tuning as tu
 from simlab.engine import SimulationConfig, SimulationEngine
@@ -98,6 +98,151 @@ class TestBaseConfiguration:
     def test_an_impossible_cell_still_raises_for_the_caller_to_mark(self):
         with pytest.raises(ValueError):
             tu.make_config(spec()["base"], {"buy_k": 0.1, "sell_k": 0.5})
+
+
+class TestSweepVocabulary:
+    """What the Simulate tab's per-setup sweep is allowed to vary.
+
+    Shared with the Tuning tab's numeric axes on purpose -- one table saying
+    what a setting is and what it may be, rather than two that drift the first
+    time a range is widened.
+    """
+
+    def test_every_sweepable_field_is_a_real_config_field(self):
+        names = {f.name for f in fields(AppleTraderConfig)}
+        assert set(tu.SWEEPABLE) <= names
+
+    def test_every_sweepable_field_has_a_range_or_a_set_of_options(self):
+        for name in tu.SWEEPABLE:
+            assert name in tu.TUNABLES or name in tu.CHOICES
+
+    def test_the_two_vocabularies_do_not_overlap(self):
+        assert not set(tu.TUNABLES) & set(tu.CHOICES)
+
+    def test_housekeeping_the_signature_ignores_is_not_offered(self):
+        """Varying it would queue several runs that Results shows as one row."""
+        assert "flatten_before_close_min" in tu.TUNABLES
+        assert "flatten_before_close_min" not in tu.SWEEPABLE
+
+    def test_a_choices_options_are_all_configurations_the_agent_accepts(self):
+        for name, choice in tu.CHOICES.items():
+            for option in choice.options:
+                assert getattr(AppleTraderConfig(**{name: option}), name) == option
+
+    def test_every_option_has_a_label(self):
+        for choice in tu.CHOICES.values():
+            assert all(choice.labels.get(o) for o in choice.options)
+
+    def test_a_number_is_labelled_by_its_format_and_a_rule_by_its_name(self):
+        assert tu.value_label("buy_k", 0.5) == "0.50"
+        assert tu.value_label("breach_update", "off") == tu.CHOICES[
+            "breach_update"
+        ].labels["off"]
+
+    def test_an_unknown_field_falls_back_to_its_name_and_value(self):
+        assert tu.sweep_label("nonsense") == "nonsense"
+        assert tu.value_label("nonsense", 3) == "3"
+
+
+class TestCellCount:
+    """The size guard runs before the grid exists, so it cannot build one."""
+
+    def test_it_is_the_product_of_the_axes(self):
+        axes = [{"name": "buy_k", "values": [1, 2, 3]},
+                {"name": "sell_k", "values": [1, 2]}]
+        assert tu.cell_count(axes) == len(tu.grid(axes)) == 6
+
+    def test_no_axes_is_the_one_base_configuration(self):
+        assert tu.cell_count([]) == len(tu.grid([])) == 1
+
+    def test_a_grid_far_too_large_to_build_is_still_counted(self):
+        axes = [{"name": f"a{i}", "values": list(range(10))} for i in range(7)]
+        assert tu.cell_count(axes) == 10_000_000
+
+
+class TestExpand:
+    """One setup crossed with its axes: what actually gets queued."""
+
+    def base(self, **kwargs) -> AppleTraderConfig:
+        kwargs.setdefault("ticker", TICKER)
+        return AppleTraderConfig(**kwargs)
+
+    def test_no_axes_is_the_base_configuration_alone(self):
+        base = self.base()
+        configs, refused = tu.expand(base, [])
+        assert configs == [base] and refused == []
+
+    def test_one_axis_is_one_configuration_per_value(self):
+        configs, _ = tu.expand(
+            self.base(), [{"name": "buy_k", "values": [0.5, 0.6, 0.7]}]
+        )
+        assert [c.buy_k for c in configs] == [0.5, 0.6, 0.7]
+
+    def test_two_axes_are_their_product(self):
+        configs, _ = tu.expand(self.base(), [
+            {"name": "buy_k", "values": [0.5, 0.7]},
+            {"name": "breach_update", "values": ["off", "extreme"]},
+        ])
+        assert len(configs) == 4
+        assert {(c.buy_k, c.breach_update) for c in configs} == {
+            (0.5, "off"), (0.5, "extreme"), (0.7, "off"), (0.7, "extreme"),
+        }
+
+    def test_a_numeric_and_a_rule_axis_mix(self):
+        configs, _ = tu.expand(self.base(), [
+            {"name": "stop_k", "values": [0.0, 0.2]},
+            {"name": "level_source", "values": ["dayrange"]},
+        ])
+        assert all(c.level_source == "dayrange" for c in configs)
+        assert sorted(c.stop_k for c in configs) == [0.0, 0.2]
+
+    def test_everything_the_axes_do_not_name_comes_from_the_base(self):
+        base = self.base(position_pct=40.0, min_win_k=0.15)
+        configs, _ = tu.expand(base, [{"name": "buy_k", "values": [0.5, 0.6]}])
+        assert all(c.position_pct == 40.0 and c.min_win_k == 0.15 for c in configs)
+
+    def test_a_cell_that_is_not_a_strategy_is_refused_with_its_reason(self):
+        """Not dropped: a grid quietly one row short is worse than one that
+        explains itself."""
+        configs, refused = tu.expand(
+            self.base(sell_k=0.25), [{"name": "buy_k", "values": [0.1, 0.5]}]
+        )
+        assert [c.buy_k for c in configs] == [0.5]
+        assert len(refused) == 1
+        overrides, reason = refused[0]
+        assert overrides == {"buy_k": 0.1} and "must sit above the buy level" in reason
+
+    def test_cells_that_sign_the_same_are_queued_once(self):
+        """`take_fraction` is not in the signature while the momentum take is
+        off, so varying it there is one configuration however many values."""
+        configs, refused = tu.expand(
+            self.base(momentum_drop=0.0),
+            [{"name": "take_fraction", "values": [0.3, 0.6, 1.0]}],
+        )
+        assert len(configs) == 1 and refused == []
+
+    def test_the_collapse_is_visible_against_the_grid(self):
+        axes = [{"name": "take_fraction", "values": [0.3, 0.6, 1.0]}]
+        configs, refused = tu.expand(self.base(momentum_drop=0.0), axes)
+        assert tu.cell_count(axes) - len(configs) - len(refused) == 2
+
+    def test_the_order_is_the_grids(self):
+        axes = [
+            {"name": "buy_k", "values": [0.5, 0.7]},
+            {"name": "stop_k", "values": [0.0, 0.2]},
+        ]
+        configs, _ = tu.expand(self.base(), axes)
+        assert [(c.buy_k, c.stop_k) for c in configs] == [
+            (0.5, 0.0), (0.5, 0.2), (0.7, 0.0), (0.7, 0.2)
+        ]
+
+    def test_every_configuration_is_one_the_engine_would_accept(self):
+        configs, _ = tu.expand(self.base(), [
+            {"name": "buy_k", "values": tu.axis_values("buy_k", 0.3, 0.9, 0.1)},
+            {"name": "level_source", "values": list(tu.CHOICES["level_source"].options)},
+        ])
+        assert configs and all(isinstance(c, AppleTraderConfig) for c in configs)
+        assert len({tu.config_signature(c) for c in configs}) == len(configs)
 
 
 class TestValidation:

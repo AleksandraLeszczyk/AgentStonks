@@ -57,6 +57,12 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
     config_signature,
 )
+from agent_stonks.config import (
+    BREACH_LABELS,
+    BREACH_POLICIES,
+    LEVEL_SOURCES,
+    LEVEL_SOURCE_LABELS,
+)
 from agent_stonks.market_hours import MARKET_TZ
 
 TUNING_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "tuning"
@@ -75,6 +81,12 @@ BASELINE = "baseline"
 MAX_AXES = 2
 # A guard against a slip of the step size queueing hours of replays.
 MAX_CELLS = 400
+# The same guard for the Simulate tab's per-setup sweep, and much lower for a
+# reason: a tuning cell is a replay on a pooled worker inside one job, while a
+# swept configuration there is a queued *experiment* -- its own subprocess, its
+# own run record, its own row in Results. A hundred of those is an afternoon
+# and a Results page nobody reads.
+MAX_SWEEP_CONFIGS = 64
 
 # How the best cell is chosen on the tuning dataset.
 PICK_MAX = "max"
@@ -144,6 +156,81 @@ TUNABLES: "dict[str, Tunable]" = {
     )
 }
 
+@dataclass(frozen=True)
+class Choice:
+    """One `AppleTraderConfig` field varied over a fixed set of rules.
+
+    The counterpart of `Tunable` for the settings that are not numbers: which
+    reference the levels hang off, and what happens when the session trades
+    through the forecast. They have no range and no step -- a sweep over one is
+    a set of named alternatives, and the whole set is the useful default.
+
+    Absent from the Tuning tab, which draws a heatmap of two numeric axes and
+    picks a cell on it; these belong to the Simulate tab's per-setup sweep,
+    where the output is several queued runs to compare rather than a surface.
+    """
+
+    name: str
+    label: str
+    options: "tuple[str, ...]"
+    #: option -> what the form and the captions call it.
+    labels: "dict[str, str]"
+
+
+CHOICES: "dict[str, Choice]" = {
+    c.name: c
+    for c in (
+        Choice(
+            "level_source", "Levels measured below",
+            tuple(LEVEL_SOURCES), dict(LEVEL_SOURCE_LABELS),
+        ),
+        Choice(
+            "breach_update", "If the session trades outside the forecast",
+            tuple(BREACH_POLICIES), dict(BREACH_LABELS),
+        ),
+    )
+}
+
+# What the Simulate tab's per-setup sweep offers, in the order the form lists
+# it: the two levels, then the rules about what they hang off, then the exits
+# and the sizing -- the same reading order as the setup form above it.
+#
+# `flatten_before_close_min` is a `Tunable` and is deliberately not here. The
+# run signature does not carry it (`config_signature`), and Results identifies
+# a configuration by that signature, so varying it would queue several runs
+# that collapse into one row -- a grid that looks like a comparison and is not.
+SWEEPABLE: "tuple[str, ...]" = (
+    "buy_k",
+    "sell_k",
+    "level_source",
+    "breach_update",
+    "stop_k",
+    "momentum_drop",
+    "take_fraction",
+    "hold_min_gain_k",
+    "min_win_k",
+    "position_pct",
+)
+
+
+def sweep_label(name: str) -> str:
+    """One sweepable field's name, whether it is numeric or a set of rules."""
+    field = TUNABLES.get(name) or CHOICES.get(name)
+    return field.label if field else name
+
+
+def value_label(name: str, value) -> str:
+    """One value of one sweepable field, as the form and the captions show it."""
+    choice = CHOICES.get(name)
+    if choice is not None:
+        return choice.labels.get(value, str(value))
+    tunable = TUNABLES.get(name)
+    try:
+        return tunable.fmt % value if tunable else str(value)
+    except TypeError:
+        return str(value)
+
+
 # Wall-clock seconds one worker spends replaying one session, for the form's
 # estimate. Measured on a stored AAPL week (a 4-session replay in ~0.6-0.8 s
 # once the market index and the replay minute frame were in); each pool worker
@@ -182,6 +269,19 @@ def axis_values(name: str, start: float, stop: float, step: float) -> list:
     return [int(round(v)) for v in values] if tunable.integer else values
 
 
+def cell_count(axes: "list[dict]") -> int:
+    """How many combinations `grid` would produce, without producing them.
+
+    A size guard has to run *before* the grid exists: seven axes of ten values
+    is ten million override dicts, and a form that builds them to find out it
+    should not have is a hung page rather than a refusal.
+    """
+    count = 1
+    for axis in axes:
+        count *= len(axis["values"])
+    return count
+
+
 def grid(axes: "list[dict]") -> "list[dict]":
     """Every combination of the axes' values, as override dicts, row by row."""
     if not axes:
@@ -204,6 +304,51 @@ def make_config(base: dict, overrides: dict) -> AppleTraderConfig:
     from .rule_agents import rule_agent
 
     return rule_agent(APPLE_TRADER_KEY).from_record({**base, **overrides})
+
+
+def expand(
+    base: AppleTraderConfig, axes: "list[dict]"
+) -> "tuple[list[AppleTraderConfig], list[tuple[dict, str]]]":
+    """`base` crossed with every combination of `axes`: (configurations, refused).
+
+    The Simulate tab's sweep, and the one place that decides what a grid of
+    settings actually queues. `axes` is the same `[{"name", "values"}]` shape
+    `grid` takes, so a sweep and a tuning job describe a grid identically.
+
+    Two kinds of cell never become a run, and they are different:
+
+    * **refused** -- the configuration is not a strategy at all, and
+      `AppleTraderConfig` says why (a sell level at or under the buy level, a
+      take fraction of nothing). Returned with its reason rather than dropped,
+      because a grid quietly one row short is worse than one that explains
+      itself.
+    * **collapsed** -- the configuration is real but signs the same as one
+      already in the list, which happens whenever a varied field is switched
+      off by another (`take_fraction` means nothing with `momentum_drop` at 0,
+      and the signature leaves it out). The whole pipeline identifies a run by
+      its signature, so queueing both would be one Results row run twice.
+      Silently collapsed here; the caller compares against `cell_count(axes)`
+      to say how many.
+
+    Order is the grid's, so the first configuration is every axis at its first
+    value and the list reads like the form above it.
+    """
+    record = asdict(base)
+    configs: "list[AppleTraderConfig]" = []
+    refused: "list[tuple[dict, str]]" = []
+    seen: "set[str]" = set()
+    for overrides in grid(axes):
+        try:
+            config = make_config(record, overrides)
+        except (TypeError, ValueError) as exc:
+            refused.append((overrides, str(exc)))
+            continue
+        signature = config_signature(config)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        configs.append(config)
+    return configs, refused
 
 
 # --- one cell ---------------------------------------------------------------

@@ -1457,15 +1457,19 @@ def _render_rule_params(
     applies to every model in the grid, but a rule set does not apply to
     anything -- it *is* the entry -- so sweeping a threshold or comparing two
     instruments should be one batch rather than three trips through this tab.
-    Each setup queues its own experiment per dataset, and lands in Results as
-    its own configuration, since the signature is a function of the settings.
+    Each configuration queues its own experiment per dataset, and lands in
+    Results as its own row, since the signature is a function of the settings.
+
+    Flattened across setups on the way out: a setup is one configuration until
+    it is swept (`_render_apple_sweep`) and a grid of them after, and nothing
+    downstream needs to know which setup a configuration came from.
 
     `symbols` is every symbol the selected datasets carry, offered to the agents
     that pick their own instrument.
     """
     renderers = {
-        APPLE_TRADER_KEY: _render_apple_params,
-        APPLE_TRADER2_KEY: _render_apple2_params,
+        APPLE_TRADER_KEY: _render_apple_setup,
+        APPLE_TRADER2_KEY: _render_apple2_setup,
     }
     return {
         key: _render_agent_setups(key, symbols, renderers[key])
@@ -1474,18 +1478,48 @@ def _render_rule_params(
     }
 
 
+def _setup_title(signatures: "list[str]") -> str:
+    """What a collapsed setup is called: its signature, or how many it stands for.
+
+    A setup is one configuration until it is swept, and then it is a grid --
+    and a grid's title cannot be a signature, because it has several. The count
+    is the useful thing at that point: which cell is which is a question for
+    Results, where each one is its own row.
+    """
+    if len(signatures) == 1:
+        return signatures[0]
+    return f"{len(signatures)} configurations"
+
+
+def _setup_signatures(signatures: "list[str]", show: int = 3) -> str:
+    """The signatures under an open setup, truncated -- a 40-cell grid's worth
+    of them would bury the controls that produced it."""
+    if not signatures:
+        return "No configuration — this setup queues nothing."
+    shown = " · ".join(f"`{s}`" for s in signatures[:show])
+    rest = len(signatures) - show
+    return shown + (f" · …and {rest} more" if rest > 0 else "")
+
+
 def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list:
     """One agent's setups: an editor each, plus add and remove.
+
+    `renderer` hands back a *list* of configurations per setup -- one for a
+    plain setup, one per cell for a swept one -- and they are flattened here,
+    because a configuration is the unit everything downstream queues, signs and
+    groups by.
 
     The newest setup is the one left open and the older ones collapse to their
     **signature** -- the same string Results groups runs by, so a glance at the
     collapsed titles answers the only question that matters here, which is
-    whether these are actually different configurations. The signature shown is
-    the one built on the previous rerun (an expander's label is fixed before its
-    body runs); every widget change reruns the page, so it trails an edit by
-    nothing a user can perceive.
+    whether these are actually different configurations. A swept setup has no
+    single signature, so it collapses to its count instead (`_setup_title`). The
+    title shown is the one built on the previous rerun (an expander's label is
+    fixed before its body runs); every widget change reruns the page, so it
+    trails an edit by nothing a user can perceive.
     """
     slots = _rule_slots(personality)
+    agent = rule_agent(personality)
     label = _agent_label(personality)
     st.markdown(f"**{label}** — {len(slots)} setup(s)")
     configs = []
@@ -1496,10 +1530,10 @@ def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list
         if remembered and index != len(slots) - 1:
             title += f" — {remembered}"
         with st.expander(title, expanded=index == len(slots) - 1):
-            config = renderer(symbols, prefix)
-            configs.append(config)
-            signature = rule_agent(personality).signature(config)
-            st.session_state[f"{prefix}__signature"] = signature
+            setup = renderer(symbols, prefix)
+            configs.extend(setup)
+            signatures = [agent.signature(config) for config in setup]
+            st.session_state[f"{prefix}__signature"] = _setup_title(signatures)
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.button(
                     "Remove this setup", icon=":material/delete:",
@@ -1508,7 +1542,7 @@ def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list
                     help=None if len(slots) > 1
                     else "The last setup cannot be removed — deselect the agent instead.",
                 )
-                st.caption(f"`{signature}`")
+                st.caption(_setup_signatures(signatures))
     st.button(
         f"Add another {label} setup", icon=":material/add:",
         key=f"sim_rule_add_{personality}", on_click=_add_rule_slot, args=(personality,),
@@ -1516,9 +1550,7 @@ def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list
              "datasets — a threshold sweep, two instruments, or one rule switched "
              "on and off, run side by side and compared in Results.",
     )
-    duplicates = len(configs) - len({
-        rule_agent(personality).signature(config) for config in configs
-    })
+    duplicates = len(configs) - len({agent.signature(config) for config in configs})
     if duplicates:
         # Deliberately about the *signature* rather than about the settings:
         # not every field is in it (the closing flatten is not, on either
@@ -1531,6 +1563,20 @@ def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list
             "something the signature carries (it is shown under each setup)."
         )
     return configs
+
+
+def _render_apple2_setup(
+    symbols: list[str], prefix: str
+) -> "list[AppleTrader2Config]":
+    """Apple Trader 2's entry in the Simulate tab, as a one-element grid.
+
+    Every setup the tab renders hands back a list of configurations, so that a
+    swept one and a plain one queue through the same path. This agent has no
+    sweep: its strategy is a list of action items rather than a handful of
+    numbers, so "every combination of the selected rules" is not a grid over a
+    few fields -- add a second setup to compare two rule sets.
+    """
+    return [_render_apple2_params(symbols, prefix)]
 
 
 def _render_apple2_params(symbols: list[str], prefix: str) -> AppleTrader2Config:
@@ -1693,6 +1739,173 @@ _APPLE_TRADER_COPY_FIELDS = dict(
 )
 
 
+def _sweep_axes(base: AppleTraderConfig, prefix: str) -> "list[dict]":
+    """The axes the user has asked this setup to vary, as `tuning.grid` takes them.
+
+    One control per selected field, and which control depends on what the field
+    is. A number gets from/to/step -- the same three boxes the Tuning tab uses,
+    so a range means the same thing in both places and `tuning.axis_values`
+    decides what it expands to. A rule gets a multiselect of its options, since
+    there is no range to walk: "hold the forecast, or move to the extreme" is a
+    set, not an interval.
+
+    Each axis says how many values it came to and what the setup above it holds,
+    because the single most useful thing to know while building a grid is
+    whether the configuration you started from is still in it.
+    """
+    names = st.multiselect(
+        "Vary these settings",
+        list(sim_tuning.SWEEPABLE),
+        default=[],
+        format_func=sim_tuning.sweep_label,
+        key=f"{prefix}_sweep_axes",
+        help="Each one selected multiplies the setup out: every combination of the "
+             "values below is queued as its own experiment and lands in Results as "
+             "its own configuration. Leave empty to queue this setup as it stands.",
+    )
+    axes: list[dict] = []
+    for name in names:
+        choice = sim_tuning.CHOICES.get(name)
+        if choice is not None:
+            values = st.multiselect(
+                choice.label, list(choice.options), default=list(choice.options),
+                format_func=lambda key, c=choice: c.labels.get(key, key),
+                key=f"{prefix}_sweep_{name}",
+            )
+        else:
+            values = _sweep_range(name, prefix)
+        if not values:
+            st.caption(
+                f":material/info: {sim_tuning.sweep_label(name)} has no values selected, "
+                "so it is not varied."
+            )
+            continue
+        axes.append({"name": name, "values": values})
+        st.caption(
+            f"{len(values)} value(s): "
+            + ", ".join(sim_tuning.value_label(name, v) for v in values)
+            + f" — this setup has {sim_tuning.value_label(name, getattr(base, name))}."
+        )
+    return axes
+
+
+def _sweep_range(name: str, prefix: str) -> list:
+    """One numeric axis's values from a from/to/step row, or [] if it is invalid.
+
+    The reason it can be invalid at all -- rather than clamped into something
+    that runs -- is that a backwards range is a typo and a silently corrected
+    typo queues the wrong grid. `tuning.axis_values` raises and the message it
+    raises with is the one shown.
+    """
+    tunable = sim_tuning.TUNABLES[name]
+    cast = int if tunable.integer else float
+    start0, stop0, step0 = tunable.default_range
+    bounds = dict(
+        min_value=cast(tunable.minimum), max_value=cast(tunable.maximum),
+        step=cast(tunable.step), format=tunable.fmt,
+    )
+    col_from, col_to, col_step = st.columns(3)
+    start = col_from.number_input(
+        f"{tunable.label}: from", value=cast(start0),
+        key=f"{prefix}_sweep_{name}_from", **bounds
+    )
+    stop = col_to.number_input(
+        "to", value=cast(stop0), key=f"{prefix}_sweep_{name}_to", **bounds
+    )
+    step = col_step.number_input(
+        "step", min_value=cast(tunable.step), max_value=cast(tunable.maximum),
+        value=cast(step0), step=cast(tunable.step), format=tunable.fmt,
+        key=f"{prefix}_sweep_{name}_step",
+    )
+    try:
+        return sim_tuning.axis_values(name, start, stop, step)
+    except ValueError as exc:
+        st.error(f":material/error: {exc}")
+        return []
+
+
+def _render_apple_sweep(
+    base: AppleTraderConfig, prefix: str
+) -> "list[AppleTraderConfig]":
+    """One Apple Trader setup expanded over the settings it is asked to vary.
+
+    The setup form above supplies the configuration every combination starts
+    from; this crosses it with the axes and hands back one config per cell, each
+    of which the tab queues as its own experiment against every selected
+    dataset. With nothing varied it is the base configuration alone, which is
+    what a setup was before this existed.
+
+    Three things a grid does that a single setup cannot, all reported rather
+    than absorbed: a cell can be refused outright (`AppleTraderConfig` says
+    why), several cells can collapse into one configuration because the run
+    signature does not separate them, and the whole thing can be far larger
+    than anyone meant. `tuning.expand` decides the first two; the size guard is
+    here because it is a statement about the queue rather than about the grid,
+    and it is measured on the grid rather than on what survives it -- a refusal
+    has to be cheaper than the thing it refuses.
+    """
+    axes = _sweep_axes(base, prefix)
+    if not axes:
+        return [base]
+
+    # Counted before it is built: the guard exists to stop a grid nobody meant,
+    # and building one to measure it is the thing being guarded against.
+    cells = sim_tuning.cell_count(axes)
+    if cells > sim_tuning.MAX_SWEEP_CONFIGS:
+        st.error(
+            f":material/error: {cells} combinations is over the "
+            f"{sim_tuning.MAX_SWEEP_CONFIGS} a single setup may queue — each one is its "
+            "own worker process, its own run record and its own row in Results, not a "
+            "cell in a heatmap. **This setup is queued as the base configuration alone** "
+            "until the grid is narrowed; drop an axis or widen a step. To sweep a "
+            "numeric pair this finely, use the Tuning tab."
+        )
+        return [base]
+
+    configs, refused = sim_tuning.expand(base, axes)
+    for overrides, reason in refused[:3]:
+        st.caption(
+            ":material/block: not a strategy, so it is not queued — "
+            + ", ".join(
+                f"{sim_tuning.sweep_label(n)} {sim_tuning.value_label(n, v)}"
+                for n, v in overrides.items()
+            )
+            + f": {reason}"
+        )
+    if len(refused) > 3:
+        st.caption(f":material/block: …and {len(refused) - 3} more refused combination(s).")
+
+    collapsed = cells - len(configs) - len(refused)
+    if collapsed > 0:
+        # The same fact `_render_agent_setups` reports across setups: Results
+        # identifies a configuration by its signature, and a field switched off
+        # by another (a take fraction with the momentum take at 0) is not in it.
+        st.caption(
+            f":material/merge: {collapsed} combination(s) sign the same as another and "
+            "are queued once — a setting the signature does not carry was varied while "
+            "something else had switched it off."
+        )
+    st.caption(
+        f":material/grid_view: **{' × '.join(str(len(a['values'])) for a in axes)} = "
+        f"{cells} combination(s)** → {len(configs)} configuration(s), each queued "
+        "against every selected dataset."
+    )
+    return configs
+
+
+def _render_apple_setup(
+    symbols: list[str], prefix: str
+) -> "list[AppleTraderConfig]":
+    """One Apple Trader entry in the Simulate tab: a base configuration and the
+    grid it is swept over.
+
+    Split from `_render_apple_params` because the Tuning tab renders that same
+    form as the base of its own grid and must keep getting one configuration
+    back; a sweep inside a sweep is not a thing.
+    """
+    return _render_apple_sweep(_render_apple_params(symbols, prefix), prefix)
+
+
 def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
     """One Apple Trader setup: its instrument and rules.
 
@@ -1726,7 +1939,10 @@ def render_simulate_tab() -> None:
         "Pick several agents, models, and datasets — every combination is queued as "
         "its own experiment. A rule-based agent has no model to vary, so its "
         "**setups** take that place: add it as many times as you have "
-        "configurations to compare, and each one is queued against every dataset."
+        "configurations to compare, and each one is queued against every dataset. "
+        "Apple Trader can also **vary settings inside one setup** — pick the levels, "
+        "the exits or the forecast rules to sweep and the setup multiplies out into "
+        "one experiment per combination."
     )
     names = [d.name for d in datasets]
     selected_names = st.multiselect(
@@ -1859,9 +2075,12 @@ def render_simulate_tab() -> None:
                     f"{len(llm_personalities)} LLM agent(s) × {len(model_choices)} model(s)"
                 )
             if rule_personalities:
-                setups = sum(len(rule_setups.get(p, [])) for p in rule_personalities)
+                # Configurations rather than setups: one Apple Trader setup with
+                # a sweep on it is several, and the multiplication below only
+                # adds up if this is what it counts.
+                configured = sum(len(rule_setups.get(p, [])) for p in rule_personalities)
                 parts.append(
-                    f"{setups} rule-based setup(s) "
+                    f"{configured} rule-based configuration(s) "
                     f"over {len(rule_personalities)} agent(s)"
                 )
             st.caption(
