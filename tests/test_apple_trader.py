@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
-from agent_stonks import apple_models
+from agent_stonks import apple_models, intraday_vol_model
 from agent_stonks import apple_trader as at
 from agent_stonks import clock
 from agent_stonks import rule_agent
@@ -735,6 +735,227 @@ class TestIntradayRangeUpdate:
         assert trader.plan["range_updates"] == 1
 
 
+# A hand-made IntradayVolatility shape, so these pin the levels rather than the
+# fitted curve: vol(t) = 0.2 + 0.8 / (1.5 + t), which peaks at the open like the
+# real one and settles onto a floor, but is readable by hand. The real fit is
+# pinned in `tests/test_intraday_vol_model.py` against the exporter's own check
+# block; what matters here is what the trader does with whatever curve it gets.
+VOL_SHAPE = {
+    "shape": {
+        "params": {"a": 0.2, "b": 0.8, "alpha": 1.0, "c": 0.0, "kappa": 30.0},
+        "t_domain": [0.0, 389.5],
+    },
+    "day_range": {"coef": {"const": 0.0, "lr_d": 0.0, "lr_w": 0.0, "lr_m": 0.0,
+                           "abs_gap": 0.0}},
+}
+# The tape's 09:30 bar opens here, and `fetch_session_open` is stubbed to None,
+# so this is the price the envelope is centred on.
+SESSION_OPEN = 101.0
+
+
+def expected_reference(minute: float, high=FORECAST["pred_high"], low=FORECAST["pred_low"]):
+    """The upper envelope at one minute, straight from the model the chart uses."""
+    upper, _ = intraday_vol_model.envelope_at(VOL_SHAPE, SESSION_OPEN, high, low, minute)
+    return upper
+
+
+class TestIntradayLevelSource:
+    """The levels resting under the intraday band rather than under a flat high.
+
+    Same forecast, read through IntradayVolatility's time-of-day shape: the
+    reference is the upper curve of the "predicted intraday range x day range"
+    overlay at the minute of the bar that just closed, so it is the predicted
+    high at 09:30 and pulls in towards the open as the day quiets.
+    """
+
+    def _trader(self, monkeypatch, **kwargs):
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: VOL_SHAPE)
+        return at.DayRangeTrader(dayrange_config(level_source="intraday", **kwargs))
+
+    def test_the_default_is_the_flat_predicted_high(self):
+        assert AppleTraderConfig().level_source == "dayrange"
+
+    def test_the_flat_source_rests_on_the_predicted_high_all_day(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config())
+        for offset in (65, 200):
+            tape.append(104.0, offset=offset)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+            assert trader.plan["reference"] == FORECAST["pred_high"]
+            assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+
+    def test_the_reference_is_the_overlay_curve_at_this_minute(
+        self, state, market_open, monkeypatch
+    ):
+        """Pinned against `intraday_vol_model` itself, not against a number
+        copied here: the level Apple Trader rests on and the band a reader sees
+        behind the candles have to be the same curve, or the chart is a lie."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = self._trader(monkeypatch)
+
+        tape.append(104.0, offset=65)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["reference"] == pytest.approx(expected_reference(65))
+
+    def test_the_levels_are_the_same_two_distances_under_that_reference(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = self._trader(monkeypatch)
+
+        tape.append(104.0, offset=65)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        plan = trader.plan
+        assert plan["buy_level"] == pytest.approx(plan["reference"] - 0.75 * 10)
+        assert plan["sell_level"] == pytest.approx(plan["reference"] - 0.10 * 10)
+
+    def test_the_reference_pulls_in_from_the_predicted_high_as_the_day_quiets(
+        self, state, market_open, monkeypatch
+    ):
+        """At the open the shape is 1 and the reference *is* the predicted high;
+        by the afternoon it is a fraction of the way there."""
+        assert expected_reference(0) == pytest.approx(FORECAST["pred_high"])
+        seen = [expected_reference(m) for m in (0, 30, 120, 300)]
+        assert seen == sorted(seen, reverse=True)
+        assert seen[-1] < FORECAST["pred_high"]
+
+    def test_the_levels_move_between_bars_with_no_breach_at_all(
+        self, state, market_open, monkeypatch
+    ):
+        """The clock alone moves them, which is the whole difference from the
+        flat source -- and is why the levels are rebuilt every bar."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = self._trader(monkeypatch, breach_update="off")
+
+        levels = []
+        for offset in (65, 150, 300):
+            tape.append(104.0, offset=offset)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+            levels.append((trader.plan["buy_level"], trader.plan["sell_level"]))
+        assert len(set(levels)) == 3
+        assert [b for b, _ in levels] == sorted([b for b, _ in levels], reverse=True)
+        assert trader.plan.get("range_updates") is None
+
+    def test_the_sell_level_stays_above_the_buy_level_at_every_minute(
+        self, state, market_open, monkeypatch
+    ):
+        """Both distances come off the same reference, so however it moves the
+        pair cannot invert -- the failure that would buy and sell every bar."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = self._trader(monkeypatch)
+        for offset in range(65, 389, 20):
+            tape.append(104.0, offset=offset)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+            assert trader.plan["sell_level"] > trader.plan["buy_level"]
+
+    def test_a_descending_target_can_close_a_position_the_price_never_reached(
+        self, state, market_open, monkeypatch
+    ):
+        """The surprising half of this setting, pinned rather than discovered.
+
+        Under the flat high a sell only fires when the price rises to it. Here
+        the reference falls through the morning, so the target can come down to
+        a flat price instead -- the model saying the day is no longer moving
+        enough to reach the morning's number.
+        """
+        broker = FakeBroker(102.6)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._trader(monkeypatch, breach_update="off")
+
+        # 09:36, while the reference is still near the predicted high: a dip
+        # deep enough to fill, closing back at 102.60.
+        tape.append(102.6, low=97.2, high=102.6, offset=6)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        entry_sell = trader.plan["sell_level"]
+        assert entry_sell > 102.6    # the target was out of reach at the fill
+
+        # 13:30, on a bar that never trades above that fill: flat price, and the
+        # target has descended through it.
+        tape.append(102.6, low=102.6, high=102.6, offset=240)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["sell_level"] < 102.6 < entry_sell
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_breach_moves_the_forecast_and_the_band_is_rebuilt_from_it(
+        self, state, market_open, monkeypatch
+    ):
+        """The two settings compose: the breach update owns the forecast, the
+        level source owns how it is read."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        trader = self._trader(monkeypatch, breach_update="extreme")
+
+        tape.append(111.5, high=112.0, offset=65)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["pred_high"] == pytest.approx(112.0)
+        assert trader.plan["reference"] == pytest.approx(expected_reference(65, high=112.0))
+
+    def test_a_missing_shape_falls_back_to_the_flat_high_and_says_so(
+        self, state, market_open, monkeypatch
+    ):
+        """`config_error` refuses a run whose symbol has no shape, so this is
+        the narrow case of one that vanished between the launch and 9:35 --
+        better a notebook-rule session than no levels at all."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
+        trader = at.DayRangeTrader(dayrange_config(level_source="intraday"))
+
+        tape.append(104.0, offset=65)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["reference"] == FORECAST["pred_high"]
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert any(
+            "IntradayVolatility shape" in e.get("text", "")
+            for e in state.agent_log if e.get("type") == "error"
+        )
+
+    def test_the_flat_source_never_loads_the_shape(self, state, market_open, monkeypatch):
+        """A run that does not read it must not pay for the file."""
+        calls = []
+        monkeypatch.setattr(
+            at.intraday_vol_model, "load",
+            lambda *a, **k: calls.append(a) or VOL_SHAPE,
+        )
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config())
+        tape.append(104.0, offset=65)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert calls == []
+
+
+class TestIntradayLevelSourceAvailability:
+    """It is a second model, so it is a second thing that can be missing."""
+
+    def test_a_symbol_the_shape_was_never_fitted_on_is_refused(self, monkeypatch):
+        monkeypatch.setattr(at.apple_models, "covers", lambda *a, **k: True)
+        config = dayrange_config(ticker="MSFT", level_source="intraday")
+        error = at.config_error(config)
+        assert error is not None and "MSFT" in error and "IntradayVolatility" in error
+
+    def test_a_missing_export_is_refused_with_the_path_it_looked_for(self, monkeypatch):
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
+        error = at.config_error(dayrange_config(level_source="intraday"))
+        assert error is not None and "intravol_AAPL.json" in error
+
+    def test_the_flat_source_needs_none_of_it(self, monkeypatch):
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
+        assert at.config_error(dayrange_config()) is None
+
+    def test_an_unknown_level_source_is_refused(self):
+        with pytest.raises(ValueError, match="level_source"):
+            dayrange_config(level_source="vwap")
+
+
 class TestDayRangeGuards:
     def test_no_entry_inside_the_closing_flatten_window(
         self, state, market_open, monkeypatch
@@ -854,6 +1075,15 @@ class TestStrategySelection:
                 dayrange_config(stop_k=0.0, momentum_drop=0.0, breach_update=policy)
             )
             assert signed == off[:-1] + f",breach={policy})"
+
+    def test_the_level_source_is_in_the_signature_only_when_it_is_not_the_high(self):
+        """It sits beside the two distances rather than at the end: "H" in
+        `buy=H-0.75A` is whatever the source says it is."""
+        flat = config_signature(dayrange_config(stop_k=0.0, momentum_drop=0.0))
+        assert flat == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
+        assert config_signature(
+            dayrange_config(stop_k=0.0, momentum_drop=0.0, level_source="intraday")
+        ) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,levels=intraday,size=95%)"
 
     def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
         """`dayrange_config` pins it off; the app's own default does not."""

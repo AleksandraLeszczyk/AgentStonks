@@ -1835,6 +1835,12 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Both are distances in **average daily ranges** (the trailing 14-day ADR in "
             "dollars), so they scale with how wide the sessions have been."
         ),
+        "dayrange_levels": (
+            "Both distances are measured below one reference. It does not have to be the "
+            "flat predicted high — the same forecast read through IntradayVolatility's "
+            "time-of-day curve gives a reference that moves with the clock, which is the "
+            "*predicted intraday range × day range* band you can draw on the chart."
+        ),
         "dayrange_breach": (
             "**H** is a forecast, and the day can trade straight through it. What happens "
             "then is a choice, and it moves both levels above: they are rebuilt from the "
@@ -1850,6 +1856,24 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         ),
     },
     outro={
+        "dayrange_levels_dayrange": (
+            ":material/horizontal_rule: One number for the whole session — the notebook's "
+            "rule, and what the buy and sell distances were swept against."
+        ),
+        "dayrange_levels_intraday": (
+            ":material/ssid_chart: The reference is the top of the intraday band: it *is* the "
+            "predicted high at 09:30, pulls in to roughly a fifth of the distance to the "
+            "open by midday, and opens back up into the last half hour. Both levels move "
+            "with it, so an entry needs a deeper dip as the day quiets — and the **target "
+            "comes down too**, which means a position opened in the morning can be closed "
+            "by a sell level that fell to it rather than by a price that rose to it. That "
+            "is the model's claim (the day is no longer moving enough to reach the "
+            "morning's target) rather than a bug, but it is a different strategy from the "
+            "one above, and it has not been swept. Note too that the band is anchored on "
+            "the session's **open**, not on the price: a day that trends well away from "
+            "the opening print leaves the levels behind, so the stop below matters more "
+            "here than it does above."
+        ),
         "dayrange_breach_off": (
             ":material/lock: The 9:35 forecast stands whatever the tape does — the notebook's "
             "rule, and the one the buy and sell distances above were swept under."
@@ -1888,6 +1912,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
             "the smaller number. Anything the day never reaches is held to the closing "
             "flatten."
+        ),
+        "level_source": (
+            "Which number `buy` and `sell` are measured below. The predicted high is one "
+            "number for the day. The intraday option stretches the same high and low by "
+            "IntradayVolatility's fitted volatility shape (it peaks at the open, decays "
+            "like a power law to a flat midday, and ramps into the close) around the "
+            "session's opening print, and takes the upper curve at each minute — the "
+            "level then answers \"how far is this stock reaching *right now*\" rather "
+            "than \"how far will it reach today\". Offered only for the symbols that "
+            "model was fitted on and exported for."
         ),
         "breach_update": (
             "The model cannot be re-run intraday — its opening features are a fixed "

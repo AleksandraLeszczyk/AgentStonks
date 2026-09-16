@@ -30,7 +30,14 @@ import streamlit as st
 
 from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels
-from .config import BREACH_LABELS, BREACH_POLICIES
+from . import intraday_vol_model
+from .config import (
+    BREACH_LABELS,
+    BREACH_POLICIES,
+    LEVELS_INTRADAY,
+    LEVEL_SOURCES,
+    LEVEL_SOURCE_LABELS,
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +175,7 @@ def dayrange_params(
             f"predicted high must be the smaller of the two — using {sell_k:g} until the "
             "buy distance is raised."
         )
+    level_source = level_source_param(defaults, ticker, copy)
     breach_update = breach_param(defaults, copy)
     stop_k, momentum_drop, take_fraction, hold_min_gain_k = exit_params(defaults, copy)
     _caption(copy.outro.get("dayrange"))
@@ -177,12 +185,53 @@ def dayrange_params(
         buy_k=float(buy_k),
         sell_k=float(sell_k),
         position_pct=float(position_pct),
+        level_source=level_source,
         breach_update=breach_update,
         stop_k=stop_k,
         momentum_drop=momentum_drop,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
     )
+
+
+def level_source_param(
+    defaults: AppleTraderConfig, ticker: str, copy: FormCopy
+) -> str:
+    """What the two distances above are measured below.
+
+    The intraday shape is a second model with its own set of symbols, so the
+    option is offered only where it can actually be computed -- rather than
+    offered everywhere and refused at launch by `level_source_error`, which is
+    the same fact learned later and with a run already queued. It says why it is
+    missing, because "this dropdown has one entry today" is otherwise a puzzle.
+
+    Keyed by ticker, like the levels: switching to a symbol without a shape must
+    not carry a selection that symbol cannot run.
+    """
+    _caption(copy.intro.get("dayrange_levels"))
+    options = [
+        key for key in LEVEL_SOURCES
+        if key != LEVELS_INTRADAY or intraday_vol_model.load(ticker) is not None
+    ]
+    current = st.session_state.get(copy.key(f"level_source_{ticker}")) or defaults.level_source
+    choice = str(
+        st.selectbox(
+            "Levels measured below",
+            options,
+            index=options.index(current) if current in options else 0,
+            format_func=lambda key: LEVEL_SOURCE_LABELS[key],
+            key=copy.key(f"level_source_{ticker}"),
+            help=copy.help.get("level_source"),
+        )
+    )
+    if LEVELS_INTRADAY not in options:
+        st.caption(
+            f":material/info: The intraday shape is not offered for {ticker}: there is no "
+            f"IntradayVolatility export at `{intraday_vol_model.model_path(ticker)}`. "
+            f"It was fitted on {', '.join(intraday_vol_model.TICKERS)}."
+        )
+    _caption(copy.outro.get(f"dayrange_levels_{choice}"))
+    return choice
 
 
 def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:

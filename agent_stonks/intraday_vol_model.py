@@ -210,3 +210,17 @@ def envelope(
     centre = min(max(float(open_price), float(low)), float(high))
     w = volatility_shape(model, minutes)
     return centre + (float(high) - centre) * w, centre - (centre - float(low)) * w
+
+
+def envelope_at(
+    model: dict, open_price: float, high: float, low: float, minute: float
+) -> "tuple[float, float]":
+    """`envelope` at one minute of the session, as two plain floats.
+
+    The band drawn on a chart is the whole session at once; a trading rule wants
+    the one minute the bar that just closed belongs to. Same function either
+    way, so a level Apple Trader rests on and the overlay a reader sees behind
+    the candles are the same curve rather than two implementations of it.
+    """
+    upper, lower = envelope(model, open_price, high, low, float(minute))
+    return float(upper), float(lower)

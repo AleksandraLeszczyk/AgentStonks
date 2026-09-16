@@ -260,6 +260,35 @@ BREACH_LABELS = {
 # before the setting existed replays under "off"
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_BREACH_UPDATE = BREACH_EXTREME
+
+# What the two levels hang off -- the reference `buy_k` and `sell_k` are
+# measured below (`apple_trader.DayRangeTrader._set_levels`). Here for the same
+# reason the breach policies are: naming one must not cost an import of torch.
+#
+#   "dayrange"  TimeToChange3's predicted high, one number for the session.
+#   "intraday"  the upper curve of that forecast stretched by IntradayVolatility's
+#               time-of-day shape -- the "predicted intraday range x day range"
+#               overlay, as a level rather than as a decoration. It is the same
+#               forecast, re-read minute by minute: at the 09:30 peak it IS the
+#               predicted high, by midday it has pulled in to roughly a fifth of
+#               the distance from the open, and it opens back up into the close.
+#
+# The second needs an IntradayVolatility export for the symbol on top of the
+# day-range bundle (`intraday_vol_model`), which `apple_trader.config_error`
+# checks before a run starts.
+LEVELS_DAYRANGE = "dayrange"
+LEVELS_INTRADAY = "intraday"
+LEVEL_SOURCES = (LEVELS_DAYRANGE, LEVELS_INTRADAY)
+LEVEL_SOURCE_LABELS = {
+    LEVELS_DAYRANGE: "Predicted high (flat all session)",
+    LEVELS_INTRADAY: "Predicted range × intraday volatility",
+}
+# Unchanged from the notebook, unlike APPLE_TRADER_BREACH_UPDATE above: the
+# intraday shape is a second model's claim rather than arithmetic on the tape,
+# it is not available for every symbol, and it changes what the strategy *is*
+# (a level that moves with the clock, and can therefore walk a target down
+# towards an open position). Opt in and measure it in SimLab.
+APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Flatten this many minutes before the close: the day-range forecast is a

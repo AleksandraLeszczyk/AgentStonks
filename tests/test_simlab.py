@@ -677,10 +677,23 @@ class TestRuleAgentRecords:
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
         assert today.breach_update == "extreme"
+        assert "levels=" not in agent.signature(today)   # the default source signs nothing
         assert agent.signature(today).endswith(",breach=extreme)")
         assert agent.signature(today) != agent.signature(
             replace(today, breach_update="brownian")
         )
+
+
+    def test_a_record_from_before_the_level_source_rests_on_the_predicted_high(self):
+        """It is the default too, so this changes nothing today -- it is here so
+        that the record keeps meaning what it meant if the default ever moves."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
+        assert old.level_source == "dayrange"
+
+        moved = replace(old, level_source="intraday")
+        assert agent.signature(moved) != agent.signature(old)
+        assert "levels=intraday" in agent.signature(moved)
 
 
 class TestDayRangeEngine:

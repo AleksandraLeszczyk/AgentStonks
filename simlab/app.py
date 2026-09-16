@@ -331,7 +331,15 @@ def _render_apple_rules() -> None:
         "kept as a **runner** only if the sell level is still `hold × A` above the fill, "
         "sold if the price comes back to the fill. It is not in the notebook's numbers, "
         "and a stored run from before it existed replays with it off.\n"
-        "- **H** itself can move. The model runs once and cannot be re-run, but a session "
+        "- **H** need not be the predicted high. The *levels measured below* setting can "
+        "point the two distances at the upper curve of the **predicted intraday range × "
+        "day range** band instead — the same forecast stretched by IntradayVolatility's "
+        "time-of-day shape around the session's open — so the reference is the predicted "
+        "high at 09:30, a fifth of that distance by midday, and wider again into the "
+        "close. The whole ladder moves with it, targets included. It needs that symbol's "
+        "own `intravol_<TICKER>.json`, and the shipped buy/sell distances were swept "
+        "against a reference that does not move.\n"
+        "- **H** itself can also move. The model runs once and cannot be re-run, but a session "
         "that trades *through* the predicted high has falsified it, so an **intraday "
         "update** moves the breached side — to the extreme so far, or past it by the "
         "excursion a driftless walk with ADR-implied volatility would still be expected to "
@@ -1520,6 +1528,12 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "them here is the intended use — the defaults are each instrument's best "
             "plateau over the notebook's sessions, which is still only a month or two of days."
         ),
+        "dayrange_levels": (
+            "What the two distances above are measured below. Each choice is its own "
+            "configuration in Results, and this is the one that changes the *shape* of "
+            "the strategy rather than a number in it, so run them side by side over the "
+            "same datasets before believing either."
+        ),
         "dayrange_breach": (
             "What a session that trades outside the forecast does to it. Each choice is its "
             "own configuration in Results, so the honest way to use this is to queue the "
@@ -1533,6 +1547,23 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
     },
     outro={
+        "dayrange_levels_dayrange": (
+            ":material/horizontal_rule: The predicted high, flat for the session — what "
+            "the shipped buy/sell distances were swept against, and what every stored "
+            "record replays as."
+        ),
+        "dayrange_levels_intraday": (
+            ":material/ssid_chart: The top of the intraday band instead, so the whole "
+            "ladder descends through the morning and rises into the close. Expect fewer "
+            "fills midday and **shorter holds**: the target descends with it, so a "
+            "morning position can be closed by a sell level that came down to it. The "
+            "swept distances are a poor starting point here — they were picked against a "
+            "reference that does not move — so sweep them again on the Tuning tab under "
+            "this setting rather than reading its first result as the strategy's worth. "
+            "It also damps the intraday update below, since the band is a fraction of the "
+            "forecast distance for most of the day: expect the two settings to be much "
+            "less than additive."
+        ),
         "dayrange_breach_off": (
             ":material/lock: The 9:35 forecast stands all day. This is what the levels above "
             "were swept under, and what every record written before this setting existed "
@@ -1573,6 +1604,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Where the exit rests below the same predicted high — {sell_k} on {ticker} "
             "by the same sweep, and the smaller of the two numbers, since it is the "
             "higher price. A day that never reaches it is held to the closing flatten."
+        ),
+        "level_source": (
+            "The predicted high, or that forecast stretched by IntradayVolatility's "
+            "time-of-day volatility shape and read at each minute. It is in the "
+            "signature unless it is the predicted high, so the two queue as two "
+            "configurations. Offered only where the shape has been exported "
+            "(`Models/intravol_<TICKER>.json`); the ticker's own file, not a shared one."
         ),
         "breach_update": (
             "Whether the predicted high is held all session or moved when the tape trades "
