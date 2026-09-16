@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agent_stonks import apple_models, clock
+from agent_stonks import apple_models, apple_trader, clock
 from agent_stonks.agent import MOMENTUM_SYSTEM_PROMPT
 from agent_stonks.apple_trader import (
     APPLE_TRADER_KEY,
@@ -656,12 +656,34 @@ class TestRuleAgentRecords:
         momentum take nor sign as a run that had them."""
         agent = rule_agent(APPLE_TRADER_KEY)
         old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
-        assert (old.stop_k, old.momentum_drop) == (0.0, 0.0)
+        assert (old.stop_k, old.stop_gain_fraction, old.momentum_drop) == (0.0, 0.0, 0.0)
         assert agent.signature(old) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert today.stop_k > 0 and today.momentum_drop > 0
-        assert agent.signature(today) != agent.signature(replace(today, stop_k=0.0))
+        assert today.stop_gain_fraction > 0 and today.momentum_drop > 0
+        assert agent.signature(today) != agent.signature(
+            replace(today, stop_gain_fraction=0.0)
+        )
+
+    def test_a_record_from_before_the_stop_was_a_share_of_the_gain_keeps_its_adrs(self):
+        """The stop used to be written in ADRs under the fill, with no reference
+        to what the trade was playing for. A record saying 0.2 of those replays
+        at 0.2 of those -- reading it as 0.2 of a gain it never mentioned would
+        be a different stop, filed in Results beside the original."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        old = agent.from_record({
+            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10, "stop_k": 0.2,
+        })
+        assert (old.stop_k, old.stop_gain_fraction) == (0.2, 0.0)
+        assert ",stop=E-0.2A" in agent.signature(old)
+        # $10 an ADR: the legacy 0.2 ADR, not 0.2 of the 0.65-ADR gain.
+        assert apple_trader.stop_distance(old, 10.0) == pytest.approx(2.0)
+
+    def test_a_record_written_today_carries_the_new_unit(self):
+        agent = rule_agent(APPLE_TRADER_KEY)
+        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        assert record["stop_gain_fraction"] == 0.5 and record["stop_k"] == 0.0
+        assert ",stop=E-0.5G" in agent.signature(agent.from_record(record))
 
     def test_a_record_from_before_the_intraday_update_replays_without_it(self):
         """The two levels used to be set at 9:35 and held all day, whatever the
@@ -911,10 +933,11 @@ class TestDayRangeEngine:
         """A record with the exit on replays with it -- the momentum score
         computed over the stored session -- and still trades the tape."""
         _, result = self._run(
-            monkeypatch, {"stop_k": 0.2, "momentum_drop": 1.0, "hold_min_gain_k": 0.3}
+            monkeypatch,
+            {"stop_gain_fraction": 0.5, "momentum_drop": 1.0, "hold_min_gain_k": 0.3},
         )
         assert result.error is None
-        assert result.config_summary["rule_config"]["stop_k"] == 0.2
+        assert result.config_summary["rule_config"]["stop_gain_fraction"] == 0.5
         fills = [d for d in result.decisions if d["status"] == "filled"]
         assert fills[0]["action"] == "buy"
         assert fills[-1]["action"] == "sell"

@@ -59,7 +59,7 @@ from .config import (
     APPLE_TRADER_MOMENTUM_DROP,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_SELL_K,
-    APPLE_TRADER_STOP_K,
+    APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
     BREACH_BROWNIAN,
     BREACH_LABELS,
@@ -144,8 +144,18 @@ class AppleTraderConfig:
     # levels are written in, but measured from the fill rather than from H.
     #
     # How far under the fill a bar's low may reach before the trade is taken to
-    # have gone the wrong way. 0 switches the stop off.
-    stop_k: float = APPLE_TRADER_STOP_K
+    # have gone the wrong way, as a share of what the trade is playing for --
+    # the predicted gain, `(buy_k - sell_k) x ADR`, which is the gap between the
+    # two levels at every minute of the session. 0.5 risks one dollar for every
+    # two the target is worth. 0 switches the stop off.
+    stop_gain_fraction: float = APPLE_TRADER_STOP_GAIN_FRACTION
+    # The same stop in the units it used to be written in: ADRs under the fill,
+    # with no reference to what the trade was playing for. Kept only so that a
+    # stored record replays and signs exactly as the run it describes -- nothing
+    # configures it any more, and a new config leaves it at 0. The two are
+    # mutually exclusive (`__post_init__`); `stop_distance` reads whichever is
+    # set.
+    stop_k: float = 0.0
     # How far (in momentum sigmas) the score has to fall from its best since the
     # entry, with the position in profit, to take gains short of the sell level.
     # 0 switches the take off, and with it the runner and its breakeven.
@@ -179,12 +189,26 @@ class AppleTraderConfig:
         self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
         if self.min_win_k is None:
             self.min_win_k = min_win_for(self.ticker)
-        for name in ("stop_k", "momentum_drop", "hold_min_gain_k", "min_win_k"):
+        for name in (
+            "stop_k", "stop_gain_fraction", "momentum_drop", "hold_min_gain_k",
+            "min_win_k",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(
                     f"{name} {getattr(self, name)!r} is a distance and cannot be negative "
                     "(0 is how the stop or the momentum take is switched off)"
                 )
+        # One stop, in one set of units. Both set is not a wider stop or a
+        # narrower one, it is a config that does not say which rule it means --
+        # and the only way to reach it is by hand, since `stop_k` is a legacy
+        # record's field and nothing writes both.
+        if self.stop_k and self.stop_gain_fraction:
+            raise ValueError(
+                f"stop_k {self.stop_k!r} and stop_gain_fraction "
+                f"{self.stop_gain_fraction!r} are two ways of writing the same stop and "
+                "only one may be set; stop_k is the legacy unit a stored record replays "
+                "under, new configurations use stop_gain_fraction"
+            )
         if not 0 < self.take_fraction <= 1:
             raise ValueError(
                 f"take_fraction {self.take_fraction!r} must be a share of the position, "
@@ -228,6 +252,60 @@ class AppleTraderConfig:
         """Which rule set this configuration runs."""
         return apple_models.strategy(self.model_key)
 
+    @property
+    def target_gain_k(self) -> float:
+        """What a target exit is playing for, in ADRs a share.
+
+        `buy_level` and `sell_level` are both `reference - k x ADR` off the same
+        reference, so the gap between them is this whatever the reference does
+        -- a breach moving the forecast, or an intraday curve moving it every
+        minute, move both levels together. It is therefore a property of the
+        configuration rather than of the session, which is what lets the stop
+        be written against it and still be a fixed price once a fill exists.
+        """
+        return float(self.buy_k) - float(self.sell_k)
+
+    @property
+    def has_stop(self) -> bool:
+        """Whether this configuration stops out at all, in either unit.
+
+        Separate from `stop_distance` because the run opens its log before
+        there is a session, and so before there is an ADR to measure the stop
+        against -- "is there a stop" is answerable then and "how far" is not.
+        """
+        return bool(self.stop_gain_fraction or self.stop_k)
+
+
+def stop_distance(config: AppleTraderConfig, adr: float) -> float:
+    """How far under the fill the stop sits, in dollars -- 0.0 when there is none.
+
+    The one place the two parameterisations meet. A configuration made today
+    carries `stop_gain_fraction`, a share of the predicted gain; a record
+    written before that carries `stop_k`, a multiple of the ADR with no
+    reference to what the trade was playing for. They are mutually exclusive
+    on the config, so this is a choice between exactly one of them and nothing.
+
+    Module-level rather than a method on the config because the chart draws
+    this line too and a second reading of the same settings is how a picture
+    and a trade stop agreeing.
+    """
+    if config.stop_gain_fraction:
+        return config.stop_gain_fraction * config.target_gain_k * float(adr)
+    return config.stop_k * float(adr)
+
+
+def stop_phrase(config: AppleTraderConfig) -> str:
+    """How a log line names the stop's distance, in the units it was written in.
+
+    A run reads back in the terms it was configured in: "0.5 x the predicted
+    gain" for a configuration, "0.2 x ADR" for a record replayed from before
+    the stop was written that way. Saying either in the other's units would
+    make the log disagree with the form that produced it.
+    """
+    if config.stop_gain_fraction:
+        return f"{config.stop_gain_fraction:g} × the predicted gain"
+    return f"{config.stop_k:g} × ADR"
+
 
 def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     """Compact identity of one rule set, standing in for a model name.
@@ -243,10 +321,16 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     know -- a record naming a removed model should sign as that model, not as
     the one that is left.
 
-    The managed exit is written only while switched on -- the stop when
-    `stop_k` is set, the take and its runner threshold when `momentum_drop` is
+    The managed exit is written only while switched on -- the stop when it has
+    a distance, the take and its runner threshold when `momentum_drop` is set
     -- so a config with both off signs exactly as a run recorded before the
     exit existed, and `take_fraction` never splits two runs that cannot differ.
+
+    The stop is written in the units it was configured in: `E-0.5G` is half the
+    predicted **G**ain under the entry, `E-0.2A` the legacy 0.2 **A**DR. Not
+    converted to one or the other, because a stored record's signature is its
+    identity everywhere downstream -- rewriting an old run's would move it to a
+    different row in Results and hide it from the already-tested check.
     The intraday update and the session circuit breaker follow the same rule for
     the same reason: each appears only when it is switched on, so every record
     written before it existed (which replays as off) keeps the signature it was
@@ -254,7 +338,9 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     """
     c = config or AppleTraderConfig()
     exits = ""
-    if c.stop_k:
+    if c.stop_gain_fraction:
+        exits += f",stop=E-{c.stop_gain_fraction:g}G"
+    elif c.stop_k:
         exits += f",stop=E-{c.stop_k:g}A"
     if c.momentum_drop:
         exits += (
@@ -531,7 +617,7 @@ class DayRangeTrader(BaseTrader):
     and the flatten there is a stop under the fill, a momentum take that banks
     most of a fading gain short of the target, and a breakeven on the runner
     that take leaves. That half is not the notebook's and has not been measured
-    against it; `stop_k = momentum_drop = 0` switches it off and gives notebook
+    against it; a stop and `momentum_drop` of 0 switch it off and give notebook
     05's rule back.
 
     Against the notebook
@@ -817,7 +903,7 @@ class DayRangeTrader(BaseTrader):
           midday the reference sits within a fifth of the forecast distance
           from the opening print, so a day that has trended well away from it
           leaves the levels behind: a trending-down day keeps the buy level
-          above the price and re-arms the entry until `stop_k` ends the
+          above the price and re-arms the entry until the stop ends the
           session's trading. That is the same dependence on the stop the breach
           policies have, for a different reason.
         * It also damps `breach_update`. A dollar added to the predicted high
@@ -905,7 +991,7 @@ class DayRangeTrader(BaseTrader):
         enter on the bar that moved the level. That is the intended reading (the
         dip is measured from where the day is *now* expected to top out, not from
         a number it has outgrown) but it is a real change in when the agent
-        trades, and it is why `stop_k` matters more under these policies than
+        trades, and it is why the stop matters more under these policies than
         under "off": a day that ratchets the high all afternoon will keep
         re-arming the entry until a stop ends the session's trading.
         """
@@ -1016,8 +1102,9 @@ class DayRangeTrader(BaseTrader):
         1. **breakeven** -- a runner (what a momentum take left behind) is sold
            once a bar's low comes back to the fill. It was kept to wait for the
            sell level, not to hand back the gain the take already banked.
-        2. **stop** -- a bar's low at `fill - stop_k x ADR`: the day went the
-           other way from the forecast. Everything is sold, and `run_cycle`
+        2. **stop** -- a bar's low at `fill - stop_distance`, which is a share
+           of what the trade is playing for (`stop_gain_fraction`): the day went
+           the other way from the forecast. Everything is sold, and `run_cycle`
            takes no new entry for the rest of the session.
         3. **target** -- a bar's high at the sell level. Everything.
         4. **flatten** -- the closing bell. Everything.
@@ -1029,7 +1116,7 @@ class DayRangeTrader(BaseTrader):
         target because a bar wide enough to touch both says nothing about which
         came first, so it is read the careful way.
 
-        With `stop_k` and `momentum_drop` both 0 only the target and the
+        With the stop and `momentum_drop` both 0 only the target and the
         flatten are left, which is notebook 05's rule as specified.
         """
         config, plan = self.config, self.plan
@@ -1047,12 +1134,13 @@ class DayRangeTrader(BaseTrader):
                 f"rest is sold at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_BREAKEVEN
 
-        if config.stop_k and entry_price:
-            stop = entry_price - config.stop_k * plan["adr14_abs"]
+        risk = stop_distance(config, plan["adr14_abs"])
+        if risk and entry_price:
+            stop = entry_price - risk
             if low <= stop:
                 return position, (
                     f"Stop loss: the bar traded down to ${low:,.2f}, at or through the "
-                    f"${stop:,.2f} stop ({config.stop_k:g} × ADR under the "
+                    f"${stop:,.2f} stop ({stop_phrase(config)}, ${risk:,.2f}, under the "
                     f"${entry_price:,.2f} fill). The day is not going the way the forecast "
                     f"said, so the position is closed at market ({pnl_pct:+.2f}%) and "
                     "nothing more is bought this session."
@@ -1164,10 +1252,10 @@ class DayRangeTrader(BaseTrader):
     def _entry_reasoning(self, bar) -> str:
         plan, config = self.plan, self.config
         exits = [f"a resting sell at ${plan['sell_level']:,.2f}"]
-        if config.stop_k:
+        risk = stop_distance(config, plan["adr14_abs"])
+        if risk:
             exits.append(
-                f"a stop {config.stop_k:g} × ADR (${config.stop_k * plan['adr14_abs']:,.2f}) "
-                "under the fill"
+                f"a stop {stop_phrase(config)} (${risk:,.2f}) under the fill"
             )
         if config.momentum_drop:
             exits.append(
@@ -1343,8 +1431,8 @@ class DayRangeTrader(BaseTrader):
             )
             if self.entry.get("runner"):
                 parts.append(f"runner, out at ${entry_price:,.2f}")
-            elif self.config.stop_k:
-                stop = entry_price - self.config.stop_k * plan["adr14_abs"]
+            elif stop_distance(self.config, plan["adr14_abs"]):
+                stop = entry_price - stop_distance(self.config, plan["adr14_abs"])
                 parts.append(f"stop ${stop:,.2f}")
         elif plan.get("stand_down"):
             parts.append(f"{plan['stand_down']}, no new entries today")
@@ -1430,10 +1518,10 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     mae = (metadata.get("test_metrics_ensemble") or {}).get("mae_usd_mean")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
     exits = []
-    if config.stop_k:
+    if config.has_stop:
         exits.append(
-            f"a stop {config.stop_k:g} ADR under the fill, after which it buys nothing more "
-            "that day"
+            f"a stop {stop_phrase(config)} under the fill, after which it buys nothing "
+            "more that day"
         )
     if config.momentum_drop:
         exits.append(

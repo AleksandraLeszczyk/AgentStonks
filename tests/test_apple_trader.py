@@ -102,6 +102,11 @@ FORECAST = {
 }
 BUY_LEVEL = 102.5   # 110 - 0.75 x 10
 SELL_LEVEL = 109.0  # 110 - 0.10 x 10
+# What a target exit is playing for, and what the stop is written against: the
+# two levels are 0.65 ADR apart, so at the default half-the-gain stop a fill at
+# 103 risks $3.25 of the $6.50 the target pays.
+TARGET_GAIN = SELL_LEVEL - BUY_LEVEL          # 6.50
+STOP_PRICE = 103.0 - 0.5 * TARGET_GAIN        # 99.75
 
 
 class Tape:
@@ -312,34 +317,20 @@ class TestDayRangeExit:
     def test_a_trade_that_goes_the_wrong_way_is_stopped_out(
         self, state, market_open, monkeypatch
     ):
-        """Filled at 103 on a $10 ADR, the default 0.2 stop sits at 101.00 --
-        a touch, like the levels, so the low decides."""
+        """Filled at 103, the default stop sits at STOP_PRICE -- a touch, like
+        the levels, so the low decides."""
         broker = FakeBroker(103.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tape = Tape(monkeypatch, broker)
         trader = self._entered(state, tracker, tape)
 
-        tape.append(101.5, low=101.01)
+        tape.append(100.0, low=STOP_PRICE + 0.01)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(101.2, low=100.99)
+        tape.append(99.6, low=STOP_PRICE - 0.01)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
         assert tracker.position_for(TICKER) == 0
         reasoning = tracker.snapshot()["decisions"][-1].reasoning
-        assert "Stop loss" in reasoning and "101.00" in reasoning
-
-    def test_the_stop_is_a_distance_in_adrs_from_the_fill(
-        self, state, market_open, monkeypatch
-    ):
-        broker = FakeBroker(103.0)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        tape = Tape(monkeypatch, broker)
-        trader = self._entered(state, tracker, tape, stop_k=0.5)  # 103 - 5 = 98
-
-        tape.append(99.0, low=98.01)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(98.0, low=97.9)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
-        assert "98.00" in tracker.snapshot()["decisions"][-1].reasoning
+        assert "Stop loss" in reasoning and f"{STOP_PRICE:,.2f}" in reasoning
 
     def test_after_a_stop_the_session_buys_nothing_more(
         self, state, market_open, monkeypatch
@@ -351,7 +342,7 @@ class TestDayRangeExit:
         tape = Tape(monkeypatch, broker)
         trader = self._entered(state, tracker, tape)
 
-        tape.append(100.5)
+        tape.append(STOP_PRICE - 0.5)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
         for _ in range(3):
             tape.append(100.0, low=BUY_LEVEL - 3)
@@ -367,7 +358,9 @@ class TestDayRangeExit:
         broker = FakeBroker(103.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tape = Tape(monkeypatch, broker)
-        trader = self._entered(state, tracker, tape, stop_k=0.0, momentum_drop=0.0)
+        trader = self._entered(
+            state, tracker, tape, stop_gain_fraction=0.0, momentum_drop=0.0
+        )
 
         for price, mom in ((104.0, 2.0), (104.5, 0.5), (99.0, -1.0), (94.0, -2.5)):
             tape.append(price, mom=mom)
@@ -402,6 +395,120 @@ class TestDayRangeExit:
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
         fills = [d for d in tracker.snapshot()["decisions"] if d.status == "filled"]
         assert [d.action for d in fills] == ["buy", "sell", "buy"]
+
+
+class TestStopIsAShareOfThePredictedGain:
+    """The stop is written against what the trade is playing for.
+
+    `sell_level - buy_level` is `(buy_k - sell_k) x ADR` at every minute --
+    both levels hang off the same reference, so whatever moves the reference
+    moves them together -- which is what lets a fraction of it be a fixed price
+    once there is a fill, and lets the same number mean the same bet on every
+    instrument.
+    """
+
+    def _entered(self, state, tracker, tape, **kwargs):
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        return trader
+
+    def test_the_default_risks_half_of_what_the_target_pays(self):
+        assert AppleTraderConfig().stop_gain_fraction == 0.5
+
+    def test_the_distance_is_the_fraction_of_the_two_levels_gap(self):
+        config = dayrange_config(buy_k=0.75, sell_k=0.10, stop_gain_fraction=0.5)
+        # 0.65 ADR between the levels, half of it under the fill, $10 an ADR.
+        assert config.target_gain_k == pytest.approx(0.65)
+        assert at.stop_distance(config, 10.0) == pytest.approx(3.25)
+
+    def test_widening_the_levels_widens_the_stop_with_them(self):
+        """The point of the reparameterisation: risk follows reward instead of
+        being a distance that has to be re-picked whenever the levels move."""
+        narrow = dayrange_config(buy_k=0.40, sell_k=0.25)
+        wide = dayrange_config(buy_k=0.90, sell_k=0.05)
+        assert at.stop_distance(narrow, 10.0) == pytest.approx(0.75)
+        assert at.stop_distance(wide, 10.0) == pytest.approx(4.25)
+
+    def test_zero_switches_it_off(self):
+        config = dayrange_config(stop_gain_fraction=0.0)
+        assert at.stop_distance(config, 10.0) == 0.0
+        assert not config.has_stop
+
+    def test_whether_there_is_a_stop_is_answerable_before_a_session_is(self):
+        """The run opens its log before there is an ADR to measure against."""
+        assert dayrange_config().has_stop
+        assert dayrange_config(stop_gain_fraction=0.0, stop_k=0.2).has_stop
+
+    def test_the_stop_fires_at_that_price(self, state, market_open, monkeypatch):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._entered(state, tracker, tape, stop_gain_fraction=0.2)
+
+        stop = 103.0 - 0.2 * TARGET_GAIN   # 101.70
+        tape.append(102.0, low=stop + 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(101.6, low=stop - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert f"{stop:,.2f}" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_log_says_what_the_stop_was_written_as(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        self._entered(state, tracker, tape)
+        entry = tracker.snapshot()["decisions"][-1].reasoning
+        assert "0.5 × the predicted gain" in entry and "$3.25" in entry
+
+    def test_a_replayed_record_reads_back_in_its_own_units(
+        self, state, market_open, monkeypatch
+    ):
+        """A run recorded before the stop was written this way keeps saying
+        ADRs -- the log has to agree with the form that produced it."""
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        self._entered(state, tracker, tape, stop_gain_fraction=0.0, stop_k=0.2)
+        entry = tracker.snapshot()["decisions"][-1].reasoning
+        assert "0.2 × ADR" in entry and "$2.00" in entry
+
+    def test_the_legacy_unit_still_stops_where_it_did(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._entered(
+            state, tracker, tape, stop_gain_fraction=0.0, stop_k=0.2
+        )
+        tape.append(101.5, low=101.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(101.2, low=100.99)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert "101.00" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_two_units_cannot_both_be_set(self):
+        """Not a wider stop or a narrower one -- a config that does not say
+        which rule it means."""
+        with pytest.raises(ValueError, match="only one may be set"):
+            dayrange_config(stop_gain_fraction=0.5, stop_k=0.2)
+
+    def test_each_unit_signs_as_itself(self):
+        """A stored record's signature is its identity everywhere downstream,
+        so replaying one must not rewrite it into the new units."""
+        assert ",stop=E-0.5G" in config_signature(dayrange_config())
+        assert ",stop=E-0.2A" in config_signature(
+            dayrange_config(stop_gain_fraction=0.0, stop_k=0.2)
+        )
+
+    def test_a_stop_that_risks_more_than_the_target_pays_is_allowed(self):
+        """Legal, and rarely meant -- the form warns rather than refusing,
+        because the rule also exits on momentum and at the close."""
+        config = dayrange_config(stop_gain_fraction=1.5)
+        assert at.stop_distance(config, 10.0) > TARGET_GAIN
 
 
 class TestDayRangeMomentumTake:
@@ -1127,10 +1234,8 @@ class TestMinimumWin:
     ):
         """The two rules are separate: switching the breaker off must not
         switch off the older refusal to re-enter after a stop."""
-        trader, tracker, tape = self._entered(
-            state, monkeypatch, min_win_k=0.0, stop_k=0.2
-        )
-        tape.append(100.9, low=100.9)   # through the 101 stop
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.0)
+        tape.append(STOP_PRICE - 0.1, low=STOP_PRICE - 0.1)   # through the stop
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
         assert trader.plan["stand_down"] == "stopped out"
         assert not self._rearms(trader, tracker, tape, state)
@@ -1139,10 +1244,8 @@ class TestMinimumWin:
         self, state, market_open, monkeypatch
     ):
         """A stop is a loss, so the breaker would fire on the same fill."""
-        trader, tracker, tape = self._entered(
-            state, monkeypatch, min_win_k=0.2, stop_k=0.2
-        )
-        tape.append(100.9, low=100.9)
+        trader, tracker, tape = self._entered(state, monkeypatch, min_win_k=0.2)
+        tape.append(STOP_PRICE - 0.1, low=STOP_PRICE - 0.1)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
         assert trader.plan["stand_down"] == "stopped out"
         lines = [
@@ -1461,23 +1564,23 @@ class TestStrategySelection:
         )
 
     def test_the_levels_are_the_signature(self):
-        base = config_signature(dayrange_config(stop_k=0.0, momentum_drop=0.0))
+        base = config_signature(dayrange_config(stop_gain_fraction=0.0, momentum_drop=0.0))
         assert base == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         assert base != config_signature(
-            dayrange_config(buy_k=0.8, stop_k=0.0, momentum_drop=0.0)
+            dayrange_config(buy_k=0.8, stop_gain_fraction=0.0, momentum_drop=0.0)
         )
         assert base != config_signature(
-            dayrange_config(sell_k=0.2, stop_k=0.0, momentum_drop=0.0)
+            dayrange_config(sell_k=0.2, stop_gain_fraction=0.0, momentum_drop=0.0)
         )
 
     def test_the_exit_is_in_the_signature_only_while_switched_on(self):
         on = config_signature(dayrange_config())
         assert on == (
             "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%,"
-            "stop=E-0.2A,take=70%@mom-1,runner>=0.3A)"
+            "stop=E-0.5G,take=70%@mom-1,runner>=0.3A)"
         )
         for field, value in (
-            ("stop_k", 0.3), ("momentum_drop", 1.5),
+            ("stop_gain_fraction", 0.3), ("momentum_drop", 1.5),
             ("take_fraction", 0.5), ("hold_min_gain_k", 0.5),
         ):
             assert config_signature(dayrange_config(**{field: value})) != on, field
@@ -1488,21 +1591,21 @@ class TestStrategySelection:
         )
 
     def test_the_intraday_update_is_in_the_signature_only_while_switched_on(self):
-        off = config_signature(dayrange_config(stop_k=0.0, momentum_drop=0.0))
+        off = config_signature(dayrange_config(stop_gain_fraction=0.0, momentum_drop=0.0))
         assert off == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         for policy in ("extreme", "brownian"):
             signed = config_signature(
-                dayrange_config(stop_k=0.0, momentum_drop=0.0, breach_update=policy)
+                dayrange_config(stop_gain_fraction=0.0, momentum_drop=0.0, breach_update=policy)
             )
             assert signed == off[:-1] + f",breach={policy})"
 
     def test_the_level_source_is_in_the_signature_only_when_it_is_not_the_high(self):
         """It sits beside the two distances rather than at the end: "H" in
         `buy=H-0.75A` is whatever the source says it is."""
-        flat = config_signature(dayrange_config(stop_k=0.0, momentum_drop=0.0))
+        flat = config_signature(dayrange_config(stop_gain_fraction=0.0, momentum_drop=0.0))
         assert flat == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         assert config_signature(
-            dayrange_config(stop_k=0.0, momentum_drop=0.0, level_source="intraday")
+            dayrange_config(stop_gain_fraction=0.0, momentum_drop=0.0, level_source="intraday")
         ) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,levels=intraday,size=95%)"
 
     def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
@@ -1516,7 +1619,7 @@ class TestStrategySelection:
             dayrange_config(breach_update="mean_reversion")
 
     def test_exit_distances_cannot_be_negative_and_the_take_is_a_share(self):
-        for field in ("stop_k", "momentum_drop", "hold_min_gain_k"):
+        for field in ("stop_gain_fraction", "momentum_drop", "hold_min_gain_k"):
             with pytest.raises(ValueError, match=field):
                 dayrange_config(**{field: -0.1})
         for fraction in (0.0, 1.5):

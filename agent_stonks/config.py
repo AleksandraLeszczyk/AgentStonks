@@ -216,15 +216,32 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # The day-range managed exit, on top of the sell level and the closing flatten
 # (`DayRangeTrader._exit`). Unlike the levels these were never swept: they are
 # specified starting points, and none of them is in the notebook's numbers.
-#   stop       sell everything once a bar's low is STOP_K x ADR under the fill,
-#              and take no new entry for the rest of the session
+#   stop       sell everything once a bar's low is STOP_GAIN_FRACTION of the
+#              predicted gain under the fill, and take no new entry for the
+#              rest of the session
 #   take       once the momentum score has fallen MOMENTUM_DROP sigmas from its
 #              best since the entry with the position in profit, sell
 #              TAKE_FRACTION of it ...
 #   runner     ... and keep the rest for the sell level only if that is still
 #              HOLD_MIN_GAIN_K x ADR above the fill (otherwise sell it all);
 #              a runner is sold if the price comes back to the fill
-APPLE_TRADER_STOP_K = 0.20
+#
+# The stop is written against the *predicted gain* rather than against the ADR:
+# the trade is playing for the distance between the two levels, which is
+# (buy_k - sell_k) x ADR at every minute -- both levels hang off the same
+# reference, so the gap between them never moves however the reference does --
+# and the only question a stop answers is how much of that to risk to make it.
+# 0.5 is one dollar risked for every two the target is worth. Written that way
+# the number means the same thing on every instrument, which STOP_K x ADR did
+# not: 0.20 ADR was a third of AAPL's 0.15-ADR target and a third of GOOGL's
+# 0.60-ADR one is 0.20 too -- same number, wildly different bets.
+#
+# Read the two together before changing either. On the shipped pairs 0.5 of the
+# predicted gain is 0.075 ADR on AAPL, 0.30 on GOOGL and 0.225 on INTC, so this
+# default is a much tighter stop on AAPL than the 0.20 ADR it replaces and a
+# wider one on GOOGL. 0 switches the stop off, which is what every record
+# written before the managed exit existed replays as.
+APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
 APPLE_TRADER_MOMENTUM_DROP = 1.0
 APPLE_TRADER_TAKE_FRACTION = 0.70
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30

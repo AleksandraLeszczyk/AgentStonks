@@ -146,6 +146,13 @@ _APPLE_LEGACY = {
     # the closing flatten. Zero switches the stop and the momentum take off, so
     # such a record replays -- and signs -- exactly as it was run.
     "stop_k": 0.0,
+    # And before the stop was written against the predicted gain it was written
+    # in ADRs (`stop_k`), which every record made until then carries. Zero here
+    # leaves that one to speak: a record saying 0.2 ADR under the fill replays
+    # at 0.2 ADR under the fill and signs `stop=E-0.2A`, rather than being
+    # re-read as 0.2 of a gain it never mentioned -- a different stop, filed in
+    # Results beside the original as though it matched.
+    "stop_gain_fraction": 0.0,
     "momentum_drop": 0.0,
     # Before the intraday update existed the 9:35 forecast stood all day and
     # the two levels never moved. "off" is that rule, and it is left out of the

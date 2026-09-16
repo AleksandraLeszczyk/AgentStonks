@@ -1647,9 +1647,10 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the others only nudge."
         ),
         "dayrange_exits": (
-            "The managed exit, every distance measured from the fill in the same ADR. Each "
-            "switched-on knob is part of the signature, so sweeping the stop or the fade "
-            "queues its own configuration; 0 switches the stop or the take off."
+            "The managed exit, all of it measured from the fill — the stop as a share of "
+            "what the trade is playing for, the runner threshold in the same ADR as the "
+            "levels. Each switched-on knob is part of the signature, so sweeping the stop "
+            "or the fade queues its own configuration; 0 switches the stop or the take off."
         ),
     },
     outro={
@@ -1727,6 +1728,18 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "against `buy − sell` above — at or over that, every completed trade stands the "
             "session down, which is a different experiment (one trade a day) from the one "
             "this reads like. In the signature while it is on, and sweepable."
+        ),
+        "stop_gain_fraction": (
+            "Starts at {stop_gain_fraction}. The stop is a share of the **predicted gain** "
+            "— `buy − sell` above, what a target exit pays — rather than a distance of its "
+            "own, so 0.5 risks $0.50 for every $1.00 the trade is playing for on every "
+            "instrument. Written in ADRs it would not travel: 0.20 ADR was a third of "
+            "AAPL's target and a third of GOOGL's, which are different bets. Sweep it here "
+            "and it moves with the levels rather than against them — a grid over `buy − "
+            "sell` and this one is a grid over reward and risk:reward, not over two "
+            "distances that happen to interact. In the signature while it is on, as "
+            "`stop=E-0.5G`; a record from before this existed carries `stop=E-0.2A` and "
+            "replays in its own units. 0 switches the stop off."
         ),
         "breach_update": (
             "Whether the predicted high is held all session or moved when the tape trades "

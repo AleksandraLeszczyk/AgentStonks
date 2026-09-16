@@ -131,7 +131,10 @@ TUNABLES: "dict[str, Tunable]" = {
     for t in (
         Tunable("buy_k", "Buy distance (× ADR below H)", 0.05, 3.0, 0.05, (0.30, 0.90, 0.10)),
         Tunable("sell_k", "Sell distance (× ADR below H)", 0.0, 3.0, 0.05, (0.05, 0.45, 0.10)),
-        Tunable("stop_k", "Stop loss (× ADR below the fill)", 0.0, 3.0, 0.05, (0.0, 0.50, 0.10)),
+        Tunable(
+            "stop_gain_fraction", "Stop loss (× the predicted gain)", 0.0, 3.0, 0.05,
+            (0.0, 1.0, 0.25),
+        ),
         Tunable(
             "momentum_drop", "Momentum fade (σ off its peak)", 0.0, 5.0, 0.1,
             (0.0, 2.0, 0.5), "%.1f",
@@ -204,7 +207,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "sell_k",
     "level_source",
     "breach_update",
-    "stop_k",
+    "stop_gain_fraction",
     "momentum_drop",
     "take_fraction",
     "hold_min_gain_k",

@@ -1855,9 +1855,10 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "enough for the dip to be worth buying, and the trade says otherwise."
         ),
         "dayrange_exits": (
-            "How a position gets out before the sell level. Every distance is measured from "
-            "the fill, in the same ADR: a stop underneath it, a partial take when momentum "
-            "fades while the trade is in profit, and a runner kept for the sell level only "
+            "How a position gets out before the sell level. Everything here is measured "
+            "from the fill: a stop underneath it, written as a share of what the trade is "
+            "playing for rather than as a distance of its own; a partial take when momentum "
+            "fades while the trade is in profit; and a runner kept for the sell level only "
             "when that is still far enough away — sold if the price comes back to the fill. "
             "None of this is in the notebook's results."
         ),
@@ -1951,11 +1952,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "losses but were not worth the risk either, including a runner sold back at "
             "the fill. 0 switches it off and lets the levels re-arm all day."
         ),
-        "stop_k": (
-            "Sells everything when a bar's low reaches this many ADRs under the fill price. "
-            "After a stop the agent buys nothing more that day, because the session has not "
-            "gone the way the forecast said. 0 switches the stop off, leaving the position "
-            "to the sell level or the flatten."
+        "stop_gain_fraction": (
+            "Sells everything when a bar's low reaches this share of the **predicted gain** "
+            "under the fill price. The predicted gain is `buy − sell` above — the distance "
+            "between the two levels, and the most a target exit can pay — so {stop_gain_fraction} "
+            "risks $0.50 for every $1.00 this trade is playing for, whatever the instrument "
+            "and whatever the levels are set to. The line under the box says what that "
+            "comes to in ADRs for the pair currently set. After a stop the agent buys "
+            "nothing more that day, because the session has not gone the way the forecast "
+            "said. 0 switches the stop off, leaving the position to the sell level, a "
+            "momentum take or the flatten."
         ),
         "momentum_drop": (
             "How far the momentum score — the tape's drift in sigmas — must fall from its "

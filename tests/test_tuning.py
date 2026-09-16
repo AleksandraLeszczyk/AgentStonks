@@ -190,11 +190,11 @@ class TestExpand:
 
     def test_a_numeric_and_a_rule_axis_mix(self):
         configs, _ = tu.expand(self.base(), [
-            {"name": "stop_k", "values": [0.0, 0.2]},
+            {"name": "stop_gain_fraction", "values": [0.0, 0.2]},
             {"name": "level_source", "values": ["dayrange"]},
         ])
         assert all(c.level_source == "dayrange" for c in configs)
-        assert sorted(c.stop_k for c in configs) == [0.0, 0.2]
+        assert sorted(c.stop_gain_fraction for c in configs) == [0.0, 0.2]
 
     def test_everything_the_axes_do_not_name_comes_from_the_base(self):
         base = self.base(position_pct=40.0, min_win_k=0.15)
@@ -229,10 +229,10 @@ class TestExpand:
     def test_the_order_is_the_grids(self):
         axes = [
             {"name": "buy_k", "values": [0.5, 0.7]},
-            {"name": "stop_k", "values": [0.0, 0.2]},
+            {"name": "stop_gain_fraction", "values": [0.0, 0.2]},
         ]
         configs, _ = tu.expand(self.base(), axes)
-        assert [(c.buy_k, c.stop_k) for c in configs] == [
+        assert [(c.buy_k, c.stop_gain_fraction) for c in configs] == [
             (0.5, 0.0), (0.5, 0.2), (0.7, 0.0), (0.7, 0.2)
         ]
 
@@ -250,7 +250,10 @@ class TestValidation:
         assert tu.validate(spec()) is None
 
     def test_at_most_two_parameters(self):
-        axes = [{"name": n, "values": [1.0]} for n in ("buy_k", "sell_k", "stop_k")]
+        axes = [
+            {"name": n, "values": [1.0]}
+            for n in ("buy_k", "sell_k", "stop_gain_fraction")
+        ]
         assert "one or two" in tu.validate(spec(axes=axes))
 
     def test_the_same_parameter_twice_is_refused(self):
@@ -459,8 +462,9 @@ def stub_model(monkeypatch):
 
 class TestJob:
     def job_spec(self, **overrides):
+        # The managed exit off, so the grid is about the two levels alone.
         base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10,
-                                 stop_k=0.0, momentum_drop=0.0)
+                                 stop_gain_fraction=0.0, momentum_drop=0.0)
         return spec(
             base=asdict(base),
             axes=[{"name": "buy_k", "values": [0.5, 0.75, 1.0]},

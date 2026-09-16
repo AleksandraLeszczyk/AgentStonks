@@ -177,7 +177,9 @@ def dayrange_params(
         )
     level_source = level_source_param(defaults, ticker, copy)
     breach_update = breach_param(defaults, copy)
-    stop_k, momentum_drop, take_fraction, hold_min_gain_k = exit_params(defaults, copy)
+    stop_gain_fraction, momentum_drop, take_fraction, hold_min_gain_k = exit_params(
+        defaults, float(buy_k), float(sell_k), copy
+    )
     min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), copy)
     _caption(copy.outro.get("dayrange"))
     return AppleTraderConfig(
@@ -188,7 +190,7 @@ def dayrange_params(
         position_pct=float(position_pct),
         level_source=level_source,
         breach_update=breach_update,
-        stop_k=stop_k,
+        stop_gain_fraction=stop_gain_fraction,
         momentum_drop=momentum_drop,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
@@ -297,7 +299,7 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
 
 
 def exit_params(
-    defaults: AppleTraderConfig, copy: FormCopy
+    defaults: AppleTraderConfig, buy_k: float, sell_k: float, copy: FormCopy
 ) -> "tuple[float, float, float, float]":
     """The managed exit: a stop under the fill, a momentum take, and a runner.
 
@@ -305,15 +307,26 @@ def exit_params(
     instrument, so there is no per-symbol default for a switch to re-seed. The
     two knobs that only mean something once the take is on are greyed out while
     it is off rather than hidden, so turning it back on finds them where they were.
+
+    The stop is the one that takes the levels as an argument, because it is
+    written as a share of what they are playing for rather than as a distance
+    of its own. The number on screen therefore means a different stop on every
+    instrument, and what it comes to in ADRs is said underneath rather than
+    left to be worked out -- the whole point of the reparameterisation is that
+    the *fraction* travels between symbols and the distance does not.
     """
     _caption(copy.intro.get("dayrange_exits"))
     col_a, col_b = st.columns(2)
-    stop_k = col_a.number_input(
-        "Stop loss (× ADR below the fill)",
-        min_value=0.0, max_value=3.0, value=defaults.stop_k, step=0.05, format="%.2f",
-        key=copy.key("stop_k"),
-        help=copy.help.get("stop_k"),
+    stop_gain_fraction = col_a.number_input(
+        "Stop loss (× the predicted gain, below the fill)",
+        min_value=0.0, max_value=3.0, value=defaults.stop_gain_fraction, step=0.05,
+        format="%.2f",
+        key=copy.key("stop_gain_fraction"),
+        help=copy.help.get("stop_gain_fraction", "").format(
+            stop_gain_fraction=f"{defaults.stop_gain_fraction:g}"
+        ),
     )
+    stop_caption(col_a, float(stop_gain_fraction), float(buy_k), float(sell_k))
     momentum_drop = col_b.number_input(
         "Momentum fade to take gains (σ off its peak)",
         min_value=0.0, max_value=5.0, value=defaults.momentum_drop, step=0.1, format="%.1f",
@@ -335,7 +348,51 @@ def exit_params(
         help=copy.help.get("hold_min_gain_k"),
         disabled=not momentum_drop,
     )
-    return float(stop_k), float(momentum_drop), float(take_pct) / 100.0, float(hold_min_gain_k)
+    return (
+        float(stop_gain_fraction), float(momentum_drop),
+        float(take_pct) / 100.0, float(hold_min_gain_k),
+    )
+
+
+def stop_caption(
+    column, stop_gain_fraction: float, buy_k: float, sell_k: float
+) -> None:
+    """What the stop fraction comes to against these levels, in ADRs.
+
+    A fraction of the predicted gain is the right thing to *set* and the wrong
+    thing to compare against the other exit knobs, which are all ADR distances
+    -- so the conversion is on screen rather than in the reader's head. It also
+    catches the configuration that looks cautious and is not: a stop wider than
+    the gain risks more than a target exit can ever pay, which is a legal bet
+    and rarely the intended one.
+
+    Written into `column` rather than into the page, or it would render under
+    *both* columns of the exit grid instead of under the box it is about.
+
+    The dollar signs are escaped for the same reason `tuning.METRICS` has none:
+    this is Streamlit markdown, where a bare "$" opens a LaTeX formula and the
+    text between two of them silently disappears.
+    """
+    if not stop_gain_fraction:
+        column.caption(
+            ":material/info: No stop — a position leaves at the sell level, on a "
+            "momentum take, or at the closing flatten."
+        )
+        return
+    gain = buy_k - sell_k
+    column.caption(
+        f"{stop_gain_fraction:g} × the {gain:.2f} × ADR the two levels are apart = "
+        f"**{stop_gain_fraction * gain:.3f} × ADR** under the fill, risking "
+        f"\${stop_gain_fraction:.2f} for every \$1.00 a target exit pays."
+    )
+    if stop_gain_fraction > 1:
+        column.warning(
+            f"The stop is {stop_gain_fraction:g} × the predicted gain, so this risks more "
+            "than a target exit can pay. That is a legitimate bet on a rule that also "
+            "exits on momentum and at the close, but it is not what a stop usually "
+            "means — under 1.00 risks less than the trade is playing for.",
+            icon=":material/info:",
+        )
 
 
 def _caption(text: "str | None") -> None:
