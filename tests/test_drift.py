@@ -6,7 +6,13 @@ that shape. Each model's scoring runs on a synthetic store with the model
 stubbed -- the real bundles have their own tests -- so what is pinned is the
 arithmetic of the metric and the point-in-time rule: a session is scored from
 what existed before it and compared with what the day then did.
+
+The two drift tests are pinned twice over: against series whose answer is not in
+doubt (a ramp, a step, a flat line), and -- in `TestAgainstExactNull` -- against
+the exact permutation null they approximate, enumerated here rather than taken
+from SciPy, which this package does not depend on.
 """
+import itertools
 import math
 from datetime import date, datetime, timedelta, timezone
 
@@ -302,3 +308,190 @@ class TestCatalogue:
             for ticker in (model.tickers or ("AAPL",)):
                 training = model.training(ticker)
                 assert set(training) == {"cutoffs", "references"}
+
+
+# --- has it moved? ----------------------------------------------------------
+
+
+def series(values, start=date(2026, 1, 5), metric="mae") -> list[dict]:
+    """One value per weekday from `start`, which is a Monday."""
+    out, day = [], start
+    for value in values:
+        out.append({"date": day.isoformat(), metric: value})
+        day += timedelta(days=1 if day.weekday() < 4 else 3)
+    return out
+
+
+class TestTrendTest:
+    def test_a_ramp_is_a_trend_and_carries_its_slope(self):
+        got = dr.trend_test(series([float(i) for i in range(12)]), "mae")
+        assert got.statistic == pytest.approx(1.0) and got.p < 1e-4
+        assert got.significant and got.direction == "up"
+        # The slope is in the metric's units per 30 calendar days, and this ramp
+        # climbs one unit per session -- of which a 30-day stretch holds ~21.
+        assert 20.0 < got.effect < 23.0
+
+    def test_a_falling_series_is_the_same_test_the_other_way(self):
+        got = dr.trend_test(series([float(-i) for i in range(12)]), "mae")
+        assert got.statistic == pytest.approx(-1.0) and got.direction == "down"
+        assert got.effect < 0
+
+    def test_noise_around_a_level_is_not_a_trend(self):
+        values = [1.0, 3.0, 2.0, 4.0, 1.5, 3.5, 2.5, 1.0, 3.0, 2.0, 4.0, 2.5]
+        got = dr.trend_test(series(values), "mae")
+        assert not got.significant and got.direction == "flat"
+
+    def test_a_flat_series_has_nothing_to_test_rather_than_a_p_value(self):
+        got = dr.trend_test(series([2.0] * 12), "mae")
+        assert got.p is None and got.statistic is None and "same value" in got.note
+
+    def test_too_few_sessions_says_so_and_names_the_bar(self):
+        got = dr.trend_test(series([1.0, 2.0, 3.0]), "mae")
+        assert got.p is None and got.n == 3
+        assert str(dr.MIN_TREND_N) in got.note
+
+    def test_unscored_sessions_are_left_out(self):
+        rows = series([float(i) for i in range(12)])
+        rows += [{"date": "2026-02-02", "mae": None}]
+        assert dr.trend_test(rows, "mae").n == 12
+
+
+class TestSplitTest:
+    CUTOFFS = [dr.Cutoff("2026-01-16", "Trained through")]
+
+    def rows(self, inside, after):
+        return series(inside) + series(after, start=date(2026, 1, 19))
+
+    def test_a_step_up_after_the_cutoff_is_found(self):
+        got = dr.split_test(self.rows([1.0] * 4 + [1.2, 0.9, 1.1, 1.0],
+                                      [3.0, 3.2, 2.9, 3.1, 3.0, 2.8, 3.3, 3.1]),
+                            "mae", self.CUTOFFS)
+        assert got.significant and got.direction == "up"
+        assert got.statistic == pytest.approx(1.0)  # every after-session above every inside one
+        assert got.effect == pytest.approx(3.05 - 1.0, abs=0.06)
+
+    def test_the_same_distribution_either_side_is_not_a_change(self):
+        both = [1.0, 1.4, 0.8, 1.2, 1.1, 0.9, 1.3, 1.0]
+        got = dr.split_test(self.rows(both, both), "mae", self.CUTOFFS)
+        assert got.p == pytest.approx(1.0, abs=0.05) and not got.significant
+
+    def test_a_model_with_no_cutoff_cannot_be_split(self):
+        got = dr.split_test(self.rows([1.0] * 8, [2.0] * 8), "mae", [])
+        assert got.p is None and "no training cutoff" in got.note
+
+    def test_a_store_entirely_on_one_side_says_which_side(self):
+        after = dr.split_test(series([1.0] * 12, start=date(2026, 1, 19)), "mae", self.CUTOFFS)
+        assert after.p is None and after.note == "all 12 sessions after the cutoff"
+        inside = dr.split_test(series([1.0] * 6), "mae", self.CUTOFFS)
+        assert inside.p is None and inside.note == "all 6 sessions inside the cutoff"
+
+    def test_too_few_on_one_side_counts_both(self):
+        rows = series([1.0] * 8) + series([2.0] * 3, start=date(2026, 1, 19))
+        assert dr.split_test(rows, "mae", self.CUTOFFS).note == (
+            f"8 inside, 3 after — needs {dr.MIN_SPLIT_N} each side"
+        )
+
+
+class TestAgainstExactNull:
+    """The normal approximations against the permutation nulls they stand in for."""
+
+    @staticmethod
+    def _kendall_s(values):
+        values = np.asarray(values, float)
+        return float(np.triu(np.sign(values[None, :] - values[:, None]), 1).sum())
+
+    def test_mann_kendall_matches_the_exact_permutation_p(self):
+        values = [0.4, -1.2, 0.9, 0.1, 1.6, -0.3, 1.1, 2.0]
+        observed = abs(self._kendall_s(values))
+        orderings = list(itertools.permutations(values))
+        exact = sum(abs(self._kendall_s(o)) >= observed for o in orderings) / len(orderings)
+        assert dr.trend_test(series(values), "mae").p == pytest.approx(exact, abs=0.02)
+
+    def test_mann_whitney_matches_the_exact_permutation_p(self):
+        inside = [1.0, 1.4, 0.8, 1.2, 1.1, 0.9]
+        after = [1.3, 1.9, 1.5, 1.2, 2.1, 1.6, 1.7]
+        rows = series(inside) + series(after, start=date(2026, 1, 19))
+        got = dr.split_test(rows, "mae", TestSplitTest.CUTOFFS)
+        both = np.array(after + inside, float)
+        ranks = dr._ranks(both)
+        n1, n2 = len(after), len(inside)
+        observed = abs(float(ranks[:n1].sum()) - n1 * (n1 + 1) / 2 - n1 * n2 / 2)
+        hits = total = 0
+        for combo in itertools.combinations(range(n1 + n2), n1):
+            u = sum(ranks[i] for i in combo) - n1 * (n1 + 1) / 2
+            hits += abs(u - n1 * n2 / 2) >= observed - 1e-9
+            total += 1
+        assert got.p == pytest.approx(hits / total, abs=0.02)
+
+
+class TestVerdict:
+    def test_rising_is_worse_only_where_lower_is_better(self):
+        lower = dr.Metric("e", "Error")
+        higher = dr.Metric("c", "Correlation", better="higher")
+        bias = dr.Metric("b", "Bias", better="zero")
+        assert dr.worsened(lower, 0.4) is True and dr.worsened(lower, -0.4) is False
+        assert dr.worsened(higher, 0.4) is False and dr.worsened(higher, -0.4) is True
+        assert dr.worsened(bias, 0.4) is None
+        assert dr.worsened(lower, None) is None
+
+    def test_assess_returns_both_tests_and_the_split(self):
+        rows = series([1.0] * 8) + series([3.0] * 8, start=date(2026, 1, 19))
+        got = dr.assess(rows, dr.Metric("mae", "MAE"), TestSplitTest.CUTOFFS)
+        assert got["n"] == 16
+        assert got["trend"].kind == dr.TREND and got["split"].kind == dr.SPLIT
+        assert got["parts"]["inside"]["mean"] == 1.0 and got["parts"]["after"]["mean"] == 3.0
+
+
+# --- every model at once -----------------------------------------------------
+
+
+class TestPairs:
+    def test_every_model_is_paired_with_the_symbols_it_exists_for(self, store):
+        got = dr.pairs(FEED, [TICKER])
+        assert got == [(key, TICKER) for key in dr.MODELS]
+        assert [k for k, _ in got] == list(dr.MODELS)  # model-major, catalogue order
+
+    def test_a_symbol_the_store_does_not_carry_is_dropped(self, store):
+        assert dr.pairs(FEED, ["NVDA"]) == []
+
+    def test_a_per_ticker_model_only_takes_its_own_symbols(self, store, monkeypatch):
+        monkeypatch.setattr(sim_data, "STORE_DIR", dr.sim_data.STORE_DIR)
+        sim_data._write_gz(sim_data.daily_path("NVDA", FEED), {"symbol": "NVDA", "bars": []})
+        keys = {k for k, t in dr.pairs(FEED, ["NVDA"])}
+        assert keys == {k for k, m in dr.MODELS.items() if m.tickers is None}
+
+    def test_the_default_symbols_are_the_ones_a_model_was_fitted_for(self, store):
+        assert dr.default_symbols(FEED) == [TICKER]
+
+
+class TestHeadline:
+    def test_every_model_names_a_metric_it_actually_has(self):
+        for model in dr.MODELS.values():
+            assert model.headline in {m.key for m in model.metrics}
+            assert model.headline_metric.key == model.headline
+
+    def test_every_model_says_how_it_lines_up_with_the_ml_models_tab(self):
+        for model in dr.MODELS.values():
+            assert model.catalogue_metric
+
+
+class TestSignature:
+    """A scoring depends on two things, and both belong in its cache key."""
+
+    def test_the_signature_carries_the_bars_and_the_model_file(self, store):
+        bars, model = dr.signature(dr.model_catalogue.OPEN_PROFILE_KEY, TICKER, FEED)
+        assert bars == dr.store_signature(TICKER, FEED)
+        assert model == dr.model_signature(dr.model_catalogue.OPEN_PROFILE_KEY, TICKER)
+
+    def test_retraining_a_model_changes_it_without_the_store_moving(self, store, monkeypatch, tmp_path):
+        retrained = tmp_path / "open_profile_lgbm.json.gz"
+        retrained.write_bytes(b"x")
+        monkeypatch.setenv("OPEN_PROFILE_MODEL", str(retrained))
+        before = dr.signature(dr.model_catalogue.OPEN_PROFILE_KEY, TICKER, FEED)
+        retrained.write_bytes(b"xx")
+        after = dr.signature(dr.model_catalogue.OPEN_PROFILE_KEY, TICKER, FEED)
+        assert after != before and after[0] == before[0]  # the bars did not move
+
+    def test_a_model_with_no_files_on_disk_is_an_empty_signature(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OPEN_PROFILE_MODEL", str(tmp_path / "nothing.json.gz"))
+        assert dr.model_signature(dr.model_catalogue.OPEN_PROFILE_KEY, TICKER) == ()

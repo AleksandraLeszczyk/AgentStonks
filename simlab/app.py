@@ -2614,209 +2614,506 @@ def render_results_tab() -> None:
 # ---------------------------------------------------------------------------
 
 _DRIFT_GROUP_LABELS = {sim_drift.DAY: "Day", sim_drift.WEEK: "Week"}
+# One colour per instrument, assigned from the chosen list rather than per
+# chart, so a symbol keeps its colour all the way down the tab and the eye can
+# follow it from one model's chart into the next.
+_DRIFT_SERIES_COLORS = (
+    PALETTE["accent"], PALETTE["orange"], PALETTE["up"],
+    "#c084fc", "#f472b6", "#facc15",
+)
+# What one press of Update covered: the tape, the instruments, and the stored
+# bars behind them. Any of the three changing would make the numbers on screen
+# stale, and recomputing them means loading PyTorch and LightGBM -- so the tab
+# asks for the button again rather than doing that on a rerun nobody asked for.
+_DRIFT_SCOPE_KEY = "drift_scope"
+_DRIFT_UPDATED_KEY = "drift_updated_at"
+# Above this many sessions in one series, the dots go and the line stays --
+# `intraday_vol` is scored on the whole daily history, which is years of it.
+_DRIFT_MARKER_LIMIT = 60
 
 
 @st.cache_data(show_spinner=False)
-def _drift_result(model_key: str, ticker: str, feed: str, _signature: tuple) -> dict:
+def _drift_result(model_key: str, ticker: str, feed: str, signature: tuple) -> dict:
     """One model's per-session metrics on one instrument's stored tape.
 
-    Keyed on what was stored (`drift.store_signature`), so a new download
-    recomputes and nothing else does. Scoring loads the model -- PyTorch for
-    the day-range bundle -- which is why the tab computes on request rather
-    than whenever SimLab reruns.
+    Keyed on the stored bars and the saved model file (`drift.signature`), so a
+    new download or a retrain recomputes and nothing else does -- which is what
+    makes Update cheap the second time: the pairs where neither has moved come
+    straight back out. Scoring loads the model, PyTorch for the day-range
+    bundle, which is why the tab computes on request rather than whenever
+    SimLab reruns.
     """
     return sim_drift.MODELS[model_key].evaluate(ticker, feed)
 
 
+def _drift_color(ticker: str, tickers: "list[str]") -> str:
+    index = tickers.index(ticker) if ticker in tickers else 0
+    return _DRIFT_SERIES_COLORS[index % len(_DRIFT_SERIES_COLORS)]
+
+
+def _drift_scope(feed: str, symbols: "list[str]") -> tuple:
+    """Everything an update would be computed from, as one comparable value.
+
+    The saved model files are in it as well as the stored bars, so retraining a
+    bundle marks the tab stale on its own -- the case the old single-model view
+    needed an explicit "Recompute" button for.
+    """
+    return (feed, tuple(symbols), tuple(
+        sim_drift.signature(model_key, ticker, feed)
+        for model_key, ticker in sim_drift.pairs(feed, symbols)
+    ))
+
+
+def _drift_update(feed: str, symbols: "list[str]") -> None:
+    """Score every model on every chosen instrument, with the progress visible.
+
+    Every pair goes through `_drift_result`, so this is one cache fill rather
+    than a separate code path -- a pair already scored on unchanged bars costs
+    a dictionary lookup, and only the new work shows on the bar.
+    """
+    todo = sim_drift.pairs(feed, symbols)
+    progress = st.progress(0.0, text="Scoring…")
+    for done, (model_key, ticker) in enumerate(todo):
+        model = sim_drift.MODELS[model_key]
+        progress.progress(done / len(todo), text=f"{model.label} · {ticker}")
+        _drift_result(model_key, ticker, feed, sim_drift.signature(model_key, ticker, feed))
+    progress.empty()
+    st.session_state[_DRIFT_SCOPE_KEY] = _drift_scope(feed, symbols)
+    st.session_state[_DRIFT_UPDATED_KEY] = datetime.now().strftime("%H:%M:%S")
+
+
+def _drift_scoreboard(feed: str, symbols: "list[str]") -> "list[dict]":
+    """Every (model, instrument) pair, with its rows, its cutoffs and its notes.
+
+    Read out of the cache Update filled, so this runs on every rerun of the tab
+    without rescoring anything.
+    """
+    board = []
+    for model_key, ticker in sim_drift.pairs(feed, symbols):
+        model = sim_drift.MODELS[model_key]
+        result = _drift_result(
+            model_key, ticker, feed, sim_drift.signature(model_key, ticker, feed)
+        )
+        training = model.training(ticker)
+        board.append({
+            "model": model,
+            "ticker": ticker,
+            "rows": result.get("rows") or [],
+            "notes": result.get("notes") or [],
+            "cutoffs": training.get("cutoffs") or [],
+            "references": training.get("references") or [],
+        })
+    return board
+
+
+def _drift_signed(metric, value: "float | None") -> str:
+    """A change in a metric's own units, always with its sign."""
+    return "—" if value is None else metric.fmt.replace("%", "%+", 1) % value
+
+
+def _drift_verdict(metric, test) -> str:
+    """One test as a sentence: whether it moved, which way, and by how much.
+
+    "Worse" rather than "up" wherever the metric has a good direction, because
+    up is bad for an error and good for a correlation and nobody should have to
+    remember which column they are in. A bias has no good direction -- only
+    zero is -- so it only ever *changed*.
+    """
+    if test.p is None:
+        return f"Not tested — {test.note}"
+    if not test.significant:
+        return f"No significant change (p {test.p:.2f})"
+    worse = sim_drift.worsened(metric, test.statistic)
+    headline = {True: "Worse", False: "Better", None: "Changed"}[worse]
+    moved = "rising" if test.statistic > 0 else "falling"
+    effect = (
+        f", {_drift_signed(metric, test.effect)} {test.effect_label}"
+        if test.effect is not None else ""
+    )
+    return f"{headline} — {moved}{effect} (p {test.p:.3f})"
+
+
+def _drift_row(entry: dict, metric) -> dict:
+    """One (model, instrument) pair as a table row, for one metric.
+
+    The two means share a cell as `inside → after`, which is the comparison
+    anyone reads them for and costs one column instead of three; where a store
+    sits entirely on one side of a cutoff -- which two of the three models do --
+    the empty half says so at a glance.
+    """
+    assessment = sim_drift.assess(entry["rows"], metric, entry["cutoffs"])
+    inside, after = assessment["parts"]["inside"], assessment["parts"]["after"]
+
+    def mean(part: dict) -> str:
+        return metric.fmt % part["mean"] if part["n"] else "—"
+
+    return {
+        # Without the project in brackets: the section below says which model
+        # this is at length, and here it costs the column its readable width.
+        "Model": entry["model"].label.split(" (")[0],
+        "Instrument": entry["ticker"],
+        "Metric": metric.name,
+        "Sessions": assessment["n"],
+        "In training → after": f"{mean(inside)} → {mean(after)}",
+        "Trend over time": _drift_verdict(metric, assessment["trend"]),
+        "Across the cutoff": _drift_verdict(metric, assessment["split"]),
+    }
+
+
+def _drift_table(rows: "list[dict]", drop: "tuple[str, ...]" = ()) -> None:
+    """The scoreboard, with the two verdict columns given the room to be read.
+
+    Widths set rather than left to the grid: the verdicts are sentences and the
+    numbers are four characters, and the browser's guess gives them equal thirds
+    and truncates the only two columns anyone opened the tab for.
+    """
+    text = st.column_config.TextColumn
+    st.dataframe(
+        pd.DataFrame([{k: v for k, v in r.items() if k not in drop} for r in rows]),
+        hide_index=True, width="stretch", column_config={
+            "Model": text("Model", width="medium"),
+            "Instrument": text("Instrument", width="small"),
+            "Metric": text("Metric", width="medium"),
+            "Sessions": st.column_config.NumberColumn("Sessions", width="small"),
+            "In training → after": text(
+                "In training → after", width="medium",
+                help="The metric's mean on the sessions the model saw in training and on "
+                     "the ones after its last cutoff. One side empty means the whole "
+                     "store falls on the other.",
+            ),
+            "Trend over time": text(
+                "Trend over time", width="large",
+                help="Mann–Kendall on the per-session values: is the metric going "
+                     "anywhere over the whole scored stretch?",
+            ),
+            "Across the cutoff": text(
+                "Across the cutoff", width="large",
+                help="Mann–Whitney U on the sessions after the model's last training "
+                     "cutoff against the ones inside it: is it worse where it is blind?",
+            ),
+        },
+    )
+
+
 def render_drift_tab() -> None:
     st.caption(
-        "How a saved model's accuracy moves over time on the sessions SimLab has stored, "
-        "session by session or week by week, against the dates its training data ended. "
-        "Every session is scored the way a live run would have seen it — daily history "
-        "strictly before the day, that day's opening print and minutes — and compared with "
-        "what the day actually did. A model is only really being tested to the right of "
-        "its last cutoff."
+        "How every saved model's accuracy moves over time on the sessions SimLab has "
+        "stored, session by session or week by week, against the dates its training data "
+        "ended. Each session is scored the way a live run would have seen it — daily "
+        "history strictly before the day, that day's opening print and minutes — and "
+        "compared with what the day actually did. A model is only really being tested to "
+        "the right of its last cutoff."
     )
-    col_model, col_feed, col_ticker = st.columns([2, 1, 1])
-    model_key = col_model.selectbox(
-        "Model", list(sim_drift.MODELS), format_func=lambda k: sim_drift.MODELS[k].label,
-        key="drift_model",
-    )
-    model = sim_drift.MODELS[model_key]
+
+    col_feed, col_symbols, col_group = st.columns([1, 3, 1], vertical_alignment="bottom")
     feed = col_feed.selectbox(
         "Tape", list(sim_data.FEEDS), key="drift_feed",
         help="Which stored bars to score on. The same day on two tapes is two sets of bars.",
     )
-    symbols = [
-        s for s in sim_drift.stored_symbols(feed)
-        if model.tickers is None or s in model.tickers
-    ]
-    st.caption(model.summary)
-    if not symbols:
+    stored = sim_drift.stored_symbols(feed)
+    if not stored:
         st.info(
-            f"Nothing stored on the `{feed}` tape that {model.label} can score"
-            + (f" (it exists for {', '.join(model.tickers)})" if model.tickers else "")
-            + ". Download a dataset in the Datasets tab."
+            f"Nothing stored on the `{feed}` tape. Download a dataset in the Datasets tab."
         )
         return
-    ticker = col_ticker.selectbox(
-        "Instrument", symbols, key=f"drift_ticker_{model_key}_{feed}"
+    symbols = col_symbols.multiselect(
+        "Instruments", stored, default=sim_drift.default_symbols(feed),
+        key=f"drift_symbols_{feed}",
+        help="Every model is scored on every instrument it exists for. The default is the "
+             "symbols a per-instrument model was actually fitted for; the open-profile "
+             "pack transfers, so it can be scored on any of them.",
     )
-
-    col_metric, col_group = st.columns([3, 1], vertical_alignment="bottom")
-    metrics = {m.key: m for m in model.metrics}
-    metric_key = col_metric.selectbox(
-        "Metric", list(metrics), format_func=lambda k: metrics[k].label,
-        key=f"drift_metric_{model_key}",
-    )
-    metric = metrics[metric_key]
     by = col_group.segmented_control(
         "Group by", list(_DRIFT_GROUP_LABELS), format_func=_DRIFT_GROUP_LABELS.get,
         default=sim_drift.DAY, key="drift_group",
     ) or sim_drift.DAY
-    if metric.help:
-        st.caption(metric.help)
-
-    request = f"{model_key}|{ticker}|{feed}"
-    requested = st.session_state.setdefault("drift_requested", [])
-    if request not in requested:
-        minute_days = len(sim_drift.stored_minute_days(ticker, feed))
-        st.caption(
-            f"{minute_days} stored session{'s' if minute_days != 1 else ''} with minute bars "
-            f"for {ticker} on `{feed}`"
-            + ("" if model.needs_minute_bars else ", plus every session in its daily history")
-            + ". Scoring loads the model, so it runs when asked."
-        )
-        if st.button("Compute drift", type="primary", icon=":material/monitoring:",
-                     key="drift_compute"):
-            requested.append(request)
-            st.rerun()
+    if not symbols:
+        st.info("Choose at least one instrument.")
         return
 
-    with st.spinner(f"Scoring {model.label} on {ticker}…"):
-        result = _drift_result(model_key, ticker, feed, sim_drift.store_signature(ticker, feed))
-    training = model.training(ticker)
-    for note in result.get("notes") or []:
-        st.caption(f":material/info: {note}")
-    rows = [r for r in result.get("rows") or [] if r.get(metric.key) is not None]
-    if not rows:
-        st.warning(f"No stored session of {ticker} on `{feed}` could be scored for this metric.")
-        return
-
-    cutoffs = training.get("cutoffs") or []
-    references = [r for r in training.get("references") or [] if r.metric == metric.key]
-    split = sim_drift.split_by_cutoff(rows, metric.key, cutoffs)
-    cards = st.columns(2 + len(references))
-    for col, (name, part) in zip(cards, (
-        ("In training data", split["inside"]), ("After the last cutoff", split["after"]),
-    )):
-        col.metric(
-            name,
-            metric.fmt % part["mean"] if part["n"] else "—",
-            help=f"Mean over {part['n']} session{'s' if part['n'] != 1 else ''}.",
-        )
-    for col, ref in zip(cards[2:], references):
-        col.metric(ref.label, metric.fmt % ref.value, help=ref.note or None)
-
-    groups = sim_drift.aggregate(rows, metric.key, by)
-    st.plotly_chart(
-        _drift_chart(rows, groups, metric, by, cutoffs, references, ticker),
-        key=f"drift_chart_{request}_{metric.key}_{by}",
-    )
-    if cutoffs:
-        st.caption(
-            " · ".join(f"**{c.label}** {c.date}" + (f" — {c.note}" if c.note else "")
-                       for c in cutoffs)
-        )
-
-    table = pd.DataFrame([
-        {
-            "period": g["label"],
-            "sessions": g["n"],
-            "mean": g["mean"],
-            "min": g["min"],
-            "max": g["max"],
-            "data": "in training" if sim_drift.in_training(g["end"], cutoffs) else "after cutoff",
-        }
-        for g in groups
-    ])
-    number = st.column_config.NumberColumn
-    st.dataframe(table, hide_index=True, column_config={
-        "period": _DRIFT_GROUP_LABELS[by],
-        "sessions": "Sessions",
-        "mean": number(f"Mean {metric.unit}".strip(), format=metric.fmt),
-        "min": number("Min", format=metric.fmt),
-        "max": number("Max", format=metric.fmt),
-        "data": "Data",
-    })
-    if st.button("Recompute", icon=":material/refresh:", key="drift_recompute",
-                 help="Score again — needed only if the model file was replaced."):
-        _drift_result.clear()
+    todo = sim_drift.pairs(feed, symbols)
+    scope = _drift_scope(feed, symbols)
+    current = st.session_state.get(_DRIFT_SCOPE_KEY) == scope
+    col_button, col_status = st.columns([1, 4], vertical_alignment="bottom")
+    if col_button.button(
+        "Update", type="primary" if not current else "secondary",
+        icon=":material/refresh:", key="drift_update", width="stretch",
+        help="Score every model on every chosen instrument. Pairs whose stored bars have "
+             "not changed and whose model file has not been retrained come back out of "
+             "the cache.",
+    ):
+        _drift_update(feed, symbols)
         st.rerun()
+    if not current:
+        col_status.caption(
+            f":material/info: {len(todo)} model–instrument pair"
+            f"{'s' if len(todo) != 1 else ''} to score across {len(sim_drift.MODELS)} models"
+            + (
+                " — the stored bars or a model file have changed since the last update."
+                if st.session_state.get(_DRIFT_SCOPE_KEY) is not None
+                else ". Scoring loads the models, so it runs when asked."
+            )
+        )
+        return
+    col_status.caption(
+        f":material/check_circle: Updated at {st.session_state.get(_DRIFT_UPDATED_KEY, '—')} · "
+        f"{len(todo)} model–instrument pair{'s' if len(todo) != 1 else ''} · cached until the "
+        "stored bars or a model file change"
+    )
+
+    board = _drift_scoreboard(feed, symbols)
+    st.markdown("#### Overview")
+    st.caption(
+        "Each model by the one number the ML Models tab grades it on, measured again on "
+        "the stored sessions. Two rank tests on the per-session values ask whether it has "
+        "actually moved: a Mann–Kendall trend over the whole stretch, and a Mann–Whitney U "
+        "either side of the model's last training cutoff. Significant means p < "
+        f"{sim_drift.ALPHA:g}. The metrics are **not comparable across rows** — a MAE in "
+        "log units and an EMD in bps answer different questions."
+    )
+    scored = [
+        _drift_row(entry, entry["model"].headline_metric)
+        for entry in board if entry["rows"]
+    ]
+    if scored:
+        _drift_table(scored)
+    else:
+        st.warning(
+            f"Nothing on the `{feed}` tape could be scored. Each model says why in its "
+            "section below — usually a missing model file or a missing dependency."
+        )
+
+    for model_key, model in sim_drift.MODELS.items():
+        entries = [e for e in board if e["model"].key == model_key]
+        st.markdown(f"#### {model.label}")
+        st.caption(model.summary)
+        st.caption(f":material/neurology: On the ML Models tab — {model.catalogue_metric}")
+        if not entries:
+            # Headed and explained rather than dropped: a model quietly missing
+            # from the tab reads as a model that has nothing wrong with it.
+            st.info(
+                f"None of the chosen instruments has a {model.label} model"
+                + (f" — it exists for {', '.join(model.tickers)}." if model.tickers else ".")
+            )
+            continue
+        metrics = {m.key: m for m in model.metrics}
+        metric = metrics[st.selectbox(
+            "Metric", list(metrics), format_func=lambda k: metrics[k].label,
+            key=f"drift_metric_{model_key}",
+        )]
+        if metric.help:
+            st.caption(metric.help)
+        charted = [e for e in entries if any(r.get(metric.key) is not None for r in e["rows"])]
+        if not charted:
+            st.warning(
+                f"No stored session on `{feed}` could be scored for this metric."
+                + ("".join(f" {n}" for e in entries for n in e["notes"]))
+            )
+            continue
+        st.plotly_chart(
+            _drift_chart(charted, metric, by, symbols),
+            key=f"drift_chart_{model_key}_{metric.key}_{by}_{feed}",
+        )
+        _drift_references(charted, metric)
+        if metric.key != model.headline:
+            _drift_table([_drift_row(e, metric) for e in charted], drop=("Model",))
+        with st.expander(f"{model.label} — session detail"):
+            _drift_detail(charted, metric, by)
 
 
-def _drift_chart(
-    rows: list[dict], groups: list[dict], metric, by: str, cutoffs: list,
-    references: list, ticker: str,
-) -> go.Figure:
-    """Per-session values, the day/week means, the training cutoffs and references."""
+def _drift_references(entries: "list[dict]", metric) -> None:
+    """What the model's own evaluation said, in the metric's units.
+
+    The chart draws these as dotted lines and the line cannot carry the
+    sentence explaining what window the number came off, which is the part that
+    decides whether it is a fair thing to be measured against.
+    """
+    # Grouped on the label and the sentence, not on the value: each ticker's
+    # day-range bundle was graded on its own test window, so three references
+    # differ only in their number and repeating the sentence three times is how
+    # a useful caption becomes an unread one.
+    seen: "dict[tuple, list]" = {}
+    for entry in entries:
+        for ref in (r for r in entry["references"] if r.metric == metric.key):
+            seen.setdefault((ref.label, ref.note), []).append((entry["ticker"], ref.value))
+    if not seen:
+        return
+    parts = []
+    for (label, note), found in seen.items():
+        shared = len({value for _, value in found}) == 1 and len(found) == len(entries)
+        values = (
+            metric.fmt % found[0][1] if shared
+            else ", ".join(f"{ticker} {metric.fmt % value}" for ticker, value in found)
+        )
+        parts.append(f"**{label}** {values}" + (f" — {note}" if note else ""))
+    st.caption(":material/flag: " + " · ".join(parts))
+
+
+def _drift_detail(entries: "list[dict]", metric, by: str) -> None:
+    """Per-instrument: what was scored, what could not be, and the period means."""
+    for entry in entries:
+        st.markdown(f"**{entry['ticker']}**")
+        for note in entry["notes"]:
+            st.caption(f":material/info: {note}")
+        if entry["cutoffs"]:
+            st.caption(" · ".join(
+                f"**{c.label}** {c.date}" + (f" — {c.note}" if c.note else "")
+                for c in sorted(entry["cutoffs"], key=lambda c: c.date)
+            ))
+        groups = sim_drift.aggregate(entry["rows"], metric.key, by)
+        number = st.column_config.NumberColumn
+        st.dataframe(
+            pd.DataFrame([{
+                "period": g["label"],
+                "sessions": g["n"],
+                "mean": g["mean"],
+                "min": g["min"],
+                "max": g["max"],
+                "data": (
+                    "in training" if sim_drift.in_training(g["end"], entry["cutoffs"])
+                    else "after cutoff"
+                ),
+            } for g in groups]),
+            hide_index=True, width="stretch", column_config={
+                "period": _DRIFT_GROUP_LABELS[by],
+                "sessions": "Sessions",
+                "mean": number(f"Mean {metric.unit}".strip(), format=metric.fmt),
+                "min": number("Min", format=metric.fmt),
+                "max": number("Max", format=metric.fmt),
+                "data": "Data",
+            },
+        )
+
+
+def _drift_chart(entries: "list[dict]", metric, by: str, tickers: "list[str]") -> go.Figure:
+    """One model's metric over time, one instrument per colour.
+
+    A chart per model rather than one for everything: within a model the
+    instruments share units and are worth reading against each other, and across
+    models they are a MAE in log units and an EMD in bps on the same axis, which
+    would be a chart that lies.
+
+    Two things the single-instrument version did not have to think about.
+    Instruments that stopped learning on the same day -- which is every one of
+    them for the two models fitted on a shared window -- get *one* cutoff line
+    naming them all, because three dashed lines on the same date and three
+    labels in the same place read as neither. And the training stretch is shaded
+    only when there is one instrument on the chart, since overlapping
+    rectangles shade nothing in particular.
+    """
     fig = go.Figure()
-    dates = [r["date"] for r in rows]
-    fig.add_trace(go.Scatter(
-        x=dates, y=[r[metric.key] for r in rows],
-        mode="markers" if by == sim_drift.WEEK else "lines+markers",
-        name="Session", opacity=0.45 if by == sim_drift.WEEK else 1.0,
-        marker=dict(size=7, color=PALETTE["accent"]),
-        line=dict(color=PALETTE["accent"], width=1.5),
-        hovertemplate=f"%{{x|%a %d %b}}<br>{metric.label}: %{{y:{metric.hover}}}<extra></extra>",
-    ))
-    if by == sim_drift.WEEK:
+    single = len(entries) == 1
+    dates: "list[str]" = []
+    # Both collected rather than drawn in the loop, and both keyed on the thing
+    # itself: the open-profile pack is one model graded once, so three
+    # instruments carry the same two reference numbers and the same cutoff, and
+    # drawing them per instrument means six lines where there are two facts.
+    marks: "dict[str, dict]" = {}          # cutoff date -> instruments, label
+    refs: "dict[tuple, dict]" = {}         # (label, value) -> instruments
+    for entry in entries:
+        ticker, colour = entry["ticker"], _drift_color(entry["ticker"], tickers)
+        rows = sorted(
+            (r for r in entry["rows"] if r.get(metric.key) is not None),
+            key=lambda r: r["date"],
+        )
+        own = [r["date"] for r in rows]
+        dates += own
+        weekly = by == sim_drift.WEEK
+        # Three years of daily bars with a dot on every one of them is a
+        # hairball, and the dots carry nothing the line does not.
+        crowded = len(own) > _DRIFT_MARKER_LIMIT
         fig.add_trace(go.Scatter(
-            x=[g["start"] for g in groups], y=[g["mean"] for g in groups],
-            mode="lines+markers", name="Weekly mean",
-            marker=dict(size=11, color=PALETTE["text"]), line=dict(color=PALETTE["text"], width=2.5),
-            customdata=[[g["label"], g["n"]] for g in groups],
+            x=own, y=[r[metric.key] for r in rows],
+            mode="markers" if weekly else ("lines" if crowded else "lines+markers"),
+            name=f"{ticker} · session" if weekly else ticker, legendgroup=ticker,
+            opacity=0.3 if weekly else (0.75 if crowded else 1.0),
+            marker=dict(size=4 if crowded else 6, color=colour),
+            line=dict(color=colour, width=1.0 if crowded else 1.5),
             hovertemplate=(
-                f"%{{customdata[0]}}<br>{metric.label}: %{{y:{metric.hover}}}"
-                "<br>%{customdata[1]} sessions<extra></extra>"
+                f"<b>{ticker}</b> %{{x|%a %d %b %Y}}<br>{metric.label}: "
+                f"%{{y:{metric.hover}}}<extra></extra>"
             ),
         ))
-    for ref in references:
-        fig.add_hline(y=ref.value, line=dict(color=PALETTE["muted"], dash="dot", width=1.5))
-        fig.add_annotation(
-            xref="paper", x=1.0, y=ref.value, text=ref.label, showarrow=False,
-            xanchor="right", yanchor="bottom", font=dict(color=PALETTE["muted"], size=11),
-        )
-    if cutoffs:
-        start = min([*dates, *(c.date for c in cutoffs)])
-        last = max(c.date for c in cutoffs)
-        fig.add_shape(
-            type="rect", xref="x", yref="paper", x0=start, x1=last, y0=0, y1=1,
-            fillcolor="rgba(148,163,184,0.10)", line_width=0, layer="below",
-        )
-        for i, cutoff in enumerate(sorted(cutoffs, key=lambda c: c.date)):
+        if weekly:
+            groups = sim_drift.aggregate(rows, metric.key, by)
+            fig.add_trace(go.Scatter(
+                x=[g["start"] for g in groups], y=[g["mean"] for g in groups],
+                mode="lines+markers", name=f"{ticker} · weekly mean", legendgroup=ticker,
+                marker=dict(size=8, color=colour), line=dict(color=colour, width=2.5),
+                customdata=[[g["label"], g["n"]] for g in groups],
+                hovertemplate=(
+                    f"<b>{ticker}</b> %{{customdata[0]}}<br>{metric.label}: "
+                    f"%{{y:{metric.hover}}}<br>%{{customdata[1]}} sessions<extra></extra>"
+                ),
+            ))
+        for ref in (r for r in entry["references"] if r.metric == metric.key):
+            key = (ref.label, round(ref.value, 9))
+            refs.setdefault(key, {"value": ref.value, "label": ref.label, "tickers": []})
+            refs[key]["tickers"].append(ticker)
+        cutoffs = sorted(entry["cutoffs"], key=lambda c: c.date)
+        if single and cutoffs and own:
             fig.add_shape(
-                type="line", xref="x", yref="paper", x0=cutoff.date, x1=cutoff.date,
-                y0=0, y1=1, line=dict(color=PALETTE["down"], dash="dash", width=1.5),
+                type="rect", xref="x", yref="paper", y0=0, y1=1, line_width=0,
+                x0=min([*own, cutoffs[0].date]), x1=cutoffs[-1].date,
+                fillcolor="rgba(148,163,184,0.10)", layer="below",
             )
-            fig.add_annotation(
-                xref="x", yref="paper", x=cutoff.date, y=1.0 - 0.07 * i,
-                text=f"{cutoff.label} {cutoff.date}", showarrow=False, xanchor="right",
-                yanchor="top", font=dict(color=PALETTE["down"], size=11),
-            )
+        for cutoff in (cutoffs if single else cutoffs[-1:]):
+            mark = marks.setdefault(cutoff.date, {"tickers": [], "label": cutoff.label})
+            mark["tickers"].append(ticker)
+    first = min(dates)
+    for i, (day, mark) in enumerate(sorted(marks.items())):
+        named = mark["tickers"]
+        colour = (
+            _drift_color(named[0], tickers) if not single and len(named) == 1
+            else PALETTE["down"]
+        )
+        fig.add_shape(
+            type="line", xref="x", yref="paper", x0=day, x1=day, y0=0, y1=1,
+            line=dict(color=colour, dash="dash", width=1.5),
+        )
+        fig.add_annotation(
+            xref="x", yref="paper", x=day, y=1.0 - 0.07 * i, showarrow=False,
+            # A cutoff before the first scored session sits on the left edge,
+            # where a right-anchored label runs off the chart. Hang it off the
+            # inside of its line instead.
+            xanchor="left" if day <= first else "right",
+            yanchor="top", font=dict(color=colour, size=11),
+            text=(
+                f" {mark['label']} {day} " if single
+                else f" {', '.join(named)} trained through {day} "
+            ),
+        )
+    for i, ref in enumerate(sorted(refs.values(), key=lambda r: r["value"])):
+        named = ref["tickers"]
+        shared = single or len(named) == len(entries)
+        colour = (
+            PALETTE["muted"] if len(named) > 1 and not single
+            else _drift_color(named[0], tickers)
+        )
+        fig.add_hline(y=ref["value"], line=dict(color=colour, dash="dot", width=1.5))
+        fig.add_annotation(
+            # Staggered leftwards rather than all at x=1: two references within
+            # a rounding error of each other land on the same pixel otherwise,
+            # and a model graded against a baseline always has two.
+            xref="paper", x=1.0 - 0.15 * i, y=ref["value"], showarrow=False,
+            xanchor="right", yanchor="bottom", font=dict(color=colour, size=11),
+            text=(ref["label"] if shared else f"{', '.join(named)} · {ref['label']}")
+                 + " " + metric.fmt % ref["value"],
+        )
     # Fitted to what is drawn: autorange pads a date axis by weeks, which put an
     # empty month in front of the first cutoff.
-    first = min([*dates, *(c.date for c in cutoffs)])
     pad = timedelta(days=3)
     fig.update_xaxes(
         type="date", rangebreaks=[dict(bounds=["sat", "mon"])],
         range=[
-            (date.fromisoformat(first) - pad).isoformat(),
+            (date.fromisoformat(min([*dates, *marks])) - pad).isoformat(),
             (date.fromisoformat(max(dates)) + pad).isoformat(),
         ],
     )
     fig.update_yaxes(title=f"{metric.label} {metric.unit}".strip())
-    fig.update_layout(title=f"{ticker} · {metric.label} by {_DRIFT_GROUP_LABELS[by].lower()}")
+    fig.update_layout(title=(
+        f"{entries[0]['ticker']} · " if single else ""
+    ) + f"{metric.label} by {_DRIFT_GROUP_LABELS[by].lower()}")
     return _chart_layout(fig, height=440)
 
 

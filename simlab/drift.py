@@ -39,6 +39,26 @@ read, not assumed: see `dayrange_training_from_metadata` and its siblings. A
 session on or before the last cutoff was seen in training by at least one
 stage, and the tab shades that stretch -- a model doing well there is fitting,
 not generalising.
+
+Which metric stands for a model
+-------------------------------
+Each model tracks several numbers, but one of them is the model's: the
+session-level version of what the ML Models tab prints in its headline column,
+named by `DriftModel.headline`. For the day range and the open profile that is
+literally the same quantity the saved file was graded on -- a MAE in log units,
+an EMD in bps -- so the reference line on the chart is that grade and the series
+is the same measurement taken later. `intraday_vol` is graded by a walk-forward
+R², which is a statistic of a window rather than of a session, so what is
+tracked is the error term inside it; `DriftModel.catalogue_metric` says so on
+screen rather than letting the two pages look interchangeable when they are not.
+
+Has it actually moved?
+----------------------
+Twenty noisy sessions will always look like they are going somewhere, so the
+answer is a test rather than a slope: `trend_test` (Mann-Kendall over the scored
+sessions) and, where the store straddles a cutoff, `split_test` (Mann-Whitney U
+either side of it). Both are rank tests on per-session values -- see the comment
+above `ALPHA` for why rank, why per session, and why both.
 """
 from __future__ import annotations
 
@@ -77,6 +97,14 @@ class Metric:
     hover: str = ".4f"    # d3, for plotly hovers
     better: str = "lower"  # "lower", "higher" or "zero"
     help: str = ""
+    # The name for a table cell, units and all. Set rather than clipped off
+    # `label`: these run to half a sentence, and a column narrow enough for
+    # nine of them beside two verdicts truncates every one mid-word.
+    short: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.short or f"{self.label} {self.unit}".strip()
 
 
 @dataclass(frozen=True)
@@ -112,6 +140,18 @@ class DriftModel:
     evaluate: Callable[..., dict]
     # ticker -> {"cutoffs": [Cutoff], "references": [Reference]}
     training: Callable[[str], dict]
+    # The one metric this model is summarised by -- the session-level version of
+    # the number the ML Models tab puts in its headline column. See
+    # `catalogue_metric` for how exactly the two line up.
+    headline: str = ""
+    # What the ML Models tab calls that number, and whether the two are the same
+    # quantity or only the same subject. `model_catalogue` is the source of the
+    # value; this says what it can be compared with.
+    catalogue_metric: str = ""
+
+    @property
+    def headline_metric(self) -> Metric:
+        return next(m for m in self.metrics if m.key == (self.headline or self.metrics[0].key))
 
 
 # --- the store --------------------------------------------------------------
@@ -176,6 +216,34 @@ def store_signature(symbol: str, feed: str) -> tuple:
             continue
         out.append((path.name, stat.st_size, stat.st_mtime_ns))
     return tuple(out)
+
+
+def model_signature(model_key: str, ticker: str) -> tuple:
+    """What changes when a model is retrained -- the other half of a cache key.
+
+    Stat calls only, and read through `model_catalogue` because that module is
+    deliberately a reader: asking the model modules where their files are would
+    import PyTorch to answer a question about an mtime.
+    """
+    spec = model_catalogue.spec(model_key, ticker)
+    out = []
+    for entry in spec.files if spec else ():
+        try:
+            stat = entry.path.stat()
+        except OSError:
+            continue
+        out.append((entry.path.name, stat.st_size, stat.st_mtime_ns))
+    return tuple(out)
+
+
+def signature(model_key: str, ticker: str, feed: str) -> tuple:
+    """Everything one scoring depends on: the stored bars and the saved model.
+
+    Both halves, so a re-downloaded day and a retrained bundle each invalidate
+    the answer -- the second is why the tab needs no "the model file changed"
+    button of its own.
+    """
+    return (store_signature(ticker, feed), model_signature(model_key, ticker))
 
 
 def _daily(symbol: str, feed: str) -> "list[dict]":
@@ -251,6 +319,241 @@ def split_by_cutoff(rows: "list[dict]", metric: str, cutoffs: "list[Cutoff]") ->
     }
 
 
+# --- is it drifting? --------------------------------------------------------
+#
+# A metric that wanders is not the same as a metric that has moved, and the eye
+# is bad at telling them apart on twenty noisy sessions. Two tests, because the
+# two ways a saved model goes wrong look different on a chart and because
+# neither test can be run on every model:
+#
+# * a **trend** over the scored sessions (Mann-Kendall), which is the only one
+#   that can always be run -- `intraday_vol` has every stored session inside its
+#   training sample and `open_profile` has none of them, so a before/after split
+#   is undefined for two of the three models;
+# * a **split** at the last training cutoff (Mann-Whitney U), for the model
+#   where the store straddles it, which is the sharper question when it can be
+#   asked: is the model worse on the sessions it never saw?
+#
+# Both are rank tests on the per-session values. Rank tests because these
+# metrics are absolute errors -- bounded below, long-tailed above -- so one wild
+# session moves a mean and a t-test far more than it should. Per session, not
+# per displayed group: a session is the observation, and a weekly grouping of
+# six points has no power to reject anything (Mann-Kendall needs |tau| > 0.85
+# at n=6). Grouping is a way to read the chart, not a way to run the test.
+#
+# The normal approximations below are the standard ones, with tie corrections,
+# and are used rather than SciPy's exact versions because this module otherwise
+# needs nothing but numpy -- and because at these sample sizes the difference is
+# in the third decimal of a p-value nobody should be reading that closely.
+
+ALPHA = 0.05
+# Below these the normal approximation is not worth printing a p-value for.
+MIN_TREND_N = 8
+MIN_SPLIT_N = 5
+
+TREND = "trend"
+SPLIT = "split"
+
+
+@dataclass(frozen=True)
+class TestResult:
+    """One answer to "has this metric changed?", with what it could not answer."""
+
+    kind: str
+    label: str
+    # Rank statistic: Kendall's tau-b for the trend, rank-biserial for the split.
+    # Both run -1..1 and both are positive when the metric is *rising*.
+    statistic: "float | None"
+    p: "float | None"
+    # The change in the metric's own units: per 30 days for the trend
+    # (Theil-Sen), after minus inside for the split (medians).
+    effect: "float | None"
+    effect_label: str
+    n: int
+    # Why there is no p-value, when there is none.
+    note: str = ""
+
+    @property
+    def significant(self) -> bool:
+        return self.p is not None and self.p < ALPHA
+
+    @property
+    def direction(self) -> str:
+        """"up", "down" or "flat" -- of the metric, not of the model's health."""
+        if self.statistic is None or not self.significant:
+            return "flat"
+        return "up" if self.statistic > 0 else "down"
+
+
+def _normal_sf(z: float) -> float:
+    """P(Z > z) for a standard normal, to the precision `erfc` gives."""
+    return 0.5 * math.erfc(z / math.sqrt(2.0))
+
+
+def _two_sided_p(z: float) -> float:
+    return min(1.0, 2.0 * _normal_sf(abs(z)))
+
+
+def _ranks(values: np.ndarray) -> np.ndarray:
+    """1-based ranks with ties averaged, as both tests below need them."""
+    order = np.argsort(values, kind="mergesort")
+    ordered = values[order]
+    ranks = np.empty(len(values), float)
+    start = 0
+    while start < len(values):
+        stop = start
+        while stop + 1 < len(values) and ordered[stop + 1] == ordered[start]:
+            stop += 1
+        ranks[order[start:stop + 1]] = (start + stop) / 2.0 + 1.0
+        start = stop + 1
+    return ranks
+
+
+def _tie_groups(values: np.ndarray) -> "list[int]":
+    _, counts = np.unique(values, return_counts=True)
+    return [int(c) for c in counts if c > 1]
+
+
+def _series(rows: "list[dict]", metric: str) -> "tuple[list[date], np.ndarray]":
+    """The scored sessions in time order, as dates and values."""
+    scored = sorted(
+        (r for r in rows if r.get(metric) is not None), key=lambda r: r["date"]
+    )
+    return (
+        [date.fromisoformat(r["date"]) for r in scored],
+        np.array([float(r[metric]) for r in scored]),
+    )
+
+
+def _theil_sen(days: "list[date]", values: np.ndarray) -> "float | None":
+    """Median pairwise slope, in the metric's units per 30 days.
+
+    The robust slope rather than a least-squares one, for the same reason the
+    test is a rank test: a single 3-sigma session should not set the trend.
+    """
+    slopes = [
+        (values[j] - values[i]) / (days[j] - days[i]).days
+        for i in range(len(values)) for j in range(i + 1, len(values))
+        if days[j] != days[i]
+    ]
+    return float(np.median(slopes)) * 30.0 if slopes else None
+
+
+def trend_test(rows: "list[dict]", metric: str) -> TestResult:
+    """Mann-Kendall on the per-session values: is the metric going anywhere?
+
+    S counts how many later sessions are above earlier ones minus how many are
+    below; under "no trend" it is symmetric about zero with the variance below,
+    tie-corrected. Kendall's tau-b normalises it to -1..1, so it reads as an
+    effect size rather than as a count that grows with the sample.
+    """
+    days, values = _series(rows, metric)
+    n = len(values)
+    if n < MIN_TREND_N:
+        return TestResult(
+            TREND, "Trend over the scored sessions", None, None, None,
+            "per 30 days", n,
+            f"fewer than {MIN_TREND_N} scored sessions ({n})",
+        )
+    signs = np.sign(values[None, :] - values[:, None])
+    s = float(np.triu(signs, k=1).sum())
+    ties = _tie_groups(values)
+    variance = (
+        n * (n - 1) * (2 * n + 5) - sum(t * (t - 1) * (2 * t + 5) for t in ties)
+    ) / 18.0
+    pairs_total = n * (n - 1) / 2.0
+    # tau-b's denominator, which collapses to zero exactly when every session
+    # ties every other one -- a flat series, where there is nothing to test.
+    untied = pairs_total * (pairs_total - sum(t * (t - 1) / 2.0 for t in ties))
+    if untied <= 0 or variance <= 0:
+        return TestResult(
+            TREND, "Trend over the scored sessions", None, None, None,
+            "per 30 days", n, "every scored session has the same value",
+        )
+    tau = s / math.sqrt(untied)
+    # The continuity correction pulls S one step toward zero before it is
+    # standardised, which is what makes the approximation usable at n ~ 20.
+    z = (s - math.copysign(1.0, s)) / math.sqrt(variance) if s else 0.0
+    return TestResult(
+        TREND, "Trend over the scored sessions", float(tau), _two_sided_p(z),
+        _theil_sen(days, values), "per 30 days", n,
+    )
+
+
+def split_test(rows: "list[dict]", metric: str, cutoffs: "list[Cutoff]") -> TestResult:
+    """Mann-Whitney U across the last training cutoff: is it worse where it is blind?
+
+    The positive direction is *after* the cutoff, so a positive statistic always
+    means the metric is larger on the sessions the model never saw. The effect
+    is the difference of medians, in the metric's own units.
+    """
+    label = "After the last cutoff vs inside the training data"
+    inside, after = [], []
+    for row in rows:
+        if row.get(metric) is None:
+            continue
+        (inside if in_training(row["date"], cutoffs) else after).append(float(row[metric]))
+    if not cutoffs:
+        return TestResult(
+            SPLIT, label, None, None, None, "difference of medians", len(after),
+            "no training cutoff in this model's file to split on",
+        )
+    if len(inside) < MIN_SPLIT_N or len(after) < MIN_SPLIT_N:
+        total = len(inside) + len(after)
+        if not inside or not after:
+            # The usual case rather than an edge one: two of the three models
+            # have the whole store on one side of their cutoff.
+            note = f"all {total} sessions {'after' if inside == [] else 'inside'} the cutoff"
+        else:
+            note = f"{len(inside)} inside, {len(after)} after — needs {MIN_SPLIT_N} each side"
+        return TestResult(
+            SPLIT, label, None, None, None, "difference of medians", total, note,
+        )
+    a, b = np.array(after), np.array(inside)
+    combined = np.concatenate([a, b])
+    ranks = _ranks(combined)
+    n1, n2 = len(a), len(b)
+    u = float(ranks[:n1].sum()) - n1 * (n1 + 1) / 2.0
+    mean_u = n1 * n2 / 2.0
+    ties = _tie_groups(combined)
+    total = n1 + n2
+    correction = sum(t ** 3 - t for t in ties) / (total * (total - 1)) if total > 1 else 0.0
+    variance = n1 * n2 / 12.0 * ((total + 1) - correction)
+    if variance <= 0:
+        return TestResult(
+            SPLIT, label, None, None, None, "difference of medians", total,
+            "every scored session has the same value",
+        )
+    z = (u - mean_u - math.copysign(0.5, u - mean_u)) / math.sqrt(variance)
+    # Rank-biserial: the chance a session after the cutoff scores above one
+    # inside it, rescaled to -1..1, which is a plain-language effect size.
+    return TestResult(
+        SPLIT, label, 2.0 * u / (n1 * n2) - 1.0, _two_sided_p(z),
+        float(np.median(a) - np.median(b)), "difference of medians", total,
+    )
+
+
+def worsened(metric: Metric, statistic: "float | None") -> "bool | None":
+    """Whether a rise in this metric is the model getting worse.
+
+    `None` for a bias, where the sign says which way it leans and neither
+    direction is the good one -- only zero is.
+    """
+    if statistic is None or metric.better == "zero":
+        return None
+    return (statistic > 0) if metric.better == "lower" else (statistic < 0)
+
+
+def assess(rows: "list[dict]", metric: Metric, cutoffs: "list[Cutoff]") -> dict:
+    """Both tests plus the cutoff split, for one model on one instrument."""
+    return {
+        "trend": trend_test(rows, metric.key),
+        "split": split_test(rows, metric.key, cutoffs),
+        "parts": split_by_cutoff(rows, metric.key, cutoffs),
+        "n": sum(1 for r in rows if r.get(metric.key) is not None),
+    }
+
+
 def _previous_weekday(day: date) -> date:
     day -= timedelta(days=1)
     while day.weekday() >= 5:
@@ -270,16 +573,22 @@ def _read_json(path: "Path | None") -> dict:
 
 DAYRANGE_METRICS = (
     Metric("mae", "Mean absolute error of the high and low", "(log units)",
+           short="MAE (log units)",
            help="|log(predicted ÷ actual)| for the session high and for the low, averaged — "
                 "the units TimeToChange3 reports its held-out test error in."),
     Metric("mae_usd", "Mean absolute error in dollars", "(USD)", "%.2f", ".2f",
+           short="MAE (USD)",
            help="The same error in price: how far the predicted high and low were from the "
                 "day's, averaged. Tracks the share price as much as the model."),
-    Metric("abs_err_high", "Absolute error of the high", "(log units)"),
-    Metric("abs_err_low", "Absolute error of the low", "(log units)"),
+    Metric("abs_err_high", "Absolute error of the high", "(log units)",
+           short="|error| high (log)"),
+    Metric("abs_err_low", "Absolute error of the low", "(log units)",
+           short="|error| low (log)"),
     Metric("bias_high", "Bias of the high (predicted − actual)", "(log units)", better="zero",
+           short="Bias, high (log)",
            help="Above zero: the model expected a higher high than the day printed."),
     Metric("bias_low", "Bias of the low (predicted − actual)", "(log units)", better="zero",
+           short="Bias, low (log)",
            help="Above zero: the model expected the day to hold up higher than it did."),
 )
 
@@ -387,13 +696,14 @@ def evaluate_dayrange(ticker: str, feed: str) -> dict:
 
 INTRADAY_VOL_METRICS = (
     Metric("abs_log_range_err", "Absolute error of the log day range", "(log units)",
-           "%.3f", ".3f",
+           "%.3f", ".3f", short="|error| log range",
            help="|log predicted − log actual| of the day's ln(high ÷ low). Daily bars only, "
                 "so every stored daily session with a month of history behind it is scored."),
     Metric("log_range_bias", "Bias of the log day range (predicted − actual)", "(log units)",
-           "%.3f", ".3f", better="zero",
+           "%.3f", ".3f", better="zero", short="Bias, log range",
            help="Above zero: the model expected a wider day than it got."),
     Metric("shape_corr", "Time-of-day shape correlation", "", "%.2f", ".2f", better="higher",
+           short="Shape correlation",
            help="Correlation between the session's log 5-minute high-low ranges and the fitted "
                 "time-of-day curve. Scored only on sessions with stored minute bars."),
 )
@@ -491,12 +801,13 @@ def evaluate_intraday_vol(ticker: str, feed: str) -> dict:
 
 OPEN_PROFILE_METRICS = (
     Metric("emd_bps", "Earth mover's distance to the realised profile", "(bps)", "%.1f", ".1f",
+           short="EMD (bps)",
            help="The volume-quantile weighted |predicted − realised| LevelsML scores the model "
                 "with, in bps of the open. The realised profile here is built from stored minute "
                 "bars; LevelsML built its from 1-hour bars, so its walk-forward number is a close "
                 "reference, not an identical one."),
     Metric("inside_band", "Volume inside the predicted outer quantiles", "(%)", "%.1f", ".1f",
-           better="higher",
+           better="higher", short="Volume inside band (%)",
            help="Share of the session's regular-hours volume that traded between the predicted "
                 "lowest and highest volume-quantile prices. A calibrated band holds the nominal "
                 "share."),
@@ -648,6 +959,11 @@ MODELS: "dict[str, DriftModel]" = {
         metrics=DAYRANGE_METRICS,
         evaluate=evaluate_dayrange,
         training=dayrange_training,
+        headline="mae",
+        catalogue_metric=(
+            "MAE (log units) — the same quantity the ML Models tab reports, on later "
+            "sessions instead of the held-out test window"
+        ),
     ),
     "intraday_vol": DriftModel(
         key="intraday_vol",
@@ -662,6 +978,13 @@ MODELS: "dict[str, DriftModel]" = {
         metrics=INTRADAY_VOL_METRICS,
         evaluate=evaluate_intraday_vol,
         training=intraday_vol_training,
+        headline="abs_log_range_err",
+        catalogue_metric=(
+            "day range walk-forward R² — the ML Models tab's number for the same "
+            "forecast, but an R² is a statistic of a whole window and has no value on "
+            "a single session, so what is tracked here is that window's error term: "
+            "the absolute error in log day range, session by session"
+        ),
     ),
     model_catalogue.OPEN_PROFILE_KEY: DriftModel(
         key=model_catalogue.OPEN_PROFILE_KEY,
@@ -676,5 +999,54 @@ MODELS: "dict[str, DriftModel]" = {
         metrics=OPEN_PROFILE_METRICS,
         evaluate=evaluate_open_profile,
         training=open_profile_training,
+        headline="emd_bps",
+        catalogue_metric=(
+            "walk-forward EMD (bps) — the same quantity the ML Models tab reports, on "
+            "profiles rebuilt from stored minute bars rather than LevelsML's 1-hour ones"
+        ),
     ),
 }
+
+
+# --- every model at once ----------------------------------------------------
+
+
+def scorable_symbols(feed: str, model: DriftModel) -> "list[str]":
+    """The stored symbols one model can be scored on, on this tape."""
+    return [
+        s for s in stored_symbols(feed)
+        if model.tickers is None or s in model.tickers
+    ]
+
+
+def default_symbols(feed: str) -> "list[str]":
+    """The symbols worth scoring everything on without being asked.
+
+    The ones a per-instrument model was actually fitted for. `open_profile`
+    transfers to any stored symbol, so taking *its* list would quietly turn one
+    click into a dozen scorings of the model that has the least to say about a
+    symbol it never saw.
+    """
+    fitted: "set[str]" = set()
+    for model in MODELS.values():
+        if model.tickers is not None:
+            fitted |= set(model.tickers)
+    stored = stored_symbols(feed)
+    return [s for s in stored if s in fitted] or stored[:1]
+
+
+def pairs(feed: str, symbols: "list[str] | None" = None) -> "list[tuple[str, str]]":
+    """Every (model, instrument) the store can score, in catalogue order.
+
+    Model-major, so the Drift tab's sections come out in the order the ML
+    Models tab lists them and an instrument that only one model exists for
+    simply appears once.
+    """
+    stored = set(stored_symbols(feed))
+    wanted = [s for s in (symbols if symbols is not None else stored_symbols(feed)) if s in stored]
+    return [
+        (key, symbol)
+        for key, model in MODELS.items()
+        for symbol in wanted
+        if model.tickers is None or symbol in model.tickers
+    ]
