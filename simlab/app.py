@@ -2868,8 +2868,8 @@ def render_drift_tab() -> None:
         "the stored sessions. Two rank tests on the per-session values ask whether it has "
         "actually moved: a Mann–Kendall trend over the whole stretch, and a Mann–Whitney U "
         "either side of the model's last training cutoff. Significant means p < "
-        f"{sim_drift.ALPHA:g}. The metrics are **not comparable across rows** — a MAE in "
-        "log units and an EMD in bps answer different questions."
+        f"{sim_drift.ALPHA:g}. The metrics are **not comparable across rows** — a MAE as "
+        "a share of ADR and an EMD in bps answer different questions."
     )
     scored = [
         _drift_row(entry, entry["model"].headline_metric)
@@ -2990,8 +2990,8 @@ def _drift_chart(entries: "list[dict]", metric, by: str, tickers: "list[str]") -
 
     A chart per model rather than one for everything: within a model the
     instruments share units and are worth reading against each other, and across
-    models they are a MAE in log units and an EMD in bps on the same axis, which
-    would be a chart that lies.
+    models they are a MAE as a share of ADR and an EMD in bps on the same axis,
+    which would be a chart that lies.
 
     Two things the single-instrument version did not have to think about.
     Instruments that stopped learning on the same day -- which is every one of
@@ -3210,7 +3210,12 @@ def _render_tuning_jobs_body(auto_refresh: bool) -> None:
             st.markdown(_tuning_job_label(job))
             done = int(job["progress"]["done"])
             total = max(int(job["progress"]["total"]), 1)
-            st.progress(min(done / total, 1.0), text=f"{done} of {total} replays")
+            reused = int(job["progress"].get("reused") or 0)
+            st.progress(
+                min(done / total, 1.0),
+                text=f"{done} of {total} replays"
+                + (f" ({reused} reused from stored runs)" if reused else ""),
+            )
             with st.container(horizontal=True, vertical_alignment="center"):
                 line = sim_tuning.last_log_line(job["job_id"])
                 if line:
@@ -3351,12 +3356,19 @@ def _render_tuning_form() -> None:
     starting_cash = col_cash.number_input(
         "Starting cash", value=100_000.0, step=10_000.0, key="tune_cash"
     )
-    col_sweep, col_workers = st.columns([3, 1], vertical_alignment="bottom")
+    col_sweep, col_reuse, col_workers = st.columns([3, 2, 1], vertical_alignment="bottom")
     sweep_test = col_sweep.checkbox(
         "Also sweep the whole grid on the test dataset", value=True, key="tune_sweep_test",
         disabled=test_ds is None,
         help="Twice the replays — and the only way to see whether the profitable region "
         "itself moved, rather than only whether the one picked cell held.",
+    )
+    reuse_runs = col_reuse.checkbox(
+        "Reuse stored runs", value=True, key="tune_reuse_runs",
+        help="A cell is the same replay a Simulate run of that configuration is, so a "
+        "matching run already in the store answers it — same rules, same sessions, same "
+        "tape, same starting cash. Those cells fill in below before anything is queued "
+        "and the job only replays the rest.",
     )
     cpus = os.cpu_count() or 2
     workers = col_workers.number_input(
@@ -3375,6 +3387,7 @@ def _render_tuning_form() -> None:
         "rule": rule,
         "min_traded_share": float(min_share),
         "sweep_test_grid": bool(sweep_test and test_ds is not None),
+        "reuse_runs": bool(reuse_runs),
         "workers": int(workers),
     }
     problem = problems[0] if problems else sim_tuning.validate(spec)
@@ -3388,32 +3401,102 @@ def _render_tuning_form() -> None:
                 sim_tuning.make_config(spec["base"], overrides)
             except (TypeError, ValueError):
                 refused += 1
-        minutes = sim_tuning.estimated_seconds(spec) / 60.0
+        runs = _runs()
+        prior = sim_tuning.prior_cells(spec, runs)
+        reused = sum(len(found) for found in prior.values())
+        minutes = sim_tuning.estimated_seconds(spec, prior) / 60.0
         duration = "under a minute" if minutes < 1 else f"roughly {minutes:.0f} min"
         st.caption(
             f"{len(cells)} combinations"
             + (f" ({refused} refused by the configuration, left blank)" if refused else "")
-            + f" · {sim_tuning.total_replays(spec)} replays · {duration} with "
-            f"{workers} worker{'s' if workers != 1 else ''}."
+            + f" · {sim_tuning.total_replays(spec)} replays"
+            + (f", {reused} of them already in the run store" if reused else "")
+            + f" · {duration} with {workers} worker{'s' if workers != 1 else ''}."
         )
+        _render_tuning_prior(spec, axes, metric, prior, runs)
     if st.button(
         "Run tuning", type="primary", icon=":material/play_arrow:",
         disabled=bool(problem), key="tune_run",
     ):
-        record = sim_tuning.submit(spec)
+        record = sim_tuning.submit(spec, runs=_runs())
         st.session_state["tune_selected_job"] = record["job_id"]
         st.toast("Tuning job started", icon=":material/tune:")
         st.rerun()
+
+
+def _tuning_base_marks(spec: dict, axes: list[dict]) -> dict:
+    """Where the base configuration sits on the grid, for a heatmap's outline."""
+    return {"Base configuration": {a["name"]: spec["base"][a["name"]] for a in axes}}
+
+
+def _render_tuning_prior(
+    spec: dict, axes: list[dict], metric: str, prior: dict, runs: list[dict]
+) -> None:
+    """What the run store already says about this grid, before anything is queued.
+
+    A tuning cell and a Simulate run of the same configuration are the same
+    replay, so a grid is rarely a blank sheet: anything swept from the Simulate
+    tab, or left behind by an earlier tuning job, already answers part of it.
+    Drawing that first does two things — it says what the job is actually going
+    to cost, and it often answers the question before the job is queued at all.
+
+    Only the cells with a stored run are filled; the rest of the surface is left
+    transparent, which is the honest picture — an empty square here means "not
+    tried", never "tried and flat".
+    """
+    base = spec["base"]
+    ticker, model = base["ticker"], base.get("model_key", "")
+    pair = f"{ticker} on {_apple_model_label(model)}"
+    stored = sim_tuning.runs_for_pair(runs, ticker, model)
+    stale = sum(1 for record in stored if sim_tuning.run_is_stale(record))
+    aged = (
+        f" {stale} stored {pair} run{'s were' if stale != 1 else ' was'} saved before the "
+        "data it read was last refreshed — a different daily history means a different "
+        "forecast, so those have to be replayed rather than reused."
+        if stale else ""
+    )
+    swept = [
+        cell for key, cell in prior[sim_tuning.TUNE].items()
+        if key != sim_tuning.overrides_key({})
+    ]
+    if not swept:
+        if not stored:
+            why = f"nothing has traded {pair} yet"
+        else:
+            why = (
+                f"none of the {len(stored)} stored {pair} run"
+                f"{'s' if len(stored) != 1 else ''} answers a cell of it — a run has to "
+                "share every setting the grid does not sweep, plus the sessions, the "
+                "tape and the starting cash."
+                + aged
+            )
+        st.caption(f":material/history: No stored run covers this grid ({why})")
+        return
+    st.markdown(f"**Already run** — {len(swept)} of {len(sim_tuning.grid(axes))} combinations")
+    st.plotly_chart(
+        _tuning_heatmap(
+            swept, axes, metric, _tuning_base_marks(spec, axes),
+            f"From stored runs · {spec['tune_dataset']['name']}",
+        ),
+        key="tune_prior_heat",
+    )
+    st.caption(
+        f"Stored {pair} runs over `{spec['tune_dataset']['name']}` matching this base "
+        "configuration in everything the grid does not sweep, and still current — "
+        "same sessions, same tape, same starting cash, and nothing they read has "
+        "changed since. Blank squares are combinations nobody has replayed, and they "
+        "are what the job would run." + aged
+    )
 
 
 def _tuning_heatmap(
     cells: list[dict], axes: list[dict], metric: str, marks: dict, title: str
 ) -> go.Figure:
     """The grid coloured by `metric`; `marks` outlines named cells (the pick, the base)."""
-    by_key = {json.dumps(c["overrides"], sort_keys=True): c for c in cells}
+    by_key = {sim_tuning.overrides_key(c["overrides"]): c for c in cells}
 
     def cell_at(overrides: dict) -> "dict | None":
-        return by_key.get(json.dumps(overrides, sort_keys=True))
+        return by_key.get(sim_tuning.overrides_key(overrides))
 
     mark_colors = {"Pick": PALETTE["text"], "Base configuration": PALETTE["muted"]}
     fig = go.Figure()
@@ -3565,7 +3648,7 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
     spec = job["spec"]
     metric = spec.get("metric", "profit")
     test_by_key = {
-        json.dumps(c["overrides"], sort_keys=True): c for c in job["cells"]["test"]
+        sim_tuning.overrides_key(c["overrides"]): c for c in job["cells"]["test"]
     }
     rows = []
     for cell in job["cells"]["tune"]:
@@ -3579,9 +3662,10 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
             days_up=cell["days_up"], days_traded=cell["days_traded"],
             worst_day=cell["worst_day"],
         )
-        tested = test_by_key.get(json.dumps(cell["overrides"], sort_keys=True))
+        tested = test_by_key.get(sim_tuning.overrides_key(cell["overrides"]))
         if job["cells"]["test"]:
             row["test_profit"] = tested["profit"] if sim_tuning.is_scored(tested) else None
+        row["source"] = f"run {cell['run_id']}" if cell.get("run_id") else "swept"
         row["_sort"] = cell[metric]
         rows.append(row)
     rows.sort(key=lambda r: r.pop("_sort"), reverse=True)
@@ -3629,6 +3713,14 @@ def _render_tuning_notes(job: dict) -> None:
                 "configuration traded them. The usual cause is too little daily history "
                 "before the dataset's first day."
             )
+    reused = sim_tuning.reused_count(job)
+    if reused:
+        st.caption(
+            f":material/history: {reused} of this job's {job['progress']['total']} replays "
+            "came out of the run store — a stored simulation of the same configuration "
+            "over the same sessions, tape and starting cash — rather than being swept "
+            "again. Which cells is in the table below."
+        )
     refused = sum(1 for c in job["cells"]["tune"] if "invalid" in c)
     if refused:
         st.caption(
@@ -3691,10 +3783,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     st.dataframe(pd.DataFrame(_tuning_summary_rows(job)), hide_index=True, column_config=config)
 
     best = job.get("best")
-    marks = {
-        "Pick": (best or {}).get("overrides"),
-        "Base configuration": {a["name"]: spec["base"][a["name"]] for a in axes},
-    }
+    marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
     tune_title = f"Tuning · {spec['tune_dataset']['name']}"
     if job["cells"]["test"]:
         col_tune, col_test = st.columns(2)
@@ -3725,6 +3814,11 @@ def _render_tuning_results(jobs: list[dict]) -> None:
                 "days_traded": "Days traded",
                 "worst_day": money("Worst day ($)", format="%+.2f"),
                 "test_profit": money("Test profit ($)", format="%+.2f"),
+                "source": st.column_config.TextColumn(
+                    "Where from",
+                    help="`swept` — replayed by this job. `run <id>` — taken from a stored "
+                    "simulation run of the same configuration over the same sessions.",
+                ),
             })
 
     if sim_tuning.is_scored(best):

@@ -247,6 +247,35 @@ def format_metric(value: "object | None") -> str:
     return f"{number:.2e}"
 
 
+def dayrange_error_pct_adr(meta: dict) -> "float | None":
+    """A day-range bundle's held-out MAE as a percentage of a typical day's range.
+
+    The sidecar grades the model in log units, which is a *fraction of the
+    day's reference price*; dividing that by the average daily range expressed
+    as a fraction of the same price gives how much of a normal day the model
+    typically misses by. Both sides are dimensionless, so the price cancels and
+    the answer means the same thing on a $300 stock and a $25 one -- and it is
+    the unit the rules downstream are already written in, where the buy and
+    sell levels and the stop are all multiples of ADR (`apple_trader`).
+
+    The denominator is the only ADR the saved file carries: `adr14_abs` on the
+    bundle's own simulation day, over that day's reference price. One day's
+    reading standing in for the test window's, so this is an estimate to a few
+    points rather than a measurement -- `simlab.drift` computes the same ratio
+    per session against each session's own ADR, which is the exact version.
+    """
+    test = meta.get("test_metrics_ensemble") or {}
+    sim = meta.get("sim_date_forecast") or {}
+    try:
+        mae = float(test["mae_mean"])
+        adr_rel = float(sim["adr14_abs"]) / float(sim["prev_avg"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    if mae != mae or adr_rel != adr_rel or adr_rel <= 0:
+        return None
+    return 100.0 * mae / adr_rel
+
+
 # --- one builder per model --------------------------------------------------
 
 def _dayrange_spec(ticker: str) -> ModelSpec:
@@ -267,6 +296,11 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
         metrics["opening-stage LOO gain"] = meta["opening_correction_loo_gain"]
     if meta.get("opening_stage_loo_mae") is not None:
         metrics["opening-stage LOO MAE"] = meta["opening_stage_loo_mae"]
+    error_pct = dayrange_error_pct_adr(meta)
+    if error_pct is not None:
+        # First, not last: it is the row's headline, and the log-unit MAE it is
+        # derived from is directly above it in `test_metrics_ensemble`.
+        metrics = {"MAE (% of ADR)": error_pct, **metrics}
     features = tuple(
         list(meta.get("daily_features") or [])
         + list(meta.get("opening_features") or [])
@@ -305,7 +339,13 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
             f"it) + the first {meta.get('opening_minutes', 5)} minutes of today"
         ),
         metrics=metrics,
-        headline=("MAE (log units)", format_metric(test.get("mae_mean"))),
+        headline=(
+            ("MAE (% of ADR)", f"{error_pct:.1f}%")
+            if error_pct is not None
+            # No simulation day in the sidecar means no ADR to divide by, and a
+            # percentage of an assumed range would be worse than the raw error.
+            else ("MAE (log units)", format_metric(test.get("mae_mean")))
+        ),
         files=files,
         trained_at=str(meta.get("created") or ""),
         data_note=(
@@ -322,13 +362,38 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
         available=available,
         unavailable_reason=reason,
         caveat=(
-            "MAE 0.0077 log units (~$2.12) over 129 test sessions against 0.0110 for a "
-            "14-day rolling baseline — 30% of the baseline's error removed, and the "
-            "ordering holds across all four walk-forward refits. It is a statement "
-            "about the day's width, not its direction, so the rules on it are a "
-            "mean-reversion bet. Missing PyTorch makes the bundle unavailable rather "
-            "than degrading to LightGBM alone: two of three voters gone is a different "
-            "predictor, not a smaller install."
+            f"MAE {format_metric(test.get('mae_mean'))} log units"
+            + (
+                f" (~${float(test['mae_usd_mean']):,.2f})"
+                if test.get("mae_usd_mean") is not None
+                else ""
+            )
+            + " on the held-out test window"
+            + (
+                f" — about {error_pct:.0f}% of a typical day's range"
+                if error_pct is not None
+                else ""
+            )
+            + (
+                f", and {float(test['skill vs rolling 14d']):.0%} of a 14-day rolling "
+                "baseline's error removed"
+                if test.get("skill vs rolling 14d") is not None
+                else ""
+            )
+            + ". "
+            + (
+                "The range that percentage is measured against is the 14-day average "
+                "on the bundle's own simulation day — the only one the file records — "
+                "so read it to the nearest few points, and see SimLab's Drift tab for "
+                "the same ratio against each session's own ADR. "
+                if error_pct is not None
+                else ""
+            )
+            + "It is a statement about the "
+            "day's width, not its direction, so the rules on it are a mean-reversion "
+            "bet. Missing PyTorch makes the bundle unavailable rather than degrading "
+            "to LightGBM alone: two of three voters gone is a different predictor, not "
+            "a smaller install."
         ),
     )
 

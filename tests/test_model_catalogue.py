@@ -83,6 +83,75 @@ def test_open_profile_spec_reads_the_gzipped_pack():
     assert spec.consumers
 
 
+# --- the day-range headline -------------------------------------------------
+
+DAYRANGE_SIDECAR = {
+    "created": "2026-09-09T16:09:02",
+    "daily_fit_through": "2026-07-09",
+    "opening_correction": True,
+    "held_out": "2026-08-28",
+    "test_metrics_ensemble": {"mae_mean": 0.008, "mae_usd_mean": 2.4},
+    # prev_avg 200, adr14_abs 4 -> a normal day is 2% of the price, so an
+    # error of 0.008 log units is 40% of one.
+    "sim_date_forecast": {"date": "2026-08-28", "prev_avg": 200.0, "adr14_abs": 4.0},
+}
+
+
+def _dayrange_spec_from(meta, tmp_path, monkeypatch, ticker="AAPL"):
+    """A spec built off a sidecar written here, with no bundle beside it.
+
+    The bundle's absence makes the spec *unavailable*, which is orthogonal to
+    what these tests read: the headline is assembled from the JSON either way.
+    """
+    bundle = tmp_path / "timetochange3_dayrange_TEST.joblib"
+    if meta is not None:
+        bundle.with_suffix(".json").write_text(json.dumps(meta))
+    monkeypatch.setenv(f"APPLE_DAYRANGE_MODEL_{ticker}", str(bundle))
+    return mc.spec(apple_models.DAYRANGE_KEY, ticker)
+
+
+class TestDayRangeErrorPctAdr:
+    """The headline is a ratio of two things the sidecar records separately.
+
+    Both sides are fractions of a price -- the MAE because the target is a log
+    ratio, the ADR because it is divided by the day it was measured on -- so
+    the price cancels and what is left is "how much of a normal day the model
+    misses by", which is the unit the trading rules are written in.
+    """
+
+    def test_the_ratio_is_the_log_mae_over_the_relative_adr(self):
+        assert mc.dayrange_error_pct_adr(DAYRANGE_SIDECAR) == pytest.approx(40.0)
+
+    def test_the_spec_leads_with_it(self, tmp_path, monkeypatch):
+        spec = _dayrange_spec_from(DAYRANGE_SIDECAR, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE (% of ADR)", "40.0%")
+        # First in the metrics table too, and numeric so the table formats it.
+        assert next(iter(spec.metrics)) == "MAE (% of ADR)"
+        assert spec.metrics["MAE (% of ADR)"] == pytest.approx(40.0)
+        assert "40% of a typical day's range" in spec.caveat
+
+    @pytest.mark.parametrize("meta", [
+        {k: v for k, v in DAYRANGE_SIDECAR.items() if k != "sim_date_forecast"},
+        {**DAYRANGE_SIDECAR, "sim_date_forecast": {"prev_avg": 200.0, "adr14_abs": 0.0}},
+        {**DAYRANGE_SIDECAR, "test_metrics_ensemble": {}},
+        {},
+    ])
+    def test_no_adr_to_divide_by_is_no_percentage(self, meta):
+        """A percentage of an assumed range would be worse than the raw error."""
+        assert mc.dayrange_error_pct_adr(meta) is None
+
+    def test_the_headline_falls_back_to_the_log_mae(self, tmp_path, monkeypatch):
+        meta = {k: v for k, v in DAYRANGE_SIDECAR.items() if k != "sim_date_forecast"}
+        spec = _dayrange_spec_from(meta, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE (log units)", "0.00800")
+        assert "MAE (% of ADR)" not in spec.metrics
+
+    def test_an_unreadable_sidecar_still_builds_a_spec(self, tmp_path, monkeypatch):
+        spec = _dayrange_spec_from(None, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE (log units)", "—")
+        assert not spec.available
+
+
 def test_missing_file_is_a_reason_not_an_exception(tmp_path, monkeypatch):
     monkeypatch.setenv("OPEN_PROFILE_MODEL", str(tmp_path / "nope.json.gz"))
     spec = mc.spec(mc.OPEN_PROFILE_KEY)

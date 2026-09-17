@@ -77,6 +77,8 @@ DAYRANGE_META = {
         "mae_mean": 0.0077, "mae_y_high": 0.0078, "mae_y_low": 0.0076,
         "bias_y_high": -0.0017, "bias_y_low": -0.0006, "mae_usd_mean": 2.11,
     },
+    # A normal day is 2% of the price here, so the held-out MAE is 38.5% of one.
+    "sim_date_forecast": {"date": "2026-08-28", "prev_avg": 300.0, "adr14_abs": 6.0},
 }
 
 
@@ -88,6 +90,22 @@ class TestTraining:
         assert "35" in cutoffs["2026-08-27"].note
         refs = {r.metric: r.value for r in training["references"]}
         assert refs["mae"] == 0.0077 and refs["bias_high"] == -0.0017 and refs["mae_usd"] == 2.11
+
+    def test_the_headline_reference_is_the_ml_models_tab_number(self):
+        """The dotted line on the chart is what the other page prints, so the two
+        are read off the same arithmetic rather than each doing its own."""
+        training = dr.dayrange_training_from_metadata(DAYRANGE_META)
+        refs = {r.metric: r for r in training["references"]}
+        assert refs["mae_pct_adr"].value == pytest.approx(38.5)
+        assert refs["mae_pct_adr"].value == pytest.approx(
+            dr.model_catalogue.dayrange_error_pct_adr(DAYRANGE_META)
+        )
+
+    def test_a_sidecar_without_a_simulation_day_has_no_adr_reference(self):
+        """Nothing to divide by, so no line -- the series is still scored."""
+        meta = {k: v for k, v in DAYRANGE_META.items() if k != "sim_date_forecast"}
+        assert "mae_pct_adr" not in {r.metric for r in
+                                     dr.dayrange_training_from_metadata(meta)["references"]}
 
     def test_a_bundle_without_an_opening_ridge_has_only_the_daily_cutoff(self):
         training = dr.dayrange_training_from_metadata({**DAYRANGE_META, "opening_correction": False})
@@ -187,6 +205,19 @@ class TestDayRange:
             (abs(math.log(105.0 / 106.0)) + abs(math.log(99.0 / 100.0))) / 2
         )
         assert row["mae_usd"] == pytest.approx((1.0 + 1.0) / 2)
+        # Against the session's own 14-day range ($2.00), not the one day's ADR
+        # the saved file records: a $1.00 miss is half a normal day.
+        assert row["mae_pct_adr"] == pytest.approx(50.0)
+
+    def test_a_session_with_no_average_range_is_left_unscored(self, store, monkeypatch, stubbed):
+        """A gap in the series rather than a division by zero dressed as a number."""
+        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
+        monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: {
+            "pred_high": 105.0, "pred_low": 99.0, "prev_avg": 100.0,
+            "adr14_abs": 0.0, "or_high": 101.2, "or_low": 100.8,
+        })
+        rows = dr.evaluate_dayrange(TICKER, FEED)["rows"]
+        assert rows and all(r["mae_pct_adr"] is None and r["mae_usd"] is not None for r in rows)
 
     def test_the_forecast_sees_only_the_past_plus_the_open(self, store, stubbed):
         dr.evaluate_dayrange(TICKER, FEED)

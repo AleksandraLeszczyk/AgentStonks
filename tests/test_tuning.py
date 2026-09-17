@@ -515,6 +515,357 @@ class TestJob:
         assert cell["profit"] == round(result.final_value - 10_000.0, 2)
 
 
+# --- cells a stored run already answers -------------------------------------
+
+
+def stored_run(
+    config: AppleTraderConfig,
+    days: "list[date]",
+    *,
+    feed: str = sim_data.DEFAULT_FEED,
+    cash: float = 10_000.0,
+    run_id: str = "20260616-120000-aaaaaa",
+    rule_config: "dict | None" = None,
+    created_at: "str | None" = None,
+    **fields,
+) -> dict:
+    """A saved run record shaped exactly as `results.save_run` writes one:
+    the engine's result spread over the top level, plus the run's identity.
+
+    Stamped *now* unless told otherwise, so it is newer than every file a
+    replay of it reads -- a run saved before one of those changed is stale and
+    deliberately not reusable (`run_is_stale`).
+    """
+    profit_per_day = 100.0
+    record = {
+        "run_id": run_id,
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        "dataset": "d",
+        "config_summary": {
+            "personality": APPLE_TRADER_KEY,
+            "provider": "rules",
+            "model": "x",
+            "symbols": [config.ticker],
+            "days": [d.isoformat() for d in days],
+            "feed": feed,
+            "starting_cash": cash,
+            "cycle_minutes": 5,
+            "rule_based": True,
+            "rule_config": asdict(config) if rule_config is None else rule_config,
+        },
+        "decisions": [
+            {"action": "buy", "status": "filled", "ts": et(day, "10:00")} for day in days
+        ],
+        "agent_log": [],
+        "equity": [
+            {"ts": et(day, "15:59"), "value": cash + profit_per_day * (i + 1)}
+            for i, day in enumerate(days)
+        ],
+        "cycles_run": len(days),
+        "final_value": cash + profit_per_day * len(days),
+        "starting_cash": cash,
+        "error": None,
+        "interrupted": False,
+        "summary": {},
+        "judge": None,
+    }
+    record.update(fields)
+    return record
+
+
+class TestPriorRuns:
+    """Which stored simulation runs may stand in for a cell of a grid.
+
+    A cell *is* a Simulate run of that configuration -- same engine, same
+    trader, same tape -- so a matching stored run answers it and replaying it
+    would only produce the same number again. What has to match is every field
+    of the decoded configuration plus the sessions, the tape and the starting
+    cash; anything looser would put a different replay's number in the cell.
+    """
+
+    def job(self, **overrides):
+        base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10)
+        return spec(**{
+            "base": asdict(base),
+            "axes": [{"name": "buy_k", "values": [0.5, 0.75]}],
+            "test_dataset": None,
+            **overrides,
+        })
+
+    def cell(self, job, overrides, runs):
+        dataset = job["tune_dataset"]
+        return tu.prior_cell(tu.index_runs(runs), job, dataset, overrides)
+
+    def config(self, job, **overrides):
+        return tu.make_config(job["base"], overrides)
+
+    def test_a_run_of_the_same_replay_answers_the_cell(self):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY])
+        cell = self.cell(job, {"buy_k": 0.5}, [run])
+        assert cell["overrides"] == {"buy_k": 0.5}
+        assert cell["run_id"] == run["run_id"] and cell["profit"] == 100.0
+
+    def test_a_run_of_another_cell_does_not_answer_this_one(self):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY])
+        assert self.cell(job, {"buy_k": 0.75}, [run]) is None
+
+    @pytest.mark.parametrize("field,value", [
+        ("position_pct", 50.0), ("sell_k", 0.2), ("min_win_k", 0.3),
+        # The signature leaves this one out (`SWEEPABLE` says why), so two runs
+        # that differ in it share a Results row -- but they are not the same
+        # replay, and a cell must not be answered by the other one.
+        ("flatten_before_close_min", 9),
+    ])
+    def test_a_setting_the_grid_does_not_sweep_must_still_match(self, field, value):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5, **{field: value}), [TUNE_DAY])
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    @pytest.mark.parametrize("dataset", [
+        {"days": [str(TEST_DAY)]},                    # other sessions
+        {"days": [str(TUNE_DAY), str(TEST_DAY)]},     # more sessions
+        {"feed": "iex"},                              # another tape
+    ])
+    def test_a_run_over_a_different_dataset_is_a_different_replay(self, dataset):
+        job = self.job()
+        config = self.config(job, buy_k=0.5)
+        days = [date.fromisoformat(d) for d in dataset.get("days", [str(TUNE_DAY)])]
+        run = stored_run(config, days, feed=dataset.get("feed", sim_data.DEFAULT_FEED))
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    def test_a_run_on_other_starting_cash_is_a_different_replay(self):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY], cash=50_000.0)
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    def test_the_session_order_is_not_part_of_the_dataset(self):
+        """The tape a replay reads, not the order a form happened to list it in."""
+        job = self.job(tune_dataset={
+            "name": "d", "days": [str(TEST_DAY), str(TUNE_DAY)],
+            "feed": sim_data.DEFAULT_FEED, "symbols": [TICKER],
+        })
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY, TEST_DAY])
+        assert self.cell(job, {"buy_k": 0.5}, [run])["run_id"] == run["run_id"]
+
+    def test_a_run_stored_before_a_field_existed_matches_what_it_meant_then(self):
+        """A record without `breach_update` describes a run whose levels never
+        moved intraday, so it answers the cell that has the update off -- and
+        not the one at today's default, which is a different strategy."""
+        job = self.job()
+        run = stored_run(
+            self.config(job, buy_k=0.5), [TUNE_DAY],
+            rule_config={k: v for k, v in {**job["base"], "buy_k": 0.5}.items()
+                         if k != "breach_update"},
+        )
+        switched_off = self.job(base={**job["base"], "buy_k": 0.5, "breach_update": "off"})
+        assert self.cell(switched_off, {}, [run])["run_id"] == run["run_id"]
+        assert AppleTraderConfig().breach_update != "off"  # today's default is not that
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    @pytest.mark.parametrize("damage", [
+        {"error": "no simulated tape price"},
+        {"interrupted": True},
+        {"cycles_run": 0},
+    ])
+    def test_a_run_that_did_not_finish_is_never_reused(self, damage):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY], **damage)
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    def test_an_llm_run_is_never_reused(self):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY])
+        run["config_summary"].update(rule_based=False, rule_config=None)
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    def test_a_rule_set_this_build_cannot_decode_is_never_reused(self):
+        """A record naming a removed model is refused rather than replayed on
+        the model that is left, so it cannot answer a cell either."""
+        job = self.job()
+        config = self.config(job, buy_k=0.5)
+        run = stored_run(
+            config, [TUNE_DAY], rule_config={**asdict(config), "buy_k": 0.1, "sell_k": 0.5},
+        )
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    def test_the_newest_of_two_identical_replays_wins(self):
+        job = self.job()
+        config = self.config(job, buy_k=0.5)
+        newer = stored_run(config, [TUNE_DAY], run_id="new")
+        older = stored_run(config, [TUNE_DAY], run_id="old")
+        assert self.cell(job, {"buy_k": 0.5}, [newer, older])["run_id"] == "new"
+
+    def test_an_invalid_combination_is_a_hole_not_a_lookup(self):
+        job = self.job(axes=[{"name": "sell_k", "values": [0.9]}])
+        run = stored_run(self.config(job), [TUNE_DAY])
+        assert self.cell(job, {"sell_k": 0.9}, [run]) is None
+
+    def test_the_grid_and_the_baseline_are_both_looked_up(self):
+        job = self.job()
+        runs = [
+            stored_run(self.config(job, buy_k=0.5), [TUNE_DAY], run_id="cell"),
+            stored_run(self.config(job), [TUNE_DAY], run_id="base"),
+        ]
+        found = tu.prior_cells(job, runs)[tu.TUNE]
+        assert found[tu.overrides_key({"buy_k": 0.5})]["run_id"] == "cell"
+        assert found[tu.overrides_key({})]["run_id"] == "base"
+        # buy_k 0.75 is the base's own value, so the baseline run answers that
+        # cell too -- same configuration, same sessions, same replay.
+        assert found[tu.overrides_key({"buy_k": 0.75})]["run_id"] == "base"
+
+    def test_the_test_grid_is_only_looked_up_when_it_is_swept(self):
+        dataset = {"name": "e", "days": [str(TEST_DAY)], "feed": sim_data.DEFAULT_FEED,
+                   "symbols": [TICKER]}
+        job = self.job(test_dataset=dataset)
+        runs = [
+            stored_run(self.config(job, buy_k=0.5), [TEST_DAY], run_id="cell"),
+            stored_run(self.config(job), [TEST_DAY], run_id="base"),
+        ]
+        # The baseline is replayed either way, so it is always looked up.
+        assert set(tu.prior_cells(job, runs)[tu.TEST]) == {tu.overrides_key({})}
+        swept = tu.prior_cells({**job, "sweep_test_grid": True}, runs)[tu.TEST]
+        assert swept[tu.overrides_key({"buy_k": 0.5})]["run_id"] == "cell"
+
+    def test_reuse_can_be_switched_off(self):
+        job = self.job(reuse_runs=False)
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY])
+        assert tu.prior_cells(job, [run]) == {tu.TUNE: {}, tu.TEST: {}}
+
+    def test_a_run_older_than_the_data_it_read_is_never_reused(self, store):
+        """The `store` fixture writes this session's bars and daily history
+        now, so a run stamped before them describes a replay off data that has
+        since been rewritten -- a different forecast, different levels,
+        different fills."""
+        job = self.job()
+        config = self.config(job, buy_k=0.5)
+        fresh = stored_run(config, [TUNE_DAY])
+        stale = stored_run(config, [TUNE_DAY], created_at="2026-06-01T12:00:00+00:00")
+        assert tu.run_is_stale(stale) and not tu.run_is_stale(fresh)
+        assert self.cell(job, {"buy_k": 0.5}, [stale]) is None
+        assert self.cell(job, {"buy_k": 0.5}, [fresh])["run_id"] == fresh["run_id"]
+
+    def test_a_run_with_no_usable_timestamp_is_never_reused(self):
+        job = self.job()
+        run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY], created_at="whenever")
+        assert self.cell(job, {"buy_k": 0.5}, [run]) is None
+
+    def test_a_run_of_a_model_this_build_cannot_run_is_never_reused(self):
+        """A record naming a removed model is refused rather than replayed on
+        the model that is left, so it cannot answer a cell either."""
+        job = self.job()
+        config = self.config(job, buy_k=0.5)
+        run = stored_run(
+            config, [TUNE_DAY], rule_config={**asdict(config), "model_key": "persistence"},
+        )
+        assert tu.run_replay_key(run) is None
+
+    def test_runs_for_pair_is_one_symbol_and_one_saved_model(self):
+        job = self.job()
+        config = self.config(job)
+        mine = stored_run(config, [TUNE_DAY], run_id="mine")
+        other_symbol = stored_run(config, [TUNE_DAY], run_id="sym")
+        other_symbol["config_summary"]["rule_config"]["ticker"] = "GOOGL"
+        other_model = stored_run(config, [TUNE_DAY], run_id="mod")
+        other_model["config_summary"]["rule_config"]["model_key"] = "something-else"
+        llm = stored_run(config, [TUNE_DAY], run_id="llm")
+        llm["config_summary"].update(rule_based=False)
+        found = tu.runs_for_pair(
+            [mine, other_symbol, other_model, llm], TICKER, config.model_key
+        )
+        assert [r["run_id"] for r in found] == ["mine"]
+
+
+class TestSeededJob:
+    """A job starts with what the run store already answers and replays the rest."""
+
+    def job(self, **overrides):
+        base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10)
+        return spec(**{
+            "base": asdict(base),
+            "axes": [{"name": "buy_k", "values": [0.5, 0.75]}],
+            "test_dataset": None,
+            **overrides,
+        })
+
+    def test_a_seeded_cell_is_stored_and_counted_as_done(self, tuning_dir):
+        job = self.job()
+        run = stored_run(tu.make_config(job["base"], {"buy_k": 0.5}), [TUNE_DAY])
+        record = tu.submit(job, launch=False, runs=[run])
+        [cell] = record["cells"][tu.TUNE]
+        assert cell["overrides"] == {"buy_k": 0.5} and cell["run_id"] == run["run_id"]
+        # The total is still the whole grid: the job ran it, it just did not
+        # have to replay this one.
+        assert record["progress"] == {"done": 1, "total": 3, "reused": 1}
+
+    def test_the_worker_replays_only_the_holes(self, store, stub_model, tuning_dir):
+        job = self.job()
+        run = stored_run(tu.make_config(job["base"], {"buy_k": 0.5}), [TUNE_DAY])
+        record = tu.submit(job, launch=False, runs=[run])
+        done = tu.run_job(record["job_id"], progress=lambda m: None)
+
+        assert done["status"] == tu.FINISHED
+        assert done["progress"]["done"] == done["progress"]["total"] == 3
+        by_cell = {tuple(c["overrides"].values()): c for c in done["cells"][tu.TUNE]}
+        assert by_cell[(0.5,)]["run_id"] == run["run_id"]   # never replayed
+        assert "run_id" not in by_cell[(0.75,)]             # swept here
+        assert tu.reused_count(done) == 1
+
+    def test_the_picks_reused_test_replay_is_counted_once(self, store, stub_model, tuning_dir):
+        """A swept test grid already holds the pick's test cell, so counting
+        `best_test` again would claim more replays than the job has."""
+        dataset = {"name": "e", "days": [str(TEST_DAY)], "feed": sim_data.DEFAULT_FEED,
+                   "symbols": [TICKER]}
+        job = self.job(test_dataset=dataset, sweep_test_grid=True)
+        runs = [stored_run(tu.make_config(job["base"], o), days)
+                for o in ({"buy_k": 0.5}, {"buy_k": 0.75}, {})
+                for days in ([TUNE_DAY], [TEST_DAY])]
+        record = tu.submit(job, launch=False, runs=runs)
+        done = tu.run_job(record["job_id"], progress=lambda m: None)
+        assert done["progress"] == {"done": 6, "total": 6, "reused": 6}
+        assert tu.reused_count(done) == 6
+        assert done["best_test"]["run_id"]
+
+    def test_nothing_stored_leaves_the_job_exactly_as_it_was(
+        self, store, stub_model, tuning_dir
+    ):
+        record = tu.submit(self.job(), launch=False, runs=[])
+        done = tu.run_job(record["job_id"], progress=lambda m: None)
+        assert done["progress"] == {"done": 3, "total": 3, "reused": 0}
+        assert tu.reused_count(done) == 0
+        assert len(done["cells"][tu.TUNE]) == 2 and tu.is_scored(done["baseline"][tu.TUNE])
+
+    def test_a_reused_cell_is_what_the_sweep_would_have_produced(
+        self, store, stub_model, tuning_dir, monkeypatch, tmp_path
+    ):
+        """The claim the whole feature rests on: a stored run of a cell's
+        configuration scores as that cell, down to the session."""
+        from simlab import results as sim_results
+
+        monkeypatch.setattr(sim_results, "RUNS_DIR", tmp_path / "runs")
+        job = self.job()
+        overrides = {"buy_k": 0.5}
+        swept = tu.evaluate(job["tune_dataset"], job["base"], overrides, job["starting_cash"])
+
+        config = tu.make_config(job["base"], overrides)
+        market = SimMarket([TICKER], [TUNE_DAY], job["tune_dataset"]["feed"])
+        result = SimulationEngine(market, SimulationConfig(
+            personality=APPLE_TRADER_KEY, provider="rules", model="x", api_key="",
+            symbols=[TICKER], days=[TUNE_DAY], starting_cash=job["starting_cash"],
+            rule_config=asdict(config), feed=job["tune_dataset"]["feed"],
+        )).run()
+        saved = sim_results.save_run(result, {}, dataset_name="d")
+
+        reused = tu.prior_cell(
+            tu.index_runs([saved]), job, job["tune_dataset"], overrides
+        )
+        assert reused["run_id"] == saved["run_id"]
+        for field in ("profit", "return_pct", "trades", "sells", "days_up", "worst_day",
+                      "daily", "no_forecast_days"):
+            assert reused[field] == swept[field], field
+
+
 # --- the replay speed-ups ---------------------------------------------------
 
 

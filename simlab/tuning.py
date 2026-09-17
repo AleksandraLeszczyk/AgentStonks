@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 from agent_stonks.apple_trader import (
@@ -56,6 +57,7 @@ from agent_stonks.apple_trader import (
     RULE_PROVIDER,
     AppleTraderConfig,
     config_signature,
+    model_ticker_error,
 )
 from agent_stonks.config import (
     BREACH_LABELS,
@@ -242,15 +244,21 @@ def value_label(name: str, value) -> str:
 SECONDS_PER_SESSION = 0.25
 
 
-def estimated_seconds(spec: dict) -> float:
-    """Roughly how long a job takes, from its replay count and session counts."""
+def estimated_seconds(spec: dict, prior: "dict | None" = None) -> float:
+    """Roughly how long a job takes, from its replay count and session counts.
+
+    `prior` is `prior_cells`' answer: those replays are already on disk and the
+    job skips them, so they cost nothing but still count towards its total.
+    """
     cells = len(grid(spec["axes"]))
-    sessions = (cells + 1) * len(spec["tune_dataset"]["days"])
+    prior = prior or {}
+    sessions = (cells + 1 - len(prior.get(TUNE) or ())) * len(spec["tune_dataset"]["days"])
     test = spec.get("test_dataset")
     if test:
-        sessions += ((cells if spec.get("sweep_test_grid") else 1) + 1) * len(test["days"])
+        planned = (cells if spec.get("sweep_test_grid") else 1) + 1
+        sessions += (planned - len(prior.get(TEST) or ())) * len(test["days"])
     workers = max(1, min(int(spec.get("workers") or 1), total_replays(spec)))
-    return SECONDS_PER_SESSION * sessions / workers
+    return SECONDS_PER_SESSION * max(sessions, 0) / workers
 
 
 # --- the grid ---------------------------------------------------------------
@@ -447,6 +455,293 @@ def is_scored(cell: "dict | None") -> bool:
     return bool(cell) and "invalid" not in cell and not cell.get("error")
 
 
+# --- cells a stored run already answers -------------------------------------
+#
+# A tuning cell and a Simulate run are the same thing: `evaluate` builds the
+# identical `SimulationConfig` the Simulate tab does and hands it to the same
+# engine. So a cell whose configuration, sessions, tape and starting cash match
+# a run already in the store has an answer on disk, and replaying it would
+# produce that answer again -- the replay is deterministic, which is what
+# `test_a_cell_is_exactly_a_simulate_run` pins.
+#
+# Two uses follow from that. The Tuning form draws the grid a job *would*
+# sweep filled in wherever the store already covers it, before anything is
+# queued; and the job itself is seeded with those cells and only replays the
+# holes.
+#
+# What has to match is every field of the decoded configuration -- not the
+# signature, which deliberately leaves out `flatten_before_close_min` and
+# writes a switched-off exit as nothing, so two runs that share one are not
+# necessarily the same replay. Records are decoded through `make_config`
+# first, so a run stored before a field existed matches the cell that means
+# what it meant then rather than falling out for lack of a key.
+
+
+def overrides_key(overrides: "dict | None") -> str:
+    """One cell's overrides as a dict key, independent of the order they were
+    written in."""
+    return json.dumps(overrides or {}, sort_keys=True)
+
+
+def _days_key(days) -> "tuple[str, ...]":
+    """A dataset's sessions as an order-independent key -- the tape a replay
+    reads, not the order a form listed it in."""
+    return tuple(sorted(str(d)[:10] for d in days or ()))
+
+
+def _config_key(config: AppleTraderConfig) -> str:
+    return json.dumps(asdict(config), sort_keys=True, default=str)
+
+
+def _replay_key(config: AppleTraderConfig, days, feed, starting_cash) -> tuple:
+    """Everything that decides what a replay of `config` produces.
+
+    The cash is in it because every metric a grid is read on is a dollar
+    amount, and the tape is because fills differ between feeds -- the same
+    reason the Tuning form warns when the two datasets disagree about it.
+    """
+    return (
+        _config_key(config), str(feed or ""), _days_key(days),
+        round(float(starting_cash or 0.0), 2),
+    )
+
+
+def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
+    """Every file a replay of this configuration reads.
+
+    A replay is a pure function of these: the dataset's minute bars and news
+    for each session, the symbol's daily history, the market indicators, and
+    the saved model's bundle with its sidecar checkpoints.
+
+    The last three are the ones that move. The daily history and the
+    indicators are a rolling store shared by every dataset, not part of the
+    dataset, and refreshing them changes what the day-range model forecasts for
+    sessions that were downloaded months ago -- which moves both levels, and so
+    every fill.
+    """
+    from . import data as sim_data
+    from agent_stonks import apple_models
+
+    symbol = config.ticker.upper()
+    paths = [sim_data.market_path(), sim_data.stored_daily_path(symbol, feed)]
+    for day in days or ():
+        stamp = date.fromisoformat(str(day)[:10])
+        paths.append(sim_data.stored_bars_path(symbol, stamp, feed))
+        paths.append(sim_data.news_path(symbol, stamp))
+    bundle = apple_models.get(config.model_key).path(symbol)
+    paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
+    return paths
+
+
+def _last_changed(paths: "list[Path]") -> "datetime | None":
+    """When any of these files was last written, or None if none exists."""
+    newest = None
+    for path in paths:
+        try:
+            stamp = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        except OSError:
+            continue
+        if newest is None or stamp > newest:
+            newest = stamp
+    return newest
+
+
+def run_is_stale(record: dict) -> bool:
+    """Whether a stored run was made before something it read last changed.
+
+    The reason a match on the configuration and the sessions is not enough. A
+    replay is deterministic given its inputs, but its inputs are files on disk
+    that outlive the run: re-downloading a symbol's daily history rewrites what
+    the day-range model sees, and a run saved before that describes a forecast
+    the same configuration would no longer produce. Seen in the wild -- a run
+    of 2026-09-09 armed its buy at 315.82 off a predicted high of 318.19, and
+    the same replay after the daily file was refreshed on 2026-09-12 arms it at
+    316.00 off 318.40.
+
+    Modification times, not content hashes: a stored record says when it was
+    written and nothing about what it read, so this is the only signal an
+    already-saved run offers. It errs the safe way -- a re-download that wrote
+    identical bytes makes a run look stale and it is replayed again, which
+    costs seconds and cannot produce a wrong number.
+
+    It cannot see a change in *code*, which no timestamp on a data file
+    reports. A rework of the trader's rules therefore wants the affected runs
+    deleted, or reuse switched off for the job.
+    """
+    try:
+        saved = datetime.fromisoformat(str(record.get("created_at")))
+        config = make_config((record.get("config_summary") or {}).get("rule_config") or {}, {})
+    except (TypeError, ValueError):
+        return True
+    if saved.tzinfo is None:
+        return True
+    summary = record.get("config_summary") or {}
+    changed = _last_changed(_replay_inputs(config, summary.get("days"), summary.get("feed")))
+    return changed is not None and changed > saved
+
+
+def run_replay_key(record: dict) -> "tuple | None":
+    """Which replay a stored simulation run *is*, or None if it is not one.
+
+    None covers every run that cannot stand in for a cell: an LLM run, a
+    different rule agent, a run that errored or was interrupted before the end,
+    a rule set this build can no longer decode or would refuse to run (a record
+    naming a removed model -- see `rule_agents._APPLE_LEGACY`), and a run whose
+    inputs have moved on under it (`run_is_stale`).
+
+    A run whose day-range model could not forecast some sessions is *not*
+    excluded: those days are an ordinary part of a replay and `score` reports
+    them (`no_forecast_days`) exactly as it would for a freshly swept cell.
+    """
+    config = record.get("config_summary") or {}
+    if config.get("personality") != APPLE_TRADER_KEY or not config.get("rule_based"):
+        return None
+    if record.get("error") or record.get("interrupted") or not (record.get("cycles_run") or 0):
+        return None
+    try:
+        decoded = make_config(config.get("rule_config") or {}, {})
+    except (TypeError, ValueError):
+        return None
+    if model_ticker_error(decoded) is not None:
+        return None
+    if run_is_stale(record):
+        return None
+    return _replay_key(
+        decoded, config.get("days"), config.get("feed"), config.get("starting_cash")
+    )
+
+
+def score_run(record: dict, days: "list[date]") -> dict:
+    """A stored run scored as a grid cell.
+
+    A saved record carries the engine's own result at its top level
+    (`results.save_run` spreads `asdict(result)` into it), so this is the same
+    `score` call `evaluate` makes on a fresh replay, over the same fields.
+    """
+    return score(SimpleNamespace(**record), days)
+
+
+def runs_for_pair(runs: "list[dict]", ticker: str, model_key: str) -> "list[dict]":
+    """Stored Apple Trader runs for one instrument and one saved model.
+
+    The pair a tuning grid is about: the model decides which rules exist and
+    the symbol is part of the model's identity, so no run outside the pair can
+    ever answer one of its cells. Used for the Tuning form's count of what the
+    store holds -- how much of it lands on *this* grid is `prior_cells`.
+    """
+    wanted = str(ticker or "").strip().upper()
+    found = []
+    for record in runs:
+        config = record.get("config_summary") or {}
+        if config.get("personality") != APPLE_TRADER_KEY or not config.get("rule_based"):
+            continue
+        rule_config = config.get("rule_config") or {}
+        if str(rule_config.get("ticker") or "").strip().upper() != wanted:
+            continue
+        if str(rule_config.get("model_key") or "") == str(model_key or ""):
+            found.append(record)
+    return found
+
+
+def index_runs(runs: "list[dict]") -> "dict[tuple, dict]":
+    """Stored runs keyed by the replay each one is, newest first wins.
+
+    Newest rather than best, deliberately: two runs with the same key are the
+    same replay of the same configuration over the same tape, so they agree,
+    and where a code change has made them disagree the later one is the one
+    this build would produce.
+    """
+    index: "dict[tuple, dict]" = {}
+    for record in runs:
+        key = run_replay_key(record)
+        if key is not None:
+            index.setdefault(key, record)
+    return index
+
+
+def prior_cell(
+    index: "dict[tuple, dict]", spec: dict, dataset: dict, overrides: dict
+) -> "dict | None":
+    """One grid cell answered out of the run index, or None if nothing matches.
+
+    An invalid combination is never looked up: it is a hole in the grid, and
+    the caller marks it as one.
+    """
+    try:
+        config = make_config(spec["base"], overrides)
+    except (TypeError, ValueError):
+        return None
+    record = index.get(
+        _replay_key(config, dataset.get("days"), dataset.get("feed"), spec["starting_cash"])
+    )
+    if record is None:
+        return None
+    days = [date.fromisoformat(str(d)[:10]) for d in dataset["days"]]
+    return {
+        "overrides": dict(overrides),
+        "run_id": record.get("run_id") or "",
+        "run_dataset": record.get("dataset") or "",
+        **score_run(record, days),
+    }
+
+
+def prior_cells(
+    spec: dict, runs: "list[dict] | None" = None
+) -> "dict[str, dict[str, dict]]":
+    """Every cell of this job's grid the run store already answers.
+
+    Returns `{role: {overrides_key: cell}}` for the tuning and test datasets,
+    with the baseline under `overrides_key({})`. The test grid is only looked
+    up when the job would sweep it -- a job that does not sweep it is not
+    asking about those cells, and half-filling a heatmap it never draws would
+    put rows in Results tables for a comparison nobody asked for. Its baseline
+    is looked up either way, since every job with a test dataset replays that.
+
+    Nothing here runs a replay, so this is cheap enough for the form to call on
+    every rerun -- it parses the store (cached upstream) and scores the records
+    that land on the grid.
+    """
+    found: "dict[str, dict[str, dict]]" = {TUNE: {}, TEST: {}}
+    if not spec.get("reuse_runs", True):
+        return found
+    if runs is None:
+        from .results import list_runs
+
+        runs = list_runs()
+    index = index_runs(runs)
+    if not index:
+        return found
+    cells = grid(spec["axes"])
+    for role, dataset, swept in (
+        (TUNE, spec.get("tune_dataset"), True),
+        (TEST, spec.get("test_dataset"), bool(spec.get("sweep_test_grid"))),
+    ):
+        if not dataset:
+            continue
+        for overrides in ([*cells, {}] if swept else [{}]):
+            cell = prior_cell(index, spec, dataset, overrides)
+            if cell is not None:
+                found[role][overrides_key(overrides)] = cell
+    return found
+
+
+def reused_count(record: dict) -> int:
+    """How many of a job's replays came out of the run store rather than a
+    fresh sweep -- countable against `progress["total"]`.
+
+    `best_test` is only its own replay when the test grid was not swept; where
+    it was, the pick's test cell is already one of `cells[TEST]` and counting
+    it again would claim more replays than the job has.
+    """
+    cells = [
+        *record["cells"][TUNE], *record["cells"][TEST],
+        record["baseline"].get(TUNE), record["baseline"].get(TEST),
+    ]
+    if not record["spec"].get("sweep_test_grid"):
+        cells.append(record.get("best_test"))
+    return sum(1 for c in cells if c and c.get("run_id"))
+
+
 # --- picking ----------------------------------------------------------------
 
 
@@ -591,12 +886,25 @@ def validate(spec: dict) -> "str | None":
     return None
 
 
-def submit(spec: dict, launch: bool = True) -> dict:
-    """Store a job and start its worker. Raises ValueError for an invalid spec."""
+def submit(spec: dict, launch: bool = True, runs: "list[dict] | None" = None) -> dict:
+    """Store a job and start its worker. Raises ValueError for an invalid spec.
+
+    The record is seeded with every cell the run store already answers
+    (`prior_cells`), so the heatmap is partly drawn the moment the job appears
+    and the worker only replays the holes. Those cells count as done against
+    the job's full total, which stays what the grid asks for -- a job that
+    reused half its grid ran the whole grid, it just did not have to replay it.
+
+    `runs` is the already-parsed store when the caller has one (the UI caches
+    it); left out, the store is read here.
+    """
     problem = validate(spec)
     if problem:
         raise ValueError(problem)
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    prior = prior_cells(spec, runs)
+    base_key = overrides_key({})
+    reused = sum(len(found) for found in prior.values())
     record = {
         "job_id": job_id,
         "created_at": _now_iso(),
@@ -605,9 +913,12 @@ def submit(spec: dict, launch: bool = True) -> dict:
         "pid": None,
         "error": None,
         "spec": spec,
-        "progress": {"done": 0, "total": total_replays(spec)},
-        "cells": {TUNE: [], TEST: []},
-        "baseline": {TUNE: None, TEST: None},
+        "progress": {"done": reused, "total": total_replays(spec), "reused": reused},
+        "cells": {
+            role: [cell for key, cell in prior[role].items() if key != base_key]
+            for role in (TUNE, TEST)
+        },
+        "baseline": {role: prior[role].get(base_key) for role in (TUNE, TEST)},
         "best": None,
         "best_test": None,
     }
@@ -707,8 +1018,26 @@ def _run_tasks(
             on_done(role, kind, future.result())
 
 
+def _stored_cell(spec: dict, dataset: dict, overrides: dict) -> "dict | None":
+    """One cell answered out of the run store, reading the store on the spot.
+
+    `prior_cells` covers everything a job knows about at submit; this is for
+    the one replay it cannot -- the pick's, on a test dataset whose grid is not
+    being swept, since which cell wins is only settled once the sweep is done.
+    """
+    if not spec.get("reuse_runs", True):
+        return None
+    from .results import list_runs
+
+    return prior_cell(index_runs(list_runs()), spec, dataset, overrides)
+
+
 def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
-    """Sweep, pick, test -- the whole job, writing the record as it goes."""
+    """Sweep, pick, test -- the whole job, writing the record as it goes.
+
+    Only the replays the record does not already hold are run: `submit` seeds
+    it with every cell the run store answers, and what is left is the holes.
+    """
     record = get_job(job_id)
     if record is None:
         raise RuntimeError(f"unknown tuning job {job_id}")
@@ -733,11 +1062,19 @@ def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
             f"{kind} {result['overrides'] or 'base'}: {detail}"
         )
 
-    first = [(TUNE, "cell", c) for c in cells] + [(TUNE, BASELINE, {})]
+    def missing(role: str) -> "list[dict]":
+        """The grid's cells this record has no answer for yet, in grid order."""
+        have = {overrides_key(c["overrides"]) for c in record["cells"][role]}
+        return [c for c in cells if overrides_key(c) not in have]
+
+    first = [(TUNE, "cell", c) for c in missing(TUNE)]
+    if record["baseline"][TUNE] is None:
+        first.append((TUNE, BASELINE, {}))
     if has_test:
-        first.append((TEST, BASELINE, {}))
+        if record["baseline"][TEST] is None:
+            first.append((TEST, BASELINE, {}))
         if spec.get("sweep_test_grid"):
-            first += [(TEST, "cell", c) for c in cells]
+            first += [(TEST, "cell", c) for c in missing(TEST)]
     _run_tasks(first, spec, workers, on_done)
 
     record["cells"][TUNE].sort(key=lambda c: cells.index(c["overrides"]))
@@ -756,10 +1093,23 @@ def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
                 (c for c in record["cells"][TEST] if c["overrides"] == best["overrides"]), None
             )
     elif has_test:
-        if best is not None:
-            _run_tasks([(TEST, "pick", best["overrides"])], spec, 1, on_done)
-        else:
+        if best is None:
             record["progress"]["done"] += 1  # the pick's replay: nothing was eligible
+        else:
+            # The pick is only known now, so its test replay could not be
+            # seeded at submit -- but the store may still answer it.
+            stored = _stored_cell(spec, spec["test_dataset"], best["overrides"])
+            if stored is None:
+                _run_tasks([(TEST, "pick", best["overrides"])], spec, 1, on_done)
+            else:
+                record["best_test"] = stored
+                record["progress"]["done"] += 1
+                record["progress"]["reused"] = record["progress"].get("reused", 0) + 1
+                _write(record)
+                progress(
+                    f"[{record['progress']['done']}/{record['progress']['total']}] {TEST} "
+                    f"pick {best['overrides']}: reused run {stored['run_id']}"
+                )
 
     record.update(status=FINISHED, finished_at=_now_iso())
     _write(record)

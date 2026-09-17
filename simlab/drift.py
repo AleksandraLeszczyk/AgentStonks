@@ -11,9 +11,9 @@ session or week by week beside the dates the training data stopped.
 What each model is scored on
 ----------------------------
 `dayrange`      TimeToChange3's predicted session high and low against the
-                day's actual high and low (the stored daily bar), in the log
-                units its test window reports. Needs the opening minutes, so
-                only sessions with stored minute bars.
+                day's actual high and low (the stored daily bar), as a share of
+                that session's own average daily range. Needs the opening
+                minutes, so only sessions with stored minute bars.
 `intraday_vol`  IntradayVolatility's daily-bar forecast of the log day range
                 against the day's ln(high/low) -- daily bars only, so the whole
                 stored daily history -- plus how well each session's 5-minute
@@ -44,13 +44,16 @@ Which metric stands for a model
 -------------------------------
 Each model tracks several numbers, but one of them is the model's: the
 session-level version of what the ML Models tab prints in its headline column,
-named by `DriftModel.headline`. For the day range and the open profile that is
-literally the same quantity the saved file was graded on -- a MAE in log units,
-an EMD in bps -- so the reference line on the chart is that grade and the series
-is the same measurement taken later. `intraday_vol` is graded by a walk-forward
-R², which is a statistic of a window rather than of a session, so what is
-tracked is the error term inside it; `DriftModel.catalogue_metric` says so on
-screen rather than letting the two pages look interchangeable when they are not.
+named by `DriftModel.headline`. For the open profile that is literally the same
+quantity the saved file was graded on -- an EMD in bps -- so the reference line
+on the chart is that grade and the series is the same measurement taken later.
+The other two are near misses, and `DriftModel.catalogue_metric` says which
+kind on screen rather than letting the two pages look interchangeable when they
+are not: the day range is graded in the same unit (error as a share of ADR) but
+the ML Models tab has only one day's ADR in the saved file to divide by, where
+every session here is divided by its own; `intraday_vol` is graded by a
+walk-forward R², which is a statistic of a window rather than of a session, so
+what is tracked is the error term inside it.
 
 Has it actually moved?
 ----------------------
@@ -572,6 +575,13 @@ def _read_json(path: "Path | None") -> dict:
 
 
 DAYRANGE_METRICS = (
+    Metric("mae_pct_adr", "Mean absolute error as a share of the day's range",
+           "(% of ADR)", "%.1f", ".1f", short="MAE (% of ADR)",
+           help="The dollar error over that session's own 14-day average daily range "
+                "(`adr14_abs`, the same one the trading rules place their levels off). "
+                "A price-free unit, so it reads the same across symbols and across a "
+                "year of price moves — and 50% means the typical miss is half a normal "
+                "day's range."),
     Metric("mae", "Mean absolute error of the high and low", "(log units)",
            short="MAE (log units)",
            help="|log(predicted ÷ actual)| for the session high and for the low, averaged — "
@@ -619,6 +629,14 @@ def dayrange_training_from_metadata(meta: dict) -> dict:
             f"held-out day {held_out}",
         ))
     test = meta.get("test_metrics_ensemble") or {}
+    error_pct = model_catalogue.dayrange_error_pct_adr(meta)
+    if error_pct is not None:
+        references.append(Reference(
+            "mae_pct_adr", error_pct, "Held-out test window",
+            "the ML Models tab's headline: the same test window's error over the 14-day "
+            "range on the bundle's own simulation day, the only ADR the file records — "
+            "an estimate of this ratio rather than a measurement of it",
+        ))
     for metric, field in (
         ("mae", "mae_mean"), ("mae_usd", "mae_usd_mean"),
         ("abs_err_high", "mae_y_high"), ("abs_err_low", "mae_y_low"),
@@ -675,10 +693,17 @@ def evaluate_dayrange(ticker: str, feed: str) -> dict:
         high, low = float(outcome["h"]), float(outcome["l"])
         err_high = math.log(forecast["pred_high"] / high)
         err_low = math.log(forecast["pred_low"] / low)
+        mae_usd = (abs(forecast["pred_high"] - high) + abs(forecast["pred_low"] - low)) / 2
+        # The session's own trailing range, which the forecast already carries
+        # because the trading rules need it. None rather than a guess when the
+        # bundle could not compute one: an unscored session is a gap in the
+        # series, which the chart draws as a gap.
+        adr = float(forecast.get("adr14_abs") or 0.0)
         rows.append({
             "date": iso,
+            "mae_pct_adr": 100.0 * mae_usd / adr if adr > 0 else None,
             "mae": (abs(err_high) + abs(err_low)) / 2,
-            "mae_usd": (abs(forecast["pred_high"] - high) + abs(forecast["pred_low"] - low)) / 2,
+            "mae_usd": mae_usd,
             "abs_err_high": abs(err_high),
             "abs_err_low": abs(err_low),
             "bias_high": err_high,
@@ -959,10 +984,12 @@ MODELS: "dict[str, DriftModel]" = {
         metrics=DAYRANGE_METRICS,
         evaluate=evaluate_dayrange,
         training=dayrange_training,
-        headline="mae",
+        headline="mae_pct_adr",
         catalogue_metric=(
-            "MAE (log units) — the same quantity the ML Models tab reports, on later "
-            "sessions instead of the held-out test window"
+            "MAE (% of ADR) — the same quantity the ML Models tab reports, on later "
+            "sessions instead of the held-out test window, and divided by each "
+            "session's own average daily range rather than by the one day's ADR the "
+            "saved file records"
         ),
     ),
     "intraday_vol": DriftModel(

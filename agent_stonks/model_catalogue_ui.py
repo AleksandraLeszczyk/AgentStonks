@@ -286,7 +286,7 @@ def model_catalogue_panel() -> None:
     st.markdown(_model_overview_html(grouped), unsafe_allow_html=True)
     st.caption(
         ":material/info: The headline metrics are **not comparable across rows** — a "
-        "day-range MAE in log units and an EMD in "
+        "day-range error as a share of ADR and an EMD in "
         "bps answer different questions on different data. Read each model's own "
         "section for what its number does and does not say."
     )
