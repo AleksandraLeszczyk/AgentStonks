@@ -777,6 +777,187 @@ class TestPriorRuns:
         assert [r["run_id"] for r in found] == ["mine"]
 
 
+class TestDerivedGrids:
+    """Tuning grids nobody submitted, read out of the run store.
+
+    The mirror of `TestPriorRuns`: that asks which runs answer a grid somebody
+    described, this asks which grids the runs describe by themselves -- runs
+    agreeing on everything but one or two tunable fields, over the same
+    sessions, tape and starting cash.
+    """
+
+    def base(self, **overrides) -> AppleTraderConfig:
+        return AppleTraderConfig(**{
+            "ticker": TICKER, "buy_k": 0.75, "sell_k": 0.10, "momentum_drop": 1.0,
+            **overrides,
+        })
+
+    def runs(self, configs, days=(TUNE_DAY,), **kwargs) -> "list[dict]":
+        """Newest first, as `results.list_runs` hands them over."""
+        return [
+            stored_run(config, list(days), run_id=f"r{i}", **kwargs)
+            for i, config in enumerate(configs)
+        ]
+
+    def test_runs_differing_in_one_field_are_a_one_axis_grid(self):
+        runs = self.runs([self.base(buy_k=k) for k in (0.9, 0.8, 0.7)])
+        [job] = tu.derived_jobs(runs)
+        assert job["status"] == tu.DERIVED and tu.is_derived(job)
+        assert job["spec"]["axes"] == [{"name": "buy_k", "values": [0.7, 0.8, 0.9]}]
+        assert [c["overrides"]["buy_k"] for c in job["cells"][tu.TUNE]] == [0.7, 0.8, 0.9]
+        assert all(c["run_id"] for c in job["cells"][tu.TUNE])
+
+    def test_a_two_axis_grid_keeps_its_holes(self):
+        """The point of the whole thing: the lattice is the product of the
+        values seen, so a combination nobody ran is a blank square."""
+        runs = self.runs([
+            self.base(buy_k=b, sell_k=s)
+            for b, s in ((0.7, 0.1), (0.7, 0.2), (0.9, 0.1))
+        ])
+        [job] = tu.derived_jobs(runs)
+        assert [a["values"] for a in job["spec"]["axes"]] == [[0.7, 0.9], [0.1, 0.2]]
+        assert len(job["cells"][tu.TUNE]) == 3
+        assert len(tu.grid(job["spec"]["axes"])) == 4
+        assert job["progress"] == {"done": 4, "total": 5, "reused": 4}
+
+    def test_a_regular_sweep_with_a_step_missing_shows_the_hole(self):
+        """Observed values alone can never leave a gap on one axis — every
+        value is there because a run had it — so the swept step is inferred."""
+        runs = self.runs([
+            self.base(momentum_drop=m) for m in (0.0, 0.4, 0.8, 1.6, 2.0)
+        ])
+        [job] = tu.derived_jobs(runs)
+        assert job["spec"]["axes"][0]["values"] == [0.0, 0.4, 0.8, 1.2, 1.6, 2.0]
+        assert len(job["cells"][tu.TUNE]) == 5
+        assert job["progress"] == {"done": 6, "total": 7, "reused": 6}
+
+    def test_settings_that_are_not_a_sweep_are_left_alone(self):
+        """Three values somebody tried are three settings, not a fine sweep
+        riddled with holes."""
+        runs = self.runs([self.base(buy_k=k) for k in (0.40, 0.45, 0.75)])
+        [job] = tu.derived_jobs(runs)
+        assert job["spec"]["axes"][0]["values"] == [0.40, 0.45, 0.75]
+
+    def test_a_filled_value_is_carried_through_as_it_was_stored(self):
+        """A cell is looked up by its overrides and 0.7 + 0.1 is not 0.8, so
+        the inferred axis has to hand back the stored floats."""
+        values = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        [job] = tu.derived_jobs(self.runs([self.base(buy_k=k) for k in values]))
+        axis = job["spec"]["axes"][0]
+        assert axis["values"] == values
+        assert all(c["overrides"]["buy_k"] in axis["values"] for c in job["cells"][tu.TUNE])
+        assert job["best"] is not None  # pick_best indexes the axis by value
+
+    def test_an_integer_axis_stays_integer(self):
+        runs = self.runs([
+            self.base(flatten_before_close_min=m) for m in (2, 4, 8, 10)
+        ])
+        [job] = tu.derived_jobs(runs)
+        assert job["spec"]["axes"][0]["values"] == [2, 4, 6, 8, 10]
+        assert all(isinstance(v, int) for v in job["spec"]["axes"][0]["values"])
+
+    def test_a_field_that_never_moved_is_not_an_axis(self):
+        runs = self.runs([self.base(buy_k=k) for k in (0.7, 0.8, 0.9)])
+        [job] = tu.derived_jobs(runs)
+        assert [a["name"] for a in job["spec"]["axes"]] == ["buy_k"]
+
+    def test_runs_over_different_sessions_are_different_grids(self):
+        configs = [self.base(buy_k=k) for k in (0.7, 0.8, 0.9)]
+        runs = self.runs(configs) + [
+            stored_run(c, [TEST_DAY], run_id=f"t{i}") for i, c in enumerate(configs)
+        ]
+        jobs = tu.derived_jobs(runs)
+        assert len(jobs) == 2
+        assert {j["spec"]["tune_dataset"]["days"][0] for j in jobs} == {
+            str(TUNE_DAY), str(TEST_DAY)
+        }
+
+    def test_runs_at_different_starting_cash_are_different_grids(self):
+        configs = [self.base(buy_k=k) for k in (0.7, 0.8, 0.9)]
+        runs = self.runs(configs) + [
+            stored_run(c, [TUNE_DAY], run_id=f"c{i}", cash=50_000.0)
+            for i, c in enumerate(configs)
+        ]
+        assert len(tu.derived_jobs(runs)) == 2
+
+    def test_a_setting_outside_the_axes_splits_the_grid(self):
+        """Two momentum sweeps at two breach policies are two grids, not one
+        surface with each cell run twice."""
+        runs = self.runs([
+            self.base(momentum_drop=m, breach_update=b)
+            for b in ("off", "extreme") for m in (0.0, 1.0, 2.0)
+        ])
+        jobs = tu.derived_jobs(runs)
+        assert len(jobs) == 2
+        assert {j["spec"]["base"]["breach_update"] for j in jobs} == {"off", "extreme"}
+        assert all([a["name"] for a in j["spec"]["axes"]] == ["momentum_drop"] for j in jobs)
+
+    def test_a_grid_inside_a_denser_one_is_not_offered_as_well(self):
+        """A full two-axis sweep would otherwise also appear as each of its
+        rows and each of its columns."""
+        runs = self.runs([
+            self.base(buy_k=b, sell_k=s)
+            for b in (0.7, 0.8, 0.9) for s in (0.1, 0.2, 0.3)
+        ])
+        [job] = tu.derived_jobs(runs)
+        assert [a["name"] for a in job["spec"]["axes"]] == ["buy_k", "sell_k"]
+        assert len(job["cells"][tu.TUNE]) == 9
+
+    def test_too_few_runs_to_be_a_sweep(self):
+        runs = self.runs([self.base(buy_k=k) for k in (0.7, 0.9)])
+        assert tu.MIN_DERIVED_CELLS == 3 and tu.derived_jobs(runs) == []
+
+    def test_runs_that_could_not_answer_a_cell_never_invent_a_grid(self):
+        """Stale, unfinished and undecodable runs are refused as cells
+        (`run_replay_key`), so they cannot make a grid either."""
+        configs = [self.base(buy_k=k) for k in (0.7, 0.8, 0.9)]
+        runs = self.runs(configs)
+        runs[0]["created_at"] = "2026-06-01T12:00:00+00:00"  # older than its inputs
+        runs[1]["interrupted"] = True
+        assert tu.derived_jobs(runs) == []
+
+    def test_the_newest_run_is_the_base_and_the_baseline(self):
+        runs = self.runs([self.base(buy_k=k) for k in (0.9, 0.8, 0.7)])  # r0 is newest
+        [job] = tu.derived_jobs(runs)
+        assert job["spec"]["base"]["buy_k"] == 0.9
+        assert job["baseline"][tu.TUNE]["run_id"] == "r0"
+        # The baseline reads as a job's does -- the configuration with nothing
+        # overridden -- whichever cell of the grid it happens to sit on.
+        assert job["baseline"][tu.TUNE]["overrides"] == {}
+        assert job["baseline"][tu.TEST] is None and job["cells"][tu.TEST] == []
+
+    def test_the_best_cell_is_the_highest_profit(self):
+        runs = self.runs([self.base(buy_k=k) for k in (0.7, 0.8, 0.9)])
+        # `stored_run` pays 100 a session, so every cell ties; the pick then
+        # goes to the first in grid order, as `pick_best` promises.
+        [job] = tu.derived_jobs(runs)
+        assert job["best"]["overrides"] == {"buy_k": 0.7}
+
+    def test_an_id_survives_a_new_run_filling_a_hole(self):
+        """The selection has to hold across a rerun, so the id is hashed from
+        what defines the grid rather than from the runs in it."""
+        configs = [self.base(buy_k=b, sell_k=s)
+                   for b, s in ((0.7, 0.1), (0.7, 0.2), (0.9, 0.1))]
+        [before] = tu.derived_jobs(self.runs(configs))
+        filled = self.runs([*configs, self.base(buy_k=0.9, sell_k=0.2)])
+        [after] = tu.derived_jobs(filled)
+        assert before["job_id"] == after["job_id"]
+        assert len(after["cells"][tu.TUNE]) == 4
+
+    def test_the_grid_is_submittable_as_a_real_job(self, tuning_dir):
+        """The one action a derived grid offers: it becomes a job that reuses
+        every cell already on it and replays only the holes."""
+        runs = self.runs([
+            self.base(buy_k=b, sell_k=s)
+            for b, s in ((0.7, 0.1), (0.7, 0.2), (0.9, 0.1))
+        ])
+        [job] = tu.derived_jobs(runs)
+        assert tu.validate(job["spec"]) is None
+        record = tu.submit(job["spec"], launch=False, runs=runs)
+        assert record["progress"]["reused"] == 4  # 3 cells and the baseline
+        assert record["progress"]["total"] == 5   # the 4-cell grid and the baseline
+
+
 class TestSeededJob:
     """A job starts with what the run store already answers and replays the rest."""
 

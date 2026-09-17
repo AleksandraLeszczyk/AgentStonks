@@ -3158,17 +3158,82 @@ def _tuning_metric_text(metric: str, value) -> str:
     return f"{value:g}"
 
 
-def _tuning_job_label(job: dict, markdown: bool = True) -> str:
+# Two settings a derived grid can differ by that are not numbers, in the short
+# form `config_signature` writes them as — `breach=brownian`, `levels=intraday`
+# — since that is what they are called everywhere else in this app.
+_SHORT_FIELD_LABELS = {"breach_update": "breach", "level_source": "levels"}
+
+
+def _field_text(name: str, value) -> str:
+    """One configuration field as `label value`, compactly enough for a label."""
+    if name in sim_tuning.TUNABLES:
+        return f"{_tuning_param_label(name)} {_tuning_value(name, value)}"
+    return f"{_SHORT_FIELD_LABELS.get(name, name)} {value}"
+
+
+def _derived_discriminators(jobs: list[dict]) -> dict[str, str]:
+    """For each derived grid, the shared settings that tell it from its look-alikes.
+
+    Several grids over the same instrument, axes and dataset are common and
+    read identically otherwise — the run store holds one momentum sweep per
+    breach policy, say. What separates them is a setting none of them sweeps,
+    so it appears nowhere else in the label; this diffs the base configurations
+    within each look-alike group and names only the fields that actually move.
+
+    The base configurations are diffed rather than their signatures because a
+    signature omits a setting that is switched off, and "off" is exactly the
+    variant that would otherwise have nothing to show.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for job in jobs:
+        if not sim_tuning.is_derived(job):
+            continue
+        spec = job["spec"]
+        key = (
+            spec["base"]["ticker"],
+            tuple(a["name"] for a in spec["axes"]),
+            spec["tune_dataset"]["name"],
+        )
+        groups.setdefault(key, []).append(job)
+    text: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        axes = {a["name"] for a in group[0]["spec"]["axes"]}
+        moving = [
+            name
+            for name in group[0]["spec"]["base"]
+            if name not in axes
+            and len({json.dumps(j["spec"]["base"].get(name), default=str) for j in group}) > 1
+        ]
+        for job in group:
+            text[job["job_id"]] = ", ".join(
+                _field_text(name, job["spec"]["base"].get(name)) for name in moving
+            )
+    return text
+
+
+def _tuning_job_label(job: dict, markdown: bool = True, detail: str = "") -> str:
     spec = job["spec"]
     params = " × ".join(_tuning_param_label(a["name"]) for a in spec["axes"])
     tick = "`" if markdown else ""
+    ticker = spec["base"]["ticker"]
+    head = f"{f'**{ticker}**' if markdown else ticker} · {params}"
+    started = (job.get("created_at") or "")[:16].replace("T", " ")
+    if sim_tuning.is_derived(job):
+        filled, total = len(job["cells"]["tune"]), len(sim_tuning.grid(spec["axes"]))
+        route = (
+            f"{filled}/{total} cells from stored runs on "
+            f"{tick}{spec['tune_dataset']['name']}{tick}"
+        )
+        return " · ".join(
+            part for part in (head, route, detail, f"newest run {started} UTC") if part
+        )
     test = (spec.get("test_dataset") or {}).get("name")
     route = f"tune {tick}{spec['tune_dataset']['name']}{tick}" + (
         f" → test {tick}{test}{tick}" if test else ""
     )
-    ticker = spec["base"]["ticker"]
-    started = (job.get("created_at") or "")[:16].replace("T", " ")
-    return f"{f'**{ticker}**' if markdown else ticker} · {params} · {route} · {started} UTC"
+    return f"{head} · {route} · {started} UTC"
 
 
 def render_tuning_tab() -> None:
@@ -3181,12 +3246,25 @@ def render_tuning_tab() -> None:
         "on the test dataset is the result worth reading."
     )
     _render_tuning_jobs()
-    jobs = sim_tuning.list_jobs()
-    with st.expander("New tuning job", icon=":material/tune:", expanded=not jobs):
+    submitted = sim_tuning.list_jobs()
+    with st.expander("New tuning job", icon=":material/tune:", expanded=not submitted):
         _render_tuning_form()
+    # Derived grids are offered beside the submitted jobs rather than in their
+    # own section: they answer the same question in the same shape, and the
+    # useful comparison is between a grid somebody swept and a grid the store
+    # already held -- which is hard to make across two lists.
+    jobs = submitted + _derived_jobs(sim_results.store_signature())
     if jobs:
         st.divider()
         _render_tuning_results(jobs)
+
+
+@st.cache_data(show_spinner=False)
+def _derived_jobs(signature: tuple) -> list[dict]:
+    # `signature` is the cache key and is deliberately unused -- see `_load_runs`.
+    # Cached because assembling these scores every run that lands on a grid, and
+    # the tab re-renders on every widget touch.
+    return sim_tuning.derived_jobs(_load_runs(signature))
 
 
 def _render_tuning_jobs() -> None:
@@ -3713,7 +3791,7 @@ def _render_tuning_notes(job: dict) -> None:
                 "configuration traded them. The usual cause is too little daily history "
                 "before the dataset's first day."
             )
-    reused = sim_tuning.reused_count(job)
+    reused = 0 if sim_tuning.is_derived(job) else sim_tuning.reused_count(job)
     if reused:
         st.caption(
             f":material/history: {reused} of this job's {job['progress']['total']} replays "
@@ -3730,13 +3808,87 @@ def _render_tuning_notes(job: dict) -> None:
         )
 
 
+def _render_derived_header(job: dict) -> None:
+    """What a derived grid is, and the offer to finish it.
+
+    Nobody submitted this one: it is the stored runs that happen to agree on
+    everything except its axes, read as the grid they describe. So it comes
+    with the caveats a submitted job does not have — no test dataset, no base
+    configuration anyone nominated, no pick rule — and the one action worth
+    offering is to turn it into a real job, which replays the holes and reuses
+    every cell already on screen.
+    """
+    spec = job["spec"]
+    axes = spec["axes"]
+    cells = sim_tuning.grid(axes)
+    filled = len(job["cells"]["tune"])
+    missing = len(cells) - filled
+    st.info(
+        f"**Assembled from {filled} stored run{'s' if filled != 1 else ''}**, not swept as a "
+        "job. They agree on every setting except "
+        + " and ".join(f"**{_tuning_param_label(a['name'])}**" for a in axes)
+        + f", so they read as a grid of {' × '.join(str(len(a['values'])) for a in axes)} "
+        f"over `{spec['tune_dataset']['name']}` — "
+        + (
+            f"{missing} of its {len(cells)} combinations nobody has run, left blank below."
+            if missing else "and every combination has been run."
+        ),
+        icon=":material/auto_awesome_mosaic:",
+    )
+    st.caption(
+        "Incomplete by construction: there is no test dataset, the base configuration "
+        "marked on the grid is simply the most recent of these runs, and the pick is the "
+        "highest cell with no minimum share of days traded — nobody chose any of that. "
+        "Read it as what has been tried, not as a tuned answer."
+    )
+    if not missing:
+        return
+    workers = min(4, max(1, (os.cpu_count() or 2) - 1))
+    spec = {**spec, "workers": workers}
+    problem = sim_tuning.validate(spec)
+    if problem:
+        st.caption(f":material/block: This grid cannot be submitted as a job: {problem}")
+        return
+    # What the job would reuse is this grid's own cells -- it was assembled by
+    # the same match `prior_cells` makes -- so the estimate reads them off the
+    # job rather than scoring the whole store again.
+    filled_cells = {
+        sim_tuning.TUNE: {
+            sim_tuning.overrides_key(c["overrides"]): c
+            for c in [*job["cells"]["tune"], job["baseline"]["tune"]] if c
+        },
+        sim_tuning.TEST: {},
+    }
+    minutes = sim_tuning.estimated_seconds(spec, filled_cells) / 60.0
+    duration = "under a minute" if minutes < 1 else f"roughly {minutes:.0f} min"
+    with st.container(horizontal=True, vertical_alignment="center"):
+        if st.button(
+            f"Sweep the {missing} missing combination{'s' if missing != 1 else ''}",
+            icon=":material/play_arrow:", type="primary", key=f"tune_fill_{job['job_id']}",
+            help="Queues a real tuning job over this grid. The cells above are reused as "
+            "they are, so only the blanks are replayed.",
+        ):
+            record = sim_tuning.submit(spec, runs=_runs())
+            st.session_state["tune_selected_job"] = record["job_id"]
+            st.toast("Tuning job started", icon=":material/tune:")
+            st.rerun()
+        st.caption(
+            f"{duration} with {workers} workers. To add a test dataset, a metric or a "
+            "wider range, copy these settings into **New tuning job** instead."
+        )
+
+
 def _render_tuning_results(jobs: list[dict]) -> None:
     st.markdown("##### :material/grid_on: Tuning results")
     ids = [j["job_id"] for j in jobs]
     wanted = st.session_state.get("tune_selected_job")
+    detail = _derived_discriminators(jobs)
     job_id = st.selectbox(
         "Tuning job", ids, index=ids.index(wanted) if wanted in ids else 0,
-        format_func={j["job_id"]: _tuning_job_label(j, markdown=False) for j in jobs}.get,
+        format_func={
+            j["job_id"]: _tuning_job_label(j, markdown=False, detail=detail.get(j["job_id"], ""))
+            for j in jobs
+        }.get,
     )
     job = next(j for j in jobs if j["job_id"] == job_id)
     spec = job["spec"]
@@ -3751,6 +3903,8 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             f"This job did not finish ({job.get('error')}). What was swept before it "
             "stopped is shown below."
         )
+    elif sim_tuning.is_derived(job):
+        _render_derived_header(job)
 
     signature = rule_agent(APPLE_TRADER_KEY).signature(sim_tuning.make_config(spec["base"], {}))
     st.caption(
@@ -3784,7 +3938,9 @@ def _render_tuning_results(jobs: list[dict]) -> None:
 
     best = job.get("best")
     marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
-    tune_title = f"Tuning · {spec['tune_dataset']['name']}"
+    tune_title = (
+        "From stored runs · " if sim_tuning.is_derived(job) else "Tuning · "
+    ) + spec["tune_dataset"]["name"]
     if job["cells"]["test"]:
         col_tune, col_test = st.columns(2)
         col_tune.plotly_chart(
@@ -3832,7 +3988,9 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             "decisions."
         )
 
-    if job["status"] != sim_tuning.RUNNING and st.button(
+    # A derived grid has no record to delete -- it is the runs themselves, and
+    # they are Results' to remove.
+    if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED) and st.button(
         "Delete this tuning job", icon=":material/delete:", key=f"tune_delete_{job_id}"
     ):
         sim_tuning.delete_job(job_id)

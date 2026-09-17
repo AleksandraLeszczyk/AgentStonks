@@ -36,6 +36,7 @@ shows the hole where it is.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import multiprocessing
@@ -47,7 +48,7 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
-from itertools import product
+from itertools import combinations, product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Optional
@@ -740,6 +741,255 @@ def reused_count(record: dict) -> int:
     if not record["spec"].get("sweep_test_grid"):
         cells.append(record.get("best_test"))
     return sum(1 for c in cells if c and c.get("run_id"))
+
+
+# --- grids the run store already holds --------------------------------------
+#
+# A tuning job is a grid of replays over one dataset. Nothing says that grid
+# has to have been *asked for*: a Simulate sweep of the two levels, or a
+# handful of setups queued one afternoon to compare a stop, leaves the same
+# thing behind -- several runs of one configuration with one or two fields
+# moved. Those are a tuning job that was run without ever being submitted, and
+# they are worth reading as one rather than as rows in Results.
+#
+# So the Tuning tab also offers *derived* jobs: job records assembled out of
+# the run store, with the cells the runs answer filled and the rest of the
+# lattice left as holes. They are incomplete by construction -- nobody chose a
+# base configuration, a test dataset or a pick rule, and the grid is only as
+# dense as the runs happen to be -- and the tab offers to finish one, which
+# submits a real job that reuses every filled cell and replays only the holes.
+
+
+#: A job nobody submitted: assembled from stored runs rather than swept.
+DERIVED = "from stored runs"
+
+#: The fewest filled cells a derived grid is worth offering. Two runs that
+#: happen to differ in one field are a pair, not a surface.
+MIN_DERIVED_CELLS = 3
+
+#: How many derived grids the tab offers, densest first. A store of a few
+#: hundred runs holds a long tail of small ones and the picker has to stay
+#: readable.
+MAX_DERIVED = 20
+
+
+def _axis_candidates() -> "list[tuple[str, ...]]":
+    """Every set of one or two tunables a derived grid could be over.
+
+    In `TUNABLES` order, so a two-axis grid's rows and columns come out in the
+    same reading order the form lists them in.
+    """
+    names = list(TUNABLES)
+    return [(n,) for n in names] + [tuple(pair) for pair in combinations(names, 2)]
+
+
+def _axis_lattice(name: str, values: "list") -> "list":
+    """The axis a set of swept values implies, holes included.
+
+    Observed values alone can never leave a hole on a one-axis grid -- every
+    value on the axis is there because some run had it -- so a sweep that is
+    missing a step would read as complete. Where the values sit on a regular
+    step, that step is the axis and the gaps in it are holes.
+
+    Only where that is unambiguous, because guessing a finer axis than anyone
+    swept would invent holes rather than find them. Every gap has to be a whole
+    number of the smallest one, that step has to be a multiple of the field's
+    own granularity, and the filled axis may not come out more than twice as
+    long as what was actually run: 0.40, 0.45 and 0.75 are three settings
+    somebody tried, not a 0.05 sweep with five holes in it.
+
+    Values a run actually used are carried through as they were stored, not as
+    the arithmetic reproduces them -- a cell is looked up by its overrides, and
+    0.7 + 0.1 is not 0.8.
+    """
+    tunable = TUNABLES[name]
+    if len(values) < 3:
+        return list(values)
+    gaps = [later - earlier for earlier, later in zip(values, values[1:])]
+    step = min(gaps)
+    if step <= 0:
+        return list(values)
+    def off_grid(value: float, unit: float) -> bool:
+        return abs(value / unit - round(value / unit)) > 1e-6
+    if any(off_grid(gap, step) for gap in gaps) or off_grid(step, tunable.step):
+        return list(values)
+    count = int(round((values[-1] - values[0]) / step)) + 1
+    if count > 2 * len(values) or count > MAX_CELLS:
+        return list(values)
+    lattice = []
+    for index in range(count):
+        value = round(values[0] + index * step, 6)
+        if tunable.integer:
+            value = int(round(value))
+        stored = next((v for v in values if abs(v - value) <= 1e-6), None)
+        lattice.append(value if stored is None else stored)
+    return lattice
+
+
+def _derived_id(names: "tuple[str, ...]", bucket: tuple) -> str:
+    """A stable id for one derived grid, so a selection survives a rerun.
+
+    Hashed from what defines the grid -- the axes and the configuration,
+    dataset and cash every cell shares -- and not from the runs in it, so a
+    grid keeps its id when a new run fills one of its holes.
+    """
+    blob = json.dumps([list(names), list(bucket)], sort_keys=True, default=str)
+    return "runs-" + hashlib.sha1(blob.encode()).hexdigest()[:10]
+
+
+def _derived_job(names: "tuple[str, ...]", bucket: tuple, found: dict) -> dict:
+    """One derived grid as a job record the Tuning tab can render unchanged.
+
+    `found` maps a cell's `overrides_key` to the (record, config, overrides) of
+    the newest run answering it, newest cell first.
+
+    The base configuration is the newest of those runs. A derived grid has no
+    untuned base to compare against -- nobody nominated one -- and the most
+    recent run is the honest stand-in: it is a configuration that was actually
+    chosen, its cell is on the grid by construction, and the heatmap's outline
+    then marks where the last thing anyone ran sits on the surface.
+    """
+    _, feed, days, cash = bucket
+    newest, base_config, _ = next(iter(found.values()))
+    axes = [
+        {
+            "name": name,
+            "values": _axis_lattice(
+                name, sorted({o[name] for _, _, o in found.values()})
+            ),
+        }
+        for name in names
+    ]
+    spec = {
+        "base": asdict(base_config),
+        "axes": axes,
+        "tune_dataset": {
+            "name": newest.get("dataset") or "",
+            "days": list(days),
+            "feed": feed,
+            # What the replay needs, rather than whatever basket the runs were
+            # handed: a rule agent trades one symbol and `validate` only asks
+            # that the dataset carries it.
+            "symbols": [base_config.ticker],
+        },
+        "test_dataset": None,
+        "starting_cash": cash,
+        # Nobody chose these. The least-assuming pair -- the highest cell, no
+        # minimum share of days traded -- so the marker says "the best anyone
+        # has run" and nothing more; the form is where a real pick is set up.
+        "metric": "profit",
+        "rule": PICK_MAX,
+        "min_traded_share": 0.0,
+        "sweep_test_grid": False,
+        "reuse_runs": True,
+        "workers": 1,
+    }
+    sessions = [date.fromisoformat(day) for day in days]
+    cells = [
+        {
+            "overrides": dict(overrides),
+            "run_id": record.get("run_id") or "",
+            "run_dataset": record.get("dataset") or "",
+            **score_run(record, sessions),
+        }
+        for record, _, overrides in found.values()
+    ]
+    order = [overrides_key(o) for o in grid(axes)]
+    cells.sort(key=lambda cell: order.index(overrides_key(cell["overrides"])))
+    baseline = next(
+        (
+            {**cell, "overrides": {}}
+            for cell in cells
+            if cell["run_id"] == (newest.get("run_id") or "")
+        ),
+        None,
+    )
+    return {
+        "job_id": _derived_id(names, bucket),
+        "created_at": newest.get("created_at") or "",
+        "finished_at": newest.get("created_at") or "",
+        "status": DERIVED,
+        "pid": None,
+        "error": None,
+        "spec": spec,
+        # Against what a submitted job would have replayed, so "6 of 30" reads
+        # as how much of the grid the store actually covers.
+        "progress": {
+            "done": len(cells) + 1, "total": len(order) + 1, "reused": len(cells) + 1,
+        },
+        "cells": {TUNE: cells, TEST: []},
+        "baseline": {TUNE: baseline, TEST: None},
+        "best": pick_best(cells, axes, "profit", PICK_MAX, 0.0),
+        "best_test": None,
+    }
+
+
+def derived_jobs(runs: "list[dict] | None" = None) -> "list[dict]":
+    """Every tuning grid the run store already holds, densest first.
+
+    A grid is a set of stored runs that agree on everything except one or two
+    tunable fields, and on the sessions, the tape and the starting cash -- the
+    same match `prior_cells` makes, read the other way round: instead of asking
+    which runs answer a grid somebody described, this asks which grids the runs
+    describe by themselves. Only runs that could stand in for a cell at all are
+    considered (`run_replay_key`), so a stale or unfinished run never invents a
+    grid.
+
+    Every axis must take at least two values, or it is not an axis; a grid of
+    fewer than `MIN_DERIVED_CELLS` runs is a coincidence rather than a sweep.
+    One run belongs to as many grids as it fits, but a grid whose runs are all
+    inside a denser one is dropped -- a two-axis sweep would otherwise also be
+    offered as each of its rows and each of its columns.
+    """
+    if runs is None:
+        from .results import list_runs
+
+        runs = list_runs()
+    usable = []
+    for record in runs:  # newest first, and every dict below keeps that order
+        key = run_replay_key(record)
+        if key is None:
+            continue
+        config = make_config(record["config_summary"]["rule_config"], {})
+        usable.append((record, config, asdict(config), key))
+    if not usable:
+        return []
+
+    candidates = []
+    for names in _axis_candidates():
+        buckets: "dict[tuple, dict]" = {}
+        for record, config, fields, (_, feed, days, cash) in usable:
+            shared = json.dumps(
+                {k: v for k, v in fields.items() if k not in names},
+                sort_keys=True, default=str,
+            )
+            overrides = {name: fields[name] for name in names}
+            buckets.setdefault((shared, feed, days, cash), {}).setdefault(
+                overrides_key(overrides), (record, config, overrides)
+            )
+        for bucket, found in buckets.items():
+            if len(found) < MIN_DERIVED_CELLS:
+                continue
+            if any(
+                len({o[name] for _, _, o in found.values()}) < 2 for name in names
+            ):
+                continue  # a field that never moved is not an axis
+            candidates.append((names, bucket, found))
+
+    jobs, covered = [], []
+    for names, bucket, found in sorted(candidates, key=lambda c: -len(c[2])):
+        ids = {record.get("run_id") for record, _, _ in found.values()}
+        if any(ids <= seen for seen in covered):
+            continue
+        covered.append(ids)
+        jobs.append(_derived_job(names, bucket, found))
+        if len(jobs) >= MAX_DERIVED:
+            break
+    return jobs
+
+
+def is_derived(job: dict) -> bool:
+    return job.get("status") == DERIVED
 
 
 # --- picking ----------------------------------------------------------------
