@@ -882,6 +882,90 @@ def expected_reference(minute: float, high=FORECAST["pred_high"], low=FORECAST["
     return upper
 
 
+class TestDayRangeIntradayModel:
+    """The reference as a model rather than as a setting beside one.
+
+    "Day Range × Intraday Volatility" is the same forecast and the same rules
+    with the levels measured below the intraday curve, so it is one choice in
+    the model picker instead of two choices the reader had to pair correctly.
+    """
+
+    KEY = "dayrange_intraday"
+
+    def test_the_model_decides_what_the_levels_are_measured_below(self):
+        assert AppleTraderConfig(model_key=self.KEY).level_source == "intraday"
+        assert AppleTraderConfig(model_key="dayrange").level_source == "dayrange"
+
+    def test_it_cannot_be_talked_out_of_its_own_reference(self):
+        """A config naming this model and the flat high would be this model in
+        name only -- the reference is the whole of what distinguishes it."""
+        config = AppleTraderConfig(model_key=self.KEY, level_source="dayrange")
+        assert config.level_source == "intraday"
+
+    def test_the_model_key_says_it_so_the_signature_does_not_say_it_twice(self):
+        sig = config_signature(AppleTraderConfig(model_key=self.KEY))
+        assert sig.startswith("dayrange_intraday_AAPL(")
+        assert "levels=" not in sig
+
+    def test_a_record_from_when_it_was_a_setting_keeps_its_signature(self):
+        """The pairing existed before this model did, as `dayrange` plus
+        `level_source=intraday`. Such a record has to replay as what it was and
+        file where it did -- rewriting it onto the new key would move it to a
+        different row in Results."""
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({
+            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
+            "level_source": "intraday",
+        })
+        assert old.model_key == "dayrange"
+        assert old.level_source == "intraday"
+        assert ",levels=intraday" in config_signature(old)
+
+    def test_a_record_with_no_reference_at_all_is_still_the_flat_model(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({"model_key": "dayrange", "buy_k": 0.75})
+        assert old.level_source == "dayrange"
+        assert "levels=" not in config_signature(old)
+
+    def test_it_is_offered_only_where_both_files_were_fitted(self):
+        both = set(apple_models.DAYRANGE_TICKERS) & set(
+            at.intraday_vol_model.TICKERS
+        )
+        assert set(apple_models.get(self.KEY).tickers) == both
+        for symbol in both:
+            assert self.KEY in apple_models.keys_for(symbol)
+
+    def test_a_missing_shape_makes_the_model_unavailable_not_silently_flat(
+        self, monkeypatch
+    ):
+        """The one outcome worth failing for: without the shape it would run as
+        the flat model under this model's name."""
+        monkeypatch.setattr(
+            apple_models, "_load_dayrange", lambda ticker=TICKER: {"stub": True}
+        )
+        monkeypatch.setattr(
+            at.intraday_vol_model, "load", lambda *a, **k: None
+        )
+        assert apple_models.load(self.KEY, TICKER) is None
+        why = apple_models.unavailable_reason(self.KEY, TICKER)
+        assert "IntradayVolatility" in why and "missing" in why
+
+    def test_a_missing_day_range_bundle_says_so_instead(self, monkeypatch):
+        monkeypatch.setattr(
+            apple_models, "_load_dayrange", lambda ticker=TICKER: None
+        )
+        why = apple_models.unavailable_reason(self.KEY, TICKER)
+        assert "day-range bundle" in why
+
+    def test_both_models_drive_the_same_rule_set(self):
+        assert (
+            apple_models.get(self.KEY).strategy
+            == apple_models.get("dayrange").strategy
+        )
+
+
 class TestIntradayLevelSource:
     """The levels resting under the intraday band rather than under a flat high.
 
@@ -2097,7 +2181,9 @@ class TestPredictedRangeUnit:
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
         for symbol in (TICKER, NON_AAPL, "INTC"):
-            assert apple_models.keys_for(symbol) == ["dayrange"]
+            assert apple_models.keys_for(symbol) == [
+                "dayrange", "dayrange_intraday",
+            ]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(

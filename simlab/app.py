@@ -1629,12 +1629,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "them here is the intended use — the defaults are each instrument's best "
             "plateau over the notebook's sessions, which is still only a month or two of days."
         ),
-        "dayrange_levels": (
-            "What the two distances above are measured below. Each choice is its own "
-            "configuration in Results, and this is the one that changes the *shape* of "
-            "the strategy rather than a number in it, so run them side by side over the "
-            "same datasets before believing either."
-        ),
         "dayrange_breach": (
             "What a session that trades outside the forecast does to it. Each choice is its "
             "own configuration in Results, so the honest way to use this is to queue the "
@@ -1654,13 +1648,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
     },
     outro={
-        "dayrange_levels_dayrange": (
+        "model_dayrange": (
             ":material/horizontal_rule: The predicted high, flat for the session — what "
             "the shipped buy/sell distances were swept against, and what every stored "
             "record replays as."
         ),
-        "dayrange_levels_intraday": (
-            ":material/ssid_chart: The top of the intraday band instead, so the whole "
+        "model_dayrange_intraday": (
+            ":material/ssid_chart: The levels rest under the top of the intraday band, so the whole "
             "ladder descends through the morning and rises into the close. Expect fewer "
             "fills midday and **shorter holds**: the target descends with it, so a "
             "morning position can be closed by a sell level that came down to it. The "
@@ -1721,13 +1715,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "either way (`A` or `R` on every k), so the two queue as two configurations. "
             "Everything read against `buy − sell` — the stop as a fraction of the "
             "predicted gain, the runner threshold, the circuit breaker — follows it."
-        ),
-        "level_source": (
-            "The predicted high, or that forecast stretched by IntradayVolatility's "
-            "time-of-day volatility shape and read at each minute. It is in the "
-            "signature unless it is the predicted high, so the two queue as two "
-            "configurations. Offered only where the shape has been exported "
-            "(`Models/intravol_<TICKER>.json`); the ticker's own file, not a shared one."
         ),
         "min_win_k": (
             "{ticker} starts at {min_win_k} — per instrument, since it is only readable "

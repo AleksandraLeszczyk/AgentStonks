@@ -145,7 +145,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="PyTorch, LightGBM and the day-range bundle",
         tickers=apple_models.DAYRANGE_TICKERS,
-        models=(apple_models.DAYRANGE_KEY,),
+        # Both models forecast the day range; the pairing then reads it through
+        # the intraday shape, which is the other overlay below.
+        models=(apple_models.DAYRANGE_KEY, apple_models.DAYRANGE_INTRADAY_KEY),
     ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
@@ -179,9 +181,10 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         requires=(
             "the IntradayVolatility export plus PyTorch, LightGBM and the day-range bundle"
         ),
-        tickers=tuple(
-            t for t in apple_models.DAYRANGE_TICKERS if intraday_vol_model.covers(t)
-        ),
+        tickers=apple_models.DAYRANGE_INTRADAY_TICKERS,
+        # This curve *is* what "Day Range × Intraday Volatility" measures its
+        # levels below, so a run on that model opens showing it.
+        models=(apple_models.DAYRANGE_INTRADAY_KEY,),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,

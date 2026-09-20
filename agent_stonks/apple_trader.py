@@ -257,6 +257,17 @@ class AppleTraderConfig:
                 f"level_source {self.level_source!r} is not one of "
                 f"{', '.join(LEVEL_SOURCES)}"
             )
+        # A model that names a reference decides it, because that is the whole
+        # difference between the two: "Day Range × Intraday Volatility" *is*
+        # the day-range forecast read through the intraday shape, so a config
+        # naming it and measuring below the flat high would be that model in
+        # name only. Applied after validation so an impossible value is still
+        # reported as one, and only for a model that declares a reference --
+        # which leaves a record written when this was a separate choice saying
+        # what it said. See `apple_models.AppleModel.level_source`.
+        named = apple_models.MODELS.get(self.model_key)
+        if named is not None and named.level_source != LEVELS_DAYRANGE:
+            self.level_source = named.level_source
         self.level_unit = str(self.level_unit or UNIT_ADR)
         if self.level_unit not in LEVEL_UNITS:
             raise ValueError(
@@ -460,7 +471,14 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         breach += ",contain"
     if c.breach_exit:
         breach += ",breach_exit"
-    levels = "" if c.level_source == LEVELS_DAYRANGE else f",levels={c.level_source}"
+    # Written only when the reference is *not* the one this model implies. For
+    # "Day Range × Intraday Volatility" the model key already says it, and a
+    # second token would be the same fact twice; for a record written when the
+    # reference was a separate choice the model implies the flat high, so the
+    # token appears exactly as it did and the record keeps its filed identity.
+    implied = apple_models.MODELS.get(c.model_key)
+    implied = implied.level_source if implied is not None else LEVELS_DAYRANGE
+    levels = "" if c.level_source == implied else f",levels={c.level_source}"
     # "H" in the two distances is whatever `level_source` says it is, which is
     # why that token is next to them rather than at the end.
     return (
@@ -529,14 +547,14 @@ def level_source_error(config: AppleTraderConfig) -> "str | None":
         return (
             f"'{label}' reads IntradayVolatility's time-of-day shape, which was fitted on "
             f"{', '.join(intraday_vol_model.TICKERS)} only, so it cannot be used on "
-            f"{config.ticker}. Use the predicted high, or pick another instrument."
+            f"{config.ticker}. Run the flat day-range model, or pick another instrument."
         )
     if intraday_vol_model.load(config.ticker) is None:
         return (
             f"'{label}' needs the IntradayVolatility export for {config.ticker} at "
             f"{intraday_vol_model.model_path(config.ticker)}, which is missing or "
             "unreadable. Write it with FinNotebooks/IntradayVolatility/scripts/"
-            "export_app_model.py, or use the predicted high."
+            "export_app_model.py, or run the flat day-range model."
         )
     return None
 
