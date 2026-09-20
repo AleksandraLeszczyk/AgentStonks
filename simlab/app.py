@@ -1751,6 +1751,21 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "`stop=E-0.5G`; a record from before this existed carries `stop=E-0.2A` and "
             "replays in its own units. 0 switches the stop off."
         ),
+        "contain_range": (
+            "Whether the forecast is always widened to hold what the session has printed "
+            "— `apply_open_constraint`'s 9:35 clip, kept true all day. In the signature "
+            "as `contain` when on, so it queues as its own configuration. Worth pairing "
+            "with the breach policy rather than sweeping alone: `extreme` already "
+            "satisfies it, so with it on `off` and `extreme` produce identical ledgers "
+            "and only `brownian` still differs."
+        ),
+        "breach_exit": (
+            "Whether a bar through the predicted high closes an open position instead of "
+            "moving the forecast. In the signature as `breach_exit` when on. Under `off` "
+            "and `extreme` the sell level is reached on the same bar anyway, so this only "
+            "changes `brownian` ledgers — where it is the difference between banking a "
+            "settled bet and riding on against a target that moved out of the bar's way."
+        ),
         "breach_update": (
             "Whether the predicted high is held all session or moved when the tape trades "
             "through it, with both levels rebuilt from it each time it does. It is in the "
@@ -3175,6 +3190,8 @@ _SHORT_FIELD_LABELS = {
     "breach_update": "breach",
     "level_source": "levels",
     "level_unit": "unit",
+    "contain_range": "contain",
+    "breach_exit": "breach exit",
 }
 
 

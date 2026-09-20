@@ -171,6 +171,16 @@ _APPLE_LEGACY = {
     # counted in ADRs, and re-reading those same numbers as predicted ranges
     # would replay a different strategy under the signature of the original.
     "level_unit": UNIT_ADR,
+    # Before this existed the 9:35 forecast was only ever widened by the breach
+    # policy, so under "off" a predicted high the tape had traded clean through
+    # stayed the number every level was measured from. False is that rule, and
+    # it is left out of the signature.
+    "contain_range": False,
+    # And a breach moved the forecast rather than closing anything: under
+    # "brownian" the sell level was carried past the bar that breached and the
+    # position rode on. False replays that, so such a record's ledger and its
+    # signature are both the ones it was written with.
+    "breach_exit": False,
     # Before the circuit breaker existed a session kept re-arming its levels
     # however badly the last trade went, stopping only on a stop. 0 is that
     # rule, and it is left out of the signature.

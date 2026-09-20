@@ -424,6 +424,10 @@ class TestTraderLevelsOverlay:
         # off the $3 ADR above. `test_the_unit_is_the_agents_own` is where the
         # other unit is switched on.
         kwargs.setdefault("level_unit", UNIT_ADR)
+        # And containment off, so "off" still means levels that never move --
+        # `test_containment_makes_off_draw_a_band` is where it is switched on.
+        kwargs.setdefault("contain_range", False)
+        kwargs.setdefault("breach_exit", False)
         return AppleTraderConfig(**kwargs)
 
     def first_buy(self, items):
@@ -545,6 +549,29 @@ class TestTraderLevelsOverlay:
         assert self.first_buy(items) == pytest.approx(
             210.0 - shipped.buy_k * self.shipped_unit()
         )
+
+    def test_containment_makes_off_draw_a_band(self, monkeypatch):
+        """The chart asks the trader, so a rule that moves the levels under
+        "off" has to move the drawing under "off" too -- otherwise the picture
+        shows orders resting where the agent is no longer resting them."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        bars = minute_bars()
+        bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
+
+        held = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                          session_date=SESSION,
+                          trader_config=self.config(breach_update="off"))["items"]
+        assert all(i["kind"] == "level" for i in held)
+
+        contained = mo.compute(
+            [mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[], session_date=SESSION,
+            trader_config=self.config(breach_update="off", contain_range=True),
+        )["items"]
+        band = next(i for i in contained if i["kind"] == "band")
+        # The high is pinned to the 215.0 that printed, so the sell curve ends
+        # exactly `sell_k x ADR` under it rather than under the stale 210.0.
+        assert band["upper"][-1] == pytest.approx(215.0 - 0.10 * 3.0)
 
     def test_no_forecast_is_a_note_rather_than_an_empty_chart(self, monkeypatch):
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)

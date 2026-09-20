@@ -32,7 +32,9 @@ from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
 from . import intraday_vol_model
 from .config import (
+    BREACH_EXTREME,
     BREACH_LABELS,
+    BREACH_OFF,
     BREACH_POLICIES,
     LEVELS_INTRADAY,
     LEVEL_SOURCES,
@@ -185,6 +187,7 @@ def dayrange_params(
         )
     level_source = level_source_param(defaults, ticker, copy)
     breach_update = breach_param(defaults, copy)
+    contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     stop_gain_fraction, momentum_drop, take_fraction, hold_min_gain_k = exit_params(
         defaults, float(buy_k), float(sell_k), copy
     )
@@ -199,6 +202,8 @@ def dayrange_params(
         level_source=level_source,
         level_unit=level_unit,
         breach_update=breach_update,
+        contain_range=contain_range,
+        breach_exit=breach_exit,
         stop_gain_fraction=stop_gain_fraction,
         momentum_drop=momentum_drop,
         take_fraction=take_fraction,
@@ -351,6 +356,48 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
     )
     _caption(copy.outro.get(f"dayrange_breach_{choice}"))
     return str(choice)
+
+
+def containment_params(
+    defaults: AppleTraderConfig, breach_update: str, copy: FormCopy
+) -> "tuple[bool, bool]":
+    """The two rules about data the session has already printed.
+
+    Rendered under the breach policy because both are about the same thing from
+    the other side: that one says how far the forecast may *lead* the tape, and
+    these say that it may not argue with it, and that a bet the tape has settled
+    is banked rather than re-forecast.
+
+    Neither is keyed by ticker: they are rules rather than swept numbers.
+    """
+    col_a, col_b = st.columns(2)
+    contain_range = bool(
+        col_a.checkbox(
+            "Forecast must contain the session so far",
+            value=defaults.contain_range,
+            key=copy.key("contain_range"),
+            help=copy.help.get("contain_range"),
+        )
+    )
+    breach_exit = bool(
+        col_b.checkbox(
+            "A breach of the predicted high sells",
+            value=defaults.breach_exit,
+            key=copy.key("breach_exit"),
+            help=copy.help.get("breach_exit"),
+        )
+    )
+    # Said where the two settings meet rather than on either alone: neither is
+    # wrong, but together they leave `breach_update` with two live options
+    # instead of three, and a form that let someone pick between two identical
+    # ones without saying so would be the form's fault.
+    if contain_range and breach_update in (BREACH_OFF, BREACH_EXTREME):
+        st.caption(
+            ":material/info: With containment on, *hold the forecast* and *move to the "
+            "extreme* are the same rule — the forecast is pulled out to the session's "
+            "extreme either way. *Lead the tape* is the only policy that still differs."
+        )
+    return contain_range, breach_exit
 
 
 def exit_params(

@@ -1029,6 +1029,7 @@ def updated_range(
     session_low: "float | None",
     minutes_left: float,
     policy: str = BREACH_OFF,
+    contain: bool = False,
 ) -> "tuple[float, float]":
     """`(pred_high, pred_low)` after what the session has actually printed.
 
@@ -1051,20 +1052,60 @@ def updated_range(
     An unknown policy reads as `off`. Callers get their policy from a stored
     record or a form, and a typo that silently traded a different strategy would
     be worse than one that traded the notebook's.
+
+    `contain` then applies `contain_session` on top, whatever the policy: the
+    returned range always holds everything the session has printed. It is the
+    difference between `off` meaning "one forecast, held through anything" and
+    "do not lead the tape, but do not argue with it either". Note that it makes
+    `off` and `extreme` agree on a breached side -- `extreme` already satisfies
+    it -- so the two policies only still differ when it is switched off.
     """
     high = float(forecast["pred_high"])
     low = float(forecast["pred_low"])
-    if policy not in (BREACH_EXTREME, BREACH_BROWNIAN):
-        return high, low
-    reach = (
-        brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
-        if policy == BREACH_BROWNIAN
-        else 0.0
-    )
-    if session_high is not None and float(session_high) > high:
-        high = float(session_high) + reach
-    if session_low is not None and float(session_low) < low:
-        low = float(session_low) - reach
+    if policy in (BREACH_EXTREME, BREACH_BROWNIAN):
+        reach = (
+            brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
+            if policy == BREACH_BROWNIAN
+            else 0.0
+        )
+        if session_high is not None and float(session_high) > high:
+            high = float(session_high) + reach
+        if session_low is not None and float(session_low) < low:
+            low = float(session_low) - reach
+    if contain:
+        high, low = contain_session(
+            high, low, session_high=session_high, session_low=session_low
+        )
+    return high, low
+
+
+def contain_session(
+    high: float,
+    low: float,
+    *,
+    session_high: "float | None",
+    session_low: "float | None",
+) -> "tuple[float, float]":
+    """The forecast widened to hold everything the session has already printed.
+
+    `apply_open_constraint`'s rule -- "the day's high cannot be below what
+    already printed" -- applied to the whole session rather than to its first
+    five minutes. A forecast the tape has traded outside of is not a forecast
+    any more, it is a number that has been disproved, and every level hanging
+    off it is measured from somewhere the day has already been.
+
+    This is arithmetic rather than a policy: it never invents a price, it only
+    refuses to keep one the tape has passed. It is therefore applied whatever
+    `updated_range`'s policy is, including `off` -- which is what makes `off`
+    mean "do not *lead* the tape" rather than "ignore it".
+
+    Only ever widens, so it cannot move a side back towards the price or cross
+    the two over each other.
+    """
+    if session_high is not None:
+        high = max(high, float(session_high))
+    if session_low is not None:
+        low = min(low, float(session_low))
     return high, low
 
 

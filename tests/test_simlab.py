@@ -701,7 +701,7 @@ class TestRuleAgentRecords:
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
         assert today.breach_update == "extreme"
         assert "levels=" not in agent.signature(today)   # the default source signs nothing
-        assert agent.signature(today).endswith(",breach=extreme)")
+        assert ",breach=extreme" in agent.signature(today)
         assert agent.signature(today) != agent.signature(
             replace(today, breach_update="brownian")
         )

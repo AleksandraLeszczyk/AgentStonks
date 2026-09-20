@@ -47,6 +47,8 @@ from .rule_agent import BaseTrader
 from .state import append_agent_log as _log
 from .config import (
     APPLE_TRADER_BREACH_UPDATE,
+    APPLE_TRADER_CONTAIN_RANGE,
+    APPLE_TRADER_BREACH_EXIT,
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_DAYRANGE_LEVELS,
@@ -177,6 +179,15 @@ class AppleTraderConfig:
     # notebook's rule (one forecast, held all day); the other two move the
     # breached side and the levels with it. See `_update_range`.
     breach_update: str = APPLE_TRADER_BREACH_UPDATE
+    # Whether the forecast is always widened to hold what the session has
+    # printed, whatever `breach_update` says (`dayrange_model.contain_session`).
+    # With it on, "off" no longer keeps a predicted high the tape has traded
+    # through -- and therefore agrees with "extreme" on a breached side.
+    contain_range: bool = APPLE_TRADER_CONTAIN_RANGE
+    # Whether a bar trading through the predicted high closes an open position.
+    # Tested against the high as it stood when the bar opened, and after the
+    # sell level, so a breach that also reaches the target logs as the target.
+    breach_exit: bool = APPLE_TRADER_BREACH_EXIT
     # Which number the two distances above are measured below -- one of
     # `config.LEVEL_SOURCES`. "dayrange" is the predicted high itself;
     # "intraday" is that forecast read through IntradayVolatility's
@@ -440,6 +451,15 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
+    # Both appear only while switched on, like every rule added since the
+    # notebook's, so a record written before either existed keeps the signature
+    # it was filed under. They are separate tokens because they are separate
+    # rules: one is about what the forecast is allowed to say, the other about
+    # what closes a position.
+    if c.contain_range:
+        breach += ",contain"
+    if c.breach_exit:
+        breach += ",breach_exit"
     levels = "" if c.level_source == LEVELS_DAYRANGE else f",levels={c.level_source}"
     # "H" in the two distances is whatever `level_source` says it is, which is
     # why that token is next to them rather than at the end.
@@ -826,6 +846,12 @@ class DayRangeTrader(BaseTrader):
         # forecast moves first and the levels are then rebuilt from it at this
         # minute, which is also what re-reads a reference that follows the clock.
         if fresh_bar and self.plan is not None:
+            # The high this bar is judged a breach of, recorded before the bar
+            # is allowed to move it. Testing against the updated number would
+            # be testing the bar against a level it had just pushed out of its
+            # own way, which under "brownian" is exactly what used to keep a
+            # resolved position open. See `_exit`.
+            self.plan["high_at_bar"] = float(self.plan["pred_high"])
             self._update_range(state, frame, ts)
             self._set_levels(ts)
 
@@ -1115,7 +1141,12 @@ class DayRangeTrader(BaseTrader):
         logged would be a decoration with side effects.
         """
         config, plan = self.config, self.plan
-        if config.breach_update == BREACH_OFF or plan is None:
+        if plan is None:
+            return None
+        # "off" with containment on still has work to do -- it does not lead
+        # the tape, but it does not keep a high the tape has passed either --
+        # so the early return is about having *neither*, not about the policy.
+        if config.breach_update == BREACH_OFF and not config.contain_range:
             return None
         if ts <= plan["opening_end"]:
             return None
@@ -1134,6 +1165,7 @@ class DayRangeTrader(BaseTrader):
             session_low=float(frame["low"].min()),
             minutes_left=dayrange.minutes_left_at(ts),
             policy=config.breach_update,
+            contain=config.contain_range,
         )
         if high == before["pred_high"] and low == before["pred_low"]:
             return None
@@ -1146,11 +1178,14 @@ class DayRangeTrader(BaseTrader):
     def _range_summary(self, ts, before: dict) -> str:
         """The one line an update writes: what the tape did, and what moved.
 
-        The two levels are built from the predicted *high* alone, so a breach of
-        the low moves the forecast and nothing else. The line says which it was
-        rather than claiming a rebuild either way -- a log that reported levels
-        that had not changed would be the reader's problem on every grinding
-        session, which is exactly when it matters.
+        Whether a breach of the *low* moves anything depends on the unit: under
+        "adr" the levels are built from the predicted high alone, so it moves
+        the forecast and nothing else; under "pred_range" the low is half the
+        unit, so both levels move with it. The line is written from the levels
+        themselves rather than from the policy for exactly that reason -- a log
+        that reported levels that had not changed (or missed ones that had)
+        would be the reader's problem on every grinding session, which is
+        exactly when it matters.
         """
         plan, config = self.plan, self.config
         dayrange = _dayrange()
@@ -1197,6 +1232,7 @@ class DayRangeTrader(BaseTrader):
     EXIT_BREAKEVEN = "breakeven"
     EXIT_STOP = "stop"
     EXIT_TARGET = "target"
+    EXIT_BREACH = "breach"
     EXIT_FLATTEN = "flatten"
     EXIT_TAKE = "momentum_take"
 
@@ -1260,6 +1296,23 @@ class DayRangeTrader(BaseTrader):
                 f"({config.sell_k:g} × {config.unit_phrase} under {self._ref_name}, "
                 f"${plan['reference']:,.2f}). Selling at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_TARGET
+
+        # After the target, so a breach that also reached the sell level is
+        # logged as the target exit it is -- which is every breach under "off"
+        # and "extreme", where the sell level sits `sell_k` units under the
+        # high the bar just traded through. What is left for this rule is the
+        # case it exists for: "brownian", where the forecast leads the tape and
+        # the target is carried past the bar that settled the bet.
+        breached = plan.get("high_at_bar", plan["pred_high"])
+        if config.breach_exit and high > breached:
+            return position, (
+                f"Breach exit: the bar traded up to ${high:,.2f}, through the "
+                f"${breached:,.2f} predicted high the levels were resting under. The "
+                f"position was a bet that the day tops out around there and the tape has "
+                f"just settled it, at a better price than the ${plan['sell_level']:,.2f} "
+                f"sell level was offering, so it is sold at market ({pnl_pct:+.2f}%) "
+                "rather than held against a forecast that has moved."
+            ), self.EXIT_BREACH
 
         if self.closing_soon():
             to_close = market_hours.seconds_to_close() or 0.0

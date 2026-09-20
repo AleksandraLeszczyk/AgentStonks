@@ -2010,6 +2010,25 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "than \"how far will it reach today\". Offered only for the symbols that "
             "model was fitted on and exported for."
         ),
+        "contain_range": (
+            "The 9:35 forecast is already clipped so it cannot come in below what the "
+            "first five minutes printed. This keeps that true for the rest of the day: "
+            "if the session trades above the predicted high or below the predicted low, "
+            "the forecast is widened to hold it. It never leads the tape — it only stops "
+            "the levels being measured from a price the day has already gone past. "
+            "Note that *move to the extreme* already does this, so with it on that policy "
+            "and *hold the forecast* become the same rule."
+        ),
+        "breach_exit": (
+            "The position is a bet that the day tops out near the predicted high. With "
+            "this on, a bar that trades clean through that high closes it at market — the "
+            "tape has settled the bet, at a better price than the sell level was going to "
+            "pay. With it off the breach instead moves the forecast, and under *lead the "
+            "tape* that carries the sell level past the bar that breached, so the position "
+            "rides on and gives the gain back if the day turns. Measured against the high "
+            "as it stood when the bar opened, and checked after the sell level, so a "
+            "breach that also reached the target is logged as the target exit it is."
+        ),
         "breach_update": (
             "The model cannot be re-run intraday — its opening features are a fixed "
             "five-minute window — but a session that has traded *through* the predicted high "

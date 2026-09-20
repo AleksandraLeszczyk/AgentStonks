@@ -289,6 +289,49 @@ BREACH_LABELS = {
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_BREACH_UPDATE = BREACH_EXTREME
 
+# Whether the forecast is always widened to hold what the session has actually
+# printed (`dayrange_model.contain_session`). The 9:35 forecast is already
+# clipped to contain the opening five minutes (`apply_open_constraint`); this
+# is that same rule applied for the rest of the day, so a predicted high the
+# tape has traded through stops being the number the levels are measured from.
+#
+# It is arithmetic rather than a forecast -- it never leads the tape, it only
+# declines to keep a number the tape has passed -- which is why it applies
+# under every APPLE_TRADER_BREACH_UPDATE policy including "off".
+#
+# Consequence worth knowing before switching it on: "extreme" already satisfies
+# this, so with it on "off" and "extreme" behave identically and the only
+# policy that still differs is "brownian" (which leads the tape by
+# `brownian_reach` on a breached side). The two remain separate settings
+# because switching this off restores the distinction.
+#
+# A SimLab record written before this existed replays with it off
+# (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
+APPLE_TRADER_CONTAIN_RANGE = True
+
+# Whether a bar that trades through the predicted high closes an open position
+# (`apple_trader.DayRangeTrader._exit`).
+#
+# The levels are a bet that the day tops out near the predicted high, so a bar
+# that trades through it has settled that bet -- in the position's favour, at a
+# better price than the sell level was ever going to offer. Without this the
+# breach instead *moves the forecast*, and under "brownian" the sell level is
+# carried past the bar that breached: the position rides on against a target
+# that stepped out of its way, with the profit it had already earned given back
+# if the day turns. Under "off" and "extreme" the target is reached on the same
+# bar anyway, so this only changes what "brownian" does -- but it is checked
+# under every policy, because which one is running should not decide whether a
+# resolved bet is banked.
+#
+# Measured against the predicted high *as it stood when the bar opened*, not
+# after this bar's own update: a level that moves on the strength of the bar it
+# is being tested against is lookahead, however the range policy is set.
+#
+# The sell level is checked first, so a breach that also reaches the target is
+# logged as the target exit it is. 0/False switches this off, which is what
+# every record written before it existed replays as.
+APPLE_TRADER_BREACH_EXIT = True
+
 # What the two levels hang off -- the reference `buy_k` and `sell_k` are
 # measured below (`apple_trader.DayRangeTrader._set_levels`). Here for the same
 # reason the breach policies are: naming one must not cost an import of torch.
