@@ -30,6 +30,7 @@ from agent_stonks.config import (
     APPLE_TRADER_SELL_K,
     BREACH_OFF,
     LEVELS_DAYRANGE,
+    UNIT_ADR,
 )
 from agent_stonks.apple_trader import (
     APPLE_TRADER_AVATAR,
@@ -163,6 +164,13 @@ _APPLE_LEGACY = {
     # nothing today and is here so that it keeps meaning the same thing if the
     # default ever moves.
     "level_source": LEVELS_DAYRANGE,
+    # And before the unit was a choice, a k was always an ADR -- which is no
+    # longer the default, so unlike `level_source` above this entry is doing
+    # work today. Every stored record's distances, its stop as a fraction of
+    # the predicted gain, its runner threshold and its circuit breaker were all
+    # counted in ADRs, and re-reading those same numbers as predicted ranges
+    # would replay a different strategy under the signature of the original.
+    "level_unit": UNIT_ADR,
     # Before the circuit breaker existed a session kept re-arming its levels
     # however badly the last trade went, stopping only on a stop. 0 is that
     # rule, and it is left out of the signature.

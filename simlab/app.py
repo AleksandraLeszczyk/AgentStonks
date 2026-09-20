@@ -1712,6 +1712,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "by the same sweep, and the smaller of the two numbers, since it is the "
             "higher price. A day that never reaches it is held to the closing flatten."
         ),
+        "level_unit": (
+            "The yardstick `buy` and `sell` are counted in: this symbol's trailing "
+            "14-day average daily range, or `predicted high − predicted low` from the "
+            "forecast itself. Worth sweeping as a pair with the two distances rather "
+            "than on its own — a k means a different number of dollars under each, so "
+            "the stored pairs are not comparable across it. It is in the signature "
+            "either way (`A` or `R` on every k), so the two queue as two configurations. "
+            "Everything read against `buy − sell` — the stop as a fraction of the "
+            "predicted gain, the runner threshold, the circuit breaker — follows it."
+        ),
         "level_source": (
             "The predicted high, or that forecast stretched by IntradayVolatility's "
             "time-of-day volatility shape and read at each minute. It is in the "
@@ -3161,7 +3171,11 @@ def _tuning_metric_text(metric: str, value) -> str:
 # Two settings a derived grid can differ by that are not numbers, in the short
 # form `config_signature` writes them as — `breach=brownian`, `levels=intraday`
 # — since that is what they are called everywhere else in this app.
-_SHORT_FIELD_LABELS = {"breach_update": "breach", "level_source": "levels"}
+_SHORT_FIELD_LABELS = {
+    "breach_update": "breach",
+    "level_source": "levels",
+    "level_unit": "unit",
+}
 
 
 def _field_text(name: str, value) -> str:

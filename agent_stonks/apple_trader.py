@@ -69,6 +69,13 @@ from .config import (
     LEVELS_INTRADAY,
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
+    LEVEL_UNITS,
+    LEVEL_UNIT_LABELS,
+    LEVEL_UNIT_PHRASES,
+    LEVEL_UNIT_TOKENS,
+    APPLE_TRADER_LEVEL_UNIT,
+    UNIT_ADR,
+    UNIT_PRED_RANGE,
     SIP_DELAY_MIN,
 )
 from .decisions import DecisionTracker, whole_shares
@@ -176,6 +183,15 @@ class AppleTraderConfig:
     # time-of-day shape, so the reference moves with the clock. See
     # `_set_levels`, and `config_error` for what it requires.
     level_source: str = APPLE_TRADER_LEVEL_SOURCE
+    # What one k is worth in dollars -- one of `config.LEVEL_UNITS`. "adr" is
+    # the trailing 14-day average daily range, a fixed number for the session
+    # and no part of the model's output; "pred_range" is `pred_high -
+    # pred_low`, so the forecast that decides where the levels sit decides how
+    # far apart they are too. Everything measured against the gap between the
+    # levels -- the stop as a fraction of the predicted gain, the runner
+    # threshold, the circuit breaker -- is counted in this same unit, so that
+    # those comparisons stay comparisons. See `level_unit`.
+    level_unit: str = APPLE_TRADER_LEVEL_UNIT
     # The session circuit breaker: a trade that closes for no more than this
     # many ADRs per share stands the agent down for the rest of the day. 0
     # switches it off. None -> the instrument's own default (`min_win_for`),
@@ -230,6 +246,12 @@ class AppleTraderConfig:
                 f"level_source {self.level_source!r} is not one of "
                 f"{', '.join(LEVEL_SOURCES)}"
             )
+        self.level_unit = str(self.level_unit or UNIT_ADR)
+        if self.level_unit not in LEVEL_UNITS:
+            raise ValueError(
+                f"level_unit {self.level_unit!r} is not one of "
+                f"{', '.join(LEVEL_UNITS)}"
+            )
         # Resolved per field, so a config that names only one level still
         # gets the instrument's default for the other.
         default_buy, default_sell = dayrange_levels(self.ticker)
@@ -254,16 +276,30 @@ class AppleTraderConfig:
 
     @property
     def target_gain_k(self) -> float:
-        """What a target exit is playing for, in ADRs a share.
+        """What a target exit is playing for, in level units a share.
 
-        `buy_level` and `sell_level` are both `reference - k x ADR` off the same
-        reference, so the gap between them is this whatever the reference does
-        -- a breach moving the forecast, or an intraday curve moving it every
-        minute, move both levels together. It is therefore a property of the
-        configuration rather than of the session, which is what lets the stop
-        be written against it and still be a fixed price once a fill exists.
+        `buy_level` and `sell_level` are both `reference - k x unit` off the
+        same reference, so the gap between them is this many units whatever the
+        reference does -- a breach moving the forecast, or an intraday curve
+        moving it every minute, move both levels together.
+
+        In *units* it is therefore a property of the configuration. In dollars
+        it is only fixed while the unit is: under `level_unit = "adr"` all
+        session, under `"pred_range"` only until a breach widens the forecast.
+        The stop still becomes a fixed price at the fill because `_buy` converts it
+        to dollars once, there and then, and `_risk` reads that back rather
+        than re-deriving it.
         """
         return float(self.buy_k) - float(self.sell_k)
+
+    @property
+    def unit_phrase(self) -> str:
+        """What a log line calls one k -- "ADR" or "predicted range".
+
+        Every line that prints a k reads this rather than writing "ADR", so a
+        run under one unit cannot be read back in the other's terms.
+        """
+        return LEVEL_UNIT_PHRASES[self.level_unit]
 
     @property
     def has_stop(self) -> bool:
@@ -276,7 +312,47 @@ class AppleTraderConfig:
         return bool(self.stop_gain_fraction or self.stop_k)
 
 
-def stop_distance(config: AppleTraderConfig, adr: float) -> float:
+def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
+    """What one k is worth in dollars for this session, given the unit chosen.
+
+    The single place `level_unit` is read. Everything counted in ks -- the two
+    distances, the stop as a fraction of the predicted gain, the runner
+    threshold, the circuit breaker -- goes through here, so there is no way for
+    two of them to end up measuring against different yardsticks and comparing
+    the results anyway.
+
+    Under "adr" this is `adr14_abs`, fixed for the session. Under "pred_range"
+    it is the current `pred_high - pred_low`, which is *not* fixed: a breach
+    ratchets one side or both (`_update_range`), so the unit -- and with it the
+    dollar gap between the two levels -- widens as the day outgrows its
+    forecast. Callers that need a number frozen at a moment (the stop, once
+    there is a fill) must hold the dollars rather than re-reading the k.
+
+    Falls back to the ADR when the forecast has no usable width, which keeps a
+    half-populated forecast from collapsing both levels onto the reference --
+    the failure mode is silent (two levels at the same price trade as a single
+    one) where a fallback is merely wrong about the unit.
+    """
+    adr = float(plan.get("adr14_abs") or 0.0)
+    if config.level_unit != UNIT_PRED_RANGE:
+        return adr
+    width = float(plan.get("pred_high") or 0.0) - float(plan.get("pred_low") or 0.0)
+    return width if width > 0 else adr
+
+
+def stop_unit(config: AppleTraderConfig, plan: "dict") -> float:
+    """The yardstick `stop_distance` should be handed for this config and session.
+
+    The gain-fraction stop is a share of the predicted gain and follows the
+    level unit; the legacy `stop_k` stop is in ADRs and stays there. Split out
+    so that the four call sites cannot disagree about which.
+    """
+    if config.stop_gain_fraction:
+        return level_unit(config, plan)
+    return float(plan.get("adr14_abs") or 0.0)
+
+
+def stop_distance(config: AppleTraderConfig, unit: float) -> float:
     """How far under the fill the stop sits, in dollars -- 0.0 when there is none.
 
     The one place the two parameterisations meet. A configuration made today
@@ -285,13 +361,21 @@ def stop_distance(config: AppleTraderConfig, adr: float) -> float:
     reference to what the trade was playing for. They are mutually exclusive
     on the config, so this is a choice between exactly one of them and nothing.
 
+    `unit` is `level_unit` for the gain-fraction form, because a fraction of
+    the predicted gain has to be counted in whatever the gain is counted in.
+    For `stop_k` it is the ADR whatever the config's unit says: that form only
+    ever appears on records written before the unit was a choice, and re-reading
+    a stored "0.2 ADR under the fill" as 0.2 of something else would file a
+    different stop beside the original as though it matched. `stop_unit` is
+    what picks the right one.
+
     Module-level rather than a method on the config because the chart draws
     this line too and a second reading of the same settings is how a picture
     and a trade stop agreeing.
     """
     if config.stop_gain_fraction:
-        return config.stop_gain_fraction * config.target_gain_k * float(adr)
-    return config.stop_k * float(adr)
+        return config.stop_gain_fraction * config.target_gain_k * float(unit)
+    return config.stop_k * float(unit)
 
 
 def stop_phrase(config: AppleTraderConfig) -> str:
@@ -337,6 +421,12 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     filed under.
     """
     c = config or AppleTraderConfig()
+    # "A" for the ADR, "R" for the predicted range. The token rides on every k
+    # in the signature rather than appearing once at the end, so that a run is
+    # never read as the same strategy at a different size -- the same 0.4 is a
+    # different distance under each unit. Records written before the unit was a
+    # choice replay as "adr" and keep the "A" they were filed under.
+    unit = LEVEL_UNIT_TOKENS[c.level_unit]
     exits = ""
     if c.stop_gain_fraction:
         exits += f",stop=E-{c.stop_gain_fraction:g}G"
@@ -345,16 +435,16 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     if c.momentum_drop:
         exits += (
             f",take={c.take_fraction * 100:g}%@mom-{c.momentum_drop:g},"
-            f"runner>={c.hold_min_gain_k:g}A"
+            f"runner>={c.hold_min_gain_k:g}{unit}"
         )
     if c.min_win_k:
-        exits += f",min_win={c.min_win_k:g}A"
+        exits += f",min_win={c.min_win_k:g}{unit}"
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     levels = "" if c.level_source == LEVELS_DAYRANGE else f",levels={c.level_source}"
     # "H" in the two distances is whatever `level_source` says it is, which is
     # why that token is next to them rather than at the end.
     return (
-        f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}A,sell=H-{c.sell_k:g}A{levels},"
+        f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}{unit},sell=H-{c.sell_k:g}{unit}{levels},"
         f"size={c.position_pct:g}%{exits}{breach})"
     )
 
@@ -718,7 +808,14 @@ class DayRangeTrader(BaseTrader):
             # known, so the stop, the breakeven and the momentum peak are all
             # measured from here -- an approximation, but a stop measured from
             # nothing would be worse.
-            self.entry = {"price": float(last["close"]), "bars": 0, "ts": ts}
+            self.entry = {
+                "price": float(last["close"]),
+                "bars": 0,
+                "ts": ts,
+                "risk": stop_distance(self.config, stop_unit(self.config, self.plan))
+                if self.plan
+                else None,
+            }
         if position <= 0:
             self.entry = None
         if fresh_bar and self.entry is not None:
@@ -958,15 +1055,25 @@ class DayRangeTrader(BaseTrader):
         for the two to disagree.
 
         `sell_k < buy_k` is enforced on the config, and both distances are
-        subtracted from the same reference, so the sell level sits above the buy
-        level at every minute however the reference moves.
+        subtracted from the same reference in the same unit, so the sell level
+        sits above the buy level at every minute however either moves.
+
+        The unit is re-read here rather than cached with the plan because under
+        `level_unit = "pred_range"` it is a function of the forecast, and the
+        forecast is exactly what `_update_range` moves. That is the intended
+        behaviour -- a day the tape has shown to be wider than predicted gets
+        wider distances, not just higher ones -- and it means the dollar gap
+        between the two levels grows over such a session, where under "adr" it
+        is the same all day. The plan carries the current unit for the log
+        lines and the chart, which must not compute a second one.
         """
         plan, config = self.plan, self.config
-        adr = plan["adr14_abs"]
+        unit = level_unit(config, plan)
         reference = self._reference(ts)
         plan["reference"] = reference
-        plan["buy_level"] = reference - config.buy_k * adr
-        plan["sell_level"] = reference - config.sell_k * adr
+        plan["level_unit"] = unit
+        plan["buy_level"] = reference - config.buy_k * unit
+        plan["sell_level"] = reference - config.sell_k * unit
 
     def _update_range(self, state: AppState, frame, ts) -> None:
         """Move the forecast the session has traded through, and the levels with it.
@@ -1134,7 +1241,7 @@ class DayRangeTrader(BaseTrader):
                 f"rest is sold at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_BREAKEVEN
 
-        risk = stop_distance(config, plan["adr14_abs"])
+        risk = self._risk()
         if risk and entry_price:
             stop = entry_price - risk
             if low <= stop:
@@ -1150,7 +1257,7 @@ class DayRangeTrader(BaseTrader):
             return position, (
                 f"Target: the bar traded up to ${high:,.2f}, at or through the "
                 f"${plan['sell_level']:,.2f} sell level "
-                f"({config.sell_k:g} × ADR under {self._ref_name}, "
+                f"({config.sell_k:g} × {config.unit_phrase} under {self._ref_name}, "
                 f"${plan['reference']:,.2f}). Selling at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_TARGET
 
@@ -1176,7 +1283,7 @@ class DayRangeTrader(BaseTrader):
         is not a move this trade was riding.
 
         What it sells depends on how much the forecast still promises. If the
-        sell level is `hold_min_gain_k x ADR` or more above the fill,
+        sell level is `hold_min_gain_k` level units or more above the fill,
         `take_fraction` of the shares go and the rest is kept as a runner --
         left to the sell level, the flatten, or the breakeven. Short of that the
         target is too close to be worth the wait and everything goes. Once per
@@ -1205,7 +1312,7 @@ class DayRangeTrader(BaseTrader):
         if peak - now < config.momentum_drop:
             return None
 
-        adr = plan["adr14_abs"]
+        unit = level_unit(config, plan)
         left = plan["sell_level"] - entry_price
         pnl_pct = (price / entry_price - 1) * 100
         fade = (
@@ -1214,12 +1321,12 @@ class DayRangeTrader(BaseTrader):
             f"price at ${price:,.2f} — above the ${entry_price:,.2f} fill but short of the "
             f"${plan['sell_level']:,.2f} sell level"
         )
-        to_target = f"${left:,.2f} ({left / adr:.2f} × ADR)"
+        to_target = f"${left:,.2f} ({left / unit:.2f} × {config.unit_phrase})"
 
-        if left < config.hold_min_gain_k * adr:
+        if left < config.hold_min_gain_k * unit:
             return position, (
                 f"{fade}. The sell level is only {to_target} above the fill, under the "
-                f"{config.hold_min_gain_k:g} × ADR worth keeping a runner for, so the whole "
+                f"{config.hold_min_gain_k:g} × {config.unit_phrase} worth keeping a runner for, so the whole "
                 f"position is sold at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_TAKE
 
@@ -1233,10 +1340,29 @@ class DayRangeTrader(BaseTrader):
         return quantity, (
             f"{fade}. Banking {quantity:g} of {position:g} shares at market "
             f"({pnl_pct:+.2f}%). The sell level is still {to_target} above the fill — at "
-            f"least the {config.hold_min_gain_k:g} × ADR worth waiting for — so the other "
+            f"least the {config.hold_min_gain_k:g} × {config.unit_phrase} worth waiting for — so the other "
             f"{position - quantity:g} ride on to it or the closing flatten, and are sold if "
             "the price comes back to the fill."
         ), self.EXIT_TAKE
+
+    def _risk(self) -> float:
+        """How far under the fill this position's stop sits, in dollars.
+
+        Frozen at the fill (`_buy`) rather than recomputed each bar, because
+        under `level_unit = "pred_range"` the unit is a function of a forecast
+        that `_update_range` moves: re-reading it would *widen* the stop under
+        an open position every time the day breached its predicted high, which
+        is the one direction a stop must never move on its own. Under "adr" the
+        two readings are identical, the unit being fixed for the session.
+
+        Falls back to a fresh reading for a position adopted before there was a
+        plan, and for an entry recorded before this was stored -- both are the
+        old behaviour, which is correct under the unit those runs used.
+        """
+        entry = self.entry or {}
+        if entry.get("risk") is not None:
+            return float(entry["risk"])
+        return stop_distance(self.config, stop_unit(self.config, self.plan or {}))
 
     # --- orders ------------------------------------------------------------
 
@@ -1247,12 +1373,17 @@ class DayRangeTrader(BaseTrader):
         if bought:
             # Where the momentum take starts looking for this position's peak.
             self.entry["ts"] = bar.name
+            # And how far under it the stop sits, in dollars, decided once here.
+            # See `_risk`.
+            self.entry["risk"] = stop_distance(
+                self.config, stop_unit(self.config, self.plan)
+            )
         return bought
 
     def _entry_reasoning(self, bar) -> str:
         plan, config = self.plan, self.config
         exits = [f"a resting sell at ${plan['sell_level']:,.2f}"]
-        risk = stop_distance(config, plan["adr14_abs"])
+        risk = stop_distance(config, stop_unit(config, plan))
         if risk:
             exits.append(
                 f"a stop {stop_phrase(config)} (${risk:,.2f}) under the fill"
@@ -1263,8 +1394,8 @@ class DayRangeTrader(BaseTrader):
             )
         return (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
-            f"${plan['buy_level']:,.2f} buy level — {config.buy_k:g} average daily "
-            f"ranges (${plan['adr14_abs']:,.2f} each) below {self._ref_name} at "
+            f"${plan['buy_level']:,.2f} buy level — {config.buy_k:g} × the "
+            f"{config.unit_phrase} (${plan['level_unit']:,.2f}) below {self._ref_name} at "
             f"${plan['reference']:,.2f}. Buying the dip below where "
             f"the day is expected to top out; the exit is {', '.join(exits)}, or the "
             "closing bell."
@@ -1357,16 +1488,17 @@ class DayRangeTrader(BaseTrader):
         config, plan = self.config, self.plan
         if not config.min_win_k or shares <= 0 or plan.get("stand_down"):
             return
-        adr = plan["adr14_abs"]
+        unit = level_unit(config, plan)
         per_share = banked / shares
-        if per_share > config.min_win_k * adr:
+        if per_share > config.min_win_k * unit:
             return
         self._stand_down(
             state,
-            f"closed for {per_share / adr:+.2f} × ADR",
-            f"The round trip netted ${per_share:,.2f} a share ({per_share / adr:+.2f} × "
-            f"ADR over {shares:g} share(s)), at or under the {config.min_win_k:g} × ADR "
-            f"(${config.min_win_k * adr:,.2f}) this configuration treats as worth "
+            f"closed for {per_share / unit:+.2f} × {config.unit_phrase}",
+            f"The round trip netted ${per_share:,.2f} a share ({per_share / unit:+.2f} × "
+            f"{config.unit_phrase} over {shares:g} share(s)), at or under the "
+            f"{config.min_win_k:g} × {config.unit_phrase} "
+            f"(${config.min_win_k * unit:,.2f}) this configuration treats as worth "
             "continuing for. A day whose first trade barely paid is not a day to keep "
             "buying the same levels on.",
         )
@@ -1399,8 +1531,8 @@ class DayRangeTrader(BaseTrader):
             f"{plan['opening_end']:%H:%M} minutes: high ${plan['pred_high']:,.2f}, low "
             f"${plan['pred_low']:,.2f} (yesterday's average ${plan['prev_avg']:,.2f}, "
             f"14-day average range ${plan['adr14_abs']:,.2f}). {rests} Buy at "
-            f"${plan['buy_level']:,.2f} (ref − {self.config.buy_k:g} × ADR), sell at "
-            f"${plan['sell_level']:,.2f} (ref − {self.config.sell_k:g} × ADR). {held}"
+            f"${plan['buy_level']:,.2f} (ref − {self.config.buy_k:g} × {self.config.unit_phrase}), sell at "
+            f"${plan['sell_level']:,.2f} (ref − {self.config.sell_k:g} × {self.config.unit_phrase}). {held}"
         )
 
     def _read_summary(self, bar, ts, position: float) -> str:
@@ -1431,8 +1563,8 @@ class DayRangeTrader(BaseTrader):
             )
             if self.entry.get("runner"):
                 parts.append(f"runner, out at ${entry_price:,.2f}")
-            elif stop_distance(self.config, plan["adr14_abs"]):
-                stop = entry_price - stop_distance(self.config, plan["adr14_abs"])
+            elif self._risk():
+                stop = entry_price - self._risk()
                 parts.append(f"stop ${stop:,.2f}")
         elif plan.get("stand_down"):
             parts.append(f"{plan['stand_down']}, no new entries today")
@@ -1451,7 +1583,7 @@ def session_levels(
     For drawing, not for trading. `model_overlays` puts the two levels beside
     the candles that tested them, and the only honest way to do that is to ask
     the agent -- so this walks a real `DayRangeTrader` through the session and
-    reads its plan, rather than re-deriving `reference - k x ADR` somewhere the
+    reads its plan, rather than re-deriving `reference - k x unit` somewhere the
     two could drift apart. Every setting that moves a level is therefore
     accounted for by construction: the breach update ratchets the forecast, the
     intraday source re-reads it each minute, and a change to either shows up in
@@ -1527,7 +1659,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         exits.append(
             f"a {config.take_fraction:.0%} take once momentum fades "
             f"{config.momentum_drop:g}σ in profit, the rest kept for the sell level only if "
-            f"it is {config.hold_min_gain_k:g} ADR or more above the fill and sold if the "
+            f"it is {config.hold_min_gain_k:g} × {config.unit_phrase} or more above the fill and sold if the "
             "price comes back to it"
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
@@ -1535,7 +1667,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         ""
         if not config.min_win_k
         else (
-            f" A trade that closes for no more than {config.min_win_k:g} ADR a share "
+            f" A trade that closes for no more than {config.min_win_k:g} × {config.unit_phrase} a share "
             "stands the agent down for the rest of the session."
         )
     )
@@ -1559,7 +1691,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         f"Apple Trader armed on {model.label} (fitted "
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
         f"today's {config.ticker} high and low will land, then rests a buy "
-        f"{config.buy_k:g} average daily ranges below {reference} and a sell "
+        f"{config.buy_k:g} × the {config.unit_phrase} below {reference} and a sell "
         f"{config.sell_k:g} below it, until the closing flatten.{breach}{managed}{breaker}"
     )
 

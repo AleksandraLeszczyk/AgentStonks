@@ -733,7 +733,7 @@ def _trader_levels_items(
     buys = [row["buy"] for row in levels]
     sells = [row["sell"] for row in levels]
     how = (
-        f"buy {config.buy_k:g} × ADR and sell {config.sell_k:g} × ADR under "
+        f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
         + ("the predicted high" if config.level_source != "intraday"
            else "the intraday band's upper curve")
     )

@@ -414,12 +414,41 @@ class TestTraderLevelsOverlay:
 
     def config(self, **kwargs):
         from agent_stonks.apple_trader import AppleTraderConfig
+        from agent_stonks.config import UNIT_ADR
 
         kwargs.setdefault("ticker", "AAPL")
         kwargs.setdefault("buy_k", 0.75)
         kwargs.setdefault("sell_k", 0.10)
         kwargs.setdefault("breach_update", "off")
+        # Pinned with the rest: the numbers in this class are ADR arithmetic
+        # off the $3 ADR above. `test_the_unit_is_the_agents_own` is where the
+        # other unit is switched on.
+        kwargs.setdefault("level_unit", UNIT_ADR)
         return AppleTraderConfig(**kwargs)
+
+    def first_buy(self, items):
+        """The chart's opening buy level, however the overlay chose to draw it.
+
+        A config whose levels never move is drawn as two flat lines and one
+        whose levels move as a band, and which of those the shipped settings
+        produce is not what these two tests are about."""
+        level = [i for i in items if i.get("label") == "Buy level"]
+        if level:
+            return level[0]["value"]
+        return next(i for i in items if i["kind"] == "band")["lower"][0]
+
+    def shipped_unit(self):
+        """What one k is worth under the shipped config, on the stubbed forecast.
+
+        Read through `level_unit` rather than written out, so that these two
+        stay tests of *which config the chart falls back to* and do not have to
+        be re-derived every time the shipped unit changes."""
+        from agent_stonks.apple_trader import AppleTraderConfig, level_unit
+
+        return level_unit(
+            AppleTraderConfig(ticker="AAPL"),
+            {"adr14_abs": 3.0, "pred_high": 210.0, "pred_low": 198.0},
+        )
 
     def items(self, monkeypatch, config=None, bars=None):
         pytest.importorskip("agent_stonks.dayrange_model")
@@ -501,8 +530,9 @@ class TestTraderLevelsOverlay:
 
         items = self.items(monkeypatch, None)["items"]
         shipped = AppleTraderConfig(ticker="AAPL")
-        buy = next(i for i in items if i["label"] == "Buy level")
-        assert buy["value"] == pytest.approx(210.0 - shipped.buy_k * 3.0)
+        assert self.first_buy(items) == pytest.approx(
+            210.0 - shipped.buy_k * self.shipped_unit()
+        )
 
     def test_a_config_for_another_symbol_is_not_used_on_this_chart(self, monkeypatch):
         """Its distances were swept on that symbol's tape, and the caption would
@@ -512,8 +542,9 @@ class TestTraderLevelsOverlay:
         items = self.items(monkeypatch, self.config(ticker="GOOGL", buy_k=1.5,
                                                     sell_k=0.05))["items"]
         shipped = AppleTraderConfig(ticker="AAPL")
-        buy = next(i for i in items if i["label"] == "Buy level")
-        assert buy["value"] == pytest.approx(210.0 - shipped.buy_k * 3.0)
+        assert self.first_buy(items) == pytest.approx(
+            210.0 - shipped.buy_k * self.shipped_unit()
+        )
 
     def test_no_forecast_is_a_note_rather_than_an_empty_chart(self, monkeypatch):
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)

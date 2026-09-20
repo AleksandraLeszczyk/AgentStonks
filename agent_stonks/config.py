@@ -177,11 +177,12 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 #
 # The day-range model forecasts where the whole session's high and low will land, once, at 9:35,
 # and the rules built on it are TimeToChange3 notebook 05's: two resting levels
-# a fixed number of average daily ranges below the predicted high H, with A the
-# 14-day average daily range in dollars.
+# a fixed number of level units below the predicted high H, with U the unit
+# APPLE_TRADER_LEVEL_UNIT names -- the notebook's 14-day average daily range,
+# or the forecast's own predicted range.
 #
-#     buy_level  = H - BUY_K  * A
-#     sell_level = H - SELL_K * A
+#     buy_level  = H - BUY_K  * U
+#     sell_level = H - SELL_K * U
 #
 # The notebook specifies 0.75 and 0.10 and only ever swept them over five
 # sessions. The levels used here are per instrument instead, because the stocks
@@ -235,9 +236,12 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 #
 # The stop is written against the *predicted gain* rather than against the ADR:
 # the trade is playing for the distance between the two levels, which is
-# (buy_k - sell_k) x ADR at every minute -- both levels hang off the same
-# reference, so the gap between them never moves however the reference does --
-# and the only question a stop answers is how much of that to risk to make it.
+# (buy_k - sell_k) level units -- both levels hang off the same reference and
+# are counted in the same unit, so the gap between them does not move when the
+# reference does -- and the only question a stop answers is how much of that to
+# risk to make it. (Under APPLE_TRADER_LEVEL_UNIT = "pred_range" the *unit*
+# itself can widen mid-session on a breach, which moves the gap; the stop is
+# fixed in dollars at the fill either way.)
 # 0.5 is one dollar risked for every two the target is worth. Written that way
 # the number means the same thing on every instrument, which STOP_K x ADR did
 # not: 0.20 ADR was a third of AAPL's 0.15-ADR target and a third of GOOGL's
@@ -313,6 +317,58 @@ LEVEL_SOURCE_LABELS = {
 # (a level that moves with the clock, and can therefore walk a target down
 # towards an open position). Opt in and measure it in SimLab.
 APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
+
+# What one "k" is worth in dollars -- the yardstick `buy_k` and `sell_k` are
+# counted in, and with them everything written against the gap between the two
+# levels (`apple_trader.level_unit`).
+#
+#   "adr"         the trailing 14-day average daily range (`adr14_abs`): what
+#                 this symbol's day has been worth lately, a fixed number for
+#                 the session, computed off closed bars and no part of the
+#                 model's output.
+#   "pred_range"  `pred_high - pred_low` from the day-range forecast itself:
+#                 what the model says *today* is worth.
+#
+# The second is the reason this setting exists. Under "adr" the levels hang off
+# a predicted high but are spaced by a historical average, so a day the model
+# calls unusually wide gets the same distances as a day it calls unusually
+# narrow -- the forecast sets where the levels sit and has no say in how far
+# apart they are. Under "pred_range" one forecast decides both.
+#
+# Three consequences worth having in mind before switching:
+#
+#   * APPLE_TRADER_DAYRANGE_LEVELS below was swept in ADRs. A k means a
+#     different number of dollars here, so those pairs are starting points
+#     under this unit rather than swept ones -- the same caveat
+#     APPLE_TRADER_BREACH_UPDATE carries, for the same reason.
+#   * The unit is no longer constant within a session. APPLE_TRADER_BREACH_UPDATE
+#     ratchets `pred_high` up and `pred_low` down, so a breached day *widens*
+#     the range and the two levels spread apart, where under "adr" a breach
+#     shifts both by the same dollar and the gap never moves. A position's
+#     target can therefore move away from its fill mid-session, which under
+#     "adr" it cannot. The stop is still fixed at the fill (`_stop_price`).
+#   * It needs a forecast with both sides. Nothing else here reads `pred_low`,
+#     so a bundle predicting only the high would go unnoticed until now;
+#     `apple_trader.level_unit` falls back to the ADR rather than to a zero
+#     width, which would put both levels on the reference.
+#
+# A SimLab record written before this setting existed replays under "adr"
+# (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
+UNIT_ADR = "adr"
+UNIT_PRED_RANGE = "pred_range"
+LEVEL_UNITS = (UNIT_ADR, UNIT_PRED_RANGE)
+LEVEL_UNIT_LABELS = {
+    UNIT_ADR: "ADR (14-day average daily range)",
+    UNIT_PRED_RANGE: "Predicted Range (predicted high − low)",
+}
+# Short tokens for the run signature and the log lines, where "0.4 x ADR" and
+# "0.4 x the predicted range" are different strategies and must not read alike.
+LEVEL_UNIT_TOKENS = {UNIT_ADR: "A", UNIT_PRED_RANGE: "R"}
+LEVEL_UNIT_PHRASES = {
+    UNIT_ADR: "ADR",
+    UNIT_PRED_RANGE: "predicted range",
+}
+APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # The session circuit breaker: once a trade has closed for no more than this
 # many ADRs of profit per share, the agent buys nothing else that day
 # (`apple_trader.DayRangeTrader._close_out`). The reasoning is that a round trip

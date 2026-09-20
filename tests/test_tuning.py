@@ -16,6 +16,7 @@ import pytest
 
 from agent_stonks import momentum_regime
 from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTraderConfig
+from agent_stonks.config import UNIT_ADR
 from agent_stonks.market_hours import MARKET_TZ
 from dataclasses import asdict, fields
 from simlab import data as sim_data
@@ -462,9 +463,12 @@ def stub_model(monkeypatch):
 
 class TestJob:
     def job_spec(self, **overrides):
-        # The managed exit off, so the grid is about the two levels alone.
+        # The managed exit off, so the grid is about the two levels alone, and
+        # the ADR unit because the tape below and the numbers asserted on it
+        # are that arithmetic.
         base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10,
-                                 stop_gain_fraction=0.0, momentum_drop=0.0)
+                                 stop_gain_fraction=0.0, momentum_drop=0.0,
+                                 level_unit=UNIT_ADR)
         return spec(
             base=asdict(base),
             axes=[{"name": "buy_k", "values": [0.5, 0.75, 1.0]},

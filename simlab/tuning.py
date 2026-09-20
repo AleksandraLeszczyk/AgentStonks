@@ -132,8 +132,12 @@ class Tunable:
 TUNABLES: "dict[str, Tunable]" = {
     t.name: t
     for t in (
-        Tunable("buy_k", "Buy distance (× ADR below H)", 0.05, 3.0, 0.05, (0.30, 0.90, 0.10)),
-        Tunable("sell_k", "Sell distance (× ADR below H)", 0.0, 3.0, 0.05, (0.05, 0.45, 0.10)),
+        # "unit" rather than "ADR": which yardstick a k is counted in is the
+        # run's own `level_unit`, and a grid swept under one is not comparable
+        # with a grid swept under the other. The setup form names it; a column
+        # header has no room to and must not name the wrong one.
+        Tunable("buy_k", "Buy distance (× unit below H)", 0.05, 3.0, 0.05, (0.30, 0.90, 0.10)),
+        Tunable("sell_k", "Sell distance (× unit below H)", 0.0, 3.0, 0.05, (0.05, 0.45, 0.10)),
         Tunable(
             "stop_gain_fraction", "Stop loss (× the predicted gain)", 0.0, 3.0, 0.05,
             (0.0, 1.0, 0.25),

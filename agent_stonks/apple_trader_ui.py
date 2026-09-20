@@ -37,6 +37,10 @@ from .config import (
     LEVELS_INTRADAY,
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
+    LEVEL_UNITS,
+    LEVEL_UNIT_LABELS,
+    UNIT_ADR,
+    UNIT_PRED_RANGE,
 )
 
 
@@ -146,15 +150,19 @@ def dayrange_params(
     _caption(copy.intro.get("dayrange"))
     default_buy, default_sell = dayrange_levels(ticker)
     levels = dict(ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}")
+    # Before the two distances, because it decides what they are counted in and
+    # a label that named the wrong unit would be worse than no label at all.
+    level_unit = level_unit_param(defaults, copy)
+    unit_label = UNIT_FORM_LABELS[level_unit]
     col_a, col_b = st.columns(2)
     buy_k = col_a.number_input(
-        "Buy distance (× ADR below H)",
+        f"Buy distance (× {unit_label} below H)",
         min_value=0.05, max_value=3.0, value=default_buy, step=0.05, format="%.2f",
         key=copy.key(f"buy_k_{ticker}"),
         help=copy.help.get("buy_k", "").format(**levels),
     )
     sell_k = col_b.number_input(
-        "Sell distance (× ADR below H)",
+        f"Sell distance (× {unit_label} below H)",
         min_value=0.0, max_value=3.0, value=default_sell, step=0.05, format="%.2f",
         key=copy.key(f"sell_k_{ticker}"),
         help=copy.help.get("sell_k", "").format(**levels),
@@ -189,6 +197,7 @@ def dayrange_params(
         sell_k=float(sell_k),
         position_pct=float(position_pct),
         level_source=level_source,
+        level_unit=level_unit,
         breach_update=breach_update,
         stop_gain_fraction=stop_gain_fraction,
         momentum_drop=momentum_drop,
@@ -235,6 +244,52 @@ def min_win_param(
             icon=":material/info:",
         )
     return float(min_win_k)
+
+
+# What the two number inputs call the unit in their own labels. Shorter than
+# `LEVEL_UNIT_LABELS`, which has room to explain itself in a dropdown and none
+# to sit inside "Buy distance (× ... below H)".
+UNIT_FORM_LABELS = {
+    UNIT_ADR: "ADR",
+    UNIT_PRED_RANGE: "Predicted Range",
+}
+
+
+def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
+    """What one k is worth: the ADR, or the model's own predicted range.
+
+    Not keyed by ticker, unlike the levels and the reference: it is a statement
+    about how the strategy is parameterised rather than about a symbol, and it
+    is available for every instrument -- both numbers come from the day-range
+    forecast every run already loads.
+
+    The warning fires on the combination rather than on either setting, because
+    neither is wrong on its own: a moving reference is the point of the breach
+    policies, and a forecast-derived unit is the point of this one. Together
+    they mean the gap between the two levels grows over a breaching session,
+    which is a real change to what a position is playing for and is not
+    something the swept pairs were chosen under.
+    """
+    choice = str(
+        st.selectbox(
+            "Distances counted in",
+            LEVEL_UNITS,
+            index=(
+                LEVEL_UNITS.index(defaults.level_unit)
+                if defaults.level_unit in LEVEL_UNITS
+                else 0
+            ),
+            format_func=lambda key: LEVEL_UNIT_LABELS[key],
+            key=copy.key("level_unit"),
+            help=copy.help.get("level_unit"),
+        )
+    )
+    if choice == UNIT_PRED_RANGE:
+        st.caption(
+            ":material/info: The shipped distances were swept in ADRs, so under the "
+            "predicted range they are starting points rather than swept ones."
+        )
+    return choice
 
 
 def level_source_param(

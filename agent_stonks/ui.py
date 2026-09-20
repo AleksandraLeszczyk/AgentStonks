@@ -1898,8 +1898,10 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "At 9:35 the model forecasts where today's high **H** will land, and the two "
             "levels below are set from it — a buy that fills on a dip "
             "well under where the day is expected to top out, and a sell just beneath it. "
-            "Both are distances in **average daily ranges** (the trailing 14-day ADR in "
-            "dollars), so they scale with how wide the sessions have been."
+            "Both are distances in whichever unit is chosen below — the trailing "
+            "14-day ADR, so they scale with how wide the sessions have been, or the "
+            "forecast's own predicted range, so they scale with how wide the model "
+            "thinks *today* will be."
         ),
         "dayrange_levels": (
             "Both distances are measured below one reference. It does not have to be the "
@@ -1985,6 +1987,18 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
             "the smaller number. Anything the day never reaches is held to the closing "
             "flatten."
+        ),
+        "level_unit": (
+            "What one unit of `buy` and `sell` is worth in dollars. The ADR is this "
+            "symbol's trailing 14-day average daily range — what its day has been worth "
+            "lately, fixed for the session and no part of the model's output. The "
+            "predicted range is `predicted high − predicted low` from the same forecast "
+            "the levels hang off, so one model decides both where they sit and how far "
+            "apart they are, and a day the model calls wide gets wider distances. Note "
+            "that with an intraday update switched on the predicted range *widens* as "
+            "the day breaches its forecast, so the two levels spread apart over such a "
+            "session; a stop is still fixed in dollars at the fill. The shipped "
+            "distances were swept in ADRs."
         ),
         "level_source": (
             "Which number `buy` and `sell` are measured below. The predicted high is one "

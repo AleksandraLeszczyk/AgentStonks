@@ -717,7 +717,7 @@ class TestRuleAgentRecords:
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
         assert today.min_win_k == 0.10   # AAPL's own default
-        assert ",min_win=0.1A" in agent.signature(today)
+        assert ",min_win=0.1R" in agent.signature(today)
 
     def test_a_record_from_before_the_level_source_rests_on_the_predicted_high(self):
         """It is the default too, so this changes nothing today -- it is here so

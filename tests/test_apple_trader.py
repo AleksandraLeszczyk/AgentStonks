@@ -18,6 +18,7 @@ from agent_stonks import clock
 from agent_stonks import rule_agent
 from agent_stonks.apple_trader import DEFAULT_TICKER as TICKER
 from agent_stonks.apple_trader import AppleTraderConfig, config_signature
+from agent_stonks.config import UNIT_ADR, UNIT_PRED_RANGE
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
@@ -187,11 +188,18 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     are about the rule as notebook 05 specified it, and a default that moves
     would rewrite what they assert. `TestIntradayRangeUpdate`,
     `TestIntradayLevelSource` and `TestMinimumWin` are where each is switched on.
+
+    `level_unit` is pinned for the same reason, and it is the one pin that is
+    not today's default: the notebook counted in ADRs, `BUY_LEVEL` and
+    `SELL_LEVEL` above are that arithmetic, and it is still what every stored
+    record replays under. `TestPredictedRangeUnit` is where the other one is
+    switched on.
     """
     kwargs.setdefault("buy_k", 0.75)
     kwargs.setdefault("sell_k", 0.10)
     kwargs.setdefault("breach_update", "off")
     kwargs.setdefault("min_win_k", 0.0)
+    kwargs.setdefault("level_unit", UNIT_ADR)
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
 
@@ -1669,8 +1677,214 @@ class TestDayRangeLevelDefaults:
     def test_the_default_pair_signs_the_run(self):
         buy_k, sell_k = at.dayrange_levels("AAPL")
         assert config_signature(AppleTraderConfig(model_key="dayrange")).startswith(
-            f"dayrange_AAPL(buy=H-{buy_k:g}A,sell=H-{sell_k:g}A,size=95%"
+            f"dayrange_AAPL(buy=H-{buy_k:g}R,sell=H-{sell_k:g}R,size=95%"
         )
+
+
+class TestPredictedRangeUnit:
+    """The two distances counted in the model's own predicted range.
+
+    The fixture separates the two units cleanly: the ADR is $10 and the
+    predicted range is $15 (110 - 95), so every level, stop and threshold lands
+    somewhere the other unit could not have put it.
+    """
+
+    def _config(self, **kwargs):
+        kwargs.setdefault("level_unit", UNIT_PRED_RANGE)
+        return dayrange_config(**kwargs)
+
+    def _trader(self, **kwargs):
+        return at.DayRangeTrader(self._config(**kwargs))
+
+    PRED_RANGE = 15.0                     # 110 - 95
+    BUY = 110.0 - 0.75 * PRED_RANGE       # 98.75, vs 102.50 under the ADR
+    SELL = 110.0 - 0.10 * PRED_RANGE      # 108.50, vs 109.00 under the ADR
+
+    def test_the_levels_are_the_two_distances_in_predicted_ranges(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(103.0))
+        Tape(monkeypatch)
+        trader = self._trader()
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        assert trader.plan["buy_level"] == pytest.approx(self.BUY)
+        assert trader.plan["sell_level"] == pytest.approx(self.SELL)
+        # And not where the ADR would have put them, which is the whole point.
+        assert trader.plan["buy_level"] != pytest.approx(BUY_LEVEL)
+
+    def test_the_unit_is_the_forecasts_width_not_the_trailing_average(self):
+        """A forecast calling an unusually wide day gets unusually wide distances.
+
+        Under the ADR the same `adr14_abs` would have produced the same two
+        distances for both of these, which is the thing this unit exists to
+        stop.
+        """
+        config = self._config()
+        narrow = {**FORECAST, "pred_high": 110.0, "pred_low": 108.0}
+        wide = {**FORECAST, "pred_high": 110.0, "pred_low": 80.0}
+        assert at.level_unit(config, narrow) == pytest.approx(2.0)
+        assert at.level_unit(config, wide) == pytest.approx(30.0)
+        # The ADR unit ignores both and reads the trailing average.
+        adr_config = self._config(level_unit=UNIT_ADR)
+        assert at.level_unit(adr_config, narrow) == pytest.approx(10.0)
+        assert at.level_unit(adr_config, wide) == pytest.approx(10.0)
+
+    def test_a_forecast_with_no_width_falls_back_to_the_adr(self):
+        """Rather than collapsing both levels onto the reference, which would
+        trade as a single level and say nothing about why."""
+        config = self._config()
+        assert at.level_unit(config, {**FORECAST, "pred_low": 110.0}) == 10.0
+        assert at.level_unit(config, {**FORECAST, "pred_low": 120.0}) == 10.0
+
+    def test_a_breach_widens_the_unit_so_the_levels_spread_apart(
+        self, state, market_open, monkeypatch
+    ):
+        """The consequence the ADR unit does not have.
+
+        Under "adr" a breach shifts both levels by the same dollar and the gap
+        between them is the same all day. Here the breach widens the forecast,
+        which widens the unit, so the two levels move apart -- the day has been
+        shown to be bigger than predicted and the trade plays for more of it.
+        """
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(111.5, high=112.0)
+        trader = self._trader(breach_update="extreme")
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        # 112 - 95 = 17 wide now, off a high of 112.
+        assert trader.plan["pred_high"] == pytest.approx(112.0)
+        gap = trader.plan["sell_level"] - trader.plan["buy_level"]
+        assert gap == pytest.approx(0.65 * 17.0)
+        assert gap > 0.65 * self.PRED_RANGE
+
+        # Where the ADR unit holds the gap fixed through the same breach.
+        adr_tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        adr_tape = Tape(monkeypatch)
+        adr_tape.append(111.5, high=112.0)
+        adr = at.DayRangeTrader(
+            dayrange_config(breach_update="extreme", level_unit=UNIT_ADR)
+        )
+        adr.run_cycle(DAYRANGE_BUNDLE, state, adr_tracker)
+        assert adr.plan["sell_level"] - adr.plan["buy_level"] == pytest.approx(6.5)
+
+    def test_the_stop_is_a_share_of_the_gain_in_the_same_unit(self):
+        """Not of a gain measured in ADRs, which would not be the gain."""
+        config = self._config(stop_gain_fraction=0.5)
+        plan = dict(FORECAST)
+        # 0.65 of a 15-dollar range is 9.75; half of that is 4.875.
+        assert at.stop_distance(
+            config, at.stop_unit(config, plan)
+        ) == pytest.approx(0.5 * 0.65 * 15.0)
+
+    def test_the_legacy_adr_stop_stays_in_adrs_whatever_the_unit_says(self):
+        """`stop_k` is a stored record's own number and means ADRs by
+        construction; re-reading it against the predicted range would replay a
+        different stop under the original's signature."""
+        config = self._config(stop_k=0.2, stop_gain_fraction=0.0)
+        plan = dict(FORECAST)
+        assert at.stop_unit(config, plan) == pytest.approx(10.0)
+        assert at.stop_distance(config, at.stop_unit(config, plan)) == pytest.approx(2.0)
+
+    def test_an_open_positions_stop_does_not_loosen_when_the_forecast_widens(
+        self, state, market_open, monkeypatch
+    ):
+        """The one direction a stop must never move on its own.
+
+        The unit is a function of a forecast the breach policy moves, so a stop
+        re-read each bar would step further from the fill every time the day
+        made a new high. It is fixed in dollars at the fill instead.
+        """
+        broker = FakeBroker(98.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._trader(breach_update="extreme", stop_gain_fraction=0.5)
+
+        tape.append(98.0, low=98.0)          # through the 98.75 buy level
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert tracker.position_for(TICKER) > 0
+        risk = trader._risk()
+        assert risk == pytest.approx(0.5 * 0.65 * 15.0)   # 4.875
+
+        # A breach of the *low* side, which widens the range without going
+        # anywhere near the 108.50 sell level. 94.00 clears both the frozen
+        # stop (98 - 4.875 = 93.125) and the looser one a re-read would give,
+        # so the only thing this asserts is which of the two is being used.
+        tape.append(96.0, low=94.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert tracker.position_for(TICKER) > 0
+        assert trader.plan["pred_low"] == pytest.approx(94.0)   # 16 wide now
+        assert trader._risk() == pytest.approx(risk)
+        # The re-read this is guarding against, for contrast: further from the
+        # fill than the stop the trade was entered with.
+        assert at.stop_distance(
+            trader.config, at.stop_unit(trader.config, trader.plan)
+        ) == pytest.approx(0.5 * 0.65 * 16.0)
+
+    def test_a_breach_of_the_low_alone_now_moves_the_levels(
+        self, state, market_open, monkeypatch
+    ):
+        """Which it does not do under the ADR unit.
+
+        There the levels are built from the predicted high and a trailing
+        average, so the low is not an input to either and a breach of it moves
+        the forecast and nothing else. Here the low is half the unit.
+        """
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(96.0))
+        tape = Tape(monkeypatch)
+        tape.append(96.0, low=94.0)
+        trader = self._trader(breach_update="extreme")
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        assert trader.plan["pred_high"] == pytest.approx(110.0)   # never breached
+        assert trader.plan["pred_low"] == pytest.approx(94.0)
+        assert trader.plan["buy_level"] == pytest.approx(110.0 - 0.75 * 16.0)
+        assert trader.plan["sell_level"] == pytest.approx(110.0 - 0.10 * 16.0)
+
+        adr_tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(96.0))
+        adr_tape = Tape(monkeypatch)
+        adr_tape.append(96.0, low=94.0)
+        adr = at.DayRangeTrader(
+            dayrange_config(breach_update="extreme", level_unit=UNIT_ADR)
+        )
+        adr.run_cycle(DAYRANGE_BUNDLE, state, adr_tracker)
+        assert adr.plan["pred_low"] == pytest.approx(94.0)
+        assert adr.plan["buy_level"] == pytest.approx(BUY_LEVEL)   # unmoved
+        assert adr.plan["sell_level"] == pytest.approx(SELL_LEVEL)
+
+    def test_the_unit_is_in_the_signature_on_every_k(self):
+        """Two units are two strategies at the same numbers, so they must not
+        share a row in Results."""
+        adr = config_signature(dayrange_config(level_unit=UNIT_ADR, min_win_k=0.2))
+        pred = config_signature(self._config(min_win_k=0.2))
+        assert "buy=H-0.75A" in adr and "min_win=0.2A" in adr
+        assert "buy=H-0.75R" in pred and "min_win=0.2R" in pred
+        assert adr != pred
+
+    def test_the_log_lines_name_the_unit_they_are_counted_in(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(98.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        tape.append(98.0, low=98.0)
+        trader = self._trader()
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        entry = tracker.snapshot()["decisions"][-1].reasoning
+        assert "buy level" in entry
+        assert "predicted range" in entry
+        assert "average daily" not in entry
+        # And the ADR unit still says "ADR", on the same line.
+        adr_tracker = DecisionTracker(
+            starting_cash=10_000.0, broker=FakeBroker(103.0)
+        )
+        adr_tape = Tape(monkeypatch, FakeBroker(103.0))
+        adr_tape.append(102.0, low=102.0)
+        adr = at.DayRangeTrader(dayrange_config(level_unit=UNIT_ADR))
+        adr.run_cycle(DAYRANGE_BUNDLE, state, adr_tracker)
+        assert "ADR" in adr_tracker.snapshot()["decisions"][-1].reasoning
 
 
 class TestInstrument:
