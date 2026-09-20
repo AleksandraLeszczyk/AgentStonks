@@ -102,6 +102,60 @@ class TestBuildChart:
         names = [t.name for t in fig.data]
         assert "Agent sleep" not in names
 
+    def test_decision_marker_hover_carries_reasoning(self):
+        decisions = [
+            {
+                "ts": "2024-01-15T14:00:30Z", "action": "buy", "price": 100.5,
+                "filled_quantity": 2, "status": "filled",
+                "reasoning": "Opened below the predicted day range low.",
+            },
+        ]
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=decisions)
+        trace = next(t for t in fig.data if t.name == "Agent buy")
+        assert "%{customdata[1]}" in trace.hovertemplate
+        assert trace.customdata[0][1] == "Opened below the predicted day range low."
+
+    def test_decision_marker_hover_drops_why_without_reasoning(self):
+        decisions = [
+            {"ts": "2024-01-15T14:00:30Z", "action": "buy", "price": 100.5,
+             "filled_quantity": 2, "status": "filled"},
+        ]
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=decisions)
+        trace = next(t for t in fig.data if t.name == "Agent buy")
+        assert "Why" not in trace.hovertemplate
+        assert "%{customdata[0]}" in trace.hovertemplate
+
+    def test_decision_marker_hover_still_shows_quantity(self):
+        decisions = [
+            {"ts": "2024-01-15T14:00:30Z", "action": "sell", "price": 102.0,
+             "filled_quantity": 3, "status": "filled", "reasoning": "Flattening into the close."},
+        ]
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=decisions)
+        trace = next(t for t in fig.data if t.name == "Agent sell")
+        assert trace.customdata[0][0] == "3.00"
+
+
+class TestHoverParagraph:
+    def test_wraps_long_prose_into_lines(self):
+        text = "word " * 60
+        out = charts._hover_paragraph(text)
+        assert "<br>" in out
+        assert all(len(line) <= charts._HOVER_WRAP_COLS for line in out.split("<br>"))
+
+    def test_escapes_angle_brackets(self):
+        out = charts._hover_paragraph("bought because <model> said so")
+        assert "<model>" not in out
+        assert "&lt;model&gt;" in out
+
+    def test_truncates_beyond_the_line_cap(self):
+        out = charts._hover_paragraph("reason " * 400)
+        assert len(out.split("<br>")) == charts._HOVER_WRAP_LINES
+        assert out.endswith("\u2026")
+
+    def test_empty_text_is_empty(self):
+        assert charts._hover_paragraph("") == ""
+        assert charts._hover_paragraph(None) == ""
+
     def test_no_decisions_does_not_error(self):
         fig = build_chart(BARS, [], [], "AAPL", SESSION_START, decisions=None)
         assert isinstance(fig, go.Figure)

@@ -1,4 +1,5 @@
 import colorsys
+import textwrap
 from datetime import datetime
 from typing import Optional
 
@@ -655,8 +656,41 @@ def _add_tactic_levels(tactic_levels: list[dict], fig: go.Figure, x0: datetime, 
         )
 
 
+# A hover label is one long line unless the text says otherwise, and the
+# reasoning behind a trade is free prose -- a rule agent's few sentences, or a
+# whole LLM paragraph. These are about the widest and tallest tooltip that
+# still sits over the chart rather than covering it.
+_HOVER_WRAP_COLS = 58
+_HOVER_WRAP_LINES = 12
+
+
+def _hover_paragraph(text: str) -> str:
+    """`text` hard-wrapped and escaped for use inside a hovertemplate.
+
+    Angle brackets are escaped because plotly renders the label as HTML: a
+    stray one in agent prose would otherwise be read as a tag and swallow
+    everything after it.
+    """
+    clean = " ".join(str(text or "").split())
+    if not clean:
+        return ""
+    clean = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    lines = textwrap.wrap(clean, width=_HOVER_WRAP_COLS) or [clean]
+    if len(lines) > _HOVER_WRAP_LINES:
+        lines = lines[:_HOVER_WRAP_LINES]
+        lines[-1] = lines[-1].rstrip(".,;:- ") + " \u2026"
+    return "<br>".join(lines)
+
+
 def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: datetime) -> None:
-    """Plot filled agent buy/sell decisions as markers on the price chart."""
+    """Plot filled agent buy/sell decisions as markers on the price chart.
+
+    Each marker carries the reasoning recorded with the decision, so hovering a
+    trade answers *why* it happened without leaving the chart for the decision
+    log. The quantity is pre-formatted into customdata rather than formatted in
+    the template: customdata carrying a text column arrives as one array of
+    strings, and a numeric format spec applied to that renders literally.
+    """
     if not decisions:
         return
     df = pd.DataFrame(decisions)
@@ -675,6 +709,21 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
         sub = df[df["action"] == action]
         if sub.empty:
             continue
+        quantities = sub.get("filled_quantity", sub.get("quantity"))
+        qty_labels = (
+            [f"{float(q):,.2f}" if pd.notna(q) else "\u2014" for q in quantities]
+            if quantities is not None
+            else ["\u2014"] * len(sub)
+        )
+        reasons = (
+            [_hover_paragraph(r) for r in sub["reasoning"]]
+            if "reasoning" in sub.columns
+            else [""] * len(sub)
+        )
+        # An empty "Why" heading on every marker is worse than no heading, so
+        # the block joins the template only when the decisions actually carry
+        # their reasoning (hand-built marker dicts and older logs do not).
+        why = "<br><br><b>Why</b><br>%{customdata[1]}" if any(reasons) else ""
         fig.add_trace(
             go.Scatter(
                 x=sub["ts"],
@@ -682,9 +731,16 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
                 mode="markers",
                 marker=dict(symbol=marker_symbol, size=14, color=color, line=dict(width=1.5, color="#ffffff")),
                 name=f"Agent {action}",
-                customdata=sub.get("filled_quantity", sub.get("quantity")),
+                customdata=list(zip(qty_labels, reasons)),
+                hoverlabel=dict(
+                    align="left",
+                    bgcolor=PALETTE["panel"],
+                    bordercolor=color,
+                    font=dict(size=11),
+                ),
                 hovertemplate=(
-                    f"<b>Agent {action}</b><br>Price: %{{y:.4f}}<br>Qty: %{{customdata:.2f}}<extra></extra>"
+                    f"<b>Agent {action}</b><br>Price: %{{y:.4f}}<br>Qty: %{{customdata[0]}}"
+                    f"{why}<extra></extra>"
                 ),
             ),
             row=1,
