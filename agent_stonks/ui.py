@@ -614,6 +614,7 @@ def _chart_panel() -> None:
             news_impacts=sym_state.news_impacts,
             fill_gaps=state.fill_gaps,
             model_overlays=overlays["items"],
+            show_momentum=state.show_momentum,
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
@@ -653,6 +654,14 @@ def _live_chart_controls() -> None:
                 default=[],
             )
             show_fib = st.checkbox("Fibonacci levels", value=False)
+            show_momentum = st.checkbox(
+                "Momentum panel",
+                value=True,
+                help="Draw the session momentum score under the price: the "
+                "15-bar log return in units of its own random-walk sigma, the "
+                "same number the rule agents' regime is triggered off. The "
+                "dotted rules are the regime-entry thresholds.",
+            )
 
         st.markdown("**Price Profile Fit**")
         dist_choice = st.selectbox("Fit mixture", ["None", "Gaussian", "Cauchy"], index=0)
@@ -713,6 +722,7 @@ def _live_chart_controls() -> None:
     state.show_candle_body = show_candle_body
     state.show_percentile_body = show_percentile_body
     state.show_whiskers = show_whiskers
+    state.show_momentum = show_momentum
     state.fill_gaps = fill_gaps
     state.vwap_style = vwap_style
     state.show_fib = show_fib
@@ -1778,6 +1788,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     model_overlays=model_overlays.live_overlays(
                         sym_state, bars, state.model_overlay_keys,
                     )["items"],
+                    show_momentum=state.show_momentum,
                 ),
             )
         )

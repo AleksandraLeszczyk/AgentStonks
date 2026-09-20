@@ -248,6 +248,7 @@ _DEFAULTS: dict[str, object] = {
     "show_candle_body": True,
     "show_percentile_body": False,
     "show_whiskers": True,
+    "show_momentum": True,
     "fill_gaps": True,
     "volume_alert_enabled": True,
     "volume_alert_multiplier": VOLUME_ALERT_DEFAULT_MULTIPLIER,
@@ -348,6 +349,8 @@ class AppState:
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False
         self.show_whiskers: bool = True
+        # Draw the session momentum score in a panel under the price/volume.
+        self.show_momentum: bool = True
         # Draw synthetic flat bars at feed minutes without any trade, so the
         # candle/volume series has no visual holes.
         self.fill_gaps: bool = True

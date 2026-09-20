@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from . import market_hours
+from . import market_hours, momentum_regime
 from .config import (
     AVG_LINE_COLORS,
     FIB_LEVELS,
@@ -692,6 +692,114 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
         )
 
 
+def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
+    """The session momentum score, drawn in its own panel under the price.
+
+    The same number the rule agents and the regime overlays read
+    (`momentum_regime.compute_momentum`): the `horizon`-bar log return in units
+    of its own random-walk sigma, EWM-smoothed. It is dimensionless, so the
+    panel is readable against the Schmitt-trigger thresholds the regime is
+    defined by -- those are the dotted rules, and crossing one is what flips
+    the regime.
+
+    Everything is session-local and needs `vol_window` bars behind it, so the
+    first stretch of the day is NaN. That is left as a gap rather than plotted
+    as zero, which would read as "balanced" when it means "not known yet".
+
+    The frame is rebuilt from the drawn bars via `momentum_regime`, which keeps
+    to the regular session and to an exchange-local index -- so the series is
+    converted back to UTC here, the wall clock the price axis is drawn in.
+    """
+    def _warming_up() -> None:
+        """Say why the panel is empty rather than leaving a blank box."""
+        fig.add_annotation(
+            xref="x domain", yref="y domain", x=0.5, y=0.5,
+            text="Momentum warms up over the first ~25 regular-session bars",
+            font=dict(color=PALETTE["muted"], size=11),
+            showarrow=False,
+            row=row,
+            col=1,
+        )
+
+    frame = momentum_regime.frame_from_bars(
+        [
+            {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+            for t, o, h, l, c, v in zip(
+                df["t"], df["o"], df["h"], df["l"], df["c"], df["v"]
+            )
+        ]
+    )
+    if not len(frame):
+        return _warming_up()
+    mom = momentum_regime.compute_momentum(frame)["mom"]
+    if not mom.notna().any():
+        return _warming_up()
+
+    x = mom.index.tz_convert("UTC")
+    enter = momentum_regime.MOMENTUM_DEFAULTS["enter_threshold"]
+
+    # Two clipped fills rather than one: the sign is the whole point of the
+    # score, and a single-color area hides it.
+    for clipped, color in (
+        (mom.clip(lower=0.0), PALETTE["up"]),
+        (mom.clip(upper=0.0), PALETTE["down"]),
+    ):
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=clipped,
+                mode="lines",
+                line=dict(width=0),
+                fill="tozeroy",
+                fillcolor=_rgba(color, 0.30),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=row,
+            col=1,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=mom,
+            mode="lines",
+            line=dict(color=PALETTE["text"], width=1.2),
+            name="Momentum",
+            showlegend=False,
+            hovertemplate="Momentum %{y:+.2f}\u03c3<extra></extra>",
+        ),
+        row=row,
+        col=1,
+    )
+
+    fig.add_hline(y=0, line=dict(color=PALETTE["muted"], width=1), row=row, col=1)
+    for level in (enter, -enter):
+        fig.add_hline(
+            y=level,
+            line=dict(color=PALETTE["muted"], width=1, dash="dot"),
+            row=row,
+            col=1,
+        )
+
+    last_at = mom.last_valid_index()
+    if last_at is not None:
+        value = float(mom.loc[last_at])
+        fig.add_annotation(
+            x=last_at.tz_convert("UTC"),
+            y=value,
+            text=f" {value:+.2f}\u03c3",
+            font=dict(
+                color=PALETTE["up"] if value >= 0 else PALETTE["down"],
+                size=11,
+                family="monospace",
+            ),
+            showarrow=False,
+            xanchor="left",
+            row=row,
+            col=1,
+        )
+
+
 def _fill_intraday_gaps(df: pd.DataFrame) -> pd.DataFrame:
     """Insert synthetic flat bars (o=h=l=c=prev close, v=0) at missing buckets.
 
@@ -1159,6 +1267,7 @@ def build_chart(
     news_impacts: Optional[dict] = None,
     fill_gaps: bool = False,
     model_overlays: Optional[list[dict]] = None,
+    show_momentum: bool = False,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -1181,14 +1290,20 @@ def build_chart(
         df_trades["t"] = pd.to_datetime(df_trades["t"])
         df_trades = df_trades[df_trades["t"] > session_start]
 
+    # The momentum score gets a panel of its own under the volume rather than
+    # a second y axis on the price: it is measured in sigmas, not dollars, and
+    # sharing the price axis would either flatten it or stretch the candles.
+    # Appending the row keeps the price-profile column at (1, 2) -- and so at
+    # `x2`/`y2`, which `add_model_overlays` addresses by axis id.
+    momentum_row = 3 if show_momentum else None
     fig = make_subplots(
-        rows=2,
+        rows=3 if show_momentum else 2,
         cols=2,
         shared_xaxes=True,
         shared_yaxes=True,
         vertical_spacing=0.02,
         horizontal_spacing=0.02,
-        row_heights=[0.75, 0.25],
+        row_heights=[0.60, 0.18, 0.22] if show_momentum else [0.75, 0.25],
         column_widths=[0.8, 0.2],
     )
 
@@ -1323,6 +1438,9 @@ def build_chart(
         row=2,
         col=1,
     )
+
+    if momentum_row is not None:
+        _add_momentum_panel(df, fig, momentum_row)
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])
     if not df_news.empty:
@@ -1479,8 +1597,21 @@ def build_chart(
         yaxis2=dict(showgrid=True, gridcolor=PALETTE["grid"], tickfont=dict(size=10)),
         legend=dict(orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)"),
         margin=dict(l=10, r=10, t=50, b=10),
-        height=520,
+        height=660 if show_momentum else 520,
     )
+    if momentum_row is not None:
+        fig.update_xaxes(
+            showgrid=True, gridcolor=PALETTE["grid"], row=momentum_row, col=1,
+        )
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor=PALETTE["grid"],
+            tickfont=dict(size=10),
+            zeroline=False,
+            title=dict(text="Momentum (\u03c3)", font=dict(size=10)),
+            row=momentum_row,
+            col=1,
+        )
     return fig
 
 

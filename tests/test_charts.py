@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pytest
@@ -392,3 +393,87 @@ class TestSessionMarkers:
         fig = go.Figure()
         charts.add_session_markers(fig, [])
         assert not fig.layout.shapes
+
+
+class TestMomentumPanel:
+    """The session momentum score, in its own row under the price.
+
+    The score is `momentum_regime`'s, not a second definition: these pin that
+    the panel is off unless asked for, that switching it on leaves the price
+    and price-profile subplots where `add_model_overlays` addresses them, and
+    that the warm-up stretch is drawn as a gap with a note rather than as a
+    run of zeros.
+    """
+
+    @staticmethod
+    def rth_bars(n: int, start: str = "2024-01-15T14:30:00Z") -> list[dict]:
+        """`n` minute bars of a drifting tape from the open (14:30Z = 09:30 ET).
+
+        The steps have to actually vary: the score divides by the window's own
+        volatility, so a constant-drift ramp has no momentum to report.
+        """
+        t0 = pd.Timestamp(start)
+        steps = np.random.default_rng(7).normal(0.02, 0.05, n)
+        out = []
+        close = 100.0
+        for i, step in enumerate(steps):
+            open_, close = close, close + float(step)
+            out.append({
+                "t": (t0 + pd.Timedelta(minutes=i)).isoformat(),
+                "o": open_, "h": max(open_, close) + 0.02,
+                "l": min(open_, close) - 0.02, "c": close, "v": 1000 + i,
+            })
+        return out
+
+    def test_off_by_default(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START)
+        assert "yaxis5" not in fig.layout
+        assert "Momentum" not in [tr.name for tr in fig.data]
+
+    def test_adds_a_third_row_when_on(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        mom = [tr for tr in fig.data if tr.name == "Momentum"]
+        assert len(mom) == 1
+        # Row 3, col 1 -- under the price (row 1) and the volume (row 2).
+        assert mom[0].yaxis == "y5"
+
+    def test_price_profile_keeps_its_axis_ids(self):
+        # add_model_overlays addresses the profile column as x2/y2, so the
+        # extra row has to be appended rather than inserted.
+        fig = build_chart(self.rth_bars(60), [], TRADES, "AAPL", SESSION_START, show_momentum=True)
+        assert any(tr.yaxis == "y2" for tr in fig.data)
+
+    def test_warmup_is_a_gap_not_zeros(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        mom = [tr for tr in fig.data if tr.name == "Momentum"][0]
+        values = pd.Series(mom.y)
+        assert values.isna().any() and values.notna().any()
+        # The leading stretch is the NaN one.
+        assert pd.isna(values.iloc[0]) and pd.notna(values.iloc[-1])
+
+    def test_too_few_bars_draws_a_note_instead(self):
+        fig = build_chart(self.rth_bars(5), [], [], "AAPL", SESSION_START, show_momentum=True)
+        assert "Momentum" not in [tr.name for tr in fig.data]
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("warms up" in t for t in texts)
+
+    def test_bars_outside_the_regular_session_draw_a_note(self):
+        # 13:30Z is 08:30 ET: after SESSION_START, so the bars are drawn, but
+        # pre-market, so the momentum frame drops every one of them.
+        pre = self.rth_bars(40, start="2024-01-15T13:30:00Z")
+        fig = build_chart(pre, [], [], "AAPL", SESSION_START, show_momentum=True)
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("warms up" in t for t in texts)
+
+    def test_labels_the_latest_value(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("σ" in t for t in texts)
+
+    def test_draws_the_regime_entry_thresholds(self):
+        from agent_stonks.momentum_regime import MOMENTUM_DEFAULTS
+
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        enter = MOMENTUM_DEFAULTS["enter_threshold"]
+        levels = {s.y0 for s in fig.layout.shapes if s.yref == "y5"}
+        assert {0, enter, -enter} <= levels
