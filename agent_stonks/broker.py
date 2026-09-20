@@ -62,6 +62,17 @@ class Broker(abc.ABC):
         venue, or None when the local ledger is the only record there is."""
         return None
 
+    def account_value(self) -> "float | None":
+        """The venue's own total account value -- cash plus the market value of
+        every position it holds -- or None when the local ledger is the only
+        record there is.
+
+        Deliberately a separate call from `account_snapshot`: this is the number
+        shown as "Portfolio value", it is wanted far more often than cash and
+        positions are, and on a real venue it costs one request instead of two.
+        """
+        return None
+
     def max_quantity(self, symbol: str, side: str, price: float) -> "float | None":
         """Largest quantity the venue would accept, or None for "no opinion"
         (the caller falls back to its own cash arithmetic)."""
@@ -158,6 +169,30 @@ class AlpacaBroker(Broker):
             ),
             "status": account.get("status"),
         }
+
+    def account_value(self) -> "float | None":
+        """Alpaca's own equity for *this* account -- the paper account's or the
+        live account's, never a blend: the host and key pair travel together in
+        `self.creds`.
+
+        This is the account's total value as Alpaca computes it, which is not
+        the same thing as the app's ledger marked to market. It includes
+        positions this session never opened, symbols the app does not stream
+        (and therefore cannot price), and any cash movement that happened
+        outside the app. Those are exactly the gaps that make a locally
+        reconstructed number drift away from what the broker shows.
+        """
+        try:
+            account = trading_rest.get_account(self.creds)
+        except TradingError as exc:
+            # Same reasoning as account_snapshot: a failed read is not "the
+            # account is worth nothing". The caller keeps its last good value.
+            logger.warning("%s: account value read failed: %s", self.venue, exc)
+            return None
+        equity = account.get("equity")
+        if equity is None:
+            return None
+        return float(equity)
 
     def asset(self, symbol: str) -> dict:
         symbol = symbol.upper()

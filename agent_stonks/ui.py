@@ -1577,6 +1577,35 @@ def _agent_identity_panel() -> None:
         )
 
 
+# Which account the money figures on this page belong to. Spelled out rather
+# than left as a bare "Portfolio value": paper and live are two separate Alpaca
+# accounts with separate balances, and a number that does not say which one it
+# came from is a number the user has to guess about.
+_ACCOUNT_SUFFIX: dict[str, str] = {
+    "alpaca_paper": " (Alpaca paper)",
+    "alpaca_live": " (Alpaca LIVE)",
+}
+
+
+def _portfolio_value_label(state: AppState) -> str:
+    return "Portfolio value" + _ACCOUNT_SUFFIX.get(state.trading_mode, "")
+
+
+def _starting_value_label(state: AppState) -> str:
+    """On a real venue this is the account's value when the run started, not a
+    budget anyone chose -- calling it a budget there invites the reading that
+    the app is trading some carved-out slice of the account."""
+    return "Starting budget" if state.trading_mode == "local" else "Value at start"
+
+
+def _cash_label(state: AppState) -> str:
+    if state.trading_mode == "alpaca_live":
+        return "Alpaca LIVE cash"
+    if state.trading_mode == "alpaca_paper":
+        return "Alpaca paper cash"
+    return "Paper cash"
+
+
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
 def _agent_log_panel() -> None:
     state = _get_state()
@@ -1585,7 +1614,7 @@ def _agent_log_panel() -> None:
         snap = tracker.snapshot()
         positions = {s: q for s, q in snap["positions"].items() if q}
         c1, c2, c3 = st.columns(3)
-        c1.metric("Paper cash", f"${snap['cash']:,.2f}")
+        c1.metric(_cash_label(state), f"${snap['cash']:,.2f}")
         c2.metric(
             "Positions",
             " · ".join(f"{s} {q:.2f} sh" for s, q in positions.items()) if positions else "flat",
@@ -1644,6 +1673,10 @@ def _agent_performance_panel(symbols: list[str]) -> None:
         st.plotly_chart(empty_chart("Start the agent to track performance"), width='stretch')
         return
 
+    # This panel *is* the portfolio-value display, it runs once a minute, and it
+    # runs on Streamlit's own thread -- so read the account's value fresh here
+    # rather than taking whatever the background refresh last left cached.
+    tracker.refresh_venue_value()
     snap = tracker.snapshot()
     decisions = [asdict(d) for d in snap["decisions"]]
     bars_by_symbol = _bars_by_symbol(state)
@@ -1653,12 +1686,19 @@ def _agent_performance_panel(symbols: list[str]) -> None:
     points = compute_equity_curve(bars_by_symbol, decisions, state.starting_budget, agent_start)
     points = _merge_live_history(state, points, agent_start)
     markers = decision_markers(decisions, agent_start, points)
-    stats = summarize(points, decisions, state.starting_budget)
+    # On a real Alpaca account the account itself is what the portfolio is
+    # worth; the curve above is a replay of this session's decisions and cannot
+    # see holdings it did not open, unstreamed symbols or outside cash moves.
+    stats = summarize(points, decisions, state.starting_budget, snap.get("venue_value"))
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Portfolio value", f"${stats['current_value']:,.2f}", f"{stats['return_pct']:+.2f}%")
+    c1.metric(
+        _portfolio_value_label(state),
+        f"${stats['current_value']:,.2f}",
+        f"{stats['return_pct']:+.2f}%",
+    )
     c2.metric("Fees paid", f"${stats['total_fees']:,.2f}")
-    c3.metric("Starting budget", f"${stats['starting_cash']:,.2f}")
+    c3.metric(_starting_value_label(state), f"${stats['starting_cash']:,.2f}")
 
     label = ", ".join(symbols or state.symbols)
     fig = build_performance_chart(points, markers, label)
@@ -1672,7 +1712,8 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
         agent_log = list(state.agent_log)
 
     tracker = state.decision_tracker
-    decisions = [asdict(d) for d in tracker.snapshot()["decisions"]] if tracker else []
+    tracker_snap = tracker.snapshot() if tracker else None
+    decisions = [asdict(d) for d in tracker_snap["decisions"]] if tracker_snap else []
 
     live_figs: list[tuple[str, object]] = []
     for sym in syms:
@@ -1762,7 +1803,9 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
         points = compute_equity_curve(_bars_by_symbol(state), decisions, state.starting_budget, agent_start)
         points = _merge_live_history(state, points, agent_start)
         markers = decision_markers(decisions, agent_start, points)
-        performance_stats = summarize(points, decisions, state.starting_budget)
+        performance_stats = summarize(
+            points, decisions, state.starting_budget, tracker_snap.get("venue_value")
+        )
         performance_fig = build_performance_chart(points, markers, ", ".join(syms))
 
     return build_report_html(
@@ -1771,6 +1814,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
         timeframe=state.timeframe,
         session_start=agent_start,
         starting_budget=state.starting_budget,
+        trading_venue=MODE_LABELS.get(state.trading_mode, state.trading_mode),
         trade_fixed_cost=TRADE_FIXED_COST,
         llm_provider=state.llm_provider,
         llm_model=state.llm_model,
@@ -2214,8 +2258,9 @@ def _agent_panel(
         value=PAPER_STARTING_CASH,
         step=100.0,
         key="agent_starting_budget",
-        help="Only used by local simulation. On an Alpaca account the balance is "
-        "the account's own and this is ignored.",
+        help="Only used by local simulation. On an Alpaca account this is ignored: "
+        "the balance, the holdings and the portfolio value all come from that "
+        "account, read from Alpaca and refreshed while the agent runs.",
         disabled=trading_mode_choice != "local",
     )
     start_clicked = c2.button("▶ Start Agent", type="primary", width='stretch', key="agent_start")
@@ -2322,7 +2367,16 @@ def _agent_panel(
                 # (left over from a previous run, or placed in Alpaca directly).
                 if state.decision_tracker.sync_from_broker():
                     snap = state.decision_tracker.snapshot()
-                    state.starting_budget = snap["cash"]
+                    # The baseline every return percentage is measured against
+                    # is the account's *value*, not its cash. On an account that
+                    # already holds something, cash is only part of what it is
+                    # worth, and using it would report a return the moment the
+                    # agent did nothing at all.
+                    state.starting_budget = (
+                        snap["venue_value"]
+                        if snap.get("venue_value") is not None
+                        else snap["cash"]
+                    )
                     held = {s: q for s, q in snap["positions"].items() if q}
                     if held:
                         st.info(

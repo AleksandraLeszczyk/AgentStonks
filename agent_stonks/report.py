@@ -288,6 +288,7 @@ def build_report_html(
     performance_stats: Optional[dict],
     decisions: list[dict],
     agent_log: list[dict],
+    trading_venue: str = "",
 ) -> str:
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     symbols_label = ", ".join(symbols)
@@ -297,6 +298,10 @@ def build_report_html(
         "Feed": feed,
         "Timeframe": timeframe,
         "Session start": session_start.strftime("%Y-%m-%d %H:%M UTC"),
+        # Which account these orders went to. A report that says what was
+        # bought and what it is worth, but not whether the money was real, is
+        # the one document where paper and live are easiest to confuse later.
+        "Order execution": trading_venue or "—",
         "Starting budget": f"${starting_budget:,.2f}",
         "Fee per trade": f"${trade_fixed_cost:.2f}",
         "LLM provider": llm_provider,

@@ -110,3 +110,16 @@ class TestSummarize:
         assert stats["current_value"] == 1100.0
         assert stats["return_pct"] == pytest.approx(10.0)
         assert stats["total_fees"] == 1.15
+
+    def test_an_explicit_current_value_overrides_the_curve(self):
+        # A real broker account knows things this replayed curve cannot: what
+        # it held before the session, symbols the app never streamed, cash that
+        # moved elsewhere. When it says what the portfolio is worth, it wins.
+        points = [{"ts": "t", "price": 100.0, "cash": 0.0, "position": 10.0, "value": 1100.0}]
+        stats = summarize(points, [], 1000.0, 1250.0)
+        assert stats["current_value"] == 1250.0
+        assert stats["return_pct"] == pytest.approx(25.0)
+
+    def test_no_override_falls_back_to_the_curve(self):
+        points = [{"ts": "t", "price": 100.0, "cash": 0.0, "position": 10.0, "value": 1100.0}]
+        assert summarize(points, [], 1000.0, None)["current_value"] == 1100.0

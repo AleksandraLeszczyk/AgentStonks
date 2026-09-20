@@ -67,7 +67,10 @@ ALERTABLE_FIELDS: dict[str, str] = {
         "intraday bars (positive = rising momentum, negative = falling) -- e.g. 'below 0' "
         "wakes you the moment a winning move stalls, well before price falls to a static stop"
     ),
-    "portfolio_value": "Paper portfolio value (cash + all positions marked to last price)",
+    "portfolio_value": (
+        "Portfolio value -- the broker account's own equity when trading a real "
+        "Alpaca account, else the simulated cash + all positions marked to last price"
+    ),
 }
 
 # Subset of alertable fields that live on the price axis, so a triggered/pending
@@ -474,12 +477,26 @@ class AppState:
             return float(ss.prev_close) if ss.prev_close is not None else None
 
     def mark_to_market(self) -> "float | None":
-        """Recompute and store the paper portfolio value: cash + every position
-        marked to its symbol's best available price. None while no tracker runs."""
+        """Recompute and store the portfolio value. None while no tracker runs.
+
+        On a real venue (Alpaca paper or live) this is the account's *own*
+        value, read from the account the orders are going to. The local sum
+        below is only used when there is no venue to ask, because against a
+        real account it is not the same number: it prices positions with this
+        app's streamed marks rather than the broker's, silently drops any
+        holding whose symbol is not streamed (there is no price for it), and
+        knows nothing about cash that moved outside the app. Showing that as
+        "portfolio value" next to a broker statement saying something else is
+        the bug this branch exists to prevent.
+        """
         tracker = self.decision_tracker
         if tracker is None:
             return None
         snap = tracker.snapshot()
+        venue_value = snap.get("venue_value")
+        if venue_value is not None:
+            self.portfolio_value = float(venue_value)
+            return self.portfolio_value
         value = float(snap["cash"])
         for symbol, position in snap["positions"].items():
             if not position:

@@ -1,4 +1,11 @@
-from agent_stonks.ui import build_news_html, wrap_text
+from agent_stonks.state import AppState
+from agent_stonks.ui import (
+    _cash_label,
+    _portfolio_value_label,
+    _starting_value_label,
+    build_news_html,
+    wrap_text,
+)
 
 
 class TestWrapText:
@@ -65,3 +72,36 @@ class TestBuildNewsHtml:
         ]
         html = build_news_html(news, "AAPL")
         assert "No summary here" in html
+
+
+class TestMoneyLabelsNameTheAccount:
+    """Paper and live are two separate Alpaca accounts with separate balances.
+    A figure that does not say which one it came from is one the user has to
+    guess about -- and guessing wrong about live money is the expensive way."""
+
+    def _state(self, mode):
+        state = AppState()
+        state.trading_mode = mode
+        return state
+
+    def test_local_simulation_keeps_its_old_wording(self):
+        state = self._state("local")
+        assert _portfolio_value_label(state) == "Portfolio value"
+        assert _starting_value_label(state) == "Starting budget"
+        assert _cash_label(state) == "Paper cash"
+
+    def test_the_paper_account_is_named(self):
+        state = self._state("alpaca_paper")
+        assert "paper" in _portfolio_value_label(state)
+        assert "paper" in _cash_label(state)
+
+    def test_the_live_account_is_named_unmistakably(self):
+        state = self._state("alpaca_live")
+        assert "LIVE" in _portfolio_value_label(state)
+        assert "LIVE" in _cash_label(state)
+        assert "paper" not in _portfolio_value_label(state).lower()
+
+    def test_a_real_account_has_a_starting_value_not_a_budget(self):
+        # Nothing was budgeted: the run opened on whatever the account held.
+        for mode in ("alpaca_paper", "alpaca_live"):
+            assert _starting_value_label(self._state(mode)) == "Value at start"

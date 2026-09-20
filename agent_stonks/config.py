@@ -88,6 +88,13 @@ LIVE_TRADING_CONFIRM_PHRASE = "TRADE LIVE"
 ORDER_FILL_TIMEOUT_SEC = 20.0
 ORDER_POLL_SEC = 0.5
 
+# How long a reading of the venue's own account value (Alpaca's `equity`) is
+# reused before it is refreshed. Portfolio value is marked to market on every
+# streamed trade -- thousands of times a session -- and the account endpoint is
+# neither free nor unmetered, so one read is shared across a short window and
+# refreshed on a background thread rather than in the stream's hot path.
+VENUE_VALUE_REFRESH_SEC = 10.0
+
 # Audible cue when an order fills (see agent_stonks.trade_sound). A raw Web
 # Audio gain multiplier, not decibels: loud enough to hear from across a room,
 # quiet enough not to startle on the twentieth fill of a session.

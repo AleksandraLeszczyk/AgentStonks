@@ -12,6 +12,7 @@ positions are held per symbol.
 """
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from dataclasses import asdict, dataclass, field
@@ -19,7 +20,9 @@ from typing import Optional
 
 from . import clock
 from .broker import Broker, PaperBroker
-from .config import TRADE_FIXED_COST
+from .config import TRADE_FIXED_COST, VENUE_VALUE_REFRESH_SEC
+
+logger = logging.getLogger(__name__)
 
 
 def whole_shares(quantity: float) -> float:
@@ -77,6 +80,79 @@ class DecisionTracker:
         # check must not be able to buy straight back in. A new run builds a new
         # tracker, which is what lifts it.
         self.buys_halted: "str | None" = None
+        # Last value the venue itself reported for the account, and when (a
+        # monotonic reading). Only a real broker ever fills these; see
+        # `venue_value`.
+        self._venue_value: "float | None" = None
+        self._venue_value_at: float = 0.0
+        self._venue_value_lock = threading.Lock()
+        self._venue_value_refreshing = False
+
+    # --- the venue's own account value ------------------------------------
+    def venue_value(self) -> "float | None":
+        """What the venue says this account is worth right now, or None when
+        there is no venue (a simulated broker) or it has never answered.
+
+        Never blocks. Portfolio value is marked to market from the websocket
+        thread on every streamed trade, and an HTTP call there would stall the
+        tape; so this returns the last value the venue gave and kicks off a
+        background refresh once it is older than VENUE_VALUE_REFRESH_SEC.
+
+        A stale reading is returned in preference to None because the
+        alternative is worse: callers fall back to summing the local ledger,
+        and that number is a different quantity, not an older one -- it misses
+        positions in symbols the app does not stream and any cash movement made
+        outside the app. Swapping between the two would make the displayed
+        portfolio value jump every time a request failed.
+        """
+        if self.broker.is_simulated:
+            return None
+        with self._venue_value_lock:
+            # Staleness is about the clock, never about whether the last read
+            # succeeded: a venue that keeps failing would otherwise be retried
+            # on every single streamed trade, which is thousands of requests a
+            # session against an account that is already not answering.
+            never_read = self._venue_value_at == 0.0
+            age = clock.monotonic() - self._venue_value_at
+            stale = never_read or age >= VENUE_VALUE_REFRESH_SEC
+            if stale and not self._venue_value_refreshing:
+                self._venue_value_refreshing = True
+                threading.Thread(
+                    target=self._refresh_venue_value_bg, daemon=True,
+                    name="venue-value-refresh",
+                ).start()
+            return self._venue_value
+
+    def refresh_venue_value(self) -> "float | None":
+        """Read the venue's account value now, blocking. For callers already
+        off the hot path (session start, the agent's own cycle)."""
+        if self.broker.is_simulated:
+            return None
+        value = self.broker.account_value()
+        self._store_venue_value(value)
+        return value
+
+    def _refresh_venue_value_bg(self) -> None:
+        try:
+            self._store_venue_value(self.broker.account_value())
+        except Exception:  # never let a background read die unremarked
+            logger.exception("venue account value refresh failed")
+            self._store_venue_value(None)
+        finally:
+            # Only the thread that claimed the slot releases it. A blocking
+            # `refresh_venue_value` running alongside must not clear a flag it
+            # never set, or two background reads end up in flight at once.
+            with self._venue_value_lock:
+                self._venue_value_refreshing = False
+
+    def _store_venue_value(self, value: "float | None") -> None:
+        """Record a reading. A failed read (None) still resets the clock, so a
+        broker that is down is retried on the same interval rather than on every
+        single streamed trade."""
+        with self._venue_value_lock:
+            if value is not None:
+                self._venue_value = float(value)
+            self._venue_value_at = clock.monotonic()
 
     def position_for(self, symbol: str) -> float:
         with self.lock:
@@ -285,6 +361,11 @@ class DecisionTracker:
         stale-but-plausible ledger rather than a zeroed one.
         """
         snapshot = self.broker.account_snapshot()
+        if snapshot is not None:
+            # The snapshot already carries the account's equity -- adopt it, so
+            # the portfolio value moves the instant a fill lands instead of
+            # waiting out the refresh interval.
+            self._store_venue_value(snapshot.get("equity"))
         with self.lock:
             if snapshot is not None:
                 self.cash = snapshot["cash"]
@@ -326,17 +407,24 @@ class DecisionTracker:
         snapshot = self.broker.account_snapshot()
         if snapshot is None:
             return False
+        self._store_venue_value(snapshot.get("equity"))
         with self.lock:
             self.cash = snapshot["cash"]
             self.positions = dict(snapshot["positions"])
         return True
 
     def snapshot(self) -> dict:
+        # Read outside the ledger lock: venue_value takes its own, and it must
+        # not be possible to order the two differently anywhere.
+        venue_value = self.venue_value()
         with self.lock:
             return {
                 "cash": self.cash,
                 "positions": dict(self.positions),
                 "decisions": list(self.decisions),
+                # The venue's own account value, or None in local simulation
+                # where the ledger above is the whole truth.
+                "venue_value": venue_value,
             }
 
     def trade_markers(self, symbol: "str | None" = None) -> list[dict]:

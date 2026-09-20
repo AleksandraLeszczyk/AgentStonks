@@ -162,9 +162,22 @@ def total_fees_paid(decisions: list[dict]) -> float:
     return sum(d.get("fee", 0.0) for d in decisions)
 
 
-def summarize(points: list[dict], decisions: list[dict], starting_cash: float) -> dict[str, Any]:
-    """Headline performance stats for the current equity curve."""
-    current_value = points[-1]["value"] if points else starting_cash
+def summarize(
+    points: list[dict],
+    decisions: list[dict],
+    starting_cash: float,
+    current_value: float | None = None,
+) -> dict[str, Any]:
+    """Headline performance stats for the current equity curve.
+
+    `current_value` overrides the curve's last point. Pass it when something
+    else is authoritative about what the portfolio is worth -- a real broker
+    account, which knows about holdings and cash movements this curve is
+    reconstructed without -- so the headline figure matches the account rather
+    than the replay.
+    """
+    if current_value is None:
+        current_value = points[-1]["value"] if points else starting_cash
     return {
         "starting_cash": starting_cash,
         "current_value": current_value,

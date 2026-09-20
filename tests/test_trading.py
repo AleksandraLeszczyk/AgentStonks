@@ -4,12 +4,16 @@ the ledger's live-trade path.
 Every order here is mocked. Nothing in this file may reach a real Alpaca
 account, paper or otherwise.
 """
+import threading
+import time
+
 import pytest
 
 from agent_stonks import trading_mode, trading_rest
 from agent_stonks.broker import AlpacaBroker, PaperBroker
 from agent_stonks.config import LIVE_TRADING_CONFIRM_PHRASE, LIVE_TRADING_ENV_FLAG
 from agent_stonks.decisions import DecisionTracker
+from agent_stonks.state import AppState
 from agent_stonks.trading_rest import TradingCredentials, TradingError
 
 PAPER = TradingCredentials(key="k", secret="s", live=False)
@@ -132,6 +136,42 @@ class TestAlpacaBroker:
     def test_flags_a_blocked_account(self, requests_mock):
         _account(requests_mock, trading_blocked=True)
         assert self._broker().account_snapshot()["blocked"] is True
+
+    def test_account_value_is_the_accounts_equity(self, requests_mock):
+        # Equity, not cash: the account is worth what it holds as well as what
+        # it has spare, and the portfolio-value display is about the total.
+        requests_mock.get(
+            f"{PAPER_URL}/v2/account",
+            json={"cash": "2500.50", "equity": "53210.75", "status": "ACTIVE"},
+        )
+        assert self._broker().account_value() == 53210.75
+
+    def test_account_value_costs_one_request_not_two(self, requests_mock):
+        # It is read on a timer for as long as the agent runs; pulling the
+        # positions list alongside it would double that traffic for nothing.
+        requests_mock.get(f"{PAPER_URL}/v2/account", json={"equity": "100"})
+        self._broker().account_value()
+        assert len(requests_mock.request_history) == 1
+
+    def test_a_failed_value_read_returns_none_not_zero(self, requests_mock):
+        # A zero would read as "the account is empty" on screen.
+        requests_mock.get(f"{PAPER_URL}/v2/account", status_code=500, json={})
+        assert self._broker().account_value() is None
+
+    def test_paper_and_live_values_come_from_their_own_accounts(self, requests_mock):
+        # The whole point of two hosts and two key pairs. A paper balance shown
+        # as the live one -- or the reverse -- is the most consequential thing
+        # this app could get wrong about money.
+        requests_mock.get(f"{PAPER_URL}/v2/account", json={"equity": "100000"})
+        requests_mock.get(f"{LIVE_URL}/v2/account", json={"equity": "4321.10"})
+
+        paper = AlpacaBroker(PAPER, fill_timeout_sec=5, sleep=lambda _: None)
+        live = AlpacaBroker(LIVE, fill_timeout_sec=5, sleep=lambda _: None)
+
+        assert paper.account_value() == 100000.0
+        assert live.account_value() == 4321.10
+        hosts = [r.url.split("/v2/")[0] for r in requests_mock.request_history]
+        assert hosts == [PAPER_URL, LIVE_URL]
 
     def test_floors_a_fractional_quantity_on_a_whole_share_symbol(self, requests_mock):
         requests_mock.get(f"{PAPER_URL}/v2/assets/BRK.A", json={"fractionable": False})
@@ -477,3 +517,149 @@ class _SimPriced(PaperBroker):
 
     def get_current_price(self, symbol, key, secret, feed="iex"):
         return self.price
+
+
+class _ValuedStub(_StubBroker):
+    """A non-simulated broker whose account is worth more than this app can see
+    -- the ordinary case, since an account holds things the app never bought."""
+
+    def __init__(self, value, snapshot=None):
+        super().__init__(report={}, snapshot=snapshot)
+        self._value = value
+        self.value_reads = 0
+
+    def account_value(self):
+        self.value_reads += 1
+        return self._value
+
+
+class TestPortfolioValueComesFromTheAccount:
+    """The bug this guards: "Portfolio value" showed a locally reconstructed
+    number while the Alpaca account said something else."""
+
+    def test_a_simulated_broker_has_no_venue_value(self):
+        # Local simulation: the in-memory ledger is the whole truth, and there
+        # is no account to ask.
+        tracker = DecisionTracker(starting_cash=1000.0, broker=PaperBroker())
+        assert tracker.venue_value() is None
+        assert tracker.snapshot()["venue_value"] is None
+
+    def test_the_accounts_value_is_read_from_the_venue(self):
+        tracker = DecisionTracker(starting_cash=1000.0, broker=_ValuedStub(53_210.75))
+        assert tracker.refresh_venue_value() == 53_210.75
+        assert tracker.snapshot()["venue_value"] == 53_210.75
+
+    def test_syncing_the_ledger_also_primes_the_value(self):
+        # One account read at session start, not two: the snapshot already
+        # carries the equity.
+        broker = _ValuedStub(
+            0.0,
+            snapshot={"cash": 4321.0, "positions": {"TSLA": 3.0}, "equity": 9876.5},
+        )
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+
+        assert tracker.sync_from_broker() is True
+        assert tracker.snapshot()["venue_value"] == 9876.5
+        assert broker.value_reads == 0
+
+    def test_a_fill_updates_the_value_from_the_same_account_read(self):
+        broker = _ValuedStub(
+            0.0,
+            snapshot={"cash": 8985.0, "positions": {"AAPL": 10.0}, "equity": 9990.0},
+        )
+        broker.report = {"status": "filled", "filled_qty": 10.0, "filled_price": 101.5}
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+
+        tracker.record_trade("AAPL", "buy", 10, "entry", "k", "s")
+
+        assert tracker.snapshot()["venue_value"] == 9990.0
+
+    def test_reading_the_value_never_blocks_on_the_network(self):
+        # Marked to market from the websocket thread on every streamed trade:
+        # an HTTP call there would stall the tape.
+        started, release = threading.Event(), threading.Event()
+
+        class _Slow(_ValuedStub):
+            def account_value(self):
+                started.set()
+                release.wait(5)
+                return 999.0
+
+        tracker = DecisionTracker(starting_cash=1000.0, broker=_Slow(999.0))
+
+        assert tracker.venue_value() is None  # returns at once, nothing cached
+        assert started.wait(2), "the account read should happen off this thread"
+        release.set()
+
+        deadline = time.monotonic() + 2
+        while tracker.venue_value() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert tracker.venue_value() == 999.0
+
+    def test_a_venue_that_keeps_failing_is_retried_on_the_interval(self, monkeypatch):
+        # Not on every streamed trade, which would be thousands of requests a
+        # session against an account that is already not answering.
+        monkeypatch.setattr("agent_stonks.decisions.VENUE_VALUE_REFRESH_SEC", 3600.0)
+        broker = _ValuedStub(None)
+        tracker = DecisionTracker(starting_cash=1000.0, broker=broker)
+
+        for _ in range(50):
+            assert tracker.venue_value() is None
+            time.sleep(0.002)
+
+        assert broker.value_reads == 1
+
+    def test_a_failed_refresh_keeps_the_last_value_the_account_gave(self):
+        # Falling back to the local sum would make the number jump to a
+        # different quantity, which reads as the portfolio moving.
+        broker = _ValuedStub(53_210.75)
+        tracker = DecisionTracker(starting_cash=1000.0, broker=broker)
+        tracker.refresh_venue_value()
+
+        broker._value = None
+        assert tracker.refresh_venue_value() is None
+        assert tracker.snapshot()["venue_value"] == 53_210.75
+
+
+class TestMarkToMarketOnARealAccount:
+    def _state(self, tracker, symbol="AAPL", price=50.0):
+        state = AppState()
+        state.set_symbols([symbol])
+        state.sym(symbol).last_price = price
+        state.decision_tracker = tracker
+        return state
+
+    def test_the_portfolio_is_worth_what_the_account_says(self):
+        broker = _ValuedStub(
+            0.0,
+            snapshot={"cash": 1000.0, "positions": {"AAPL": 10.0}, "equity": 53_210.75},
+        )
+        tracker = DecisionTracker(starting_cash=1000.0, broker=broker)
+        tracker.sync_from_broker()
+        state = self._state(tracker)
+
+        # Marking the ledger locally would say 1000 + 10 * 50 = 1500.
+        assert state.mark_to_market() == 53_210.75
+        assert state.portfolio_value == 53_210.75
+
+    def test_holdings_the_app_does_not_stream_are_not_dropped(self):
+        # The local sum silently skips a position it has no price for; the
+        # account's own value includes it.
+        broker = _ValuedStub(
+            0.0,
+            snapshot={"cash": 1000.0, "positions": {"NVDA": 40.0}, "equity": 80_000.0},
+        )
+        tracker = DecisionTracker(starting_cash=1000.0, broker=broker)
+        tracker.sync_from_broker()
+        state = self._state(tracker)  # streams AAPL only
+
+        assert state.mark_to_market() == 80_000.0
+
+    def test_local_simulation_still_marks_the_ledger_itself(self):
+        tracker = DecisionTracker(starting_cash=1000.0, broker=PaperBroker())
+        tracker.cash = 500.0
+        tracker.positions = {"AAPL": 10.0}
+        state = self._state(tracker, price=50.0)
+
+        assert state.mark_to_market() == 1000.0
+
