@@ -175,9 +175,15 @@ class Choice:
     through the forecast. They have no range and no step -- a sweep over one is
     a set of named alternatives, and the whole set is the useful default.
 
-    Absent from the Tuning tab, which draws a heatmap of two numeric axes and
-    picks a cell on it; these belong to the Simulate tab's per-setup sweep,
-    where the output is several queued runs to compare rather than a surface.
+    A grid axis like any other, in the Tuning tab as well as the Simulate
+    tab's per-setup sweep: a heatmap with a row per rule reads exactly as one
+    with a row per level, and a sweep of the levels under each forecast policy
+    is the comparison the policies have never had.
+
+    What a set of rules does not have is a *neighbourhood*. Two adjacent buy
+    distances are nearly the same strategy, which is what makes the plateau
+    pick mean something; two forecast policies are not near each other in any
+    sense, so `pick_best` reads a plateau along the numeric axes only.
     """
 
     name: str
@@ -185,6 +191,9 @@ class Choice:
     options: "tuple[str, ...]"
     #: option -> what the form and the captions call it.
     labels: "dict[str, str]"
+    #: The same field named for a chart axis or a job label, where `label` is a
+    #: whole sentence and what it sits next to is two words.
+    short: str = ""
 
 
 CHOICES: "dict[str, Choice]" = {
@@ -192,11 +201,11 @@ CHOICES: "dict[str, Choice]" = {
     for c in (
         Choice(
             "level_source", "Levels measured below",
-            tuple(LEVEL_SOURCES), dict(LEVEL_SOURCE_LABELS),
+            tuple(LEVEL_SOURCES), dict(LEVEL_SOURCE_LABELS), short="Level source",
         ),
         Choice(
             "breach_update", "If the session trades outside the forecast",
-            tuple(BREACH_POLICIES), dict(BREACH_LABELS),
+            tuple(BREACH_POLICIES), dict(BREACH_LABELS), short="Forecast breach",
         ),
     )
 }
@@ -223,6 +232,11 @@ SWEEPABLE: "tuple[str, ...]" = (
 )
 
 
+# Everything a grid axis may be, numbers first: the order the Tuning tab and
+# the Simulate tab's sweep both list their pickers in.
+AXES: "tuple[str, ...]" = tuple(TUNABLES) + tuple(CHOICES)
+
+
 def sweep_label(name: str) -> str:
     """One sweepable field's name, whether it is numeric or a set of rules."""
     field = TUNABLES.get(name) or CHOICES.get(name)
@@ -239,6 +253,31 @@ def value_label(name: str, value) -> str:
         return tunable.fmt % value if tunable else str(value)
     except TypeError:
         return str(value)
+
+
+def axis_title(name: str) -> str:
+    """An axis's name for a chart, a table or a job label: no unit, no sentence.
+
+    `Tunable.label` carries the unit a k is counted in, which a form needs and
+    an axis title next to its own tick values does not; `Choice.label` is a
+    sentence for the same reason. Both are trimmed to the field's name here so
+    a heatmap's two titles are the two parameters and not a paragraph.
+    """
+    choice = CHOICES.get(name)
+    if choice is not None:
+        return choice.short or choice.label
+    return sweep_label(name).split(" (")[0]
+
+
+def axis_tick(name: str, value) -> str:
+    """One axis value, short enough to be a chart tick.
+
+    A rule comes out as its own key -- `extreme`, `brownian` -- which is what
+    `config_signature` writes and what a caption elsewhere in the app calls it.
+    The sentence in `Choice.labels` is the axis *title*'s job; repeated down
+    the side of a heatmap it is most of the chart.
+    """
+    return str(value) if name in CHOICES else value_label(name, value)
 
 
 # Wall-clock seconds one worker spends replaying one session, for the form's
@@ -1028,11 +1067,20 @@ def pick_best(
         return None
     by_position = {_position(c, axes): c for c in scored}
 
+    # A neighbour only means something where a step along the axis is a small
+    # change in the same setting. It is on a numeric axis -- 0.35 is nearly
+    # 0.30 -- and it is not on a set of rules, where the order is only the one
+    # the form lists them in. So a choice axis offers no offsets and the
+    # plateau is read within each rule rather than smeared across them.
+    offsets = list(product(*(
+        (-1, 0, 1) if axis["name"] in TUNABLES else (0,) for axis in axes
+    )))
+
     def plateau(cell: dict) -> float:
         here = _position(cell, axes)
         values = [
             float(other[metric])
-            for offset in product((-1, 0, 1), repeat=len(axes))
+            for offset in offsets
             if (other := by_position.get(tuple(p + o for p, o in zip(here, offset))))
         ]
         return sum(values) / len(values)
@@ -1121,10 +1169,19 @@ def validate(spec: dict) -> "str | None":
     if len({a["name"] for a in axes}) != len(axes):
         return "The same parameter is tuned twice."
     for axis in axes:
-        if axis["name"] not in TUNABLES:
+        if axis["name"] not in AXES:
             return f"{axis['name']} is not a tunable parameter."
         if not axis.get("values"):
-            return f"{TUNABLES[axis['name']].label}: no values to try."
+            return f"{sweep_label(axis['name'])}: no values to try."
+        choice = CHOICES.get(axis["name"])
+        # A stored job outlives the rules it was written with, and a spec is
+        # rewritten by hand often enough while debugging. An option that no
+        # longer exists would replay as the config's default and be reported
+        # under the name of a rule it never ran.
+        if choice is not None:
+            unknown = [v for v in axis["values"] if v not in choice.options]
+            if unknown:
+                return f"{choice.label}: {', '.join(map(str, unknown))} is not an option."
     cells = len(grid(axes))
     if cells > MAX_CELLS:
         return f"{cells} combinations is more than the {MAX_CELLS} one job may sweep."

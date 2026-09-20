@@ -144,6 +144,23 @@ class TestSweepVocabulary:
         assert tu.sweep_label("nonsense") == "nonsense"
         assert tu.value_label("nonsense", 3) == "3"
 
+    def test_a_grid_axis_may_be_a_number_or_a_rule(self):
+        """Both vocabularies, numbers first -- the order both forms list them in."""
+        assert tu.AXES == tuple(tu.TUNABLES) + tuple(tu.CHOICES)
+        assert "breach_update" in tu.AXES
+
+    def test_an_axis_is_titled_without_its_unit_or_its_sentence(self):
+        """What a heatmap axis and a job label carry, next to their own values."""
+        assert tu.axis_title("buy_k") == "Buy distance"
+        assert tu.axis_title("breach_update") == "Forecast breach"
+        assert tu.axis_title("nonsense") == "nonsense"
+
+    def test_a_rule_ticks_as_its_own_key(self):
+        """`extreme`, not the sentence -- the axis title already says what it is,
+        and this is what `config_signature` writes it as."""
+        assert tu.axis_tick("breach_update", "extreme") == "extreme"
+        assert tu.axis_tick("buy_k", 0.5) == "0.50"
+
 
 class TestCellCount:
     """The size guard runs before the grid exists, so it cannot build one."""
@@ -265,6 +282,25 @@ class TestValidation:
         other = {**spec()["tune_dataset"], "symbols": ["GOOGL"]}
         assert "does not carry AAPL" in tu.validate(spec(tune_dataset=other))
 
+    def test_a_rule_is_a_parameter_a_job_may_tune(self):
+        """The levels under each forecast policy, which is the comparison the
+        policies have never had: neither shipped level was swept under them."""
+        axes = [{"name": "buy_k", "values": [0.5, 0.7]},
+                {"name": "breach_update", "values": ["off", "extreme", "brownian"]}]
+        assert tu.validate(spec(axes=axes)) is None
+        assert len(tu.grid(axes)) == 6
+
+    def test_a_rule_axis_with_nothing_ticked_is_refused(self):
+        axes = [{"name": "breach_update", "values": []}]
+        assert "no values to try" in tu.validate(spec(axes=axes))
+
+    def test_an_option_that_is_not_one_is_refused(self):
+        """A stored job outlives its rules. An option this build no longer has
+        would quietly replay as the config's default and be filed under the
+        name of a policy it never ran."""
+        axes = [{"name": "breach_update", "values": ["extreme", "telepathy"]}]
+        assert "telepathy" in tu.validate(spec(axes=axes))
+
     def test_too_many_cells_is_refused(self):
         axes = [{"name": "buy_k", "values": list(range(30))},
                 {"name": "sell_k", "values": list(range(30))}]
@@ -339,6 +375,35 @@ class TestPick:
     def test_ties_go_to_the_first_cell(self):
         best = tu.pick_best(cells_from([5] * 9), AXES)
         assert best["overrides"] == {"buy_k": 0.3, "sell_k": 0.1}
+
+    def test_a_rule_axis_has_no_neighbours(self):
+        """A plateau is robustness to a small change in the same setting, and
+        there is no such thing as a small change of forecast policy. So the
+        neighbourhood is read within each rule: here the middle of the run of
+        profitable cells under `off`, not a cell smeared across two policies.
+        """
+        axes = [{"name": "breach_update", "values": ["off", "extreme"]},
+                {"name": "buy_k", "values": [0.3, 0.5, 0.7]}]
+        profits = {
+            ("off", 0.3): 300, ("off", 0.5): 320, ("off", 0.7): 310,
+            ("extreme", 0.3): 900, ("extreme", 0.5): -500, ("extreme", 0.7): -500,
+        }
+        cells = [
+            {"overrides": o, "profit": profits[(o["breach_update"], o["buy_k"])],
+             "days": 10, "days_traded": 10}
+            for o in tu.grid(axes)
+        ]
+        best = tu.pick_best(cells, axes, rule=tu.PICK_PLATEAU)
+        assert best["overrides"] == {"breach_update": "off", "buy_k": 0.7}
+        # Its neighbourhood is the `off` row alone -- itself and 0.5. Were the
+        # two policies adjacent, every `off` cell would be averaged against the
+        # losses under `extreme` and the 900 spike would have carried the pick.
+        assert best["pick_score"] == pytest.approx((320 + 310) / 2)
+
+    def test_a_numeric_axis_still_averages_across_both(self):
+        """The change is only about rules: a grid of two numbers is unmoved."""
+        best = tu.pick_best(cells_from(self.PROFITS), AXES, rule=tu.PICK_PLATEAU)
+        assert best["pick_score"] == pytest.approx((300 + 350 + 400 + 300) / 4)
 
     def test_overlapping_days_are_named(self):
         assert tu.overlapping_days(["2026-06-15", "2026-06-16"], ["2026-06-16"]) == ["2026-06-16"]

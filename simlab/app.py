@@ -3141,23 +3141,28 @@ _PICK_LABELS = {
 
 
 def _tuning_param_label(name: str) -> str:
-    """A tunable's name without its unit, for tables, titles and captions."""
-    tunable = sim_tuning.TUNABLES.get(name)
-    return tunable.label.split(" (")[0] if tunable else name
+    """An axis's name without its unit, for tables, titles and captions."""
+    return sim_tuning.axis_title(name)
 
 
 def _tuning_value(name: str, value) -> str:
-    tunable = sim_tuning.TUNABLES.get(name)
-    try:
-        return tunable.fmt % value if tunable else str(value)
-    except TypeError:
-        return str(value)
+    """One value on an axis: a formatted number, or a rule under its own name."""
+    return sim_tuning.value_label(name, value)
 
 
 def _tuning_values_text(values: "dict | None") -> str:
+    """One cell's settings, for the summary table and the pick's caption.
+
+    In the chart's tick form rather than the form's: both of the places this
+    appears sit next to a heatmap axis or a `config_signature`, and a cell that
+    the grid calls `brownian` and the table calls "Brownian extension,
+    volatility implied by ADR" reads as two different things.
+    """
     if not values:
         return "—"
-    return ", ".join(f"{_tuning_param_label(n)} {_tuning_value(n, v)}" for n, v in values.items())
+    return ", ".join(
+        f"{_tuning_param_label(n)} {sim_tuning.axis_tick(n, v)}" for n, v in values.items()
+    )
 
 
 def _tuning_metric_text(metric: str, value) -> str:
@@ -3334,6 +3339,39 @@ def _tuning_dataset_spec(dataset) -> dict:
     }
 
 
+def _tuning_range(name: str) -> "tuple[list, str]":
+    """One numeric axis from a from/to/step row: (values, "") or ([], why not).
+
+    The Simulate tab's sweep asks the same three boxes (`_sweep_range`) and
+    both hand the answer to `tuning.axis_values`, so a range means the same
+    thing in both places. The problem comes back rather than being shown here
+    because the Tuning tab reports one problem at a time, above the button it
+    disables -- a red box under each bad row and a live button is the arrangement
+    that gets a broken grid queued.
+    """
+    tunable = sim_tuning.TUNABLES[name]
+    cast = int if tunable.integer else float
+    start0, stop0, step0 = tunable.default_range
+    bounds = dict(
+        min_value=cast(tunable.minimum), max_value=cast(tunable.maximum),
+        step=cast(tunable.step), format=tunable.fmt,
+    )
+    col_from, col_to, col_step = st.columns(3)
+    start = col_from.number_input(
+        f"{tunable.label}: from", value=cast(start0), key=f"tune_{name}_from", **bounds
+    )
+    stop = col_to.number_input("to", value=cast(stop0), key=f"tune_{name}_to", **bounds)
+    step = col_step.number_input(
+        "step", min_value=cast(tunable.step), max_value=cast(tunable.maximum),
+        value=cast(step0), step=cast(tunable.step), format=tunable.fmt,
+        key=f"tune_{name}_step",
+    )
+    try:
+        return sim_tuning.axis_values(name, start, stop, step), ""
+    except ValueError as exc:
+        return [], str(exc)
+
+
 def _render_tuning_form() -> None:
     datasets = sim_data.list_datasets()
     if not datasets:
@@ -3350,36 +3388,33 @@ def _render_tuning_form() -> None:
 
     st.markdown("**Parameters to tune**")
     names = st.multiselect(
-        "Tune", list(sim_tuning.TUNABLES), default=["buy_k", "sell_k"],
+        "Tune", list(sim_tuning.AXES), default=["buy_k", "sell_k"],
         max_selections=sim_tuning.MAX_AXES,
-        format_func=lambda n: sim_tuning.TUNABLES[n].label, key="tune_axes",
-        help="One parameter draws a bar chart, two a heatmap — the first one is its rows.",
+        format_func=sim_tuning.sweep_label, key="tune_axes",
+        help="One parameter draws a bar chart, two a heatmap — the first one is its rows. "
+             "A number is swept over a range; a rule is swept over the options you tick, "
+             "so a grid can put the levels under each forecast policy side by side.",
     )
     axes: list[dict] = []
     problems: list[str] = []
     for name in names:
-        tunable = sim_tuning.TUNABLES[name]
-        cast = int if tunable.integer else float
-        start0, stop0, step0 = tunable.default_range
-        bounds = dict(
-            min_value=cast(tunable.minimum), max_value=cast(tunable.maximum),
-            step=cast(tunable.step), format=tunable.fmt,
-        )
-        col_from, col_to, col_step = st.columns(3)
-        start = col_from.number_input(
-            f"{tunable.label}: from", value=cast(start0), key=f"tune_{name}_from", **bounds
-        )
-        stop = col_to.number_input("to", value=cast(stop0), key=f"tune_{name}_to", **bounds)
-        step = col_step.number_input(
-            "step", min_value=cast(tunable.step), max_value=cast(tunable.maximum),
-            value=cast(step0), step=cast(tunable.step), format=tunable.fmt,
-            key=f"tune_{name}_step",
-        )
-        try:
-            values = sim_tuning.axis_values(name, start, stop, step)
-        except ValueError as exc:
-            problems.append(str(exc))
-            continue
+        choice = sim_tuning.CHOICES.get(name)
+        if choice is not None:
+            values = st.multiselect(
+                choice.label, list(choice.options), default=list(choice.options),
+                format_func=lambda key, c=choice: c.labels.get(key, key),
+                key=f"tune_{name}_options",
+                help="Each ticked option is a row (or a column) of the grid: the same "
+                     "sweep replayed under that rule.",
+            )
+            if not values:
+                problems.append(f"{choice.label}: no values to try.")
+                continue
+        else:
+            values, problem = _tuning_range(name)
+            if problem:
+                problems.append(problem)
+                continue
         axes.append({"name": name, "values": values})
         st.caption(
             f"{len(values)} values: {', '.join(_tuning_value(name, v) for v in values)} — "
@@ -3598,7 +3633,7 @@ def _tuning_heatmap(
     fig = go.Figure()
     if len(axes) == 1:
         axis = axes[0]
-        xs = [_tuning_value(axis["name"], v) for v in axis["values"]]
+        xs = [sim_tuning.axis_tick(axis["name"], v) for v in axis["values"]]
         ys = []
         for value in axis["values"]:
             cell = cell_at({axis["name"]: value})
@@ -3613,7 +3648,7 @@ def _tuning_heatmap(
             if value in axis["values"]:
                 y = ys[axis["values"].index(value)]
                 fig.add_trace(go.Scatter(
-                    x=[_tuning_value(axis["name"], value)], y=[y or 0], mode="markers",
+                    x=[sim_tuning.axis_tick(axis["name"], value)], y=[y or 0], mode="markers",
                     name=label, marker=dict(symbol="star", size=16,
                                             color=mark_colors.get(label, PALETTE["text"])),
                 ))
@@ -3621,8 +3656,8 @@ def _tuning_heatmap(
         fig.update_yaxes(title=sim_tuning.METRICS[metric])
     else:
         row_axis, col_axis = axes
-        xs = [_tuning_value(col_axis["name"], v) for v in col_axis["values"]]
-        ys = [_tuning_value(row_axis["name"], v) for v in row_axis["values"]]
+        xs = [sim_tuning.axis_tick(col_axis["name"], v) for v in col_axis["values"]]
+        ys = [sim_tuning.axis_tick(row_axis["name"], v) for v in row_axis["values"]]
         z, text = [], []
         for row_value in row_axis["values"]:
             z_row, text_row = [], []
@@ -3652,8 +3687,8 @@ def _tuning_heatmap(
             row_value, col_value = overrides.get(row_axis["name"]), overrides.get(col_axis["name"])
             if row_value in row_axis["values"] and col_value in col_axis["values"]:
                 fig.add_trace(go.Scatter(
-                    x=[_tuning_value(col_axis["name"], col_value)],
-                    y=[_tuning_value(row_axis["name"], row_value)],
+                    x=[sim_tuning.axis_tick(col_axis["name"], col_value)],
+                    y=[sim_tuning.axis_tick(row_axis["name"], row_value)],
                     mode="markers", name=label, hoverinfo="skip",
                     marker=dict(symbol="square-open", size=30, line=dict(
                         width=3, color=mark_colors.get(label, PALETTE["text"]))),
