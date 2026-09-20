@@ -18,7 +18,25 @@ FINNHUB_STREAM_URL = "wss://ws.finnhub.io?token={token}"
 # choice because it is the only one of the two that also streams quotes, and
 # because its bar volumes match the REST bars the buffer is seeded and
 # backfilled with.
-DATA_SOURCES = ["finnhub", "alpaca"]
+#
+# The source and the Alpaca feed are offered as one choice, because they are
+# one decision: "Alpaca" says nothing until the feed it streams is named, and
+# Finnhub takes no feed at all -- it streams the consolidated trade tape. The
+# two still travel separately through the app (the quote poll, the agents'
+# fill-price lookups and the REST fallback all read the feed, whichever socket
+# is running), so Finnhub is paired with IEX: the one Alpaca feed every plan
+# serves.
+LIVE_SOURCES: dict[str, tuple[str, str]] = {
+    "finnhub": ("finnhub", "iex"),
+    "alpaca:iex": ("alpaca", "iex"),
+    "alpaca:sip": ("alpaca", "sip"),
+}
+LIVE_SOURCE_LABELS: dict[str, str] = {
+    "finnhub": "Finnhub (trades \u2192 local candles)",
+    "alpaca:iex": "Alpaca (iex)",
+    "alpaca:sip": "Alpaca (sip)",
+}
+DEFAULT_LIVE_SOURCE = "finnhub"
 DEFAULT_DATA_SOURCE = "finnhub"
 
 # Where REST bars come from: the initial history load, the timeframe reload, the
@@ -128,7 +146,6 @@ BACKFILL_POLL_SEC = 60
 OPTIONS_POLL_SEC = 60
 OPTIONS_WALL_HISTORY_MAXLEN = 200
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]
-FEEDS = ["iex", "sip"]
 
 # High-volume alert: trigger when today's cumulative volume exceeds
 # VOLUME_ALERT_DEFAULT_MULTIPLIER x the average daily volume. The baseline is

@@ -1,3 +1,4 @@
+from agent_stonks import config
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
     _cash_label,
@@ -145,3 +146,31 @@ class TestTheRequestedModeIsRemembered:
         state.trading_mode_requested = "alpaca_live"
         state.trading_mode = "local"
         assert state.trading_mode != state.trading_mode_requested
+
+
+class TestTheLiveSourceChoice:
+    """The sidebar offers the source and the Alpaca feed as one choice."""
+
+    def test_offers_finnhub_and_both_alpaca_feeds(self):
+        assert list(config.LIVE_SOURCES) == ["finnhub", "alpaca:iex", "alpaca:sip"]
+
+    def test_each_choice_names_a_source_and_a_feed(self):
+        assert config.LIVE_SOURCES["alpaca:iex"] == ("alpaca", "iex")
+        assert config.LIVE_SOURCES["alpaca:sip"] == ("alpaca", "sip")
+
+    def test_finnhub_rides_on_iex_quotes(self):
+        """Finnhub streams no Alpaca feed, but the quote poll and every agent's
+        fill-price lookup still read one, so it is paired with the feed served
+        on every Alpaca plan."""
+        source, feed = config.LIVE_SOURCES["finnhub"]
+        assert source == "finnhub"
+        assert feed == "iex"
+
+    def test_default_is_finnhub(self):
+        assert config.DEFAULT_LIVE_SOURCE in config.LIVE_SOURCES
+        assert config.LIVE_SOURCES[config.DEFAULT_LIVE_SOURCE][0] == config.DEFAULT_DATA_SOURCE
+
+    def test_every_choice_is_labelled(self):
+        assert set(config.LIVE_SOURCE_LABELS) == set(config.LIVE_SOURCES)
+        assert config.LIVE_SOURCE_LABELS["alpaca:iex"] == "Alpaca (iex)"
+        assert config.LIVE_SOURCE_LABELS["alpaca:sip"] == "Alpaca (sip)"

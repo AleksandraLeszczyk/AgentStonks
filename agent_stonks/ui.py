@@ -60,12 +60,13 @@ from .config import (
     AGENT_PERFORMANCE_POLL_SEC,
     APPLE_TRADER_CYCLE_SEC,
     CHART_POLL_SEC,
-    DATA_SOURCES,
     DEFAULT_DATA_SOURCE,
     DEFAULT_HISTORY_FEED,
+    DEFAULT_LIVE_SOURCE,
     DEFAULT_TRADING_MODE,
-    FEEDS,
     HISTORY_FEEDS,
+    LIVE_SOURCE_LABELS,
+    LIVE_SOURCES,
     LIVE_TRADING_ENV_FLAG,
     TRADING_MODES,
     MAX_BARS,
@@ -2958,40 +2959,27 @@ def build_ui() -> None:
             "analyses, and the trading agent cover every listed symbol.",
         )
         with st.expander("Connection"):
-            data_source = st.selectbox(
+            live_source = st.selectbox(
                 "Live data source",
-                DATA_SOURCES,
-                index=0,
-                format_func=lambda s: {
-                    "finnhub": "Finnhub (trades → local candles)",
-                    "alpaca": "Alpaca (bars + quotes)",
-                }.get(s, s),
+                list(LIVE_SOURCES),
+                index=list(LIVE_SOURCES).index(DEFAULT_LIVE_SOURCE),
+                format_func=lambda s: LIVE_SOURCE_LABELS.get(s, s),
                 help=(
-                    "Which WebSocket fills the live bar series. **Finnhub** streams the "
-                    "consolidated trade tape and the candles are built from it here, so the "
-                    "newest candle is the minute in progress rather than the last one to "
-                    "close; it needs FINNHUB_API_KEY. **Alpaca** streams ready-made bars off "
-                    "the feed below and is the only one of the two that also streams "
-                    "bid/ask. Alpaca credentials are required either way — the REST "
+                    "Which WebSocket fills the live bar series, and — for Alpaca — which "
+                    "of its feeds. **Finnhub** streams the consolidated trade tape and the "
+                    "candles are built from it here, so the newest candle is the minute in "
+                    "progress rather than the last one to close; it needs FINNHUB_API_KEY. "
+                    "**Alpaca** streams ready-made bars off the named feed and is the only "
+                    "one of the two that also streams bid/ask.\n\n"
+                    "The feed travels further than the socket: the bid/ask quote poll and "
+                    "the price every agent fills at read it whichever source is streaming, "
+                    "so Finnhub rides on IEX quotes — the one Alpaca feed served on every "
+                    "plan. Alpaca credentials are required either way, because the REST "
                     "fallback, the bar backfill and (under Finnhub) the quote poll all run "
-                    "on them."
+                    "on them. Historical bars have their own setting below."
                 ),
             )
-            finnhub_token_input = st.text_input(
-                "Finnhub API Key",
-                type="password",
-                placeholder="From env FINNHUB_API_KEY if blank",
-            )
-            feed = st.selectbox(
-                "Alpaca feed",
-                FEEDS,
-                index=0,
-                help=(
-                    "Which Alpaca feed the live socket streams when the source above is "
-                    "Alpaca, and which feed the bid/ask quote poll reads. Historical bars "
-                    "have their own setting below."
-                ),
-            )
+            data_source, feed = LIVE_SOURCES[live_source]
             history_feed = st.selectbox(
                 "History / backfill source",
                 HISTORY_FEEDS,
@@ -3012,6 +3000,11 @@ def build_ui() -> None:
                     "window. Failing that it uses yfinance (within 1.5% of SIP, free, ~15 min "
                     "delayed, ~7 days of minute history), and IEX only when neither answers."
                 ),
+            )
+            finnhub_token_input = st.text_input(
+                "Finnhub API Key",
+                type="password",
+                placeholder="From env FINNHUB_API_KEY if blank",
             )
             api_key = st.text_input(
                 "Alpaca API Key",
