@@ -92,6 +92,7 @@ from .historical import (
     fetch_close_series,
     fetch_dividends,
     fetch_earnings_dates,
+    fetch_intraday_history_bars,
     fetch_market_indicators,
     fetch_price_target_history,
     fetch_smart_money_flow,
@@ -142,6 +143,31 @@ from .technical_analysis import (
     analyze_trend,
     get_put_call_walls_and_gamma,
 )
+from .volume_baseline import (
+    DEFAULT_VOLUME_BASELINE,
+    VOLUME_BASELINE_WINDOWS,
+    lookback_days,
+    minute_volume_baseline,
+)
+
+
+def _volume_baseline(symbol: str, bars: "list[dict]", state: AppState) -> "dict | None":
+    """The volume panel's "usual volume" reference for the selected window.
+
+    The prior sessions are fetched here rather than kept on `SymbolState`, for
+    the reason the day-range overlay fetches its own history: the live buffer
+    holds today only, and the baseline wants a week of *consolidated* minutes,
+    which is not the tape the stream is on. `fetch_intraday_history_bars`
+    caches for an hour and swallows its own failures, so the fragment's poll
+    does not turn into a download per rerun, and a window that cannot be built
+    draws nothing.
+    """
+    window = state.volume_baseline_window
+    if window not in VOLUME_BASELINE_WINDOWS or window == "off":
+        return None
+    days = lookback_days(window)
+    history = fetch_intraday_history_bars(symbol, days) if days else []
+    return minute_volume_baseline(window, bars, history)
 
 
 def _get_state() -> AppState:
@@ -616,6 +642,7 @@ def _chart_panel() -> None:
             fill_gaps=state.fill_gaps,
             model_overlays=overlays["items"],
             show_momentum=state.show_momentum,
+            volume_baseline=_volume_baseline(sym, bars, state),
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
@@ -662,6 +689,21 @@ def _live_chart_controls() -> None:
                 "15-bar log return in units of its own random-walk sigma, the "
                 "same number the rule agents' regime is triggered off. The "
                 "dotted rules are the regime-entry thresholds.",
+            )
+            baseline_keys = list(VOLUME_BASELINE_WINDOWS)
+            volume_baseline_window = st.selectbox(
+                "Usual volume",
+                baseline_keys,
+                index=baseline_keys.index(DEFAULT_VOLUME_BASELINE),
+                format_func=lambda k: VOLUME_BASELINE_WINDOWS[k],
+                help="What the volume panel compares today's bars against. The "
+                "dashed line is the window's mean volume per bar; the shaded "
+                "backdrop is the average volume of each *clock minute* across "
+                "the window, which is the fairer read — the open and the close "
+                "carry several times what midday does. \"This session\" has no "
+                "backdrop, since its shape is the bars themselves. Prior "
+                "windows come from yfinance's consolidated tape, so they stay "
+                "comparable whichever live feed is streaming.",
             )
 
         st.markdown("**Price Profile Fit**")
@@ -724,6 +766,7 @@ def _live_chart_controls() -> None:
     state.show_percentile_body = show_percentile_body
     state.show_whiskers = show_whiskers
     state.show_momentum = show_momentum
+    state.volume_baseline_window = volume_baseline_window
     state.fill_gaps = fill_gaps
     state.vwap_style = vwap_style
     state.show_fib = show_fib
@@ -1786,6 +1829,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     decisions=tracker.trade_markers(symbol=sym) if tracker else None,
                     news_impacts=sym_state.news_impacts,
                     fill_gaps=state.fill_gaps,
+                    volume_baseline=_volume_baseline(sym, bars, state),
                     model_overlays=model_overlays.live_overlays(
                         sym_state, bars, state.model_overlay_keys,
                     )["items"],

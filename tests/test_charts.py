@@ -531,3 +531,146 @@ class TestMomentumPanel:
         enter = MOMENTUM_DEFAULTS["enter_threshold"]
         levels = {s.y0 for s in fig.layout.shapes if s.yref == "y5"}
         assert {0, enter, -enter} <= levels
+
+
+class TestVolumeBaseline:
+    """The "usual volume" references drawn under the live volume bars."""
+
+    # 14:00 UTC is 09:00 ET on 2024-01-15, so the bars sit at minutes 540-542.
+    MINUTE = 9 * 60
+
+    def baseline(self, **over) -> dict:
+        base = {
+            "key": "week",
+            "label": "Last trading week",
+            "mean_per_minute": 1000.0,
+            "per_minute": {self.MINUTE + i: 4000.0 for i in range(3)},
+            "sessions": 5,
+            "dates": ["2024-01-08"],
+        }
+        return {**base, **over}
+
+    def traces(self, fig, prefix: str) -> list:
+        return [t for t in fig.data if (t.name or "").startswith(prefix)]
+
+    def test_nothing_is_drawn_without_a_baseline(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=None)
+        assert not self.traces(fig, "Mean volume")
+        assert not self.traces(fig, "Avg volume")
+
+    def test_the_mean_is_a_flat_line(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        (line,) = self.traces(fig, "Mean volume")
+        assert list(line.y) == [1000.0, 1000.0]
+
+    def test_the_mean_spans_the_drawn_bars(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        (line,) = self.traces(fig, "Mean volume")
+        assert [pd.Timestamp(x) for x in line.x] == [
+            pd.Timestamp("2024-01-15T14:00:00Z"),
+            pd.Timestamp("2024-01-15T14:02:00Z"),
+        ]
+
+    def test_the_shape_is_aligned_to_each_bars_clock_minute(self):
+        shape = {self.MINUTE: 9000.0, self.MINUTE + 1: 8000.0, self.MINUTE + 2: 7000.0}
+        fig = build_chart(
+            BARS, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(per_minute=shape),
+        )
+        (ghost,) = self.traces(fig, "Avg volume")
+        assert list(ghost.y) == [9000.0, 8000.0, 7000.0]
+
+    def test_both_references_land_in_the_volume_panel(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        volume = next(t for t in fig.data if t.name == "Volume")
+        for prefix in ("Mean volume", "Avg volume"):
+            (trace,) = self.traces(fig, prefix)
+            assert trace.yaxis == volume.yaxis
+
+    def test_the_shape_is_semi_transparent(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        (ghost,) = self.traces(fig, "Avg volume")
+        assert ghost.opacity < 1
+        assert "rgba" in ghost.fillcolor
+
+    def test_a_window_with_no_shape_still_draws_its_mean(self):
+        # "This session": the mean line alone.
+        fig = build_chart(
+            BARS, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(key="session", label="This session", per_minute={}),
+        )
+        assert self.traces(fig, "Mean volume")
+        assert not self.traces(fig, "Avg volume")
+
+    def test_minutes_outside_the_window_are_gaps_not_zeroes(self):
+        fig = build_chart(
+            BARS, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(per_minute={self.MINUTE: 9000.0}),
+        )
+        (ghost,) = self.traces(fig, "Avg volume")
+        assert ghost.y[0] == 9000.0
+        assert all(v != v for v in ghost.y[1:])
+
+    def test_the_session_count_is_named_on_both(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        for prefix in ("Mean volume", "Avg volume"):
+            (trace,) = self.traces(fig, prefix)
+            assert "5 sessions" in trace.name
+            assert "Last trading week" in trace.name
+
+    def test_one_session_is_not_called_sessions(self):
+        fig = build_chart(
+            BARS, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(label="Yesterday", sessions=1),
+        )
+        (line,) = self.traces(fig, "Mean volume")
+        assert "1 session)" in line.name
+
+    def test_the_mean_is_annotated_on_the_panel(self):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        assert any("mean 1,000" in a.text for a in fig.layout.annotations)
+
+    def test_a_wider_timeframe_scales_the_reference_to_its_bars(self):
+        # A 5-minute bar holds five minutes of volume; comparing it against a
+        # one-minute average would make every bar look like an outlier.
+        five_min = [
+            {"t": f"2024-01-15T14:{m:02d}:00Z", "o": 100.0, "h": 101.0,
+             "l": 99.0, "c": 100.5, "v": 5000}
+            for m in (0, 5, 10)
+        ]
+        shape = {self.MINUTE + i: 100.0 for i in range(15)}
+        fig = build_chart(
+            five_min, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(per_minute=shape, mean_per_minute=100.0),
+        )
+        (line,) = self.traces(fig, "Mean volume")
+        (ghost,) = self.traces(fig, "Avg volume")
+        assert list(line.y) == [500.0, 500.0]
+        assert list(ghost.y) == [500.0, 500.0, 500.0]
+
+
+class TestBarMinutes:
+    def make(self, stamps) -> pd.Series:
+        return pd.Series(pd.to_datetime(stamps, utc=True))
+
+    def test_one_minute_bars(self):
+        assert charts._bar_minutes(
+            self.make(["2024-01-15T14:00Z", "2024-01-15T14:01Z", "2024-01-15T14:02Z"])
+        ) == 1
+
+    def test_fifteen_minute_bars(self):
+        assert charts._bar_minutes(
+            self.make(["2024-01-15T14:00Z", "2024-01-15T14:15Z", "2024-01-15T14:30Z"])
+        ) == 15
+
+    def test_a_hole_does_not_widen_the_bar(self):
+        # The median gap, not the mean: sessions have holes in them.
+        assert charts._bar_minutes(
+            self.make([
+                "2024-01-15T14:00Z", "2024-01-15T14:01Z",
+                "2024-01-15T14:40Z", "2024-01-15T14:41Z",
+            ])
+        ) == 1
+
+    def test_a_single_bar_falls_back_to_one_minute(self):
+        assert charts._bar_minutes(self.make(["2024-01-15T14:00Z"])) == 1

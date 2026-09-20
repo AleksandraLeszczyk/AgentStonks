@@ -221,6 +221,127 @@ def fetch_daily_volume_bars(symbol: str, days: int = 90, ttl_sec: int = _VOLUME_
     return bars
 
 
+# Several days of minute bars for the volume baseline. The window is made of
+# *completed* sessions, so it is the same download all day -- cached for an
+# hour, like the daily OHLC history below and for the same reason.
+_intraday_history_cache: dict[tuple[str, int, str], dict] = {}
+_INTRADAY_HISTORY_CACHE_TTL_SEC = 3600
+# A failure is cached too, briefly. The caller is a chart fragment that reruns
+# every half minute, and an uncached failure would turn a yfinance outage into
+# a download attempt per rerun for as long as it lasted.
+_INTRADAY_HISTORY_RETRY_SEC = 300
+
+
+# yfinance refuses more than 8 days of 1-minute bars in a single request, so a
+# window longer than that is fetched in chunks and stitched back together.
+_INTRADAY_HISTORY_CHUNK_DAYS = 7
+
+
+def fetch_intraday_history_bars(
+    symbol: str,
+    days: int,
+    interval: str = "1m",
+    ttl_sec: int = _INTRADAY_HISTORY_CACHE_TTL_SEC,
+) -> list[dict]:
+    """The last `days` calendar days of intraday bars from yfinance, oldest-first.
+
+    The multi-day counterpart to `fetch_intraday_bars_for_date`: one read
+    covering a whole window rather than one per session, because the volume
+    baseline (`agent_stonks.volume_baseline`) wants five sessions at once and
+    splits them apart itself by ET date.
+
+    yfinance is the source rather than the live feed because volume is the
+    quantity being averaged, and the same argument as `fetch_intraday_volume_bars`
+    applies: IEX reports one venue's slice of it, so a consolidated baseline
+    under consolidated bars is the only comparison that means anything.
+
+    Two limits shape this. yfinance serves 1-minute history for roughly the
+    last 30 days -- ample for a trading week -- but refuses more than 8 days of
+    it per request, which is *not* ample: a week that contains a holiday needs
+    more calendar days than that to hold five sessions. So the window is walked
+    in `_INTRADAY_HISTORY_CHUNK_DAYS` chunks and concatenated, and a chunk that
+    fails is skipped rather than sinking the whole read.
+
+    Regular hours only (yfinance's default), matching the session the chart
+    draws. Cached for `ttl_sec`; returns [] (or the last good cache) on total
+    failure, so a baseline that cannot be fetched simply is not drawn.
+    """
+    now = datetime.now(timezone.utc)
+    key = (symbol, days, interval)
+    cached = _intraday_history_cache.get(key)
+    if cached:
+        age = (now - cached["ts"]).total_seconds()
+        if age < (_INTRADAY_HISTORY_RETRY_SEC if cached.get("failed") else ttl_sec):
+            return cached["bars"]
+
+    end = now.astimezone(MARKET_TZ).date() + timedelta(days=1)
+    start = end - timedelta(days=max(days, 1) + 1)
+    bars: list[dict] = []
+    failures: list[tuple[str, object]] = []
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + timedelta(days=_INTRADAY_HISTORY_CHUNK_DAYS), end)
+        bars += _intraday_chunk(symbol, chunk_start, chunk_end, interval, failures)
+        chunk_start = chunk_end
+
+    if not bars:
+        if failures:
+            log_fetch_failure("intraday history", failures, symbol=symbol)
+        kept = cached["bars"] if cached else []
+        _intraday_history_cache[key] = {"ts": now, "bars": kept, "failed": True}
+        return kept
+    # Chunk boundaries fall mid-day at worst, and yfinance is inclusive at both
+    # ends, so the seams can repeat a bar. Averaging one twice would weight it.
+    bars = list({bar["t"]: bar for bar in bars}.values())
+    bars.sort(key=lambda bar: bar["t"])
+    log_fetch(
+        "intraday history", "yfinance", symbol=symbol,
+        detail=f"{len(bars)} {interval} bars over {days}d",
+        failures=failures,
+    )
+    _intraday_history_cache[key] = {"ts": now, "bars": bars}
+    return bars
+
+
+def _intraday_chunk(
+    symbol: str,
+    start,
+    end,
+    interval: str,
+    failures: list,
+) -> list[dict]:
+    """One yfinance window's worth of intraday bars, [] if it failed."""
+    try:
+        df = yf.download(
+            symbol,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+        )
+    except Exception as exc:
+        failures.append((f"yfinance {start}..{end}", exc))
+        return []
+    if df is None or df.empty:
+        return []
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    idx = pd.to_datetime(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize(MARKET_TZ)
+    idx = idx.tz_convert("UTC")
+    return [
+        {
+            "t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "o": float(row.Open), "h": float(row.High),
+            "l": float(row.Low), "c": float(row.Close), "v": float(row.Volume),
+        }
+        for ts, row in zip(idx, df.itertuples(index=False))
+        if row.Volume == row.Volume
+    ]
+
+
 # A year of daily bars is a slow download and never changes during a session,
 # so this one is cached for far longer than the volume reads above -- long
 # enough that a per-minute trading loop asks yfinance once a day.

@@ -23,6 +23,7 @@ from .config import (
     VOLUME_ALERT_DEFAULT_MULTIPLIER,
 )
 from .market_hours import MARKET_OPEN, MARKET_TZ
+from .volume_baseline import DEFAULT_VOLUME_BASELINE
 
 # Continuously-updated state fields the agent can attach a condition alert to.
 # Every entry is refreshed on the live price/quote stream (and the REST
@@ -249,6 +250,7 @@ _DEFAULTS: dict[str, object] = {
     "show_percentile_body": False,
     "show_whiskers": True,
     "show_momentum": True,
+    "volume_baseline_window": DEFAULT_VOLUME_BASELINE,
     "fill_gaps": True,
     "volume_alert_enabled": True,
     "volume_alert_multiplier": VOLUME_ALERT_DEFAULT_MULTIPLIER,
@@ -351,6 +353,9 @@ class AppState:
         self.show_whiskers: bool = True
         # Draw the session momentum score in a panel under the price/volume.
         self.show_momentum: bool = True
+        # Which prior window the volume panel's "usual volume" references are
+        # built from -- a key of volume_baseline.VOLUME_BASELINE_WINDOWS.
+        self.volume_baseline_window: str = DEFAULT_VOLUME_BASELINE
         # Draw synthetic flat bars at feed minutes without any trade, so the
         # candle/volume series has no visual holes.
         self.fill_gaps: bool = True

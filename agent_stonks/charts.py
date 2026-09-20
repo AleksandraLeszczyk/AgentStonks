@@ -748,6 +748,107 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
         )
 
 
+def _bar_minutes(times: "pd.Series") -> int:
+    """How many minutes one chart bar spans, read off the bars themselves.
+
+    The timeframe is a sidebar setting the chart is never told, but the volume
+    baseline is measured per minute and has to be summed into whatever bucket
+    is actually drawn -- otherwise a 15-minute chart is compared against a
+    one-minute average and every bar towers over it. The median gap is used
+    rather than the first because a session has holes in it.
+    """
+    if len(times) < 2:
+        return 1
+    gaps = times.sort_values().diff().dropna()
+    if gaps.empty:
+        return 1
+    minutes = int(round(gaps.median().total_seconds() / 60))
+    return max(minutes, 1)
+
+
+def _add_volume_baseline(
+    df: "pd.DataFrame", fig: go.Figure, baseline: Optional[dict], row: int
+) -> None:
+    """Draw the usual-volume references under the live volume bars.
+
+    Two traces from one window (see `agent_stonks.volume_baseline`): the flat
+    mean, and -- for the windows that have one -- the per-minute shape, ghosted
+    behind the bars so it reads as a backdrop rather than a second series
+    competing with them. The shape is drawn only where today's bars already
+    are, so the reference never widens the x axis past the live session.
+    """
+    if not baseline:
+        return
+    span = _bar_minutes(df["t"])
+    label = baseline.get("label", "Average")
+    sessions = baseline.get("sessions") or 0
+    unit = "session" if sessions == 1 else "sessions"
+    note = f"{label} ({sessions} {unit})"
+
+    per_minute = baseline.get("per_minute") or {}
+    if per_minute:
+        et = df["t"].dt.tz_convert(market_hours.MARKET_TZ)
+        minutes = et.dt.hour * 60 + et.dt.minute
+        shape = []
+        for start in minutes:
+            window = [
+                per_minute[m]
+                for m in range(int(start), int(start) + span)
+                if m in per_minute
+            ]
+            # A gap, not a zero: outside the window's trading hours the
+            # baseline has nothing to say, and a zero would read as "this
+            # minute is normally dead".
+            shape.append(sum(window) if window else float("nan"))
+        fig.add_trace(
+            go.Scatter(
+                x=df["t"],
+                y=shape,
+                mode="lines",
+                line=dict(shape="hv", width=1, color=PALETTE["accent"]),
+                fill="tozeroy",
+                fillcolor="rgba(96, 165, 250, 0.18)",
+                opacity=0.55,
+                name=f"Avg volume \u2014 {note}",
+                showlegend=False,
+                hovertemplate=f"<b>Usual volume</b> \u2014 {note}<br>%{{y:,.0f}}<extra></extra>",
+            ),
+            row=row,
+            col=1,
+        )
+
+    mean = baseline.get("mean_per_minute")
+    if mean is None:
+        return
+    level = float(mean) * span
+    fig.add_trace(
+        go.Scatter(
+            x=[df["t"].min(), df["t"].max()],
+            y=[level, level],
+            mode="lines",
+            line=dict(color=PALETTE["orange"], width=1.5, dash="dash"),
+            name=f"Mean volume \u2014 {note}",
+            showlegend=False,
+            hovertemplate=(
+                f"<b>Mean volume</b> \u2014 {note}<br>%{{y:,.0f}} per bar<extra></extra>"
+            ),
+        ),
+        row=row,
+        col=1,
+    )
+    fig.add_annotation(
+        x=df["t"].max(),
+        y=level,
+        text=f"mean {level:,.0f} \u00b7 {label.lower()}",
+        showarrow=False,
+        xanchor="right",
+        yanchor="bottom",
+        font=dict(size=9, color=PALETTE["orange"]),
+        row=row,
+        col=1,
+    )
+
+
 def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
     """The session momentum score, drawn in its own panel under the price.
 
@@ -1324,6 +1425,7 @@ def build_chart(
     fill_gaps: bool = False,
     model_overlays: Optional[list[dict]] = None,
     show_momentum: bool = False,
+    volume_baseline: Optional[dict] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -1494,6 +1596,7 @@ def build_chart(
         row=2,
         col=1,
     )
+    _add_volume_baseline(df, fig, volume_baseline, row=2)
 
     if momentum_row is not None:
         _add_momentum_panel(df, fig, momentum_row)
