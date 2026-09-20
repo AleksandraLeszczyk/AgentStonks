@@ -11,9 +11,12 @@ replay chart can show the prediction beside the tape that tested it.
 Five overlays
 -------------
 `day_range`          TimeToChange3's forecast of where the session's high and
-                     low will land, made once from the first five minutes. Two
-                     price levels and the band between them -- the model's
-                     claim about the *width* of the day. See `dayrange_model`.
+                     low will land, made once from the first five minutes -- the
+                     model's claim about the *width* of the day. Two price levels
+                     and the band between them while the tape stays inside that
+                     claim; once it trades outside, the forecast is revised for
+                     the rest of the session and the pair is drawn stepped, off
+                     the same walk `trader_levels` uses. See `dayrange_model`.
 `profile_range`      the LevelsML density model's predicted price profile,
                      reduced to the three numbers a price axis can carry: its
                      outer quantiles and its point of control. The curve itself
@@ -136,7 +139,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         label="Predicted day range",
         summary=(
             "TimeToChange3's forecast of the session's high and low, made once from "
-            "the first five minutes. Drawn as two levels and the band between them."
+            "the first five minutes. Two levels and the band between them while the "
+            "session stays inside it, and a stepped pair once it trades outside and "
+            "the forecast is revised."
         ),
         requires="PyTorch, LightGBM and the day-range bundle",
         tickers=apple_models.DAYRANGE_TICKERS,
@@ -351,7 +356,8 @@ def _span(key: str, label_: str, x0, x1, color: str,
 
 
 def _band(key: str, label_: str, ts, lower, upper, color: str,
-          dash: str = "dot", note: str = "") -> dict:
+          dash: str = "dot", note: str = "",
+          lower_label: str = "", upper_label: str = "") -> dict:
     """A price range that changes through the session.
 
     Where a `span` is one rectangle, a band is a pair of curves over the same
@@ -360,6 +366,13 @@ def _band(key: str, label_: str, ts, lower, upper, color: str,
     the candles, and like any non-forward span it is clipped to the bars in
     hand. There is no profile mirror: a curve through time has no single price
     to put on that axis.
+
+    `lower_label` and `upper_label` name the two edges for the hover, and are
+    what a band that *replaces* a pair of levels owes its reader: the flat
+    shape says "Pred. high" and "Pred. low" on the two lines, and a moving
+    shape that could only say "upper" and "lower" would have lost something in
+    the switch. They default to that generic pair, which is right for a band
+    whose edges have no names of their own -- a volatility envelope's do not.
     """
     stamps = pd.DatetimeIndex(ts)
     if stamps.tz is None:
@@ -372,6 +385,8 @@ def _band(key: str, label_: str, ts, lower, upper, color: str,
         "t": [stamp.isoformat() for stamp in stamps.tz_convert("UTC")],
         "lower": [float(v) for v in lower],
         "upper": [float(v) for v in upper],
+        "lower_label": lower_label or f"{label_} lower",
+        "upper_label": upper_label or f"{label_} upper",
         "color": color,
         "dash": dash,
         "note": note,
@@ -462,7 +477,9 @@ def compute(
         return memo["result"]
 
     builders = {
-        DAY_RANGE_KEY: lambda: _day_range_items(day_range_forecast(), day),
+        DAY_RANGE_KEY: lambda: _day_range_items(
+            day_range_forecast(), day, symbol, session, open_price, trader_config
+        ),
         PROFILE_RANGE_KEY: lambda: _profile_range_items(
             session, daily_bars or [], day
         ),
@@ -557,8 +574,29 @@ def _day_range_forecast(
     return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
 
 
-def _day_range_items(result: dict, day: pd.Timestamp) -> "tuple[list[dict], str]":
-    """The predicted high and low, and the band between them."""
+def _day_range_items(
+    result: dict,
+    day: pd.Timestamp,
+    symbol: str = "",
+    session: "pd.DataFrame | None" = None,
+    open_price: "float | None" = None,
+    config=None,
+) -> "tuple[list[dict], str]":
+    """The predicted high and low, and the range between them.
+
+    Flat while the session stays inside the forecast, and a pair of stepped
+    curves once it does not -- the same shape `trader_levels` draws, for the
+    same reason and off the same walk. A forecast the tape has traded through
+    is revised during the session (`apple_trader.DayRangeTrader._update_range`,
+    `dayrange_model.contain_session`), and the buy and sell levels are rebuilt
+    from the revision every time it moves. Drawing the 9:35 numbers flat while
+    the levels beneath them step up would put the two halves of one picture in
+    disagreement, and the half that was wrong would be the one labelled with
+    the model's name.
+
+    Falls back to the flat 9:35 forecast when there is no session to walk,
+    which is what a caller with bars but no usable window has.
+    """
     overlay = OVERLAYS[DAY_RANGE_KEY]
     forecast = result["forecast"]
     if forecast is None:
@@ -567,22 +605,76 @@ def _day_range_items(result: dict, day: pd.Timestamp) -> "tuple[list[dict], str]
     color = MODEL_OVERLAY_COLORS[DAY_RANGE_KEY]
     x0 = result["made_at"]
     x1 = _session_close(day)
-    high, low = forecast["pred_high"], forecast["pred_low"]
+    high, low = float(forecast["pred_high"]), float(forecast["pred_low"])
     made_at = f"forecast at {pd.Timestamp(x0):%H:%M}"
+
+    walked = _day_range_walk(symbol, session, x0, open_price, forecast, config)
+    highs = [row["pred_high"] for row in walked]
+    lows = [row["pred_low"] for row in walked]
+    moves = bool(walked) and (min(highs) != max(highs) or min(lows) != max(lows))
+    if not moves:
+        return (
+            [
+                _span(
+                    DAY_RANGE_KEY, "Predicted day range", x0, x1, color,
+                    y0=low, y1=high,
+                    note=f"{low:.2f} – {high:.2f} ({made_at})",
+                ),
+                _level(DAY_RANGE_KEY, "Pred. high", high, color,
+                       note=f"predicted session high ({made_at})", x0=x0, x1=x1),
+                _level(DAY_RANGE_KEY, "Pred. low", low, color,
+                       note=f"predicted session low ({made_at})", x0=x0, x1=x1),
+            ],
+            "",
+        )
+    # One band rather than a span plus two levels: the span's whole job was to
+    # tint between the two lines, which is what a band already does, and three
+    # items that must agree bar by bar are three chances to disagree.
     return (
         [
-            _span(
-                DAY_RANGE_KEY, "Predicted day range", x0, x1, color,
-                y0=low, y1=high,
-                note=f"{low:.2f} – {high:.2f} ({made_at})",
-            ),
-            _level(DAY_RANGE_KEY, "Pred. high", high, color,
-                   note=f"predicted session high ({made_at})", x0=x0, x1=x1),
-            _level(DAY_RANGE_KEY, "Pred. low", low, color,
-                   note=f"predicted session low ({made_at})", x0=x0, x1=x1),
+            _band(
+                DAY_RANGE_KEY, "Pred. high / low",
+                [row["t"] for row in walked], lows, highs, color,
+                lower_label="Pred. low", upper_label="Pred. high",
+                note=(
+                    f"the {made_at}, revised where the session traded outside it "
+                    f"({low:.2f} – {high:.2f} at 09:35, "
+                    f"{lows[-1]:.2f} – {highs[-1]:.2f} now)"
+                ),
+            )
         ],
         "",
     )
+
+
+def _day_range_walk(
+    symbol: str,
+    session: "pd.DataFrame | None",
+    made_at,
+    open_price: "float | None",
+    forecast: dict,
+    config,
+) -> "list[dict]":
+    """The forecast bar by bar, as the configured agent maintains it.
+
+    Shares `session_levels` with `trader_levels` rather than re-walking the
+    session, so the predicted high drawn here is by construction the one the
+    buy and sell levels are measured under -- the drift this is meant to
+    prevent could not be prevented by two walks that merely agree today.
+
+    An empty list means "nothing to walk", not "nothing moved": the caller
+    reads it as the flat 9:35 forecast, which is what it is.
+    """
+    if session is None or not len(session):
+        return []
+    from .apple_trader import AppleTraderConfig, session_levels  # heavy-ish, and only here
+
+    if config is None or (config.ticker or "").upper() != (symbol or "").upper():
+        # Same rule as `trader_levels`: another symbol's configuration is not
+        # this chart's, and the shipped one is what an agent started now would
+        # maintain the forecast with.
+        config = AppleTraderConfig(ticker=symbol)
+    return session_levels(config, forecast, session, made_at, open_price=open_price)
 
 
 # --- intraday range (IntradayVolatility) ------------------------------------
@@ -754,6 +846,7 @@ def _trader_levels_items(
             _band(
                 TRADER_LEVELS_KEY, "Buy/sell levels",
                 [row["t"] for row in levels], buys, sells, color,
+                lower_label="Buy level", upper_label="Sell level",
                 note=(
                     f"{how}; they move through the session "
                     f"({buys[0]:.2f} – {sells[0]:.2f} at the forecast, "

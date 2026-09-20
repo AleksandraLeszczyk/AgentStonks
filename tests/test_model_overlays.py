@@ -228,18 +228,19 @@ class TestDayRangeOverlay:
         )
 
     def test_produces_two_levels_and_the_band_between_them(self, monkeypatch):
+        """A session that stays inside its forecast leaves it flat all day."""
         pytest.importorskip("agent_stonks.dayrange_model")
-        self.stub_forecast(monkeypatch)
+        self.stub_forecast(monkeypatch, low=196.0)   # the tape bottoms at 196.80
         items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION)["items"]
         levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
-        assert levels == {"Pred. high": 210.0, "Pred. low": 198.0}
+        assert levels == {"Pred. high": 210.0, "Pred. low": 196.0}
         band = next(i for i in items if i["kind"] == "span")
-        assert (band["y0"], band["y1"]) == (198.0, 210.0)
+        assert (band["y0"], band["y1"]) == (196.0, 210.0)
 
     def test_the_band_runs_from_the_forecast_to_the_closing_bell(self, monkeypatch):
         pytest.importorskip("agent_stonks.dayrange_model")
-        self.stub_forecast(monkeypatch)
+        self.stub_forecast(monkeypatch, low=196.0)
         items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION)["items"]
         band = next(i for i in items if i["kind"] == "span")
@@ -248,6 +249,57 @@ class TestDayRangeOverlay:
         # The 5-minute opening window ends on the 09:34 bar.
         start = pd.Timestamp(band["x0"]).tz_convert("America/New_York")
         assert (start.hour, start.minute) == (9, 34)
+
+    def test_a_breached_forecast_is_drawn_as_a_stepped_band(self, monkeypatch):
+        """The tape bottoms at 196.80, under the 198.00 predicted low, so the
+        low is revised and the flat pair becomes two curves."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+                           daily_bars=[], session_date=SESSION)["items"]
+        assert [i["kind"] for i in items] == ["band"]
+        band = items[0]
+        assert band["label"] == "Pred. high / low"
+        assert len(band["t"]) == len(band["lower"]) == len(band["upper"])
+        # Starts at the 9:35 forecast and ends at the session's own low.
+        assert band["lower"][0] == pytest.approx(198.0)
+        assert band["lower"][-1] == pytest.approx(196.80, abs=0.01)
+        # The high was never traded through, so it is flat across the session.
+        assert min(band["upper"]) == max(band["upper"]) == pytest.approx(210.0)
+
+    def test_the_low_only_steps_down_and_never_back_up(self, monkeypatch):
+        """Piecewise, not a curve fitted to the tape: each step holds until the
+        session trades through it again."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        band = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+                          daily_bars=[], session_date=SESSION)["items"][0]
+        lows = band["lower"]
+        assert all(b <= a for a, b in zip(lows, lows[1:]))
+        assert len(set(lows)) > 1          # it really did step
+
+    def test_the_drawn_high_is_the_one_the_trader_levels_hang_off(
+        self, monkeypatch
+    ):
+        """The reason both overlays share one walk. A chart showing the buy and
+        sell stepping up under a predicted high that stood still would have the
+        model's own line contradicting the orders derived from it."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        bars = minute_bars()
+        bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
+        items = mo.compute([mo.DAY_RANGE_KEY, mo.TRADER_LEVELS_KEY], "AAPL", bars,
+                           daily_bars=[], session_date=SESSION)["items"]
+        ranges = next(i for i in items if i["label"] == "Pred. high / low")
+        levels = next(i for i in items if i["label"] == "Buy/sell levels")
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        shipped = AppleTraderConfig(ticker="AAPL")
+        # sell = pred_high - sell_k x unit, on the same bar, from the same walk.
+        unit = ranges["upper"][-1] - ranges["lower"][-1]
+        assert levels["upper"][-1] == pytest.approx(
+            ranges["upper"][-1] - shipped.sell_k * unit
+        )
 
     def test_bars_that_miss_the_open_refuse_rather_than_forecast(self, monkeypatch):
         pytest.importorskip("agent_stonks.dayrange_model")
@@ -386,7 +438,9 @@ class TestIntradayDayRangeOverlay:
         items = mo.compute([mo.DAY_RANGE_KEY, mo.INTRADAY_DAYRANGE_KEY], "AAPL",
                            minute_bars(), daily_bars=[], session_date=SESSION)["items"]
         assert len(calls) == 1
-        assert {i["kind"] for i in items} == {"level", "span", "band"}
+        # The tape trades under the 198.00 predicted low, so the day-range
+        # overlay is a band rather than a span plus two levels.
+        assert {i["kind"] for i in items} == {"band"}
 
     def test_no_forecast_is_a_note_naming_this_overlay(self, monkeypatch):
         self.stub(monkeypatch)
@@ -944,6 +998,26 @@ class TestRenderer:
         add_model_overlays([envelope()], fig, pd.Timestamp(BARS[0]["t"]),
                            pd.Timestamp(BARS[-1]["t"]), row=None, col=None)
         assert [t.type for t in fig.data] == ["scatter", "scatter", "candlestick"]
+
+    def test_a_bands_two_edges_are_named_in_the_hover(self):
+        """A band that stands in for two named levels has to keep their names.
+        The legend still groups the pair under the overlay, but hovering the
+        top edge must say "Pred. high", not "Pred. high / low upper"."""
+        named = {**envelope(), "label": "Pred. high / low",
+                 "lower_label": "Pred. low", "upper_label": "Pred. high"}
+        fig = self.chart([named])
+        hovers = [t.hovertemplate for t in fig.data if getattr(t, "legendgroup", None) == "iv"]
+        assert any("<b>Pred. high</b>" in h for h in hovers)
+        assert any("<b>Pred. low</b>" in h for h in hovers)
+        assert not any("upper" in h or "lower" in h for h in hovers)
+
+    def test_a_band_without_edge_names_still_says_which_edge(self):
+        """An envelope's edges have no names of their own, so the generic pair
+        is the right answer there rather than a blank."""
+        fig = self.chart([envelope()])
+        hovers = [t.hovertemplate for t in fig.data if getattr(t, "legendgroup", None) == "iv"]
+        assert any("Pred. intraday range upper" in h for h in hovers)
+        assert any("Pred. intraday range lower" in h for h in hovers)
 
     def test_overlay_x_max_ignores_items_that_do_not_reach_forward(self):
         last = pd.Timestamp(BARS[-1]["t"])

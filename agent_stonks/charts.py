@@ -945,13 +945,18 @@ def _add_bands(
         color = item.get("color") or PALETTE["accent"]
         key = item.get("key")
         name = item.get("group") or item.get("label", key)
+        # The legend names the overlay once; the hover names the edge, which is
+        # where a band that stands in for two named levels keeps their names.
+        label_ = item.get("label", "")
+        up_name = item.get("upper_label") or f"{label_} upper"
+        low_name = item.get("lower_label") or f"{label_} lower"
         line = dict(color=color, width=1.2, dash=item.get("dash", "dot"))
         note = [item.get("note", "")] * len(xs)
         fig.add_trace(
             go.Scatter(
                 x=xs, y=upper, mode="lines", line=line, name=name,
                 legendgroup=key, showlegend=key not in shown, customdata=note,
-                hovertemplate=f"<b>{item.get('label', '')}</b> upper %{{y:.2f}}"
+                hovertemplate=f"<b>{up_name}</b> %{{y:.2f}}"
                 "<br>%{x|%H:%M} · %{customdata}<extra></extra>",
             ),
             row=row, col=col,
@@ -961,7 +966,7 @@ def _add_bands(
                 x=xs, y=lower, mode="lines", line=line, name=name,
                 fill="tonexty", fillcolor=_rgba(color, MODEL_OVERLAY_BAND_ALPHA),
                 legendgroup=key, showlegend=False, customdata=note,
-                hovertemplate=f"<b>{item.get('label', '')}</b> lower %{{y:.2f}}"
+                hovertemplate=f"<b>{low_name}</b> %{{y:.2f}}"
                 "<br>%{x|%H:%M} · %{customdata}<extra></extra>",
             ),
             row=row, col=col,

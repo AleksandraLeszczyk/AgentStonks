@@ -1645,8 +1645,15 @@ def session_levels(
     `forecast` is `dayrange_model.forecast_session`'s dict, `session` the day's
     minute bars and `opening_end` the last bar of the window the forecast was
     built on -- bars at or before it are skipped, exactly as the loop skips
-    trading them. Returns one `{"t", "buy", "sell", "reference"}` per bar after
+    trading them. Returns one
+    `{"t", "buy", "sell", "reference", "pred_high", "pred_low"}` per bar after
     that, in order.
+
+    The forecast is in each row as well as the levels because the two must be
+    drawn from the same walk: the levels hang off the predicted high, so a
+    chart that took the levels from here and the forecast from the 9:35 dict
+    would draw a breached session with the buy and sell stepping up and the
+    line they are measured under standing still.
 
     No orders, no log and no ledger: nothing here touches `run_cycle`. The
     circuit breaker and the managed exit are deliberately not modelled -- they
@@ -1678,6 +1685,8 @@ def session_levels(
                 "buy": float(trader.plan["buy_level"]),
                 "sell": float(trader.plan["sell_level"]),
                 "reference": float(trader.plan["reference"]),
+                "pred_high": float(trader.plan["pred_high"]),
+                "pred_low": float(trader.plan["pred_low"]),
             }
         )
     return out
