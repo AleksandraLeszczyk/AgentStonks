@@ -278,6 +278,7 @@ _DEFAULTS: dict[str, object] = {
     "premarket_phase": "",
     "premarket_generated_at": None,
     "trading_mode": "local",
+    "trading_mode_requested": "",
     "trading_status": "",
     "trade_sound_enabled": False,
     "trade_sound_volume": TRADE_SOUND_VOLUME,
@@ -403,6 +404,13 @@ class AppState:
         # degrades to "local", and the UI reads this to say which account is
         # being traded rather than which one was asked for.
         self.trading_mode: str = "local"
+        # What the user actually picked at the last Start, which is not always
+        # what they got: every refusal in `trading_mode.resolve_broker` degrades
+        # toward simulation. Keeping the request next to the outcome is what
+        # lets the UI keep saying "you asked for live and this is not live"
+        # instead of flashing it once and then quietly contradicting the
+        # dropdown for the rest of the session. Empty until the first Start.
+        self.trading_mode_requested: str = ""
         self.trading_status: str = ""
         # Audible cue on a fill (see agent_stonks.trade_sound). Off by default:
         # a dashboard that makes noise without being asked is a worse default

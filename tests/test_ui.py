@@ -1,6 +1,7 @@
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
     _cash_label,
+    _venue_badge,
     _portfolio_value_label,
     _starting_value_label,
     build_news_html,
@@ -105,3 +106,42 @@ class TestMoneyLabelsNameTheAccount:
         # Nothing was budgeted: the run opened on whatever the account held.
         for mode in ("alpaca_paper", "alpaca_live"):
             assert _starting_value_label(self._state(mode)) == "Value at start"
+
+
+class TestVenueBadge:
+    """The status line has to say where orders are going. The bug it replaces:
+    a session that asked for live, was refused for want of live keys and
+    degraded to simulation, said "Local simulation" under a dropdown still
+    reading "Alpaca LIVE" -- and the one message explaining why had already
+    scrolled away with the rerun that produced it."""
+
+    def test_every_mode_has_a_distinguishable_badge(self):
+        badges = {_venue_badge(m) for m in ("local", "alpaca_paper", "alpaca_live")}
+        assert len(badges) == 3
+
+    def test_live_is_not_mistakable_for_paper(self):
+        assert "LIVE" in _venue_badge("alpaca_live")
+        assert "paper" not in _venue_badge("alpaca_live").lower()
+        assert "paper" in _venue_badge("alpaca_paper").lower()
+        assert "LIVE" not in _venue_badge("alpaca_paper")
+
+    def test_simulation_says_so(self):
+        assert "simulation" in _venue_badge("local").lower()
+
+    def test_an_unknown_mode_falls_back_to_its_own_name(self):
+        assert _venue_badge("something_else") == "something_else"
+
+
+class TestTheRequestedModeIsRemembered:
+    """`trading_mode` is what the run got; `trading_mode_requested` is what was
+    asked for. Keeping both is what lets the UI say they differ."""
+
+    def test_nothing_is_requested_before_the_first_start(self):
+        assert AppState().trading_mode_requested == ""
+
+    def test_a_downgrade_leaves_the_two_disagreeing(self):
+        # What resolve_broker does when live keys are missing.
+        state = AppState()
+        state.trading_mode_requested = "alpaca_live"
+        state.trading_mode = "local"
+        assert state.trading_mode != state.trading_mode_requested

@@ -66,7 +66,6 @@ from .config import (
     DEFAULT_TRADING_MODE,
     FEEDS,
     HISTORY_FEEDS,
-    LIVE_TRADING_CONFIRM_PHRASE,
     LIVE_TRADING_ENV_FLAG,
     TRADING_MODES,
     MAX_BARS,
@@ -123,7 +122,14 @@ from .state import (
 from .tactics import tactic_price_levels, tactics_summaries
 from . import bar_history, newsimpact_model
 from .trade_sound import next_trade_cue, play_trade_sound
-from .trading_mode import MODE_LABELS, live_trading_enabled, resolve_broker
+from .trading_mode import (
+    ENV_KEYS as TRADING_ENV_KEYS,
+    MODE_LABELS,
+    PAPER_FALLBACK_ENV,
+    credentials_for,
+    live_trading_enabled,
+    resolve_broker,
+)
 from .stream import backfill_bars, launch_stream, launch_stream_news
 from .technical_analysis import (
     analyze_intraday,
@@ -1598,6 +1604,20 @@ def _starting_value_label(state: AppState) -> str:
     return "Starting budget" if state.trading_mode == "local" else "Value at start"
 
 
+# One badge per venue, used everywhere the app has to say where orders are
+# going. Short enough to sit inside the status line, which is the only place
+# guaranteed to be on screen whether the agent is running, idle or stopped.
+_VENUE_BADGE: dict[str, str] = {
+    "local": "💻 local simulation",
+    "alpaca_paper": "📝 Alpaca paper",
+    "alpaca_live": "🔴 Alpaca LIVE",
+}
+
+
+def _venue_badge(mode: str) -> str:
+    return _VENUE_BADGE.get(mode, mode)
+
+
 def _cash_label(state: AppState) -> str:
     if state.trading_mode == "alpaca_live":
         return "Alpaca LIVE cash"
@@ -2058,8 +2078,8 @@ def _apple_trader2_params(symbols: list[str]) -> AppleTrader2Config:
     return config
 
 
-def _execution_controls() -> tuple[str, str]:
-    """Where this agent run's orders go. Returns (mode, live_confirmation_phrase).
+def _execution_controls() -> str:
+    """Where this agent run's orders go. Returns the requested mode.
 
     Rendered above the Start button rather than tucked in an expander: which
     account an automated strategy is about to trade is the single most
@@ -2079,12 +2099,15 @@ def _execution_controls() -> tuple[str, str]:
             "routing, real fills, real rejections, fake money. Needs "
             "`ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_SECRET`.\n\n"
             "**Alpaca LIVE** sends real orders with real money. Needs "
-            f"`{LIVE_TRADING_ENV_FLAG}=true` in the environment *and* the typed "
-            "confirmation below."
+            f"`{LIVE_TRADING_ENV_FLAG}=true` in the environment."
         ),
     )
 
-    live_confirm = ""
+    # Whether this venue can actually be reached is knowable right here, from
+    # the environment alone, and telling the user now beats letting them press
+    # ▶ Start and discover the run quietly degraded to simulation.
+    keyed = credentials_for(mode).configured if mode != "local" else True
+
     if mode == "alpaca_live":
         if not live_trading_enabled():
             st.error(
@@ -2092,23 +2115,35 @@ def _execution_controls() -> tuple[str, str]:
                 "environment and restart the app to enable it. Until then this run "
                 "falls back to local simulation."
             )
+        elif not keyed:
+            key_var, secret_var = TRADING_ENV_KEYS["alpaca_live"]
+            st.error(
+                f"**No live credentials.** `{key_var}` and `{secret_var}` are not set, "
+                "so this run falls back to local simulation and sends nothing "
+                "anywhere. Live deliberately does not borrow `ALPACA_API_KEY`: if "
+                "that happened to be a live key, whether real money moved would come "
+                "down to which variable was already set."
+            )
         else:
             st.warning(
-                "**This will trade real money.** An automated strategy will place "
-                "orders on your live Alpaca account without asking again per trade. "
-                f'Type `{LIVE_TRADING_CONFIRM_PHRASE}` to arm it for this run.'
-            )
-            live_confirm = st.text_input(
-                "Confirm live trading",
-                key="agent_live_confirm",
-                placeholder=LIVE_TRADING_CONFIRM_PHRASE,
+                "**This will trade real money.** Pressing ▶ Start arms an automated "
+                "strategy on your live Alpaca account, and it will place orders "
+                "without asking again per trade."
             )
     elif mode == "alpaca_paper":
-        st.caption(
-            "Orders go to your Alpaca **paper** account — no real money, but real "
-            "order routing, so rejections and partial fills are real too."
-        )
-    return mode, live_confirm
+        if not keyed:
+            key_var, secret_var = TRADING_ENV_KEYS["alpaca_paper"]
+            st.error(
+                f"**No paper credentials.** Set `{key_var}` / `{secret_var}` (or "
+                f"`{PAPER_FALLBACK_ENV[0]}` / `{PAPER_FALLBACK_ENV[1]}`, if those are "
+                "your paper keys). Until then this run falls back to local simulation."
+            )
+        else:
+            st.caption(
+                "Orders go to your Alpaca **paper** account — no real money, but real "
+                "order routing, so rejections and partial fills are real too."
+            )
+    return mode
 
 
 def _agent_panel(
@@ -2229,7 +2264,7 @@ def _agent_panel(
         _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
     )
 
-    trading_mode_choice, live_confirm = _execution_controls()
+    trading_mode_choice = _execution_controls()
 
     sound_col, vol_col = st.columns([1, 2])
     state.trade_sound_enabled = sound_col.toggle(
@@ -2342,9 +2377,10 @@ def _agent_panel(
             # misconfigured or blocked account can never silently become a
             # different account than the one the user picked.
             live_broker, effective_mode, broker_message = resolve_broker(
-                trading_mode_choice, live_confirm
+                trading_mode_choice
             )
             state.trading_mode = effective_mode
+            state.trading_mode_requested = trading_mode_choice
             state.trading_status = broker_message
             if effective_mode != trading_mode_choice:
                 st.warning(broker_message)
@@ -2457,19 +2493,37 @@ def _agent_panel(
         if state.agent_running and state.symbols
         else ""
     )
-    st.caption(f"Status: {status}{watching}")
+    # Where orders go belongs in the status line rather than in a banner of its
+    # own: this line is on screen whether the agent is running, idle or stopped,
+    # and "is this moving real money" is not a question that stops mattering the
+    # moment a run ends. Before the first Start nothing has been resolved yet,
+    # so the line says that instead of naming a venue it has not chosen.
+    if state.trading_mode_requested:
+        venue = f" · {_venue_badge(state.trading_mode)}"
+    else:
+        venue = " · no venue resolved yet — press ▶ Start"
+    st.caption(f"Status: {status}{venue}{watching}")
     _trade_sound_fragment()
 
-    # The venue stays on screen for as long as the agent runs, not just at the
-    # moment Start was pressed. Someone coming back to a session left running
-    # should be able to tell at a glance whether it is moving real money.
-    if state.agent_running:
-        if state.trading_mode == "alpaca_live":
-            st.error(f"🔴 **LIVE** — orders are going to your real Alpaca account. {state.trading_status}")
-        elif state.trading_mode == "alpaca_paper":
-            st.info(f"📝 Orders routed to your Alpaca **paper** account. {state.trading_status}")
-        else:
-            st.caption("💻 Local simulation — no orders are being sent.")
+    # A run that did not get the venue it asked for. This is the whole reason
+    # the requested mode is kept: resolve_broker degrades toward simulation on
+    # every misconfiguration, and saying so once in a toast leaves the dropdown
+    # reading "Alpaca LIVE" over a session that is sending nothing anywhere.
+    # It stays on screen until the next Start changes the answer.
+    if state.trading_mode_requested and state.trading_mode != state.trading_mode_requested:
+        st.warning(
+            f"**Not {_venue_badge(state.trading_mode_requested)}.** This run is on "
+            f"{_venue_badge(state.trading_mode)} instead — {state.trading_status}"
+        )
+    elif state.trading_mode == "alpaca_live":
+        st.error(
+            "🔴 **LIVE** — orders are going to your real Alpaca account. "
+            f"{state.trading_status}"
+        )
+    elif state.trading_mode == "alpaca_paper":
+        st.info(
+            f"📝 Orders routed to your Alpaca **paper** account. {state.trading_status}"
+        )
     _agent_identity_panel()
 
     _agent_performance_panel(symbols)

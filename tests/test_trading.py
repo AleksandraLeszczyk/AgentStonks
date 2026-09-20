@@ -11,7 +11,7 @@ import pytest
 
 from agent_stonks import trading_mode, trading_rest
 from agent_stonks.broker import AlpacaBroker, PaperBroker
-from agent_stonks.config import LIVE_TRADING_CONFIRM_PHRASE, LIVE_TRADING_ENV_FLAG
+from agent_stonks.config import LIVE_TRADING_ENV_FLAG
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
 from agent_stonks.trading_rest import TradingCredentials, TradingError
@@ -258,23 +258,23 @@ class TestResolveBroker:
         assert mode == "local" and broker.is_simulated
 
     def test_live_refused_without_the_environment_flag(self, monkeypatch):
+        # The one gate on live trading, and it lives outside the app: having
+        # the keys is not enough, and neither is picking the mode.
         monkeypatch.setenv("ALPACA_LIVE_API_KEY", "k")
         monkeypatch.setenv("ALPACA_LIVE_SECRET", "s")
-        broker, mode, msg = trading_mode.resolve_broker(
-            "alpaca_live", LIVE_TRADING_CONFIRM_PHRASE
-        )
+        broker, mode, msg = trading_mode.resolve_broker("alpaca_live")
         assert mode == "local" and broker.is_simulated
         assert LIVE_TRADING_ENV_FLAG in msg
 
-    def test_live_refused_without_the_typed_confirmation(self, monkeypatch):
-        monkeypatch.setenv(LIVE_TRADING_ENV_FLAG, "true")
+    def test_the_env_flag_must_be_truthy_not_merely_present(self, monkeypatch):
+        monkeypatch.setenv(LIVE_TRADING_ENV_FLAG, "false")
         monkeypatch.setenv("ALPACA_LIVE_API_KEY", "k")
         monkeypatch.setenv("ALPACA_LIVE_SECRET", "s")
-        broker, mode, msg = trading_mode.resolve_broker("alpaca_live", "yes please")
-        assert mode == "local" and broker.is_simulated
-        assert LIVE_TRADING_CONFIRM_PHRASE in msg
+        _, mode, msg = trading_mode.resolve_broker("alpaca_live")
+        assert mode == "local"
+        assert LIVE_TRADING_ENV_FLAG in msg
 
-    def test_live_needs_both_gates_together(self, monkeypatch, requests_mock):
+    def test_live_is_armed_by_the_env_flag_alone(self, monkeypatch, requests_mock):
         monkeypatch.setenv(LIVE_TRADING_ENV_FLAG, "true")
         monkeypatch.setenv("ALPACA_LIVE_API_KEY", "k")
         monkeypatch.setenv("ALPACA_LIVE_SECRET", "s")
@@ -282,9 +282,7 @@ class TestResolveBroker:
             f"{LIVE_URL}/v2/account",
             json={"cash": "500", "equity": "500", "status": "ACTIVE"},
         )
-        broker, mode, _ = trading_mode.resolve_broker(
-            "alpaca_live", LIVE_TRADING_CONFIRM_PHRASE
-        )
+        broker, mode, _ = trading_mode.resolve_broker("alpaca_live")
         assert mode == "alpaca_live"
         assert broker.is_simulated is False and broker.is_live is True
 
@@ -315,9 +313,7 @@ class TestResolveBroker:
         monkeypatch.setenv("ALPACA_SECRET", "s")
         account = requests_mock.get(f"{LIVE_URL}/v2/account", json={"status": "ACTIVE"})
 
-        broker, mode, msg = trading_mode.resolve_broker(
-            "alpaca_live", LIVE_TRADING_CONFIRM_PHRASE
-        )
+        broker, mode, msg = trading_mode.resolve_broker("alpaca_live")
 
         assert mode == "local" and broker.is_simulated
         assert "ALPACA_LIVE_API_KEY" in msg

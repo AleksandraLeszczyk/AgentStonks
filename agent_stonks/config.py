@@ -74,12 +74,12 @@ TRADING_REST_LIVE = "https://api.alpaca.markets"
 TRADING_MODES = ["local", "alpaca_paper", "alpaca_live"]
 DEFAULT_TRADING_MODE = "alpaca_paper"
 
-# Live trading is off unless this environment variable is truthy, and the UI
-# asks for a typed confirmation on top of it. Two independent gates, because
-# the failure mode here is not a crash or a bad chart -- it is real money moved
-# by an automated agent that the user did not intend to have running.
+# Live trading is off unless this environment variable is truthy. It is set
+# outside the app, so nothing the agent does in-process -- and no timer that
+# starts a run on its own -- can reach the live account on its own initiative.
+# Picking "Alpaca LIVE" in the UI is then the deliberate act; the run is still
+# announced in red for as long as it lasts.
 LIVE_TRADING_ENV_FLAG = "ALPACA_ENABLE_LIVE_TRADING"
-LIVE_TRADING_CONFIRM_PHRASE = "TRADE LIVE"
 
 # A market order is accepted immediately and fills asynchronously. The tracker
 # waits this long for a terminal state before recording whatever filled so far;

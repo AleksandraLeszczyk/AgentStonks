@@ -7,14 +7,13 @@ The asymmetry is deliberate. Falling back from a real venue to the local ledger
 is always safe -- the worst case is a simulated trade the user thought was real,
 which is visible the moment they look at their Alpaca account. Falling the other
 way is not recoverable: a live order cannot be un-sent. So every failure here
-degrades toward simulation, and live trading is reachable only by passing two
-independent gates that both have to be set deliberately:
+degrades toward simulation, and live trading is reachable only when
+LIVE_TRADING_ENV_FLAG is set in the environment.
 
-    1. the LIVE_TRADING_ENV_FLAG environment variable, set outside the app
-    2. a phrase typed into the UI for this session
-
-Neither is remembered for the user. An agent loop that starts itself on a timer
-must not be able to reach the live account because someone ticked a box once.
+That gate lives outside the app on purpose. An agent loop that starts itself on
+a timer must not be able to reach the live account just because the process is
+running; arming it is a thing the user does to the environment, not something
+any code path here can do for itself.
 """
 from __future__ import annotations
 
@@ -22,12 +21,7 @@ import logging
 import os
 
 from .broker import AlpacaBroker, Broker, PaperBroker
-from .config import (
-    DEFAULT_TRADING_MODE,
-    LIVE_TRADING_CONFIRM_PHRASE,
-    LIVE_TRADING_ENV_FLAG,
-    TRADING_MODES,
-)
+from .config import DEFAULT_TRADING_MODE, LIVE_TRADING_ENV_FLAG, TRADING_MODES
 from .trading_rest import TradingCredentials, TradingError, get_account
 
 logger = logging.getLogger(__name__)
@@ -62,10 +56,6 @@ PAPER_FALLBACK_ENV: tuple[str, str] = ("ALPACA_API_KEY", "ALPACA_SECRET")
 def live_trading_enabled() -> bool:
     """Whether the environment permits live trading at all."""
     return os.getenv(LIVE_TRADING_ENV_FLAG, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def confirmation_ok(phrase: str) -> bool:
-    return phrase.strip().upper() == LIVE_TRADING_CONFIRM_PHRASE
 
 
 def credentials_for(mode: str) -> TradingCredentials:
@@ -105,9 +95,7 @@ def verify_account(creds: TradingCredentials) -> "tuple[bool, str]":
     )
 
 
-def resolve_broker(
-    mode: str, confirm_phrase: str = ""
-) -> "tuple[Broker, str, str]":
+def resolve_broker(mode: str) -> "tuple[Broker, str, str]":
     """Turn a requested mode into (broker, effective_mode, message).
 
     `effective_mode` is what the caller actually got, which is not always what
@@ -121,19 +109,12 @@ def resolve_broker(
     if mode == "local":
         return PaperBroker(), "local", "Local simulation — no orders leave this app."
 
-    if mode == "alpaca_live":
-        if not live_trading_enabled():
-            return (
-                PaperBroker(), "local",
-                f"LIVE trading refused: {LIVE_TRADING_ENV_FLAG} is not set in the "
-                "environment. Falling back to local simulation.",
-            )
-        if not confirmation_ok(confirm_phrase):
-            return (
-                PaperBroker(), "local",
-                f'LIVE trading refused: type "{LIVE_TRADING_CONFIRM_PHRASE}" to confirm. '
-                "Falling back to local simulation.",
-            )
+    if mode == "alpaca_live" and not live_trading_enabled():
+        return (
+            PaperBroker(), "local",
+            f"LIVE trading refused: {LIVE_TRADING_ENV_FLAG} is not set in the "
+            "environment. Falling back to local simulation.",
+        )
 
     creds = credentials_for(mode)
     if not creds.configured:

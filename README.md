@@ -161,7 +161,7 @@ docker run -p 8501:8501 --env-file .env agentstonks
 | `ALPACA_API_KEY` | Alpaca API key ID |
 | `ALPACA_SECRET` | Alpaca secret key |
 | `ALPACA_PAPER_API_KEY` / `ALPACA_PAPER_SECRET` | (optional) Alpaca **paper** trading keys. Orders default to the paper account; if `ALPACA_API_KEY` is already a paper key these are unnecessary — paper falls back to it |
-| `ALPACA_ENABLE_LIVE_TRADING` | Set truthy to make **live** trading selectable at all. Off by default; the app also requires a typed confirmation per run |
+| `ALPACA_ENABLE_LIVE_TRADING` | Set truthy to make **live** trading selectable at all. Off by default, and set outside the app, so no run can arm itself |
 | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET` | (optional) Alpaca **live** trading keys — real money. Never inherited from the data or paper variables |
 | `FINNHUB_API_KEY` | Finnhub API key — powers the default live data source (trades → locally built candles). Without it the app streams bars from Alpaca instead |
 | `GEMINI_API_KEY` | (optional) Gemini key — for LLM news scoring and/or the trading agent |
@@ -191,8 +191,8 @@ agent_stonks/
   trading_rest.py — Alpaca *Trading* API (accounts, positions, orders) — a different host and a
                   different key pair per venue; the only module that can move money
   trading_mode.py — picks the venue for a run (local / Alpaca paper / Alpaca live) and refuses
-                  toward simulation on every misconfiguration; live needs an env flag AND a
-                  typed confirmation
+                  toward simulation on every misconfiguration; live needs the
+                  ALPACA_ENABLE_LIVE_TRADING env flag, set outside the app
   broker.py     — the Broker abstraction: PaperBroker (invented fills), SimBroker (stored tape),
                   AlpacaBroker (real orders, real rejections, account is the source of truth)
   stream.py     — Alpaca's WebSocket streaming threads (bars/trades/quotes, news), plus the REST
