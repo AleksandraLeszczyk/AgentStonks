@@ -328,8 +328,9 @@ def _render_apple_rules() -> None:
         "- Anything still open is flattened before the close.\n"
         "- A **managed exit** sits on top, every distance measured from the fill: a "
         "**stop** when a bar's low falls `stop × A` under it (after which the session takes "
-        "no new entry); a **take** of part of the position once the momentum score fades "
-        "`drop` σ off its best since the entry while the trade is in profit; and the rest "
+        "no new entry); a **take** of part of the position, while the trade is in profit, "
+        "once the momentum over the last `N` bars has been positive since the entry and "
+        "turns balanced or negative; and the rest "
         "kept as a **runner** only if the sell level is still `hold × A` above the fill, "
         "sold if the price comes back to the fill. It is not in the notebook's numbers, "
         "and a stored run from before it existed replays with it off.\n"
@@ -3388,7 +3389,8 @@ def _render_tuning_form() -> None:
 
     st.markdown("**Parameters to tune**")
     names = st.multiselect(
-        "Tune", list(sim_tuning.AXES), default=["buy_k", "sell_k"],
+        "Tune", [a for a in sim_tuning.AXES if a not in sim_tuning.LEGACY_AXES],
+        default=["buy_k", "sell_k"],
         max_selections=sim_tuning.MAX_AXES,
         format_func=sim_tuning.sweep_label, key="tune_axes",
         help="One parameter draws a bar chart, two a heatmap — the first one is its rows. "

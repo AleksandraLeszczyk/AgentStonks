@@ -244,9 +244,9 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 #   stop       sell everything once a bar's low is STOP_GAIN_FRACTION of the
 #              predicted gain under the fill, and take no new entry for the
 #              rest of the session
-#   take       once the momentum score has fallen MOMENTUM_DROP sigmas from its
-#              best since the entry with the position in profit, sell
-#              TAKE_FRACTION of it ...
+#   take       once the total momentum over the last MOMENTUM_FADE_BARS bars
+#              has turned from positive to balanced or negative since the
+#              entry, with the position in profit, sell TAKE_FRACTION of it ...
 #   runner     ... and keep the rest for the sell level only if that is still
 #              HOLD_MIN_GAIN_K x ADR above the fill (otherwise sell it all);
 #              a runner is sold if the price comes back to the fill
@@ -270,7 +270,12 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # wider one on GOOGL. 0 switches the stop off, which is what every record
 # written before the managed exit existed replays as.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
-APPLE_TRADER_MOMENTUM_DROP = 1.0
+# The momentum take's look-back: the fade is read from the N-bar log return in
+# units of its own random-walk scale (`momentum_regime.compute_momentum` with
+# `horizon = N`) and the same Schmitt-trigger regime the chart draws -- so
+# "positive" and "balanced" mean exactly what they mean there. 15 is that
+# module's own horizon. 0 switches the take off.
+APPLE_TRADER_MOMENTUM_FADE_BARS = 15
 APPLE_TRADER_TAKE_FRACTION = 0.70
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What the agent does when the session trades through the forecast it was given

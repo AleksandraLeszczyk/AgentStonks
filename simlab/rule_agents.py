@@ -155,6 +155,12 @@ _APPLE_LEGACY = {
     # Results beside the original as though it matched.
     "stop_gain_fraction": 0.0,
     "momentum_drop": 0.0,
+    # And before the take read a positive-to-balanced turn over N bars it read
+    # a fall of `momentum_drop` sigmas from the peak, which every record made
+    # until then carries. Zero here leaves that one to speak, exactly as for
+    # the stop above: a record saying 1σ replays the 1σ rule and signs
+    # `@mom-1`, rather than picking up today's 15-bar turn beside it.
+    "momentum_fade_bars": 0,
     # Before the intraday update existed the 9:35 forecast stood all day and
     # the two levels never moved. "off" is that rule, and it is left out of the
     # signature, so such a record replays and files exactly where it did.

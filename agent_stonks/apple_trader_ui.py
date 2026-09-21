@@ -189,7 +189,7 @@ def dayrange_params(
         )
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
-    stop_gain_fraction, momentum_drop, take_fraction, hold_min_gain_k = exit_params(
+    stop_gain_fraction, momentum_fade_bars, take_fraction, hold_min_gain_k = exit_params(
         defaults, float(buy_k), float(sell_k), copy
     )
     min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), copy)
@@ -205,7 +205,7 @@ def dayrange_params(
         contain_range=contain_range,
         breach_exit=breach_exit,
         stop_gain_fraction=stop_gain_fraction,
-        momentum_drop=momentum_drop,
+        momentum_fade_bars=momentum_fade_bars,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
         min_win_k=min_win_k,
@@ -362,7 +362,7 @@ def containment_params(
 
 def exit_params(
     defaults: AppleTraderConfig, buy_k: float, sell_k: float, copy: FormCopy
-) -> "tuple[float, float, float, float]":
+) -> "tuple[float, int, float, float]":
     """The managed exit: a stop under the fill, a momentum take, and a runner.
 
     Not keyed by ticker, unlike the levels: none of these was swept per
@@ -389,18 +389,18 @@ def exit_params(
         ),
     )
     stop_caption(col_a, float(stop_gain_fraction), float(buy_k), float(sell_k))
-    momentum_drop = col_b.number_input(
-        "Momentum fade to take gains (σ off its peak)",
-        min_value=0.0, max_value=5.0, value=defaults.momentum_drop, step=0.1, format="%.1f",
-        key=copy.key("momentum_drop"),
-        help=copy.help.get("momentum_drop"),
+    momentum_fade_bars = col_b.number_input(
+        "Momentum fade to take gains (look-back, bars)",
+        min_value=0, max_value=120, value=int(defaults.momentum_fade_bars), step=1,
+        key=copy.key("momentum_fade_bars"),
+        help=copy.help.get("momentum_fade_bars"),
     )
     take_pct = col_a.number_input(
         "Take on a fade (% of shares)",
         min_value=1.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
         key=copy.key("take_pct"),
         help=copy.help.get("take_fraction"),
-        disabled=not momentum_drop,
+        disabled=not momentum_fade_bars,
     )
     hold_min_gain_k = col_b.number_input(
         "Keep a runner if the target is ≥ (× ADR above the fill)",
@@ -408,10 +408,10 @@ def exit_params(
         format="%.2f",
         key=copy.key("hold_min_gain_k"),
         help=copy.help.get("hold_min_gain_k"),
-        disabled=not momentum_drop,
+        disabled=not momentum_fade_bars,
     )
     return (
-        float(stop_gain_fraction), float(momentum_drop),
+        float(stop_gain_fraction), int(momentum_fade_bars),
         float(take_pct) / 100.0, float(hold_min_gain_k),
     )
 

@@ -2252,11 +2252,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "said. 0 switches the stop off, leaving the position to the sell level, a "
             "momentum take or the flatten."
         ),
-        "momentum_drop": (
-            "How far the momentum score — the tape's drift in sigmas — must fall from its "
-            "best since the entry, while the position is in profit, before gains are taken "
-            "short of the sell level. Smaller fires on any wobble; larger waits for a real "
-            "turn. 0 switches the take off, and with it the runner."
+        "momentum_fade_bars": (
+            "Gains are taken short of the sell level, with the position in profit, once "
+            "the total momentum over the last this-many bars — the price's move over them "
+            "in sigmas of its own noise — has been positive since the entry and turns "
+            "balanced or negative. Positive starts above 0.9σ and ends under 0.4σ, so a "
+            "score hovering at the line is not a turn. Fewer bars reacts to short "
+            "wobbles; more waits for the whole move to give out. 0 switches the take "
+            "off, and with it the runner."
         ),
         "take_fraction": (
             "How much of the position a momentum take sells when the rest is kept as a "

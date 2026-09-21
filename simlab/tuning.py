@@ -143,7 +143,15 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 1.0, 0.25),
         ),
         Tunable(
-            "momentum_drop", "Momentum fade (σ off its peak)", 0.0, 5.0, 0.1,
+            "momentum_fade_bars", "Momentum fade look-back (bars)", 0, 120, 1,
+            (5, 30, 5), "%d", integer=True,
+        ),
+        # The take as it used to be written (`AppleTraderConfig.momentum_drop`).
+        # Still a tunable so a stored sweep over it is still read back as the
+        # grid it was (`derived_jobs`); not offered for a new one
+        # (`LEGACY_AXES`), since it cannot be set beside the look-back.
+        Tunable(
+            "momentum_drop", "Momentum fade, legacy (σ off its peak)", 0.0, 5.0, 0.1,
             (0.0, 2.0, 0.5), "%.1f",
         ),
         Tunable("take_fraction", "Share taken on a fade", 0.05, 1.0, 0.05, (0.30, 1.0, 0.10)),
@@ -224,7 +232,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "level_source",
     "breach_update",
     "stop_gain_fraction",
-    "momentum_drop",
+    "momentum_fade_bars",
     "take_fraction",
     "hold_min_gain_k",
     "min_win_k",
@@ -235,6 +243,10 @@ SWEEPABLE: "tuple[str, ...]" = (
 # Everything a grid axis may be, numbers first: the order the Tuning tab and
 # the Simulate tab's sweep both list their pickers in.
 AXES: "tuple[str, ...]" = tuple(TUNABLES) + tuple(CHOICES)
+
+# Axes a stored grid may have but a new one is not offered: a field kept only
+# so old records replay.
+LEGACY_AXES: "tuple[str, ...]" = ("momentum_drop",)
 
 
 def sweep_label(name: str) -> str:
@@ -379,7 +391,7 @@ def expand(
       itself.
     * **collapsed** -- the configuration is real but signs the same as one
       already in the list, which happens whenever a varied field is switched
-      off by another (`take_fraction` means nothing with `momentum_drop` at 0,
+      off by another (`take_fraction` means nothing with `momentum_fade_bars` at 0,
       and the signature leaves it out). The whole pipeline identifies a run by
       its signature, so queueing both would be one Results row run twice.
       Silently collapsed here; the caller compares against `cell_count(axes)`

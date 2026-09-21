@@ -58,7 +58,7 @@ from .config import (
     APPLE_TRADER_MIN_WIN,
     APPLE_TRADER_MIN_WIN_K,
     APPLE_TRADER_MODEL,
-    APPLE_TRADER_MOMENTUM_DROP,
+    APPLE_TRADER_MOMENTUM_FADE_BARS,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_GAIN_FRACTION,
@@ -165,10 +165,19 @@ class AppleTraderConfig:
     # mutually exclusive (`__post_init__`); `stop_distance` reads whichever is
     # set.
     stop_k: float = 0.0
-    # How far (in momentum sigmas) the score has to fall from its best since the
-    # entry, with the position in profit, to take gains short of the sell level.
-    # 0 switches the take off, and with it the runner and its breakeven.
-    momentum_drop: float = APPLE_TRADER_MOMENTUM_DROP
+    # The momentum take: gains are taken short of the sell level once the
+    # total momentum over the last this-many bars, having been positive at some
+    # point since the entry, has turned balanced or negative -- with the
+    # position in profit. See `_momentum_take`. 0 switches the take off, and
+    # with it the runner and its breakeven.
+    momentum_fade_bars: int = APPLE_TRADER_MOMENTUM_FADE_BARS
+    # The take in the form it used to be written in: how far (in sigmas) the
+    # smoothed 15-bar score had to fall from its best since the entry. Kept
+    # only so a stored record replays and signs exactly as the run it
+    # describes -- nothing configures it any more, and a new config leaves it
+    # at 0. Mutually exclusive with `momentum_fade_bars` (`__post_init__`),
+    # like `stop_k` with `stop_gain_fraction`.
+    momentum_drop: float = 0.0
     # The share of the position that take sells when a runner is kept.
     take_fraction: float = APPLE_TRADER_TAKE_FRACTION
     # The gain still left to the sell level, in ADRs above the fill, that is
@@ -217,8 +226,8 @@ class AppleTraderConfig:
         if self.min_win_k is None:
             self.min_win_k = min_win_for(self.ticker)
         for name in (
-            "stop_k", "stop_gain_fraction", "momentum_drop", "hold_min_gain_k",
-            "min_win_k",
+            "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
+            "hold_min_gain_k", "min_win_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -235,6 +244,22 @@ class AppleTraderConfig:
                 f"{self.stop_gain_fraction!r} are two ways of writing the same stop and "
                 "only one may be set; stop_k is the legacy unit a stored record replays "
                 "under, new configurations use stop_gain_fraction"
+            )
+        # A bar count, whatever a form or a JSON record handed over.
+        if float(self.momentum_fade_bars) != int(self.momentum_fade_bars):
+            raise ValueError(
+                f"momentum_fade_bars {self.momentum_fade_bars!r} is a number of bars "
+                "and must be whole"
+            )
+        self.momentum_fade_bars = int(self.momentum_fade_bars)
+        # The same reason as the stop: two takes is not a stricter take, it is
+        # a config that does not say which rule it means.
+        if self.momentum_drop and self.momentum_fade_bars:
+            raise ValueError(
+                f"momentum_drop {self.momentum_drop!r} and momentum_fade_bars "
+                f"{self.momentum_fade_bars!r} are two ways of writing the momentum take "
+                "and only one may be set; momentum_drop is the legacy rule a stored "
+                "record replays under, new configurations use momentum_fade_bars"
             )
         if not 0 < self.take_fraction <= 1:
             raise ValueError(
@@ -333,6 +358,12 @@ class AppleTraderConfig:
         """
         return bool(self.stop_gain_fraction or self.stop_k)
 
+    @property
+    def has_take(self) -> bool:
+        """Whether the momentum take is on, in either of its forms -- and with
+        it the runner and the breakeven."""
+        return bool(self.momentum_fade_bars or self.momentum_drop)
+
 
 def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
     """What one k is worth in dollars for this session, given the unit chosen.
@@ -413,6 +444,16 @@ def stop_phrase(config: AppleTraderConfig) -> str:
     return f"{config.stop_k:g} × ADR"
 
 
+def fade_phrase(config: AppleTraderConfig) -> str:
+    """The momentum take's trigger in words, in whichever form it is written."""
+    if config.momentum_fade_bars:
+        return (
+            f"the {config.momentum_fade_bars}-bar momentum turning from positive to "
+            "balanced or negative"
+        )
+    return f"the momentum score {config.momentum_drop:g}σ off its peak"
+
+
 def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     """Compact identity of one rule set, standing in for a model name.
 
@@ -428,8 +469,7 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     the one that is left.
 
     The managed exit is written only while switched on -- the stop when it has
-    a distance, the take and its runner threshold when `momentum_drop` is set
-    -- so a config with both off signs exactly as a run recorded before the
+    a distance, the take and its runner threshold when the take is on -- so a config with both off signs exactly as a run recorded before the
     exit existed, and `take_fraction` never splits two runs that cannot differ.
 
     The stop is written in the units it was configured in: `E-0.5G` is half the
@@ -454,9 +494,18 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         exits += f",stop=E-{c.stop_gain_fraction:g}G"
     elif c.stop_k:
         exits += f",stop=E-{c.stop_k:g}A"
-    if c.momentum_drop:
+    # The take is signed in the form it was configured in, like the stop:
+    # `@fade15b` is the positive-to-balanced turn over 15 bars, `@mom-1` the
+    # legacy 1σ fall from the peak a stored record keeps.
+    if c.momentum_fade_bars:
+        take = f"fade{c.momentum_fade_bars}b"
+    elif c.momentum_drop:
+        take = f"mom-{c.momentum_drop:g}"
+    else:
+        take = ""
+    if take:
         exits += (
-            f",take={c.take_fraction * 100:g}%@mom-{c.momentum_drop:g},"
+            f",take={c.take_fraction * 100:g}%@{take},"
             f"runner>={c.hold_min_gain_k:g}{unit}"
         )
     if c.min_win_k:
@@ -745,7 +794,7 @@ class DayRangeTrader(BaseTrader):
     and the flatten there is a stop under the fill, a momentum take that banks
     most of a fading gain short of the target, and a breakeven on the runner
     that take leaves. That half is not the notebook's and has not been measured
-    against it; a stop and `momentum_drop` of 0 switch it off and give notebook
+    against it; a stop and a momentum take of 0 switch it off and give notebook
     05's rule back.
 
     Against the notebook
@@ -1277,7 +1326,7 @@ class DayRangeTrader(BaseTrader):
         target because a bar wide enough to touch both says nothing about which
         came first, so it is read the careful way.
 
-        With the stop and `momentum_drop` both 0 only the target and the
+        With the stop and the momentum take both 0 only the target and the
         flatten are left, which is notebook 05's rule as specified.
         """
         config, plan = self.config, self.plan
@@ -1348,10 +1397,14 @@ class DayRangeTrader(BaseTrader):
     ) -> "tuple[float, str, str] | None":
         """Bank gains short of the target when the move carrying them fades.
 
-        Fires when the position is in profit and the momentum score has fallen
-        `momentum_drop` sigmas from its best since the entry bar. The peak is
-        taken over this position's bars only: a morning surge before the entry
-        is not a move this trade was riding.
+        Fires when the position is in profit and the total momentum over the
+        last `momentum_fade_bars` bars has turned from positive to balanced or
+        negative: it was positive on some bar since the entry and is not any
+        more (`_fade_turned`). "Since the entry" because a morning surge before
+        the fill is not a move this trade was riding -- and a dip buy usually
+        fills with momentum negative, so the take waits for the bounce to carry
+        it positive and then for that to give out. A legacy record's
+        `momentum_drop` reads the older rule instead (`_fade_dropped`).
 
         What it sells depends on how much the forecast still promises. If the
         sell level is `hold_min_gain_k` level units or more above the fill,
@@ -1360,35 +1413,34 @@ class DayRangeTrader(BaseTrader):
         target is too close to be worth the wait and everything goes. Once per
         position: a runner is never trimmed again.
 
-        The score is recomputed over the session on each call rather than
-        tracked bar by bar, so a cycle that missed a bar still sees its peak.
+        The momentum is recomputed over the session on each call rather than
+        tracked bar by bar, so a cycle that missed a bar still sees the turn.
         Only reached with a profitable, untrimmed position and the rule on.
         """
         config, plan = self.config, self.plan
         entry = self.entry or {}
         if (
-            not config.momentum_drop
+            not config.has_take
             or entry.get("runner")
             or not entry_price
             or price <= entry_price
         ):
             return None
 
-        mom = momentum_regime.compute_momentum(frame)["mom"]
-        now = float(mom.iloc[-1])
-        since = mom[frame.index >= entry.get("ts", frame.index[-1])].dropna()
-        if math.isnan(now) or not len(since):
-            return None
-        peak = float(since.max())
-        if peak - now < config.momentum_drop:
+        since = entry.get("ts", frame.index[-1])
+        why = (
+            self._fade_turned(frame, since)
+            if config.momentum_fade_bars
+            else self._fade_dropped(frame, since)
+        )
+        if why is None:
             return None
 
         unit = level_unit(config, plan)
         left = plan["sell_level"] - entry_price
         pnl_pct = (price / entry_price - 1) * 100
         fade = (
-            f"Momentum take: the momentum score has fallen from {peak:+.2f}σ, its best since "
-            f"the entry, to {now:+.2f}σ ({config.momentum_drop:g}σ is the trigger), with the "
+            f"Momentum take: {why}, with the "
             f"price at ${price:,.2f} — above the ${entry_price:,.2f} fill but short of the "
             f"${plan['sell_level']:,.2f} sell level"
         )
@@ -1415,6 +1467,50 @@ class DayRangeTrader(BaseTrader):
             f"{position - quantity:g} ride on to it or the closing flatten, and are sold if "
             "the price comes back to the fill."
         ), self.EXIT_TAKE
+
+    def _fade_turned(self, frame, since) -> "str | None":
+        """Whether the `momentum_fade_bars`-bar momentum has turned from
+        positive to balanced or negative since `since` -- and if so, how to say so.
+
+        "Total momentum over the last N bars" is the N-bar log return in units
+        of its own random-walk scale, smoothed (`compute_momentum` at `horizon
+        = N`), and positive / balanced / negative are the Schmitt-trigger regime
+        over it (`assign_regimes`) -- the same definitions the chart's momentum
+        panel draws with, at a look-back of the user's choosing. The hysteresis
+        is what keeps a score hovering at the line from counting as a turn: it
+        becomes positive above 0.9σ and stops being positive under 0.4σ.
+        """
+        n = self.config.momentum_fade_bars
+        scored = momentum_regime.add_momentum_regimes(frame, {"horizon": n})
+        now = scored.iloc[-1]
+        after = scored[scored.index >= since]
+        if not len(after) or math.isnan(float(now["mom"])):
+            return None
+        if now["regime"] == 1 or not (after["regime"] == 1).any():
+            return None
+        peak = float(after["mom"].max())
+        return (
+            f"the {n}-bar momentum was positive since the entry (up to {peak:+.2f}σ) and "
+            f"has turned {momentum_regime.regime_name(int(now['regime']))} at "
+            f"{float(now['mom']):+.2f}σ"
+        )
+
+    def _fade_dropped(self, frame, since) -> "str | None":
+        """The legacy take a stored record replays: the smoothed 15-bar score
+        fallen `momentum_drop` sigmas from its best since `since`."""
+        drop = self.config.momentum_drop
+        mom = momentum_regime.compute_momentum(frame)["mom"]
+        now = float(mom.iloc[-1])
+        after = mom[frame.index >= since].dropna()
+        if math.isnan(now) or not len(after):
+            return None
+        peak = float(after.max())
+        if peak - now < drop:
+            return None
+        return (
+            f"the momentum score has fallen from {peak:+.2f}σ, its best since the entry, "
+            f"to {now:+.2f}σ ({drop:g}σ is the trigger)"
+        )
 
     def _risk(self) -> float:
         """How far under the fill this position's stop sits, in dollars.
@@ -1459,10 +1555,8 @@ class DayRangeTrader(BaseTrader):
             exits.append(
                 f"a stop {stop_phrase(config)} (${risk:,.2f}) under the fill"
             )
-        if config.momentum_drop:
-            exits.append(
-                f"a momentum take if the move fades {config.momentum_drop:g}σ short of it"
-            )
+        if config.has_take:
+            exits.append(f"a momentum take if the move fades short of it ({fade_phrase(config)})")
         return (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
             f"${plan['buy_level']:,.2f} buy level — {config.buy_k:g} × the "
@@ -1735,10 +1829,10 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             f"a stop {stop_phrase(config)} under the fill, after which it buys nothing "
             "more that day"
         )
-    if config.momentum_drop:
+    if config.has_take:
         exits.append(
-            f"a {config.take_fraction:.0%} take once momentum fades "
-            f"{config.momentum_drop:g}σ in profit, the rest kept for the sell level only if "
+            f"a {config.take_fraction:.0%} take in profit once momentum fades "
+            f"({fade_phrase(config)}), the rest kept for the sell level only if "
             f"it is {config.hold_min_gain_k:g} × {config.unit_phrase} or more above the fill and sold if the "
             "price comes back to it"
         )
