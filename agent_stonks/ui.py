@@ -2092,186 +2092,174 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
     prefix="apple_trader",
     unavailable_suffix="not streamed",
     instrument_help=(
-        "The one symbol this run trades. Only symbols a saved model covers are "
-        "listed — every rule here is a model's output, so an instrument without "
-        "one has no strategy to run. It also has to be streamed: add it to the "
-        "symbols in the sidebar before starting."
+        "The one symbol this run trades.\n\n"
+        "- Only symbols a saved model covers are listed — without a model there is "
+        "no strategy to run.\n"
+        "- It must also be streamed: add it to the sidebar symbols before starting."
     ),
     model_help=(
-        "Which saved model the agent runs on — and, with it, which rules. "
-        "Only the models fitted on the instrument above are listed."
+        "Which saved model the agent runs on — and, with it, which rules. Only the "
+        "models fitted on the instrument above are listed."
     ),
-    intro={
+    sections={
         "dayrange": (
-            "At 9:35 the model forecasts where today's high **H** will land, and the two "
-            "levels below are set from it — a buy that fills on a dip "
-            "well under where the day is expected to top out, and a sell just beneath it. "
-            "Both are distances in whichever unit is chosen below — the trailing "
-            "14-day ADR, so they scale with how wide the sessions have been, or the "
-            "forecast's own predicted range, so they scale with how wide the model "
-            "thinks *today* will be."
+            "At 9:35 the model forecasts where today's high **H** will land, and two "
+            "levels are set below it.\n\n"
+            "- **Buy** — rests well under H, so it fills on a dip.\n"
+            "- **Sell** — rests just beneath H.\n"
+            "- **Unit** — both distances are counted in the trailing 14-day ADR (they "
+            "scale with how wide recent sessions were) or in the forecast's own "
+            "predicted range (they scale with how wide the model thinks *today* will be)."
         ),
         "dayrange_breach": (
-            "**H** is a forecast, and the day can trade straight through it. What happens "
-            "then is a choice, and it moves both levels above: they are rebuilt from the "
-            "predicted high every time it moves, live, including for a position that is "
-            "already open."
-        ),
-        "dayrange_breaker": (
-            "And when to stop for the day. A round trip that barely paid is evidence the "
-            "setup was not there this session — the forecast said the day would be wide "
-            "enough for the dip to be worth buying, and the trade says otherwise."
+            "**H** is a forecast, and the day can trade straight through it.\n\n"
+            "- What happens then is chosen below.\n"
+            "- Both levels are rebuilt from the predicted high every time it moves — "
+            "live, including under a position that is already open."
         ),
         "dayrange_exits": (
-            "How a position gets out before the sell level. Everything here is measured "
-            "from the fill: a stop underneath it, written as a share of what the trade is "
-            "playing for rather than as a distance of its own; a partial take when momentum "
-            "fades while the trade is in profit; and a runner kept for the sell level only "
-            "when that is still far enough away — sold if the price comes back to the fill. "
-            "None of this is in the notebook's results."
+            "How a position gets out before the sell level. Everything is measured from "
+            "the fill.\n\n"
+            "- **Stop** — under the fill, as a share of what the trade is playing for.\n"
+            "- **Momentum take** — part of the position, when momentum fades while the "
+            "trade is in profit.\n"
+            "- **Runner** — the rest, kept for the sell level only if that is still far "
+            "enough away; sold if the price comes back to the fill.\n\n"
+            "A trade closes at the sell level, the stop, a momentum take (its runner at "
+            "the sell level or back at the fill), or the closing flatten. None of this is "
+            "in the notebook's results."
         ),
-    },
-    outro={
-        "model_dayrange": (
-            ":material/horizontal_rule: The predicted high, one number for the whole session "
-            "— the notebook's rule, and what the buy and sell distances were swept against."
-        ),
-        "model_dayrange_intraday": (
-            ":material/ssid_chart: The levels rest under the top of the intraday band: it *is* the "
-            "predicted high at 09:30, pulls in to roughly a fifth of the distance to the "
-            "open by midday, and opens back up into the last half hour. Both levels move "
-            "with it, so an entry needs a deeper dip as the day quiets — and the **target "
-            "comes down too**, which means a position opened in the morning can be closed "
-            "by a sell level that fell to it rather than by a price that rose to it. That "
-            "is the model's claim (the day is no longer moving enough to reach the "
-            "morning's target) rather than a bug, but it is a different strategy from the "
-            "flat model, and it has not been swept. Note too that the band is anchored on "
-            "the session's **open**, not on the price: a day that trends well away from "
-            "the opening print leaves the levels behind, so the stop below matters more "
-            "here than it does above."
-        ),
-        "dayrange_breach_off": (
-            ":material/lock: The 9:35 forecast stands whatever the tape does — the notebook's "
-            "rule, and the one the buy and sell distances above were swept under."
-        ),
-        "dayrange_breach_extreme": (
-            ":material/trending_up: On a bar that prints outside the range, the breached side "
-            "moves to the session's own high (or low) and the levels follow. It never leads "
-            "the tape, so the level arrives one move late — but it also cannot claim a high "
-            "the day has not already made."
-        ),
-        "dayrange_breach_brownian": (
-            ":material/show_chart: Past the extreme, by the distance a driftless random walk "
-            "with this ADR's volatility would still be expected to cover before the close — "
-            "half an ADR with the whole day left, shrinking with the square root of the time "
-            "remaining, nothing at the bell. It leads the tape rather than following it, and "
-            "pays for that with a sell level the day may never come back up to."
-        ),
-        "dayrange": (
-            ":material/info: The model runs once. A trade closes at the sell level, the "
-            "stop, a momentum take (its runner at the sell level or back at the fill), or the "
-            "closing flatten. Two things end the session's buying: a stop — the day has not "
-            "gone the way the forecast said — and a trade that closed for too little to be "
-            "worth repeating."
+        "dayrange_breaker": (
+            "When to stop buying for the day. Two things end it:\n\n"
+            "- **A stop** — the day has not gone the way the forecast said.\n"
+            "- **A trade that barely paid** — the forecast said the day was wide enough "
+            "for the dip to be worth buying, and the trade says otherwise."
         ),
     },
     help={
+        "model_dayrange": (
+            "The levels hang off the predicted high — one number for the whole session. "
+            "The notebook's rule, and what the buy and sell distances were swept against."
+        ),
+        "model_dayrange_intraday": (
+            "The levels rest under the top of the intraday band.\n\n"
+            "- The band *is* the predicted high at 09:30, pulls in to about a fifth of "
+            "the distance to the open by midday, and opens back up into the last half hour.\n"
+            "- Both levels move with it, so an entry needs a deeper dip as the day quiets.\n"
+            "- **The target comes down too** — a morning position can be closed by a sell "
+            "level that fell to it. That is the model's claim, not a bug, but it is a "
+            "different strategy from the flat model and has not been swept.\n"
+            "- The band is anchored on the session's **open**, not the price: a day that "
+            "trends away from the open leaves the levels behind, so the stop matters more here."
+        ),
         "buy_k": (
-            "How far under the predicted high the entry rests. {ticker} starts at "
-            "{buy_k}: re-running notebook 05's grid over every {ticker} session with a "
-            "forecast, it is the middle of the most profitable stretch among settings "
-            "that traded on at least half the days. Shallower entries fill on more days; "
-            "deeper ones pay a better price on fewer. It was picked on the same sessions "
-            "it was scored on, so it is the best-evidenced starting point, not an edge."
+            "How far under the predicted high the entry rests.\n\n"
+            "- {ticker} starts at **{buy_k}** — the middle of the most profitable stretch "
+            "of notebook 05's grid, re-run over every {ticker} session with a forecast, "
+            "among settings that traded on at least half the days.\n"
+            "- Shallower entries fill on more days; deeper ones pay a better price on fewer.\n"
+            "- It was picked on the sessions it was scored on: the best-evidenced starting "
+            "point, not an edge."
         ),
         "sell_k": (
-            "Where the exit rests, as a distance below the same predicted high — {sell_k} "
-            "for {ticker}, from the same sweep. It must sit above the buy level, i.e. be "
-            "the smaller number. Anything the day never reaches is held to the closing "
-            "flatten."
+            "Where the exit rests, below the same predicted high.\n\n"
+            "- {ticker} starts at **{sell_k}**, from the same sweep.\n"
+            "- It must be the smaller of the two numbers — the higher price.\n"
+            "- A day that never reaches it is held to the closing flatten."
         ),
         "level_unit": (
-            "What one unit of `buy` and `sell` is worth in dollars. The ADR is this "
-            "symbol's trailing 14-day average daily range — what its day has been worth "
-            "lately, fixed for the session and no part of the model's output. The "
-            "predicted range is `predicted high − predicted low` from the same forecast "
-            "the levels hang off, so one model decides both where they sit and how far "
-            "apart they are, and a day the model calls wide gets wider distances. Note "
-            "that with an intraday update switched on the predicted range *widens* as "
-            "the day breaches its forecast, so the two levels spread apart over such a "
-            "session; a stop is still fixed in dollars at the fill. The shipped "
-            "distances were swept in ADRs."
-        ),
-        "contain_range": (
-            "The 9:35 forecast is already clipped so it cannot come in below what the "
-            "first five minutes printed. This keeps that true for the rest of the day: "
-            "if the session trades above the predicted high or below the predicted low, "
-            "the forecast is widened to hold it. It never leads the tape — it only stops "
-            "the levels being measured from a price the day has already gone past. "
-            "Note that *move to the extreme* already does this, so with it on that policy "
-            "and *hold the forecast* become the same rule."
-        ),
-        "breach_exit": (
-            "The position is a bet that the day tops out near the predicted high. With "
-            "this on, a bar that trades clean through that high closes it at market — the "
-            "tape has settled the bet, at a better price than the sell level was going to "
-            "pay. With it off the breach instead moves the forecast, and under *lead the "
-            "tape* that carries the sell level past the bar that breached, so the position "
-            "rides on and gives the gain back if the day turns. Measured against the high "
-            "as it stood when the bar opened, and checked after the sell level, so a "
-            "breach that also reached the target is logged as the target exit it is."
+            "What one unit of `buy` and `sell` is worth in dollars.\n\n"
+            "- **ADR** — this symbol's trailing 14-day average daily range. Fixed for "
+            "the session, and no part of the model's output.\n"
+            "- **Predicted range** — `predicted high − predicted low` from the same "
+            "forecast, so a day the model calls wide gets wider distances. With an "
+            "intraday update on it *widens* as the day breaches its forecast, spreading "
+            "the levels apart; a stop stays fixed in dollars at the fill.\n\n"
+            "The shipped distances were swept in ADRs — under the predicted range they "
+            "are starting points only."
         ),
         "breach_update": (
-            "The model cannot be re-run intraday — its opening features are a fixed "
-            "five-minute window — but a session that has traded *through* the predicted high "
-            "has already disproved it, and the buy and sell levels hang off that number. "
-            "This picks what to replace it with. Only the breached side moves, and only "
-            "outward: the high never comes back down during a session. Neither of the two "
-            "updating policies has been swept, and the buy/sell distances above were picked "
-            "with the forecast held fixed all day."
+            "What replaces the predicted high once the session trades through it. The "
+            "model cannot be re-run intraday — its features are a fixed five-minute window.\n\n"
+            "- **Hold the 9:35 forecast** — it stands whatever the tape does. The "
+            "notebook's rule, and the one the distances were swept under.\n"
+            "- **Move to the extreme so far** — the breached side moves to the session's "
+            "own high (or low). It never leads the tape: one move late, but it never "
+            "claims a high the day has not made.\n"
+            "- **Brownian extension** — past the extreme, by what a driftless random walk "
+            "with this ADR's volatility would still cover before the close: half an ADR "
+            "with the whole day left, nothing at the bell. It leads the tape, and pays "
+            "for that with a sell level the day may never come back up to.\n\n"
+            "Only the breached side moves, and only outward. Neither updating policy has "
+            "been swept."
         ),
-        "min_win_k": (
-            "{ticker} starts at {min_win_k}, per instrument because the number only means "
-            "something against that symbol's own buy/sell pair. "
-            "Once a trade has closed for no more than this many ADRs **per share**, the "
-            "agent buys nothing else today — same unit as the levels and the stop, so the "
-            "three can be read against each other. Measured over the whole position, so a "
-            "momentum take and the runner it left are judged together as one trade. A stop "
-            "already ends the session on its own; this catches the trades that were not "
-            "losses but were not worth the risk either, including a runner sold back at "
-            "the fill. 0 switches it off and lets the levels re-arm all day."
+        "contain_range": (
+            "Keeps the forecast wide enough to hold what the session has printed.\n\n"
+            "- The 9:35 forecast is already clipped to the first five minutes; this keeps "
+            "that true all day.\n"
+            "- If the session trades above the predicted high or below the predicted low, "
+            "the forecast widens to hold it.\n"
+            "- It never leads the tape — it only stops the levels being measured from a "
+            "price the day has already passed.\n\n"
+            "With it on, *hold the 9:35 forecast* and *move to the extreme* become the "
+            "same rule; only *Brownian extension* still differs."
         ),
+        "breach_exit": (
+            "The position is a bet that the day tops out near the predicted high.\n\n"
+            "- **On** — a bar that trades clean through that high closes the position at "
+            "market: the bet is settled, at a better price than the sell level.\n"
+            "- **Off** — the breach moves the forecast instead. Under *Brownian "
+            "extension* that carries the sell level past the bar, so the position rides "
+            "on and can give the gain back.\n\n"
+            "Measured against the high as it stood when the bar opened, and checked after "
+            "the sell level — a breach that also reached the target logs as the target."
+        ),
+        "position_pct": "The share of available cash each entry spends.",
         "stop_gain_fraction": (
-            "Sells everything when a bar's low reaches this share of the **predicted gain** "
-            "under the fill price. The predicted gain is `buy − sell` above — the distance "
-            "between the two levels, and the most a target exit can pay — so {stop_gain_fraction} "
-            "risks $0.50 for every $1.00 this trade is playing for, whatever the instrument "
-            "and whatever the levels are set to. The line under the box says what that "
-            "comes to in ADRs for the pair currently set. After a stop the agent buys "
-            "nothing more that day, because the session has not gone the way the forecast "
-            "said. 0 switches the stop off, leaving the position to the sell level, a "
-            "momentum take or the flatten."
+            "Sells everything when a bar's low reaches this share of the **predicted "
+            "gain** under the fill.\n\n"
+            "- Predicted gain = `buy − sell`: the gap between the levels, and the most a "
+            "target exit can pay.\n"
+            "- {stop_gain_fraction} risks \\$0.50 for every \\$1.00 the trade plays for — "
+            "on any instrument, at any levels.\n"
+            "- After a stop nothing more is bought that day.\n"
+            "- 0 switches the stop off."
         ),
         "momentum_fade_bars": (
-            "Gains are taken short of the sell level, with the position in profit, once "
-            "the total momentum over the last this-many bars — the price's move over them "
-            "in sigmas of its own noise — has been positive since the entry and turns "
-            "balanced or negative. Positive starts above 0.9σ and ends under 0.4σ, so a "
-            "score hovering at the line is not a turn. Fewer bars reacts to short "
-            "wobbles; more waits for the whole move to give out. 0 switches the take "
-            "off, and with it the runner."
+            "Takes gains short of the sell level when momentum gives out.\n\n"
+            "- **Momentum** — the price's move over the last this-many bars, in sigmas "
+            "of its own noise.\n"
+            "- **Fires** when the position is in profit and momentum, having been "
+            "positive since the entry, turns balanced or negative.\n"
+            "- Positive starts above 0.9σ and ends under 0.4σ, so a score hovering at "
+            "the line is not a turn.\n"
+            "- Fewer bars react to short wobbles; more wait for the whole move to give out.\n"
+            "- 0 switches the take off, and with it the runner."
         ),
         "take_fraction": (
             "How much of the position a momentum take sells when the rest is kept as a "
-            "runner. Whole shares, rounded down, and at least one."
+            "runner.\n\n"
+            "- Whole shares, rounded down, and at least one."
         ),
         "hold_min_gain_k": (
             "Keep a runner only if the sell level is still this many ADRs above the fill; "
-            "otherwise a momentum take sells everything. The fill is at or above the buy "
-            "level, so the gap is at most buy − sell — 0.15 on AAPL's default pair, 0.60 on "
-            "GOOGL's — which means 0.30 keeps a runner on GOOGL and INTC and never on AAPL. "
-            "A runner is sold at the sell level, at the flatten, or if the price comes back "
-            "to the fill."
+            "otherwise a momentum take sells everything.\n\n"
+            "- The gap is at most `buy − sell`: 0.15 on AAPL's default pair, 0.60 on "
+            "GOOGL's — so 0.30 keeps a runner on GOOGL and INTC, never on AAPL.\n"
+            "- A runner is sold at the sell level, at the flatten, or back at the fill."
+        ),
+        "min_win_k": (
+            "After a trade closes for no more than this many ADRs **per share**, nothing "
+            "else is bought today.\n\n"
+            "- {ticker} starts at **{min_win_k}** — per instrument, since it only means "
+            "something against that symbol's own buy/sell pair.\n"
+            "- Judged over the whole position: a momentum take and its runner count as "
+            "one trade.\n"
+            "- Catches trades that were not losses but were not worth the risk either, "
+            "including a runner sold back at the fill.\n"
+            "- At or above `buy − sell`, every trade stands the session down — a "
+            "one-trade-a-day rule.\n"
+            "- 0 switches it off and lets the levels re-arm all day."
         ),
     },
 )

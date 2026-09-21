@@ -1612,154 +1612,167 @@ def _render_apple2_params(symbols: list[str], prefix: str) -> AppleTrader2Config
 _APPLE_TRADER_COPY_FIELDS = dict(
     unavailable_suffix="not in the datasets",
     instrument_help=(
-        "The one symbol the run trades. Only symbols a saved model covers are "
-        "listed — the models are the strategy here, so the instrument and the "
-        "model constrain each other. The same rules over two symbols are two "
-        "configurations in Results, never one averaged row."
+        "The one symbol the run trades.\n\n"
+        "- Only symbols a saved model covers are listed — the models are the strategy "
+        "here, so the instrument and the model constrain each other.\n"
+        "- The same rules over two symbols are two configurations in Results, never "
+        "one averaged row."
     ),
     model_help=(
         "Which saved model the run trades on, and with it which rules. Only the "
         "models fitted on the instrument above are listed."
     ),
-    intro={
+    sections={
         "dayrange": (
-            "Two knobs, and they are the whole strategy. At 9:35 the model forecasts where "
-            "today's high **H** will land; the buy rests `buy × ADR` below it and the sell "
-            "`sell × ADR` below it, with ADR the trailing 14-day average daily range in "
-            "dollars. Each distinct pair is its own configuration in Results, so sweeping "
-            "them here is the intended use — the defaults are each instrument's best "
-            "plateau over the notebook's sessions, which is still only a month or two of days."
+            "Two knobs, and they are the whole strategy.\n\n"
+            "- At 9:35 the model forecasts where today's high **H** will land.\n"
+            "- The buy rests `buy × unit` below it, the sell `sell × unit` below it.\n"
+            "- Each distinct pair is its own configuration in Results — sweeping them is "
+            "the intended use.\n"
+            "- The defaults are each instrument's best plateau over the notebook's "
+            "sessions: still only a month or two of days.\n\n"
+            "No entry mode and no probability — neither means anything to a forecast of "
+            "the day's range, and the signature leaves them out so a day-range result is "
+            "never filed beside a momentum one."
         ),
         "dayrange_breach": (
-            "What a session that trades outside the forecast does to it. Each choice is its "
-            "own configuration in Results, so the honest way to use this is to queue the "
-            "same levels three times and let the datasets say whether either update is worth "
-            "anything — neither has ever been swept."
-        ),
-        "dayrange_breaker": (
-            "And when to stop for the day. Its own axis on the Tuning tab, and worth one: "
-            "it changes how many trades a session takes at all, which is the number most of "
-            "the others only nudge."
+            "What a session that trades outside the forecast does to it.\n\n"
+            "- Each choice is its own configuration in Results.\n"
+            "- Queue the same levels three times and let the datasets say whether either "
+            "update is worth anything — neither has ever been swept."
         ),
         "dayrange_exits": (
-            "The managed exit, all of it measured from the fill — the stop as a share of "
-            "what the trade is playing for, the runner threshold in the same ADR as the "
-            "levels. Each switched-on knob is part of the signature, so sweeping the stop "
-            "or the fade queues its own configuration; 0 switches the stop or the take off."
+            "The managed exit, all of it measured from the fill.\n\n"
+            "- **Stop** — a share of what the trade is playing for.\n"
+            "- **Runner threshold** — in the same unit as the levels.\n"
+            "- Each switched-on knob is in the signature, so sweeping the stop or the "
+            "fade queues its own configuration.\n"
+            "- 0 switches the stop or the take off. With both off a run files beside the "
+            "records made before the exit existed, which replay that way."
         ),
-    },
-    outro={
-        "model_dayrange": (
-            ":material/horizontal_rule: The predicted high, flat for the session — what "
-            "the shipped buy/sell distances were swept against, and what every stored "
-            "record replays as."
-        ),
-        "model_dayrange_intraday": (
-            ":material/ssid_chart: The levels rest under the top of the intraday band, so the whole "
-            "ladder descends through the morning and rises into the close. Expect fewer "
-            "fills midday and **shorter holds**: the target descends with it, so a "
-            "morning position can be closed by a sell level that came down to it. The "
-            "swept distances are a poor starting point here — they were picked against a "
-            "reference that does not move — so sweep them again on the Tuning tab under "
-            "this setting rather than reading its first result as the strategy's worth. "
-            "It also damps the intraday update below, since the band is a fraction of the "
-            "forecast distance for most of the day: expect the two settings to be much "
-            "less than additive."
-        ),
-        "dayrange_breach_off": (
-            ":material/lock: The 9:35 forecast stands all day. This is what the levels above "
-            "were swept under, and what every record written before this setting existed "
-            "replays as — so a run with it off files beside them."
-        ),
-        "dayrange_breach_extreme": (
-            ":material/trending_up: The breached side moves to the session's own extreme. "
-            "Expect it to trade more days than `off` does: on a day that runs past the "
-            "forecast the buy level chases the high up, which turns sessions that stood aside "
-            "into sessions that entered."
-        ),
-        "dayrange_breach_brownian": (
-            ":material/show_chart: Past the extreme by ADR × √(session left) ÷ 2 — the "
-            "excursion a driftless walk with this ADR's volatility would still be expected "
-            "to make. Wider levels than `extreme` early in the day, converging on it by the "
-            "close; compare the two on the same datasets rather than reasoning about which "
-            "should win."
-        ),
-        "dayrange": (
-            ":material/info: No entry mode and no probability — neither means anything to a "
-            "forecast of the day's range, and the signature leaves them out so a day-range "
-            "result is never filed beside a momentum one. The exit knobs appear in it only "
-            "while switched on, so a run with both off files beside the records made before "
-            "the exit existed, which replay that way."
+        "dayrange_breaker": (
+            "When to stop for the day.\n\n"
+            "- Its own axis on the Tuning tab, and worth one: it changes how many trades "
+            "a session takes at all — the number most of the other knobs only nudge."
         ),
     },
     help={
+        "model_dayrange": (
+            "The predicted high, flat for the session — what the shipped buy/sell "
+            "distances were swept against, and what every stored record replays as."
+        ),
+        "model_dayrange_intraday": (
+            "The levels rest under the top of the intraday band, so the whole ladder "
+            "descends through the morning and rises into the close.\n\n"
+            "- Expect fewer fills midday and **shorter holds** — the target descends too, "
+            "so a morning position can be closed by a sell level that came down to it.\n"
+            "- The swept distances are a poor starting point here (they were picked "
+            "against a reference that does not move): sweep them again on the Tuning tab "
+            "before reading a first result as the strategy's worth.\n"
+            "- It damps the intraday update, since the band is a fraction of the forecast "
+            "distance most of the day — expect the two settings to be much less than additive."
+        ),
         "buy_k": (
-            "Starts at {buy_k} on {ticker}. Notebook 05 specified 0.75 and only swept "
-            "it over five sessions; this default comes from the same 195-cell grid "
-            "swept over every session with a forecast, keeping cells that trade on at "
-            "least half of them and taking the middle of the best 3×3 plateau rather "
-            "than its sharpest cell. It is still in-sample, and how well it holds up "
-            "differs by instrument — `config.APPLE_TRADER_DAYRANGE_LEVELS` records each "
-            "ticker's two halves."
+            "Starts at **{buy_k}** on {ticker}.\n\n"
+            "- Notebook 05 specified 0.75 and swept it over only five sessions.\n"
+            "- This default comes from the same 195-cell grid over every session with a "
+            "forecast: cells that trade on at least half of them, taking the middle of the "
+            "best 3×3 plateau rather than its sharpest cell.\n"
+            "- Still in-sample, and how well it holds up differs by instrument — "
+            "`config.APPLE_TRADER_DAYRANGE_LEVELS` records each ticker's two halves."
         ),
         "sell_k": (
-            "Where the exit rests below the same predicted high — {sell_k} on {ticker} "
-            "by the same sweep, and the smaller of the two numbers, since it is the "
-            "higher price. A day that never reaches it is held to the closing flatten."
+            "Where the exit rests below the same predicted high.\n\n"
+            "- **{sell_k}** on {ticker}, from the same sweep.\n"
+            "- The smaller of the two numbers, since it is the higher price.\n"
+            "- A day that never reaches it is held to the closing flatten."
         ),
         "level_unit": (
-            "The yardstick `buy` and `sell` are counted in: this symbol's trailing "
-            "14-day average daily range, or `predicted high − predicted low` from the "
-            "forecast itself. Worth sweeping as a pair with the two distances rather "
-            "than on its own — a k means a different number of dollars under each, so "
-            "the stored pairs are not comparable across it. It is in the signature "
-            "either way (`A` or `R` on every k), so the two queue as two configurations. "
-            "Everything read against `buy − sell` — the stop as a fraction of the "
-            "predicted gain, the runner threshold, the circuit breaker — follows it."
-        ),
-        "min_win_k": (
-            "{ticker} starts at {min_win_k} — per instrument, since it is only readable "
-            "against that symbol's own `buy − sell`. "
-            "The session circuit breaker: after a trade closes for no more than this many "
-            "ADRs a share, the run buys nothing else that day. Judged over the whole "
-            "position, so a momentum take and its runner count as one trade. Compare it "
-            "against `buy − sell` above — at or over that, every completed trade stands the "
-            "session down, which is a different experiment (one trade a day) from the one "
-            "this reads like. In the signature while it is on, and sweepable."
-        ),
-        "stop_gain_fraction": (
-            "Starts at {stop_gain_fraction}. The stop is a share of the **predicted gain** "
-            "— `buy − sell` above, what a target exit pays — rather than a distance of its "
-            "own, so 0.5 risks $0.50 for every $1.00 the trade is playing for on every "
-            "instrument. Written in ADRs it would not travel: 0.20 ADR was a third of "
-            "AAPL's target and a third of GOOGL's, which are different bets. Sweep it here "
-            "and it moves with the levels rather than against them — a grid over `buy − "
-            "sell` and this one is a grid over reward and risk:reward, not over two "
-            "distances that happen to interact. In the signature while it is on, as "
-            "`stop=E-0.5G`; a record from before this existed carries `stop=E-0.2A` and "
-            "replays in its own units. 0 switches the stop off."
-        ),
-        "contain_range": (
-            "Whether the forecast is always widened to hold what the session has printed "
-            "— `apply_open_constraint`'s 9:35 clip, kept true all day. In the signature "
-            "as `contain` when on, so it queues as its own configuration. Worth pairing "
-            "with the breach policy rather than sweeping alone: `extreme` already "
-            "satisfies it, so with it on `off` and `extreme` produce identical ledgers "
-            "and only `brownian` still differs."
-        ),
-        "breach_exit": (
-            "Whether a bar through the predicted high closes an open position instead of "
-            "moving the forecast. In the signature as `breach_exit` when on. Under `off` "
-            "and `extreme` the sell level is reached on the same bar anyway, so this only "
-            "changes `brownian` ledgers — where it is the difference between banking a "
-            "settled bet and riding on against a target that moved out of the bar's way."
+            "The yardstick `buy` and `sell` are counted in.\n\n"
+            "- **ADR** — this symbol's trailing 14-day average daily range.\n"
+            "- **Predicted range** — `predicted high − predicted low` from the forecast itself.\n"
+            "- Sweep it as a pair with the two distances: a k is a different number of "
+            "dollars under each, so stored pairs are not comparable across it.\n"
+            "- In the signature either way (`A` or `R` on every k).\n"
+            "- Everything read against `buy − sell` — the stop, the runner threshold, the "
+            "circuit breaker — follows it.\n\n"
+            "The shipped distances were swept in ADRs."
         ),
         "breach_update": (
             "Whether the predicted high is held all session or moved when the tape trades "
-            "through it, with both levels rebuilt from it each time it does. It is in the "
-            "signature unless it is off, so the three choices queue as three configurations "
-            "over one dataset — which is the only way to find out what it is worth, since "
-            "the levels above were swept with the forecast fixed."
+            "through it — both levels are rebuilt from it each time it moves.\n\n"
+            "- **Hold the 9:35 forecast** — it stands all day. What the levels were swept "
+            "under, and what every record from before this setting replays as.\n"
+            "- **Move to the extreme so far** — the breached side moves to the session's "
+            "own extreme. Expect more trading days than holding: the buy level chases the "
+            "high up.\n"
+            "- **Brownian extension** — past the extreme by ADR × √(session left) ÷ 2. "
+            "Wider than the extreme early in the day, converging on it by the close.\n\n"
+            "In the signature unless held, so the three queue as three configurations — "
+            "the only way to find out what it is worth, since the levels were swept with "
+            "the forecast fixed."
+        ),
+        "contain_range": (
+            "Whether the forecast is always widened to hold what the session has printed "
+            "— `apply_open_constraint`'s 9:35 clip, kept true all day.\n\n"
+            "- In the signature as `contain` when on.\n"
+            "- Pair it with the breach policy rather than sweeping it alone: moving to the "
+            "extreme already satisfies it, so with it on *hold* and *extreme* give "
+            "identical ledgers — only *Brownian* still differs."
+        ),
+        "breach_exit": (
+            "Whether a bar through the predicted high closes an open position instead of "
+            "moving the forecast.\n\n"
+            "- In the signature as `breach_exit` when on.\n"
+            "- Under *hold* and *extreme* the sell level is reached on the same bar anyway, "
+            "so this only changes *Brownian* ledgers — banking a settled bet versus riding "
+            "on against a target that moved out of the bar's way."
+        ),
+        "stop_gain_fraction": (
+            "Starts at **{stop_gain_fraction}**. A share of the **predicted gain** "
+            "(`buy − sell`, what a target exit pays), not a distance of its own.\n\n"
+            "- 0.5 risks \\$0.50 for every \\$1.00 the trade plays for, on every "
+            "instrument. In ADRs it would not travel: 0.20 ADR was a third of AAPL's "
+            "target and a third of GOOGL's — different bets.\n"
+            "- Swept against `buy − sell` it is a grid over reward and risk:reward, not "
+            "over two distances that happen to interact.\n"
+            "- Signs as `stop=E-0.5G`; a record from before carries `stop=E-0.2A` and "
+            "replays in its own units.\n"
+            "- 0 switches the stop off."
+        ),
+        "momentum_fade_bars": (
+            "The momentum take's look-back, in bars.\n\n"
+            "- Fires in profit once the N-bar momentum, positive since the entry, turns "
+            "balanced or negative.\n"
+            "- Signs as `take=70%@fade15b`; a record from before carries `@mom-1` (a σ "
+            "fall from the peak) and replays that rule.\n"
+            "- Sweepable; 0 switches the take off, and with it the runner."
+        ),
+        "position_pct": (
+            "The share of available cash each entry spends. In the signature as `size=`."
+        ),
+        "take_fraction": (
+            "How much of the position a momentum take sells when a runner is kept.\n\n"
+            "- In the signature only while the take is on.\n"
+            "- Whole shares, rounded down, and at least one."
+        ),
+        "hold_min_gain_k": (
+            "Keep a runner only if the sell level is still this far above the fill; "
+            "otherwise the take sells everything.\n\n"
+            "- The gap is at most `buy − sell`, so on AAPL's default pair 0.30 never "
+            "keeps one.\n"
+            "- In the signature as `runner>=` while the take is on."
+        ),
+        "min_win_k": (
+            "The session circuit breaker: after a trade closes for no more than this many "
+            "ADRs a share, the run buys nothing else that day.\n\n"
+            "- {ticker} starts at **{min_win_k}** — per instrument, since it is only "
+            "readable against that symbol's own `buy − sell`.\n"
+            "- Judged over the whole position: a momentum take and its runner count as "
+            "one trade.\n"
+            "- At or over `buy − sell`, every completed trade stands the session down — a "
+            "different experiment (one trade a day).\n"
+            "- In the signature while it is on, and sweepable."
         ),
     },
 )

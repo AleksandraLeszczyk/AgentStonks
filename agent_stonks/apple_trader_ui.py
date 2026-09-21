@@ -20,7 +20,15 @@ and how a setting lands in Results; the dashboard's says what the setting will
 do to a run that is about to start with real money's worth of paper behind it.
 Flattening those into one voice would lose something both apps were written to
 say, so each passes its own `FormCopy` and this module never invents a sentence
-of its own.
+of its own -- beyond the few that are numbers worked out from the form itself.
+
+Nothing is written into the panel
+---------------------------------
+Every explanation lives behind a `?`: on a widget's own help, or on the small
+section headings that group the knobs. The panel itself is only the controls,
+plus a warning where a combination is legal but almost certainly not what was
+meant. Prose written into the page between the widgets made the form hard to
+scan; in a tooltip it is there for whoever asks.
 """
 from __future__ import annotations
 
@@ -31,9 +39,7 @@ import streamlit as st
 from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
 from .config import (
-    BREACH_EXTREME,
     BREACH_LABELS,
-    BREACH_OFF,
     BREACH_POLICIES,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
@@ -46,10 +52,10 @@ from .config import (
 class FormCopy:
     """One app's half of the form: its widget-key namespace and its wording.
 
-    `help` and `intro` are keyed by field/strategy name rather than being
-    separate attributes so that adding a knob needs no change here -- a missing
-    key renders a knob with no help text, which is a thin form rather than a
-    crash.
+    `help` and `sections` are keyed by name rather than being separate
+    attributes so that adding a knob needs no change here -- a missing key
+    renders a knob (or a heading) with no `?`, which is a thin form rather than
+    a crash.
     """
 
     #: Namespaces every widget key, so both apps can render this in one
@@ -60,10 +66,11 @@ class FormCopy:
     unavailable_suffix: str
     instrument_help: str
     model_help: str
-    #: Leading caption per strategy key, and the trailing note under it.
-    intro: "dict[str, str]" = field(default_factory=dict)
-    outro: "dict[str, str]" = field(default_factory=dict)
-    #: Help text per knob.
+    #: The `?` on each section heading: "dayrange" (the levels),
+    #: "dayrange_breach", "dayrange_exits", "dayrange_breaker".
+    sections: "dict[str, str]" = field(default_factory=dict)
+    #: Help text per knob, and per model as `model_<key>` -- the latter is
+    #: appended to the model picker's own help for the model selected.
     help: "dict[str, str]" = field(default_factory=dict)
 
     def key(self, name: str) -> str:
@@ -79,28 +86,23 @@ def params(symbols: "list[str] | None", copy: FormCopy) -> AppleTraderConfig:
     defaults = AppleTraderConfig()
     ticker = instrument_row(defaults, symbols, copy)
     keys = apple_models.keys_for(ticker)
+    default_key = defaults.model_key if defaults.model_key in keys else keys[0]
+    # Scoped to the instrument: the models on offer change with it, and a
+    # widget holding one that is no longer an option would be a stale
+    # selection rather than a choice.
+    model_widget = f"{copy.prefix}_model_{ticker}"
+    shown = st.session_state.get(model_widget, default_key)
     model_key = str(
         st.selectbox(
             "Model",
             keys,
-            index=keys.index(defaults.model_key) if defaults.model_key in keys else 0,
+            index=keys.index(default_key),
             format_func=model_label,
-            # Scoped to the instrument: the models on offer change with it, and
-            # a widget holding one that is no longer an option would be a stale
-            # selection rather than a choice.
-            key=f"{copy.prefix}_model_{ticker}",
-            help=copy.model_help,
+            key=model_widget,
+            help=model_help(shown if shown in keys else default_key, copy),
         )
     )
-    model = apple_models.get(model_key)
-    bundle = apple_models.load(model.key, ticker)
-    st.caption(model.summary)
-    # What this app has to say about *this* model on top of the registry's own
-    # summary -- what it will do to a run here, in the voice this app uses.
-    # Keyed by model rather than by strategy: the two day-range models share a
-    # rule set and differ only in what the levels are measured below, which is
-    # exactly the thing a reader picking between them needs spelled out.
-    _caption(copy.outro.get(f"model_{model_key}"))
+    bundle = apple_models.load(model_key, ticker)
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
     return dayrange_params(defaults, model_key, ticker, copy)
@@ -129,12 +131,38 @@ def instrument_row(
                 else f"{t} ({copy.unavailable_suffix})"
             ),
             key=copy.key("ticker"),
-            help=copy.instrument_help,
+            help=instrument_help(options, copy),
         )
     )
-    labels = ", ".join(apple_models.get(k).label for k in apple_models.keys_for(ticker))
-    st.caption(f":material/model_training: Models fitted on {ticker}: {labels}.")
     return ticker
+
+
+def instrument_help(options: "list[str]", copy: FormCopy) -> str:
+    """The instrument picker's `?`, ending with which models each symbol has."""
+    fitted = "\n".join(
+        f"- **{t}**: "
+        + ", ".join(apple_models.get(k).label for k in apple_models.keys_for(t))
+        for t in options
+    )
+    return f"{copy.instrument_help}\n\n**Models fitted per instrument**\n\n{fitted}"
+
+
+def model_help(key: str, copy: FormCopy) -> str:
+    """The model picker's `?`: what picking a model means, then the one picked.
+
+    The registry's summary says what the model is; the app's own note, keyed by
+    model rather than by strategy, says what it does to a run here -- the two
+    day-range models share a rule set and differ only in what the levels are
+    measured below, which is exactly what a reader choosing between them needs.
+    The help is built before the widget renders, so it describes the selection
+    the widget is holding: the one on screen.
+    """
+    model = apple_models.get(key)
+    parts = [copy.model_help, f"**{model.label}**", model.summary]
+    note = copy.help.get(f"model_{key}")
+    if note:
+        parts.append(note)
+    return "\n\n".join(p for p in parts if p)
 
 
 def model_label(key: str) -> str:
@@ -151,7 +179,7 @@ def dayrange_params(
     the ticker so that switching instrument re-seeds them with that symbol's
     pair rather than carrying the last symbol's numbers across.
     """
-    _caption(copy.intro.get("dayrange"))
+    section("Levels", copy.sections.get("dayrange"))
     default_buy, default_sell = dayrange_levels(ticker)
     levels = dict(ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}")
     # Before the two distances, because it decides what they are counted in and
@@ -175,6 +203,7 @@ def dayrange_params(
         "Position size (% of cash)",
         min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
         key=copy.key("dayrange_size"),
+        help=copy.help.get("position_pct"),
     )
     # A pair the wrong way round is not a strategy -- it would sell at a price
     # below the one it bought at, on every bar. The config refuses it outright,
@@ -183,17 +212,16 @@ def dayrange_params(
     if sell_k >= buy_k:
         sell_k = round(max(0.0, buy_k - 0.05), 2)
         st.error(
-            "The sell level has to sit *above* the buy level, so its distance below the "
-            f"predicted high must be the smaller of the two — using {sell_k:g} until the "
-            "buy distance is raised."
+            f"The sell distance must be smaller than the buy distance — using "
+            f"{sell_k:g} until the buy distance is raised.",
+            icon=":material/error:",
         )
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     stop_gain_fraction, momentum_fade_bars, take_fraction, hold_min_gain_k = exit_params(
-        defaults, float(buy_k), float(sell_k), copy
+        defaults, float(buy_k), float(sell_k), unit_label, copy
     )
     min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), copy)
-    _caption(copy.outro.get("dayrange"))
     return AppleTraderConfig(
         model_key=model_key,
         ticker=ticker,
@@ -229,7 +257,7 @@ def min_win_param(
     instrument because it only means something against that symbol's own pair,
     so switching symbol must re-seed it rather than carry the last one across.
     """
-    _caption(copy.intro.get("dayrange_breaker"))
+    section("Circuit breaker", copy.sections.get("dayrange_breaker"))
     min_win_k = st.number_input(
         "Stand down after a trade under (× ADR a share)",
         min_value=0.0, max_value=3.0, value=min_win_for(ticker), step=0.05, format="%.2f",
@@ -241,12 +269,10 @@ def min_win_param(
     target_gain = buy_k - sell_k
     if min_win_k and min_win_k >= target_gain:
         st.warning(
-            f"The buy and sell levels are {target_gain:.2f} × ADR apart, so a trade that "
-            f"runs all the way to the sell level nets at most that — under the "
-            f"{min_win_k:.2f} × ADR above. Every completed trade will stand the session "
-            "down, whatever it made: this is a one-trade-a-day rule rather than a circuit "
-            f"breaker. Set it below {target_gain:.2f} to have it fire only on the weak ones.",
-            icon=":material/info:",
+            f"At or above the {target_gain:.2f} the levels are apart, every trade stands "
+            f"the session down — one trade a day. Set it below {target_gain:.2f} to stop "
+            "only after weak trades.",
+            icon=":material/warning:",
         )
     return float(min_win_k)
 
@@ -289,11 +315,6 @@ def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
             help=copy.help.get("level_unit"),
         )
     )
-    if choice == UNIT_PRED_RANGE:
-        st.caption(
-            ":material/info: The shipped distances were swept in ADRs, so under the "
-            "predicted range they are starting points rather than swept ones."
-        )
     return choice
 
 
@@ -304,7 +325,7 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
     swept per instrument, so switching symbol keeps the choice — the same reason
     the exit knobs below are not keyed either.
     """
-    _caption(copy.intro.get("dayrange_breach"))
+    section("Forecast breach", copy.sections.get("dayrange_breach"))
     options = list(BREACH_POLICIES)
     choice = st.selectbox(
         "If the session trades outside the forecast",
@@ -314,7 +335,6 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
         key=copy.key("breach_update"),
         help=copy.help.get("breach_update"),
     )
-    _caption(copy.outro.get(f"dayrange_breach_{choice}"))
     return str(choice)
 
 
@@ -347,21 +367,17 @@ def containment_params(
             help=copy.help.get("breach_exit"),
         )
     )
-    # Said where the two settings meet rather than on either alone: neither is
-    # wrong, but together they leave `breach_update` with two live options
-    # instead of three, and a form that let someone pick between two identical
-    # ones without saying so would be the form's fault.
-    if contain_range and breach_update in (BREACH_OFF, BREACH_EXTREME):
-        st.caption(
-            ":material/info: With containment on, *hold the forecast* and *move to the "
-            "extreme* are the same rule — the forecast is pulled out to the session's "
-            "extreme either way. *Lead the tape* is the only policy that still differs."
-        )
+    # That containment makes "hold" and "extreme" the same rule is said in the
+    # `contain_range` help of each app rather than under the boxes.
     return contain_range, breach_exit
 
 
 def exit_params(
-    defaults: AppleTraderConfig, buy_k: float, sell_k: float, copy: FormCopy
+    defaults: AppleTraderConfig,
+    buy_k: float,
+    sell_k: float,
+    unit_label: str,
+    copy: FormCopy,
 ) -> "tuple[float, int, float, float]":
     """The managed exit: a stop under the fill, a momentum take, and a runner.
 
@@ -377,18 +393,23 @@ def exit_params(
     left to be worked out -- the whole point of the reparameterisation is that
     the *fraction* travels between symbols and the distance does not.
     """
-    _caption(copy.intro.get("dayrange_exits"))
+    section("Exits", copy.sections.get("dayrange_exits"))
     col_a, col_b = st.columns(2)
+    stop_key = copy.key("stop_gain_fraction")
+    shown = float(st.session_state.get(stop_key, defaults.stop_gain_fraction))
     stop_gain_fraction = col_a.number_input(
         "Stop loss (× the predicted gain, below the fill)",
         min_value=0.0, max_value=3.0, value=defaults.stop_gain_fraction, step=0.05,
         format="%.2f",
-        key=copy.key("stop_gain_fraction"),
-        help=copy.help.get("stop_gain_fraction", "").format(
-            stop_gain_fraction=f"{defaults.stop_gain_fraction:g}"
-        ),
+        key=stop_key,
+        help="\n\n".join(p for p in (
+            copy.help.get("stop_gain_fraction", "").format(
+                stop_gain_fraction=f"{defaults.stop_gain_fraction:g}"
+            ),
+            stop_note(shown, float(buy_k), float(sell_k), unit_label),
+        ) if p),
     )
-    stop_caption(col_a, float(stop_gain_fraction), float(buy_k), float(sell_k))
+    stop_warning(col_a, float(stop_gain_fraction))
     momentum_fade_bars = col_b.number_input(
         "Momentum fade to take gains (look-back, bars)",
         min_value=0, max_value=120, value=int(defaults.momentum_fade_bars), step=1,
@@ -416,48 +437,49 @@ def exit_params(
     )
 
 
-def stop_caption(
-    column, stop_gain_fraction: float, buy_k: float, sell_k: float
-) -> None:
-    """What the stop fraction comes to against these levels, in ADRs.
+def stop_note(
+    stop_gain_fraction: float, buy_k: float, sell_k: float, unit_label: str
+) -> str:
+    """What the stop fraction comes to against these levels, in their unit.
 
     A fraction of the predicted gain is the right thing to *set* and the wrong
     thing to compare against the other exit knobs, which are all ADR distances
-    -- so the conversion is on screen rather than in the reader's head. It also
-    catches the configuration that looks cautious and is not: a stop wider than
-    the gain risks more than a target exit can ever pay, which is a legal bet
-    and rarely the intended one.
-
-    Written into `column` rather than into the page, or it would render under
-    *both* columns of the exit grid instead of under the box it is about.
+    -- so the conversion is in the stop's `?` rather than in the reader's head.
+    The help is built before the widget renders, so it reads the value the
+    widget is holding: the one on screen.
 
     The dollar signs are escaped for the same reason `tuning.METRICS` has none:
     this is Streamlit markdown, where a bare "$" opens a LaTeX formula and the
     text between two of them silently disappears.
     """
     if not stop_gain_fraction:
-        column.caption(
-            ":material/info: No stop — a position leaves at the sell level, on a "
-            "momentum take, or at the closing flatten."
+        return (
+            "**At the current setting:** no stop — a position leaves at the sell level, "
+            "on a momentum take, or at the closing flatten."
         )
-        return
     gain = buy_k - sell_k
-    column.caption(
-        f"{stop_gain_fraction:g} × the {gain:.2f} × ADR the two levels are apart = "
-        f"**{stop_gain_fraction * gain:.3f} × ADR** under the fill, risking "
-        f"\${stop_gain_fraction:.2f} for every \$1.00 a target exit pays."
+    return (
+        f"**At the current levels:** {stop_gain_fraction:g} × the {gain:.2f} × "
+        f"{unit_label} between them = **{stop_gain_fraction * gain:.3f} × {unit_label}** "
+        "under the fill, "
+        f"risking \\${stop_gain_fraction:.2f} for every \\$1.00 a target exit pays."
     )
+
+
+def stop_warning(column, stop_gain_fraction: float) -> None:
+    """Flag a stop wider than the predicted gain: legal, rarely what is meant.
+
+    Written into `column` rather than into the page, or it would render under
+    *both* columns of the exit grid instead of under the box it is about.
+    """
     if stop_gain_fraction > 1:
         column.warning(
-            f"The stop is {stop_gain_fraction:g} × the predicted gain, so this risks more "
-            "than a target exit can pay. That is a legitimate bet on a rule that also "
-            "exits on momentum and at the close, but it is not what a stop usually "
-            "means — under 1.00 risks less than the trade is playing for.",
-            icon=":material/info:",
+            "The stop is wider than the predicted gain — it risks more than a target "
+            "exit can pay.",
+            icon=":material/warning:",
         )
 
 
-def _caption(text: "str | None") -> None:
-    """Render a caption only if the calling app wrote one for this slot."""
-    if text:
-        st.caption(text)
+def section(title: str, help: "str | None") -> None:
+    """A small heading for a group of knobs, with the group's explanation on its `?`."""
+    st.markdown(f"**{title}**", help=help or None)
