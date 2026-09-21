@@ -2,6 +2,8 @@ import base64
 import html
 import os
 import re
+import threading
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -614,6 +616,7 @@ def _chart_panel() -> None:
         overlays = model_overlays.live_overlays(
             sym_state, bars, state.model_overlay_keys
         )
+        option_walls = _live_option_walls(sym_state, state.option_walls)
 
         fig = build_chart(
             bars,
@@ -643,6 +646,7 @@ def _chart_panel() -> None:
             model_overlays=overlays["items"],
             show_momentum=state.show_momentum,
             volume_baseline=_volume_baseline(sym, bars, state),
+            option_walls=option_walls,
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
@@ -668,20 +672,68 @@ def _live_chart_controls() -> None:
                 help="Draw flat zero-volume placeholder bars for feed minutes "
                 "without any trade (common on IEX for thin symbols).",
             )
-            vwap_style = st.selectbox("VWAP", ["hide", "dot", "line"], index=0)
+            show_vwap = st.checkbox("VWAP", value=False)
         with c2:
             st.markdown("**Overlays**")
-            vwma_selection = st.multiselect(
-                "VWMA",
-                ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
-                default=[],
-            )
-            avg_selection = st.multiselect(
-                "Average Lines",
-                ["7d Avg", "28d Avg", "1y Avg"],
-                default=[],
-            )
-            show_fib = st.checkbox("Fibonacci levels", value=False)
+            with _help_row(
+                "Volume-weighted moving averages of the close over the last 5, "
+                "15 or 60 bars.",
+                icon_ratio=_HALF_WIDTH_ICON,
+            ):
+                vwma_selection = st.multiselect(
+                    "VWMA",
+                    ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
+                    default=[],
+                    placeholder="VWMA",
+                    label_visibility="collapsed",
+                )
+            with _help_row(
+                "Flat lines at the volume-weighted average close over the last "
+                "7 days, 28 days or year of daily bars.",
+                icon_ratio=_HALF_WIDTH_ICON,
+            ):
+                avg_selection = st.multiselect(
+                    "Average Lines",
+                    ["7d Avg", "28d Avg", "1y Avg"],
+                    default=[],
+                    placeholder="Average lines",
+                    label_visibility="collapsed",
+                )
+            with _help_row(
+                "The strikes with the most call open interest (Call wall, likely "
+                "resistance) and put open interest (Put wall, likely support) in "
+                "the nearest expiry within 45 days, from yfinance and refreshed "
+                "every minute: the same walls as the Put/Call Walls tab. A wall "
+                "far outside today's range is a label in the chart's corner "
+                "rather than a line, so it doesn't flatten the candles.",
+                icon_ratio=_HALF_WIDTH_ICON,
+            ):
+                wall_selection = st.multiselect(
+                    "Options walls",
+                    list(_OPTION_WALL_OPTIONS),
+                    default=[],
+                    placeholder="Options walls",
+                    label_visibility="collapsed",
+                )
+            baseline_keys = list(VOLUME_BASELINE_WINDOWS)
+            with _help_row(
+                "What the volume panel compares today's bars against. The dashed "
+                "line is the window's mean volume per bar; the shaded backdrop is "
+                "the average volume of each *clock minute* across the window, "
+                "which is the fairer read — the open and the close carry several "
+                "times what midday does. \"This session\" has no backdrop, since "
+                "its shape is the bars themselves. Prior windows come from "
+                "yfinance's consolidated tape, so they stay comparable whichever "
+                "live feed is streaming.",
+                icon_ratio=_HALF_WIDTH_ICON,
+            ):
+                volume_baseline_window = st.selectbox(
+                    "Usual volume",
+                    baseline_keys,
+                    index=baseline_keys.index(DEFAULT_VOLUME_BASELINE),
+                    format_func=lambda k: f"Usual volume: {VOLUME_BASELINE_WINDOWS[k]}",
+                    label_visibility="collapsed",
+                )
             show_momentum = st.checkbox(
                 "Momentum panel",
                 value=True,
@@ -690,41 +742,31 @@ def _live_chart_controls() -> None:
                 "same number the rule agents' regime is triggered off. The "
                 "dotted rules are the regime-entry thresholds.",
             )
-            baseline_keys = list(VOLUME_BASELINE_WINDOWS)
-            volume_baseline_window = st.selectbox(
-                "Usual volume",
-                baseline_keys,
-                index=baseline_keys.index(DEFAULT_VOLUME_BASELINE),
-                format_func=lambda k: VOLUME_BASELINE_WINDOWS[k],
-                help="What the volume panel compares today's bars against. The "
-                "dashed line is the window's mean volume per bar; the shaded "
-                "backdrop is the average volume of each *clock minute* across "
-                "the window, which is the fairer read — the open and the close "
-                "carry several times what midday does. \"This session\" has no "
-                "backdrop, since its shape is the bars themselves. Prior "
-                "windows come from yfinance's consolidated tape, so they stay "
-                "comparable whichever live feed is streaming.",
-            )
 
-        st.markdown(
-            "**Price Profile Fit**",
-            help="Gaussian / Cauchy: fit a mixture to the volume-at-price "
-            "profile (both can be drawn at once). ML predicted profile: draws "
-            "where today's volume is predicted to trade (LevelsML density "
-            "model: per-quantile LightGBM at the open, from daily-bar "
-            "features). Needs the trained pack in ../Models and daily bars.",
-        )
-        profile_selection = st.multiselect(
-            "Price profile fit",
-            list(_PROFILE_FIT_OPTIONS),
-            default=[],
-            placeholder="None",
-            label_visibility="collapsed",
-        )
+        st.markdown("**Price Profile Fit**")
+        with _help_row(
+            "- **Gaussian / Cauchy mixture** — fits a mixture to the "
+            "volume-at-price profile. Both can be drawn at once; **Components** "
+            "sets how many.\n"
+            "- **ML predicted profile** — where today's volume is predicted to "
+            "trade (LevelsML density model: per-quantile LightGBM at the open, "
+            "from daily-bar features). Needs the trained pack in ../Models and "
+            "daily bars.\n"
+            "- **Fibonacci levels** — retracement lines across the session's "
+            "high-low range, drawn on the candles."
+        ):
+            profile_selection = st.multiselect(
+                "Price profile fit",
+                list(_PROFILE_FIT_OPTIONS),
+                default=[],
+                placeholder="None",
+                label_visibility="collapsed",
+            )
         mixture_dists = [
             _PROFILE_FIT_OPTIONS[o] for o in profile_selection
-            if _PROFILE_FIT_OPTIONS[o] != "predicted"
+            if _PROFILE_FIT_OPTIONS[o] in ("gaussian", "cauchy")
         ]
+        show_fib = "Fibonacci levels" in profile_selection
         show_predicted = "ML predicted profile" in profile_selection
         max_components = 0
         fit_target_choice = "Live volume"
@@ -740,7 +782,6 @@ def _live_chart_controls() -> None:
 
         overlay_keys = _model_overlay_controls(state)
 
-        st.markdown("**Data**")
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
             disabled=not (state.symbols and state.api_key),
@@ -775,8 +816,9 @@ def _live_chart_controls() -> None:
     state.show_momentum = show_momentum
     state.volume_baseline_window = volume_baseline_window
     state.fill_gaps = fill_gaps
-    state.vwap_style = vwap_style
+    state.vwap_style = "dot" if show_vwap else "hide"
     state.show_fib = show_fib
+    state.option_walls = [_OPTION_WALL_OPTIONS[o] for o in wall_selection]
     state.mixture_distribution = mixture_dists
     state.mixture_max_components = max_components
     state.show_predicted_profile = show_predicted
@@ -789,12 +831,100 @@ def _live_chart_controls() -> None:
 
 
 
+# `_help_row`'s icon column inside one of Chart Settings' two half-width columns.
+_HALF_WIDTH_ICON = 0.16
+
+
+def _help_row(help_text: str, icon_ratio: float = 0.08):
+    """A column for a label-less widget, with its help icon to its right.
+
+    A widget whose label is collapsed loses its own help icon along with the
+    label, so the icon goes in a narrow column of its own beside it. Use as
+    `with _help_row("..."):` around the widget. The icon column needs ~30px or
+    the icon wraps below the widget's middle, so a row inside a half-width
+    column passes a larger `icon_ratio` than a full-width one.
+    """
+    field, icon = st.columns([1, icon_ratio], gap="small", vertical_alignment="center")
+    with icon:
+        # A zero-width body: anything visible wraps the icon onto a second
+        # line in a column this narrow, dropping it below the widget's middle.
+        st.markdown("\u200b", help=help_text)
+    return field
+
+
+# Options walls multiselect: option label -> key in the walls analysis.
+_OPTION_WALL_OPTIONS = {"Call wall": "call_wall", "Put wall": "put_wall"}
+
+# Symbols whose options chain is being fetched for the live chart right now,
+# and when each was last tried -- see `_live_option_walls`.
+_option_fetch_lock = threading.Lock()
+_option_fetch_running: set[str] = set()
+_option_fetch_tried: dict[str, float] = {}
+
+
+def _refresh_option_chain(sym_state: SymbolState) -> None:
+    """Refresh `sym_state.options_chain` in a background thread, at most once
+    per OPTIONS_POLL_SEC per symbol.
+
+    The chart fragment re-runs every few seconds and a yfinance chain fetch
+    takes a second or two, so fetching inline would stall the live chart. A
+    failure is logged by `fetch_option_chain` and simply retried on the next
+    interval; the chart keeps drawing the last chain it had.
+    """
+    sym = sym_state.symbol
+    now = time.monotonic()
+    with _option_fetch_lock:
+        if sym in _option_fetch_running or now - _option_fetch_tried.get(sym, -1e9) < OPTIONS_POLL_SEC:
+            return
+        _option_fetch_running.add(sym)
+        _option_fetch_tried[sym] = now
+
+    def fetch() -> None:
+        try:
+            with sym_state.lock:
+                spot = sym_state.last_price
+            data = fetch_options_walls_data(sym, spot=spot)
+        except Exception:
+            pass
+        else:
+            with sym_state.lock:
+                sym_state.options_chain = data
+        finally:
+            with _option_fetch_lock:
+                _option_fetch_running.discard(sym)
+
+    threading.Thread(target=fetch, name=f"option-walls-{sym}", daemon=True).start()
+
+
+def _live_option_walls(sym_state: SymbolState, keys: "list[str]") -> "dict | None":
+    """The selected walls ({"call_wall": ..., "put_wall": ...}) from the symbol's
+    latest options chain, or None when none are selected or no chain has
+    arrived yet. Also kicks off a refresh of that chain."""
+    if not keys:
+        return None
+    _refresh_option_chain(sym_state)
+    with sym_state.lock:
+        data = sym_state.options_chain
+    if not data or not data.get("strikes"):
+        return None
+    analysis = get_put_call_walls_and_gamma(
+        strikes=data["strikes"],
+        calls_oi=data["calls_oi"],
+        puts_oi=data["puts_oi"],
+        calls_gamma_exposure=data["calls_gamma_exposure"],
+        puts_gamma_exposure=data["puts_gamma_exposure"],
+        spot=data["spot"],
+    )
+    return {k: analysis.get(k) for k in keys}
+
+
 # Price Profile Fit multiselect: option label -> mixture distribution, or
-# "predicted" for the ML profile curve.
+# "predicted" for the ML profile curve, or "fib" for the Fibonacci levels.
 _PROFILE_FIT_OPTIONS = {
     "Gaussian mixture": "gaussian",
     "Cauchy mixture": "cauchy",
     "ML predicted profile": "predicted",
+    "Fibonacci levels": "fib",
 }
 
 
@@ -824,18 +954,24 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     st.session_state["model_overlay_keys"] = stored
 
     st.markdown("**Model Predictions**")
-    selected = st.multiselect(
-        "Show on chart",
-        available,
-        format_func=model_overlays.label,
-        key="model_overlay_keys",
-        help="Draws what the trained models predict for this session: price "
-        "ranges as horizontal lines, in the candles and in the profile beside "
-        "them, and time-of-day ranges as a shaded envelope that is widest at the "
-        "open and narrows through midday. **Apple Trader buy/sell levels** is the "
-        "exception — not a forecast but the two orders the agent configured below "
-        "would rest, which follow whatever settings that form is holding.",
-    )
+    with _help_row(
+        "Draws what the trained models predict for this session:\n"
+        "- **Price ranges** — horizontal lines, in the candles and in the "
+        "profile beside them.\n"
+        "- **Time-of-day ranges** — a shaded envelope, widest at the open and "
+        "narrowing through midday.\n"
+        "- **Apple Trader buy/sell levels** — not a forecast: the two orders the "
+        "agent configured below would rest, following whatever settings that "
+        "form is holding."
+    ):
+        selected = st.multiselect(
+            "Model predictions",
+            available,
+            format_func=model_overlays.label,
+            key="model_overlay_keys",
+            placeholder="None",
+            label_visibility="collapsed",
+        )
     for key in selected:
         overlay = model_overlays.get(key)
         if overlay:

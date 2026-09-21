@@ -674,3 +674,39 @@ class TestBarMinutes:
 
     def test_a_single_bar_falls_back_to_one_minute(self):
         assert charts._bar_minutes(self.make(["2024-01-15T14:00Z"])) == 1
+
+
+class TestOptionWalls:
+    def _annotations(self, fig):
+        return [a.text.strip() for a in fig.layout.annotations if a.text]
+
+    def test_both_walls_drawn(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          option_walls={"call_wall": 105.0, "put_wall": 95.0})
+        texts = self._annotations(fig)
+        assert "Call wall 105.00" in texts
+        assert "Put wall 95.00" in texts
+        levels = {s.y0 for s in fig.layout.shapes if s.y0 == s.y1}
+        assert {105.0, 95.0} <= levels
+
+    def test_only_selected_wall_drawn(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          option_walls={"put_wall": 95.0})
+        texts = self._annotations(fig)
+        assert "Put wall 95.00" in texts
+        assert not any(t.startswith("Call wall") for t in texts)
+
+    def test_no_walls_by_default(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START)
+        assert not any("wall" in t for t in self._annotations(fig))
+
+    def test_far_wall_is_an_edge_label_not_a_line(self):
+        # Session trades 99-103; a put wall 20% below must not stretch the axis.
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          option_walls={"call_wall": 103.5, "put_wall": 80.0})
+        levels = {s.y0 for s in fig.layout.shapes if s.y0 == s.y1}
+        assert 103.5 in levels
+        assert 80.0 not in levels
+        edge = [a for a in fig.layout.annotations if a.text and "Put wall" in a.text]
+        assert edge and edge[0].yref == "y domain" and edge[0].y == 0
+        assert "▼" in edge[0].text

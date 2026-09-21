@@ -174,3 +174,65 @@ class TestTheLiveSourceChoice:
         assert set(config.LIVE_SOURCE_LABELS) == set(config.LIVE_SOURCES)
         assert config.LIVE_SOURCE_LABELS["alpaca:iex"] == "Alpaca (iex)"
         assert config.LIVE_SOURCE_LABELS["alpaca:sip"] == "Alpaca (sip)"
+
+
+class TestLiveOptionWalls:
+    CHAIN = {
+        "strikes": [95.0, 100.0, 105.0],
+        "calls_oi": [10, 50, 400],
+        "puts_oi": [300, 40, 5],
+        "calls_gamma_exposure": [1.0, 2.0, 1.0],
+        "puts_gamma_exposure": [-1.0, -2.0, -1.0],
+        "spot": 100.0,
+    }
+
+    def _sym_state(self, chain):
+        from agent_stonks.state import SymbolState
+        sym_state = SymbolState("AAPL", AppState())
+        sym_state.options_chain = chain
+        return sym_state
+
+    def _stub_fetch(self, monkeypatch, calls, release=None):
+        from agent_stonks import ui
+        monkeypatch.setattr(ui, "_option_fetch_tried", {})
+        monkeypatch.setattr(ui, "_option_fetch_running", set())
+
+        def fetch(sym, spot=None):
+            calls.append(sym)
+            if release is not None:
+                release.wait(2)
+            return self.CHAIN
+
+        monkeypatch.setattr(ui, "fetch_options_walls_data", fetch)
+
+    def test_nothing_selected_fetches_nothing(self, monkeypatch):
+        from agent_stonks.ui import _live_option_walls
+        calls = []
+        self._stub_fetch(monkeypatch, calls)
+        assert _live_option_walls(self._sym_state(self.CHAIN), []) is None
+        assert calls == []
+
+    def test_selected_walls_from_the_latest_chain(self, monkeypatch):
+        from agent_stonks.ui import _live_option_walls
+        self._stub_fetch(monkeypatch, [])
+        walls = _live_option_walls(self._sym_state(self.CHAIN), ["call_wall", "put_wall"])
+        assert walls == {"call_wall": 105.0, "put_wall": 95.0}
+        walls = _live_option_walls(self._sym_state(self.CHAIN), ["put_wall"])
+        assert walls == {"put_wall": 95.0}
+
+    def test_no_chain_yet_draws_nothing_and_fetches_once(self, monkeypatch):
+        import threading
+        import time as _time
+        from agent_stonks.ui import _live_option_walls
+        calls, release = [], threading.Event()
+        self._stub_fetch(monkeypatch, calls, release)
+        sym_state = self._sym_state(None)
+        assert _live_option_walls(sym_state, ["call_wall"]) is None
+        release.set()
+        deadline = _time.monotonic() + 2
+        while sym_state.options_chain is None and _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        assert sym_state.options_chain == self.CHAIN
+        # A second render inside the poll interval must not fetch again.
+        assert _live_option_walls(sym_state, ["call_wall"]) == {"call_wall": 105.0}
+        assert calls == ["AAPL"]

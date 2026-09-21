@@ -136,7 +136,7 @@ class ModelOverlay:
 OVERLAYS: "dict[str, ModelOverlay]" = {
     DAY_RANGE_KEY: ModelOverlay(
         key=DAY_RANGE_KEY,
-        label="Predicted day range",
+        label="Predicted day range (TimeToChange3)",
         summary=(
             "TimeToChange3's forecast of the session's high and low, made once from "
             "the first five minutes. Two levels and the band between them while the "
@@ -151,7 +151,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
-        label="Predicted price profile range",
+        label="Predicted price profile range (LevelsML)",
         summary=(
             "The LevelsML density model's outer quantiles and point of control, as "
             "price levels. The same prediction the profile curve draws, on the "
@@ -162,7 +162,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     INTRADAY_RANGE_KEY: ModelOverlay(
         key=INTRADAY_RANGE_KEY,
-        label="Predicted intraday range",
+        label="Predicted intraday range (IntradayVolatility)",
         summary=(
             "IntradayVolatility's time-of-day volatility curve around the open, scaled "
             "to its own forecast of the day's range: widest at 09:30, narrowest at "
@@ -173,7 +173,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     INTRADAY_DAYRANGE_KEY: ModelOverlay(
         key=INTRADAY_DAYRANGE_KEY,
-        label="Predicted intraday range × day range",
+        label="Predicted intraday range × day range (IntradayVolatility × TimeToChange3)",
         summary=(
             "The same time-of-day curve, stretched so it tops out at TimeToChange3's "
             "predicted high and bottoms out at its predicted low. Made at 09:35."
@@ -188,7 +188,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
-        label="Apple Trader buy/sell levels",
+        label="Apple Trader buy/sell levels (agent orders, not a forecast)",
         summary=(
             "Where the configured Apple Trader rests its two orders: the buy and the "
             "sell, each a distance in ADRs under the day-range forecast. The only "

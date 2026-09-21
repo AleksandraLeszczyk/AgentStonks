@@ -245,6 +245,7 @@ _DEFAULTS: dict[str, object] = {
     "mixture_max_components": 0,
     "mixture_fit_target": "live",
     "show_predicted_profile": False,
+    "option_walls": [],
     "vwap_style": "hide",
     "show_candle_body": True,
     "show_percentile_body": False,
@@ -346,6 +347,8 @@ class AppState:
         self.mixture_max_components: int = 0
         self.mixture_fit_target: str = "live"
         self.show_predicted_profile: bool = False
+        # Options walls drawn on the candle chart: any of "call_wall", "put_wall".
+        self.option_walls: list[str] = []
         # Which model predictions the price chart draws (model_overlays keys).
         self.model_overlay_keys: list[str] = []
         self.vwap_style: str = "hide"

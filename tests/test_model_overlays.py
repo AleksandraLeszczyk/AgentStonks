@@ -448,7 +448,9 @@ class TestIntradayDayRangeOverlay:
         result = mo.compute([mo.INTRADAY_DAYRANGE_KEY], "AAPL", minute_bars(),
                             daily_bars=[], session_date=SESSION)
         assert result["items"] == []
-        assert result["notes"][0].startswith("Predicted intraday range × day range:")
+        assert result["notes"][0].startswith(
+            "Predicted intraday range × day range (IntradayVolatility × TimeToChange3):"
+        )
 
 
 class TestTraderLevelsOverlay:

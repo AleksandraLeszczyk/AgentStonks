@@ -673,6 +673,69 @@ def _add_tactic_levels(tactic_levels: list[dict], fig: go.Figure, x0: datetime, 
         )
 
 
+# Colours match the gamma chart's Call Wall / Put Wall markers.
+_OPTION_WALLS = (
+    ("call_wall", "Call wall", PALETTE["up"]),
+    ("put_wall", "Put wall", PALETTE["down"]),
+)
+
+
+def _add_option_walls(
+    option_walls: dict, fig: go.Figure, x0: datetime, x1: datetime,
+    price_low: float, price_high: float,
+) -> None:
+    """Dashed horizontal lines at the options Call Wall and Put Wall.
+
+    Expects {"call_wall": float | None, "put_wall": float | None} (see
+    technical_analysis.get_put_call_walls_and_gamma); a missing key or None
+    skips that wall.
+
+    The walls are strikes with the most open interest, and one can sit far
+    from where the stock trades today -- 20% away is not unusual. A line there
+    would stretch the price axis until the candles are a flat strip, so a wall
+    outside the session's range, widened by one range (and at least 0.5% of
+    price) either side, is instead a label pinned to the top or bottom edge of
+    the chart's left corner, pointing the way to it.
+    """
+    pad = max(price_high - price_low, 0.005 * price_high)
+    for key, label, color in _OPTION_WALLS:
+        level = option_walls.get(key)
+        if level is None:
+            continue
+        font = dict(color=color, size=10, family="monospace")
+        if price_low - pad <= level <= price_high + pad:
+            fig.add_shape(
+                type="line",
+                x0=x0, x1=x1,
+                y0=level, y1=level,
+                line=dict(color=color, width=1.5, dash="dash"),
+                row=1, col=1,
+            )
+            fig.add_annotation(
+                xref="x", yref="y",
+                x=x1, y=level,
+                text=f" {label} {level:.2f}",
+                font=font,
+                showarrow=False,
+                xanchor="left",
+            )
+        else:
+            above = level > price_high
+            # The left corner, clear of the right-hand labels every in-range
+            # level (a near wall, the averages, the model levels) carries.
+            fig.add_annotation(
+                xref="x domain", yref="y domain",
+                x=0.005, y=1 if above else 0,
+                text=f"{'▲' if above else '▼'} {label} {level:.2f}",
+                font=font,
+                # Opaque, so a line running along the edge doesn't strike it through.
+                bgcolor=PALETTE["panel"],
+                showarrow=False,
+                xanchor="left",
+                yanchor="top" if above else "bottom",
+            )
+
+
 # A hover label is one long line unless the text says otherwise, and the
 # reasoning behind a trade is free prose -- a rule agent's few sentences, or a
 # whole LLM paragraph. These are about the widest and tallest tooltip that
@@ -1443,6 +1506,7 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     show_momentum: bool = False,
     volume_baseline: Optional[dict] = None,
+    option_walls: Optional[dict] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -1729,6 +1793,11 @@ def build_chart(
         _add_price_alerts(price_alerts, fig, df["t"].iloc[0], df["t"].iloc[-1])
     if tactic_levels:
         _add_tactic_levels(tactic_levels, fig, df["t"].iloc[0], df["t"].iloc[-1])
+    if option_walls:
+        _add_option_walls(
+            option_walls, fig, df["t"].iloc[0], df["t"].iloc[-1],
+            price_low=float(df["l"].min()), price_high=float(df["h"].max()),
+        )
     if model_overlays:
         add_model_overlays(
             model_overlays, fig, df["t"].iloc[0], df["t"].iloc[-1],
