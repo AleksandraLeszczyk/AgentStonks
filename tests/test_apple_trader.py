@@ -2326,11 +2326,12 @@ class TestPredictedRangeUnit:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        # HighLow_5m has only been run on AAPL.
-        assert apple_models.keys_for(TICKER) == [
-            "dayrange", "dayrange_intraday", "highlow",
-        ]
-        for symbol in (NON_AAPL, "INTC"):
+        # HighLow_5m has been run on AAPL and INTC, not GOOGL.
+        for symbol in (TICKER, "INTC"):
+            assert apple_models.keys_for(symbol) == [
+                "dayrange", "dayrange_intraday", "highlow",
+            ]
+        for symbol in (NON_AAPL,):
             assert apple_models.keys_for(symbol) == [
                 "dayrange", "dayrange_intraday",
             ]

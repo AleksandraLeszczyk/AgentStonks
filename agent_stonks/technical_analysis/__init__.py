@@ -73,6 +73,7 @@ from .smart_money import (  # noqa: F401
     analyze_order_blocks,
     analyze_premium_discount,
     analyze_smart_money_setup,
+    fair_value_gaps,
     find_fair_value_gaps,
     find_order_blocks,
     smart_money_trade_geometry,

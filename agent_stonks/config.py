@@ -540,6 +540,16 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
 MODEL_OVERLAY_BAND_ALPHA = 0.08
 MODEL_OVERLAY_SPAN_ALPHA = 0.14
 
+# Candle-pattern overlays (see candle_patterns.py). A fair value gap is tinted
+# by its direction in the candles' own up/down colors; a gap price has since
+# traded through is drawn fainter, ending at the bar that filled it.
+CANDLE_PATTERN_COLORS: dict[str, str] = {
+    "bullish": "#26c6a2",
+    "bearish": "#ef5350",
+}
+CANDLE_PATTERN_OPEN_ALPHA = 0.22
+CANDLE_PATTERN_FILLED_ALPHA = 0.08
+
 MA_COLORS: dict[int, str] = {
     5:  "#60a5fa",  # blue
     15: "#fb923c",  # orange

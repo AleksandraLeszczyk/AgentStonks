@@ -351,6 +351,12 @@ class AppState:
         self.option_walls: list[str] = []
         # Which model predictions the price chart draws (model_overlays keys).
         self.model_overlay_keys: list[str] = []
+        # Which candle patterns the price chart draws (candle_patterns keys),
+        # and the fair-value-gap filters: minimum size in average bar ranges,
+        # and whether gaps price has already traded through are dropped.
+        self.candle_pattern_keys: list[str] = []
+        self.fvg_min_size: float = 0.5
+        self.fvg_hide_filled: bool = False
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False

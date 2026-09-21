@@ -15,6 +15,7 @@ import streamlit as st
 
 from . import (
     apple_models,
+    candle_patterns,
     market_hours,
     model_overlays,
 )
@@ -704,6 +705,7 @@ def _chart_panel() -> None:
             news_impacts=sym_state.news_impacts,
             fill_gaps=state.fill_gaps,
             model_overlays=overlays["items"],
+            candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
@@ -841,6 +843,7 @@ def _live_chart_controls() -> None:
                 )
 
         overlay_keys = _model_overlay_controls(state)
+        pattern_keys, fvg_min_size, fvg_hide_filled = _candle_pattern_controls()
 
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
@@ -888,6 +891,9 @@ def _live_chart_controls() -> None:
         else "live"
     )
     state.model_overlay_keys = overlay_keys
+    state.candle_pattern_keys = pattern_keys
+    state.fvg_min_size = fvg_min_size
+    state.fvg_hide_filled = fvg_hide_filled
 
 
 
@@ -1037,6 +1043,61 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
         if overlay:
             st.caption(f"{overlay.label} — {overlay.summary}")
     return selected
+
+
+def _candle_pattern_controls() -> "tuple[list[str], float, bool]":
+    """Which candle patterns the price chart draws, and the FVG filters.
+
+    Returns `(keys, fvg_min_size, fvg_hide_filled)`. The filters only show
+    once a fair value gap is selected; the defaults stand otherwise.
+    """
+    st.markdown("**Candle Patterns**")
+    with _help_row(
+        "Shapes read off the candles themselves — no model, no forecast.\n"
+        "- **Fair Value Gap (FVG)** — three candles where candle 1's wick and "
+        "candle 3's wick don't overlap. The gap between them is boxed from "
+        "candle 1: green for a gap up, red for a gap down, running right until "
+        "price trades through it, then faded. Hover a box's left edge for its "
+        "range and when it formed and filled. Regular session only."
+    ):
+        selected = st.multiselect(
+            "Candle patterns",
+            candle_patterns.keys(),
+            format_func=candle_patterns.label,
+            key="candle_pattern_keys",
+            placeholder="None",
+            label_visibility="collapsed",
+        )
+    min_size = candle_patterns.DEFAULT_FVG_MIN_SIZE
+    hide_filled = False
+    if candle_patterns.FVG_KEY in selected:
+        c1, c2 = st.columns(2, vertical_alignment="bottom")
+        with c1:
+            min_size = st.slider(
+                "Min FVG size (× avg bar range)",
+                min_value=0.0, max_value=2.0, step=0.25,
+                value=candle_patterns.DEFAULT_FVG_MIN_SIZE,
+                key="fvg_min_size",
+                help="Drops gaps narrower than this many times the average "
+                "high-low range of the 14 bars before them. 1-minute bars leave "
+                "100+ tiny gaps a session, most filled within a few bars; 0 "
+                "draws every one.",
+            )
+        with c2:
+            hide_filled = st.checkbox(
+                "Hide filled gaps",
+                key="fvg_hide_filled",
+                help="Only draw gaps price has not yet traded through.",
+            )
+    return selected, float(min_size), bool(hide_filled)
+
+
+def _live_candle_patterns(state: AppState, bars: "list[dict]") -> "list[dict]":
+    """The selected candle patterns over one symbol's live bars."""
+    return candle_patterns.compute(
+        state.candle_pattern_keys, bars,
+        min_size=state.fvg_min_size, hide_filled=state.fvg_hide_filled,
+    )
 
 
 def _volume_alert_controls() -> None:
@@ -2045,6 +2106,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     model_overlays=model_overlays.live_overlays(
                         sym_state, bars, state.model_overlay_keys,
                     )["items"],
+                    candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
                 ),
             )

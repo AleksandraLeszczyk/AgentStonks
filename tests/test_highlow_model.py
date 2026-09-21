@@ -24,10 +24,10 @@ H = pytest.importorskip("agent_stonks.highlow_model")
 NOTEBOOK = Path("/Users/aleksandra/Documents/playground/Code/FinNotebooks/HighLow_5m")
 
 # What the notebook's own `highlow` package predicts from its own panel for the
-# held-out week of 31 Aug 2026 plus one later day and one test-window day, with
-# the bundle saved 2026-09-15 (`highlow.models.load_bundle(...).predict_prices`).
-# (pred_high, pred_low, adr14_usd)
-NOTEBOOK_FORECASTS = {
+# held-out week of 31 Aug 2026 plus one later day and one test-window day
+# (`highlow.models.load_bundle(...).predict_prices`), per ticker's bundle:
+# AAPL saved 2026-09-15, INTC 2026-09-21. (pred_high, pred_low, adr14_usd)
+AAPL_FORECASTS = {
     "2026-03-02": (265.63175058123767, 259.76960582407247, 6.819571428571438),
     "2026-08-31": (321.235, 315.78224457142767, 5.9200214285714265),
     "2026-09-01": (317.8488540510188, 313.09447158886843, 6.009664285714284),
@@ -36,6 +36,18 @@ NOTEBOOK_FORECASTS = {
     "2026-09-04": (329.76991231125703, 324.7885355428754, 6.860378571428567),
     "2026-09-11": (336.3560774590717, 326.3, 7.329599999999999),
 }
+INTC_FORECASTS = {
+    "2026-03-02": (45.88399158706168, 43.88328505541922, 2.331371428571429),
+    "2026-08-31": (92.52259005688143, 88.91520912956068, 4.119050000000001),
+    "2026-09-01": (88.20672619422156, 85.05890732577451, 4.1104785714285725),
+    "2026-09-02": (90.92706444298031, 87.5004722200887, 4.157135714285715),
+    "2026-09-03": (90.08890242862724, 87.19492111916887, 3.8492785714285733),
+    "2026-09-04": (95.81487950584402, 91.81971111056774, 3.8367785714285736),
+    "2026-09-11": (104.88463667029384, 101.07, 3.8160571428571433),
+}
+NOTEBOOK_FORECASTS = {"AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS}
+# The candidates each bundle ships with non-zero weight.
+SHIPPED = {"AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"]}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -92,8 +104,9 @@ def cache_dir(tmp_path, monkeypatch):
 
 
 class TestRegistry:
-    def test_highlow_is_offered_on_aapl_only(self):
-        assert apple_models.HIGHLOW_KEY in apple_models.keys_for("AAPL")
+    def test_highlow_is_offered_where_a_bundle_was_saved(self):
+        for symbol in ("AAPL", "INTC"):
+            assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
     def test_it_drives_the_day_range_rules(self):
@@ -120,6 +133,25 @@ class TestRollups:
             for part in (days[:4], days[4:])
         ]
         pd.testing.assert_frame_equal(pd.concat(halves), whole)
+
+
+class TestHalfDays:
+    def test_the_rule_reproduces_the_notebooks_list(self):
+        """`config.EARLY_CLOSE_DATES` in HighLow_5m, which ends in 2025."""
+        listed = {
+            "2023-07-03", "2023-11-24", "2024-07-03", "2024-11-29", "2024-12-24",
+            "2025-07-03", "2025-11-28", "2025-12-24",
+        }
+        days = pd.bdate_range("2023-01-01", "2025-12-31")
+        assert set(days[H.early_close(days)].strftime("%Y-%m-%d")) == listed
+
+    def test_a_half_day_with_a_full_bar_count_is_still_dropped(self):
+        """INTC's 28 Nov 2025: SIP printed past the 13:00 close, so the session
+        passed the bar count. The date is what drops it."""
+        tape = _tape(date(2025, 11, 27), date(2025, 11, 28))
+        rollups, dropped = H.session_rollups(H.minute_frame_from_bars(tape[date(2025, 11, 28)]))
+        assert rollups.empty
+        assert [pd.Timestamp(d) for d in dropped] == [pd.Timestamp("2025-11-28")]
 
 
 class TestHistoryCache:
@@ -208,17 +240,27 @@ class TestForecastSeams:
             )
 
 
-@pytest.fixture(scope="module")
-def notebook_inputs():
-    minute_file = NOTEBOOK / "data" / "AAPL" / "minute.parquet"
-    if not minute_file.exists():
-        pytest.skip("the HighLow_5m AAPL notebook data is not on this machine")
-    bundle = H.load_bundle("AAPL")
+_NOTEBOOK_INPUTS: dict = {}
+
+
+def notebook_inputs(ticker: str):
+    """The bundle, and the notebook's *raw* SIP files rolled up by the live
+    path's code -- raw rather than the cleaned `minute.parquet`, so the session
+    cleaning (half days included) is part of what is checked."""
+    if ticker in _NOTEBOOK_INPUTS:
+        return _NOTEBOOK_INPUTS[ticker]
+    files = sorted((NOTEBOOK / "data" / ticker / "raw").glob("*.parquet"))
+    if not files:
+        pytest.skip(f"the HighLow_5m {ticker} notebook data is not on this machine")
+    bundle = H.load_bundle(ticker)
     if bundle is None:
-        pytest.skip("the HighLow AAPL bundle is not installed")
-    raw = pd.read_parquet(minute_file)[H.OHLCV]
+        pytest.skip(f"the HighLow {ticker} bundle is not installed")
+    raw = pd.concat(pd.read_parquet(f) for f in files).sort_index()
+    raw = raw[~raw.index.duplicated()].loc["2023-01-01":"2026-09-11 23:59"]
+    raw = raw.tz_convert("America/New_York").between_time("09:30", "15:59")[H.OHLCV]
     history, _ = H.session_rollups(raw)
-    return bundle, raw, history
+    _NOTEBOOK_INPUTS[ticker] = (bundle, raw, history)
+    return _NOTEBOOK_INPUTS[ticker]
 
 
 class TestAgainstTheNotebook:
@@ -227,18 +269,45 @@ class TestAgainstTheNotebook:
     the N-BEATS half runs in float32 and the two venvs carry different pandas
     -- but within a millionth of a dollar, far inside anything a level reads."""
 
-    @pytest.mark.parametrize("day", sorted(NOTEBOOK_FORECASTS))
-    def test_reproduces_the_notebook_forecast(self, notebook_inputs, day):
-        bundle, raw, history = notebook_inputs
+    @pytest.mark.parametrize(
+        "ticker,day",
+        [(t, d) for t, days in NOTEBOOK_FORECASTS.items() for d in sorted(days)],
+    )
+    def test_reproduces_the_notebook_forecast(self, ticker, day):
+        bundle, raw, history = notebook_inputs(ticker)
         stamp = pd.Timestamp(day)
         opening = raw[raw.index.normalize().tz_localize(None) == stamp].iloc[:5]
         out = H.forecast_from(bundle, history, opening, stamp)
-        high, low, adr = NOTEBOOK_FORECASTS[day]
+        high, low, adr = NOTEBOOK_FORECASTS[ticker][day]
         assert out["pred_high"] == pytest.approx(high, abs=1e-5)
         assert out["pred_low"] == pytest.approx(low, abs=1e-5)
         assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)
 
-    def test_only_the_weighted_candidates_are_loaded(self, notebook_inputs):
-        bundle, _, _ = notebook_inputs
+    @pytest.mark.parametrize("ticker", sorted(SHIPPED))
+    def test_only_the_weighted_candidates_are_loaded(self, ticker):
+        bundle, _, _ = notebook_inputs(ticker)
         assert bundle["kind"] == "highlow"
-        assert sorted(bundle["daily_models"]) == ["lgbm", "nbeats"]
+        assert bundle["ticker"] == ticker  # the file that loaded is the right one
+        assert sorted(bundle["daily_models"]) == SHIPPED[ticker]
+
+    def test_a_bundle_whose_shipped_candidate_reads_a_custom_group_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """INTC's linear median reads microstructure columns this module never
+        builds; at weight 0 that is harmless, weighted it must not load."""
+        import joblib
+
+        src = H.model_path("INTC")
+        if not src.exists():
+            pytest.skip("the HighLow INTC bundle is not installed")
+        H._register_unpickle_alias()
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            blob = joblib.load(src)
+        blob["weights"] = {**blob["weights"], "linear": 1.0}
+        target = tmp_path / src.name
+        joblib.dump(blob, target)
+        for extra in (src.with_name(f"{src.stem}_nhits.pt"), src.with_suffix(".json")):
+            (tmp_path / extra.name).write_bytes(extra.read_bytes())
+        assert H._build_bundle(target) is None

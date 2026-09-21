@@ -11,6 +11,9 @@ from plotly.subplots import make_subplots
 from . import market_hours, momentum_regime
 from .config import (
     AVG_LINE_COLORS,
+    CANDLE_PATTERN_COLORS,
+    CANDLE_PATTERN_FILLED_ALPHA,
+    CANDLE_PATTERN_OPEN_ALPHA,
     FIB_LEVELS,
     MA_COLORS,
     MODEL_OVERLAY_BAND_ALPHA,
@@ -1496,6 +1499,111 @@ def add_model_overlays(
         )
 
 
+# --- candle-pattern overlays ------------------------------------------------
+#
+# The renderer for `candle_patterns.compute` output, shared by the live chart
+# and SimLab's replay chart like `add_model_overlays` above.
+
+
+def add_candle_patterns(
+    patterns: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: Optional[int] = 1,
+    col: Optional[int] = 1,
+) -> None:
+    """Draw fair value gaps as boxes behind the candles.
+
+    Traces rather than shapes, so the legend can hide a whole direction and a
+    gap can say what it is on hover: each (direction, filled) set is one
+    filled polygon trace with the boxes separated by gaps in the data, plus
+    one invisible marker per gap at its left edge that carries the hover. A
+    day holds dozens of gaps, and a trace each would bury the legend.
+
+    Boxes are clipped to `x0`/`x1`; an open gap runs to its session's last bar. The
+    polygons are moved to the front of `fig.data`, which puts them behind the
+    candles, as `_add_bands` does for the same reason.
+    """
+    gaps = [p for p in patterns or [] if p.get("kind") == "fvg"]
+    if not gaps:
+        return
+    x0, x1 = pd.Timestamp(x0), pd.Timestamp(x1)
+    first = len(fig.data)
+    hover: "dict[str, list]" = {"bullish": [], "bearish": []}
+    shown: set = set()
+    for direction in ("bullish", "bearish"):
+        color = CANDLE_PATTERN_COLORS[direction]
+        name = f"{direction.capitalize()} FVG"
+        group = f"fvg_{direction}"
+        for filled in (False, True):
+            xs: list = []
+            ys: list = []
+            for gap in gaps:
+                if gap["direction"] != direction or bool(gap.get("filled")) != filled:
+                    continue
+                gx0 = max(_as_tz_of(gap["x0"], x0), x0)
+                gx1 = min(_as_tz_of(gap["x1"], x0), x1)
+                if gx1 <= gx0:
+                    continue
+                y0, y1 = gap["y0"], gap["y1"]
+                xs += [gx0, gx1, gx1, gx0, gx0, None]
+                ys += [y0, y0, y1, y1, y0, None]
+                hover[direction].append((gx0, (y0 + y1) / 2, gap))
+            if not xs:
+                continue
+            alpha = CANDLE_PATTERN_FILLED_ALPHA if filled else CANDLE_PATTERN_OPEN_ALPHA
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=ys, mode="lines", fill="toself",
+                    fillcolor=_rgba(color, alpha), line=dict(width=0),
+                    name=name, legendgroup=group, showlegend=group not in shown,
+                    hoverinfo="skip",
+                ),
+                row=row, col=col,
+            )
+            shown.add(group)
+    if len(fig.data) > first:
+        fig.data = fig.data[first:] + fig.data[:first]
+
+    for direction, points in hover.items():
+        if not points:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=[p[0] for p in points],
+                y=[p[1] for p in points],
+                mode="markers",
+                marker=dict(size=10, opacity=0),
+                name=f"{direction.capitalize()} FVG",
+                legendgroup=f"fvg_{direction}",
+                showlegend=False,
+                customdata=[_fvg_hover(p[2]) for p in points],
+                hovertemplate="%{customdata}<extra></extra>",
+            ),
+            row=row, col=col,
+        )
+
+
+def _fvg_hover(gap: dict) -> str:
+    formed = pd.Timestamp(gap["formed"]).tz_convert(market_hours.MARKET_TZ).strftime("%H:%M")
+    ratio = gap.get("size_ratio")
+    lines = [
+        f"<b>{gap['direction'].capitalize()} FVG</b> {gap['y0']:.2f}–{gap['y1']:.2f}",
+        f"Size {gap['size']:.2f}" + (f" ({ratio:.1f}× avg bar range)" if ratio is not None else ""),
+        f"Formed {formed}",
+    ]
+    if gap.get("filled"):
+        filled = pd.Timestamp(gap["x1"]).tz_convert(market_hours.MARKET_TZ).strftime("%H:%M")
+        lines.append(f"Filled {filled}")
+    elif gap.get("touched"):
+        touched = pd.Timestamp(gap["touched"]).tz_convert(market_hours.MARKET_TZ).strftime("%H:%M")
+        lines.append(f"Open · revisited {touched}")
+    else:
+        lines.append("Open")
+    return "<br>".join(lines)
+
+
 def build_chart(
     bars: list[dict],
     news: list[dict],
@@ -1522,6 +1630,7 @@ def build_chart(
     news_impacts: Optional[dict] = None,
     fill_gaps: bool = False,
     model_overlays: Optional[list[dict]] = None,
+    candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
@@ -1820,6 +1929,10 @@ def build_chart(
         add_model_overlays(
             model_overlays, fig, df["t"].iloc[0], df["t"].iloc[-1],
             row=1, col=1, profile_axes=("x2", "y2"), volume_row=2,
+        )
+    if candle_patterns:
+        add_candle_patterns(
+            candle_patterns, fig, df["t"].iloc[0], df["t"].iloc[-1], row=1, col=1,
         )
 
     last = df.iloc[-1]

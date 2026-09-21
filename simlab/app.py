@@ -20,6 +20,7 @@ import streamlit as st
 
 from agent_stonks import (
     apple_models,
+    candle_patterns,
     clock,
     model_overlays,
 )
@@ -40,6 +41,7 @@ from agent_stonks import apple_trader_ui
 from agent_stonks.apple_rules_ui import rules_panel, signal_catalogue
 from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
 from agent_stonks.charts import (
+    add_candle_patterns,
     add_model_overlays,
     add_session_markers,
     overlay_x_max,
@@ -650,8 +652,12 @@ def _price_chart(
     bars: list[dict],
     decisions: list[dict],
     overlays: "list[dict] | None" = None,
+    patterns: "list[dict] | None" = None,
 ) -> go.Figure:
     """The replayed day(s)' candles, the fills, and what the models predicted.
+
+    `patterns` are `candle_patterns.compute` items (fair value gaps), drawn by
+    the live chart's renderer too.
 
     `overlays` are `model_overlays.compute` items, drawn by the same renderer
     the live chart uses. There is no price-profile column here, so the
@@ -711,6 +717,11 @@ def _price_chart(
         x0, x1 = pd.Timestamp(bars[0]["t"]), pd.Timestamp(bars[-1]["t"])
         add_model_overlays(overlays, fig, x0, x1, row=None, col=None)
         fig.update_xaxes(range=[x0, overlay_x_max(overlays, x1)])
+    if patterns and bars:
+        add_candle_patterns(
+            patterns, fig, pd.Timestamp(bars[0]["t"]), pd.Timestamp(bars[-1]["t"]),
+            row=None, col=None,
+        )
     fig.update_layout(xaxis_rangeslider_visible=False)
     return _chart_layout(fig, height=420)
 
@@ -873,6 +884,46 @@ def _run_overlay_controls(
     return {"items": items, "notes": notes}
 
 
+def _run_pattern_controls(record: dict, symbol: str, bars: "list[dict]") -> "list[dict]":
+    """Pick which candle patterns to draw over a replayed tape, and find them.
+
+    Nothing is pre-selected: unlike a model overlay, no run traded on a
+    pattern. Each replayed day is read on its own (`candle_patterns.compute`).
+    """
+    run_id = record.get("run_id") or "run"
+    c1, c2, c3 = st.columns([2, 1.2, 0.8], vertical_alignment="bottom")
+    with c1:
+        selected = st.multiselect(
+            "Candle patterns",
+            candle_patterns.keys(),
+            format_func=candle_patterns.label,
+            key=f"sim_patterns_{run_id}_{symbol}",
+            help="Shapes read off the replayed candles themselves. A fair value "
+            "gap is three candles where candle 1's wick and candle 3's wick "
+            "don't overlap: boxed from candle 1, green up / red down, faded once "
+            "price trades through it. Regular session only.",
+        )
+    if candle_patterns.FVG_KEY not in selected:
+        return candle_patterns.compute(selected, bars)
+    with c2:
+        min_size = st.slider(
+            "Min FVG size (× avg bar range)",
+            min_value=0.0, max_value=2.0, step=0.25,
+            value=candle_patterns.DEFAULT_FVG_MIN_SIZE,
+            key=f"sim_fvg_min_{run_id}_{symbol}",
+            help="Drops gaps narrower than this many times the average high-low "
+            "range of the 14 bars before them; 0 draws every one.",
+        )
+    with c3:
+        hide_filled = st.checkbox(
+            "Hide filled", key=f"sim_fvg_hide_{run_id}_{symbol}",
+            help="Only draw gaps price had not traded through by the end of the day.",
+        )
+    return candle_patterns.compute(
+        selected, bars, min_size=min_size, hide_filled=hide_filled
+    )
+
+
 def _render_judge_report(judge_report: dict) -> None:
     st.markdown("##### :material/gavel: LLM judge")
     if judge_report.get("judge_model"):
@@ -950,8 +1001,9 @@ def _render_run(record: dict) -> None:
                     bars = market.series[sym].minute_bars
                     if bars:
                         overlays = _run_overlay_controls(record, market, sym, days)
+                        patterns = _run_pattern_controls(record, sym, bars)
                         st.plotly_chart(
-                            _price_chart(sym, bars, decisions, overlays["items"])
+                            _price_chart(sym, bars, decisions, overlays["items"], patterns)
                         )
                         for note in overlays["notes"]:
                             st.caption(f":material/info: {note}")

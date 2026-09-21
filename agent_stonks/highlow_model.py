@@ -11,11 +11,23 @@ asked of a much larger dataset and anchored differently. FinNotebooks'
     pred_low  = min(close5 * exp(-down * adr14), low5)
 
 `close5`, `high5`, `low5` come from the first five 1-minute bars; `adr14` is the
-mean `log(high/low)` of the previous 14 sessions. The shipped model is a
-0.5 LightGBM + 0.5 N-BEATS blend (the linear median and N-HiTS are in the
-bundle at weight 0). On AAPL's 129-session test window it scores 0.0050 mean
-absolute log error per extreme ($1.37), against TimeToChange3's 0.0077 on the
-same sessions; head-to-head on the ten sessions neither had seen, -20%.
+mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
+on validation and the bundle records it: AAPL ships 0.5 LightGBM + 0.5 N-BEATS,
+INTC ships N-HiTS alone; every other candidate is in the bundle at weight 0 and
+is not loaded. On the 129-session test window AAPL scores 0.0050 mean absolute
+log error per extreme ($1.37) against TimeToChange3's 0.0077, INTC 0.0150
+($1.22) against 0.0216.
+
+INTC's notebook also built three custom feature groups (market via SPY,
+regime, microstructure). Validation kept only microstructure, and only for the
+linear median, which ships at weight 0 -- so the shipped forecast reads the base
+48 features alone and none of the groups is mirrored here. A retrain that gives
+a candidate reading them a weight would need them copied first;
+`_build_bundle` refuses such a bundle rather than predicting off missing columns.
+
+Half days: the notebook drops an explicit list of NYSE 13:00 closes (a bar
+count misses some -- INTC's 28 Nov 2025 passed it). That list ends in 2025, so
+`session_report` uses the rule that generates it (`newsimpact_model.early_close`).
 
 Apple Trader uses it *only* for the forecast. Everything downstream -- the two
 resting levels, the breach update, the managed exit, the circuit breaker -- is
@@ -96,6 +108,7 @@ torch.set_num_threads(1)
 
 from . import market_hours, model_store  # noqa: E402
 from .model_store import ModelStore  # noqa: E402
+from .newsimpact_model import early_close  # noqa: E402
 
 MODEL_PATH_ENV = "APPLE_HIGHLOW_MODEL"
 DEFAULT_TICKER = model_store.DEFAULT_TICKER
@@ -301,10 +314,15 @@ def session_report(minute: pd.DataFrame) -> pd.DataFrame:
         n_bars=("close", "size"), first_minute=("minute", "min"),
         last_minute=("minute", "max"), volume=("volume", "sum"),
     )
+    # The notebook lists NYSE's 13:00 closes (`config.EARLY_CLOSE_DATES`) because
+    # a bar count alone misses some: SIP can print after a 13:00 close, and
+    # INTC's 28 Nov 2025 passed the count. The list stops at 2025, so the rule
+    # that generates it -- identical on every date it covers -- stands in here.
+    rep["half_day"] = early_close(pd.DatetimeIndex(rep.index))
     rep["short"] = rep["n_bars"] < MIN_BARS_PER_SESSION
     rep["no_open_bar"] = rep["first_minute"] != 0
     rep["early_end"] = rep["last_minute"] < SESSION_MINUTES - 5
-    rep["kept"] = ~(rep["short"] | rep["no_open_bar"] | rep["early_end"])
+    rep["kept"] = ~(rep["half_day"] | rep["short"] | rep["no_open_bar"] | rep["early_end"])
     return rep
 
 
@@ -660,6 +678,15 @@ def _build_bundle(path: Path) -> "dict | None":
     except (OSError, KeyError, RuntimeError, ValueError, AttributeError):
         return None
     if not models:
+        return None
+    # Only the base feature set is mirrored. A weighted candidate reading one of
+    # the notebook's custom groups (INTC's market / regime / microstructure)
+    # would hit columns this module never builds, so the bundle is refused
+    # here rather than failing -- or worse, predicting -- at 9:35.
+    read = set(blob["feature_cols"])
+    for m in models.values():
+        read |= set(getattr(m, "feature_cols", None) or ())
+    if read - set(FEATURE_COLS):
         return None
 
     meta_file = metadata_path(path)

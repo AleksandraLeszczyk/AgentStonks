@@ -125,35 +125,70 @@ def analyze_order_blocks(bars: list[dict], spot: "float | None" = None) -> dict:
         "summary": " ".join(summary_parts),
     }
 
+def fair_value_gaps(bars: list[dict]) -> list[dict]:
+    """Every fair value gap in `bars`, oldest first, with when it was revisited.
+
+    The one definition of the pattern, shared by the agent's read below and the
+    chart's candle-pattern overlay (`candle_patterns`). A *bullish* FVG forms when
+    candle 3's low sits above candle 1's high (`low[i+1] > high[i-1]`), leaving the
+    zone `(high[i-1], low[i+1])` that candle 2 crossed without the wicks either side
+    overlapping. A *bearish* FVG is the mirror (`high[i+1] < low[i-1]`).
+
+    `index` is candle 2. Two later moments are recorded, because "filled" means
+    different things to different readers:
+
+    `touched_at`   the first later bar that trades into the zone at all -- what
+                   the agent's read calls "filled" (price came back to it).
+    `filled_at`    the first later bar that trades through the far edge (below
+                   a bullish gap's bottom, above a bearish gap's top), after which
+                   there is no imbalance left to draw.
+
+    Both are None while it has not happened yet.
+    """
+    h = [float(b["h"]) for b in bars]
+    l = [float(b["l"]) for b in bars]
+    n = len(bars)
+
+    gaps: list[dict] = []
+    for i in range(1, n - 1):
+        if l[i + 1] > h[i - 1]:
+            kind, bottom, top = "bullish", h[i - 1], l[i + 1]
+        elif h[i + 1] < l[i - 1]:
+            kind, bottom, top = "bearish", h[i + 1], l[i - 1]
+        else:
+            continue
+        later = range(i + 2, n)
+        touched = next((j for j in later if l[j] <= top and h[j] >= bottom), None)
+        filled = next(
+            (j for j in later if (l[j] <= bottom if kind == "bullish" else h[j] >= top)),
+            None,
+        )
+        gaps.append({
+            "type": kind, "index": i, "bottom": round(bottom, 4), "top": round(top, 4),
+            "touched_at": touched, "filled_at": filled,
+        })
+    return gaps
+
+
 def find_fair_value_gaps(bars: list[dict], max_gaps: int = 6) -> dict:
     """Locate fair value gaps (FVGs): three-candle price imbalances institutions
     tend to revisit.
 
-    A *bullish* FVG forms when a strong up-candle leaves a gap between the high of
-    the candle before it and the low of the candle after it (`low[i+1] > high[i-1]`);
-    the gap zone `(high[i-1], low[i+1])` is an unfilled imbalance that often acts as
-    support on a pullback. A *bearish* FVG is the mirror (`high[i+1] < low[i-1]`).
-    A gap is "filled" once a later bar trades back through the zone.
+    See `fair_value_gaps` for the pattern. Here a gap is "filled" once a later
+    bar trades back into the zone.
     """
     n = len(bars)
     if n < 3:
         return {"note": "not enough bars to locate fair value gaps", "fair_value_gaps": []}
 
-    h = [float(b["h"]) for b in bars]
-    l = [float(b["l"]) for b in bars]
-
-    gaps: list[dict] = []
-    for i in range(1, n - 1):
-        if l[i + 1] > h[i - 1]:
-            gaps.append({"type": "bullish", "index": i, "bottom": round(h[i - 1], 4), "top": round(l[i + 1], 4)})
-        elif h[i + 1] < l[i - 1]:
-            gaps.append({"type": "bearish", "index": i, "bottom": round(h[i + 1], 4), "top": round(l[i - 1], 4)})
-
-    for g in gaps:
-        idx = g["index"]
-        g["filled"] = any(l[j] <= g["top"] and h[j] >= g["bottom"] for j in range(idx + 2, n))
-        g["bars_ago"] = n - 1 - idx
-
+    gaps = [
+        {
+            "type": g["type"], "index": g["index"], "bottom": g["bottom"], "top": g["top"],
+            "filled": g["touched_at"] is not None,
+            "bars_ago": n - 1 - g["index"],
+        }
+        for g in fair_value_gaps(bars)
+    ]
     return {"fair_value_gaps": gaps[-max_gaps:], "bar_count": n}
 
 def analyze_fair_value_gaps(bars: list[dict], spot: "float | None" = None) -> dict:
