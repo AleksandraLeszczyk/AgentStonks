@@ -1741,8 +1741,8 @@ def _trade_sound_fragment() -> None:
     """
     state = _get_state()
     tracker = state.decision_tracker
-    if tracker is None or not state.trade_sound_enabled:
-        # Forget the position in the ledger while sound is off, so switching it
+    if tracker is None or state.trade_sound_volume <= 0:
+        # Forget the position in the ledger while sound is off, so turning it
         # back on adopts the trades that happened meanwhile instead of firing a
         # chime for each of them.
         st.session_state.pop("trade_sound_seen", None)
@@ -2381,7 +2381,9 @@ def _execution_controls() -> str:
                 "that happened to be a live key, whether real money moved would come "
                 "down to which variable was already set."
             )
-        else:
+        elif _get_state().trading_mode != "alpaca_live":
+            # A pre-Start caution only: once a live run is on, the status block
+            # under the Start button says so and this would be a second banner.
             st.warning(
                 "**This will trade real money.** Pressing ▶ Start arms an automated "
                 "strategy on your live Alpaca account, and it will place orders "
@@ -2523,25 +2525,17 @@ def _agent_panel(
 
     trading_mode_choice = _execution_controls()
 
-    sound_col, vol_col = st.columns([1, 2])
-    state.trade_sound_enabled = sound_col.toggle(
+    state.trade_sound_volume = st.slider(
         "Trade sound",
-        value=state.trade_sound_enabled,
-        key="agent_trade_sound_enabled",
-        help="Play a short chime whenever an order fills — rising for a buy, "
-        "falling for a sell. Off by default. Your browser only allows sound "
-        "after you interact with the page, which starting the agent satisfies.",
+        min_value=0.0,
+        max_value=0.60,
+        value=state.trade_sound_volume,
+        step=0.05,
+        key="agent_trade_sound_volume",
+        help="Volume of a short chime whenever an order fills — rising for a buy, "
+        "falling for a sell. 0 (the default) is off. Your browser only allows "
+        "sound after you interact with the page, which starting the agent satisfies.",
     )
-    if state.trade_sound_enabled:
-        state.trade_sound_volume = vol_col.slider(
-            "Sound volume",
-            min_value=0.05,
-            max_value=0.60,
-            value=state.trade_sound_volume,
-            step=0.05,
-            key="agent_trade_sound_volume",
-            help="Loudness of the chime, relative to your system volume.",
-        )
 
     c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.3])
     starting_budget = c1.number_input(
@@ -2639,11 +2633,10 @@ def _agent_panel(
             state.trading_mode = effective_mode
             state.trading_mode_requested = trading_mode_choice
             state.trading_status = broker_message
-            if effective_mode != trading_mode_choice:
-                st.warning(broker_message)
-            elif effective_mode == "alpaca_live":
-                st.error(f"🔴 LIVE TRADING ARMED — {broker_message}")
-            else:
+            # Only local simulation is announced here: a degraded, paper or live
+            # venue gets its banner from the persistent status block below,
+            # and announcing it here too would stack two banners saying the same.
+            if effective_mode == trading_mode_choice == "local":
                 st.success(broker_message)
 
             state.starting_budget = starting_budget
