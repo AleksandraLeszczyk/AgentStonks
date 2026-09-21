@@ -511,6 +511,19 @@ class TestMomentumPanel:
         texts = [a["text"] for a in fig.layout.annotations]
         assert any("warms up" in t for t in texts)
 
+    def test_warming_up_panel_still_anchors_the_shared_time_axis(self):
+        # An empty momentum panel left its x axis (matched to the price and
+        # volume axes) without data, and plotly then autoranged the whole
+        # group over 1912-2034: right after the open the candles vanished.
+        bars = self.rth_bars(5)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True)
+        anchors = [tr for tr in fig.data if tr.yaxis == "y5"]
+        assert len(anchors) == 1
+        xs = pd.to_datetime(list(anchors[0].x), utc=True)
+        assert xs[0] == pd.Timestamp(bars[0]["t"])
+        assert xs[-1] == pd.Timestamp(bars[-1]["t"])
+        assert all(y is None for y in anchors[0].y)
+
     def test_bars_outside_the_regular_session_draw_a_note(self):
         # 13:30Z is 08:30 ET: after SESSION_START, so the bars are drawn, but
         # pre-market, so the momentum frame drops every one of them.

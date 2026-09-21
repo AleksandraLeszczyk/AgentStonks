@@ -948,7 +948,25 @@ def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
     converted back to UTC here, the wall clock the price axis is drawn in.
     """
     def _warming_up() -> None:
-        """Say why the panel is empty rather than leaving a blank box."""
+        """Say why the panel is empty rather than leaving a blank box.
+
+        The panel still gets one invisible trace over the drawn bars' span. Its
+        x axis is matched to the price and volume axes, and with no trace at all
+        plotly autoranges it as an empty linear axis. The matched group then
+        spans 1912-2034, so right after the open the candles collapse into a
+        sliver at the chart's edge.
+        """
+        fig.add_trace(
+            go.Scatter(
+                x=[df["t"].iloc[0], df["t"].iloc[-1]],
+                y=[None, None],
+                mode="lines",
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=row,
+            col=1,
+        )
         fig.add_annotation(
             xref="x domain", yref="y domain", x=0.5, y=0.5,
             text="Momentum warms up over the first ~25 regular-session bars",
