@@ -134,7 +134,14 @@ from .trading_mode import (
     live_trading_enabled,
     resolve_broker,
 )
-from .stream import backfill_bars, launch_stream, launch_stream_news
+from .stream import (
+    backfill_bars,
+    launch_stream,
+    launch_stream_news,
+    reap_dead_sessions,
+    register_live_session,
+    stop_streams,
+)
 from .technical_analysis import (
     analyze_intraday,
     analyze_liquidity,
@@ -172,7 +179,31 @@ def _volume_baseline(symbol: str, bars: "list[dict]", state: AppState) -> "dict 
     return minute_volume_baseline(window, bars, history)
 
 
+def _session_id() -> str:
+    """This Streamlit session's id, or "" outside a script run."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        ctx = get_script_run_ctx()
+        return ctx.session_id if ctx else ""
+    except Exception:
+        return ""
+
+
+def _session_is_active(session_id: str) -> bool:
+    try:
+        from streamlit.runtime import Runtime
+
+        return Runtime.instance().is_active_session(session_id)
+    except Exception:
+        # No runtime to ask: never stop a session on a guess.
+        return True
+
+
 def _get_state() -> AppState:
+    # Any rerun, in any session, stops the streams of sessions whose browser
+    # has gone for good (see stream.reap_dead_sessions).
+    reap_dead_sessions(_session_is_active)
     if "app_state" not in st.session_state:
         st.session_state["app_state"] = AppState()
     state = st.session_state["app_state"]
@@ -3119,6 +3150,9 @@ def _start_live_session(
             except Exception as exc:
                 state.status = f"News impact scoring failed for {sym}: {exc}"
     state.status = "Connecting WebSocket…"
+    session_id = _session_id()
+    if session_id:
+        register_live_session(session_id, state)
     launch_stream(
         syms, key, secret, feed, state, timeframe,
         data_source=data_source, finnhub_token=finnhub_token,
@@ -3296,22 +3330,7 @@ def build_ui() -> None:
                 )
 
         if stop_clicked:
-            if state.bars_fallback_stop_event:
-                state.bars_fallback_stop_event.set()
-            if state.news_fallback_stop_event:
-                state.news_fallback_stop_event.set()
-            if state.ws:
-                try:
-                    state.ws.close()
-                except Exception:
-                    pass
-            if state.ws_news:
-                try:
-                    state.ws_news.close()
-                except Exception:
-                    pass
-            state.status = "Stopped"
-            state.news_status = "Stopped"
+            stop_streams(state)
 
         _live_panel()
 

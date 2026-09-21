@@ -1,7 +1,42 @@
 import json
 
+import pytest
+
 from agent_stonks import finnhub_stream, stream
 from agent_stonks.state import AppState
+
+
+class FakeWS:
+    """Stands in for websocket.WebSocketApp: records the handlers and sends."""
+
+    instances: list["FakeWS"] = []
+
+    def __init__(self, url, **handlers):
+        self.url = url
+        self.handlers = handlers
+        self.sent: list[str] = []
+        self.closed = False
+        FakeWS.instances.append(self)
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def close(self):
+        self.closed = True
+
+    def run_forever(self, **_):
+        pass
+
+
+@pytest.fixture
+def fake_socket(monkeypatch):
+    """Finnhub hubs built on FakeWS, with no socket threads started."""
+    FakeWS.instances = []
+    monkeypatch.setattr("agent_stonks.ws_reconnect.websocket.WebSocketApp", FakeWS)
+    monkeypatch.setattr(finnhub_stream, "_start_socket_thread", lambda hub: None)
+    finnhub_stream._hubs.clear()
+    yield FakeWS
+    finnhub_stream._hubs.clear()
 
 
 def _app(*symbols: str):
@@ -275,26 +310,16 @@ class TestApplyTrade:
 
 
 class TestSocketMessages:
+    @pytest.fixture(autouse=True)
+    def _fake(self, fake_socket):
+        pass
+
     def _stream(self, app, symbols, monkeypatch, timeframe="1Min"):
-        """Run start_stream against a fake WebSocketApp, returning its handlers."""
-        captured: dict = {}
-
-        class FakeWS:
-            def __init__(self, url, **handlers):
-                captured["url"] = url
-                captured.update(handlers)
-                self.sent: list[str] = []
-
-            def send(self, payload):
-                self.sent.append(payload)
-
-            def run_forever(self, **_):
-                captured["ran"] = True
-
-        monkeypatch.setattr(finnhub_stream.websocket, "WebSocketApp", FakeWS)
+        """Subscribe `app` on a hub built over FakeWS, returning its handlers."""
         builders = {s: _builder(app.sym(s)) for s in symbols}
-        finnhub_stream.start_stream(symbols, "tok", app, timeframe, builders)
-        return captured, app.ws
+        sub = finnhub_stream.subscribe(symbols, "tok", app, builders)
+        ws = sub.hub.socket.ws
+        return {"url": ws.url, **ws.handlers}, ws
 
     def test_authenticates_in_the_url_and_subscribes_per_symbol(self, monkeypatch):
         app, _ = _app("AAPL", "TSLA")
@@ -425,7 +450,8 @@ class TestSourceSelection:
         )
 
         assert "finnhub" not in started
-        assert "_start_stream" in started
+        assert "run_forever" in started
+        assert app.ws.label == "Alpaca bars stream (iex)"
         assert app.data_source == "alpaca"
 
 
@@ -509,3 +535,127 @@ class TestBufferOwnership:
         elapsed = clock.parse_iso_strict("2024-01-01T14:09:00Z").timestamp()
         assert builder.close_if_elapsed(now=elapsed) is None
         assert state.bars[-1]["c"] == 2
+
+
+class TestSharedSocket:
+    """One Finnhub socket per key, whatever the number of sessions (see FinnhubHub)."""
+
+    @pytest.fixture(autouse=True)
+    def _fake(self, fake_socket):
+        pass
+
+    def _subscribe(self, app, symbols):
+        builders = {s: _builder(app.sym(s)) for s in symbols}
+        return finnhub_stream.subscribe(symbols, "tok", app, builders)
+
+    @staticmethod
+    def _frames(ws):
+        return [json.loads(m) for m in ws.sent]
+
+    def test_two_sessions_share_one_socket_subscribed_to_the_union(self):
+        app1, _ = _app("AAPL", "TSLA")
+        app2, _ = _app("AAPL", "NVDA")
+        sub1 = self._subscribe(app1, ["AAPL", "TSLA"])
+        sub2 = self._subscribe(app2, ["AAPL", "NVDA"])
+
+        assert sub1.hub is sub2.hub
+        assert len(FakeWS.instances) == 1
+        ws = sub1.hub.socket.ws
+        ws.handlers["on_open"](ws)
+
+        assert sorted(f["symbol"] for f in self._frames(ws)) == ["AAPL", "NVDA", "TSLA"]
+        assert app1.bars_connected and app2.bars_connected
+        assert "AAPL, NVDA" in app2.status
+
+    def test_a_trade_reaches_every_session_streaming_its_symbol(self):
+        app1, _ = _app("AAPL")
+        app2, _ = _app("AAPL", "NVDA")
+        sub = self._subscribe(app1, ["AAPL"])
+        self._subscribe(app2, ["AAPL", "NVDA"])
+        ws = sub.hub.socket.ws
+
+        ws.handlers["on_message"](ws, json.dumps({"type": "trade", "data": [
+            {"s": "AAPL", "p": 190.0, "t": 1704117600000, "v": 10},
+            {"s": "NVDA", "p": 120.0, "t": 1704117600000, "v": 5},
+        ]}))
+
+        assert app1.sym("AAPL").last_price == 190.0
+        assert app2.sym("AAPL").last_price == 190.0
+        assert app2.sym("NVDA").last_price == 120.0
+        # Each session builds its own bar from the trade.
+        assert app1.sym("AAPL").bars[-1] is not app2.sym("AAPL").bars[-1]
+
+    def test_a_session_joining_a_live_socket_subscribes_only_what_is_new(self):
+        app1, _ = _app("AAPL")
+        sub = self._subscribe(app1, ["AAPL"])
+        ws = sub.hub.socket.ws
+        ws.handlers["on_open"](ws)
+        ws.sent.clear()
+
+        app2, _ = _app("AAPL", "NVDA")
+        self._subscribe(app2, ["AAPL", "NVDA"])
+
+        assert self._frames(ws) == [{"type": "subscribe", "symbol": "NVDA"}]
+        assert app2.bars_connected is True
+
+    def test_leaving_unsubscribes_only_symbols_nobody_else_streams(self):
+        app1, _ = _app("AAPL")
+        app2, _ = _app("AAPL", "NVDA")
+        sub1 = self._subscribe(app1, ["AAPL"])
+        sub2 = self._subscribe(app2, ["AAPL", "NVDA"])
+        ws = sub1.hub.socket.ws
+        ws.handlers["on_open"](ws)
+        ws.sent.clear()
+
+        sub2.close()
+
+        assert self._frames(ws) == [{"type": "unsubscribe", "symbol": "NVDA"}]
+        assert app2.bars_connected is False
+        assert app1.bars_connected is True
+        assert ws.closed is False
+
+    def test_the_last_session_leaving_closes_the_socket(self):
+        app, _ = _app("AAPL")
+        sub = self._subscribe(app, ["AAPL"])
+        ws = sub.hub.socket.ws
+
+        sub.close()
+
+        assert ws.closed is True
+        assert sub.hub.socket.closed is True
+        assert finnhub_stream._hubs == {}
+        # The next session opens a fresh socket.
+        self._subscribe(app, ["AAPL"])
+        assert len(FakeWS.instances) == 2
+
+    def test_a_reconnect_subscribes_again(self):
+        # The 2026-09-18 bug: after a reconnect the socket came back subscribed
+        # to nothing. Every connection must send the full set again.
+        app, _ = _app("AAPL", "TSLA")
+        sub = self._subscribe(app, ["AAPL", "TSLA"])
+        ws = sub.hub.socket.ws
+        ws.handlers["on_open"](ws)
+        ws.handlers["on_close"](ws)
+        assert app.bars_connected is False
+        ws.sent.clear()
+
+        ws.handlers["on_open"](ws)
+
+        assert self._frames(ws) == [
+            {"type": "subscribe", "symbol": "AAPL"},
+            {"type": "subscribe", "symbol": "TSLA"},
+        ]
+        assert app.bars_connected is True
+
+    def test_launch_puts_the_subscription_on_app_ws(self, monkeypatch):
+        monkeypatch.setattr(finnhub_stream.threading, "Thread", lambda **k: type(
+            "T", (), {"start": lambda self: None}
+        )())
+        app, _ = _app("AAPL")
+        import threading
+
+        finnhub_stream.launch(["AAPL"], "tok", app, "1Min", threading.Event())
+
+        assert isinstance(app.ws, finnhub_stream.FinnhubSubscription)
+        app.ws.close()
+        assert finnhub_stream._hubs == {}

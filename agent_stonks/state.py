@@ -6,9 +6,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
-    import websocket
-
     from .decisions import DecisionTracker
+    from .finnhub_stream import FinnhubSubscription
+    from .ws_reconnect import ReconnectingSocket
 
 from . import clock
 from .config import (
@@ -332,8 +332,10 @@ class AppState:
         self.news_status: str = "Idle"
         self.bars_connected: bool = False
         self.news_connected: bool = False
-        self.ws: "websocket.WebSocketApp | None" = None
-        self.ws_news: "websocket.WebSocketApp | None" = None
+        # The live bars socket (Alpaca), or this session's subscription to the
+        # shared Finnhub socket. Either way, `close()` releases it.
+        self.ws: "ReconnectingSocket | FinnhubSubscription | None" = None
+        self.ws_news: "ReconnectingSocket | None" = None
         self.bars_fallback_stop_event: "threading.Event | None" = None
         self.news_fallback_stop_event: "threading.Event | None" = None
         self.timeframe: str = "1Min"

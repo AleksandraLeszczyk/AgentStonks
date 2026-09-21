@@ -39,6 +39,7 @@ from .news import fetch_news_with_fallback
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
 from .state import AppState, SymbolState
 from .stream_common import merge_missing_bars  # noqa: F401  (re-export)
+from .ws_reconnect import ReconnectingSocket
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ def _backfill_all_quietly(
             _backfill_quietly(symbol, key, secret, history_feed, sym_state, timeframe)
 
 
-def _start_stream(
+def _bars_socket(
     symbols: list[str],
     key: str,
     secret: str,
@@ -123,9 +124,10 @@ def _start_stream(
     app: AppState,
     timeframe: str = "1Min",
     history_feed: str = DEFAULT_HISTORY_FEED,
-) -> None:
-    """Open one Alpaca WebSocket and stream real-time bars/trades/quotes for
-    every subscribed symbol into its SymbolState."""
+) -> ReconnectingSocket:
+    """The Alpaca WebSocket that streams real-time bars/trades/quotes for every
+    subscribed symbol into its SymbolState. Not yet running: the caller keeps it
+    on `app.ws` and runs `run_forever()` on a thread."""
     tf_minutes = _TF_MINUTES.get(timeframe, 1)
     symbols_label = ", ".join(symbols)
 
@@ -252,39 +254,32 @@ def _start_stream(
                 # A quote moves bid/ask price+size and the derived spread.
                 _fire_due_alerts(state)
 
+    # Disconnects, reconnects and their reasons are logged by the socket
+    # itself, under its label (see agent_stonks.ws_reconnect).
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
-        logger.warning("Bars stream error for %s: %s", symbols_label, err)
         app.status = f"WS error: {err}"
         app.bars_connected = False
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
-        logger.info("Bars stream closed for %s, reconnecting…", symbols_label)
         app.bars_connected = False
         if app.status.startswith("✅"):
             app.status = "Stream closed"
 
-    ws = websocket.WebSocketApp(
+    # ReconnectingSocket reconnects after any drop (ping/pong timeout, network
+    # blip, server-side close). Without that, bars would silently stop, and
+    # nothing else in the UI would show that the socket died. It also sets TCP
+    # keepalive: the most common cause of repeated "Connection to remote host
+    # was lost." drops is a NAT/proxy between here and Alpaca killing an idle
+    # TCP session without a close frame. Keepalive probes let the OS notice a
+    # dead socket in about 30-50 s instead of leaving it hung.
+    return ReconnectingSocket(
+        f"Alpaca bars stream ({feed})",
         BARS_STREAM_URL.format(feed=feed),
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
     )
-    app.ws = ws
-    # reconnect=5: without this, any drop (ping/pong timeout, network blip,
-    # server-side close) ends run_forever for good and bars silently stop
-    # arriving -- nothing else in the UI depends on this socket, so there's
-    # no other signal that it died. ws.close() (Stop button) still ends the
-    # retry loop via keep_running.
-    #
-    # sockopt enables TCP keepalive: the most common cause of repeated
-    # "Connection to remote host was lost." drops is a NAT/proxy/load-balancer
-    # between this process and Alpaca silently killing an idle TCP session --
-    # neither side sends a close frame, so the app only notices on the next
-    # read, which raises immediately. Keepalive probes generate traffic so
-    # the OS detects and recovers (or reports) a dead socket within ~30-50s
-    # instead of leaving it to rot.
-    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
 def _poll_symbol_via_rest(
@@ -441,7 +436,7 @@ def _fallback_bars_loop(
 ) -> None:
     """REST-polling fallback that keeps prices flowing for every symbol while the
     bars/trades WS isn't connected. Alpaca's per-key streaming connection limit
-    doesn't apply to REST calls, so this keeps working even while `_start_stream`
+    doesn't apply to REST calls, so this keeps working even while `_bars_socket`
     is stuck retrying a rejected socket (e.g. another session/tab holding the one
     streaming slot Alpaca allows per key) -- and it is the safety net under the
     Finnhub socket too, since neither socket's outage affects Alpaca REST.
@@ -548,11 +543,11 @@ def launch_stream(
     if source == "finnhub":
         finnhub_stream.launch(symbols, finnhub_token, app, timeframe, stop_event)
     else:
-        threading.Thread(
-            target=_start_stream,
-            args=(symbols, key, secret, feed, app, timeframe, history_feed),
-            daemon=True,
-        ).start()
+        # Assigned here, before the thread starts, so a second launch_stream
+        # that follows quickly always finds this socket on app.ws to close.
+        sock = _bars_socket(symbols, key, secret, feed, app, timeframe, history_feed)
+        app.ws = sock
+        threading.Thread(target=sock.run_forever, daemon=True).start()
     threading.Thread(
         target=_fallback_bars_loop,
         args=(symbols, key, secret, feed, app, timeframe, stop_event, source, history_feed),
@@ -577,9 +572,12 @@ def _news_message_states(app: AppState, msg: dict) -> list[SymbolState]:
     return states
 
 
-def _start_stream_news(symbols: list[str], key: str, secret: str, app: AppState) -> None:
-    """Open Alpaca news WebSocket and stream real-time news articles into every
-    matching symbol's state."""
+def _news_socket(
+    symbols: list[str], key: str, secret: str, app: AppState
+) -> ReconnectingSocket:
+    """The Alpaca news WebSocket that streams real-time news articles into every
+    matching symbol's state. Not yet running: the caller keeps it on
+    `app.ws_news` and runs `run_forever()` on a thread."""
     symbols_label = ", ".join(symbols)
 
     def on_open(ws: websocket.WebSocketApp) -> None:
@@ -629,25 +627,22 @@ def _start_stream_news(symbols: list[str], key: str, secret: str, app: AppState)
                 app.news_connected = False
 
     def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
-        logger.warning("News stream error for %s: %s", symbols_label, err)
         app.news_status = f"WS error: {err}"
         app.news_connected = False
 
     def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
-        logger.info("News stream closed for %s, reconnecting…", symbols_label)
         app.news_connected = False
         if app.news_status.startswith("✅"):
             app.news_status = "Stream closed"
 
-    ws = websocket.WebSocketApp(
+    return ReconnectingSocket(
+        "Alpaca news stream",
         NEWS_STREAM_URL,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
     )
-    app.ws_news = ws
-    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=_keepalive_sockopt())
 
 
 def _fallback_news_loop(
@@ -662,7 +657,7 @@ def _fallback_news_loop(
     news WS isn't connected.
 
     Alpaca's per-key streaming connection limit doesn't apply to REST calls, so this
-    keeps working even while `_start_stream_news` is stuck retrying a rejected socket.
+    keeps working even while `_news_socket` is stuck retrying a rejected socket.
     """
     while not stop_event.wait(NEWS_FALLBACK_POLL_SEC):
         if app.news_connected:
@@ -714,11 +709,70 @@ def launch_stream_news(
     stop_event = threading.Event()
     app.news_fallback_stop_event = stop_event
 
-    threading.Thread(
-        target=_start_stream_news, args=(symbols, key, secret, app), daemon=True
-    ).start()
+    sock = _news_socket(symbols, key, secret, app)
+    app.ws_news = sock
+    threading.Thread(target=sock.run_forever, daemon=True).start()
     threading.Thread(
         target=_fallback_news_loop,
         args=(symbols, key, secret, worldnews_key, app, stop_event),
         daemon=True,
     ).start()
+
+
+def stop_streams(app: AppState) -> None:
+    """Stop everything `launch_stream` and `launch_stream_news` started for
+    `app`: both sockets (or its Finnhub subscription) and both REST fallbacks."""
+    for event in (app.bars_fallback_stop_event, app.news_fallback_stop_event):
+        if event:
+            event.set()
+    for sock in (app.ws, app.ws_news):
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    app.bars_connected = False
+    app.news_connected = False
+    app.status = "Stopped"
+    app.news_status = "Stopped"
+
+
+# Every session that has started a live stream, by Streamlit session id, so a
+# session whose browser went away can have its streams stopped. Their threads
+# are daemons that hold the AppState, so nothing else would ever stop them.
+# Before this, every page refresh left a set of sockets reconnecting forever.
+_live_sessions: dict[str, AppState] = {}
+_gone_since: dict[str, float] = {}
+_live_sessions_lock = threading.Lock()
+
+# Streamlit keeps a disconnected session for 2 minutes, so a tab that lost its
+# connection (laptop sleep, network blip) can come back to it. Waiting longer
+# than that means only a session that can never come back is stopped.
+SESSION_REAP_AFTER_SEC = 5 * 60
+
+
+def register_live_session(session_id: str, app: AppState) -> None:
+    with _live_sessions_lock:
+        _live_sessions[session_id] = app
+        _gone_since.pop(session_id, None)
+
+
+def reap_dead_sessions(is_active, now: float | None = None) -> list[str]:
+    """Stop the streams of every registered session that `is_active(session_id)`
+    has reported gone for SESSION_REAP_AFTER_SEC. Returns the reaped ids."""
+    now = time.monotonic() if now is None else now
+    reaped: list[tuple[str, AppState]] = []
+    with _live_sessions_lock:
+        for session_id, app in list(_live_sessions.items()):
+            if is_active(session_id):
+                _gone_since.pop(session_id, None)
+                continue
+            since = _gone_since.setdefault(session_id, now)
+            if now - since >= SESSION_REAP_AFTER_SEC:
+                reaped.append((session_id, app))
+                del _live_sessions[session_id]
+                del _gone_since[session_id]
+    for session_id, app in reaped:
+        logger.info("Stopping the streams of closed session %s", session_id)
+        stop_streams(app)
+    return [session_id for session_id, _ in reaped]

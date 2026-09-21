@@ -47,8 +47,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-import websocket
-
 from . import clock
 from . import scoring
 from .config import FINNHUB_BAR_FLUSH_SEC, FINNHUB_STREAM_URL
@@ -60,13 +58,14 @@ from .stream_common import (
     check_volume_alert,
     fire_due_alerts,
     floor_ts,
-    keepalive_sockopt,
     record_bar_close,
 )
+from .ws_reconnect import ReconnectingSocket
 
 logger = logging.getLogger(__name__)
 
 SOURCE_LABEL = "Finnhub WebSocket stream"
+SOCKET_LABEL = "Finnhub stream"
 
 
 def _iso_from_millis(millis: object) -> str:
@@ -278,29 +277,117 @@ def _flush_loop(
                 fire_due_alerts(state)
 
 
-def start_stream(
-    symbols: list[str],
-    token: str,
-    app: AppState,
-    timeframe: str,
-    builders: dict[str, CandleBuilder],
-) -> None:
-    """Open one Finnhub WebSocket and stream the trade tape for every symbol,
-    aggregating it into that symbol's bar series. Blocks until the socket is
-    closed for good (`ws.close()` from the Stop button)."""
-    symbols_label = ", ".join(symbols)
+class FinnhubSubscription:
+    """One session's claim on the shared Finnhub socket, kept on `app.ws`.
 
-    def on_open(ws: websocket.WebSocketApp) -> None:
+    `close()` (Stop, a restarted stream, a reaped session) drops this session's
+    symbols. The socket itself closes only when the last subscription does.
+    """
+
+    def __init__(
+        self,
+        hub: "FinnhubHub",
+        app: AppState,
+        symbols: list[str],
+        builders: dict[str, CandleBuilder],
+    ) -> None:
+        self.hub = hub
+        self.app = app
+        self.symbols = list(symbols)
+        self.builders = builders
+        self.status = f"✅ Streaming {', '.join(symbols)} (Finnhub trades → local candles)"
+
+    def close(self) -> None:
+        self.hub.remove(self)
+
+
+class FinnhubHub:
+    """The process's one Finnhub socket for an API key, shared by every session.
+
+    Finnhub allows one socket per key, and a second connection gets one of them
+    dropped. Each Streamlit session used to open its own socket: a second tab,
+    a page refresh, or a SimLab and a live app on the same key. The sockets then
+    dropped each other, and each reconnected every 5 s, until Finnhub's
+    5-handshakes-per-window limit refused them with 429. Here each session
+    registers a `FinnhubSubscription`. The socket subscribes to the union of
+    their symbols and hands every trade to each session that streams that symbol.
+    """
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self._subs: list[FinnhubSubscription] = []
+        # Symbols the live connection has been sent a subscribe frame for.
+        # Cleared on every (re)connect, when on_open subscribes to everything again.
+        self._subscribed: set[str] = set()
+        self._connected = False
+        self.socket = ReconnectingSocket(
+            SOCKET_LABEL,
+            FINNHUB_STREAM_URL.format(token=token),
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+
+    # -- subscriptions ------------------------------------------------------
+
+    def _sync_subscriptions(self) -> None:
+        """Bring the live connection's subscriptions in line with the sessions'.
+        Caller holds `_lock`. A no-op while disconnected: on_open sends everything."""
+        if not self._connected:
+            return
+        wanted = {s for sub in self._subs for s in sub.symbols}
+        for symbol in sorted(wanted - self._subscribed):
+            if self.socket.send(json.dumps({"type": "subscribe", "symbol": symbol})):
+                self._subscribed.add(symbol)
+        for symbol in sorted(self._subscribed - wanted):
+            self.socket.send(json.dumps({"type": "unsubscribe", "symbol": symbol}))
+            self._subscribed.discard(symbol)
+
+    def add(self, sub: FinnhubSubscription) -> None:
+        with _lock:
+            self._subs.append(sub)
+            self._sync_subscriptions()
+            if self._connected:
+                sub.app.bars_connected = True
+                sub.app.status = sub.status
+
+    def remove(self, sub: FinnhubSubscription) -> None:
+        with _lock:
+            if sub not in self._subs:
+                return
+            self._subs.remove(sub)
+            sub.app.bars_connected = False
+            if self._subs:
+                self._sync_subscriptions()
+                return
+            if _hubs.get(self.token) is self:
+                del _hubs[self.token]
+        self.socket.close()
+
+    # -- socket handlers ----------------------------------------------------
+
+    def _on_open(self, ws: Any) -> None:
         # Finnhub authenticates in the handshake query string, so an accepted
-        # socket is already an authenticated one -- there is no auth round trip
-        # to wait for and no subscription acknowledgement to come back. One
-        # subscribe frame per symbol is the whole protocol.
-        for symbol in symbols:
-            ws.send(json.dumps({"type": "subscribe", "symbol": symbol}))
-        app.bars_connected = True
-        app.status = f"✅ Streaming {symbols_label} (Finnhub trades → local candles)"
+        # socket is already an authenticated one. There is no auth round trip to
+        # wait for and no subscription acknowledgement. One subscribe frame per
+        # symbol is the whole protocol, and it is sent on every (re)connect.
+        with _lock:
+            self._connected = True
+            self._subscribed = set()
+            self._sync_subscriptions()
+            for sub in self._subs:
+                sub.app.bars_connected = True
+                sub.app.status = sub.status
 
-    def on_message(ws: websocket.WebSocketApp, raw: str) -> None:
+    def _mark_down(self, status: str, only_if_streaming: bool = False) -> None:
+        with _lock:
+            for sub in self._subs:
+                sub.app.bars_connected = False
+                if not only_if_streaming or sub.app.status.startswith("✅"):
+                    sub.app.status = status
+
+    def _on_message(self, ws: Any, raw: str) -> None:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -312,54 +399,67 @@ def start_stream(
         if kind == "ping":
             return
         if kind == "error":
-            app.status = f"Finnhub stream error: {payload.get('msg')}"
-            app.bars_connected = False
-            logger.warning("Finnhub stream error for %s: %s", symbols_label, payload.get("msg"))
+            logger.warning("%s: error frame: %s", SOCKET_LABEL, payload.get("msg"))
+            self._mark_down(f"Finnhub stream error: {payload.get('msg')}")
             return
         if kind != "trade":
             return
 
+        with _lock:
+            subs = list(self._subs)
         for raw_trade in payload.get("data") or []:
             trade = normalize_trade(raw_trade)
             if trade is None:
                 continue
-            state = app.sym(trade["S"])
-            builder = builders.get(trade["S"])
-            if state is None or builder is None:
-                continue
-            log_fetch(
-                "last price",
-                SOURCE_LABEL,
-                symbol=state.symbol,
-                detail=f"price={trade['p']}",
-            )
-            apply_trade(state, builder, trade)
+            for sub in subs:
+                builder = sub.builders.get(trade["S"])
+                state = sub.app.sym(trade["S"])
+                if state is None or builder is None:
+                    continue
+                log_fetch(
+                    "last price",
+                    SOURCE_LABEL,
+                    symbol=state.symbol,
+                    detail=f"price={trade['p']}",
+                )
+                apply_trade(state, builder, dict(trade))
 
-    def on_error(ws: websocket.WebSocketApp, err: Exception) -> None:
-        logger.warning("Finnhub stream error for %s: %s", symbols_label, err)
-        app.status = f"Finnhub WS error: {err}"
-        app.bars_connected = False
+    def _on_error(self, ws: Any, err: Exception) -> None:
+        self._mark_down(f"Finnhub WS error: {err}")
 
-    def on_close(ws: websocket.WebSocketApp, *_: Any) -> None:
-        logger.info("Finnhub stream closed for %s, reconnecting…", symbols_label)
-        app.bars_connected = False
-        if app.status.startswith("✅"):
-            app.status = "Stream closed"
+    def _on_close(self, ws: Any, *_: Any) -> None:
+        with _lock:
+            self._connected = False
+            self._subscribed = set()
+        self._mark_down("Stream closed", only_if_streaming=True)
 
-    app.status = "Connecting to Finnhub…"
-    ws = websocket.WebSocketApp(
-        FINNHUB_STREAM_URL.format(token=token),
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    )
-    app.ws = ws
-    # Same reconnect/keepalive reasoning as the Alpaca socket: without
-    # reconnect, one blip ends run_forever for good and the tape silently stops,
-    # and without TCP keepalive a NAT/proxy can kill an idle session without
-    # either side sending a close frame.
-    ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=5, sockopt=keepalive_sockopt())
+
+# One hub per API key, for the whole process. `_lock` guards this registry and
+# every hub's subscriber list.
+_hubs: dict[str, FinnhubHub] = {}
+_lock = threading.RLock()
+
+
+def _start_socket_thread(hub: FinnhubHub) -> None:
+    threading.Thread(target=hub.socket.run_forever, daemon=True).start()
+
+
+def subscribe(
+    symbols: list[str], token: str, app: AppState, builders: dict[str, CandleBuilder]
+) -> FinnhubSubscription:
+    """Register `app` for `symbols` on the key's shared socket, opening the
+    socket if this is the first subscription."""
+    with _lock:
+        hub = _hubs.get(token)
+        created = hub is None
+        if created:
+            hub = _hubs[token] = FinnhubHub(token)
+            app.status = "Connecting to Finnhub…"
+        sub = FinnhubSubscription(hub, app, symbols, builders)
+        hub.add(sub)
+    if created:
+        _start_socket_thread(hub)
+    return sub
 
 
 def launch(
@@ -369,10 +469,11 @@ def launch(
     timeframe: str,
     stop_event: threading.Event,
 ) -> None:
-    """Start the Finnhub socket and its bar-flush timer as background threads.
+    """Join the shared Finnhub socket and start this session's bar-flush timer.
 
-    The builders are created here, one per symbol, and shared by the two threads:
-    the socket thread fills them, the timer thread closes them out.
+    The builders are created here, one per symbol. The socket's thread fills
+    them and the timer thread closes them out. `app.ws` holds the subscription,
+    so the usual `app.ws.close()` releases it.
     """
     tf_minutes = TF_MINUTES.get(timeframe, 1)
     builders: dict[str, CandleBuilder] = {}
@@ -381,9 +482,7 @@ def launch(
         if state is not None:
             builders[symbol] = CandleBuilder(state, tf_minutes)
 
-    threading.Thread(
-        target=start_stream, args=(symbols, token, app, timeframe, builders), daemon=True
-    ).start()
+    app.ws = subscribe(symbols, token, app, builders)
     threading.Thread(
         target=_flush_loop, args=(builders, app, stop_event), daemon=True
     ).start()
