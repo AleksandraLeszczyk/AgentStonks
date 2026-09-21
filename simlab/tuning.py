@@ -156,11 +156,11 @@ TUNABLES: "dict[str, Tunable]" = {
         ),
         Tunable("take_fraction", "Share taken on a fade", 0.05, 1.0, 0.05, (0.30, 1.0, 0.10)),
         Tunable(
-            "hold_min_gain_k", "Keep a runner if target ≥ (× ADR)", 0.0, 3.0, 0.05,
+            "hold_min_gain_k", "Keep a runner if target ≥ (× unit)", 0.0, 3.0, 0.05,
             (0.0, 0.60, 0.10),
         ),
         Tunable(
-            "min_win_k", "Stand down under (× ADR a share)", 0.0, 3.0, 0.05,
+            "min_win_k", "Stand down under (× unit a share)", 0.0, 3.0, 0.05,
             (0.0, 0.40, 0.10),
         ),
         Tunable(

@@ -2242,14 +2242,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- Whole shares, rounded down, and at least one."
         ),
         "hold_min_gain_k": (
-            "Keep a runner only if the sell level is still this many ADRs above the fill; "
+            "Keep a runner only if the sell level is still this many × {unit} above the fill; "
             "otherwise a momentum take sells everything.\n\n"
             "- The gap is at most `buy − sell`: 0.15 on AAPL's default pair, 0.60 on "
             "GOOGL's — so 0.30 keeps a runner on GOOGL and INTC, never on AAPL.\n"
             "- A runner is sold at the sell level, at the flatten, or back at the fill."
         ),
         "min_win_k": (
-            "After a trade closes for no more than this many ADRs **per share**, nothing "
+            "After a trade closes for no more than this many × {unit} **per share**, nothing "
             "else is bought today.\n\n"
             "- {ticker} starts at **{min_win_k}** — per instrument, since it only means "
             "something against that symbol's own buy/sell pair.\n"

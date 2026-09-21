@@ -221,7 +221,7 @@ def dayrange_params(
     stop_gain_fraction, momentum_fade_bars, take_fraction, hold_min_gain_k = exit_params(
         defaults, float(buy_k), float(sell_k), unit_label, copy
     )
-    min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), copy)
+    min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
     return AppleTraderConfig(
         model_key=model_key,
         ticker=ticker,
@@ -241,11 +241,11 @@ def dayrange_params(
 
 
 def min_win_param(
-    ticker: str, buy_k: float, sell_k: float, copy: FormCopy
+    ticker: str, buy_k: float, sell_k: float, unit_label: str, copy: FormCopy
 ) -> float:
     """The session circuit breaker, and the one thing worth checking it against.
 
-    The most a target exit can net is `buy_k - sell_k` ADRs a share, so a
+    The most a target exit can net is `buy_k - sell_k` level units a share, so a
     threshold at or above that stands the session down after *every* completed
     trade however well it went. That is a legitimate setting -- one trade a day
     unless it runs past the target -- but it is not what "stop after a bad
@@ -259,11 +259,11 @@ def min_win_param(
     """
     section("Circuit breaker", copy.sections.get("dayrange_breaker"))
     min_win_k = st.number_input(
-        "Stand down after a trade under (× ADR a share)",
+        f"Stand down after a trade under (× {unit_label} a share)",
         min_value=0.0, max_value=3.0, value=min_win_for(ticker), step=0.05, format="%.2f",
         key=copy.key(f"min_win_k_{ticker}"),
         help=copy.help.get("min_win_k", "").format(
-            ticker=ticker, min_win_k=f"{min_win_for(ticker):g}"
+            ticker=ticker, min_win_k=f"{min_win_for(ticker):g}", unit=unit_label
         ),
     )
     target_gain = buy_k - sell_k
@@ -389,7 +389,7 @@ def exit_params(
     The stop is the one that takes the levels as an argument, because it is
     written as a share of what they are playing for rather than as a distance
     of its own. The number on screen therefore means a different stop on every
-    instrument, and what it comes to in ADRs is said underneath rather than
+    instrument, and what it comes to in level units is said in its `?` rather than
     left to be worked out -- the whole point of the reparameterisation is that
     the *fraction* travels between symbols and the distance does not.
     """
@@ -424,11 +424,11 @@ def exit_params(
         disabled=not momentum_fade_bars,
     )
     hold_min_gain_k = col_b.number_input(
-        "Keep a runner if the target is ≥ (× ADR above the fill)",
+        f"Keep a runner if the target is ≥ (× {unit_label} above the fill)",
         min_value=0.0, max_value=3.0, value=defaults.hold_min_gain_k, step=0.05,
         format="%.2f",
         key=copy.key("hold_min_gain_k"),
-        help=copy.help.get("hold_min_gain_k"),
+        help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
         disabled=not momentum_fade_bars,
     )
     return (
@@ -443,7 +443,7 @@ def stop_note(
     """What the stop fraction comes to against these levels, in their unit.
 
     A fraction of the predicted gain is the right thing to *set* and the wrong
-    thing to compare against the other exit knobs, which are all ADR distances
+    thing to compare against the other exit knobs, which are all level-unit distances
     -- so the conversion is in the stop's `?` rather than in the reader's head.
     The help is built before the widget renders, so it reads the value the
     widget is holding: the one on screen.

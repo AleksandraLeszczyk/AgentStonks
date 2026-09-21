@@ -1765,7 +1765,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
         "min_win_k": (
             "The session circuit breaker: after a trade closes for no more than this many "
-            "ADRs a share, the run buys nothing else that day.\n\n"
+            "× {unit} a share, the run buys nothing else that day.\n\n"
             "- {ticker} starts at **{min_win_k}** — per instrument, since it is only "
             "readable against that symbol's own `buy − sell`.\n"
             "- Judged over the whole position: a momentum take and its runner count as "
