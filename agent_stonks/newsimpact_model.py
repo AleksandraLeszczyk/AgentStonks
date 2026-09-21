@@ -344,7 +344,10 @@ def slope_tstat(grid: Grid, s: np.ndarray, k: np.ndarray, pre: int, post: int, b
     out = {}
     for name, lo_off, hi_off in (("t_pre", -1 - pre, -1), ("t_post", -1, -1 + post)):
         n = hi_off - lo_off + 1
-        idx = (np.asarray(k)[:, None] + np.arange(lo_off, hi_off + 1)[None, :])
+        if n < 3:  # a slope t-stat needs n - 2 > 0 residual degrees of freedom
+            out[name] = np.full(len(np.asarray(k)), np.nan)
+            continue
+        idx =(np.asarray(k)[:, None] + np.arange(lo_off, hi_off + 1)[None, :])
         valid = (idx >= 0).all(axis=1) & (idx < MAX_BARS).all(axis=1) & (np.asarray(s) >= 0)
         idx = np.clip(idx, 0, MAX_BARS - 1)
         Y = L[np.where(valid, s, 0)[:, None], idx]
