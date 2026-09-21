@@ -200,6 +200,35 @@ def _session_is_active(session_id: str) -> bool:
         return True
 
 
+# The Historical tab is a daily-bar view, but Streamlit renders every tab on
+# every rerun, so uncached these Yahoo downloads ran on each click anywhere in
+# the app -- ~4 s of network per widget change, whatever tab was on screen.
+# Cached here rather than in `historical`, whose other callers (premarket, the
+# agent's tools) keep their own freshness. Exceptions are not cached, so a
+# failed download is retried on the next rerun.
+_HISTORICAL_TTL_SEC = 300
+
+
+@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
+def _cached_close_series(symbol: str, days: int) -> pd.Series:
+    return fetch_close_series(symbol, days)
+
+
+@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
+def _cached_dividends(symbol: str, days: int) -> pd.Series:
+    return fetch_dividends(symbol, days)
+
+
+@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
+def _cached_earnings_dates(symbol: str, days: int) -> pd.DataFrame:
+    return fetch_earnings_dates(symbol, days)
+
+
+@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
+def _cached_static_analysis(symbol: str) -> dict:
+    return fetch_static_analysis(symbol)
+
+
 def _get_state() -> AppState:
     # Any rerun, in any session, stops the streams of sessions whose browser
     # has gone for good (see stream.reap_dead_sessions).
@@ -1201,8 +1230,8 @@ def _historical_panel(symbols: list[str]) -> None:
     days = HISTORICAL_PERIODS[period_label]
     # Shared context series fetched once for the whole basket.
     try:
-        spy_close = fetch_close_series(SPY_SYMBOL, days)
-        vix_close = fetch_close_series(VIX_SYMBOL, days)
+        spy_close = _cached_close_series(SPY_SYMBOL, days)
+        vix_close = _cached_close_series(VIX_SYMBOL, days)
     except Exception as exc:
         st.error(f"Failed to load market context series: {exc}")
         spy_close, vix_close = None, None
@@ -1210,9 +1239,9 @@ def _historical_panel(symbols: list[str]) -> None:
     for sym in symbols:
         with st.spinner(f"Loading historical data for {sym}…"):
             try:
-                ticker_close = fetch_close_series(sym, days)
-                dividends = fetch_dividends(sym, days)
-                earnings = fetch_earnings_dates(sym, days)
+                ticker_close = _cached_close_series(sym, days)
+                dividends = _cached_dividends(sym, days)
+                earnings = _cached_earnings_dates(sym, days)
             except Exception as exc:
                 st.error(f"Failed to load historical data for {sym}: {exc}")
                 continue
@@ -1233,7 +1262,7 @@ def _historical_panel(symbols: list[str]) -> None:
 
 
 def _static_analysis_panel(symbol: str) -> None:
-    static = fetch_static_analysis(symbol)
+    static = _cached_static_analysis(symbol)
     pe_ratio = static["pe_ratio"]
     dividend_yield = static["dividend_yield"]
     growth_rate = static["growth_rate"]
@@ -2027,15 +2056,15 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
         days = HISTORICAL_PERIODS[historical_period_label]
         target_syms = st.session_state.get("hist_target_syms") or []
         try:
-            spy_close = fetch_close_series(SPY_SYMBOL, days)
-            vix_close = fetch_close_series(VIX_SYMBOL, days)
+            spy_close = _cached_close_series(SPY_SYMBOL, days)
+            vix_close = _cached_close_series(VIX_SYMBOL, days)
         except Exception:
             spy_close, vix_close = None, None
         for sym in syms:
             try:
-                ticker_close = fetch_close_series(sym, days)
-                dividends = fetch_dividends(sym, days)
-                earnings = fetch_earnings_dates(sym, days)
+                ticker_close = _cached_close_series(sym, days)
+                dividends = _cached_dividends(sym, days)
+                earnings = _cached_earnings_dates(sym, days)
                 price_targets = fetch_price_target_history(sym, days) if sym in target_syms else None
                 historical_figs.append(
                     (
@@ -2306,12 +2335,24 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
 )
 
 
+# Both rule forms are fragments: a knob change reruns the form alone rather
+# than the whole page, every tab of which Streamlit would otherwise re-render
+# (and a full rerun is what made each edit freeze the screen). What they return
+# is only read by ▶ Start, whose click is a full rerun that runs these again
+# and so returns the values on screen. The chart overlay reads the config from
+# the state instead, so it is published from inside the fragment.
+@st.fragment
 def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     """Apple Trader's instrument and tunables, inside the dashboard's expander."""
     with st.expander("Apple Trader rules", expanded=True):
-        return apple_trader_ui.params(symbols, _APPLE_TRADER_COPY)
+        config = apple_trader_ui.params(symbols, _APPLE_TRADER_COPY)
+    # Published for the chart's buy/sell overlay, which is drawn from a
+    # configuration rather than from a model and should show the one on screen.
+    _get_state().apple_trader_config = config
+    return config
 
 
+@st.fragment
 def _apple_trader2_params(symbols: list[str]) -> AppleTrader2Config:
     """Apple Trader 2's instrument and rules.
 
@@ -2513,12 +2554,11 @@ def _agent_panel(
             if not os.getenv(env_var):
                 st.caption(f"⚠️ {env_var} is not set.")
 
-    apple_config = (
-        _apple_trader_params(symbols) if personality == APPLE_TRADER_KEY else None
-    )
-    # Published for the chart's buy/sell overlay, which is drawn from a
-    # configuration rather than from a model and should show the one on screen.
-    state.apple_trader_config = apple_config
+    if personality == APPLE_TRADER_KEY:
+        apple_config = _apple_trader_params(symbols)
+    else:
+        apple_config = None
+        state.apple_trader_config = None
     apple2_config = (
         _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
     )
