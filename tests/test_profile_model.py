@@ -190,3 +190,11 @@ class TestChartIntegration:
                           predicted_profile=self.make_profile(),
                           mixture_fit_target="live")
         assert any(t.name and t.name.startswith("C") for t in fig.data)
+
+    def test_gaussian_and_cauchy_drawn_together(self):
+        fig = build_chart(self.BARS, [], self.TRADES, "AAPL", self.SESSION_START,
+                          mixture_distribution=["gaussian", "cauchy"],
+                          mixture_max_components=2)
+        names = self._trace_names(fig)
+        assert any(n.startswith("G1") for n in names)
+        assert any(n.startswith("C1") for n in names)

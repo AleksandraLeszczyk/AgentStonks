@@ -241,7 +241,7 @@ _DEFAULTS: dict[str, object] = {
     "show_7d_avg": False,
     "show_28d_avg": False,
     "show_1y_avg": False,
-    "mixture_distribution": "none",
+    "mixture_distribution": [],
     "mixture_max_components": 0,
     "mixture_fit_target": "live",
     "show_predicted_profile": False,
@@ -341,7 +341,8 @@ class AppState:
         self.show_7d_avg: bool = False
         self.show_28d_avg: bool = False
         self.show_1y_avg: bool = False
-        self.mixture_distribution: str = "none"
+        # Mixtures fitted to the price profile: any of "gaussian", "cauchy".
+        self.mixture_distribution: list[str] = []
         self.mixture_max_components: int = 0
         self.mixture_fit_target: str = "live"
         self.show_predicted_profile: bool = False

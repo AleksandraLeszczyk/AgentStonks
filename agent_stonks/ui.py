@@ -706,30 +706,37 @@ def _live_chart_controls() -> None:
                 "comparable whichever live feed is streaming.",
             )
 
-        st.markdown("**Price Profile Fit**")
-        dist_choice = st.selectbox("Fit mixture", ["None", "Gaussian", "Cauchy"], index=0)
-        fit_enabled = dist_choice != "None"
-        max_components = st.slider(
-            "Components",
-            min_value=1,
-            max_value=5,
-            value=1,
-            disabled=not fit_enabled,
-        )
-        show_predicted = st.checkbox(
-            "ML predicted profile",
-            value=False,
-            help="Draws where today's volume is predicted to trade (LevelsML "
-            "density model: per-quantile LightGBM at the open, from daily-bar "
+        st.markdown(
+            "**Price Profile Fit**",
+            help="Gaussian / Cauchy: fit a mixture to the volume-at-price "
+            "profile (both can be drawn at once). ML predicted profile: draws "
+            "where today's volume is predicted to trade (LevelsML density "
+            "model: per-quantile LightGBM at the open, from daily-bar "
             "features). Needs the trained pack in ../Models and daily bars.",
         )
-        fit_target_choice = st.selectbox(
-            "Fit to",
-            ["Live volume", "Predicted profile"],
-            index=0,
-            disabled=not (fit_enabled and show_predicted),
-            help="Which profile the Gaussian/Cauchy mixture is fitted to.",
+        profile_selection = st.multiselect(
+            "Price profile fit",
+            list(_PROFILE_FIT_OPTIONS),
+            default=[],
+            placeholder="None",
+            label_visibility="collapsed",
         )
+        mixture_dists = [
+            _PROFILE_FIT_OPTIONS[o] for o in profile_selection
+            if _PROFILE_FIT_OPTIONS[o] != "predicted"
+        ]
+        show_predicted = "ML predicted profile" in profile_selection
+        max_components = 0
+        fit_target_choice = "Live volume"
+        if mixture_dists:
+            max_components = st.slider("Components", min_value=1, max_value=5, value=1)
+            if show_predicted:
+                fit_target_choice = st.selectbox(
+                    "Fit to",
+                    ["Live volume", "Predicted profile"],
+                    index=0,
+                    help="Which profile the mixture is fitted to.",
+                )
 
         overlay_keys = _model_overlay_controls(state)
 
@@ -770,8 +777,8 @@ def _live_chart_controls() -> None:
     state.fill_gaps = fill_gaps
     state.vwap_style = vwap_style
     state.show_fib = show_fib
-    state.mixture_distribution = dist_choice.lower() if fit_enabled else "none"
-    state.mixture_max_components = max_components if fit_enabled else 0
+    state.mixture_distribution = mixture_dists
+    state.mixture_max_components = max_components
     state.show_predicted_profile = show_predicted
     state.mixture_fit_target = (
         "predicted"
@@ -780,6 +787,15 @@ def _live_chart_controls() -> None:
     )
     state.model_overlay_keys = overlay_keys
 
+
+
+# Price Profile Fit multiselect: option label -> mixture distribution, or
+# "predicted" for the ML profile curve.
+_PROFILE_FIT_OPTIONS = {
+    "Gaussian mixture": "gaussian",
+    "Cauchy mixture": "cauchy",
+    "ML predicted profile": "predicted",
+}
 
 
 def _model_overlay_controls(state: AppState) -> "list[str]":

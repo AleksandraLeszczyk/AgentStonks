@@ -1,7 +1,7 @@
 import colorsys
 import textwrap
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -167,6 +167,16 @@ def _cmm_em(
 _MIXTURE_EM = {"gaussian": _gmm_em, "cauchy": _cmm_em}
 
 
+# Component label prefix, location symbol and scale symbol per distribution.
+_MIXTURE_SYMBOLS = {"gaussian": ("G", "μ", "σ"), "cauchy": ("C", "x₀", "γ")}
+
+
+def _mixture_dists(mixture_distribution: "str | Sequence[str]") -> list[str]:
+    """The known distributions among one name or a collection of names."""
+    names = [mixture_distribution] if isinstance(mixture_distribution, str) else mixture_distribution
+    return [d for d in names if d in _MIXTURE_EM]
+
+
 def _mixture_pdf(x: np.ndarray, loc: float, scale: float, dist: str) -> np.ndarray:
     if dist == "cauchy":
         return 1.0 / (np.pi * scale * (1.0 + ((x - loc) / scale) ** 2))
@@ -213,19 +223,22 @@ def _plot_price_distribution(
     fig: go.Figure,
     n_price_bins: int = 50,
     n_time_buckets: int = 20,
-    mixture_distribution: str = "none",
+    mixture_distribution: "str | Sequence[str]" = "none",
     mixture_max_components: int = 0,
     predicted_profile: Optional[dict] = None,
     mixture_fit_target: str = "live",
-) -> tuple[go.Figure, list[tuple[float, float, float]]]:
+) -> tuple[go.Figure, list[tuple[str, list[tuple[float, float, float]]]]]:
     """
     Add a horizontal volume-weighted price distribution histogram to col 2.
     Colors run violet→red from oldest to newest trades.
 
     `predicted_profile` ({"prices", "density", ...} from
     profile_model.predicted_open_profile) is drawn as a curve over the
-    histogram; `mixture_fit_target` picks whether the Gaussian/Cauchy mixture
-    is fitted to the realized volume ("live") or that curve ("predicted").
+    histogram; `mixture_fit_target` picks whether the Gaussian/Cauchy mixtures
+    are fitted to the realized volume ("live") or that curve ("predicted").
+    `mixture_distribution` is one distribution name or several, each fitted
+    and drawn separately. Returns the figure and one (distribution,
+    components) pair per fitted mixture.
     """
     df = df_trades.sort_values("t").reset_index(drop=True)
     has_trades = not df.empty
@@ -329,69 +342,73 @@ def _plot_price_distribution(
             col=2,
         )
 
-    fit_enabled = mixture_distribution in _MIXTURE_EM and mixture_max_components > 0
-    components: list[tuple[float, float, float]] = []
-    if fit_enabled:
+    fitted: list[tuple[str, list[tuple[float, float, float]]]] = []
+    dists = _mixture_dists(mixture_distribution) if mixture_max_components > 0 else []
+    if dists:
         if mixture_fit_target == "predicted" and pred_prices is not None:
             fit_centers, fit_weights, fit_step = pred_prices, pred_weights, pred_step
         else:
             fit_centers, fit_weights, fit_step = bin_centers, total_per_bin, bin_width
         total_vol = fit_weights.sum() if fit_weights is not None and len(fit_weights) else 0.0
-        if total_vol > 0:
+        color_offset = 0
+        for dist in dists if total_vol > 0 else []:
             components = _fit_mixture(fit_centers, fit_weights, mixture_max_components,
-                                      mixture_distribution,
-                                      min_scale=max(fit_step / 2, 1e-6))
-            if components:
-                price_smooth = np.linspace(fit_centers.min(), fit_centers.max(), 400)
-                scale = total_vol * fit_step
-                prefix = "C" if mixture_distribution == "cauchy" else "G"
-                loc_sym = "x₀" if mixture_distribution == "cauchy" else "μ"
-                scale_sym = "γ" if mixture_distribution == "cauchy" else "σ"
+                                      dist, min_scale=max(fit_step / 2, 1e-6))
+            if not components:
+                continue
+            fitted.append((dist, components))
+            price_smooth = np.linspace(fit_centers.min(), fit_centers.max(), 400)
+            scale = total_vol * fit_step
+            prefix, loc_sym, scale_sym = _MIXTURE_SYMBOLS[dist]
 
-                if len(components) > 1:
-                    mixture_pdf = sum(
-                        w * _mixture_pdf(price_smooth, mu, sigma, mixture_distribution)
-                        for w, mu, sigma in components
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=mixture_pdf * scale,
-                            y=price_smooth,
-                            mode="lines",
-                            name=f"{prefix}MM envelope",
-                            line=dict(color="#ffffff", width=2),
-                            opacity=0.9,
-                            hovertemplate=(
-                                "<b>Price:</b> %{y:.4f}<br>"
-                                "<b>Fitted vol:</b> %{x:,.0f}"
-                                "<extra></extra>"
-                            ),
+            if len(components) > 1:
+                mixture_pdf = sum(
+                    w * _mixture_pdf(price_smooth, mu, sigma, dist)
+                    for w, mu, sigma in components
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=mixture_pdf * scale,
+                        y=price_smooth,
+                        mode="lines",
+                        name=f"{prefix}MM envelope",
+                        # Solid for the Gaussian, dashed for the Cauchy, so the
+                        # two envelopes stay apart when both are drawn.
+                        line=dict(color="#ffffff", width=2,
+                                  dash="dash" if dist == "cauchy" else "solid"),
+                        opacity=0.9,
+                        hovertemplate=(
+                            "<b>Price:</b> %{y:.4f}<br>"
+                            "<b>Fitted vol:</b> %{x:,.0f}"
+                            f"<extra>{prefix}MM</extra>"
                         ),
-                        row=1,
-                        col=2,
-                    )
+                    ),
+                    row=1,
+                    col=2,
+                )
 
-                for i, (w, mu, sigma) in enumerate(components):
-                    pdf = w * _mixture_pdf(price_smooth, mu, sigma, mixture_distribution)
-                    color = _MIXTURE_COLORS[i % len(_MIXTURE_COLORS)]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=pdf * scale,
-                            y=price_smooth,
-                            mode="lines",
-                            name=f"{prefix}{i + 1}  {loc_sym}={mu:.2f}  {scale_sym}={sigma:.2f}",
-                            line=dict(color=color, width=1.5, dash="dot"),
-                            opacity=0.85,
-                            hovertemplate=(
-                                f"<b>{prefix}{i + 1}</b>  {loc_sym}={mu:.2f}  {scale_sym}={sigma:.2f}<br>"
-                                "<b>Price:</b> %{y:.4f}<br>"
-                                "<b>Fitted vol:</b> %{x:,.0f}"
-                                "<extra></extra>"
-                            ),
+            for i, (w, mu, sigma) in enumerate(components):
+                pdf = w * _mixture_pdf(price_smooth, mu, sigma, dist)
+                color = _MIXTURE_COLORS[(color_offset + i) % len(_MIXTURE_COLORS)]
+                fig.add_trace(
+                    go.Scatter(
+                        x=pdf * scale,
+                        y=price_smooth,
+                        mode="lines",
+                        name=f"{prefix}{i + 1}  {loc_sym}={mu:.2f}  {scale_sym}={sigma:.2f}",
+                        line=dict(color=color, width=1.5, dash="dot"),
+                        opacity=0.85,
+                        hovertemplate=(
+                            f"<b>{prefix}{i + 1}</b>  {loc_sym}={mu:.2f}  {scale_sym}={sigma:.2f}<br>"
+                            "<b>Price:</b> %{y:.4f}<br>"
+                            "<b>Fitted vol:</b> %{x:,.0f}"
+                            "<extra></extra>"
                         ),
-                        row=1,
-                        col=2,
-                    )
+                    ),
+                    row=1,
+                    col=2,
+                )
+            color_offset += len(components)
 
     if not has_trades:
         fig.update_layout(
@@ -400,7 +417,7 @@ def _plot_price_distribution(
             paper_bgcolor="rgba(0,0,0,0)",
             height=700,
         )
-        return fig, components
+        return fig, fitted
 
     # Invisible scatter to attach a colorbar legend
     fig.add_trace(
@@ -445,7 +462,7 @@ def _plot_price_distribution(
         bargroupgap=0,
         height=700,
     )
-    return fig, components
+    return fig, fitted
 
 
 def _add_moving_averages(df: pd.DataFrame, fig: go.Figure, periods: list[int]) -> None:
@@ -1409,7 +1426,7 @@ def build_chart(
     show_7d_avg: bool = True,
     show_28d_avg: bool = True,
     show_1y_avg: bool = False,
-    mixture_distribution: str = "none",
+    mixture_distribution: "str | Sequence[str]" = "none",
     mixture_max_components: int = 0,
     predicted_profile: Optional[dict] = None,
     mixture_fit_target: str = "live",
@@ -1466,7 +1483,7 @@ def build_chart(
     )
 
     if not df_trades.empty or predicted_profile is not None:
-        fig, mixture_components = _plot_price_distribution(
+        fig, mixture_fits = _plot_price_distribution(
             df_trades, fig,
             mixture_distribution=mixture_distribution,
             mixture_max_components=mixture_max_components,
@@ -1474,7 +1491,7 @@ def build_chart(
             mixture_fit_target=mixture_fit_target,
         )
     else:
-        mixture_components = []
+        mixture_fits = []
 
     body_colors = [PALETTE["up"] if c >= o else PALETTE["down"] for c, o in zip(df["c"], df["o"])]
     body_base = [min(o, c) for o, c in zip(df["o"], df["c"])]
@@ -1679,12 +1696,13 @@ def build_chart(
         df_daily=df_daily,
     )
 
-    if mixture_components:
+    color_offset = 0
+    for dist, components in mixture_fits:
         x0 = df["t"].iloc[0]
         x1 = df["t"].iloc[-1]
-        prefix = "C" if mixture_distribution == "cauchy" else "G"
-        for i, (_, mu, _) in enumerate(mixture_components):
-            color = _MIXTURE_COLORS[i % len(_MIXTURE_COLORS)]
+        prefix = _MIXTURE_SYMBOLS[dist][0]
+        for i, (_, mu, _) in enumerate(components):
+            color = _MIXTURE_COLORS[(color_offset + i) % len(_MIXTURE_COLORS)]
             fig.add_shape(
                 type="line",
                 x0=x0, x1=x1,
@@ -1700,6 +1718,7 @@ def build_chart(
                 showarrow=False,
                 xanchor="left",
             )
+        color_offset += len(components)
 
     if show_fib:
         _add_fibonacci_levels(df, fig)
