@@ -2,7 +2,7 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are two, and they
+named X" and never branch on which one they got. Today there are three, and they
 share a rule set:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
@@ -15,6 +15,12 @@ share a rule set:
                      time-of-day shape, so the reference the levels hang off
                      moves with the clock. Two saved files rather than one, and
                      unavailable wherever either is missing.
+`highlow`            HighLow_5m's forecast of the same two numbers, anchored on
+                     the 9:35 price and fitted on every session since 2023 (35%
+                     less error than TimeToChange3 on the same test window).
+                     Only the forecast differs: its bundle carries
+                     `kind="highlow"` and `apple_trader.DayRangeTrader` asks
+                     `highlow_model` for today's range instead.
 
 That second entry is why `AppleModel` carries `level_source`: what the levels
 are measured below used to be a separate setting beside the model picker, which
@@ -73,6 +79,12 @@ DEFAULT_TICKER = "AAPL"
 # model: TimeToChange3's pipeline was run per ticker, and each run produced its
 # own bundle.
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
+
+# Which symbols HighLow_5m has saved a bundle for (`highlow15m_<TICKER>.*`).
+# AAPL only as of the 2026-09-15 save; the notebook's config names GOOGL and
+# INTC but they were never run through it. Adding one is this tuple plus the
+# four files in `Code/Models`.
+HIGHLOW_TICKERS = (DEFAULT_TICKER,)
 
 
 @dataclass(frozen=True)
@@ -183,8 +195,27 @@ def _dayrange_intraday_unavailable(ticker: str = DEFAULT_TICKER) -> str:
     )
 
 
+def _load_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The HighLow bundle for one ticker, imported late for the same reason as
+    the day-range one (torch and LightGBM, in that order)."""
+    try:
+        from . import highlow_model
+    except ImportError:
+        return None
+    return highlow_model.load_bundle(ticker)
+
+
+def _highlow_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import highlow_model
+    except ImportError:
+        return Path(f"highlow15m_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return highlow_model.model_path(ticker)
+
+
 DAYRANGE_KEY = "dayrange"
 DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
+HIGHLOW_KEY = "highlow"
 # Both saved models have to exist for the pairing, so the symbols it covers are
 # the symbols both were fitted on.
 DAYRANGE_INTRADAY_TICKERS = tuple(
@@ -237,6 +268,28 @@ MODELS: "dict[str, AppleModel]" = {
         path=_intraday_path,
         unavailable=_dayrange_intraday_unavailable,
         level_source=LEVELS_INTRADAY,
+    ),
+    HIGHLOW_KEY: AppleModel(
+        key=HIGHLOW_KEY,
+        label="HighLow model",
+        summary=(
+            "FinNotebooks' HighLow_5m forecast of where the session's high and low "
+            "will land, made once at 9:35 -- measured from the 9:35 price in units "
+            "of the 14-day average range, by an equal blend of LightGBM and N-BEATS "
+            "fitted on every session since 2023 with its first five minutes. On "
+            "AAPL's 129-session test window its error is 35% below TimeToChange3's "
+            "($1.37 per extreme against $2.11). Only the forecast changes: the "
+            "levels, exits and breach rules are the day-range strategy's, hung off "
+            "this predicted high and predicted range."
+        ),
+        requires=(
+            "PyTorch, LightGBM, scikit-learn and joblib, the N-BEATS checkpoint, and "
+            "Alpaca credentials for ~150 sessions of SIP minute history"
+        ),
+        strategy=STRATEGY_DAYRANGE,
+        tickers=HIGHLOW_TICKERS,
+        load=_load_highlow,
+        path=_highlow_path,
     ),
 }
 

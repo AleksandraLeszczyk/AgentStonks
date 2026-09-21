@@ -525,6 +525,9 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     # for its shape stretched to the day-range forecast (a sibling of that cyan).
     "intraday_range":    "#facc15",
     "intraday_dayrange": "#2dd4bf",
+    # HighLow's forecast of the same two numbers as "day_range": a sibling of
+    # that cyan, bluer, so the two ranges can be drawn together and told apart.
+    "highlow_range": "#60a5fa",
     # Apple Trader's two resting levels. Deliberately not a sibling of the cyan
     # above: these are an *agent's* orders, not a model's forecast, and reading
     # the chart means telling the two apart at a glance.

@@ -649,6 +649,73 @@ class TestTraderLevelsOverlay:
             assert mo.TRADER_LEVELS_KEY not in mo.for_models([key], "AAPL")["keys"]
 
 
+class TestHighLowOverlay:
+    """HighLow's range is drawn like TimeToChange3's, and an agent configured on
+    HighLow has its levels drawn under HighLow's high -- not TimeToChange3's."""
+
+    def stub_both(self, monkeypatch, ttc3_high=210.0, highlow_high=206.0):
+        import agent_stonks.dayrange_model as dr
+        import agent_stonks.highlow_model as hl
+
+        monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: {"stub": True})
+        monkeypatch.setattr(dr, "opening_minutes", lambda bundle=None: 5)
+        monkeypatch.setattr(dr, "daily_frame_from_bars", lambda bars: pd.DataFrame())
+        base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0}
+        monkeypatch.setattr(dr, "forecast_session",
+                            lambda *a, **k: {**base, "pred_high": ttc3_high, "pred_low": 190.0})
+        seen = []
+
+        def highlow(bundle, ticker, opening, day, key=None, secret=None):
+            seen.append((key, secret))
+            return {**base, "pred_high": highlow_high, "pred_low": 190.0}
+
+        monkeypatch.setattr(hl, "forecast_session", highlow)
+        return seen
+
+    def config(self, **kwargs):
+        from agent_stonks.apple_trader import AppleTraderConfig
+        from agent_stonks.config import UNIT_ADR
+
+        return AppleTraderConfig(
+            ticker="AAPL", buy_k=0.75, sell_k=0.10, breach_update="off",
+            level_unit=UNIT_ADR, contain_range=False, **kwargs,
+        )
+
+    def test_the_highlow_range_is_two_levels_under_its_own_key(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        self.stub_both(monkeypatch)
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
+                           daily_bars=[], session_date=SESSION)["items"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Pred. high": 206.0, "Pred. low": 190.0}
+        assert {i["key"] for i in items} == {mo.HIGHLOW_RANGE_KEY}
+
+    def test_the_agents_levels_follow_the_model_it_is_configured_on(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        self.stub_both(monkeypatch)
+
+        def buy(model_key):
+            items = mo.compute(
+                [mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[],
+                session_date=SESSION, trader_config=self.config(model_key=model_key),
+            )["items"]
+            return next(i["value"] for i in items if i["label"] == "Buy level")
+
+        assert buy("dayrange") == pytest.approx(210.0 - 0.75 * 3.0)
+        assert buy("highlow") == pytest.approx(206.0 - 0.75 * 3.0)
+
+    def test_the_credentials_reach_the_sip_history(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        seen = self.stub_both(monkeypatch)
+        mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
+                   session_date=SESSION, credentials=("k", "s"))
+        assert seen == [("k", "s")]
+
+    def test_a_highlow_run_opens_showing_its_range(self):
+        assert mo.for_models([apple_models.HIGHLOW_KEY], "AAPL")["keys"] == [mo.HIGHLOW_RANGE_KEY]
+        assert mo.HIGHLOW_RANGE_KEY not in mo.keys_for("GOOGL")
+
+
 class TestLiveOverlays:
     LONG_HISTORY = [{"t": "2026-08-06", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}]
 

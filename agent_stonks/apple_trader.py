@@ -621,6 +621,53 @@ def _dayrange():
     return dayrange_model
 
 
+def _highlow():
+    """`agent_stonks.highlow_model`, imported on first use (same reason as
+    `_dayrange`)."""
+    from . import highlow_model
+
+    return highlow_model
+
+
+def session_forecast(
+    bundle: dict,
+    ticker: str,
+    opening,
+    today,
+    key: "str | None" = None,
+    secret: "str | None" = None,
+) -> "tuple[dict, float | None]":
+    """Today's `(forecast, open_price)` from whichever model `bundle` is.
+
+    The one place the strategy learns which model it is running on, and the
+    only thing that differs between them: both return the same forecast keys
+    (`pred_high`, `pred_low`, `adr14_abs`, ...), and every level, exit and
+    breach rule downstream reads those and nothing else.
+
+    `open_price` is the official opening print the day-range model is fed and
+    the intraday envelope is centred on. The HighLow model rolls its daily bars
+    up from minute bars, so it reads the first bar's open instead and needs no
+    print; None then makes the plan fall back to that same bar.
+    """
+    if bundle.get("kind") == "highlow":
+        return (
+            _highlow().forecast_session(bundle, ticker, opening, today, key, secret),
+            None,
+        )
+    dayrange = _dayrange()
+    history = dayrange.daily_frame_from_bars(
+        historical.fetch_daily_ohlc_bars(ticker, days=dayrange.DAILY_HISTORY_DAYS)
+    )
+    # Kept, not just passed on: under `intraday` the envelope is centred on the
+    # session's open, so the same print the forecast was built from is needed
+    # again on every bar of the day.
+    open_price = historical.fetch_session_open(ticker)
+    forecast = dayrange.forecast_session(
+        bundle, history, opening, today, open_price=open_price,
+    )
+    return forecast, open_price
+
+
 def _window_bars(
     state: AppState, ticker: str, tape: str, start, end
 ) -> "list[dict]":
@@ -986,18 +1033,14 @@ class DayRangeTrader(BaseTrader):
         """
         try:
             opening, tape = self._opening_window(state, frame, want)
-            dayrange = _dayrange()
-            history = dayrange.daily_frame_from_bars(
-                historical.fetch_daily_ohlc_bars(
-                    self.ticker, days=dayrange.DAILY_HISTORY_DAYS
-                )
-            )
-            # Kept, not just passed on: under `intraday` the envelope is centred
-            # on the session's open, so the same print the forecast was built
-            # from is needed again on every bar of the day.
-            open_price = historical.fetch_session_open(self.ticker)
-            forecast = dayrange.forecast_session(
-                bundle, history, opening, today, open_price=open_price,
+            # A replay's state carries placeholder keys (every *dataset* read is
+            # patched), so HighLow's SIP history falls back to the environment's
+            # there -- the one read no dataset can serve.
+            replayed = bool(getattr(state, "bar_tape_override", ""))
+            forecast, open_price = session_forecast(
+                bundle, self.ticker, opening, today,
+                key=None if replayed else state.api_key,
+                secret=None if replayed else state.api_secret,
             )
         except Exception as exc:
             self.blocked = {"date": today, "reason": str(exc)}
@@ -1821,7 +1864,10 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
 def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     """The one line the log opens a run with: which model, and what it will do."""
     metadata = bundle.get("metadata") or {}
-    mae = (metadata.get("test_metrics_ensemble") or {}).get("mae_usd_mean")
+    # TimeToChange3 files its held-out score as `test_metrics_ensemble`, HighLow
+    # as `test_metrics`; the dollar error is `mae_usd_mean` in both.
+    scores = metadata.get("test_metrics_ensemble") or metadata.get("test_metrics") or {}
+    mae = scores.get("mae_usd_mean")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
     exits = []
     if config.has_stop:

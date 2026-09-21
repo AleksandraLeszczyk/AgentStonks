@@ -31,8 +31,11 @@ Five overlays
 `intraday_dayrange`  the same curve stretched so its peak is TimeToChange3's
                      predicted high and its trough the predicted low. The one
                      forecast is shared with `day_range` within a call.
+`highlow_range`      HighLow's forecast of the same two numbers, drawn exactly
+                     like `day_range` (flat, or stepped once the session
+                     breaks it). See `highlow_model`.
 `trader_levels`      where Apple Trader would rest its buy and its sell, from
-                     the same forecast. The odd one out: every other overlay
+                     the forecast of the model its configuration names. The odd one out: every other overlay
                      draws what a *model* said, this one draws what an *agent*
                      would do about it, so it takes a configuration and asks
                      `apple_trader.session_levels` rather than deriving the
@@ -100,6 +103,7 @@ PROFILE_RANGE_KEY = "profile_range"
 INTRADAY_RANGE_KEY = "intraday_range"
 INTRADAY_DAYRANGE_KEY = "intraday_dayrange"
 TRADER_LEVELS_KEY = "trader_levels"
+HIGHLOW_RANGE_KEY = "highlow_range"
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,19 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         # This curve *is* what "Day Range × Intraday Volatility" measures its
         # levels below, so a run on that model opens showing it.
         models=(apple_models.DAYRANGE_INTRADAY_KEY,),
+    ),
+    HIGHLOW_RANGE_KEY: ModelOverlay(
+        key=HIGHLOW_RANGE_KEY,
+        label="Predicted day range (HighLow)",
+        summary=(
+            "HighLow's forecast of the session's high and low, made once from the "
+            "first five minutes and anchored on the 9:35 price. Drawn like the "
+            "TimeToChange3 range: flat while the session stays inside it, stepped "
+            "once it trades outside."
+        ),
+        requires="PyTorch, LightGBM, the HighLow bundle and Alpaca SIP minute history",
+        tickers=apple_models.HIGHLOW_TICKERS,
+        models=(apple_models.HIGHLOW_KEY,),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -422,6 +439,7 @@ def compute(
     open_price: "float | None" = None,
     dayrange_daily_bars: "list[dict] | None" = None,
     trader_config=None,
+    credentials: "tuple[str, str] | None" = None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
@@ -442,7 +460,12 @@ def compute(
     the honest default: a chart with nothing configured should show what the
     agent would do if started now, not the last symbol's numbers. A caller with
     a real one -- the live form's, or a stored run's -- passes it, and the
-    levels drawn are then that run's rather than a plausible set.
+    levels drawn are then that run's rather than a plausible set. The levels
+    hang off the forecast of the model that configuration names, so a HighLow
+    run draws its levels under HighLow's range.
+
+    `credentials` are the Alpaca key and secret the HighLow forecast reads its
+    SIP history with; None falls back to the environment's.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -479,6 +502,19 @@ def compute(
             )
         return memo["result"]
 
+    def highlow_forecast() -> dict:
+        if "highlow" not in memo:
+            memo["highlow"] = _highlow_forecast(symbol, session, day, credentials)
+        return memo["highlow"]
+
+    def trader_forecast() -> dict:
+        named = getattr(trader_config, "model_key", None)
+        if named == apple_models.HIGHLOW_KEY and (
+            (getattr(trader_config, "ticker", "") or "").upper() == symbol
+        ):
+            return highlow_forecast()
+        return day_range_forecast()
+
     builders = {
         DAY_RANGE_KEY: lambda: _day_range_items(
             day_range_forecast(), day, symbol, session, open_price, trader_config
@@ -492,8 +528,12 @@ def compute(
         INTRADAY_DAYRANGE_KEY: lambda: _intraday_dayrange_items(
             symbol, session, day, open_price, day_range_forecast()
         ),
+        HIGHLOW_RANGE_KEY: lambda: _day_range_items(
+            highlow_forecast(), day, symbol, session, None, trader_config,
+            key=HIGHLOW_RANGE_KEY,
+        ),
         TRADER_LEVELS_KEY: lambda: _trader_levels_items(
-            symbol, session, day, open_price, day_range_forecast(), trader_config
+            symbol, session, day, open_price, trader_forecast(), trader_config
         ),
     }
 
@@ -577,6 +617,48 @@ def _day_range_forecast(
     return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
 
 
+def _highlow_forecast(
+    symbol: str,
+    session: pd.DataFrame,
+    day: pd.Timestamp,
+    credentials: "tuple[str, str] | None",
+) -> dict:
+    """HighLow's forecast for the session, or why there is none -- the same
+    `{"forecast", "made_at", "problem"}` shape `_day_range_forecast` returns.
+
+    Its history is SIP minute bars strictly before `day`, read from the
+    model's own cache (`highlow_model.history_frame`), so a past session is
+    drawn with what the model could have said that morning.
+    """
+    def failed(problem: str) -> dict:
+        return {"forecast": None, "made_at": None, "problem": problem}
+
+    try:
+        bundle = apple_models.load(apple_models.HIGHLOW_KEY, symbol)
+        if bundle is None:
+            return failed(apple_models.unavailable_reason(apple_models.HIGHLOW_KEY, symbol))
+
+        from . import highlow_model  # heavy (torch + LightGBM); only once it is needed
+
+        want = highlow_model.opening_minutes(bundle)
+        if len(session) < want:
+            return failed(
+                f"the forecast is built on the first {want} minutes and only "
+                f"{len(session)} bars have closed."
+            )
+        opening = session.iloc[:want]
+        if float(opening["minutes_from_open"].iloc[0]) >= 1.0:
+            return failed(
+                f"these bars start at {session.index[0]:%H:%M}, not the 09:30 open, so "
+                "the first five minutes the forecast needs are not here."
+            )
+        key, secret = credentials or (None, None)
+        forecast = highlow_model.forecast_session(bundle, symbol, opening, day, key, secret)
+    except Exception as exc:  # a decoration must never take the chart down
+        return failed(str(exc))
+    return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
+
+
 def _day_range_items(
     result: dict,
     day: pd.Timestamp,
@@ -584,6 +666,7 @@ def _day_range_items(
     session: "pd.DataFrame | None" = None,
     open_price: "float | None" = None,
     config=None,
+    key: str = DAY_RANGE_KEY,
 ) -> "tuple[list[dict], str]":
     """The predicted high and low, and the range between them.
 
@@ -599,13 +682,16 @@ def _day_range_items(
 
     Falls back to the flat 9:35 forecast when there is no session to walk,
     which is what a caller with bars but no usable window has.
+
+    `key` is the overlay being drawn: `day_range` (TimeToChange3) or
+    `highlow_range`, which differ only in whose forecast `result` holds.
     """
-    overlay = OVERLAYS[DAY_RANGE_KEY]
+    overlay = OVERLAYS[key]
     forecast = result["forecast"]
     if forecast is None:
         return [], f"{overlay.label}: {result['problem']}"
 
-    color = MODEL_OVERLAY_COLORS[DAY_RANGE_KEY]
+    color = MODEL_OVERLAY_COLORS[key]
     x0 = result["made_at"]
     x1 = _session_close(day)
     high, low = float(forecast["pred_high"]), float(forecast["pred_low"])
@@ -619,13 +705,13 @@ def _day_range_items(
         return (
             [
                 _span(
-                    DAY_RANGE_KEY, "Predicted day range", x0, x1, color,
+                    key, "Predicted day range", x0, x1, color,
                     y0=low, y1=high,
                     note=f"{low:.2f} – {high:.2f} ({made_at})",
                 ),
-                _level(DAY_RANGE_KEY, "Pred. high", high, color,
+                _level(key, "Pred. high", high, color,
                        note=f"predicted session high ({made_at})", x0=x0, x1=x1),
-                _level(DAY_RANGE_KEY, "Pred. low", low, color,
+                _level(key, "Pred. low", low, color,
                        note=f"predicted session low ({made_at})", x0=x0, x1=x1),
             ],
             "",
@@ -636,7 +722,7 @@ def _day_range_items(
     return (
         [
             _band(
-                DAY_RANGE_KEY, "Pred. high / low",
+                key, "Pred. high / low",
                 [row["t"] for row in walked], lows, highs, color,
                 lower_label="Pred. low", upper_label="Pred. high",
                 note=(
@@ -831,6 +917,7 @@ def _trader_levels_items(
         f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
         + ("the predicted high" if config.level_source != "intraday"
            else "the intraday band's upper curve")
+        + (" (HighLow)" if config.model_key == apple_models.HIGHLOW_KEY else "")
     )
     moves = min(buys) != max(buys) or min(sells) != max(sells)
     if not moves:
@@ -970,6 +1057,7 @@ def live_overlays(
         return cached["result"]
 
     session_date = session_date_of(bars)
+    app = getattr(sym_state, "app", None)
     result = compute(
         wanted,
         sym_state.symbol,
@@ -977,6 +1065,7 @@ def live_overlays(
         daily_bars=list(sym_state.daily_bars or []),
         session_date=session_date,
         trader_config=config,
+        credentials=(getattr(app, "api_key", "") or None, getattr(app, "api_secret", "") or None),
         **_live_dayrange_inputs(sym_state.symbol, wanted, session_date),
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}

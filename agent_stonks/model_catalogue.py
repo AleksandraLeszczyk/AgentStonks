@@ -580,8 +580,81 @@ def _intraday_vol_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _highlow_spec(ticker: str) -> ModelSpec:
+    path = _saved_path("APPLE_HIGHLOW_MODEL", "highlow15m_{ticker}.joblib", ticker)
+    files = (
+        ModelFile("bundle", path),
+        ModelFile("N-BEATS weights", path.with_name(f"{path.stem}_nbeats.pt")),
+        ModelFile("metadata", path.with_suffix(".json")),
+    )
+    available, reason = _availability(files, "torch", "lightgbm", "sklearn", "joblib")
+    meta = _read_json(path.with_suffix(".json"))
+    test = meta.get("test_metrics") or {}
+    metrics = {k: v for k, v in test.items()}
+    if meta.get("walk_forward_mae_mean") is not None:
+        metrics["walk-forward MAE"] = meta["walk_forward_mae_mean"]
+    weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
+    data = meta.get("data") or {}
+    model = apple_models.get(apple_models.HIGHLOW_KEY)
+    return ModelSpec(
+        key=apple_models.HIGHLOW_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note="",
+        project="HighLow_5m, mirrors `highlow`",
+        predicts=(
+            "Where the **whole session's** high and low will land, called once at "
+            "9:35 and measured from the 9:35 price in 14-day average ranges. Like "
+            "TimeToChange3 it forecasts the *width* of the day well and its centre "
+            "only roughly."
+        ),
+        target="up = log(high / close5) / adr14, down = log(close5 / low) / adr14",
+        algorithm=(
+            "Weighted blend "
+            + " + ".join(f"{w:g} {k}" for k, w in weights.items())
+            + ", L1 loss, clipped to contain the observed 5-minute range"
+        ),
+        family="LightGBM + N-BEATS blend",
+        consumers=("Apple Trader — day-range strategy", "Chart overlay — predicted day range (HighLow)"),
+        features=tuple(list(meta.get("features") or []) + list(meta.get("sequence_channels") or [])),
+        inputs=(
+            f"~127 sessions of SIP minute bars rolled up to daily (a "
+            f"{meta.get('lookback', 32)}-day sequence inside it) + the first "
+            f"{meta.get('opening_minutes', 5)} minutes of today"
+        ),
+        metrics=metrics,
+        headline=(
+            ("MAE ($ per extreme)", f"${float(test['mae_usd_mean']):,.2f}")
+            if test.get("mae_usd_mean") is not None
+            else ("MAE (log units)", format_metric(test.get("mae_mean")))
+        ),
+        files=files,
+        trained_at=str(meta.get("created") or ""),
+        data_note=(
+            f"Fitted through {data.get('fit_through', '?')} on {data.get('sessions', '?')} "
+            f"sessions · held out {' – '.join(meta.get('held_out_week') or []) or '?'}"
+            if meta
+            else ""
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            f"MAE {format_metric(test.get('mae_mean'))} log units on the "
+            f"{', '.join((meta.get('splits') or {}).get('test') or []) or 'test'} window, "
+            "against TimeToChange3's published "
+            f"{format_metric(meta.get('ttc3_published_test_mae_mean'))}. The shipped "
+            "trading distances were swept on TimeToChange3's forecast, not this one."
+        ),
+    )
+
+
 _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
+    apple_models.HIGHLOW_KEY: _highlow_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,
 }
 

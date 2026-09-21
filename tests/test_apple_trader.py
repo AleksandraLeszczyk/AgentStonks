@@ -1022,6 +1022,90 @@ class TestDayRangeIntradayModel:
         )
 
 
+class TestHighLowModel:
+    """HighLow changes the forecast and nothing else: the same state machine,
+    the same levels arithmetic, fed HighLow's predicted high and range."""
+
+    KEY = "highlow"
+    BUNDLE = {"opening_minutes": 5, "kind": "highlow"}
+
+    def _stub_highlow(self, monkeypatch, forecast):
+        calls = []
+
+        def fake(bundle, ticker, opening, today, key=None, secret=None):
+            calls.append({"ticker": ticker, "bars": len(opening), "key": key, "secret": secret})
+            return dict(forecast)
+
+        monkeypatch.setattr(at._highlow(), "forecast_session", fake)
+        return calls
+
+    def test_it_drives_the_day_range_trader(self):
+        config = AppleTraderConfig(model_key=self.KEY)
+        assert isinstance(at.build_trader(config, self.BUNDLE), at.DayRangeTrader)
+        assert config.level_source == "dayrange"
+
+    def test_the_levels_hang_off_the_highlow_forecast(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        calls = self._stub_highlow(monkeypatch, {**FORECAST, "pred_high": 120.0})
+        trader = at.DayRangeTrader(replace(dayrange_config(), model_key=self.KEY))
+
+        tape.append(104.0, low=104.0)
+        trader.run_cycle(self.BUNDLE, state, tracker)
+        # 120 - 0.75 x 10 and 120 - 0.10 x 10: HighLow's high, the same rule.
+        assert trader.plan["buy_level"] == pytest.approx(112.5)
+        assert trader.plan["sell_level"] == pytest.approx(119.0)
+        # TimeToChange3 was never asked, and the SIP history got the run's keys.
+        assert tape.forecast_calls == 0
+        assert calls == [{"ticker": TICKER, "bars": 5, "key": "k", "secret": "s"}]
+
+    def test_a_replay_withholds_its_placeholder_keys(self, state, market_open, monkeypatch):
+        """SimLab's state carries "simulated" keys; sending those to Alpaca is a
+        401 on every session. None lets the history read the environment's."""
+        state.bar_tape_override = "yfinance"
+        state.api_key = state.api_secret = "simulated"
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        Tape(monkeypatch).append(104.0, low=104.0)
+        calls = self._stub_highlow(monkeypatch, FORECAST)
+        trader = at.DayRangeTrader(replace(dayrange_config(), model_key=self.KEY))
+        trader.run_cycle(self.BUNDLE, state, tracker)
+        assert (calls[0]["key"], calls[0]["secret"]) == (None, None)
+
+    def test_under_the_predicted_range_unit_it_is_highlows_range(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        Tape(monkeypatch).append(104.0, low=104.0)
+        self._stub_highlow(monkeypatch, {**FORECAST, "pred_high": 110.0, "pred_low": 106.0})
+        trader = at.DayRangeTrader(
+            replace(dayrange_config(level_unit=UNIT_PRED_RANGE), model_key=self.KEY)
+        )
+        trader.run_cycle(self.BUNDLE, state, tracker)
+        assert trader.plan["buy_level"] == pytest.approx(110.0 - 0.75 * 4.0)
+
+    def test_a_highlow_failure_stands_the_session_down(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+
+        def boom(*a, **k):
+            raise ValueError("only 40 complete SIP sessions of history")
+
+        monkeypatch.setattr(at._highlow(), "forecast_session", boom)
+        trader = at.DayRangeTrader(replace(dayrange_config(), model_key=self.KEY))
+        tape.append(104.0, low=90.0)
+        assert trader.run_cycle(self.BUNDLE, state, tracker) == "no_data"
+        assert "SIP sessions" in trader.blocked["reason"]
+        assert tracker.position_for(TICKER) == 0
+
+    def test_it_is_refused_on_a_symbol_it_was_not_fitted_on(self):
+        config = AppleTraderConfig(ticker="GOOGL", model_key=self.KEY)
+        assert "HighLow" in at.model_ticker_error(config)
+
+    def test_it_signs_its_own_row_in_results(self):
+        sig = config_signature(AppleTraderConfig(model_key=self.KEY))
+        assert sig.startswith("highlow_AAPL(")
+
+
 class TestIntradayLevelSource:
     """The levels resting under the intraday band rather than under a flat high.
 
@@ -2242,7 +2326,11 @@ class TestPredictedRangeUnit:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        for symbol in (TICKER, NON_AAPL, "INTC"):
+        # HighLow_5m has only been run on AAPL.
+        assert apple_models.keys_for(TICKER) == [
+            "dayrange", "dayrange_intraday", "highlow",
+        ]
+        for symbol in (NON_AAPL, "INTC"):
             assert apple_models.keys_for(symbol) == [
                 "dayrange", "dayrange_intraday",
             ]

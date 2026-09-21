@@ -322,7 +322,11 @@ DAYRANGE_PRESET = "Day range — two levels below the predicted high"
 
 class TestInstrument:
     def test_the_models_on_offer_follow_the_symbol(self):
-        for symbol in (TICKER, DAYRANGE_ONLY, "INTC"):
+        # HighLow_5m has only been run on AAPL.
+        assert apple_models.keys_for(TICKER) == [
+            "dayrange", "dayrange_intraday", "highlow",
+        ]
+        for symbol in (DAYRANGE_ONLY, "INTC"):
             assert apple_models.keys_for(symbol) == [
                 "dayrange", "dayrange_intraday",
             ]

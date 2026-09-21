@@ -1661,6 +1661,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "The predicted high, flat for the session — what the shipped buy/sell "
             "distances were swept against, and what every stored record replays as."
         ),
+        "model_highlow": (
+            "The day-range rules on HighLow's predicted high and range. The shipped "
+            "distances were swept on TimeToChange3's forecast, so sweep them again on "
+            "the Tuning tab.\n\n"
+            "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY "
+            "/ ALPACA_SECRET), cached under `data/highlow/` — the first replay fetches it."
+        ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band, so the whole ladder "
             "descends through the morning and rises into the close.\n\n"

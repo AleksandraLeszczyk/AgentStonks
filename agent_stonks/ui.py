@@ -2141,6 +2141,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "The levels hang off the predicted high — one number for the whole session. "
             "The notebook's rule, and what the buy and sell distances were swept against."
         ),
+        "model_highlow": (
+            "The day-range rules, unchanged, on HighLow's predicted high and predicted "
+            "range instead of TimeToChange3's.\n\n"
+            "- Its range is usually **narrower** (it anchors on the 9:35 price), so "
+            "distances counted in the predicted range sit closer together.\n"
+            "- The shipped buy/sell distances were swept on TimeToChange3's forecast, "
+            "not this one.\n"
+            "- At 9:35 it needs ~150 sessions of Alpaca SIP minute history: the first "
+            "run fetches it (tens of seconds) and caches it under `data/highlow/`."
+        ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band.\n\n"
             "- The band *is* the predicted high at 09:30, pulls in to about a fifth of "

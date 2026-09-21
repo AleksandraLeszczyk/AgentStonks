@@ -32,6 +32,16 @@ duration of a simulation:
   answer) -> today's frame sliced out of one frame per replayed day, instead
   of rebuilt from the bar buffer on every cycle. Same rows; it is what makes a
   tuning grid of rule replays affordable
+
+Deliberately *not* patched: ``highlow_model.history_frame``. The HighLow
+forecast reads Alpaca SIP minute history strictly before the session date it is
+handed -- the simulated day, never the wall clock -- so a replay already gets
+the history a live run on that day would have had, from the model's own disk
+cache (``data/highlow/``). Nothing about the dataset could supply it anyway:
+it needs ~150 sessions of minute bars and a dataset stores a handful. It reads
+with ALPACA_API_KEY / ALPACA_SECRET, since the engine's own keys are
+placeholders (``DayRangeTrader._plan_session`` withholds them in a replay).
+
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead
 of silently leaking real-time data into simulated sessions.
