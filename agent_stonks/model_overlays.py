@@ -414,6 +414,33 @@ def _band(key: str, label_: str, ts, lower, upper, color: str,
     }
 
 
+def _path(key: str, label_: str, ts, values, color: str,
+          dash: str = "dot", note: str = "") -> dict:
+    """A single price that changes through the session.
+
+    A `level` that moves: one curve over the timestamps, with nothing tinted
+    either side of it. For a line that belongs beside a band rather than inside
+    it -- Apple Trader's stop follows its buy level, but the gap between the two
+    is not a range anyone predicted, and tinting it would say it was. Clipped
+    like a band, and shares its overlay's legend entry.
+    """
+    stamps = pd.DatetimeIndex(ts)
+    if stamps.tz is None:
+        stamps = stamps.tz_localize(market_hours.MARKET_TZ)
+    return {
+        "kind": "path",
+        "key": key,
+        "label": label_,
+        "group": OVERLAYS[key].label if key in OVERLAYS else key,
+        "t": [stamp.isoformat() for stamp in stamps.tz_convert("UTC")],
+        "values": [float(v) for v in values],
+        "color": color,
+        "dash": dash,
+        "note": note,
+        "forward": False,
+    }
+
+
 def _iso(ts) -> str:
     """A timestamp in the one form every consumer here accepts.
 
@@ -883,7 +910,7 @@ def _trader_levels_items(
     result: dict,
     config=None,
 ) -> "tuple[list[dict], str]":
-    """The buy and the sell, as the configured agent would rest them.
+    """The buy, the sell and the stop, as the configured agent would rest them.
 
     Flat under the notebook's settings and a moving pair under the others, so
     the shape of the drawing follows the shape of the strategy: two levels when
@@ -891,7 +918,9 @@ def _trader_levels_items(
     where a resting order is exactly the kind of thing to read against traded
     volume -- and a band between them when they do.
     """
-    from .apple_trader import AppleTraderConfig, session_levels  # heavy-ish, and only here
+    from .apple_trader import (  # heavy-ish, and only here
+        AppleTraderConfig, session_levels, stop_phrase,
+    )
 
     overlay = OVERLAYS[TRADER_LEVELS_KEY]
     forecast = result["forecast"]
@@ -919,18 +948,30 @@ def _trader_levels_items(
            else "the intraday band's upper curve")
         + (" (HighLow)" if config.model_key == apple_models.HIGHLOW_KEY else "")
     )
+    stops = [row["stop"] for row in levels if row["stop"] is not None]
+    stop_color = MODEL_OVERLAY_COLORS["trader_stop"]
+    stop_note = (
+        f"Apple Trader's stop, {stop_phrase(config)} under a fill at the buy level "
+        "(a fill above the buy stops that much higher, and is then fixed in dollars)"
+    )
     moves = min(buys) != max(buys) or min(sells) != max(sells)
     if not moves:
         x0, x1 = made_at, _session_close(day)
-        return (
-            [
-                _level(TRADER_LEVELS_KEY, "Buy level", buys[0], color,
-                       note=f"Apple Trader's resting buy — {how}", x0=x0, x1=x1),
-                _level(TRADER_LEVELS_KEY, "Sell level", sells[0], color, dash="dashdot",
-                       note=f"Apple Trader's resting sell — {how}", x0=x0, x1=x1),
-            ],
-            "",
-        )
+        items = [
+            _level(TRADER_LEVELS_KEY, "Buy level", buys[0], color,
+                   note=f"Apple Trader's resting buy — {how}", x0=x0, x1=x1),
+            _level(TRADER_LEVELS_KEY, "Sell level", sells[0], color, dash="dashdot",
+                   note=f"Apple Trader's resting sell — {how}", x0=x0, x1=x1),
+        ]
+        if stops:
+            items.append(_level(TRADER_LEVELS_KEY, "Stop level", stops[0], stop_color,
+                                dash="dot", note=stop_note, x0=x0, x1=x1))
+        return items, ""
+    stop_path = (
+        [_path(TRADER_LEVELS_KEY, "Stop level", [row["t"] for row in levels], stops,
+               stop_color, note=f"{stop_note}; it follows the buy level")]
+        if stops else []
+    )
     return (
         [
             _band(
@@ -942,7 +983,8 @@ def _trader_levels_items(
                     f"({buys[0]:.2f} – {sells[0]:.2f} at the forecast, "
                     f"{buys[-1]:.2f} – {sells[-1]:.2f} now)"
                 ),
-            )
+            ),
+            *stop_path,
         ],
         "",
     )

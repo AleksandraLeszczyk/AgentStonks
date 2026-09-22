@@ -1801,8 +1801,15 @@ def session_levels(
     minute bars and `opening_end` the last bar of the window the forecast was
     built on -- bars at or before it are skipped, exactly as the loop skips
     trading them. Returns one
-    `{"t", "buy", "sell", "reference", "pred_high", "pred_low"}` per bar after
-    that, in order.
+    `{"t", "buy", "sell", "stop", "reference", "pred_high", "pred_low"}` per
+    bar after that, in order.
+
+    `stop` is where the stop would sit under a fill *at* the buy level --
+    `stop_distance` read off the plan exactly as `_buy` reads it -- or None when
+    the configuration has no stop. A real fill prints at the close of the bar
+    that reached the level, so it can sit a little above the buy and take its
+    stop up with it; and once filled the stop is frozen in dollars (`_risk`)
+    while this line keeps following the levels.
 
     The forecast is in each row as well as the levels because the two must be
     drawn from the same walk: the levels hang off the predicted high, so a
@@ -1834,11 +1841,14 @@ def session_levels(
             continue
         trader._move_range(session[session.index <= ts], ts)
         trader._set_levels(ts)
+        buy = float(trader.plan["buy_level"])
+        risk = stop_distance(config, stop_unit(config, trader.plan))
         out.append(
             {
                 "t": ts,
-                "buy": float(trader.plan["buy_level"]),
+                "buy": buy,
                 "sell": float(trader.plan["sell_level"]),
+                "stop": buy - risk if risk else None,
                 "reference": float(trader.plan["reference"]),
                 "pred_high": float(trader.plan["pred_high"]),
                 "pred_low": float(trader.plan["pred_low"]),

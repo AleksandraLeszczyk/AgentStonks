@@ -484,6 +484,9 @@ class TestTraderLevelsOverlay:
         # `test_containment_makes_off_draw_a_band` is where it is switched on.
         kwargs.setdefault("contain_range", False)
         kwargs.setdefault("breach_exit", False)
+        # And no stop, so the buy/sell tests see two lines -- the stop tests
+        # switch it on.
+        kwargs.setdefault("stop_gain_fraction", 0.0)
         return AppleTraderConfig(**kwargs)
 
     def first_buy(self, items):
@@ -527,6 +530,42 @@ class TestTraderLevelsOverlay:
         assert levels == {"Buy level": pytest.approx(207.75),
                           "Sell level": pytest.approx(209.70)}
         assert not [i for i in items if i["kind"] == "band"]
+
+    def test_the_stop_is_drawn_under_the_buy_level(self, monkeypatch):
+        """Where the agent's stop would sit under a fill at the buy: half the
+        0.65 ADR the trade plays for, off the $3 ADR -- $0.975 under 207.75."""
+        items = self.items(monkeypatch, self.config(stop_gain_fraction=0.5))["items"]
+        stop = next(i for i in items if i["label"] == "Stop level")
+        assert stop["kind"] == "level"
+        assert stop["value"] == pytest.approx(207.75 - 0.5 * 0.65 * 3.0)
+        buy = next(i for i in items if i["label"] == "Buy level")
+        assert (stop["x0"], stop["x1"]) == (buy["x0"], buy["x1"])
+
+    def test_the_legacy_adr_stop_is_drawn_in_adrs(self, monkeypatch):
+        items = self.items(
+            monkeypatch, self.config(stop_gain_fraction=0.0, stop_k=0.2)
+        )["items"]
+        stop = next(i for i in items if i["label"] == "Stop level")
+        assert stop["value"] == pytest.approx(207.75 - 0.2 * 3.0)
+
+    def test_a_stop_follows_moving_levels(self, monkeypatch):
+        """Under a breach the buy moves, and the stop hangs off it -- drawn as
+        its own line, not a second tinted band."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        bars = minute_bars()
+        bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
+        items = mo.compute(
+            [mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[], session_date=SESSION,
+            trader_config=self.config(breach_update="extreme", stop_gain_fraction=0.5),
+        )["items"]
+        band = next(i for i in items if i["kind"] == "band")
+        path = next(i for i in items if i["kind"] == "path")
+        assert path["label"] == "Stop level"
+        assert path["t"] == band["t"]
+        risk = 0.5 * 0.65 * 3.0
+        assert path["values"][0] == pytest.approx(band["lower"][0] - risk)
+        assert path["values"][-1] == pytest.approx(band["lower"][-1] - risk)
 
     def test_the_two_distances_are_the_configured_ones(self, monkeypatch):
         items = self.items(monkeypatch, self.config(buy_k=1.0, sell_k=0.5))["items"]
@@ -1055,6 +1094,22 @@ class TestRenderer:
         last_bar = pd.Timestamp(BARS[-1]["t"]).tz_convert("UTC").tz_localize(None)
         assert pd.Timestamp(max(upper.x)) <= last_bar
         assert pd.Timestamp(fig.layout.xaxis.range[1]) == pd.Timestamp(BARS[-1]["t"])
+
+    def test_a_path_is_one_unfilled_line_behind_the_candles_in_its_bands_legend(self):
+        """A moving stop beside the moving buy/sell band: its own curve, no
+        tint, and hidden with the band from the one legend entry."""
+        stop = {**envelope(), "kind": "path", "label": "Stop level",
+                "values": envelope()["lower"], "color": "#f87171"}
+        del stop["upper"], stop["lower"]
+        fig = self.chart([envelope(), stop])
+        traces = [t for t in fig.data if t.legendgroup == "iv"]
+        assert len(traces) == 3
+        path = traces[-1]
+        assert path.fill in (None, "none") and path.line.color == "#f87171"
+        assert "Stop level" in path.hovertemplate
+        assert sum(bool(t.showlegend) for t in traces) == 1
+        candles = next(i for i, t in enumerate(fig.data) if t.name == "AAPL")
+        assert fig.data.index(path) < candles
 
     def test_a_band_draws_on_simlabs_plain_figure(self):
         fig = go.Figure(

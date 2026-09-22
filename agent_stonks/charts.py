@@ -1279,7 +1279,8 @@ def _add_bands(
     row: Optional[int],
     col: Optional[int],
 ) -> None:
-    """Price ranges that change through the session (`model_overlays._band`).
+    """Price ranges that change through the session (`model_overlays._band`),
+    and single prices that do (`model_overlays._path`).
 
     Each band is two line traces -- its upper edge, then its lower edge filled
     up to it -- clipped to the visible span like any non-forward span, so a
@@ -1306,18 +1307,32 @@ def _add_bands(
         if visible.sum() < 2:
             continue
         xs = stamps[visible]
-        upper = np.asarray(item.get("upper") or [], float)[visible]
-        lower = np.asarray(item.get("lower") or [], float)[visible]
         color = item.get("color") or PALETTE["accent"]
         key = item.get("key")
         name = item.get("group") or item.get("label", key)
+        line = dict(color=color, width=1.2, dash=item.get("dash", "dot"))
+        note = [item.get("note", "")] * len(xs)
+        if item.get("kind") == "path":
+            # One curve, no fill: a moving level (`model_overlays._path`).
+            values = np.asarray(item.get("values") or [], float)[visible]
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=values, mode="lines", line=line, name=name,
+                    legendgroup=key, showlegend=key not in shown, customdata=note,
+                    hovertemplate=f"<b>{item.get('label', '')}</b> %{{y:.2f}}"
+                    "<br>%{x|%H:%M} · %{customdata}<extra></extra>",
+                ),
+                row=row, col=col,
+            )
+            shown.add(key)
+            continue
+        upper = np.asarray(item.get("upper") or [], float)[visible]
+        lower = np.asarray(item.get("lower") or [], float)[visible]
         # The legend names the overlay once; the hover names the edge, which is
         # where a band that stands in for two named levels keeps their names.
         label_ = item.get("label", "")
         up_name = item.get("upper_label") or f"{label_} upper"
         low_name = item.get("lower_label") or f"{label_} lower"
-        line = dict(color=color, width=1.2, dash=item.get("dash", "dot"))
-        note = [item.get("note", "")] * len(xs)
         fig.add_trace(
             go.Scatter(
                 x=xs, y=upper, mode="lines", line=line, name=name,
@@ -1460,7 +1475,7 @@ def add_model_overlays(
                 )
             events.append({**item, "_ts": ts})
 
-        elif kind == "band":
+        elif kind in ("band", "path"):
             bands.append(item)
 
     if bands:
