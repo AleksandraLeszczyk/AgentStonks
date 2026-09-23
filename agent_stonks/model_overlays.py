@@ -377,7 +377,8 @@ def _span(key: str, label_: str, x0, x1, color: str,
 
 def _band(key: str, label_: str, ts, lower, upper, color: str,
           dash: str = "dot", note: str = "",
-          lower_label: str = "", upper_label: str = "") -> dict:
+          lower_label: str = "", upper_label: str = "",
+          step: bool = False) -> dict:
     """A price range that changes through the session.
 
     Where a `span` is one rectangle, a band is a pair of curves over the same
@@ -393,6 +394,12 @@ def _band(key: str, label_: str, ts, lower, upper, color: str,
     shape that could only say "upper" and "lower" would have lost something in
     the switch. They default to that generic pair, which is right for a band
     whose edges have no names of their own -- a volatility envelope's do not.
+
+    `step` draws each value as holding until the next timestamp instead of
+    sloping into it. It is for a forecast or a level that is *revised* at a
+    bar rather than one that varies continuously: the revision happened at
+    that candle, and a one-minute diagonal into it would blur exactly the
+    moment the reader is looking for.
     """
     stamps = pd.DatetimeIndex(ts)
     if stamps.tz is None:
@@ -410,19 +417,20 @@ def _band(key: str, label_: str, ts, lower, upper, color: str,
         "color": color,
         "dash": dash,
         "note": note,
+        "step": step,
         "forward": False,
     }
 
 
 def _path(key: str, label_: str, ts, values, color: str,
-          dash: str = "dot", note: str = "") -> dict:
+          dash: str = "dot", note: str = "", step: bool = False) -> dict:
     """A single price that changes through the session.
 
     A `level` that moves: one curve over the timestamps, with nothing tinted
     either side of it. For a line that belongs beside a band rather than inside
     it -- Apple Trader's stop follows its buy level, but the gap between the two
     is not a range anyone predicted, and tinting it would say it was. Clipped
-    like a band, and shares its overlay's legend entry.
+    like a band, and shares its overlay's legend entry. `step` as for a band.
     """
     stamps = pd.DatetimeIndex(ts)
     if stamps.tz is None:
@@ -437,6 +445,7 @@ def _path(key: str, label_: str, ts, values, color: str,
         "color": color,
         "dash": dash,
         "note": note,
+        "step": step,
         "forward": False,
     }
 
@@ -751,7 +760,7 @@ def _day_range_items(
             _band(
                 key, "Pred. high / low",
                 [row["t"] for row in walked], lows, highs, color,
-                lower_label="Pred. low", upper_label="Pred. high",
+                lower_label="Pred. low", upper_label="Pred. high", step=True,
                 note=(
                     f"the {made_at}, revised where the session traded outside it "
                     f"({low:.2f} – {high:.2f} at 09:35, "
@@ -969,7 +978,7 @@ def _trader_levels_items(
         return items, ""
     stop_path = (
         [_path(TRADER_LEVELS_KEY, "Stop level", [row["t"] for row in levels], stops,
-               stop_color, note=f"{stop_note}; it follows the buy level")]
+               stop_color, note=f"{stop_note}; it follows the buy level", step=True)]
         if stops else []
     )
     return (
@@ -977,7 +986,7 @@ def _trader_levels_items(
             _band(
                 TRADER_LEVELS_KEY, "Buy/sell levels",
                 [row["t"] for row in levels], buys, sells, color,
-                lower_label="Buy level", upper_label="Sell level",
+                lower_label="Buy level", upper_label="Sell level", step=True,
                 note=(
                     f"{how}; they move through the session "
                     f"({buys[0]:.2f} – {sells[0]:.2f} at the forecast, "

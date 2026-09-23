@@ -267,6 +267,24 @@ class TestDayRangeOverlay:
         # The high was never traded through, so it is flat across the session.
         assert min(band["upper"]) == max(band["upper"]) == pytest.approx(210.0)
 
+    def test_a_breach_on_the_first_bar_still_shows_the_935_forecast_before_it(
+        self, monkeypatch
+    ):
+        """The walk reads each bar before recording it, so a breach on the very
+        first bar after the forecast used to be in every row: the band came out
+        flat at the revised high, as if that had been the forecast all along."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch, low=196.0)
+        bars = minute_bars()
+        bars[5] = {**bars[5], "h": 215.0}    # the 09:35 bar, first after the window
+        band = mo.compute([mo.DAY_RANGE_KEY], "AAPL", bars,
+                          daily_bars=[], session_date=SESSION)["items"][0]
+        assert band["kind"] == "band" and band["step"]
+        start = pd.Timestamp(band["t"][0]).tz_convert("America/New_York")
+        assert (start.hour, start.minute) == (9, 34)
+        assert band["upper"][0] == pytest.approx(210.0)
+        assert band["upper"][1] > 210.0
+
     def test_the_low_only_steps_down_and_never_back_up(self, monkeypatch):
         """Piecewise, not a curve fitted to the tape: each step holds until the
         session trades through it again."""
@@ -621,6 +639,22 @@ class TestTraderLevelsOverlay:
                            trader_config=self.config(breach_update="extreme"))["items"]
         band = next(i for i in moved if i["kind"] == "band")
         assert band["lower"][-1] == pytest.approx(215.0 - 0.75 * 3.0)
+
+    def test_a_breach_on_the_first_bar_steps_the_levels_at_that_bar(self, monkeypatch):
+        """The live case that drew two flat lines: the tape went through the
+        predicted high on the bar straight after the forecast, so every walked
+        row already held the revised levels. The forecast's own levels lead the
+        band now, and the step lands on the bar that breached."""
+        bars = minute_bars()
+        bars[5] = {**bars[5], "h": 215.0}    # the 09:35 bar, first after the window
+        items = self.items(monkeypatch, self.config(breach_update="extreme"),
+                           bars=bars)["items"]
+        band = next(i for i in items if i["kind"] == "band")
+        assert band["step"]
+        assert band["lower"][0] == pytest.approx(207.75)     # the 09:35 buy
+        assert band["lower"][1] == pytest.approx(215.0 - 0.75 * 3.0)
+        stamps = [pd.Timestamp(t).tz_convert("America/New_York") for t in band["t"][:2]]
+        assert [(t.hour, t.minute) for t in stamps] == [(9, 34), (9, 35)]
 
     def test_no_config_draws_the_instruments_shipped_levels(self, monkeypatch):
         """A chart with nothing configured shows what the agent would do if
@@ -1110,6 +1144,16 @@ class TestRenderer:
         assert sum(bool(t.showlegend) for t in traces) == 1
         candles = next(i for i, t in enumerate(fig.data) if t.name == "AAPL")
         assert fig.data.index(path) < candles
+
+    def test_a_stepped_band_holds_each_value_until_the_next(self):
+        """A revised forecast changes at a bar; a sloped line into the revision
+        would hide the minute it happened. A smooth envelope stays linear."""
+        fig = self.chart([{**envelope(), "step": True}])
+        edges = [t for t in fig.data if t.legendgroup == "iv"]
+        assert {t.line.shape for t in edges} == {"hv"}
+        fig = self.chart([envelope()])
+        edges = [t for t in fig.data if t.legendgroup == "iv"]
+        assert {t.line.shape for t in edges} == {"linear"}
 
     def test_a_band_draws_on_simlabs_plain_figure(self):
         fig = go.Figure(

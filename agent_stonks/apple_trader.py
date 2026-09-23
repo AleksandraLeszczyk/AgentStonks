@@ -1801,8 +1801,10 @@ def session_levels(
     minute bars and `opening_end` the last bar of the window the forecast was
     built on -- bars at or before it are skipped, exactly as the loop skips
     trading them. Returns one
-    `{"t", "buy", "sell", "stop", "reference", "pred_high", "pred_low"}` per
-    bar after that, in order.
+    `{"t", "buy", "sell", "stop", "reference", "pred_high", "pred_low"}` for
+    `opening_end` itself -- the levels the forecast alone rests -- and then one
+    per bar after that, in order, each holding the levels once that bar has
+    been read. Empty while no bar has closed after the forecast.
 
     `stop` is where the stop would sit under a fill *at* the buy level --
     `stop_distance` read off the plan exactly as `_buy` reads it -- or None when
@@ -1835,25 +1837,32 @@ def session_levels(
         ),
         **forecast,
     }
-    out: "list[dict]" = []
-    for ts in session.index:
-        if ts <= opening_end:
-            continue
-        trader._move_range(session[session.index <= ts], ts)
-        trader._set_levels(ts)
+    def row(ts) -> dict:
         buy = float(trader.plan["buy_level"])
         risk = stop_distance(config, stop_unit(config, trader.plan))
-        out.append(
-            {
-                "t": ts,
-                "buy": buy,
-                "sell": float(trader.plan["sell_level"]),
-                "stop": buy - risk if risk else None,
-                "reference": float(trader.plan["reference"]),
-                "pred_high": float(trader.plan["pred_high"]),
-                "pred_low": float(trader.plan["pred_low"]),
-            }
-        )
+        return {
+            "t": ts,
+            "buy": buy,
+            "sell": float(trader.plan["sell_level"]),
+            "stop": buy - risk if risk else None,
+            "reference": float(trader.plan["reference"]),
+            "pred_high": float(trader.plan["pred_high"]),
+            "pred_low": float(trader.plan["pred_low"]),
+        }
+
+    after = [ts for ts in session.index if ts > opening_end]
+    if not after:
+        return []
+    # The levels as the forecast alone sets them, before any bar has had a
+    # chance to move them. Without this row a breach on the first bar after
+    # the forecast is already in every row, the walk looks flat, and the chart
+    # draws the revised levels as if they had stood since 09:35.
+    trader._set_levels(opening_end)
+    out: "list[dict]" = [row(opening_end)]
+    for ts in after:
+        trader._move_range(session[session.index <= ts], ts)
+        trader._set_levels(ts)
+        out.append(row(ts))
     return out
 
 

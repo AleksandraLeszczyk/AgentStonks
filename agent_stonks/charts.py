@@ -1310,7 +1310,8 @@ def _add_bands(
         color = item.get("color") or PALETTE["accent"]
         key = item.get("key")
         name = item.get("group") or item.get("label", key)
-        line = dict(color=color, width=1.2, dash=item.get("dash", "dot"))
+        line = dict(color=color, width=1.2, dash=item.get("dash", "dot"),
+                    shape="hv" if item.get("step") else "linear")
         note = [item.get("note", "")] * len(xs)
         if item.get("kind") == "path":
             # One curve, no fill: a moving level (`model_overlays._path`).
