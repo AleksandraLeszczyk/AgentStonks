@@ -2430,7 +2430,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- **Refused** when that is more than this many × {unit} down.\n"
             "- Only that bar: the next one is judged again, so once the fall eases a "
             "price still at the buy level is bought.\n"
-            "- 0.30 is a fall seen on about 1% of minutes on AAPL, GOOGL and INTC.\n"
+            "- 0.30 is a fall seen on about 1% of minutes on AAPL, GOOGL and INTC; the "
+            "0.10 default refuses far more often, waiting for the fall to flatten.\n"
             "- 0 switches it off."
         ),
         "min_win_k": (

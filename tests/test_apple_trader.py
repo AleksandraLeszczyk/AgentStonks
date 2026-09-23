@@ -1480,13 +1480,12 @@ class TestMinimumWin:
         tape.append(103.0, low=BUY_LEVEL - 0.01)
         return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
 
-    def test_off_by_default_in_these_tests_and_per_instrument_in_the_app(self):
+    def test_off_by_default_in_these_tests_and_0_10_in_the_app(self):
         assert dayrange_config().min_win_k == 0.0
-        # Per instrument, and AAPL's is lower on purpose: its levels are only
-        # 0.15 ADR apart, so 0.20 could never be cleared by a target exit.
-        assert AppleTraderConfig(ticker="AAPL").min_win_k == 0.10
-        assert AppleTraderConfig(ticker="GOOGL").min_win_k == 0.20
-        assert AppleTraderConfig(ticker="INTC").min_win_k == 0.20
+        # 0.10 on every instrument since 2026-09-23 -- what AAPL alone had
+        # before, because its levels are only 0.15 ADR apart.
+        for ticker in ("AAPL", "GOOGL", "INTC"):
+            assert AppleTraderConfig(ticker=ticker).min_win_k == 0.10, ticker
 
     def test_every_instruments_default_leaves_its_target_exit_alive(self):
         """The invariant AAPL's entry exists to keep: a trade that runs all the
@@ -2971,7 +2970,7 @@ class TestNoBuyIntoAFall:
         return [e["text"] for e in state.agent_log if e.get("type") == "status"]
 
     def test_the_default_is_on(self):
-        assert AppleTraderConfig().max_fall_k == pytest.approx(0.30)
+        assert AppleTraderConfig().max_fall_k == pytest.approx(0.10)
 
     def test_a_steep_fall_to_the_buy_level_is_not_bought(self, state, market_open, monkeypatch):
         # $106.00 -> $102.50 is $3.50 down over 15 bars: 0.35 ADR, past 0.30.

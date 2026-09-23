@@ -473,17 +473,17 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # two settings disagree. 0 switches it off, which is what every record written
 # before it existed replays as.
 #
-# AAPL is the instrument that disagrees, so it has its own entry: at 0.20 its
-# 0.15-ADR target exit could never clear the bar and every completed trade ended
-# the session. 0.10 leaves a target exit (and anything better) alive and catches
-# what the rule is for -- a breakeven runner, a flatten at the fill, a take that
-# faded early. Per instrument for the same reason the levels are
+# AAPL was the instrument that disagreed, which is why it got 0.10 of its own
+# first: at 0.20 its 0.15-ADR target exit could never clear the bar and every
+# completed trade ended the session. 0.10 leaves a target exit (and anything
+# better) alive and catches what the rule is for -- a breakeven runner, a
+# flatten at the fill, a take that gave out early. Since 2026-09-23 (the user's
+# call) 0.10 is every instrument's default, so the per-symbol table below is
+# empty; it stays for the same reason the levels are per instrument
 # (APPLE_TRADER_DAYRANGE_LEVELS): the number only means something against that
-# symbol's own buy/sell distances.
-APPLE_TRADER_MIN_WIN_K = 0.20
-APPLE_TRADER_MIN_WIN: "dict[str, float]" = {
-    "AAPL": 0.10,
-}
+# symbol's own buy/sell distances. Counted in the level unit, like every k.
+APPLE_TRADER_MIN_WIN_K = 0.10
+APPLE_TRADER_MIN_WIN: "dict[str, float]" = {}
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Whether a day-range position may be added to on the way down
@@ -514,7 +514,12 @@ APPLE_TRADER_SCALE_IN = True
 # sessions touch it at least once, mostly in the first hour. Not swept. 0
 # switches it off, which is what every SimLab record written before it existed
 # replays as (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
-APPLE_TRADER_MAX_FALL_K = 0.30
+#
+# The default is 0.10 since 2026-09-23 (the user's call), a much stricter gate
+# than the 0.30 measured above: in ADRs a 15-bar fall of 0.16 is already seen on
+# 5% of minutes, so 0.10 refuses most buys made while the price is still
+# sliding and waits for the fall to flatten out. Not swept either.
+APPLE_TRADER_MAX_FALL_K = 0.10
 # Flatten this many minutes before the close: the day-range forecast is a
 # statement about one session, and the momentum regime does not survive the
 # overnight gap either.
