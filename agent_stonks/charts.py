@@ -10,6 +10,7 @@ from plotly.subplots import make_subplots
 
 from . import market_hours, momentum_regime
 from .config import (
+    APPLE_TRADER_MOMENTUM_FADE_BARS,
     AVG_LINE_COLORS,
     CANDLE_PATTERN_COLORS,
     CANDLE_PATTERN_FILLED_ALPHA,
@@ -904,6 +905,9 @@ def _add_volume_baseline(
     if mean is None:
         return
     level = float(mean) * span
+    if level <= 0:
+        # Nothing to draw on the log volume axis -- and nothing worth saying.
+        return
     fig.add_trace(
         go.Scatter(
             x=[df["t"].min(), df["t"].max()],
@@ -921,7 +925,9 @@ def _add_volume_baseline(
     )
     fig.add_annotation(
         x=df["t"].max(),
-        y=level,
+        # The volume axis is logarithmic, and plotly places annotations on a
+        # log axis in log10 units rather than data units.
+        y=float(np.log10(level)),
         text=f"mean {level:,.0f} \u00b7 {label.lower()}",
         showarrow=False,
         xanchor="right",
@@ -932,24 +938,27 @@ def _add_volume_baseline(
     )
 
 
-def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
-    """The session momentum score, drawn in its own panel under the price.
+def _add_momentum_panel(
+    df: pd.DataFrame, fig: go.Figure, row: int, bars: int = APPLE_TRADER_MOMENTUM_FADE_BARS
+) -> None:
+    """The session's absolute momentum, drawn in its own panel under the price.
 
-    The same number the rule agents and the regime overlays read
-    (`momentum_regime.compute_momentum`): the `horizon`-bar log return in units
-    of its own random-walk sigma, EWM-smoothed. It is dimensionless, so the
-    panel is readable against the Schmitt-trigger thresholds the regime is
-    defined by -- those are the dotted rules, and crossing one is what flips
-    the regime.
+    Momentum here is the plain price change over the last `bars` bars --
+    `close - close[bars ago]`, in dollars -- rather than `momentum_regime`'s
+    score, which divides that move by the tape's own noise. The live chart
+    passes the Apple Trader's "Momentum fade" look-back as `bars`, so the panel
+    covers the same stretch of tape the momentum take is measured over.
 
-    Everything is session-local and needs `vol_window` bars behind it, so the
-    first stretch of the day is NaN. That is left as a gap rather than plotted
-    as zero, which would read as "balanced" when it means "not known yet".
+    Session-local, like the take: the first `bars` regular-session bars have
+    nothing to compare against, and that stretch is left as a gap rather than
+    plotted as zero, which would read as "flat" when it means "not known yet".
 
     The frame is rebuilt from the drawn bars via `momentum_regime`, which keeps
     to the regular session and to an exchange-local index -- so the series is
     converted back to UTC here, the wall clock the price axis is drawn in.
     """
+    bars = max(int(bars), 1)
+
     def _warming_up() -> None:
         """Say why the panel is empty rather than leaving a blank box.
 
@@ -972,7 +981,7 @@ def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
         )
         fig.add_annotation(
             xref="x domain", yref="y domain", x=0.5, y=0.5,
-            text="Momentum warms up over the first ~25 regular-session bars",
+            text=f"Momentum warms up over the first {bars} regular-session bars",
             font=dict(color=PALETTE["muted"], size=11),
             showarrow=False,
             row=row,
@@ -989,15 +998,17 @@ def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
     )
     if not len(frame):
         return _warming_up()
-    mom = momentum_regime.compute_momentum(frame)["mom"]
+    close = frame["close"]
+    before = close.groupby(frame["session"], sort=False).shift(bars)
+    mom = close - before
     if not mom.notna().any():
         return _warming_up()
+    pct = mom / before * 100.0
 
     x = mom.index.tz_convert("UTC")
-    enter = momentum_regime.MOMENTUM_DEFAULTS["enter_threshold"]
 
     # Two clipped fills rather than one: the sign is the whole point of the
-    # score, and a single-color area hides it.
+    # series, and a single-color area hides it.
     for clipped, color in (
         (mom.clip(lower=0.0), PALETTE["up"]),
         (mom.clip(upper=0.0), PALETTE["down"]),
@@ -1020,24 +1031,21 @@ def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
         go.Scatter(
             x=x,
             y=mom,
+            customdata=pct,
             mode="lines",
             line=dict(color=PALETTE["text"], width=1.2),
             name="Momentum",
             showlegend=False,
-            hovertemplate="Momentum %{y:+.2f}\u03c3<extra></extra>",
+            hovertemplate=(
+                f"Momentum %{{y:+$.2f}} over {bars} bars "
+                "(%{customdata:+.2f}%)<extra></extra>"
+            ),
         ),
         row=row,
         col=1,
     )
 
     fig.add_hline(y=0, line=dict(color=PALETTE["muted"], width=1), row=row, col=1)
-    for level in (enter, -enter):
-        fig.add_hline(
-            y=level,
-            line=dict(color=PALETTE["muted"], width=1, dash="dot"),
-            row=row,
-            col=1,
-        )
 
     last_at = mom.last_valid_index()
     if last_at is not None:
@@ -1045,7 +1053,7 @@ def _add_momentum_panel(df: pd.DataFrame, fig: go.Figure, row: int) -> None:
         fig.add_annotation(
             x=last_at.tz_convert("UTC"),
             y=value,
-            text=f" {value:+.2f}\u03c3",
+            text=f" {'+' if value >= 0 else '-'}${abs(value):.2f}",
             font=dict(
                 color=PALETTE["up"] if value >= 0 else PALETTE["down"],
                 size=11,
@@ -1648,6 +1656,7 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
+    momentum_bars: int = APPLE_TRADER_MOMENTUM_FADE_BARS,
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
 ) -> go.Figure:
@@ -1672,8 +1681,8 @@ def build_chart(
         df_trades["t"] = pd.to_datetime(df_trades["t"])
         df_trades = df_trades[df_trades["t"] > session_start]
 
-    # The momentum score gets a panel of its own under the volume rather than
-    # a second y axis on the price: it is measured in sigmas, not dollars, and
+    # Momentum gets a panel of its own under the volume rather than a second y
+    # axis on the price: it is a change in dollars, centred on zero, and
     # sharing the price axis would either flatten it or stretch the candles.
     # Appending the row keeps the price-profile column at (1, 2) -- and so at
     # `x2`/`y2`, which `add_model_overlays` addresses by axis id.
@@ -1823,7 +1832,7 @@ def build_chart(
     _add_volume_baseline(df, fig, volume_baseline, row=2)
 
     if momentum_row is not None:
-        _add_momentum_panel(df, fig, momentum_row)
+        _add_momentum_panel(df, fig, momentum_row, bars=momentum_bars)
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])
     if not df_news.empty:
@@ -1993,6 +2002,11 @@ def build_chart(
         margin=dict(l=10, r=10, t=50, b=10),
         height=660 if show_momentum else 520,
     )
+    # Volume on a log scale: the opening and closing bursts run many times a
+    # midday bar, and on a linear axis they flatten everything between them.
+    # Both columns of the row, because the profile column's axis is matched to
+    # the volume axis by `shared_yaxes` and matched axes must share a type.
+    fig.update_yaxes(type="log", row=2)
     if momentum_row is not None:
         fig.update_xaxes(
             showgrid=True, gridcolor=PALETTE["grid"], row=momentum_row, col=1,
@@ -2002,7 +2016,8 @@ def build_chart(
             gridcolor=PALETTE["grid"],
             tickfont=dict(size=10),
             zeroline=False,
-            title=dict(text="Momentum (\u03c3)", font=dict(size=10)),
+            tickprefix="$",
+            title=dict(text=f"Momentum ({momentum_bars} bars)", font=dict(size=10)),
             row=momentum_row,
             col=1,
         )

@@ -52,6 +52,15 @@ class TestBuildChart:
         fig = build_chart(BARS, [], [], "AAPL", SESSION_START)
         assert isinstance(fig, go.Figure)
 
+    @pytest.mark.parametrize("show_momentum", [False, True])
+    def test_the_volume_axis_is_logarithmic(self, show_momentum):
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, show_momentum=show_momentum)
+        volume = next(t for t in fig.data if t.name == "Volume")
+        axis = fig.layout["yaxis" + volume.yaxis[1:]]
+        assert axis.type == "log"
+        # The price panel stays linear.
+        assert fig.layout.yaxis.type != "log"
+
     def test_empty_bars_returns_waiting_chart(self):
         fig = build_chart([], [], [], "AAPL", SESSION_START)
         texts = [a["text"] for a in fig.layout.annotations]
@@ -450,13 +459,13 @@ class TestSessionMarkers:
 
 
 class TestMomentumPanel:
-    """The session momentum score, in its own row under the price.
+    """The session's absolute momentum, in its own row under the price.
 
-    The score is `momentum_regime`'s, not a second definition: these pin that
-    the panel is off unless asked for, that switching it on leaves the price
-    and price-profile subplots where `add_model_overlays` addresses them, and
-    that the warm-up stretch is drawn as a gap with a note rather than as a
-    run of zeros.
+    Momentum is the dollar change over the last `momentum_bars` bars. These pin
+    that definition, that the panel is off unless asked for, that switching it
+    on leaves the price and price-profile subplots where `add_model_overlays`
+    addresses them, and that the warm-up stretch is drawn as a gap with a note
+    rather than as a run of zeros.
     """
 
     @staticmethod
@@ -532,18 +541,53 @@ class TestMomentumPanel:
         texts = [a["text"] for a in fig.layout.annotations]
         assert any("warms up" in t for t in texts)
 
-    def test_labels_the_latest_value(self):
+    @pytest.mark.parametrize("n", [5, 15, 30])
+    def test_momentum_is_the_dollar_change_over_the_look_back(self, n):
+        bars = self.rth_bars(60)
+        fig = build_chart(
+            bars, [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=n,
+        )
+        (mom,) = [tr for tr in fig.data if tr.name == "Momentum"]
+        closes = [b["c"] for b in bars]
+        expected = [None] * n + [closes[i] - closes[i - n] for i in range(n, len(closes))]
+        values = list(mom.y)
+        assert all(pd.isna(v) for v in values[:n])
+        assert values[n:] == pytest.approx(expected[n:])
+
+    def test_the_look_back_defaults_to_the_momentum_fade_default(self):
+        from agent_stonks.config import APPLE_TRADER_MOMENTUM_FADE_BARS
+
         fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        (mom,) = [tr for tr in fig.data if tr.name == "Momentum"]
+        values = pd.Series(mom.y)
+        assert values.isna().sum() == APPLE_TRADER_MOMENTUM_FADE_BARS
+
+    def test_the_warm_up_note_names_the_look_back(self):
+        fig = build_chart(
+            self.rth_bars(5), [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=20,
+        )
         texts = [a["text"] for a in fig.layout.annotations]
-        assert any("σ" in t for t in texts)
+        assert any("first 20 regular-session bars" in t for t in texts)
 
-    def test_draws_the_regime_entry_thresholds(self):
-        from agent_stonks.momentum_regime import MOMENTUM_DEFAULTS
+    def test_labels_the_latest_value_in_dollars(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=15)
+        change = bars[-1]["c"] - bars[-16]["c"]
+        texts = [a["text"].strip() for a in fig.layout.annotations]
+        assert f"{'+' if change >= 0 else '-'}${abs(change):.2f}" in texts
 
+    def test_the_axis_is_in_dollars_and_names_the_look_back(self):
+        fig = build_chart(
+            self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=12,
+        )
+        assert fig.layout.yaxis5.tickprefix == "$"
+        assert "12 bars" in fig.layout.yaxis5.title.text
+
+    def test_only_the_zero_line_is_drawn(self):
+        # The σ regime thresholds mean nothing on a dollar axis.
         fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
-        enter = MOMENTUM_DEFAULTS["enter_threshold"]
         levels = {s.y0 for s in fig.layout.shapes if s.yref == "y5"}
-        assert {0, enter, -enter} <= levels
+        assert levels == {0}
 
 
 class TestVolumeBaseline:
@@ -642,6 +686,19 @@ class TestVolumeBaseline:
     def test_the_mean_is_annotated_on_the_panel(self):
         fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
         assert any("mean 1,000" in a.text for a in fig.layout.annotations)
+
+    def test_the_mean_label_sits_at_the_mean_on_the_log_axis(self):
+        # Annotations on a log axis are placed in log10 units.
+        fig = build_chart(BARS, [], [], "AAPL", SESSION_START, volume_baseline=self.baseline())
+        (note,) = [a for a in fig.layout.annotations if "mean 1,000" in a.text]
+        assert note.y == pytest.approx(3.0)
+
+    def test_a_zero_mean_draws_nothing_on_the_log_axis(self):
+        fig = build_chart(
+            BARS, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(mean_per_minute=0.0),
+        )
+        assert not self.traces(fig, "Mean volume")
 
     def test_a_wider_timeframe_scales_the_reference_to_its_bars(self):
         # A 5-minute bar holds five minutes of volume; comparing it against a

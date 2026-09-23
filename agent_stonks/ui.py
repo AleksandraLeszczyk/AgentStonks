@@ -62,6 +62,7 @@ from .config import (
     AGENT_LOG_POLL_SEC,
     AGENT_PERFORMANCE_POLL_SEC,
     APPLE_TRADER_CYCLE_SEC,
+    APPLE_TRADER_MOMENTUM_FADE_BARS,
     CHART_POLL_SEC,
     DEFAULT_DATA_SOURCE,
     DEFAULT_HISTORY_FEED,
@@ -707,6 +708,7 @@ def _chart_panel() -> None:
             model_overlays=overlays["items"],
             candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
+            momentum_bars=_momentum_bars(state),
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
         )
@@ -715,6 +717,20 @@ def _chart_panel() -> None:
             st.caption(f":material/info: {sym} — {note}")
     if not rendered:
         st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
+
+
+def _momentum_bars(state) -> int:
+    """The look-back the live momentum panel is measured over.
+
+    The Apple Trader's momentum-fade look-back, so the panel shows the move
+    its momentum take watches: the running agent's while one runs (that
+    setting takes effect on ▶ Start, so the form may already differ), else the
+    form's. The default when there is neither, or the take is switched off (0).
+    """
+    running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
+    config = running.get("config") or getattr(state, "apple_trader_config", None)
+    bars = int(getattr(config, "momentum_fade_bars", 0) or 0)
+    return bars if bars > 0 else APPLE_TRADER_MOMENTUM_FADE_BARS
 
 
 def _live_chart_controls() -> None:
@@ -799,10 +815,12 @@ def _live_chart_controls() -> None:
             show_momentum = st.checkbox(
                 "Momentum panel",
                 value=True,
-                help="Draw the session momentum score under the price: the "
-                "15-bar log return in units of its own random-walk sigma, the "
-                "same number the rule agents' regime is triggered off. The "
-                "dotted rules are the regime-entry thresholds.",
+                help="Draw the session's momentum under the price: how many "
+                "dollars the close has moved over the last N bars. N is the "
+                "Apple Trader's *Momentum fade to take gains* look-back (the "
+                "running agent's while one runs), or "
+                f"{APPLE_TRADER_MOMENTUM_FADE_BARS} bars when that is off or "
+                "another personality is picked.",
             )
 
         st.markdown("**Price Profile Fit**")
@@ -2108,6 +2126,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     )["items"],
                     candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
+                    momentum_bars=_momentum_bars(state),
                 ),
             )
         )
