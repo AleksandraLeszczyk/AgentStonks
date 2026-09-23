@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from agent_stonks import (
@@ -3896,9 +3897,30 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
     return rows
 
 
+def _tuning_session_moves(symbol: str, feed: str, days: list[str]) -> dict[str, dict]:
+    """Each session's close − open and high − low, from the stored daily bars.
+
+    Daily bars are stamped at midnight exchange time in UTC (04:00Z or 05:00Z),
+    so the session a bar belongs to is its date in ET, not in UTC. A day with no
+    stored daily bar is left out rather than drawn as zero.
+    """
+    wanted = set(days)
+    moves = {}
+    for bar in sim_data.load_daily_bars(symbol, feed):
+        day = pd.Timestamp(bar["t"]).tz_convert(MARKET_TZ).date().isoformat()
+        if day in wanted:
+            moves[day] = {"close_open": bar["c"] - bar["o"], "high_low": bar["h"] - bar["l"]}
+    return moves
+
+
 def _tuning_daily_chart(job: dict) -> go.Figure:
     spec = job["spec"]
-    fig = go.Figure()
+    symbol = spec["base"]["ticker"]
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[0.6, 0.4],
+    )
+    moves: dict[str, dict] = {}
     for cell, dataset, color in (
         (job.get("best"), spec["tune_dataset"], PALETTE["accent"]),
         (job.get("best_test"), spec.get("test_dataset"), PALETTE["up"]),
@@ -3909,11 +3931,28 @@ def _tuning_daily_chart(job: dict) -> go.Figure:
         fig.add_trace(go.Bar(
             x=days, y=[cell["daily"][d] for d in days],
             name=f"Pick on {dataset['name']}", marker_color=color,
-        ))
-    fig.update_xaxes(type="category")
-    fig.update_yaxes(title="Profit ($)")
-    fig.update_layout(title="The pick, session by session")
-    return _chart_layout(fig, height=300)
+        ), row=1, col=1)
+        moves.update(_tuning_session_moves(symbol, dataset["feed"], days))
+    if moves:
+        days = sorted(moves)
+        fig.add_trace(go.Bar(
+            x=days, y=[moves[d]["high_low"] for d in days],
+            name=f"{symbol} high − low", marker_color=PALETTE["muted"],
+        ), row=2, col=1)
+        fig.add_trace(go.Bar(
+            x=days, y=[moves[d]["close_open"] for d in days],
+            name=f"{symbol} close − open",
+            marker_color=[
+                PALETTE["up"] if moves[d]["close_open"] >= 0 else PALETTE["down"]
+                for d in days
+            ],
+        ), row=2, col=1)
+    fig.update_xaxes(type="category", categoryorder="category ascending", gridcolor=PALETTE["grid"])
+    fig.update_yaxes(title="Profit ($)", row=1, col=1)
+    fig.update_yaxes(title=f"{symbol} ($/share)", row=2, col=1)
+    fig.update_yaxes(gridcolor=PALETTE["grid"])
+    fig.update_layout(title="The pick, session by session", barmode="group")
+    return _chart_layout(fig, height=460)
 
 
 def _render_tuning_notes(job: dict) -> None:
