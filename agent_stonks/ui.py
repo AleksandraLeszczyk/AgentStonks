@@ -2406,11 +2406,21 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
 @st.fragment
 def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     """Apple Trader's instrument and tunables, inside the dashboard's expander."""
+    state = _get_state()
+    running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
     with st.expander("Apple Trader rules", expanded=True):
-        config = apple_trader_ui.params(symbols, _APPLE_TRADER_COPY)
+        config = apple_trader_ui.params(
+            symbols, _APPLE_TRADER_COPY, seed=running.get("config")
+        )
+        if running.get("config") is not None:
+            st.caption(
+                "The running agent picks up a change to the buy or sell distance "
+                "at its next bar. Every other setting takes effect on ▶ Start."
+            )
     # Published for the chart's buy/sell overlay, which is drawn from a
-    # configuration rather than from a model and should show the one on screen.
-    _get_state().apple_trader_config = config
+    # configuration rather than from a model and should show the one on screen,
+    # and for the running agent, which reads the two distances back from it.
+    state.apple_trader_config = config
     return config
 
 

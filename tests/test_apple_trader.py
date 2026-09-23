@@ -2443,3 +2443,143 @@ class TestInstrument:
 
 def tracker_for_loop() -> DecisionTracker:
     return DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
+
+
+class TestRecordedLevels:
+    """What a live run publishes for the chart: one row per cycle, from the
+    same plan the analysis line prints, so the two can never disagree."""
+
+    def _cycle(self, trader, state, tracker, tape, close, **bar):
+        tape.append(close, **bar)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+    def _analysis(self, state):
+        return [e["text"] for e in state.agent_log if e.get("type") == "analysis"]
+
+    def test_the_first_row_is_the_forecasts_own_levels_at_the_window_end(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config(breach_update="extreme"))
+        self._cycle(trader, state, tracker, tape, 111.5, high=112.0)   # a breach
+
+        rows = state.apple_trader_levels["rows"]
+        assert [r["t"] for r in rows] == [tape.index[4], tape.index[-1]]
+        assert rows[0]["buy"] == pytest.approx(BUY_LEVEL)
+        assert rows[1]["buy"] == pytest.approx(112.0 - 7.5)
+        assert state.apple_trader_levels["ticker"] == TICKER
+
+    def test_every_row_quotes_what_that_cycles_analysis_line_quotes(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config(breach_update="brownian"))
+        for close, high in [(108.0, 108.2), (111.0, 112.5), (110.0, 110.5), (113.0, 114.0)]:
+            self._cycle(trader, state, tracker, tape, close, high=high)
+            row = state.apple_trader_levels["rows"][-1]
+            line = self._analysis(state)[-1]
+            assert f"buy ${row['buy']:,.2f}" in line
+            assert f"sell ${row['sell']:,.2f}" in line
+
+
+class TestSidebarLevelEdits:
+    """A running agent takes the buy and sell distances the sidebar holds,
+    from its next bar, and nothing else."""
+
+    def _started(self, state, monkeypatch, **kwargs):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        state.apple_trader_config = trader.config
+        tape.append(108.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return trader, tracker, tape
+
+    def test_an_edit_moves_the_levels_from_the_next_bar_and_is_logged(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._started(state, monkeypatch)
+        state.apple_trader_config = dayrange_config(buy_k=0.9, sell_k=0.2)
+        tape.append(108.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        assert (trader.config.buy_k, trader.config.sell_k) == (0.9, 0.2)
+        assert trader.plan["buy_level"] == pytest.approx(110.0 - 9.0)
+        assert trader.plan["sell_level"] == pytest.approx(110.0 - 2.0)
+        rows = state.apple_trader_levels["rows"]
+        assert [r["buy"] for r in rows] == pytest.approx([BUY_LEVEL, BUY_LEVEL, 101.0])
+        assert state.apple_trader_levels["config"].buy_k == 0.9
+        changed = [e["text"] for e in state.agent_log if "from the sidebar" in e["text"]]
+        assert len(changed) == 1
+        assert "buy 0.75 → 0.9" in changed[0] and "was $102.50" in changed[0]
+
+    def test_other_settings_are_not_adopted(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._started(state, monkeypatch)
+        state.apple_trader_config = dayrange_config(position_pct=5.0, breach_update="extreme")
+        tape.append(108.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.config.position_pct != 5.0
+        assert trader.config.breach_update == "off"
+
+    def test_a_form_for_another_instrument_is_ignored(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._started(state, monkeypatch)
+        state.apple_trader_config = dayrange_config(ticker="GOOGL", buy_k=1.5, sell_k=0.9)
+        tape.append(108.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.config.buy_k == 0.75
+
+    def test_distances_in_another_unit_are_refused_once(
+        self, state, market_open, monkeypatch
+    ):
+        """0.9 × ADR and 0.9 × the predicted range are different orders."""
+        trader, tracker, tape = self._started(state, monkeypatch)
+        state.apple_trader_config = dayrange_config(
+            buy_k=0.9, sell_k=0.2, level_unit=UNIT_PRED_RANGE
+        )
+        for _ in range(3):
+            tape.append(108.0)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.config.buy_k == 0.75
+        refused = [e for e in state.agent_log if "needs ▶ Start" in e["text"]]
+        assert len(refused) == 1
+
+    def test_an_open_position_keeps_the_stop_it_was_filled_with(
+        self, state, market_open, monkeypatch
+    ):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config())
+        state.apple_trader_config = trader.config
+        tape.append(103.0, low=102.0)             # touches 102.50: bought at 103
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert tracker.position_for(TICKER) > 0
+        risk = trader.entry["risk"]
+
+        state.apple_trader_config = dayrange_config(buy_k=0.9, sell_k=0.2)
+        tape.append(104.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.entry["risk"] == risk
+        # The recorded stop is the position's, which is what the log line quotes.
+        stop = state.apple_trader_levels["rows"][-1]["stop"]
+        assert stop == pytest.approx(103.0 - risk)
+        assert f"stop ${stop:,.2f}" in state.agent_log[-1]["text"]
+
+    def test_a_restart_keeps_what_the_earlier_run_rested(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._started(state, monkeypatch)
+        before = list(state.apple_trader_levels["rows"])
+
+        # ▶ Start launches with what the sidebar holds.
+        state.apple_trader_config = dayrange_config(buy_k=0.9, sell_k=0.2)
+        restarted = at.DayRangeTrader(state.apple_trader_config)
+        tape.append(108.0)
+        restarted.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        rows = state.apple_trader_levels["rows"]
+        assert rows[: len(before)] == before
+        assert rows[-1]["t"] == tape.index[-1]
+        assert rows[-1]["buy"] == pytest.approx(101.0)
+        assert len(rows) == len(before) + 1

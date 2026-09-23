@@ -77,11 +77,22 @@ class FormCopy:
         return f"{self.prefix}_{name}"
 
 
-def params(symbols: "list[str] | None", copy: FormCopy) -> AppleTraderConfig:
+def params(
+    symbols: "list[str] | None",
+    copy: FormCopy,
+    seed: "AppleTraderConfig | None" = None,
+) -> AppleTraderConfig:
     """Apple Trader's instrument and tunables, as one config.
 
     The instrument comes first because it decides which models exist, and the
     model then decides which rules apply.
+
+    `seed` is a running agent's configuration. The buy and sell distances open
+    on its numbers rather than the instrument's shipped pair whenever the two
+    widgets are drawn fresh -- which Streamlit does after they have been off
+    screen for a run. A running agent adopts what these two widgets hold
+    (`DayRangeTrader._adopt_form_levels`), so re-seeding them from the shipped
+    pair would quietly move its orders.
     """
     defaults = AppleTraderConfig()
     ticker = instrument_row(defaults, symbols, copy)
@@ -105,7 +116,7 @@ def params(symbols: "list[str] | None", copy: FormCopy) -> AppleTraderConfig:
     bundle = apple_models.load(model_key, ticker)
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
-    return dayrange_params(defaults, model_key, ticker, copy)
+    return dayrange_params(defaults, model_key, ticker, copy, seed)
 
 
 def instrument_row(
@@ -171,7 +182,8 @@ def model_label(key: str) -> str:
 
 
 def dayrange_params(
-    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
+    seed: "AppleTraderConfig | None" = None,
 ) -> AppleTraderConfig:
     """The day-range rules: two resting levels below the predicted high.
 
@@ -186,16 +198,24 @@ def dayrange_params(
     # a label that named the wrong unit would be worse than no label at all.
     level_unit = level_unit_param(defaults, copy)
     unit_label = UNIT_FORM_LABELS[level_unit]
+    start_buy, start_sell = default_buy, default_sell
+    if (
+        seed is not None
+        and (seed.ticker or "").upper() == ticker
+        and seed.model_key == model_key
+        and seed.level_unit == level_unit
+    ):
+        start_buy, start_sell = float(seed.buy_k), float(seed.sell_k)
     col_a, col_b = st.columns(2)
     buy_k = col_a.number_input(
         f"Buy distance (× {unit_label} below H)",
-        min_value=0.05, max_value=3.0, value=default_buy, step=0.05, format="%.2f",
+        min_value=0.05, max_value=3.0, value=start_buy, step=0.05, format="%.2f",
         key=copy.key(f"buy_k_{ticker}"),
         help=copy.help.get("buy_k", "").format(**levels),
     )
     sell_k = col_b.number_input(
         f"Sell distance (× {unit_label} below H)",
-        min_value=0.0, max_value=3.0, value=default_sell, step=0.05, format="%.2f",
+        min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
         key=copy.key(f"sell_k_{ticker}"),
         help=copy.help.get("sell_k", "").format(**levels),
     )

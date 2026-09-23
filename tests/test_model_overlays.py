@@ -722,6 +722,81 @@ class TestTraderLevelsOverlay:
             assert mo.TRADER_LEVELS_KEY not in mo.for_models([key], "AAPL")["keys"]
 
 
+class TestRecordedTraderLevels:
+    """A live run's own record of its levels is what the chart draws, so
+    sidebar edits show at the minute they were adopted and the numbers are
+    the ones the agent's log quotes."""
+
+    def history(self, buys, sells=None, highs=None, day=SESSION, ticker="AAPL",
+                model_key="dayrange"):
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        start = pd.Timestamp(f"{day} 09:34", tz="America/New_York")
+        sells = sells or [b + 2.0 for b in buys]
+        highs = highs or [210.0] * len(buys)
+        rows = [
+            {"t": start + pd.Timedelta(minutes=i), "buy": b, "sell": s, "stop": b - 1.0,
+             "reference": h, "pred_high": h, "pred_low": 198.0}
+            for i, (b, s, h) in enumerate(zip(buys, sells, highs))
+        ]
+        return {"ticker": ticker, "date": pd.Timestamp(day),
+                "config": AppleTraderConfig(ticker=ticker, model_key=model_key),
+                "rows": rows}
+
+    def compute(self, keys, history, monkeypatch):
+        # The walk and the forecast must not be needed: the record replaces both.
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
+        return mo.compute(keys, "AAPL", minute_bars(), daily_bars=[],
+                          session_date=SESSION, trader_history=history)["items"]
+
+    def test_an_edit_is_drawn_as_a_step_at_the_minute_it_was_adopted(self, monkeypatch):
+        items = self.compute([mo.TRADER_LEVELS_KEY],
+                             self.history([207.0, 207.0, 205.5, 205.5]), monkeypatch)
+        band = next(i for i in items if i["kind"] == "band")
+        assert band["lower"] == [207.0, 207.0, 205.5, 205.5]
+        assert band["step"]
+        stamps = [pd.Timestamp(t).tz_convert("America/New_York") for t in band["t"]]
+        assert [(t.hour, t.minute) for t in stamps] == [(9, 34), (9, 35), (9, 36), (9, 37)]
+        stop = next(i for i in items if i["kind"] == "path")
+        assert stop["values"] == [206.0, 206.0, 204.5, 204.5]
+
+    def test_levels_that_never_moved_are_still_two_flat_lines(self, monkeypatch):
+        items = self.compute([mo.TRADER_LEVELS_KEY], self.history([207.0] * 3), monkeypatch)
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels["Buy level"] == 207.0 and levels["Sell level"] == 209.0
+
+    def test_the_day_range_is_the_runs_own_forecast(self, monkeypatch):
+        items = self.compute([mo.DAY_RANGE_KEY],
+                             self.history([207.0] * 3, highs=[210.0, 212.0, 212.0]),
+                             monkeypatch)
+        band = next(i for i in items if i["kind"] == "band")
+        assert band["upper"] == [210.0, 212.0, 212.0]
+
+    def test_a_highlow_run_draws_its_range_on_the_highlow_overlay_only(self, monkeypatch):
+        history = self.history([207.0] * 3, highs=[210.0, 212.0, 212.0], model_key="highlow")
+        items = self.compute([mo.HIGHLOW_RANGE_KEY], history, monkeypatch)
+        assert next(i for i in items if i["kind"] == "band")["upper"][-1] == 212.0
+        # The TimeToChange3 overlay is not this run's model, so it forecasts as before.
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: {
+            "forecast": None, "made_at": None, "problem": "stub"})
+        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
+                            session_date=SESSION, trader_history=history)
+        assert result["items"] == [] and "stub" in result["notes"][0]
+
+    def test_another_days_or_symbols_record_is_ignored(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mo, "_trader_levels_items",
+                            lambda *a, **k: calls.append(k) or ([], ""))
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: {
+            "forecast": None, "made_at": None, "problem": "stub"})
+        for history in (self.history([207.0], day="2026-08-06"),
+                        self.history([207.0], ticker="GOOGL")):
+            mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[],
+                       session_date=SESSION, trader_history=history)
+        assert all(k.get("levels") is None for k in calls) and len(calls) == 2
+
+
 class TestHighLowOverlay:
     """HighLow's range is drawn like TimeToChange3's, and an agent configured on
     HighLow has its levels drawn under HighLow's high -- not TimeToChange3's."""
@@ -848,6 +923,23 @@ class TestLiveOverlays:
         mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
                    session_date=SESSION, dayrange_daily_bars=self.LONG_HISTORY)
         assert seen == [self.LONG_HISTORY]
+
+    def test_a_new_row_in_the_agents_record_redraws_within_the_bar(self, monkeypatch):
+        """A sidebar edit is adopted mid-bar; the chart must not wait a minute."""
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)
+        rows = [{"t": 1, "buy": 207.0}]
+        sym_state = self.make_state(bars)
+        sym_state.app = SimpleNamespace(
+            apple_trader_config=None, apple_trader_levels={"rows": rows},
+            api_key="", api_secret="",
+        )
+        mo.live_overlays(sym_state, bars, [mo.TRADER_LEVELS_KEY])
+        mo.live_overlays(sym_state, bars, [mo.TRADER_LEVELS_KEY])
+        rows[-1] = {"t": 1, "buy": 205.5}
+        mo.live_overlays(sym_state, bars, [mo.TRADER_LEVELS_KEY])
+        assert len(calls) == 2
+        assert calls[-1]["trader_history"]["rows"][-1]["buy"] == 205.5
 
     def test_the_answer_is_cached_until_a_new_bar_arrives(self, monkeypatch):
         calls = []

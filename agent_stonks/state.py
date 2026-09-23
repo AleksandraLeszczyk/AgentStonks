@@ -321,9 +321,16 @@ class AppState:
         # plausible set (`model_overlays.TRADER_LEVELS_KEY`). None whenever
         # another personality is selected and the form is not rendered; the
         # overlay then falls back to the instrument's shipped configuration.
-        # Read-only to everything but the form -- the running agent holds its
-        # own copy, taken at launch, and is not steered from here.
+        # Written only by the form. The running agent holds its own copy,
+        # taken at launch, and reads just the buy and sell distances back from
+        # here each cycle (`DayRangeTrader._adopt_form_levels`); everything
+        # else takes ▶ Start.
         self.apple_trader_config = None
+        # What the running (or last) Apple Trader actually rested today, one
+        # row per cycle: `{"ticker", "date", "config", "rows"}`, written by
+        # `DayRangeTrader._record_levels`. The chart draws this in place of a
+        # re-derived walk, so its levels are the ones the log quotes.
+        self.apple_trader_levels = None
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"

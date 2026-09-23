@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta, timezone
 from typing import Optional
 
@@ -888,6 +888,9 @@ class DayRangeTrader(BaseTrader):
         # before 9:35. Keyed by date so a multi-day run re-forecasts each
         # morning rather than trading Tuesday off Monday's levels.
         self.plan: "dict | None" = None
+        # The last sidebar edit refused for its unit, so it is reported once
+        # rather than every minute (`_adopt_form_levels`).
+        self._refused_form = None
 
     # --- one cycle --------------------------------------------------------
 
@@ -908,6 +911,10 @@ class DayRangeTrader(BaseTrader):
                 {"type": "status", "text": f"No {self.ticker} bars yet today."},
             )
             return "no_data"
+
+        # Before anything reads the levels, so an edit made in the sidebar
+        # during the last minute is what this bar is judged against.
+        self._adopt_form_levels(state, frame.index[-1])
 
         want = _dayrange().opening_minutes(bundle)
         if self.plan is None:
@@ -969,6 +976,9 @@ class DayRangeTrader(BaseTrader):
             self._update_range(state, frame, ts)
             self._set_levels(ts)
 
+        # Recorded from the same plan the line below prints, in the same cycle,
+        # so the chart and the log cannot quote two different levels.
+        self._record_levels(state, ts)
         _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position)})
 
         # Trading starts after the opening window, since the forecast does not
@@ -1069,6 +1079,18 @@ class DayRangeTrader(BaseTrader):
             **forecast,
         }
         self._set_levels(opening.index[-1])
+        prior = getattr(state, "apple_trader_levels", None) or {}
+        if (
+            prior.get("rows")
+            and prior.get("ticker") == self.ticker
+            and pd.Timestamp(prior.get("date")) == pd.Timestamp(today)
+        ):
+            # A restart mid-session: what the earlier run rested is history and
+            # stays on the chart. This run's levels start at the bar it first
+            # reads, not at 09:35 -- it rested nothing before it existed.
+            self.plan["history"] = list(prior["rows"])
+        else:
+            self._record_levels(state, opening.index[-1])
 
         warning = _dayrange().volume_scale_warning(tape)
         if warning:
@@ -1104,6 +1126,106 @@ class DayRangeTrader(BaseTrader):
                 },
             )
         return shape
+
+    # --- the sidebar, and the record the chart draws ------------------------
+
+    def _adopt_form_levels(self, state: AppState, ts) -> None:
+        """Take the buy and sell distances the sidebar now holds, if they changed.
+
+        The one part of the configuration a run can be steered by mid-session:
+        the two distances say where the orders rest, which is exactly what a
+        person watching the tape wants to nudge, and changing them touches no
+        position -- an open trade keeps the stop it was filled with (`_risk`).
+        Everything else still needs ▶ Start, which re-reads the whole form.
+
+        Only a form for this run's instrument and model is read, and only when
+        its distances are counted in the same unit: 0.8 × ADR and 0.8 × the
+        predicted range are different orders, and adopting the number without
+        the unit would rest them somewhere nobody asked for.
+        """
+        form = getattr(state, "apple_trader_config", None)
+        config = self.config
+        if (
+            form is None
+            or (form.ticker or "").upper() != self.ticker.upper()
+            or form.model_key != config.model_key
+        ):
+            return
+        new = (float(form.buy_k), float(form.sell_k))
+        old = (float(config.buy_k), float(config.sell_k))
+        if new == old:
+            return
+        if form.level_unit != config.level_unit:
+            refused = (new, form.level_unit)
+            if self._refused_form != refused:
+                self._refused_form = refused
+                _log(
+                    state,
+                    {
+                        "type": "status",
+                        "text": (
+                            f"The sidebar's buy/sell distances are counted in "
+                            f"{form.unit_phrase} but this run counts in "
+                            f"{config.unit_phrase}; a new unit needs ▶ Start, so the "
+                            f"levels stay at {old[0]:g} / {old[1]:g} × "
+                            f"{config.unit_phrase}."
+                        ),
+                    },
+                )
+            return
+        try:
+            self.config = replace(config, buy_k=new[0], sell_k=new[1])
+        except ValueError as exc:  # the form repairs a crossed pair; belt and braces
+            _log(state, {"type": "error", "text": f"Sidebar levels not applied: {exc}"})
+            return
+        text = (
+            f"{self.ticker} levels changed from the sidebar at {pd.Timestamp(ts):%H:%M}: "
+            f"buy {old[0]:g} → {new[0]:g}, sell {old[1]:g} → {new[1]:g} × "
+            f"{config.unit_phrase} below {self._ref_name}."
+        )
+        if self.plan is not None:
+            was = (float(self.plan["buy_level"]), float(self.plan["sell_level"]))
+            self._set_levels(ts)
+            text += (
+                f" Buy ${self.plan['buy_level']:,.2f} (was ${was[0]:,.2f}), sell "
+                f"${self.plan['sell_level']:,.2f} (was ${was[1]:,.2f})."
+            )
+        if self.entry is not None:
+            text += " The open position keeps the stop it was filled with."
+        _log(state, {"type": "analysis", "text": text})
+
+    def _record_levels(self, state: AppState, ts) -> None:
+        """Add this cycle's levels to the session's record, and publish it.
+
+        The chart draws this record while the run is live
+        (`model_overlays.live_overlays`) rather than re-deriving the levels,
+        because only the run knows what it actually rested: the forecast it
+        made from its own opening window, each sidebar edit at the minute it
+        was adopted, and a restart mid-session. One row per cycle, keyed by the
+        bar the cycle read; a second write for the same bar replaces the first.
+
+        `stop` is the position's own stop while long -- the number the log line
+        quotes -- and otherwise where it would sit under a fill at the buy.
+        """
+        plan = self.plan
+        row = _levels_row(self.config, plan, ts)
+        if self.entry is not None:
+            if self.entry.get("runner"):
+                row["stop"] = float(self.entry["price"])
+            else:
+                risk = self._risk()
+                row["stop"] = float(self.entry["price"]) - risk if risk else None
+        history = plan.setdefault("history", [])
+        if history and history[-1]["t"] == row["t"]:
+            history[-1] = row
+        else:
+            history.append(row)
+        state.apple_trader_levels = {
+            "ticker": self.ticker,
+            "date": plan["date"],
+            "config": self.config,
+            "rows": history,
+        }
 
     # --- the levels, and the forecast they hang off ------------------------
 
@@ -1779,6 +1901,22 @@ class DayRangeTrader(BaseTrader):
         return " · ".join(parts)
 
 
+def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
+    """One bar's levels off a plan: what `session_levels` walks and a live run
+    records (`DayRangeTrader._record_levels`), in the one shape the chart reads."""
+    buy = float(plan["buy_level"])
+    risk = stop_distance(config, stop_unit(config, plan))
+    return {
+        "t": ts,
+        "buy": buy,
+        "sell": float(plan["sell_level"]),
+        "stop": buy - risk if risk else None,
+        "reference": float(plan["reference"]),
+        "pred_high": float(plan["pred_high"]),
+        "pred_low": float(plan["pred_low"]),
+    }
+
+
 def session_levels(
     config: AppleTraderConfig,
     forecast: dict,
@@ -1788,7 +1926,10 @@ def session_levels(
 ) -> "list[dict]":
     """The buy and sell levels this configuration would rest, bar by bar.
 
-    For drawing, not for trading. `model_overlays` puts the two levels beside
+    For drawing, not for trading -- and for a session no live run recorded:
+    while one is running the chart draws its own record instead
+    (`DayRangeTrader._record_levels`), which knows about sidebar edits and
+    restarts that a walk under one configuration cannot. `model_overlays` puts the two levels beside
     the candles that tested them, and the only honest way to do that is to ask
     the agent -- so this walks a real `DayRangeTrader` through the session and
     reads its plan, rather than re-deriving `reference - k x unit` somewhere the
@@ -1838,17 +1979,7 @@ def session_levels(
         **forecast,
     }
     def row(ts) -> dict:
-        buy = float(trader.plan["buy_level"])
-        risk = stop_distance(config, stop_unit(config, trader.plan))
-        return {
-            "t": ts,
-            "buy": buy,
-            "sell": float(trader.plan["sell_level"]),
-            "stop": buy - risk if risk else None,
-            "reference": float(trader.plan["reference"]),
-            "pred_high": float(trader.plan["pred_high"]),
-            "pred_low": float(trader.plan["pred_low"]),
-        }
+        return _levels_row(config, trader.plan, ts)
 
     after = [ts for ts in session.index if ts > opening_end]
     if not after:

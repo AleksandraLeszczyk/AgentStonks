@@ -476,6 +476,7 @@ def compute(
     dayrange_daily_bars: "list[dict] | None" = None,
     trader_config=None,
     credentials: "tuple[str, str] | None" = None,
+    trader_history: "dict | None" = None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
@@ -502,6 +503,14 @@ def compute(
 
     `credentials` are the Alpaca key and secret the HighLow forecast reads its
     SIP history with; None falls back to the environment's.
+
+    `trader_history` is a live Apple Trader's own record of what it rested
+    (`AppState.apple_trader_levels`). When it is for this symbol and this day,
+    `trader_levels` and the day-range overlay of the model it runs draw it
+    instead of walking the session under `trader_config`: the record carries
+    the forecast the run actually made, every sidebar edit at the minute it was
+    adopted, and any restart, none of which a walk can know. It is what makes
+    the chart quote the same levels as the agent's log.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -551,10 +560,31 @@ def compute(
             return highlow_forecast()
         return day_range_forecast()
 
+    recorded = _recorded_levels(trader_history, symbol, day)
+
+    def range_items(key: str, forecast) -> "tuple[list[dict], str]":
+        if recorded is not None and OVERLAYS[key].draws(recorded[1].model_key):
+            return _day_range_items(
+                _recorded_result(recorded[0]), day, symbol, key=key, walked=recorded[0]
+            )
+        return _day_range_items(
+            forecast(), day, symbol, session,
+            open_price if key == DAY_RANGE_KEY else None, trader_config, key=key,
+        )
+
+    def trader_items() -> "tuple[list[dict], str]":
+        if recorded is not None:
+            rows, config = recorded
+            return _trader_levels_items(
+                symbol, session, day, open_price, _recorded_result(rows), config,
+                levels=rows,
+            )
+        return _trader_levels_items(
+            symbol, session, day, open_price, trader_forecast(), trader_config
+        )
+
     builders = {
-        DAY_RANGE_KEY: lambda: _day_range_items(
-            day_range_forecast(), day, symbol, session, open_price, trader_config
-        ),
+        DAY_RANGE_KEY: lambda: range_items(DAY_RANGE_KEY, day_range_forecast),
         PROFILE_RANGE_KEY: lambda: _profile_range_items(
             session, daily_bars or [], day
         ),
@@ -564,13 +594,8 @@ def compute(
         INTRADAY_DAYRANGE_KEY: lambda: _intraday_dayrange_items(
             symbol, session, day, open_price, day_range_forecast()
         ),
-        HIGHLOW_RANGE_KEY: lambda: _day_range_items(
-            highlow_forecast(), day, symbol, session, None, trader_config,
-            key=HIGHLOW_RANGE_KEY,
-        ),
-        TRADER_LEVELS_KEY: lambda: _trader_levels_items(
-            symbol, session, day, open_price, trader_forecast(), trader_config
-        ),
+        HIGHLOW_RANGE_KEY: lambda: range_items(HIGHLOW_RANGE_KEY, highlow_forecast),
+        TRADER_LEVELS_KEY: trader_items,
     }
 
     for key in wanted:
@@ -703,6 +728,7 @@ def _day_range_items(
     open_price: "float | None" = None,
     config=None,
     key: str = DAY_RANGE_KEY,
+    walked: "list[dict] | None" = None,
 ) -> "tuple[list[dict], str]":
     """The predicted high and low, and the range between them.
 
@@ -721,6 +747,9 @@ def _day_range_items(
 
     `key` is the overlay being drawn: `day_range` (TimeToChange3) or
     `highlow_range`, which differ only in whose forecast `result` holds.
+
+    `walked` is a live run's own record (`_recorded_levels`), drawn as given in
+    place of the walk.
     """
     overlay = OVERLAYS[key]
     forecast = result["forecast"]
@@ -733,7 +762,8 @@ def _day_range_items(
     high, low = float(forecast["pred_high"]), float(forecast["pred_low"])
     made_at = f"forecast at {pd.Timestamp(x0):%H:%M}"
 
-    walked = _day_range_walk(symbol, session, x0, open_price, forecast, config)
+    if walked is None:
+        walked = _day_range_walk(symbol, session, x0, open_price, forecast, config)
     highs = [row["pred_high"] for row in walked]
     lows = [row["pred_low"] for row in walked]
     moves = bool(walked) and (min(highs) != max(highs) or min(lows) != max(lows))
@@ -763,7 +793,7 @@ def _day_range_items(
                 lower_label="Pred. low", upper_label="Pred. high", step=True,
                 note=(
                     f"the {made_at}, revised where the session traded outside it "
-                    f"({low:.2f} – {high:.2f} at 09:35, "
+                    f"({low:.2f} – {high:.2f} at {pd.Timestamp(x0):%H:%M}, "
                     f"{lows[-1]:.2f} – {highs[-1]:.2f} now)"
                 ),
             )
@@ -800,6 +830,40 @@ def _day_range_walk(
         # maintain the forecast with.
         config = AppleTraderConfig(ticker=symbol)
     return session_levels(config, forecast, session, made_at, open_price=open_price)
+
+
+def _recorded_levels(
+    history: "dict | None", symbol: str, day: pd.Timestamp
+) -> "tuple[list[dict], object] | None":
+    """A live run's record of its levels, if it is about this chart's session.
+
+    `(rows, config)` with each row's `t` as an exchange-local timestamp, or
+    None when there is no record, it is another symbol's, or another day's --
+    yesterday's run must not draw over this morning's candles.
+    """
+    if not history or not history.get("rows") or history.get("config") is None:
+        return None
+    if (history.get("ticker") or "").upper() != symbol:
+        return None
+    if pd.Timestamp(history.get("date")).normalize() != pd.Timestamp(day).normalize():
+        return None
+    rows = []
+    for row in list(history["rows"]):  # the agent's thread appends to it
+        stamp = pd.Timestamp(row["t"])
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(market_hours.MARKET_TZ)
+        rows.append({**row, "t": stamp.tz_convert(market_hours.MARKET_TZ)})
+    return rows, history["config"]
+
+
+def _recorded_result(rows: "list[dict]") -> dict:
+    """The forecast a recorded run started from, in `_day_range_forecast`'s shape."""
+    first = rows[0]
+    return {
+        "forecast": {"pred_high": first["pred_high"], "pred_low": first["pred_low"]},
+        "made_at": first["t"],
+        "problem": "",
+    }
 
 
 # --- intraday range (IntradayVolatility) ------------------------------------
@@ -918,6 +982,7 @@ def _trader_levels_items(
     open_price: "float | None",
     result: dict,
     config=None,
+    levels: "list[dict] | None" = None,
 ) -> "tuple[list[dict], str]":
     """The buy, the sell and the stop, as the configured agent would rest them.
 
@@ -926,6 +991,10 @@ def _trader_levels_items(
     neither moves all session -- which also mirrors them into the price profile,
     where a resting order is exactly the kind of thing to read against traded
     volume -- and a band between them when they do.
+
+    `levels` is a live run's own record (`_recorded_levels`) with `config` the
+    run's configuration; it is drawn as given, sidebar edits and all, in place
+    of `session_levels`' walk under `config`.
     """
     from .apple_trader import (  # heavy-ish, and only here
         AppleTraderConfig, session_levels, stop_phrase,
@@ -941,7 +1010,9 @@ def _trader_levels_items(
         config = AppleTraderConfig(ticker=symbol)
 
     made_at = result["made_at"]
-    levels = session_levels(config, forecast, session, made_at, open_price=open_price)
+    recorded = levels is not None
+    if levels is None:
+        levels = session_levels(config, forecast, session, made_at, open_price=open_price)
     if not levels:
         return [], (
             f"{overlay.label}: the session has no bar after the {pd.Timestamp(made_at):%H:%M} "
@@ -960,6 +1031,9 @@ def _trader_levels_items(
     stops = [row["stop"] for row in levels if row["stop"] is not None]
     stop_color = MODEL_OVERLAY_COLORS["trader_stop"]
     stop_note = (
+        f"Apple Trader's stop: the open position's own while it is long, otherwise "
+        f"{stop_phrase(config)} under a fill at the buy level"
+        if recorded else
         f"Apple Trader's stop, {stop_phrase(config)} under a fill at the buy level "
         "(a fill above the buy stops that much higher, and is then fixed in dollars)"
     )
@@ -1099,9 +1173,14 @@ def live_overlays(
     # picture of it: moving a distance in the sidebar has to move the lines on
     # the next rerun, not on the next bar.
     config = getattr(getattr(sym_state, "app", None), "apple_trader_config", None)
+    # And the running agent's record, which grows once a cycle and changes the
+    # moment a sidebar edit is adopted -- which can be mid-bar.
+    history = getattr(getattr(sym_state, "app", None), "apple_trader_levels", None)
+    rows = (history or {}).get("rows") or []
     key = (
         bars[-1].get("t"), tuple(wanted), len(bars),
         None if config is None else astuple(config),
+        len(rows), tuple(rows[-1].values()) if rows else None,
     )
     cached = getattr(sym_state, "model_overlay_cache", None)
     if cached and cached.get("key") == key:
@@ -1116,6 +1195,7 @@ def live_overlays(
         daily_bars=list(sym_state.daily_bars or []),
         session_date=session_date,
         trader_config=config,
+        trader_history=history,
         credentials=(getattr(app, "api_key", "") or None, getattr(app, "api_secret", "") or None),
         **_live_dayrange_inputs(sym_state.symbol, wanted, session_date),
     )
