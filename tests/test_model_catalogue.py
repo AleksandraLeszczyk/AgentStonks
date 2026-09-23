@@ -25,6 +25,7 @@ the whole design of the module, and it is one assertion.
 """
 
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -150,6 +151,82 @@ class TestDayRangeErrorPctAdr:
         spec = _dayrange_spec_from(None, tmp_path, monkeypatch)
         assert spec.headline == ("MAE (log units)", "—")
         assert not spec.available
+
+
+def test_highlow_history_dir_mirrors_the_real_one():
+    highlow = pytest.importorskip("agent_stonks.highlow_model")
+    assert mc.HIGHLOW_HISTORY_DIR / "AAPL_sip_sessions.json" == highlow.history_path("AAPL")
+
+
+# 20 sessions each spanning exactly 2% of the price (log(high/low) = 0.02), so
+# every 14-day ADR is 0.02 and an error of 0.005 log units is 25% of a day.
+HIGHLOW_SESSIONS = {
+    f"2026-01-{day:02d}": {"high": 100.0 * math.exp(0.02), "low": 100.0}
+    for day in range(1, 21)
+}
+HIGHLOW_SIDECAR = {
+    "ticker": "AAPL",
+    "created": "2026-09-21T16:45:00",
+    "test_metrics": {"mae_mean": 0.005, "mae_usd_mean": 1.37},
+    # Sessions 15-20: the first 14 have no full look-back of their own.
+    "splits": {"test": ["2026-01-15", "2026-01-20"]},
+}
+
+
+def _highlow_spec_from(meta, sessions, tmp_path, monkeypatch, ticker="AAPL"):
+    bundle = tmp_path / f"highlow15m_{ticker}.joblib"
+    bundle.with_suffix(".json").write_text(json.dumps(meta))
+    monkeypatch.setenv(f"APPLE_HIGHLOW_MODEL_{ticker}", str(bundle))
+    history = tmp_path / "highlow"
+    history.mkdir(exist_ok=True)
+    if sessions is not None:
+        (history / f"{ticker}_sip_sessions.json").write_text(
+            json.dumps({"sessions": sessions})
+        )
+    monkeypatch.setattr(mc, "HIGHLOW_HISTORY_DIR", history)
+    return mc.spec(apple_models.HIGHLOW_KEY, ticker)
+
+
+class TestHighLowErrorPctAdr:
+    """The sidecar has the log-unit MAE and no ADR; the ADR is the model's own
+    `adr14`, averaged over the test-window sessions the SIP cache holds."""
+
+    def test_the_ratio_is_the_log_mae_over_the_window_adr(self):
+        pct, sessions = mc.highlow_error_pct_adr(HIGHLOW_SIDECAR, HIGHLOW_SESSIONS)
+        assert pct == pytest.approx(25.0)
+        assert sessions == 6
+
+    def test_only_the_test_window_counts(self):
+        """A wider day outside the window moves nothing inside it."""
+        sessions = {**HIGHLOW_SESSIONS, "2026-01-21": {"high": 110.0, "low": 100.0}}
+        pct, n = mc.highlow_error_pct_adr(HIGHLOW_SIDECAR, sessions)
+        assert (pct, n) == (pytest.approx(25.0), 6)
+
+    @pytest.mark.parametrize("meta, sessions", [
+        (HIGHLOW_SIDECAR, {}),
+        # Nothing in the window has 14 sessions behind it.
+        (HIGHLOW_SIDECAR, dict(list(HIGHLOW_SESSIONS.items())[:14])),
+        ({**HIGHLOW_SIDECAR, "splits": {}}, HIGHLOW_SESSIONS),
+        ({**HIGHLOW_SIDECAR, "test_metrics": {}}, HIGHLOW_SESSIONS),
+        ({}, HIGHLOW_SESSIONS),
+    ])
+    def test_nothing_to_measure_is_no_percentage(self, meta, sessions):
+        assert mc.highlow_error_pct_adr(meta, sessions) is None
+
+    def test_the_spec_leads_with_it(self, tmp_path, monkeypatch):
+        spec = _highlow_spec_from(HIGHLOW_SIDECAR, HIGHLOW_SESSIONS, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE (% of ADR)", "25.0%")
+        assert next(iter(spec.metrics)) == "MAE (% of ADR)"
+        assert spec.metrics["MAE (% of ADR)"] == pytest.approx(25.0)
+        assert "25% of a typical day's range" in spec.caveat
+        assert "6 test-window sessions" in spec.caveat
+
+    def test_without_the_cache_the_headline_falls_back_to_dollars(
+        self, tmp_path, monkeypatch
+    ):
+        spec = _highlow_spec_from(HIGHLOW_SIDECAR, None, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE ($ per extreme)", "$1.37")
+        assert "MAE (% of ADR)" not in spec.metrics
 
 
 def test_missing_file_is_a_reason_not_an_exception(tmp_path, monkeypatch):

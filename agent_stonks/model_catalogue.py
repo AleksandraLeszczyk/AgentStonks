@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from importlib.util import find_spec
@@ -274,6 +275,66 @@ def dayrange_error_pct_adr(meta: dict) -> "float | None":
     if mae != mae or adr_rel != adr_rel or adr_rel <= 0:
         return None
     return 100.0 * mae / adr_rel
+
+
+# Where `highlow_model` caches its per-session SIP rollups. Mirrored rather
+# than imported for the same reason as `_saved_path`: that module imports
+# torch. Pinned against `highlow_model.history_path` by the tests.
+HIGHLOW_HISTORY_DIR = Path(__file__).resolve().parent.parent / "data" / "highlow"
+
+
+def _highlow_sessions(ticker: str) -> dict:
+    """The cached `{date: {high, low, ...}}` rollups for one ticker, or `{}`."""
+    path = HIGHLOW_HISTORY_DIR / f"{ticker.upper()}_sip_sessions.json"
+    return (_read_json(path).get("sessions") or {}) if path.exists() else {}
+
+
+def highlow_error_pct_adr(
+    meta: dict, sessions: "dict | None" = None, ticker: str = ""
+) -> "tuple[float, int] | None":
+    """A HighLow bundle's test-window MAE as a percentage of its ADR, and how
+    many sessions that ADR was averaged over -- or None.
+
+    The sidecar grades the model in log units, as TimeToChange3's does, but
+    unlike TimeToChange3's it records no ADR at all, so the denominator comes
+    from the SIP rollups the model itself reads (`data/highlow`). It is the
+    model's own `adr14` -- the mean `log(high / low)` of the previous 14
+    sessions -- averaged over the test-window sessions the cache holds. Also
+    a fraction of the price, so the price cancels as in
+    `dayrange_error_pct_adr`.
+
+    An estimate: the sidecar has only the window's mean error, so this is
+    mean error over mean ADR rather than the mean of the per-session ratios,
+    and the cache may not reach back to the start of the window (it is
+    fetched for trading, not for grading). None when there is nothing in the
+    window to measure -- a percentage of an assumed range would be worse than
+    the raw error.
+    """
+    test = meta.get("test_metrics") or {}
+    window = (meta.get("splits") or {}).get("test") or []
+    try:
+        mae = float(test["mae_mean"])
+        start, end = str(window[0]), str(window[-1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if sessions is None:
+        sessions = _highlow_sessions(ticker or str(meta.get("ticker") or ""))
+    ranges: "list[tuple[str, float]]" = []
+    for day in sorted(sessions):
+        try:
+            high, low = float(sessions[day]["high"]), float(sessions[day]["low"])
+            ranges.append((day, math.log(high / low)))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+    adrs = [
+        sum(r for _, r in ranges[i - 14:i]) / 14
+        for i in range(14, len(ranges))
+        if start <= ranges[i][0] <= end
+    ]
+    adr = sum(adrs) / len(adrs) if adrs else 0.0
+    if mae != mae or not adr > 0:
+        return None
+    return 100.0 * mae / adr, len(adrs)
 
 
 # --- one builder per model --------------------------------------------------
@@ -593,6 +654,11 @@ def _highlow_spec(ticker: str) -> ModelSpec:
     metrics = {k: v for k, v in test.items()}
     if meta.get("walk_forward_mae_mean") is not None:
         metrics["walk-forward MAE"] = meta["walk_forward_mae_mean"]
+    measured = highlow_error_pct_adr(meta, ticker=ticker)
+    error_pct = measured[0] if measured else None
+    if error_pct is not None:
+        # First, as on TimeToChange3's row: it is the headline.
+        metrics = {"MAE (% of ADR)": error_pct, **metrics}
     weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
     data = meta.get("data") or {}
     model = apple_models.get(apple_models.HIGHLOW_KEY)
@@ -625,7 +691,11 @@ def _highlow_spec(ticker: str) -> ModelSpec:
         ),
         metrics=metrics,
         headline=(
-            ("MAE ($ per extreme)", f"${float(test['mae_usd_mean']):,.2f}")
+            ("MAE (% of ADR)", f"{error_pct:.1f}%")
+            if error_pct is not None
+            # No SIP history cached yet (it is fetched on the first forecast):
+            # the dollar error, then the raw one, rather than an assumed range.
+            else ("MAE ($ per extreme)", f"${float(test['mae_usd_mean']):,.2f}")
             if test.get("mae_usd_mean") is not None
             else ("MAE (log units)", format_metric(test.get("mae_mean")))
         ),
@@ -643,7 +713,14 @@ def _highlow_spec(ticker: str) -> ModelSpec:
         available=available,
         unavailable_reason=reason,
         caveat=(
-            f"MAE {format_metric(test.get('mae_mean'))} log units on the "
+            (
+                f"Misses each extreme by about {error_pct:.0f}% of a typical day's "
+                f"range — the ADR averaged over the {measured[1]} test-window sessions "
+                "in the local SIP cache, so an estimate. "
+                if measured
+                else ""
+            )
+            + f"MAE {format_metric(test.get('mae_mean'))} log units on the "
             f"{', '.join((meta.get('splits') or {}).get('test') or []) or 'test'} window, "
             "against TimeToChange3's published "
             f"{format_metric(meta.get('ttc3_published_test_mae_mean'))}. The shipped "
