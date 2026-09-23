@@ -81,6 +81,43 @@ class TestFrame:
         assert frame["bar_of_day"].iloc[-1] == 29
 
 
+class TestClosedBarsOnly:
+    """The live frame holds bars whose minute has ended, never the one still
+    trading -- which the Finnhub source keeps as the buffer's newest row."""
+
+    def _state(self, bars, timeframe=None):
+        import threading
+        from types import SimpleNamespace
+
+        app = SimpleNamespace(timeframe=timeframe) if timeframe else None
+        return SimpleNamespace(symbol="AAPL", lock=threading.Lock(), bars=bars, app=app)
+
+    def _at(self, monkeypatch, hhmmss):
+        monkeypatch.setattr(
+            mr.clock, "now",
+            lambda: pd.Timestamp(f"2026-07-21 {hhmmss}", tz="America/New_York"),
+        )
+
+    def test_the_minute_still_trading_is_left_out(self, monkeypatch):
+        """09:36:05: the 09:36 candle is five seconds old, and the newest bar a
+        rule agent may act on is 09:35."""
+        self._at(monkeypatch, "09:36:05")
+        frame = mr.minute_frame(self._state(_bars("2026-07-21", [100.0] * 7)))
+        assert frame.index[-1].strftime("%H:%M") == "09:35"
+        assert len(frame) == 6
+
+    def test_a_bar_counts_from_the_second_its_minute_ends(self, monkeypatch):
+        self._at(monkeypatch, "09:37:00")
+        frame = mr.minute_frame(self._state(_bars("2026-07-21", [100.0] * 7)))
+        assert frame.index[-1].strftime("%H:%M") == "09:36"
+
+    def test_the_cut_follows_the_streams_timeframe(self, monkeypatch):
+        bars = _bars("2026-07-21", [100.0] * 60)[::5]      # 09:30, 09:35, ..., 10:25
+        self._at(monkeypatch, "10:29:00")
+        frame = mr.minute_frame(self._state(bars, timeframe="5Min"))
+        assert frame.index[-1].strftime("%H:%M") == "10:20"
+
+
 class TestMomentum:
     def test_momentum_is_drift_in_units_of_its_own_random_walk_scale(self):
         frame = mr.compute_momentum(_session(), PARAMS)

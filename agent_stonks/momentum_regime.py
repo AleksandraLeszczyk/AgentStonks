@@ -197,18 +197,40 @@ def add_session_columns(bars: pd.DataFrame) -> pd.DataFrame:
 
 
 def minute_frame(sym_state) -> pd.DataFrame:
-    """The frame the pipeline runs on: today's session, live.
+    """The frame the pipeline runs on: today's session, live, closed bars only.
 
     Nothing here crosses the overnight gap, so it needs no history behind today
     at all.
+
+    A bar whose minute has not ended yet is left out. Alpaca only ever delivers
+    a bar once it has closed, but the Finnhub source builds its candles locally
+    and the newest one in the buffer is the minute still trading
+    (`finnhub_stream`). The rule agents run a few seconds after each minute
+    boundary and act on the newest row exactly once, so reading that row meant
+    judging every minute on its first ~5 seconds -- a dip to the buy level
+    later in the minute was never seen. SimLab's replay frame
+    (`simlab.patches.fast_minute_frame`) has always cut at the same place:
+    bars that ended by the clock.
     """
-    today = clock.now().astimezone(market_hours.MARKET_TZ).date()
+    now = clock.now()
+    today = now.astimezone(market_hours.MARKET_TZ).date()
     with sym_state.lock:
         live_bars = list(sym_state.bars)
     live = frame_from_bars(live_bars)
     if not len(live):
         return live
-    return live[live.index.date == today]
+    width = pd.Timedelta(minutes=_bar_minutes(sym_state))
+    closed = (live.index + width) <= pd.Timestamp(now)
+    return live[(live.index.date == today) & closed]
+
+
+def _bar_minutes(sym_state) -> int:
+    """How long one bar of this buffer lasts -- the stream's timeframe, 1 minute
+    unless the app says otherwise."""
+    from .stream_common import TF_MINUTES  # stream-side module; only needed here
+
+    timeframe = getattr(getattr(sym_state, "app", None), "timeframe", None) or "1Min"
+    return TF_MINUTES.get(timeframe, 1)
 
 
 def regime_name(regime: "int | None") -> str:

@@ -2583,3 +2583,35 @@ class TestSidebarLevelEdits:
         assert rows[-1]["t"] == tape.index[-1]
         assert rows[-1]["buy"] == pytest.approx(101.0)
         assert len(rows) == len(before) + 1
+
+
+class TestReadsClosedBarsOnly:
+    """Through the real `minute_frame`, not `Tape`'s stand-in: with a Finnhub
+    buffer the newest row is the minute still trading, and the agent must act
+    on the one that just closed."""
+
+    def test_a_dip_in_the_bar_that_just_closed_buys(self, state, monkeypatch):
+        original = at.momentum_regime.minute_frame
+        tape = Tape(monkeypatch)
+        monkeypatch.setattr(at.momentum_regime, "minute_frame", original)
+        clock.set_simulated(datetime(2026, 7, 21, 14, 30, 5, tzinfo=timezone.utc))  # 10:30:05 ET
+        try:
+            def bar(ts, close, low=None):
+                return {"t": ts.tz_convert("UTC").isoformat(), "o": close, "h": close,
+                        "l": close if low is None else low, "c": close, "v": 1.0e5}
+
+            opening = [bar(ts, row["close"], row["low"]) for ts, row in zip(tape.index, tape.rows)]
+            ten = Tape.OPEN + pd.Timedelta(hours=1)
+            sym_state = state.sym(TICKER)
+            sym_state.bars.extend(opening + [
+                bar(ten - pd.Timedelta(minutes=1), 103.0, low=102.0),  # 10:29: touched 102.50
+                bar(ten, 104.0),                                      # 10:30: 5 s old
+            ])
+            broker = FakeBroker(103.0)
+            tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+            trader = at.DayRangeTrader(dayrange_config())
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+            line = [e["text"] for e in state.agent_log if e.get("type") == "analysis"][-1]
+            assert line.startswith(f"{TICKER} 10:29 ")
+        finally:
+            clock.clear()
