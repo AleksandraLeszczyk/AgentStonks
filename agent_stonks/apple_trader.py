@@ -58,7 +58,8 @@ from .config import (
     APPLE_TRADER_MIN_WIN,
     APPLE_TRADER_MIN_WIN_K,
     APPLE_TRADER_MODEL,
-    APPLE_TRADER_MOMENTUM_FADE_BARS,
+    APPLE_TRADER_NEGATIVE_FOR_BARS,
+    APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     APPLE_TRADER_POSITION_PCT,
     APPLE_TRADER_MAX_FALL_K,
     APPLE_TRADER_SCALE_IN,
@@ -169,17 +170,24 @@ class AppleTraderConfig:
     # set.
     stop_k: float = 0.0
     # The momentum take: gains are taken short of the sell level once the
-    # total momentum over the last this-many bars, having been positive at some
-    # point since the entry, has turned balanced or negative -- with the
-    # position in profit. See `_momentum_take`. 0 switches the take off, and
-    # with it the runner and its breakeven.
-    momentum_fade_bars: int = APPLE_TRADER_MOMENTUM_FADE_BARS
-    # The take in the form it used to be written in: how far (in sigmas) the
-    # smoothed 15-bar score had to fall from its best since the entry. Kept
-    # only so a stored record replays and signs exactly as the run it
-    # describes -- nothing configures it any more, and a new config leaves it
-    # at 0. Mutually exclusive with `momentum_fade_bars` (`__post_init__`),
-    # like `stop_k` with `stop_gain_fraction`.
+    # momentum over the last this-many bars -- `close - close[N bars ago]`, the
+    # live chart's momentum panel -- has been negative for `negative_for_bars`
+    # bars in a row since the entry, with the position in profit. See
+    # `_momentum_take`. 0 switches the take off, and with it the runner and its
+    # breakeven.
+    negative_momentum_bars: int = APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
+    # How many bars in a row that momentum has to stay under zero: "negative
+    # for long enough". Only read while the take above is on.
+    negative_for_bars: int = APPLE_TRADER_NEGATIVE_FOR_BARS
+    # The two earlier forms of the take, kept only so a stored record replays
+    # and signs exactly as the run it describes -- nothing configures either
+    # any more, and a new config leaves both at 0. `momentum_fade_bars` is the
+    # positive-to-balanced turn of the sigma score over N bars (2026-09-21 to
+    # -23), `momentum_drop` the fall in sigmas of the smoothed 15-bar score
+    # from its best since the entry (before that). At most one of the three
+    # takes may be set (`__post_init__`), like `stop_k` with
+    # `stop_gain_fraction`.
+    momentum_fade_bars: int = 0
     momentum_drop: float = 0.0
     # The share of the position that take sells when a runner is kept.
     take_fraction: float = APPLE_TRADER_TAKE_FRACTION
@@ -242,7 +250,7 @@ class AppleTraderConfig:
             self.min_win_k = min_win_for(self.ticker)
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
-            "hold_min_gain_k", "min_win_k", "max_fall_k",
+            "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -260,21 +268,33 @@ class AppleTraderConfig:
                 "only one may be set; stop_k is the legacy unit a stored record replays "
                 "under, new configurations use stop_gain_fraction"
             )
-        # A bar count, whatever a form or a JSON record handed over.
-        if float(self.momentum_fade_bars) != int(self.momentum_fade_bars):
+        # Bar counts, whatever a form or a JSON record handed over.
+        for name in ("negative_momentum_bars", "negative_for_bars", "momentum_fade_bars"):
+            if float(getattr(self, name)) != int(getattr(self, name)):
+                raise ValueError(
+                    f"{name} {getattr(self, name)!r} is a number of bars and must be whole"
+                )
+            setattr(self, name, int(getattr(self, name)))
+        # A streak of no bars would fire on the first bar in profit, which is
+        # not "negative for long enough" but no rule at all.
+        if self.negative_momentum_bars and self.negative_for_bars < 1:
             raise ValueError(
-                f"momentum_fade_bars {self.momentum_fade_bars!r} is a number of bars "
-                "and must be whole"
+                f"negative_for_bars {self.negative_for_bars!r} must be at least 1 bar "
+                "while the momentum take is on"
             )
-        self.momentum_fade_bars = int(self.momentum_fade_bars)
         # The same reason as the stop: two takes is not a stricter take, it is
         # a config that does not say which rule it means.
-        if self.momentum_drop and self.momentum_fade_bars:
+        takes = [
+            name
+            for name in ("negative_momentum_bars", "momentum_fade_bars", "momentum_drop")
+            if getattr(self, name)
+        ]
+        if len(takes) > 1:
             raise ValueError(
-                f"momentum_drop {self.momentum_drop!r} and momentum_fade_bars "
-                f"{self.momentum_fade_bars!r} are two ways of writing the momentum take "
-                "and only one may be set; momentum_drop is the legacy rule a stored "
-                "record replays under, new configurations use momentum_fade_bars"
+                f"{' and '.join(takes)} are different ways of writing the momentum take "
+                "and only one may be set; momentum_fade_bars and momentum_drop are the "
+                "legacy rules a stored record replays under, new configurations use "
+                "negative_momentum_bars"
             )
         if not 0 < self.take_fraction <= 1:
             raise ValueError(
@@ -392,13 +412,17 @@ class AppleTraderConfig:
         chart's momentum panel draws. With the take off there is no look-back
         of the run's own, so the default one.
         """
-        return int(self.momentum_fade_bars) or APPLE_TRADER_MOMENTUM_FADE_BARS
+        return (
+            int(self.negative_momentum_bars)
+            or int(self.momentum_fade_bars)
+            or APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
+        )
 
     @property
     def has_take(self) -> bool:
         """Whether the momentum take is on, in either of its forms -- and with
         it the runner and the breakeven."""
-        return bool(self.momentum_fade_bars or self.momentum_drop)
+        return bool(self.negative_momentum_bars or self.momentum_fade_bars or self.momentum_drop)
 
 
 def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
@@ -482,6 +506,11 @@ def stop_phrase(config: AppleTraderConfig) -> str:
 
 def fade_phrase(config: AppleTraderConfig) -> str:
     """The momentum take's trigger in words, in whichever form it is written."""
+    if config.negative_momentum_bars:
+        return (
+            f"the {config.negative_momentum_bars}-bar momentum negative for "
+            f"{config.negative_for_bars} bars in a row"
+        )
     if config.momentum_fade_bars:
         return (
             f"the {config.momentum_fade_bars}-bar momentum turning from positive to "
@@ -531,9 +560,12 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     elif c.stop_k:
         exits += f",stop=E-{c.stop_k:g}A"
     # The take is signed in the form it was configured in, like the stop:
-    # `@fade15b` is the positive-to-balanced turn over 15 bars, `@mom-1` the
-    # legacy 1σ fall from the peak a stored record keeps.
-    if c.momentum_fade_bars:
+    # `@neg15b/5b` is the 15-bar momentum negative for 5 bars in a row;
+    # `@fade15b` the legacy positive-to-balanced turn over 15 bars and `@mom-1`
+    # the older 1σ fall from the peak, which stored records keep.
+    if c.negative_momentum_bars:
+        take = f"neg{c.negative_momentum_bars}b/{c.negative_for_bars}b"
+    elif c.momentum_fade_bars:
         take = f"fade{c.momentum_fade_bars}b"
     elif c.momentum_drop:
         take = f"mom-{c.momentum_drop:g}"
@@ -1860,16 +1892,16 @@ class DayRangeTrader(BaseTrader):
     def _momentum_take(
         self, frame, position: float, entry_price: float, price: float
     ) -> "tuple[float, str, str] | None":
-        """Bank gains short of the target when the move carrying them fades.
+        """Bank gains short of the target once momentum has been negative for long enough.
 
-        Fires when the position is in profit and the total momentum over the
-        last `momentum_fade_bars` bars has turned from positive to balanced or
-        negative: it was positive on some bar since the entry and is not any
-        more (`_fade_turned`). "Since the entry" because a morning surge before
-        the fill is not a move this trade was riding -- and a dip buy usually
-        fills with momentum negative, so the take waits for the bounce to carry
-        it positive and then for that to give out. A legacy record's
-        `momentum_drop` reads the older rule instead (`_fade_dropped`).
+        Fires when the position is in profit and the momentum over the last
+        `negative_momentum_bars` bars has been negative on each of the last
+        `negative_for_bars` bars since the entry (`_momentum_negative`). Only
+        bars after the fill count, because the dip that reached the buy level
+        is falling by construction -- a streak it started is not this trade
+        going wrong. A legacy record reads the rule it was run under instead:
+        `momentum_fade_bars` the positive-to-balanced turn (`_fade_turned`),
+        `momentum_drop` the fall from the peak (`_fade_dropped`).
 
         What it sells depends on how much the forecast still promises. If the
         sell level is `hold_min_gain_k` level units or more above the fill,
@@ -1893,11 +1925,12 @@ class DayRangeTrader(BaseTrader):
             return None
 
         since = entry.get("ts", frame.index[-1])
-        why = (
-            self._fade_turned(frame, since)
-            if config.momentum_fade_bars
-            else self._fade_dropped(frame, since)
-        )
+        if config.negative_momentum_bars:
+            why = self._momentum_negative(frame, since)
+        elif config.momentum_fade_bars:
+            why = self._fade_turned(frame, since)
+        else:
+            why = self._fade_dropped(frame, since)
         if why is None:
             return None
 
@@ -1933,9 +1966,39 @@ class DayRangeTrader(BaseTrader):
             "the price comes back to the fill."
         ), self.EXIT_TAKE
 
+    def _momentum_negative(self, frame, since) -> "str | None":
+        """Whether the `negative_momentum_bars`-bar momentum has been negative
+        on each of the last `negative_for_bars` bars after `since` -- and if
+        so, how to say so.
+
+        Momentum is `close - close[N bars ago]` in dollars, the series the live
+        chart's momentum panel draws, so the take fires where that panel has
+        sat under zero for the streak. The first N bars of the session have
+        nothing to compare against and break a streak rather than extend it,
+        like the panel's gap there. Recomputed over the session on each call,
+        so a cycle that missed a bar still counts it.
+        """
+        n, needed = self.config.negative_momentum_bars, self.config.negative_for_bars
+        closes = frame["close"]
+        mom = closes - closes.shift(n)
+        after = mom[frame.index > since].to_numpy()
+        streak = 0
+        for value in after[::-1]:
+            if not value < 0:  # NaN (not known yet) or at/above zero
+                break
+            streak += 1
+        if streak < needed:
+            return None
+        return (
+            f"the {n}-bar momentum has been negative for the last {streak} bars since "
+            f"the entry (now ${float(mom.iloc[-1]):+,.2f} against {n} bars ago; "
+            f"{needed} in a row is the trigger)"
+        )
+
     def _fade_turned(self, frame, since) -> "str | None":
-        """Whether the `momentum_fade_bars`-bar momentum has turned from
-        positive to balanced or negative since `since` -- and if so, how to say so.
+        """The take a record from 2026-09-21 to -23 replays: whether the
+        `momentum_fade_bars`-bar momentum has turned from positive to balanced
+        or negative since `since` -- and if so, how to say so.
 
         "Total momentum over the last N bars" is the N-bar log return in units
         of its own random-walk scale, smoothed (`compute_momentum` at `horizon
@@ -2003,7 +2066,7 @@ class DayRangeTrader(BaseTrader):
             state, tracker, float(bar["close"]), self._entry_reasoning(bar)
         )
         if bought:
-            # Where the momentum take starts looking for this position's peak.
+            # Where the momentum take starts counting for this position.
             self.entry["ts"] = bar.name
             # And how far under it the stop sits, in dollars, decided once here.
             # See `_risk`.
@@ -2025,7 +2088,7 @@ class DayRangeTrader(BaseTrader):
                 f"a stop {stop_phrase(config)} (${risk:,.2f}) under the fill"
             )
         if config.has_take:
-            exits.append(f"a momentum take if the move fades short of it ({fade_phrase(config)})")
+            exits.append(f"a momentum take if the move gives out short of it ({fade_phrase(config)})")
         return (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
             f"${plan['buy_level']:,.2f} buy level — {config.buy_k:g} × the "
@@ -2337,7 +2400,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         )
     if config.has_take:
         exits.append(
-            f"a {config.take_fraction:.0%} take in profit once momentum fades "
+            f"a {config.take_fraction:.0%} take in profit once momentum gives out "
             f"({fade_phrase(config)}), the rest kept for the sell level only if "
             f"it is {config.hold_min_gain_k:g} × {config.unit_phrase} or more above the fill and sold if the "
             "price comes back to it"

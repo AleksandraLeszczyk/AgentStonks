@@ -377,7 +377,7 @@ class TestDayRangeExit:
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tape = Tape(monkeypatch, broker)
         trader = self._entered(
-            state, tracker, tape, stop_gain_fraction=0.0, momentum_fade_bars=0
+            state, tracker, tape, stop_gain_fraction=0.0, negative_momentum_bars=0
         )
 
         for price, mom in ((104.0, 2.0), (104.5, 0.5), (99.0, -1.0), (94.0, -2.5)):
@@ -530,104 +530,114 @@ class TestStopIsAShareOfThePredictedGain:
 
 
 class TestDayRangeMomentumTake:
-    """Banking gains short of the target when the move carrying them fades.
+    """Banking gains short of the target once momentum has been negative for long enough.
 
     Every test fills at 103 on the $10 ADR, so the 109 sell level is 0.6 ADR
     above the fill -- past the 0.3 worth keeping a runner for -- and the stop
-    sits at 101. The momentum score is scripted per bar, except in the last
-    test, which computes it from the closes.
+    sits at 101. Momentum is read from the closes: the 3-bar change `close -
+    close[3 bars ago]`, which the take wants negative 2 bars in a row, so a
+    test walks the price through a streak in a handful of bars. The opening
+    window closes at 101.0 .. 101.4.
     """
 
     def _entered(self, state, monkeypatch, **kwargs):
+        kwargs.setdefault("negative_momentum_bars", 3)
+        kwargs.setdefault("negative_for_bars", 2)
         broker = FakeBroker(103.0)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        tape = Tape(monkeypatch, broker, real_momentum=kwargs.pop("real_momentum", False))
+        tape = Tape(monkeypatch, broker, real_momentum=True)
         trader = at.DayRangeTrader(dayrange_config(**kwargs))
-        tape.append(103.0, low=BUY_LEVEL - 0.01, mom=0.0)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
         return trader, tracker, tape
+
+    @staticmethod
+    def _walk(trader, state, tracker, tape, closes, expect="hold"):
+        for close in closes:
+            tape.append(close)
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == expect, close
+
+    def _rise(self, trader, state, tracker, tape):
+        """Up off the fill and into profit: 105.0, 105.5, 104.8 -- momentum
+        +3.7, +4.1, +1.8, none of it negative."""
+        self._walk(trader, state, tracker, tape, (105.0, 105.5, 104.8))
 
     def _taken(self, state, monkeypatch, **kwargs):
         trader, tracker, tape = self._entered(state, monkeypatch, **kwargs)
         held = tracker.position_for(TICKER)
-        tape.append(105.0, mom=2.0)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(105.2, mom=0.3)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        self._rise(trader, state, tracker, tape)
+        self._walk(trader, state, tracker, tape, (104.6,))  # -0.40 against 105.0
+        self._walk(trader, state, tracker, tape, (104.4,), "sold")  # -1.10 against 105.5
         return trader, tracker, tape, held
 
-    def test_a_fading_move_in_profit_banks_most_and_keeps_a_runner(
+    def test_negative_for_long_enough_in_profit_banks_most_and_keeps_a_runner(
         self, state, market_open, monkeypatch
     ):
-        trader, tracker, tape = self._entered(state, monkeypatch)
-        held = tracker.position_for(TICKER)
-
-        tape.append(105.0, mom=2.0)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(105.5, mom=1.2)  # off its peak, but still positive
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        # Under the 0.9σ it took to turn positive, but a regime is left only
-        # under 0.4σ: a score hovering at the line is not a turn.
-        tape.append(105.4, mom=0.6)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(105.2, mom=0.3)  # balanced
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        trader, tracker, tape, held = self._taken(state, monkeypatch)
 
         runner = tracker.position_for(TICKER)
         assert held - runner == int(held * 0.7)
         assert 0 < runner < held
         reasoning = tracker.snapshot()["decisions"][-1].reasoning
         assert "Momentum take" in reasoning and "Banking" in reasoning
-        assert "15-bar momentum" in reasoning and "turned balanced" in reasoning
+        assert "3-bar momentum has been negative for the last 2 bars" in reasoning
 
-    def test_a_turn_straight_to_negative_takes_too(self, state, market_open, monkeypatch):
-        trader, tracker, tape = self._entered(state, monkeypatch)
-        tape.append(105.0, mom=2.0)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(104.8, mom=-1.2)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
-        assert "turned negative" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_momentum_that_never_turned_positive_has_not_faded(
+    def test_one_negative_bar_is_not_long_enough_and_a_positive_one_restarts_the_count(
         self, state, market_open, monkeypatch
     ):
-        """A dip buy fills with momentum negative; a price drifting up on a
-        balanced tape is not a move that gave out."""
         trader, tracker, tape = self._entered(state, monkeypatch)
         held = tracker.position_for(TICKER)
-        for mom in (-1.5, 0.2, 0.8, 0.1):
-            tape.append(104.5, mom=mom)
-            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        self._rise(trader, state, tracker, tape)
+        # -0.40, then +0.50 against 105.5: the streak is broken at one ...
+        self._walk(trader, state, tracker, tape, (104.6, 106.0, 105.8))
+        # ... and has to be built again from nothing: -0.10, then -2.00.
+        self._walk(trader, state, tracker, tape, (104.5,))
+        assert tracker.position_for(TICKER) == held
+        self._walk(trader, state, tracker, tape, (104.0,), "sold")
+
+    def test_how_long_is_long_enough_is_configurable(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._entered(state, monkeypatch, negative_for_bars=3)
+        self._rise(trader, state, tracker, tape)
+        self._walk(trader, state, tracker, tape, (104.6, 104.4))
+        self._walk(trader, state, tracker, tape, (104.3,), "sold")  # -0.50 against 104.8
+        assert "negative for the last 3 bars" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_fall_into_the_fill_does_not_count(self, state, market_open, monkeypatch):
+        """The dip that reached the buy level is falling by construction: a
+        streak it started is not this trade going wrong, so only bars after the
+        fill count toward it."""
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker, real_momentum=True)
+        trader = at.DayRangeTrader(
+            dayrange_config(negative_momentum_bars=3, negative_for_bars=2)
+        )
+        for close in (106.0, 105.5, 105.0):
+            tape.append(close)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)  # -3.00 against 106.0
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+        self._walk(trader, state, tracker, tape, (103.5,))  # -2.00: one bar, not two
+        self._walk(trader, state, tracker, tape, (103.4,), "sold")  # -1.60: two
+
+    def test_momentum_not_known_yet_is_not_negative(self, state, market_open, monkeypatch):
+        """The first N bars of the session have nothing to compare against --
+        the chart's panel leaves them blank -- and a blank is not a streak."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, negative_momentum_bars=10
+        )
+        held = tracker.position_for(TICKER)
+        self._walk(trader, state, tracker, tape, (105.0, 104.8, 104.6, 104.4))
         assert tracker.position_for(TICKER) == held
 
-    def test_the_look_back_is_the_momentum_horizon(self, state, market_open, monkeypatch):
-        """N is handed to the score as its horizon, not applied after it."""
-        seen = []
-        trader, tracker, tape = self._entered(state, monkeypatch, momentum_fade_bars=7)
-        monkeypatch.setattr(
-            at.momentum_regime, "compute_momentum",
-            lambda frame, params=None: seen.append(params) or frame,
-        )
-        tape.append(105.0, mom=2.0)
-        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert seen and seen[-1]["horizon"] == 7
-
-    def test_a_legacy_record_keeps_the_fall_from_the_peak(
-        self, state, market_open, monkeypatch
-    ):
-        """A record from before the look-back carries `momentum_drop` instead,
-        and replays the rule it was run under: 1σ off the peak, whatever the
-        regime says."""
-        trader, tracker, tape = self._entered(
-            state, monkeypatch, momentum_fade_bars=0, momentum_drop=1.0
-        )
-        tape.append(105.0, mom=2.0)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(105.5, mom=1.2)  # 0.8σ off the peak
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(105.2, mom=0.9)  # 1.1σ, still a positive regime
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
-        assert "1σ is the trigger" in tracker.snapshot()["decisions"][-1].reasoning
+    def test_there_is_no_gain_to_take_under_water(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._entered(state, monkeypatch)
+        held = tracker.position_for(TICKER)
+        self._rise(trader, state, tracker, tape)
+        # Negative two bars running, but the second is below the fill (and
+        # above the stop): that is the stop's business, not the take's.
+        self._walk(trader, state, tracker, tape, (104.6, 102.9))
+        assert tracker.position_for(TICKER) == held
 
     def test_the_share_taken_is_configurable(self, state, market_open, monkeypatch):
         _, tracker, _, held = self._taken(state, monkeypatch, take_fraction=0.5)
@@ -639,8 +649,7 @@ class TestDayRangeMomentumTake:
         trader, tracker, tape, _ = self._taken(state, monkeypatch)
         runner = tracker.position_for(TICKER)
 
-        tape.append(104.0, mom=-2.5)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        self._walk(trader, state, tracker, tape, (104.0,))  # still negative
         assert tracker.position_for(TICKER) == runner
         tape.append(108.8, high=SELL_LEVEL + 0.05)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
@@ -668,30 +677,127 @@ class TestDayRangeMomentumTake:
         self, state, market_open, monkeypatch
     ):
         """0.6 ADR left to the sell level, under a 0.7 threshold."""
-        trader, tracker, tape = self._entered(state, monkeypatch, hold_min_gain_k=0.7)
-
-        tape.append(105.0, mom=2.0)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(104.5, mom=0.3)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        _, tracker, _, _ = self._taken(state, monkeypatch, hold_min_gain_k=0.7)
         assert tracker.position_for(TICKER) == 0
         assert "whole position" in tracker.snapshot()["decisions"][-1].reasoning
 
-    def test_there_is_no_gain_to_take_under_water(self, state, market_open, monkeypatch):
+    def test_the_default_rule_end_to_end(self, state, market_open, monkeypatch):
+        """At the shipped 15 bars / 5 in a row: a zig-zag climb that never
+        reaches the target, then a zig-zag slide. The climb keeps the 15-bar
+        change positive; the slide takes it under zero six bars down from the
+        106.00 top, and the take waits out five bars of that before selling at
+        104.70 -- three bars and 50 cents later than the legacy sigma turn on
+        the same tape (`TestLegacyMomentumFade`). The runner goes back out at
+        the fill."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, negative_momentum_bars=15, negative_for_bars=5
+        )
+        price = 103.0
+        for step in [0.3, -0.1] * 15 + [-0.3, 0.1] * 15:
+            price += step
+            tape.append(round(price, 2))
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        fills = [d for d in tracker.snapshot()["decisions"] if d.status == "filled"]
+        assert [d.action for d in fills] == ["buy", "sell", "sell"]
+        buy, take, breakeven = fills
+        assert "Momentum take" in take.reasoning and take.price == pytest.approx(104.7)
+        assert "15-bar momentum has been negative for the last 5 bars" in take.reasoning
+        assert take.filled_quantity == int(buy.filled_quantity * 0.7)
+        assert "Breakeven" in breakeven.reasoning
+        assert tracker.position_for(TICKER) == 0
+
+
+class TestLegacyMomentumFade:
+    """The two takes stored records replay under, now that neither is configured.
+
+    `momentum_fade_bars` is the positive-to-balanced turn of the sigma score
+    (2026-09-21 to -23), `momentum_drop` the fall from the peak before it. The
+    score is scripted per bar, except in the last test, which computes it from
+    the closes. Same fill, levels and stop as `TestDayRangeMomentumTake`.
+    """
+
+    def _entered(self, state, monkeypatch, **kwargs):
+        kwargs.setdefault("negative_momentum_bars", 0)
+        kwargs.setdefault("momentum_fade_bars", 15)
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker, real_momentum=kwargs.pop("real_momentum", False))
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        tape.append(103.0, low=BUY_LEVEL - 0.01, mom=0.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        return trader, tracker, tape
+
+    def test_a_fading_move_in_profit_banks_most_and_keeps_a_runner(
+        self, state, market_open, monkeypatch
+    ):
         trader, tracker, tape = self._entered(state, monkeypatch)
         held = tracker.position_for(TICKER)
 
-        tape.append(104.0, mom=2.0)
+        tape.append(105.0, mom=2.0)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(102.9, mom=-1.0)  # below the fill, above the stop
+        tape.append(105.5, mom=1.2)  # off its peak, but still positive
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        # Under the 0.9σ it took to turn positive, but a regime is left only
+        # under 0.4σ: a score hovering at the line is not a turn.
+        tape.append(105.4, mom=0.6)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(105.2, mom=0.3)  # balanced
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+
+        runner = tracker.position_for(TICKER)
+        assert held - runner == int(held * 0.7)
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "15-bar momentum" in reasoning and "turned balanced" in reasoning
+
+    def test_a_turn_straight_to_negative_takes_too(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._entered(state, monkeypatch)
+        tape.append(105.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(104.8, mom=-1.2)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert "turned negative" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_momentum_that_never_turned_positive_has_not_faded(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._entered(state, monkeypatch)
+        held = tracker.position_for(TICKER)
+        for mom in (-1.5, 0.2, 0.8, 0.1):
+            tape.append(104.5, mom=mom)
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
         assert tracker.position_for(TICKER) == held
+
+    def test_the_look_back_is_the_momentum_horizon(self, state, market_open, monkeypatch):
+        """N is handed to the score as its horizon, not applied after it."""
+        seen = []
+        trader, tracker, tape = self._entered(state, monkeypatch, momentum_fade_bars=7)
+        monkeypatch.setattr(
+            at.momentum_regime, "compute_momentum",
+            lambda frame, params=None: seen.append(params) or frame,
+        )
+        tape.append(105.0, mom=2.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert seen and seen[-1]["horizon"] == 7
+
+    def test_the_older_record_keeps_the_fall_from_the_peak(
+        self, state, market_open, monkeypatch
+    ):
+        """1σ off the peak, whatever the regime says."""
+        trader, tracker, tape = self._entered(
+            state, monkeypatch, momentum_fade_bars=0, momentum_drop=1.0
+        )
+        tape.append(105.0, mom=2.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(105.5, mom=1.2)  # 0.8σ off the peak
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(105.2, mom=0.9)  # 1.1σ, still a positive regime
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert "1σ is the trigger" in tracker.snapshot()["decisions"][-1].reasoning
 
     def test_the_peak_is_this_positions_not_the_mornings(
         self, state, market_open, monkeypatch
     ):
-        """A surge before the entry is not a move this trade was riding, so its
-        fading is not this trade's fade either."""
         trader, tracker, tape = self._entered(state, monkeypatch)
         held = tracker.position_for(TICKER)
         for row in tape.rows[:-1]:
@@ -702,11 +808,10 @@ class TestDayRangeMomentumTake:
         assert tracker.position_for(TICKER) == held
 
     def test_the_score_is_computed_from_the_tape(self, state, market_open, monkeypatch):
-        """End to end on the real momentum score: a zig-zag climb that never
-        reaches the target, then a turn. The climb carries the 15-bar momentum
-        positive (to about +1.95σ) and its zig-zag never takes it back under the
-        0.4σ exit line; the turn does, eight bars down from the 106.00 top at
-        105.20, and the runner goes back out at the fill."""
+        """End to end on the real momentum score: the climb carries the 15-bar
+        score positive (to about +1.95σ) and its zig-zag never takes it back
+        under the 0.4σ exit line; the turn does, eight bars down from the
+        106.00 top at 105.20, and the runner goes back out at the fill."""
         trader, tracker, tape = self._entered(state, monkeypatch, real_momentum=True)
         price = 103.0
         for step in [0.3, -0.1] * 15 + [-0.3, 0.1] * 15:
@@ -1437,7 +1542,7 @@ class TestMinimumWin:
         """A breakeven runner is the case the stop does not already cover: not a
         loss, but nothing to show for the risk either."""
         trader, tracker, tape = self._entered(
-            state, monkeypatch, min_win_k=0.05, stop_k=0.0, momentum_fade_bars=0
+            state, monkeypatch, min_win_k=0.05, stop_k=0.0, negative_momentum_bars=0
         )
         # Flattened at the close, back at the fill.
         tape.append(103.0, high=103.0, low=103.0)
@@ -1454,15 +1559,17 @@ class TestMinimumWin:
         one good."""
         trader, tracker, tape = self._entered(
             state, monkeypatch, min_win_k=0.3, take_fraction=0.7,
+            negative_momentum_bars=1, negative_for_bars=1,
         )
         held = tracker.position_for(TICKER)
 
-        # Take 70% at 108 (+$5 a share), then the runner back at the 103 fill
-        # (+$0). Over the whole position that is 0.7 x 5 = $3.50 a share, 0.35
-        # ADR -- above the 0.3 bar, though the closing piece alone made nothing.
-        tape.append(108.0, mom=2.0)
+        # Take 70% at 107.90 (+$4.90 a share) on the first bar down, then the
+        # runner back at the 103 fill (+$0). Over the whole position that is
+        # 0.7 x 4.90 = $3.43 a share, 0.343 ADR -- above the 0.3 bar, though the
+        # closing piece alone made nothing.
+        tape.append(108.0)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
-        tape.append(108.0, mom=0.3)
+        tape.append(107.9)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
         runner = tracker.position_for(TICKER)
         assert 0 < runner < held
@@ -1479,10 +1586,11 @@ class TestMinimumWin:
         blocking an entry while holding one would be meaningless anyway."""
         trader, tracker, tape = self._entered(
             state, monkeypatch, min_win_k=3.0,
+            negative_momentum_bars=1, negative_for_bars=1,
         )
-        tape.append(104.0, mom=2.0)
+        tape.append(104.0)
         trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        tape.append(104.0, mom=0.3)
+        tape.append(103.9)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
         assert tracker.position_for(TICKER) > 0
         assert not trader.plan.get("stand_down")
@@ -1841,52 +1949,70 @@ class TestStrategySelection:
         )
 
     def test_the_levels_are_the_signature(self):
-        base = config_signature(dayrange_config(stop_gain_fraction=0.0, momentum_fade_bars=0))
+        base = config_signature(dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0))
         assert base == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         assert base != config_signature(
-            dayrange_config(buy_k=0.8, stop_gain_fraction=0.0, momentum_fade_bars=0)
+            dayrange_config(buy_k=0.8, stop_gain_fraction=0.0, negative_momentum_bars=0)
         )
         assert base != config_signature(
-            dayrange_config(sell_k=0.2, stop_gain_fraction=0.0, momentum_fade_bars=0)
+            dayrange_config(sell_k=0.2, stop_gain_fraction=0.0, negative_momentum_bars=0)
         )
 
     def test_the_exit_is_in_the_signature_only_while_switched_on(self):
         on = config_signature(dayrange_config())
         assert on == (
             "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%,"
-            "stop=E-0.5G,take=70%@fade15b,runner>=0.3A)"
+            "stop=E-0.5G,take=70%@neg15b/5b,runner>=0.3A)"
         )
         # A legacy record's take signs in its own form, as it was filed.
         assert config_signature(
-            dayrange_config(momentum_fade_bars=0, momentum_drop=1.0)
-        ) == on.replace("@fade15b", "@mom-1")
+            dayrange_config(negative_momentum_bars=0, momentum_fade_bars=15)
+        ) == on.replace("@neg15b/5b", "@fade15b")
+        assert config_signature(
+            dayrange_config(negative_momentum_bars=0, momentum_drop=1.0)
+        ) == on.replace("@neg15b/5b", "@mom-1")
         for field, value in (
-            ("stop_gain_fraction", 0.3), ("momentum_fade_bars", 20),
-            ("take_fraction", 0.5), ("hold_min_gain_k", 0.5),
+            ("stop_gain_fraction", 0.3), ("negative_momentum_bars", 20),
+            ("negative_for_bars", 3), ("take_fraction", 0.5), ("hold_min_gain_k", 0.5),
         ):
             assert config_signature(dayrange_config(**{field: value})) != on, field
-        # With the take off its two knobs trade nothing, so they sign nothing.
-        off = dayrange_config(momentum_fade_bars=0)
+        # With the take off its knobs trade nothing, so they sign nothing.
+        off = dayrange_config(negative_momentum_bars=0)
         assert config_signature(off) == config_signature(
-            replace(off, take_fraction=0.5, hold_min_gain_k=0.9)
+            replace(off, negative_for_bars=9, take_fraction=0.5, hold_min_gain_k=0.9)
         )
 
+    def test_only_one_momentum_take_may_be_set(self):
+        """Today's streak and the two legacy takes are three ways of writing one
+        rule; a config naming two does not say which it means."""
+        for legacy in ({"momentum_fade_bars": 15}, {"momentum_drop": 1.0}):
+            with pytest.raises(ValueError, match="only one may be set"):
+                dayrange_config(negative_momentum_bars=15, **legacy)
+
+    def test_the_streak_is_whole_bars_and_at_least_one(self):
+        with pytest.raises(ValueError, match="negative_for_bars"):
+            dayrange_config(negative_for_bars=0)
+        with pytest.raises(ValueError, match="negative_for_bars"):
+            dayrange_config(negative_for_bars=2.5)
+        # Off, the streak is never read, so it is not held to anything.
+        dayrange_config(negative_momentum_bars=0, negative_for_bars=0)
+
     def test_the_intraday_update_is_in_the_signature_only_while_switched_on(self):
-        off = config_signature(dayrange_config(stop_gain_fraction=0.0, momentum_fade_bars=0))
+        off = config_signature(dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0))
         assert off == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         for policy in ("extreme", "brownian"):
             signed = config_signature(
-                dayrange_config(stop_gain_fraction=0.0, momentum_fade_bars=0, breach_update=policy)
+                dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0, breach_update=policy)
             )
             assert signed == off[:-1] + f",breach={policy})"
 
     def test_the_level_source_is_in_the_signature_only_when_it_is_not_the_high(self):
         """It sits beside the two distances rather than at the end: "H" in
         `buy=H-0.75A` is whatever the source says it is."""
-        flat = config_signature(dayrange_config(stop_gain_fraction=0.0, momentum_fade_bars=0))
+        flat = config_signature(dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0))
         assert flat == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         assert config_signature(
-            dayrange_config(stop_gain_fraction=0.0, momentum_fade_bars=0, level_source="intraday")
+            dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0, level_source="intraday")
         ) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,levels=intraday,size=95%)"
 
     def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
@@ -1902,7 +2028,8 @@ class TestStrategySelection:
 
     def test_exit_distances_cannot_be_negative_and_the_take_is_a_share(self):
         for field in (
-            "stop_gain_fraction", "momentum_drop", "momentum_fade_bars", "hold_min_gain_k",
+            "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
+            "negative_momentum_bars", "hold_min_gain_k",
         ):
             with pytest.raises(ValueError, match=field):
                 dayrange_config(**{field: -0.1})
@@ -2890,14 +3017,19 @@ class TestNoBuyIntoAFall:
             tape.append(BUY_LEVEL)
             return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
 
-        assert run(momentum_fade_bars=15) == "hold"
-        assert run(momentum_fade_bars=5) == "bought"
+        assert run(negative_momentum_bars=15) == "hold"
+        assert run(negative_momentum_bars=5) == "bought"
 
     def test_with_the_take_off_the_look_back_is_the_default(self):
-        from agent_stonks.config import APPLE_TRADER_MOMENTUM_FADE_BARS
+        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
-        assert dayrange_config(momentum_fade_bars=0).fall_bars == APPLE_TRADER_MOMENTUM_FADE_BARS
-        assert dayrange_config(momentum_fade_bars=8).fall_bars == 8
+        assert (
+            dayrange_config(negative_momentum_bars=0).fall_bars
+            == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
+        )
+        assert dayrange_config(negative_momentum_bars=8).fall_bars == 8
+        # A record replaying the legacy turn keeps the look-back it signed.
+        assert dayrange_config(negative_momentum_bars=0, momentum_fade_bars=12).fall_bars == 12
 
     def test_an_add_is_refused_too(self, state, market_open, monkeypatch):
         broker = FakeBroker(BUY_LEVEL)
@@ -2922,7 +3054,7 @@ class TestNoBuyIntoAFall:
             dayrange_config(max_fall_k=-0.1)
 
     def test_in_the_signature_only_while_on(self):
-        on = config_signature(dayrange_config(max_fall_k=0.3, momentum_fade_bars=12))
+        on = config_signature(dayrange_config(max_fall_k=0.3, negative_momentum_bars=12))
         assert ",nofall=0.3A/12b" in on
         assert "nofall" not in config_signature(dayrange_config())
 

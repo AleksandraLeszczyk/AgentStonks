@@ -255,9 +255,10 @@ def dayrange_params(
         )
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
-    stop_gain_fraction, momentum_fade_bars, take_fraction, hold_min_gain_k = exit_params(
-        defaults, float(buy_k), float(sell_k), unit_label, copy
-    )
+    (
+        stop_gain_fraction, negative_momentum_bars, negative_for_bars, take_fraction,
+        hold_min_gain_k,
+    ) = exit_params(defaults, float(buy_k), float(sell_k), unit_label, copy)
     min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
     return AppleTraderConfig(
         model_key=model_key,
@@ -272,7 +273,8 @@ def dayrange_params(
         contain_range=contain_range,
         breach_exit=breach_exit,
         stop_gain_fraction=stop_gain_fraction,
-        momentum_fade_bars=momentum_fade_bars,
+        negative_momentum_bars=negative_momentum_bars,
+        negative_for_bars=negative_for_bars,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
         min_win_k=min_win_k,
@@ -421,12 +423,12 @@ def exit_params(
     sell_k: float,
     unit_label: str,
     copy: FormCopy,
-) -> "tuple[float, int, float, float]":
+) -> "tuple[float, int, int, float, float]":
     """The managed exit: a stop under the fill, a momentum take, and a runner.
 
     Not keyed by ticker, unlike the levels: none of these was swept per
     instrument, so there is no per-symbol default for a switch to re-seed. The
-    two knobs that only mean something once the take is on are greyed out while
+    knobs that only mean something once the take is on are greyed out while
     it is off rather than hidden, so turning it back on finds them where they were.
 
     The stop is the one that takes the levels as an argument, because it is
@@ -453,29 +455,36 @@ def exit_params(
         ) if p),
     )
     stop_warning(col_a, float(stop_gain_fraction))
-    momentum_fade_bars = col_b.number_input(
-        "Momentum fade to take gains (look-back, bars)",
-        min_value=0, max_value=120, value=int(defaults.momentum_fade_bars), step=1,
-        key=copy.key("momentum_fade_bars"),
-        help=copy.help.get("momentum_fade_bars"),
+    negative_momentum_bars = col_b.number_input(
+        "Negative momentum (look-back, bars)",
+        min_value=0, max_value=120, value=int(defaults.negative_momentum_bars), step=1,
+        key=copy.key("negative_momentum_bars"),
+        help=copy.help.get("negative_momentum_bars"),
+    )
+    negative_for_bars = col_b.number_input(
+        "Negative for long enough (bars in a row)",
+        min_value=1, max_value=120, value=max(int(defaults.negative_for_bars), 1), step=1,
+        key=copy.key("negative_for_bars"),
+        help=copy.help.get("negative_for_bars"),
+        disabled=not negative_momentum_bars,
     )
     take_pct = col_a.number_input(
-        "Take on a fade (% of shares)",
+        "Take on negative momentum (% of shares)",
         min_value=1.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
         key=copy.key("take_pct"),
         help=copy.help.get("take_fraction"),
-        disabled=not momentum_fade_bars,
+        disabled=not negative_momentum_bars,
     )
-    hold_min_gain_k = col_b.number_input(
+    hold_min_gain_k = col_a.number_input(
         f"Keep a runner if the target is ≥ (× {unit_label} above the fill)",
         min_value=0.0, max_value=3.0, value=defaults.hold_min_gain_k, step=0.05,
         format="%.2f",
         key=copy.key("hold_min_gain_k"),
         help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
-        disabled=not momentum_fade_bars,
+        disabled=not negative_momentum_bars,
     )
     return (
-        float(stop_gain_fraction), int(momentum_fade_bars),
+        float(stop_gain_fraction), int(negative_momentum_bars), int(negative_for_bars),
         float(take_pct) / 100.0, float(hold_min_gain_k),
     )
 

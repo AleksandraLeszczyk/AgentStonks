@@ -1699,7 +1699,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- **Stop** — a share of what the trade is playing for.\n"
             "- **Runner threshold** — in the same unit as the levels.\n"
             "- Each switched-on knob is in the signature, so sweeping the stop or the "
-            "fade queues its own configuration.\n"
+            "take queues its own configuration.\n"
             "- 0 switches the stop or the take off. With both off a run files beside the "
             "records made before the exit existed, which replay that way."
         ),
@@ -1804,13 +1804,20 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "replays in its own units.\n"
             "- 0 switches the stop off."
         ),
-        "momentum_fade_bars": (
+        "negative_momentum_bars": (
             "The momentum take's look-back, in bars.\n\n"
-            "- Fires in profit once the N-bar momentum, positive since the entry, turns "
-            "balanced or negative.\n"
-            "- Signs as `take=70%@fade15b`; a record from before carries `@mom-1` (a σ "
-            "fall from the peak) and replays that rule.\n"
+            "- Momentum is `close − close N bars ago`, in dollars (the live chart's "
+            "panel). Fires in profit once it has been negative for *Negative for long "
+            "enough* bars in a row since the entry.\n"
+            "- Signs as `take=70%@neg15b/5b`; records from before carry `@fade15b` (the "
+            "positive-to-balanced σ turn) or `@mom-1` (a σ fall from the peak) and "
+            "replay that rule.\n"
             "- Sweepable; 0 switches the take off, and with it the runner."
+        ),
+        "negative_for_bars": (
+            "How many bars in a row the momentum has to stay negative before the take "
+            "sells. Only bars after the fill count. Sweepable; in the signature only "
+            "while the take is on."
         ),
         "position_pct": (
             "The share of available cash each entry spends. In the signature as `size=`."

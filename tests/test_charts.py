@@ -554,13 +554,13 @@ class TestMomentumPanel:
         assert all(pd.isna(v) for v in values[:n])
         assert values[n:] == pytest.approx(expected[n:])
 
-    def test_the_look_back_defaults_to_the_momentum_fade_default(self):
-        from agent_stonks.config import APPLE_TRADER_MOMENTUM_FADE_BARS
+    def test_the_look_back_defaults_to_the_momentum_take_default(self):
+        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
         fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
         (mom,) = [tr for tr in fig.data if tr.name == "Momentum"]
         values = pd.Series(mom.y)
-        assert values.isna().sum() == APPLE_TRADER_MOMENTUM_FADE_BARS
+        assert values.isna().sum() == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
     def test_the_warm_up_note_names_the_look_back(self):
         fig = build_chart(

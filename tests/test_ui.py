@@ -254,20 +254,20 @@ class TestMomentumBars:
     def config(n):
         from types import SimpleNamespace
 
-        return SimpleNamespace(momentum_fade_bars=n)
+        return SimpleNamespace(negative_momentum_bars=n)
 
     def test_default_without_an_apple_trader(self):
-        from agent_stonks.config import APPLE_TRADER_MOMENTUM_FADE_BARS
+        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
-        assert _momentum_bars(self.state()) == APPLE_TRADER_MOMENTUM_FADE_BARS
+        assert _momentum_bars(self.state()) == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
     def test_the_forms_look_back(self):
         assert _momentum_bars(self.state(form=self.config(22))) == 22
 
     def test_a_switched_off_take_falls_back_to_the_default(self):
-        from agent_stonks.config import APPLE_TRADER_MOMENTUM_FADE_BARS
+        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
-        assert _momentum_bars(self.state(form=self.config(0))) == APPLE_TRADER_MOMENTUM_FADE_BARS
+        assert _momentum_bars(self.state(form=self.config(0))) == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
     def test_the_running_agents_look_back_wins_over_the_form(self):
         state = self.state(

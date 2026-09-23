@@ -161,6 +161,11 @@ _APPLE_LEGACY = {
     # the stop above: a record saying 1σ replays the 1σ rule and signs
     # `@mom-1`, rather than picking up today's 15-bar turn beside it.
     "momentum_fade_bars": 0,
+    # And before the take read the N-bar $ momentum staying negative for a
+    # streak it read that positive-to-balanced turn, which every record made
+    # 2026-09-21 to -23 carries as `momentum_fade_bars`. Zero here leaves that
+    # one to speak too: such a record replays the turn and signs `@fade15b`.
+    "negative_momentum_bars": 0,
     # Before the intraday update existed the 9:35 forecast stood all day and
     # the two levels never moved. "off" is that rule, and it is left out of the
     # signature, so such a record replays and files exactly where it did.

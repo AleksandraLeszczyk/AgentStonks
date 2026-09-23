@@ -62,7 +62,7 @@ from .config import (
     AGENT_LOG_POLL_SEC,
     AGENT_PERFORMANCE_POLL_SEC,
     APPLE_TRADER_CYCLE_SEC,
-    APPLE_TRADER_MOMENTUM_FADE_BARS,
+    APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     CHART_POLL_SEC,
     DEFAULT_DATA_SOURCE,
     DEFAULT_HISTORY_FEED,
@@ -722,15 +722,15 @@ def _chart_panel() -> None:
 def _momentum_bars(state) -> int:
     """The look-back the live momentum panel is measured over.
 
-    The Apple Trader's momentum-fade look-back, so the panel shows the move
-    its momentum take watches: the running agent's while one runs (that
+    The Apple Trader's negative-momentum look-back, so the panel shows the
+    series its momentum take watches: the running agent's while one runs (that
     setting takes effect on ▶ Start, so the form may already differ), else the
     form's. The default when there is neither, or the take is switched off (0).
     """
     running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
     config = running.get("config") or getattr(state, "apple_trader_config", None)
-    bars = int(getattr(config, "momentum_fade_bars", 0) or 0)
-    return bars if bars > 0 else APPLE_TRADER_MOMENTUM_FADE_BARS
+    bars = int(getattr(config, "negative_momentum_bars", 0) or 0)
+    return bars if bars > 0 else APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
 
 def _live_chart_controls() -> None:
@@ -817,9 +817,9 @@ def _live_chart_controls() -> None:
                 value=True,
                 help="Draw the session's momentum under the price: how many "
                 "dollars the close has moved over the last N bars. N is the "
-                "Apple Trader's *Momentum fade to take gains* look-back (the "
+                "Apple Trader's *Negative momentum* look-back (the "
                 "running agent's while one runs), or "
-                f"{APPLE_TRADER_MOMENTUM_FADE_BARS} bars when that is off or "
+                f"{APPLE_TRADER_NEGATIVE_MOMENTUM_BARS} bars when that is off or "
                 "another personality is picked.",
             )
 
@@ -2262,8 +2262,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "How a position gets out before the sell level. Everything is measured from "
             "the fill.\n\n"
             "- **Stop** — under the fill, as a share of what the trade is playing for.\n"
-            "- **Momentum take** — part of the position, when momentum fades while the "
-            "trade is in profit.\n"
+            "- **Momentum take** — part of the position, when momentum has been negative "
+            "for long enough while the trade is in profit.\n"
             "- **Runner** — the rest, kept for the sell level only if that is still far "
             "enough away; sold if the price comes back to the fill.\n\n"
             "A trade closes at the sell level, the stop, a momentum take (its runner at "
@@ -2393,16 +2393,21 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- After a stop nothing more is bought that day.\n"
             "- 0 switches the stop off."
         ),
-        "momentum_fade_bars": (
-            "Takes gains short of the sell level when momentum gives out.\n\n"
-            "- **Momentum** — the price's move over the last this-many bars, in sigmas "
-            "of its own noise.\n"
-            "- **Fires** when the position is in profit and momentum, having been "
-            "positive since the entry, turns balanced or negative.\n"
-            "- Positive starts above 0.9σ and ends under 0.4σ, so a score hovering at "
-            "the line is not a turn.\n"
+        "negative_momentum_bars": (
+            "Takes gains short of the sell level when momentum stays negative.\n\n"
+            "- **Momentum** — the close now minus the close this-many bars ago, in "
+            "dollars: the chart's momentum panel.\n"
+            "- **Fires** when the position is in profit and that has been below zero on "
+            "each of the last *Negative for long enough* bars since the entry.\n"
             "- Fewer bars react to short wobbles; more wait for the whole move to give out.\n"
             "- 0 switches the take off, and with it the runner."
+        ),
+        "negative_for_bars": (
+            "How many bars in a row momentum has to stay negative before the take sells.\n\n"
+            "- Only bars after the fill count: the dip that reached the buy level was "
+            "falling anyway.\n"
+            "- One bar back above zero starts the count again.\n"
+            "- 1 sells on the first negative bar in profit."
         ),
         "take_fraction": (
             "How much of the position a momentum take sells when the rest is kept as a "
@@ -2420,7 +2425,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Refuses a buy — the first one or an add — while the price is falling too "
             "fast to catch.\n\n"
             "- **The fall** — the close now minus the close N bars ago, where N is the "
-            "*Momentum fade* look-back (15 if the take is off): the same number the "
+            "*Negative momentum* look-back (15 if the take is off): the same number the "
             "chart's momentum panel draws.\n"
             "- **Refused** when that is more than this many × {unit} down.\n"
             "- Only that bar: the next one is judged again, so once the fall eases a "

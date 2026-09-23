@@ -244,9 +244,10 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 #   stop       sell everything once a bar's low is STOP_GAIN_FRACTION of the
 #              predicted gain under the fill, and take no new entry for the
 #              rest of the session
-#   take       once the total momentum over the last MOMENTUM_FADE_BARS bars
-#              has turned from positive to balanced or negative since the
-#              entry, with the position in profit, sell TAKE_FRACTION of it ...
+#   take       once the momentum over the last NEGATIVE_MOMENTUM_BARS bars
+#              (close - close N bars earlier) has been negative for
+#              NEGATIVE_FOR_BARS bars in a row while holding, with the position
+#              in profit, sell TAKE_FRACTION of it ...
 #   runner     ... and keep the rest for the sell level only if that is still
 #              HOLD_MIN_GAIN_K x ADR above the fill (otherwise sell it all);
 #              a runner is sold if the price comes back to the fill
@@ -270,12 +271,17 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # wider one on GOOGL. 0 switches the stop off, which is what every record
 # written before the managed exit existed replays as.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
-# The momentum take's look-back: the fade is read from the N-bar log return in
-# units of its own random-walk scale (`momentum_regime.compute_momentum` with
-# `horizon = N`) and the same Schmitt-trigger regime the chart draws -- so
-# "positive" and "balanced" mean exactly what they mean there. 15 is that
-# module's own horizon. 0 switches the take off.
-APPLE_TRADER_MOMENTUM_FADE_BARS = 15
+# The momentum take (`DayRangeTrader._momentum_negative`): momentum is the
+# N-bar price change, `close - close[N bars ago]` in dollars -- exactly the
+# series the live chart's momentum panel draws, so the take fires where the
+# panel has sat under zero for NEGATIVE_FOR_BARS bars in a row since the entry.
+# The streak is what keeps a single down bar in an up move from counting: 5 of
+# 15 is a third of the look-back spent falling. Neither number was swept. 0
+# bars switches the take off. Replaced (2026-09-23) the positive-to-balanced
+# turn of the sigma score over `momentum_fade_bars`, which stored records still
+# carry and replay (`simlab.rule_agents._APPLE_LEGACY`).
+APPLE_TRADER_NEGATIVE_MOMENTUM_BARS = 15
+APPLE_TRADER_NEGATIVE_FOR_BARS = 5
 APPLE_TRADER_TAKE_FRACTION = 0.70
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What the agent does when the session trades through the forecast it was given
@@ -495,7 +501,7 @@ APPLE_TRADER_POSITION_PCT = 95.0
 APPLE_TRADER_SCALE_IN = True
 # No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`): an entry,
 # first buy or add alike, is refused while the price has dropped more than this
-# many level units over the momentum look-back (APPLE_TRADER_MOMENTUM_FADE_BARS
+# many level units over the momentum look-back (APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 # unless the run sets its own) -- the same `close - close[N bars ago]` the live
 # chart's momentum panel draws. The bar that reaches the buy level is usually a
 # falling one, so this does not refuse dips; it refuses the steep part of one

@@ -234,14 +234,14 @@ class TestExpand:
         """`take_fraction` is not in the signature while the momentum take is
         off, so varying it there is one configuration however many values."""
         configs, refused = tu.expand(
-            self.base(momentum_fade_bars=0),
+            self.base(negative_momentum_bars=0),
             [{"name": "take_fraction", "values": [0.3, 0.6, 1.0]}],
         )
         assert len(configs) == 1 and refused == []
 
     def test_the_collapse_is_visible_against_the_grid(self):
         axes = [{"name": "take_fraction", "values": [0.3, 0.6, 1.0]}]
-        configs, refused = tu.expand(self.base(momentum_fade_bars=0), axes)
+        configs, refused = tu.expand(self.base(negative_momentum_bars=0), axes)
         assert tu.cell_count(axes) - len(configs) - len(refused) == 2
 
     def test_the_order_is_the_grids(self):
@@ -533,7 +533,7 @@ class TestJob:
         # level), and the ADR unit because the tape below and the numbers
         # asserted on it are that arithmetic.
         base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10,
-                                 stop_gain_fraction=0.0, momentum_fade_bars=0,
+                                 stop_gain_fraction=0.0, negative_momentum_bars=0,
                                  max_fall_k=0.0, level_unit=UNIT_ADR)
         return spec(
             base=asdict(base),
@@ -860,7 +860,7 @@ class TestDerivedGrids:
         return AppleTraderConfig(**{
             "ticker": TICKER, "buy_k": 0.75, "sell_k": 0.10,
             # A legacy record's take, which still reads back as the grid it was.
-            "momentum_drop": 1.0, "momentum_fade_bars": 0,
+            "momentum_drop": 1.0, "negative_momentum_bars": 0,
             **overrides,
         })
 

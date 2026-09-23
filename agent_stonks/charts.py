@@ -10,7 +10,7 @@ from plotly.subplots import make_subplots
 
 from . import market_hours, momentum_regime
 from .config import (
-    APPLE_TRADER_MOMENTUM_FADE_BARS,
+    APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     AVG_LINE_COLORS,
     CANDLE_PATTERN_COLORS,
     CANDLE_PATTERN_FILLED_ALPHA,
@@ -939,15 +939,15 @@ def _add_volume_baseline(
 
 
 def _add_momentum_panel(
-    df: pd.DataFrame, fig: go.Figure, row: int, bars: int = APPLE_TRADER_MOMENTUM_FADE_BARS
+    df: pd.DataFrame, fig: go.Figure, row: int, bars: int = APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 ) -> None:
     """The session's absolute momentum, drawn in its own panel under the price.
 
     Momentum here is the plain price change over the last `bars` bars --
     `close - close[bars ago]`, in dollars -- rather than `momentum_regime`'s
     score, which divides that move by the tape's own noise. The live chart
-    passes the Apple Trader's "Momentum fade" look-back as `bars`, so the panel
-    covers the same stretch of tape the momentum take is measured over.
+    passes the Apple Trader's "Negative momentum" look-back as `bars`, so the
+    panel is the very series the momentum take counts negative bars on.
 
     Session-local, like the take: the first `bars` regular-session bars have
     nothing to compare against, and that stretch is left as a gap rather than
@@ -1656,7 +1656,7 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
-    momentum_bars: int = APPLE_TRADER_MOMENTUM_FADE_BARS,
+    momentum_bars: int = APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
 ) -> go.Figure:
