@@ -1763,11 +1763,14 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- **Hold the 9:35 forecast** — it stands all day. What the levels were swept "
             "under, and what every record from before this setting replays as.\n"
             "- **Move to the extreme so far** — the breached side moves to the session's "
-            "own extreme. Expect more trading days than holding: the buy level chases the "
-            "high up.\n"
+            "own extreme and the other side follows by the same amount (never past what "
+            "the session printed), so the range keeps its width. Expect more trading "
+            "days than holding: the buy level chases the high up. Signs `breach=shift`; "
+            "a record signed `breach=extreme` moved only the breached side and replays "
+            "that.\n"
             "- **Brownian extension** — past the extreme by ADR × √(session left) ÷ 2. "
             "Wider than the extreme early in the day, converging on it by the close.\n\n"
-            "In the signature unless held, so the three queue as three configurations — "
+            "In the signature unless held, so each queues as its own configuration — "
             "the only way to find out what it is worth, since the levels were swept with "
             "the forecast fixed."
         ),
@@ -1775,15 +1778,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Whether the forecast is always widened to hold what the session has printed "
             "— `apply_open_constraint`'s 9:35 clip, kept true all day.\n\n"
             "- In the signature as `contain` when on.\n"
-            "- Pair it with the breach policy rather than sweeping it alone: moving to the "
-            "extreme already satisfies it, so with it on *hold* and *extreme* give "
-            "identical ledgers — only *Brownian* still differs."
+            "- Pair it with the breach policy rather than sweeping it alone: with it on, "
+            "*hold* moves a breached side to the extreme too, so it only differs from "
+            "*move to the extreme* by that policy moving the other side with it."
         ),
         "breach_exit": (
             "Whether a bar through the predicted high closes an open position instead of "
             "moving the forecast.\n\n"
             "- In the signature as `breach_exit` when on.\n"
-            "- Under *hold* and *extreme* the sell level is reached on the same bar anyway, "
+            "- Under *hold* and *move to the extreme* the sell level is reached on the same "
+            "bar anyway, "
             "so this only changes *Brownian* ledgers — banking a settled bet versus riding "
             "on against a target that moved out of the bar's way."
         ),
@@ -1881,7 +1885,7 @@ def _sweep_axes(base: AppleTraderConfig, prefix: str) -> "list[dict]":
         choice = sim_tuning.CHOICES.get(name)
         if choice is not None:
             values = st.multiselect(
-                choice.label, list(choice.options), default=list(choice.options),
+                choice.label, list(choice.pickable), default=list(choice.pickable),
                 format_func=lambda key, c=choice: c.labels.get(key, key),
                 key=f"{prefix}_sweep_{name}",
             )
@@ -3490,7 +3494,7 @@ def _render_tuning_form() -> None:
         choice = sim_tuning.CHOICES.get(name)
         if choice is not None:
             values = st.multiselect(
-                choice.label, list(choice.options), default=list(choice.options),
+                choice.label, list(choice.pickable), default=list(choice.pickable),
                 format_func=lambda key, c=choice: c.labels.get(key, key),
                 key=f"tune_{name}_options",
                 help="Each ticked option is a row (or a column) of the grid: the same "

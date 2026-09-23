@@ -2335,14 +2335,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- **Hold the 9:35 forecast** — it stands whatever the tape does. The "
             "notebook's rule, and the one the distances were swept under.\n"
             "- **Move to the extreme so far** — the breached side moves to the session's "
-            "own high (or low). It never leads the tape: one move late, but it never "
-            "claims a high the day has not made.\n"
+            "own high (or low) and the other side moves with it by the same amount, so "
+            "the range keeps its width and follows the day. The other side never passes "
+            "a price the session has already printed. It never leads the tape: one move "
+            "late, but it never claims a high the day has not made.\n"
             "- **Brownian extension** — past the extreme, by what a driftless random walk "
             "with this ADR's volatility would still cover before the close: half an ADR "
             "with the whole day left, nothing at the bell. It leads the tape, and pays "
             "for that with a sell level the day may never come back up to.\n\n"
-            "Only the breached side moves, and only outward. Neither updating policy has "
-            "been swept."
+            "Under *Brownian extension* only the breached side moves, and only outward. "
+            "Neither updating policy has been swept."
         ),
         "contain_range": (
             "Keeps the forecast wide enough to hold what the session has printed.\n\n"
@@ -2352,8 +2354,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "the forecast widens to hold it.\n"
             "- It never leads the tape — it only stops the levels being measured from a "
             "price the day has already passed.\n\n"
-            "With it on, *hold the 9:35 forecast* and *move to the extreme* become the "
-            "same rule; only *Brownian extension* still differs."
+            "With it on, *hold the 9:35 forecast* moves a breached side to the extreme "
+            "too; *move to the extreme so far* still differs by moving the other side "
+            "with it."
         ),
         "breach_exit": (
             "The position is a bet that the day tops out near the predicted high.\n\n"

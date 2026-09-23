@@ -285,31 +285,49 @@ APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # paying that. Same reason `TRADING_MODES` is a list here.
 #
 #   "off"       the 9:35 forecast stands all session, whatever the tape prints
-#   "extreme"   a breached side moves to the session's own high (or low)
-#   "brownian"  ... and then past it by what a driftless walk with ADR-implied
-#               volatility is still expected to add, ADR x sqrt(session left)/2
+#   "shift"     a breach moves both sides: the breached one to the session's own
+#               extreme, the other by the same amount, so the forecast keeps its
+#               width and is re-centred on where the day has gone -- never so
+#               far that it would exclude a price the session already printed
+#   "extreme"   only the breached side moves to the extreme, the other stays.
+#               The rule "Move to the extreme so far" meant until 2026-09-23;
+#               kept so records made under it replay as run, not offered
+#   "brownian"  a breached side moves to the extreme and then past it by what
+#               a driftless walk with ADR-implied volatility is still expected
+#               to add, ADR x sqrt(session left)/2; the other side stays
 #
 # The forecast already refuses to sit under the opening window's high
-# (`dayrange_model.apply_open_constraint`); the latter two carry that same
+# (`dayrange_model.apply_open_constraint`); the moving policies carry that same
 # correction through the rest of the day, and `DayRangeTrader` rebuilds its two
 # levels from the updated high each time it moves.
 BREACH_OFF = "off"
+BREACH_SHIFT = "shift"
 BREACH_EXTREME = "extreme"
 BREACH_BROWNIAN = "brownian"
-BREACH_POLICIES = (BREACH_OFF, BREACH_EXTREME, BREACH_BROWNIAN)
+# Every policy a config may carry -- including one a stored record carries
+# that is no longer offered.
+BREACH_POLICIES = (BREACH_OFF, BREACH_SHIFT, BREACH_EXTREME, BREACH_BROWNIAN)
+# What a form or a new sweep offers.
+BREACH_OFFERED = (BREACH_OFF, BREACH_SHIFT, BREACH_BROWNIAN)
 BREACH_LABELS = {
     BREACH_OFF: "Hold the 9:35 forecast",
-    BREACH_EXTREME: "Move to the extreme so far",
+    BREACH_SHIFT: "Move to the extreme so far",
+    BREACH_EXTREME: "Move only the breached side to the extreme (earlier rule)",
     BREACH_BROWNIAN: "Brownian extension, volatility implied by ADR",
 }
-# The default is "extreme" because it is the weaker claim of the two: "the day's
-# high is at least what has already traded" is arithmetic, not a forecast.
-# Neither policy has been swept, and APPLE_TRADER_DAYRANGE_LEVELS above was --
-# under "off", with the forecast held fixed all day -- so the two numbers there
-# were picked against a rule this setting changes. A SimLab record written
-# before the setting existed replays under "off"
+# The default moves to the extreme because that is the weaker claim: "the
+# day's high is at least what has already traded" is arithmetic, not a
+# forecast. Since 2026-09-23 it moves the other side with it ("shift"), at the
+# user's request: a day that has broken out of its forecast has moved, not
+# widened, so the range keeps its predicted width. Under the default
+# "pred_range" unit that also keeps the unit fixed, and both levels translate
+# by exactly the breach. No policy has been swept, and
+# APPLE_TRADER_DAYRANGE_LEVELS above was -- under "off", with the forecast held
+# fixed all day -- so the two numbers there were picked against a rule this
+# setting changes. A SimLab record written before the setting existed replays
+# under "off" and one written under "extreme" replays that
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
-APPLE_TRADER_BREACH_UPDATE = BREACH_EXTREME
+APPLE_TRADER_BREACH_UPDATE = BREACH_SHIFT
 
 # Whether the forecast is always widened to hold what the session has actually
 # printed (`dayrange_model.contain_session`). The 9:35 forecast is already

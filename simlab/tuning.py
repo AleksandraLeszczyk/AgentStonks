@@ -62,6 +62,7 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.config import (
     BREACH_LABELS,
+    BREACH_OFFERED,
     BREACH_POLICIES,
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
@@ -206,6 +207,15 @@ class Choice:
     #: The same field named for a chart axis or a job label, where `label` is a
     #: whole sentence and what it sits next to is two words.
     short: str = ""
+    #: What a picker offers for a new sweep, when that is not all of `options`:
+    #: an earlier rule stays a valid option so a stored job still reads back,
+    #: but is not offered again.
+    offered: "tuple[str, ...]" = ()
+
+    @property
+    def pickable(self) -> "tuple[str, ...]":
+        """The options a picker lists for a new sweep."""
+        return self.offered or self.options
 
 
 CHOICES: "dict[str, Choice]" = {
@@ -218,6 +228,7 @@ CHOICES: "dict[str, Choice]" = {
         Choice(
             "breach_update", "If the session trades outside the forecast",
             tuple(BREACH_POLICIES), dict(BREACH_LABELS), short="Forecast breach",
+            offered=tuple(BREACH_OFFERED),
         ),
     )
 }

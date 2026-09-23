@@ -778,6 +778,41 @@ class TestIntradayRangeUpdate:
         assert trader.plan["pred_low"] == pytest.approx(94.0)
         assert trader.plan["pred_high"] == FORECAST["pred_high"]
 
+    def test_shift_moves_both_sides_and_the_levels_translate_by_the_breach(
+        self, state, market_open, monkeypatch
+    ):
+        """"Move to the extreme so far" (since 2026-09-23): up $2 through the
+        $110 high moves the $95 low up $2 too. Under the predicted-range unit
+        the width -- and so the unit -- is unchanged, and both levels move by
+        exactly the breach."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
+        tape = Tape(monkeypatch)
+        tape.append(111.5, high=112.0)
+        trader = self._run("shift", state, tracker, tape, level_unit=UNIT_PRED_RANGE)
+
+        assert trader.plan["pred_high"] == pytest.approx(112.0)
+        assert trader.plan["pred_low"] == pytest.approx(97.0)
+        assert trader.plan["buy_level"] == pytest.approx(110.0 - 0.75 * 15 + 2.0)
+        assert trader.plan["sell_level"] == pytest.approx(110.0 - 0.10 * 15 + 2.0)
+        # The log names the side the tape went through, not the one that followed.
+        (line,) = [
+            e["text"] for e in state.agent_log if "forecast updated" in e.get("text", "")
+        ]
+        assert "traded up through the $110.00 predicted high" in line
+        assert "predicted low" not in line
+        assert "and the other with it" in line
+
+    def test_shift_on_a_breach_of_the_low_brings_the_high_down(
+        self, state, market_open, monkeypatch
+    ):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(94.0))
+        tape = Tape(monkeypatch)
+        tape.append(94.5, low=94.0)
+        trader = self._run("shift", state, tracker, tape)
+
+        assert trader.plan["pred_low"] == pytest.approx(94.0)
+        assert trader.plan["pred_high"] == pytest.approx(109.0)
+
     def test_brownian_extends_past_the_extreme(self, state, market_open, monkeypatch):
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
         tape = Tape(monkeypatch)
@@ -1855,8 +1890,9 @@ class TestStrategySelection:
         ) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,levels=intraday,size=95%)"
 
     def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
-        """`dayrange_config` pins it off; the app's own default does not."""
-        assert AppleTraderConfig().breach_update == "extreme"
+        """`dayrange_config` pins it off; the app's own default does not. "Move
+        to the extreme so far" is "shift" since 2026-09-23."""
+        assert AppleTraderConfig().breach_update == "shift"
 
     def test_an_unknown_update_policy_is_refused(self):
         """Read as "off" once a record carries it, but refused while a config is

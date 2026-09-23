@@ -40,7 +40,7 @@ from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
 from .config import (
     BREACH_LABELS,
-    BREACH_POLICIES,
+    BREACH_OFFERED,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
     UNIT_ADR,
@@ -365,7 +365,11 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
     the exit knobs below are not keyed either.
     """
     section("Forecast breach", copy.sections.get("dayrange_breach"))
-    options = list(BREACH_POLICIES)
+    # The rules offered, plus the one this form was seeded with if it is an
+    # earlier rule no longer offered, so reopening on it does not change it.
+    options = list(BREACH_OFFERED)
+    if defaults.breach_update not in options:
+        options.append(defaults.breach_update)
     choice = st.selectbox(
         "If the session trades outside the forecast",
         options,
@@ -406,7 +410,7 @@ def containment_params(
             help=copy.help.get("breach_exit"),
         )
     )
-    # That containment makes "hold" and "extreme" the same rule is said in the
+    # How containment and the breach policy overlap is said in the
     # `contain_range` help of each app rather than under the boxes.
     return contain_range, breach_exit
 

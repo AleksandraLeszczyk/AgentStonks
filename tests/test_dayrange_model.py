@@ -305,8 +305,34 @@ class TestIntradayUpdate:
     def test_an_unbreached_forecast_is_untouched(self):
         """A day trading inside the range is a day the forecast still describes,
         under every policy."""
-        for policy in (D.BREACH_EXTREME, D.BREACH_BROWNIAN):
+        for policy in (D.BREACH_SHIFT, D.BREACH_EXTREME, D.BREACH_BROWNIAN):
             assert self._update(policy, 109.99, 100.01) == (110.0, 100.0)
+
+    def test_shift_moves_both_sides_by_the_breach(self):
+        """"Move to the extreme so far": the breached side to the extreme, the
+        other by the same amount, so the range keeps its $10 width."""
+        assert self._update(D.BREACH_SHIFT, 112.5, 103.0) == (112.5, 102.5)
+        assert self._update(D.BREACH_SHIFT, 107.0, 97.25) == (107.25, 97.25)
+
+    def test_shift_never_moves_the_other_side_past_what_the_session_printed(self):
+        # Up $2.50, but the session already traded $101.00: a predicted low of
+        # $102.50 would be a low the day has already disproved.
+        assert self._update(D.BREACH_SHIFT, 112.5, 101.0) == (112.5, 101.0)
+        # Down $2.75, but the session already traded $109.00.
+        assert self._update(D.BREACH_SHIFT, 109.0, 97.25) == (109.0, 97.25)
+
+    def test_shift_through_both_sides_on_one_bar_holds_the_session(self):
+        # Up $1, down $2: the range moves down $1 and then holds the session.
+        assert self._update(D.BREACH_SHIFT, 111.0, 98.0) == (111.0, 98.0)
+
+    def test_shift_ratchets_from_where_it_last_moved(self):
+        first = self._update(D.BREACH_SHIFT, 112.5, 103.0)
+        assert first == (112.5, 102.5)
+        moved = {"pred_high": first[0], "pred_low": first[1], "adr14_abs": 10.0}
+        # Nothing new printed: nothing moves.
+        assert self._update(D.BREACH_SHIFT, 112.5, 103.0, forecast=moved) == first
+        # A new high moves both again, from the moved range.
+        assert self._update(D.BREACH_SHIFT, 113.5, 103.0, forecast=moved) == (113.5, 103.0)
 
     def test_extreme_moves_the_breached_side_to_the_extreme(self):
         assert self._update(D.BREACH_EXTREME, 112.5, 101.0) == (112.5, 100.0)

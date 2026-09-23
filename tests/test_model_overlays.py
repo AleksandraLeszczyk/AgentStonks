@@ -252,7 +252,8 @@ class TestDayRangeOverlay:
 
     def test_a_breached_forecast_is_drawn_as_a_stepped_band(self, monkeypatch):
         """The tape bottoms at 196.80, under the 198.00 predicted low, so the
-        low is revised and the flat pair becomes two curves."""
+        low is revised and the flat pair becomes two curves -- and under the
+        default "move to the extreme so far" the high follows it down."""
         pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
@@ -264,8 +265,11 @@ class TestDayRangeOverlay:
         # Starts at the 9:35 forecast and ends at the session's own low.
         assert band["lower"][0] == pytest.approx(198.0)
         assert band["lower"][-1] == pytest.approx(196.80, abs=0.01)
-        # The high was never traded through, so it is flat across the session.
-        assert min(band["upper"]) == max(band["upper"]) == pytest.approx(210.0)
+        # The high was never traded through, but moves down with the low by
+        # the same $1.20, keeping the forecast's width.
+        assert band["upper"][0] == pytest.approx(210.0)
+        assert band["upper"][-1] == pytest.approx(208.80, abs=0.01)
+        assert band["upper"][-1] - band["lower"][-1] == pytest.approx(12.0)
 
     def test_a_breach_on_the_first_bar_still_shows_the_935_forecast_before_it(
         self, monkeypatch

@@ -157,7 +157,7 @@ import torch.nn as nn  # noqa: E402
 torch.set_num_threads(1)
 
 from . import market_hours, model_store  # noqa: E402
-# The three intraday-update policy names. They live in `config` rather than
+# The intraday-update policy names. They live in `config` rather than
 # here because everything that has to *name* one -- the config dataclass, both
 # forms, a stored record -- would otherwise import this module, and with it 200
 # MB of torch, to do it. The arithmetic that gives them meaning is below
@@ -167,6 +167,7 @@ from .config import (  # noqa: E402,F401  -- BREACH_POLICIES is re-exported
     BREACH_EXTREME,
     BREACH_OFF,
     BREACH_POLICIES,
+    BREACH_SHIFT,
 )
 from .model_store import ModelStore  # noqa: E402
 
@@ -1039,6 +1040,13 @@ def updated_range(
     of the session so far, `minutes_left` the minutes to the close (see
     `minutes_left_at`).
 
+    Under `shift` both sides move: the breached side to the extreme, the other
+    by the same distance, so the range keeps its width and is re-centred on
+    where the day has gone. The side that followed never passes the session's
+    own extreme on its side -- a predicted low above a low already printed is
+    not a forecast -- so once the session's own range is wider than the
+    forecast, the forecast is the session's range.
+
     Under `extreme` a breached side moves to the extreme itself: the flat
     statement that the day's high is at least what has already traded, which is
     `apply_open_constraint`'s rule applied to the whole session instead of to
@@ -1062,7 +1070,20 @@ def updated_range(
     """
     high = float(forecast["pred_high"])
     low = float(forecast["pred_low"])
-    if policy in (BREACH_EXTREME, BREACH_BROWNIAN):
+    if policy == BREACH_SHIFT:
+        # The breach on each side, as a distance past the forecast. A bar wide
+        # enough to breach both sides moves the range by the difference.
+        up = max(0.0, float(session_high) - high) if session_high is not None else 0.0
+        down = max(0.0, low - float(session_low)) if session_low is not None else 0.0
+        high, low = high + up - down, low + up - down
+        # The side that followed is held to what the session has printed: a
+        # predicted low above today's low (or a high below today's high) is a
+        # number the tape has already disproved. That also puts the breached
+        # side exactly on its extreme.
+        high, low = contain_session(
+            high, low, session_high=session_high, session_low=session_low
+        )
+    elif policy in (BREACH_EXTREME, BREACH_BROWNIAN):
         reach = (
             brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
             if policy == BREACH_BROWNIAN

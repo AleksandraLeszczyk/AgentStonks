@@ -715,9 +715,9 @@ class TestRuleAgentRecords:
         assert "breach" not in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert today.breach_update == "extreme"
+        assert today.breach_update == "shift"
         assert "levels=" not in agent.signature(today)   # the default source signs nothing
-        assert ",breach=extreme" in agent.signature(today)
+        assert ",breach=shift" in agent.signature(today)
         assert agent.signature(today) != agent.signature(
             replace(today, breach_update="brownian")
         )
@@ -2737,3 +2737,27 @@ class TestRuleSetupTickerCheck:
             self.datasets(ds1=["SPY"], ds2=["AAPL"], ds3=[]), ["ds1", "ds2", "ds3"],
         )
         assert missing == [(APPLE_TRADER_KEY, "AAPL", ["ds1", "ds3"])]
+
+
+class TestBreachShiftRecords:
+    """"Move to the extreme so far" moves both sides since 2026-09-23 ("shift");
+    a record made under the rule it used to mean ("extreme") replays that."""
+
+    def test_a_record_under_the_earlier_rule_replays_it_and_keeps_its_signature(self):
+        agent = rule_agent(APPLE_TRADER_KEY)
+        old = agent.from_record({"model_key": "dayrange", "breach_update": "extreme"})
+        assert old.breach_update == "extreme"
+        assert ",breach=extreme" in agent.signature(old)
+
+    def test_todays_default_signs_as_shift(self):
+        agent = rule_agent(APPLE_TRADER_KEY)
+        assert ",breach=shift" in agent.signature(AppleTraderConfig(model_key="dayrange"))
+
+    def test_the_earlier_rule_is_a_valid_sweep_value_but_not_offered(self):
+        from simlab import tuning as tu
+
+        choice = tu.CHOICES["breach_update"]
+        assert "extreme" in choice.options
+        assert "extreme" not in choice.pickable
+        assert choice.pickable == ("off", "shift", "brownian")
+

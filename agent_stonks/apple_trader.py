@@ -69,6 +69,7 @@ from .config import (
     BREACH_LABELS,
     BREACH_OFF,
     BREACH_POLICIES,
+    BREACH_SHIFT,
     LEVELS_DAYRANGE,
     LEVELS_INTRADAY,
     LEVEL_SOURCES,
@@ -187,8 +188,9 @@ class AppleTraderConfig:
     hold_min_gain_k: float = APPLE_TRADER_HOLD_MIN_GAIN_K
     # What to do when the session trades through the forecast the two levels
     # are built on -- one of `dayrange_model.BREACH_POLICIES`. "off" is the
-    # notebook's rule (one forecast, held all day); the other two move the
-    # breached side and the levels with it. See `_update_range`.
+    # notebook's rule (one forecast, held all day); "shift" moves both sides by
+    # the breach, "brownian" (and the earlier "extreme") the breached side
+    # only, and the levels with it. See `_update_range`.
     breach_update: str = APPLE_TRADER_BREACH_UPDATE
     # Whether the forecast is always widened to hold what the session has
     # printed, whatever `breach_update` says (`dayrange_model.contain_session`).
@@ -1667,10 +1669,12 @@ class DayRangeTrader(BaseTrader):
         self._set_levels(ts)
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
+        session_high = float(frame["high"].max())
+        session_low = float(frame["low"].min())
         high, low = dayrange.updated_range(
             plan,
-            session_high=float(frame["high"].max()),
-            session_low=float(frame["low"].min()),
+            session_high=session_high,
+            session_low=session_low,
             minutes_left=dayrange.minutes_left_at(ts),
             policy=config.breach_update,
             contain=config.contain_range,
@@ -1681,6 +1685,10 @@ class DayRangeTrader(BaseTrader):
         plan["pred_high"], plan["pred_low"] = high, low
         plan["range_updates"] = int(plan.get("range_updates", 0)) + 1
         self._set_levels(ts)
+        # Which side the tape went through, as distinct from which side moved:
+        # under "shift" the other side follows without having been breached.
+        before["breached_high"] = session_high > before["pred_high"]
+        before["breached_low"] = session_low < before["pred_low"]
         return before
 
     def _range_summary(self, ts, before: dict) -> str:
@@ -1698,12 +1706,14 @@ class DayRangeTrader(BaseTrader):
         plan, config = self.plan, self.config
         dayrange = _dayrange()
         moved = []
-        if plan["pred_high"] != before["pred_high"]:
+        breached_high = before.get("breached_high", plan["pred_high"] != before["pred_high"])
+        breached_low = before.get("breached_low", plan["pred_low"] != before["pred_low"])
+        if breached_high:
             moved.append(
                 f"the session has traded up through the ${before['pred_high']:,.2f} "
                 "predicted high"
             )
-        if plan["pred_low"] != before["pred_low"]:
+        if breached_low:
             moved.append(
                 f"it has traded down through the ${before['pred_low']:,.2f} predicted low"
             )
@@ -1714,8 +1724,17 @@ class DayRangeTrader(BaseTrader):
                 f"the extreme so far, extended by the ${reach:,.2f} a driftless walk with "
                 f"this ADR's volatility is still expected to add over the {left:.0f} min left"
             )
+        elif config.breach_update == BREACH_SHIFT and breached_high != breached_low:
+            how = (
+                "the breached side moved to the extreme so far and the other with it, "
+                "no further than the session has printed"
+            )
         else:
             how = "the extreme so far"
+        if not moved:
+            # Containment alone, with nothing breached this bar, cannot move a
+            # side -- but say something true rather than nothing if it ever does.
+            moved.append("the forecast was widened to hold the session so far")
         if plan["buy_level"] == before["buy_level"]:
             # Only the low moved. Nothing this strategy rests on hangs off it.
             levels = (
@@ -2126,7 +2145,7 @@ class DayRangeTrader(BaseTrader):
             "Both are held all day."
             if self.config.breach_update == BREACH_OFF
             else (
-                f"If the session trades outside that range the breached side is moved "
+                f"If the session trades outside that range it moves {_breach_side(self.config)} "
                 f"({BREACH_LABELS[self.config.breach_update].lower()}) and both levels "
                 "follow it."
             )
@@ -2297,6 +2316,11 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
 
 # --- the loop ---------------------------------------------------------------
 
+def _breach_side(config: AppleTraderConfig) -> str:
+    """What a breach moves under this policy, for the log lines that say so."""
+    return "both sides of it" if config.breach_update == BREACH_SHIFT else "the breached side"
+
+
 def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     """The one line the log opens a run with: which model, and what it will do."""
     metadata = bundle.get("metadata") or {}
@@ -2339,7 +2363,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         ""
         if config.breach_update == BREACH_OFF
         else (
-            f" A session that trades outside the forecast moves the breached side "
+            f" A session that trades outside the forecast moves {_breach_side(config)} "
             f"({BREACH_LABELS[config.breach_update].lower()}) and both levels with it."
         )
     )
