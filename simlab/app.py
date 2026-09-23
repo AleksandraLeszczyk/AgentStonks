@@ -1822,6 +1822,14 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "keeps one.\n"
             "- In the signature as `runner>=` while the take is on."
         ),
+        "scale_in": (
+            "Adds to an open position on the way down while the cash left can pay for "
+            "a share: each next buy rests half-way from the last one to the bottom of "
+            "the range (reference − 1 unit), and the stop sits under the next buy "
+            "until the last one.\n\n"
+            "- Needs a position size under 100%.\n"
+            "- In the signature as `adds=half` while it can change a trade."
+        ),
         "min_win_k": (
             "The session circuit breaker: after a trade closes for no more than this many "
             "× {unit} a share, the run buys nothing else that day.\n\n"

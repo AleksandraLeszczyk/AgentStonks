@@ -60,6 +60,7 @@ from .config import (
     APPLE_TRADER_MODEL,
     APPLE_TRADER_MOMENTUM_FADE_BARS,
     APPLE_TRADER_POSITION_PCT,
+    APPLE_TRADER_SCALE_IN,
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
@@ -218,6 +219,11 @@ class AppleTraderConfig:
     # filled in by `__post_init__`, so after construction it is always a float.
     # See `_close_out`.
     min_win_k: Optional[float] = None
+    # Whether an open position is added to at a lower level when the cash left
+    # after the first buy can pay for more -- see `DayRangeTrader._add` and
+    # `can_scale_in`. The next add rests half-way between the last buy and the
+    # bottom of the range, `reference - 1 x unit`.
+    scale_in: bool = APPLE_TRADER_SCALE_IN
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -357,6 +363,16 @@ class AppleTraderConfig:
         against -- "is there a stop" is answerable then and "how far" is not.
         """
         return bool(self.stop_gain_fraction or self.stop_k)
+
+    @property
+    def can_scale_in(self) -> bool:
+        """Whether a position can ever be added to under this configuration.
+
+        `scale_in` asks for it; a position size under 100% is what leaves cash
+        to do it with. At 100% the first buy spends the balance and the setting
+        cannot change a trade, so the signature leaves it out there too.
+        """
+        return bool(self.scale_in) and self.position_pct < 100
 
     @property
     def has_take(self) -> bool:
@@ -510,6 +526,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         )
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
+    # Only where it can change a trade (`can_scale_in`), so a run at 100% signs
+    # the same with the setting on or off -- and every record written before it
+    # existed, which replays with it off, keeps the signature it was filed under.
+    adds = ",adds=half" if c.can_scale_in else ""
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     # Both appear only while switched on, like every rule added since the
     # notebook's, so a record written before either existed keeps the signature
@@ -532,7 +552,7 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # why that token is next to them rather than at the end.
     return (
         f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}{unit},sell=H-{c.sell_k:g}{unit}{levels},"
-        f"size={c.position_pct:g}%{exits}{breach})"
+        f"size={c.position_pct:g}%{adds}{exits}{breach})"
     )
 
 
@@ -844,6 +864,12 @@ class DayRangeTrader(BaseTrader):
     against it; a stop and a momentum take of 0 switch it off and give notebook
     05's rule back.
 
+    Nor is the ladder (`scale_in`): under a position size below 100% the cash
+    the first buy leaves can buy more on the way down, each add resting
+    half-way between the last buy and the bottom of the range, with the stop
+    under the next add rather than under the fill (`_add`, `_after_fill`).
+    Switched off it is the notebook's one buy per position.
+
     Against the notebook
     --------------------
     The trigger is the notebook's, bar for bar: a buy fires on a bar whose
@@ -993,6 +1019,15 @@ class DayRangeTrader(BaseTrader):
                 quantity, reason, kind = exit_
                 self._sell(state, tracker, quantity, last, reason, kind)
                 return "sold"
+            # After the exits, so a bar wide enough to reach the stop under the
+            # next rung is the stop's. Never inside the flatten window: `_exit`
+            # has already sold everything there.
+            if (
+                fresh_bar
+                and self._can_add()
+                and float(last["low"]) <= self.plan["buy_level"]
+            ):
+                return "bought" if self._add(state, tracker, last, position) else "hold"
             return "hold"
 
         # The session has been stood down: a stop, or a trade that closed for
@@ -1213,8 +1248,7 @@ class DayRangeTrader(BaseTrader):
             if self.entry.get("runner"):
                 row["stop"] = float(self.entry["price"])
             else:
-                risk = self._risk()
-                row["stop"] = float(self.entry["price"]) - risk if risk else None
+                row["stop"] = self._stop_price()
         history = plan.setdefault("history", [])
         if history and history[-1]["t"] == row["t"]:
             history[-1] = row
@@ -1330,8 +1364,174 @@ class DayRangeTrader(BaseTrader):
         reference = self._reference(ts)
         plan["reference"] = reference
         plan["level_unit"] = unit
-        plan["buy_level"] = reference - config.buy_k * unit
+        plan["buy_level"] = reference - self._buy_k() * unit
         plan["sell_level"] = reference - config.sell_k * unit
+
+    # --- adding to a position on the way down --------------------------------
+
+    def _buy_k(self) -> float:
+        """How far under the reference the buy level rests on this bar, in units.
+
+        `buy_k` while flat. While long with another add still possible it is the
+        next rung of the ladder (`_rung_k`); otherwise `buy_k` again, the level
+        a position that cannot be added to has no use for but the chart and the
+        log have always shown.
+        """
+        if self._can_add():
+            return self._rung_k(int(self.entry["fills"]))
+        return float(self.config.buy_k)
+
+    def _rung_k(self, fills: int) -> float:
+        """The distance of the buy that would follow `fills` buys, in units.
+
+        Each add rests half-way between the last buy and the bottom of the
+        range, `reference - 1 x unit`: the predicted low under "pred_range",
+        one ADR under the reference under "adr". So the gap left to the bottom
+        halves with every fill -- 0.40, 0.70, 0.85, 0.925 for AAPL's 0.40 --
+        and no add is ever placed under it.
+
+        Counted from `buy_k` rather than stored per rung, so a sidebar edit to
+        the buy distance moves the whole ladder with it, the same way it moves
+        the first buy.
+        """
+        buy_k = float(self.config.buy_k)
+        return 1.0 - (1.0 - buy_k) / 2 ** fills
+
+    def _can_add(self) -> bool:
+        """Whether the open position may still be added to.
+
+        `can_add` is decided at each fill, from the cash that fill left
+        (`_after_fill`). A runner is never added to -- the momentum take already
+        decided to take money off this position -- and a buy distance at or
+        under the bottom of the range leaves nowhere lower to go.
+        """
+        entry = self.entry or {}
+        return bool(
+            self.config.can_scale_in
+            and entry.get("can_add")
+            and entry.get("fills")
+            and not entry.get("runner")
+            and float(self.config.buy_k) < 1.0
+        )
+
+    def _stop_price(self) -> "float | None":
+        """Where this position's stop sits, in dollars -- or None with no stop.
+
+        Frozen at each fill (`_after_fill`) for the reason `_risk` is: a stop
+        must not move under a position on its own. The distance is the usual
+        one; what it is measured under is the next buy while cash can still pay
+        for it, since a stop above the next rung would always fire before the
+        price got there, and the last fill once it cannot.
+
+        A position adopted on a restart has no recorded stop and falls back to
+        the old reading, `risk` under the fill it was adopted at.
+        """
+        entry = self.entry or {}
+        if "stop" in entry:
+            return entry["stop"]
+        risk = self._risk()
+        if not risk or not entry.get("price"):
+            return None
+        return float(entry["price"]) - risk
+
+    def _after_fill(self, state: AppState, tracker: DecisionTracker, bar) -> None:
+        """Settle what a buy leaves behind: the next rung, and the stop under it.
+
+        Called after the first buy and after every add. Whether another add is
+        possible is decided here, once, from the cash this fill left and the
+        price of the next rung -- the same whole-share sizing the buy itself
+        uses -- and the stop is frozen under whichever of the two it belongs
+        under. The levels are then rebuilt, so the plan and the line below quote
+        the rung the position is now waiting on.
+        """
+        config, plan, entry = self.config, self.plan, self.entry
+        ts = bar.name
+        risk = self._risk()
+        rung_k = self._rung_k(int(entry["fills"]))
+        rung = float(plan["reference"]) - rung_k * level_unit(config, plan)
+        cash = float(tracker.snapshot()["cash"])
+        shares = rule_agent.order_quantity(cash, rung, config.position_pct)
+        entry["can_add"] = bool(
+            config.can_scale_in and float(config.buy_k) < 1.0 and shares > 0
+        )
+        anchor = rung if entry["can_add"] else float(entry["last_fill"])
+        entry["stop"] = anchor - risk if risk else None
+        entry["stop_under"] = "next buy" if entry["can_add"] else "fill"
+        self._set_levels(ts)
+        if not config.can_scale_in:
+            return
+        position = tracker.position_for(self.ticker)
+        held = (
+            f"{self.ticker} holds {position:g} sh at an average ${entry['price']:,.2f} "
+            f"after {int(entry['fills'])} buy(s)."
+        )
+        if entry["can_add"]:
+            stop = (
+                f" The stop sits {stop_phrase(config)} (${risk:,.2f}) under that, at "
+                f"${entry['stop']:,.2f}, so the price can reach the next buy before it."
+                if risk else ""
+            )
+            text = (
+                f"{held} Next buy at ${plan['buy_level']:,.2f} ({rung_k:g} × "
+                f"{config.unit_phrase} under {self._ref_name}, half-way to the "
+                f"${float(plan['reference']) - level_unit(config, plan):,.2f} bottom of "
+                f"the range): ${cash:,.2f} cash pays for {shares:g} more share(s).{stop}"
+            )
+        else:
+            why = (
+                "the buy distance leaves nowhere lower to go"
+                if float(config.buy_k) >= 1.0
+                else f"${cash:,.2f} cash buys no share at the ${rung:,.2f} next rung"
+            )
+            stop = (
+                f" The stop sits {stop_phrase(config)} (${risk:,.2f}) under the last "
+                f"${float(entry['last_fill']):,.2f} fill, at ${entry['stop']:,.2f}."
+                if risk else ""
+            )
+            text = f"{held} No further buys: {why}.{stop}"
+        _log(state, {"type": "analysis", "text": text})
+
+    def _add(
+        self, state: AppState, tracker: DecisionTracker, bar, position: float
+    ) -> bool:
+        """Buy more of the open position at the next rung of the ladder.
+
+        Sized like any entry -- `position_pct` of the cash that is left -- and
+        folded into the one position the exits manage: the entry price becomes
+        the average cost, which the target, the momentum take, the breakeven
+        and the circuit breaker all measure from, and the momentum take starts
+        looking for its bounce from this fill rather than from the first. What
+        the position has banked and how many bars it has been open carry over.
+        """
+        before = dict(self.entry)
+        rung_k = self._buy_k()
+        reasoning = (
+            f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
+            f"${self.plan['buy_level']:,.2f} next buy level — {rung_k:g} × the "
+            f"{self.config.unit_phrase} below {self._ref_name}, half-way from the last "
+            f"buy to the bottom of the range. Adding to the {position:g} sh bought at an "
+            f"average ${float(before['price']):,.2f}."
+        )
+        if not self.buy(state, tracker, float(bar["close"]), reasoning):
+            # Nothing bought -- the cash at this close did not stretch to a share,
+            # or the order was refused. The ladder ends here; the stop stays
+            # where the last fill put it, since it must not move on its own.
+            self.entry = {**before, "can_add": False}
+            self._set_levels(bar.name)
+            return False
+        fill = float(self.entry["price"])
+        held = tracker.position_for(self.ticker)
+        added = held - position
+        average = (float(before["price"]) * position + fill * added) / held
+        self.entry = {
+            **before,
+            "price": average,
+            "ts": bar.name,
+            "fills": int(before["fills"]) + 1,
+            "last_fill": fill,
+        }
+        self._after_fill(state, tracker, bar)
+        return True
 
     def _update_range(self, state: AppState, frame, ts) -> None:
         """Move the forecast the session has traded through, and the levels with it.
@@ -1510,13 +1710,18 @@ class DayRangeTrader(BaseTrader):
             ), self.EXIT_BREAKEVEN
 
         risk = self._risk()
-        if risk and entry_price:
-            stop = entry_price - risk
+        stop = self._stop_price()
+        if stop is not None and entry_price:
             if low <= stop:
+                under = (
+                    f"${stop + risk:,.2f} next buy"
+                    if entry.get("stop_under") == "next buy"
+                    else f"${float(entry.get('last_fill') or entry_price):,.2f} fill"
+                )
                 return position, (
                     f"Stop loss: the bar traded down to ${low:,.2f}, at or through the "
                     f"${stop:,.2f} stop ({stop_phrase(config)}, ${risk:,.2f}, under the "
-                    f"${entry_price:,.2f} fill). The day is not going the way the forecast "
+                    f"{under}). The day is not going the way the forecast "
                     f"said, so the position is closed at market ({pnl_pct:+.2f}%) and "
                     "nothing more is bought this session."
                 ), self.EXIT_STOP
@@ -1710,6 +1915,10 @@ class DayRangeTrader(BaseTrader):
             self.entry["risk"] = stop_distance(
                 self.config, stop_unit(self.config, self.plan)
             )
+            # The first rung of the ladder `_add` climbs down.
+            self.entry["fills"] = 1
+            self.entry["last_fill"] = float(self.entry["price"])
+            self._after_fill(state, tracker, bar)
         return bought
 
     def _entry_reasoning(self, bar) -> str:
@@ -1887,15 +2096,16 @@ class DayRangeTrader(BaseTrader):
         if position > 0 and self.entry:
             entry_price = self.entry["price"]
             pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
+            fills = int(self.entry.get("fills") or 0)
+            average = f" avg of {fills} buys" if fills > 1 else ""
             parts.append(
-                f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%), "
+                f"long {position:g} sh @ ${entry_price:,.2f}{average} ({pnl:+.2f}%), "
                 f"{self.entry['bars']} bars"
             )
             if self.entry.get("runner"):
                 parts.append(f"runner, out at ${entry_price:,.2f}")
-            elif self._risk():
-                stop = entry_price - self._risk()
-                parts.append(f"stop ${stop:,.2f}")
+            elif self._stop_price() is not None:
+                parts.append(f"stop ${self._stop_price():,.2f}")
         elif plan.get("stand_down"):
             parts.append(f"{plan['stand_down']}, no new entries today")
         return " · ".join(parts)

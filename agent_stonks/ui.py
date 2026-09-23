@@ -2347,6 +2347,20 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "the sell level — a breach that also reached the target logs as the target."
         ),
         "position_pct": "The share of available cash each entry spends.",
+        "scale_in": (
+            "Adds to an open position on the way down, while the cash left over can "
+            "pay for at least one more share.\n\n"
+            "- Each buy spends *Position size* of the cash that is left.\n"
+            "- After every buy the next one rests **half-way to the bottom of the "
+            "range** — the predicted low, or one ADR under H, depending on what the "
+            "distances are counted in. AAPL's 0.40 becomes 0.70, then 0.85, 0.925…\n"
+            "- While another buy is possible the stop sits its usual distance under "
+            "**the next buy**, not under the fill; after the last one, under that "
+            "last fill.\n"
+            "- The target, the momentum take and the breakeven measure from the "
+            "average cost.\n"
+            "- Needs a position size under 100%."
+        ),
         "stop_gain_fraction": (
             "Sells everything when a bar's low reaches this share of the **predicted "
             "gain** under the fill.\n\n"

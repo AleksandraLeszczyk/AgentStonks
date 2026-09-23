@@ -462,6 +462,19 @@ APPLE_TRADER_MIN_WIN: "dict[str, float]" = {
 }
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
+# Whether a day-range position may be added to on the way down
+# (`apple_trader.DayRangeTrader._add`). Only does anything under a position size
+# below 100%, since that is what leaves cash for a second buy. After every fill
+# the next buy rests half-way between the last one and the bottom of the range
+# (reference - 1 unit: the predicted low under "pred_range", H - ADR under
+# "adr"), so with AAPL's 0.40 the ladder is 0.40, 0.70, 0.85, 0.925... units
+# under the reference -- each add half as far below the last, never past the
+# bottom. While cash can still pay for the next add the stop sits its usual
+# distance under that add rather than under the fill, because a stop above the
+# next rung would always fire first and no add would ever happen. Not swept. A
+# SimLab record written before the setting existed replays with it off
+# (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
+APPLE_TRADER_SCALE_IN = True
 # Flatten this many minutes before the close: the day-range forecast is a
 # statement about one session, and the momentum regime does not survive the
 # overnight gap either.

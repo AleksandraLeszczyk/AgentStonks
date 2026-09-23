@@ -191,6 +191,10 @@ _APPLE_LEGACY = {
     # however badly the last trade went, stopping only on a stop. 0 is that
     # rule, and it is left out of the signature.
     "min_win_k": 0.0,
+    # Before the ladder existed a position was bought once and nothing more was
+    # bought until it had closed. False is that rule, and it is left out of the
+    # signature.
+    "scale_in": False,
 }
 
 

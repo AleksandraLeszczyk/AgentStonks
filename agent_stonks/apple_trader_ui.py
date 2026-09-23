@@ -225,6 +225,16 @@ def dayrange_params(
         key=copy.key("dayrange_size"),
         help=copy.help.get("position_pct"),
     )
+    # Disabled rather than hidden at 100%: the setting is still what the run
+    # would do with spare cash, there just is none -- and the config ignores it
+    # there too (`can_scale_in`), so the two cannot disagree.
+    scale_in = st.checkbox(
+        "Buy again lower while cash allows",
+        value=defaults.scale_in,
+        key=copy.key("dayrange_scale_in"),
+        disabled=float(position_pct) >= 100,
+        help=copy.help.get("scale_in"),
+    )
     # A pair the wrong way round is not a strategy -- it would sell at a price
     # below the one it bought at, on every bar. The config refuses it outright,
     # which here would take the whole page down mid-render, so the pair is
@@ -248,6 +258,7 @@ def dayrange_params(
         buy_k=float(buy_k),
         sell_k=float(sell_k),
         position_pct=float(position_pct),
+        scale_in=bool(scale_in),
         level_unit=level_unit,
         breach_update=breach_update,
         contain_range=contain_range,

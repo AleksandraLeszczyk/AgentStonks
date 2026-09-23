@@ -195,6 +195,9 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     policies in `TestIntradayRangeUpdate` are only separable from each other
     while containment is off. `TestPredictedRangeUnit`, `TestRangeContainment`
     and `TestBreachExit` are where each of the three is switched on.
+
+    `scale_in` is pinned off for the same reason: the notebook buys once and
+    waits. `TestScaleIn` is where the ladder is switched on.
     """
     kwargs.setdefault("buy_k", 0.75)
     kwargs.setdefault("sell_k", 0.10)
@@ -203,6 +206,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("level_unit", UNIT_ADR)
     kwargs.setdefault("contain_range", False)
     kwargs.setdefault("breach_exit", False)
+    kwargs.setdefault("scale_in", False)
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
 
@@ -2615,3 +2619,159 @@ class TestReadsClosedBarsOnly:
             assert line.startswith(f"{TICKER} 10:29 ")
         finally:
             clock.clear()
+
+
+class TestScaleIn:
+    """Buying again lower while the cash left over allows it.
+
+    Notebook arithmetic (H $110, ADR $10, buy 0.75): the first buy rests at
+    $102.50 and the bottom of the range is $100.00, one ADR under H, so the
+    ladder is $102.50 → $101.25 → $100.625, each rung half-way down what is
+    left. The stop is half the $6.50 predicted gain, $3.25.
+    """
+
+    RISK = 0.5 * TARGET_GAIN  # 3.25
+    RUNG_2 = 101.25   # 110 - 0.875 x 10
+    RUNG_3 = 100.625  # 110 - 0.9375 x 10
+
+    def _trader(self, **kwargs):
+        kwargs.setdefault("scale_in", True)
+        kwargs.setdefault("position_pct", 50.0)
+        return at.DayRangeTrader(dayrange_config(**kwargs))
+
+    def _cycle(self, trader, state, tracker, tape, close, **bar):
+        tape.append(close, **bar)
+        return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+    def _analysis(self, state):
+        return [e["text"] for e in state.agent_log if e.get("type") == "analysis"]
+
+    def _bought_once(self, state, monkeypatch, at_price=BUY_LEVEL, **kwargs):
+        broker = FakeBroker(at_price)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._trader(**kwargs)
+        assert self._cycle(trader, state, tracker, tape, at_price) == "bought"
+        return trader, tracker, tape
+
+    def test_after_a_buy_the_next_rests_half_way_to_the_bottom_of_the_range(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        assert trader.plan["buy_level"] == pytest.approx(self.RUNG_2)
+        # Under the next buy, not under the fill: the fill's own stop, $99.25,
+        # sits above $101.25 - nothing, so the price could never get there.
+        assert trader._stop_price() == pytest.approx(self.RUNG_2 - self.RISK)
+        assert any("Next buy at $101.25" in line for line in self._analysis(state))
+
+    def test_a_bar_that_reaches_the_next_rung_adds_to_the_position(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        first = tracker.position_for(TICKER)                       # 48 sh
+        assert self._cycle(trader, state, tracker, tape, 102.0, low=101.9) == "hold"
+        assert self._cycle(trader, state, tracker, tape, self.RUNG_2) == "bought"
+
+        held = tracker.position_for(TICKER)
+        added = held - first
+        assert first == 48 and added == 25     # half of the $5,080 left
+        average = (48 * BUY_LEVEL + 25 * self.RUNG_2) / 73
+        assert trader.entry["price"] == pytest.approx(average)
+        assert trader.plan["buy_level"] == pytest.approx(self.RUNG_3)
+        assert trader._stop_price() == pytest.approx(self.RUNG_3 - self.RISK)
+
+    def test_the_bar_that_would_have_stopped_a_single_buy_adds_instead(
+        self, state, market_open, monkeypatch
+    ):
+        """$99.00 is through a single $102.50 buy's $99.25 stop. With the ladder
+        the stop sits under the next rung instead, so the bar adds at $101.25."""
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        assert self._cycle(trader, state, tracker, tape, 101.0, low=99.0) == "bought"
+        assert tracker.position_for(TICKER) > 48
+
+    def test_a_bar_through_the_stop_under_the_next_rung_sells_everything(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        stop = self.RUNG_2 - self.RISK                                  # 98.00
+        assert self._cycle(trader, state, tracker, tape, 97.5, low=97.9) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert f"${stop:,.2f} stop" in reasoning and "$101.25 next buy" in reasoning
+
+    def test_the_target_sells_the_whole_ladder_and_resets_it(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        self._cycle(trader, state, tracker, tape, self.RUNG_2)
+        assert self._cycle(trader, state, tracker, tape, 108.0, high=SELL_LEVEL) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        self._cycle(trader, state, tracker, tape, 107.0)
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+
+    def test_when_the_cash_runs_out_the_stop_moves_under_the_last_fill(
+        self, state, market_open, monkeypatch
+    ):
+        """At 95% the second buy is the last one the cash can pay for."""
+        trader, tracker, tape = self._bought_once(state, monkeypatch, position_pct=95.0)
+        assert self._cycle(trader, state, tracker, tape, self.RUNG_2) == "bought"
+        held = tracker.position_for(TICKER)
+
+        assert trader._stop_price() == pytest.approx(self.RUNG_2 - self.RISK)
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)  # no next rung
+        assert "No further buys" in self._analysis(state)[-1]
+        assert self._cycle(trader, state, tracker, tape, self.RUNG_3) == "hold"
+        assert tracker.position_for(TICKER) == held
+
+    def test_the_bottom_of_a_predicted_range_is_the_predicted_low(
+        self, state, market_open, monkeypatch
+    ):
+        """Unit $15 (110 - 95): the buy at $98.75, half-way to $95 is $96.875."""
+        buy = 110.0 - 0.75 * 15.0
+        trader, tracker, tape = self._bought_once(
+            state, monkeypatch, at_price=buy, level_unit=UNIT_PRED_RANGE
+        )
+        assert trader.plan["buy_level"] == pytest.approx((buy + FORECAST["pred_low"]) / 2)
+
+    def test_at_full_size_a_position_is_bought_once(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch, position_pct=100.0)
+        held = tracker.position_for(TICKER)
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert trader._stop_price() == pytest.approx(BUY_LEVEL - self.RISK)
+        assert self._cycle(trader, state, tracker, tape, 100.5) == "hold"
+        assert tracker.position_for(TICKER) == held
+
+    def test_switched_off_the_stop_is_the_fills_own(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch, scale_in=False)
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert trader._stop_price() == pytest.approx(BUY_LEVEL - self.RISK)
+        assert not any("Next buy" in line for line in self._analysis(state))
+
+    def test_the_chart_record_steps_to_each_rung_with_its_stop(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        self._cycle(trader, state, tracker, tape, 102.0)
+        row = state.apple_trader_levels["rows"][-1]
+        assert row["buy"] == pytest.approx(self.RUNG_2)
+        assert row["stop"] == pytest.approx(self.RUNG_2 - self.RISK)
+        line = [x for x in self._analysis(state) if " · " in x][-1]
+        assert f"buy ${row['buy']:,.2f}" in line and f"stop ${row['stop']:,.2f}" in line
+
+    def test_signed_only_where_it_can_change_a_trade(self):
+        assert "adds=half" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "adds=half" not in config_signature(
+            AppleTraderConfig(model_key="dayrange", position_pct=100.0)
+        )
+        assert "adds=half" not in config_signature(
+            AppleTraderConfig(model_key="dayrange", scale_in=False)
+        )
+
+    def test_a_record_from_before_the_ladder_replays_without_it(self):
+        from simlab.rule_agents import _apple_from_record
+
+        assert _apple_from_record({"position_pct": 50.0}).scale_in is False
