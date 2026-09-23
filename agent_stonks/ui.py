@@ -2413,6 +2413,18 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "GOOGL's — so 0.30 keeps a runner on GOOGL and INTC, never on AAPL.\n"
             "- A runner is sold at the sell level, at the flatten, or back at the fill."
         ),
+        "max_fall_k": (
+            "Refuses a buy — the first one or an add — while the price is falling too "
+            "fast to catch.\n\n"
+            "- **The fall** — the close now minus the close N bars ago, where N is the "
+            "*Momentum fade* look-back (15 if the take is off): the same number the "
+            "chart's momentum panel draws.\n"
+            "- **Refused** when that is more than this many × {unit} down.\n"
+            "- Only that bar: the next one is judged again, so once the fall eases a "
+            "price still at the buy level is bought.\n"
+            "- 0.30 is a fall seen on about 1% of minutes on AAPL, GOOGL and INTC.\n"
+            "- 0 switches it off."
+        ),
         "min_win_k": (
             "After a trade closes for no more than this many × {unit} **per share**, nothing "
             "else is bought today.\n\n"

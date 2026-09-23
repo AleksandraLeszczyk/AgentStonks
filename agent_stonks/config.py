@@ -475,6 +475,22 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # SimLab record written before the setting existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_SCALE_IN = True
+# No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`): an entry,
+# first buy or add alike, is refused while the price has dropped more than this
+# many level units over the momentum look-back (APPLE_TRADER_MOMENTUM_FADE_BARS
+# unless the run sets its own) -- the same `close - close[N bars ago]` the live
+# chart's momentum panel draws. The bar that reaches the buy level is usually a
+# falling one, so this does not refuse dips; it refuses the steep part of one
+# and lets the next bar buy once the fall eases, if the price is still there.
+#
+# 0.30 from the stored yfinance minutes (Aug-Sep 2026, ~30 sessions each): the
+# 15-bar change is under -0.30 ADR on about 1% of minutes after 09:35 on AAPL,
+# GOOGL and INTC alike (-0.24 at 2%, -0.16 at 5%) -- the same in ADRs on all
+# three, which is why one default serves every instrument. About half the
+# sessions touch it at least once, mostly in the first hour. Not swept. 0
+# switches it off, which is what every SimLab record written before it existed
+# replays as (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
+APPLE_TRADER_MAX_FALL_K = 0.30
 # Flatten this many minutes before the close: the day-range forecast is a
 # statement about one session, and the momentum regime does not survive the
 # overnight gap either.

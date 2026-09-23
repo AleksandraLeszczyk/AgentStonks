@@ -60,6 +60,7 @@ from .config import (
     APPLE_TRADER_MODEL,
     APPLE_TRADER_MOMENTUM_FADE_BARS,
     APPLE_TRADER_POSITION_PCT,
+    APPLE_TRADER_MAX_FALL_K,
     APPLE_TRADER_SCALE_IN,
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_GAIN_FRACTION,
@@ -224,6 +225,12 @@ class AppleTraderConfig:
     # `can_scale_in`. The next add rests half-way between the last buy and the
     # bottom of the range, `reference - 1 x unit`.
     scale_in: bool = APPLE_TRADER_SCALE_IN
+    # No buy -- first entry or add -- while the price has fallen more than this
+    # many level units over the last `fall_bars` bars: the dip is still falling
+    # too fast to catch. The next bar is judged afresh, so a fall that eases
+    # with the price still under the buy level is bought then. 0 switches it
+    # off. See `DayRangeTrader._falling`.
+    max_fall_k: float = APPLE_TRADER_MAX_FALL_K
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -233,7 +240,7 @@ class AppleTraderConfig:
             self.min_win_k = min_win_for(self.ticker)
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
-            "hold_min_gain_k", "min_win_k",
+            "hold_min_gain_k", "min_win_k", "max_fall_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -373,6 +380,17 @@ class AppleTraderConfig:
         cannot change a trade, so the signature leaves it out there too.
         """
         return bool(self.scale_in) and self.position_pct < 100
+
+    @property
+    def fall_bars(self) -> int:
+        """The look-back `max_fall_k` measures the fall over, in bars.
+
+        The momentum take's, so "falling too fast to buy" and "the move has
+        faded" read the same stretch of tape -- and the same one the live
+        chart's momentum panel draws. With the take off there is no look-back
+        of the run's own, so the default one.
+        """
+        return int(self.momentum_fade_bars) or APPLE_TRADER_MOMENTUM_FADE_BARS
 
     @property
     def has_take(self) -> bool:
@@ -530,6 +548,11 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # the same with the setting on or off -- and every record written before it
     # existed, which replays with it off, keeps the signature it was filed under.
     adds = ",adds=half" if c.can_scale_in else ""
+    # Only while on, like every rule added since the notebook's. The look-back
+    # rides along because it is not otherwise in the signature when the take
+    # is off, and the same limit over 5 bars and over 30 is not one rule.
+    if c.max_fall_k:
+        adds += f",nofall={c.max_fall_k:g}{unit}/{c.fall_bars}b"
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     # Both appear only while switched on, like every rule added since the
     # notebook's, so a record written before either existed keeps the signature
@@ -1027,6 +1050,8 @@ class DayRangeTrader(BaseTrader):
                 and self._can_add()
                 and float(last["low"]) <= self.plan["buy_level"]
             ):
+                if self._refuse_falling(state, frame, ts):
+                    return "hold"
                 return "bought" if self._add(state, tracker, last, position) else "hold"
             return "hold"
 
@@ -1050,6 +1075,8 @@ class DayRangeTrader(BaseTrader):
                         ),
                     },
                 )
+                return "hold"
+            if self._refuse_falling(state, frame, ts):
                 return "hold"
             return "bought" if self._buy(state, tracker, last) else "hold"
         return "hold"
@@ -1413,6 +1440,55 @@ class DayRangeTrader(BaseTrader):
             and not entry.get("runner")
             and float(self.config.buy_k) < 1.0
         )
+
+    def _falling(self, frame) -> "str | None":
+        """Why the price is falling too fast to buy right now, or None if it is not.
+
+        The fall is `close - close[fall_bars bars ago]` in dollars -- the
+        absolute momentum the live chart's panel draws -- against `max_fall_k`
+        level units. Early in the session, with fewer bars than the look-back,
+        it is the change since the first regular-session bar: the whole of the
+        move so far is the fall there is to judge.
+        """
+        limit_k = float(self.config.max_fall_k)
+        if not limit_k or self.plan is None or not len(frame):
+            return None
+        closes = frame["close"]
+        n = self.config.fall_bars
+        before = float(closes.iloc[-1 - n]) if len(closes) > n else float(closes.iloc[0])
+        change = float(closes.iloc[-1]) - before
+        unit = level_unit(self.config, self.plan)
+        if not unit or change >= -limit_k * unit:
+            return None
+        span = f"{n} bars" if len(closes) > n else f"{len(closes) - 1} bars since the open"
+        return (
+            f"the price has fallen ${-change:,.2f} over the last {span} "
+            f"({change / unit:+.2f} × the {self.config.unit_phrase}), steeper than the "
+            f"{limit_k:g} × {self.config.unit_phrase} (${limit_k * unit:,.2f}) an entry "
+            "is allowed into"
+        )
+
+    def _refuse_falling(self, state: AppState, frame, ts) -> bool:
+        """Log and refuse a buy the price reached by falling too fast.
+
+        Refuses this bar only: the next one is judged afresh, so a fall that
+        eases with the price still at the buy level is bought then.
+        """
+        why = self._falling(frame)
+        if why is None:
+            return False
+        _log(
+            state,
+            {
+                "type": "status",
+                "text": (
+                    f"The {ts:%H:%M} bar traded down to the "
+                    f"${self.plan['buy_level']:,.2f} buy level, but {why}. Not buying "
+                    "into the fall; the next bar is judged again."
+                ),
+            },
+        )
+        return True
 
     def _stop_price(self) -> "float | None":
         """Where this position's stop sits, in dollars -- or None with no stop.
@@ -2243,6 +2319,14 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             "price comes back to it"
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
+    no_fall = (
+        ""
+        if not config.max_fall_k
+        else (
+            f" No buy while the price has fallen more than {config.max_fall_k:g} × "
+            f"{config.unit_phrase} over the last {config.fall_bars} bars."
+        )
+    )
     breaker = (
         ""
         if not config.min_win_k
@@ -2272,7 +2356,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
         f"today's {config.ticker} high and low will land, then rests a buy "
         f"{config.buy_k:g} × the {config.unit_phrase} below {reference} and a sell "
-        f"{config.sell_k:g} below it, until the closing flatten.{breach}{managed}{breaker}"
+        f"{config.sell_k:g} below it, until the closing flatten.{breach}{no_fall}{managed}{breaker}"
     )
 
 

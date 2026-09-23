@@ -528,12 +528,13 @@ def stub_model(monkeypatch):
 
 class TestJob:
     def job_spec(self, **overrides):
-        # The managed exit off, so the grid is about the two levels alone, and
-        # the ADR unit because the tape below and the numbers asserted on it
-        # are that arithmetic.
+        # The managed exit and the no-buy-into-a-fall rule off, so the grid is
+        # about the two levels alone (the tape dives straight to the deeper
+        # level), and the ADR unit because the tape below and the numbers
+        # asserted on it are that arithmetic.
         base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10,
                                  stop_gain_fraction=0.0, momentum_fade_bars=0,
-                                 level_unit=UNIT_ADR)
+                                 max_fall_k=0.0, level_unit=UNIT_ADR)
         return spec(
             base=asdict(base),
             axes=[{"name": "buy_k", "values": [0.5, 0.75, 1.0]},

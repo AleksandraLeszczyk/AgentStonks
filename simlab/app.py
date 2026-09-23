@@ -1830,6 +1830,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- Needs a position size under 100%.\n"
             "- In the signature as `adds=half` while it can change a trade."
         ),
+        "max_fall_k": (
+            "No buy — first or add — while the close has fallen more than this many "
+            "× {unit} over the momentum look-back (15 bars with the take off).\n\n"
+            "- Refuses that bar only; the next is judged again.\n"
+            "- In the signature as `nofall=0.3R/15b` while it is on, and sweepable. A "
+            "record from before it existed replays with it off."
+        ),
         "min_win_k": (
             "The session circuit breaker: after a trade closes for no more than this many "
             "× {unit} a share, the run buys nothing else that day.\n\n"

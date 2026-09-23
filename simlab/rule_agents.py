@@ -195,6 +195,9 @@ _APPLE_LEGACY = {
     # bought until it had closed. False is that rule, and it is left out of the
     # signature.
     "scale_in": False,
+    # And an entry was never refused for the speed of the fall that reached the
+    # buy level. 0 is that rule, and it is left out of the signature.
+    "max_fall_k": 0.0,
 }
 
 

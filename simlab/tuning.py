@@ -164,6 +164,10 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 0.40, 0.10),
         ),
         Tunable(
+            "max_fall_k", "No buy into a fall over (× unit)", 0.0, 3.0, 0.05,
+            (0.0, 0.50, 0.10),
+        ),
+        Tunable(
             "position_pct", "Position size (% of cash)", 1.0, 100.0, 5.0,
             (25.0, 100.0, 25.0), "%.0f",
         ),
@@ -236,6 +240,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "take_fraction",
     "hold_min_gain_k",
     "min_win_k",
+    "max_fall_k",
     "position_pct",
 )
 

@@ -235,6 +235,13 @@ def dayrange_params(
         disabled=float(position_pct) >= 100,
         help=copy.help.get("scale_in"),
     )
+    max_fall_k = col_b.number_input(
+        f"Don't buy into a fall steeper than (× {unit_label})",
+        min_value=0.0, max_value=3.0, value=defaults.max_fall_k, step=0.05,
+        format="%.2f",
+        key=copy.key("max_fall_k"),
+        help=copy.help.get("max_fall_k", "").format(unit=unit_label) or None,
+    )
     # A pair the wrong way round is not a strategy -- it would sell at a price
     # below the one it bought at, on every bar. The config refuses it outright,
     # which here would take the whole page down mid-render, so the pair is
@@ -259,6 +266,7 @@ def dayrange_params(
         sell_k=float(sell_k),
         position_pct=float(position_pct),
         scale_in=bool(scale_in),
+        max_fall_k=float(max_fall_k),
         level_unit=level_unit,
         breach_update=breach_update,
         contain_range=contain_range,

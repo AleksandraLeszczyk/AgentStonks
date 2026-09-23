@@ -197,7 +197,9 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     and `TestBreachExit` are where each of the three is switched on.
 
     `scale_in` is pinned off for the same reason: the notebook buys once and
-    waits. `TestScaleIn` is where the ladder is switched on.
+    waits. `TestScaleIn` is where the ladder is switched on. So is `max_fall_k`:
+    the notebook buys whatever the speed of the fall. `TestNoBuyIntoAFall` is
+    where it is switched on.
     """
     kwargs.setdefault("buy_k", 0.75)
     kwargs.setdefault("sell_k", 0.10)
@@ -207,6 +209,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("contain_range", False)
     kwargs.setdefault("breach_exit", False)
     kwargs.setdefault("scale_in", False)
+    kwargs.setdefault("max_fall_k", 0.0)
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
 
@@ -2775,3 +2778,120 @@ class TestScaleIn:
         from simlab.rule_agents import _apple_from_record
 
         assert _apple_from_record({"position_pct": 50.0}).scale_in is False
+
+
+class TestNoBuyIntoAFall:
+    """No buy -- first or add -- while the price is falling too fast to catch.
+
+    Notebook arithmetic (H $110, ADR $10, buy $102.50) at `max_fall_k` 0.30:
+    a close more than $3.00 under the close 15 bars earlier refuses the bar.
+    """
+
+    def _trader(self, **kwargs):
+        kwargs.setdefault("max_fall_k", 0.30)
+        return at.DayRangeTrader(dayrange_config(**kwargs))
+
+    def _run(self, state, monkeypatch, pad: float, pad_bars: int = 20, **kwargs):
+        """`pad_bars` bars at `pad`, then one at the buy level; the outcome of that last one."""
+        broker = FakeBroker(pad)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = self._trader(**kwargs)
+        for _ in range(pad_bars):
+            tape.append(pad)
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(BUY_LEVEL)
+        outcome = trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return outcome, trader, tracker, tape
+
+    def _status(self, state):
+        return [e["text"] for e in state.agent_log if e.get("type") == "status"]
+
+    def test_the_default_is_on(self):
+        assert AppleTraderConfig().max_fall_k == pytest.approx(0.30)
+
+    def test_a_steep_fall_to_the_buy_level_is_not_bought(self, state, market_open, monkeypatch):
+        # $106.00 -> $102.50 is $3.50 down over 15 bars: 0.35 ADR, past 0.30.
+        outcome, _, tracker, _ = self._run(state, monkeypatch, pad=106.0)
+        assert outcome == "hold"
+        assert tracker.position_for(TICKER) == 0
+        (line,) = [t for t in self._status(state) if "Not buying into the fall" in t]
+        assert "$3.50" in line and "15 bars" in line and "-0.35" in line
+
+    def test_a_gentle_fall_to_the_buy_level_is_bought(self, state, market_open, monkeypatch):
+        # $104.50 -> $102.50 is $2.00: 0.20 ADR, inside 0.30.
+        outcome, _, tracker, _ = self._run(state, monkeypatch, pad=104.5)
+        assert outcome == "bought"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_off_at_zero(self, state, market_open, monkeypatch):
+        outcome, *_ = self._run(state, monkeypatch, pad=106.0, max_fall_k=0.0)
+        assert outcome == "bought"
+
+    def test_only_the_bar_is_refused_and_the_buy_follows_once_the_fall_is_out_of_the_window(
+        self, state, market_open, monkeypatch
+    ):
+        outcome, trader, tracker, tape = self._run(state, monkeypatch, pad=106.0)
+        assert outcome == "hold"
+        outcomes = []
+        for _ in range(15):
+            tape.append(BUY_LEVEL)
+            outcomes.append(trader.run_cycle(DAYRANGE_BUNDLE, state, tracker))
+        # The $106 closes drop out of the 15-bar look-back one bar at a time;
+        # the first bar whose look-back starts at $102.50 buys.
+        assert outcomes == ["hold"] * 14 + ["bought"]
+
+    def test_the_look_back_is_the_momentum_takes(self, state, market_open, monkeypatch):
+        # The fall to $102.60 is six bars old: inside 15 bars, outside 5.
+        def run(**kwargs):
+            broker = FakeBroker(106.0)
+            tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+            tape = Tape(monkeypatch, broker)
+            trader = self._trader(**kwargs)
+            for close in [106.0] * 20 + [102.6] * 6:
+                tape.append(close)
+                trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+            tape.append(BUY_LEVEL)
+            return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        assert run(momentum_fade_bars=15) == "hold"
+        assert run(momentum_fade_bars=5) == "bought"
+
+    def test_with_the_take_off_the_look_back_is_the_default(self):
+        from agent_stonks.config import APPLE_TRADER_MOMENTUM_FADE_BARS
+
+        assert dayrange_config(momentum_fade_bars=0).fall_bars == APPLE_TRADER_MOMENTUM_FADE_BARS
+        assert dayrange_config(momentum_fade_bars=8).fall_bars == 8
+
+    def test_an_add_is_refused_too(self, state, market_open, monkeypatch):
+        broker = FakeBroker(BUY_LEVEL)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        # $1.00 allowed: the first buy comes up from the opening window, the
+        # add falls $1.75 from $103.00 to the $101.25 next rung.
+        trader = self._trader(max_fall_k=0.10, scale_in=True, position_pct=50.0)
+        tape.append(BUY_LEVEL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        first = tracker.position_for(TICKER)
+        for _ in range(20):
+            tape.append(103.0)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        tape.append(TestScaleIn.RUNG_2)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == first
+        assert any("Not buying into the fall" in t for t in self._status(state))
+
+    def test_negative_is_refused(self):
+        with pytest.raises(ValueError, match="max_fall_k"):
+            dayrange_config(max_fall_k=-0.1)
+
+    def test_in_the_signature_only_while_on(self):
+        on = config_signature(dayrange_config(max_fall_k=0.3, momentum_fade_bars=12))
+        assert ",nofall=0.3A/12b" in on
+        assert "nofall" not in config_signature(dayrange_config())
+
+    def test_a_record_from_before_it_existed_replays_with_it_off(self):
+        from simlab.rule_agents import _apple_from_record
+
+        assert _apple_from_record({}).max_fall_k == 0.0
+        assert _apple_from_record({"max_fall_k": 0.25}).max_fall_k == 0.25
