@@ -16,7 +16,7 @@ from bisect import bisect_right
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from agent_stonks import clock
+from agent_stonks import clock, minute_momentum
 from agent_stonks.market_hours import MARKET_CLOSE, MARKET_OPEN, MARKET_TZ
 
 from . import data
@@ -120,6 +120,9 @@ class SimMarket:
             sym: _SymbolSeries(sym, self.days, feed) for sym in self.symbols
         }
         self.indicators = data.load_market_indicators()
+        # `abs_mean_minute_momentum` per (symbol, ET day): a stored week never
+        # changes during a replay, and every simulated minute asks for it.
+        self._minute_move: "dict[tuple[str, date], float | None]" = {}
 
     # --- timeline ---------------------------------------------------------
 
@@ -140,6 +143,28 @@ class SimMarket:
         return datetime.combine(day, MARKET_CLOSE, tzinfo=MARKET_TZ).astimezone(timezone.utc)
 
     # --- per-symbol views at time t --------------------------------------
+
+    def abs_mean_minute_momentum(self, symbol: str, t: datetime) -> "float | None":
+        """Last week's mean absolute one-minute move, as of the session `t` is in.
+
+        The live value, measured the live way (`minute_momentum.compute`) from
+        the stored sessions of the week before -- whatever the store holds on
+        this run's feed, dataset or not. None when it holds none of them, which
+        the trader reads as "cannot tell" rather than as a number.
+        """
+        day = t.astimezone(MARKET_TZ).date()
+        key = (symbol.upper(), day)
+        if key not in self._minute_move:
+            bars = [
+                bar
+                for prior in minute_momentum.prior_week_days(day)
+                for bar in data.load_day_bars(symbol.upper(), prior, self.feed)
+            ]
+            result = minute_momentum.compute(bars, day.isoformat())
+            self._minute_move[key] = (
+                result["abs_mean_minute_momentum"] if result is not None else None
+            )
+        return self._minute_move[key]
 
     def _series(self, symbol: str) -> "_SymbolSeries | None":
         """One symbol's stored series, or None when the dataset has no such

@@ -660,13 +660,16 @@ class TestMomentumPanel:
         (chg,) = self.agent_trace(fig, "momentum change")
         assert (mom.yaxis, chg.yaxis) == ("y5", "y7")
         assert mom.mode == "lines" and 0 < mom.opacity < 1
-        m = [None] * n + [c[i] - c[i - n] for i in range(n, len(c))]
+        # Averages per bar: (c - c[n]) / n, and (m1 - m1[n]) / n.
+        m = [(c[i] - c[i - n]) / n for i in range(n, len(c))]
         assert all(pd.isna(v) for v in list(mom.y)[:n])
-        assert list(mom.y)[n:] == pytest.approx(m[n:])
-        d = [m[i] - m[i - 1] for i in range(n + 1, len(c))]
+        assert list(mom.y)[n:] == pytest.approx(m)
+        m1 = [None] + [c[i] - c[i - 1] for i in range(1, len(c))]
+        d = [(m1[i] - m1[i - n]) / n for i in range(n + 1, len(c))]
+        assert all(pd.isna(v) for v in list(chg.y)[:n + 1])
         assert list(chg.y)[n + 1:] == pytest.approx(d)
         texts = [a["text"] for a in fig.layout.annotations]
-        assert sum(f"{n}-bar \u00b7 Apple Trader" in t for t in texts) == 2
+        assert sum(f"{n}-bar avg \u00b7 Apple Trader" in t for t in texts) == 2
 
     def test_a_one_bar_look_back_draws_no_extra_line(self):
         # It would be the bars themselves.

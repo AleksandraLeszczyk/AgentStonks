@@ -203,6 +203,11 @@ _APPLE_LEGACY = {
     # And an entry was never refused for the speed of the fall that reached the
     # buy level. 0 is that rule, and it is left out of the signature.
     "max_fall_k": 0.0,
+    # Before the momentum confirmation (2026-09-24) nothing read the behaviour
+    # table: the buy and the target sold on a touch, and the take was whichever
+    # of the rules above the record carries. 0 is that, and it is left out of
+    # the signature, so every stored run keeps the identity it was filed under.
+    "momentum_confirmation_bars": 0,
 }
 
 

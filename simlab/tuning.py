@@ -67,6 +67,7 @@ from agent_stonks.config import (
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
 )
+from agent_stonks import minute_momentum
 from agent_stonks.market_hours import MARKET_TZ
 
 TUNING_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "tuning"
@@ -144,11 +145,19 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 1.0, 0.25),
         ),
         Tunable(
-            "negative_momentum_bars", "Negative momentum look-back (bars)", 0, 120, 1,
+            "momentum_confirmation_bars", "Momentum confirmation period (bars)", 0, 60, 1,
+            (2, 15, 1), "%d", integer=True,
+        ),
+        # The take and the entry gate as they were 2026-09-23 to -24. Still
+        # tunables so a stored sweep over one reads back as the grid it was;
+        # not offered for a new one (`LEGACY_AXES`), since neither can be set
+        # beside the confirmation.
+        Tunable(
+            "negative_momentum_bars", "Negative momentum look-back, legacy (bars)", 0, 120, 1,
             (5, 30, 5), "%d", integer=True,
         ),
         Tunable(
-            "negative_for_bars", "Negative for (bars in a row)", 1, 60, 1,
+            "negative_for_bars", "Negative for, legacy (bars in a row)", 1, 60, 1,
             (1, 10, 1), "%d", integer=True,
         ),
         # The take as it used to be written (`AppleTraderConfig.momentum_fade_bars`
@@ -174,7 +183,7 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 0.40, 0.10),
         ),
         Tunable(
-            "max_fall_k", "No buy into a fall over (× unit)", 0.0, 3.0, 0.05,
+            "max_fall_k", "No buy into a fall over, legacy (× unit)", 0.0, 3.0, 0.05,
             (0.0, 0.50, 0.10),
         ),
         Tunable(
@@ -256,12 +265,10 @@ SWEEPABLE: "tuple[str, ...]" = (
     "level_source",
     "breach_update",
     "stop_gain_fraction",
-    "negative_momentum_bars",
-    "negative_for_bars",
+    "momentum_confirmation_bars",
     "take_fraction",
     "hold_min_gain_k",
     "min_win_k",
-    "max_fall_k",
     "position_pct",
 )
 
@@ -272,7 +279,10 @@ AXES: "tuple[str, ...]" = tuple(TUNABLES) + tuple(CHOICES)
 
 # Axes a stored grid may have but a new one is not offered: a field kept only
 # so old records replay.
-LEGACY_AXES: "tuple[str, ...]" = ("momentum_fade_bars", "momentum_drop")
+LEGACY_AXES: "tuple[str, ...]" = (
+    "momentum_fade_bars", "momentum_drop",
+    "negative_momentum_bars", "negative_for_bars", "max_fall_k",
+)
 
 
 def sweep_label(name: str) -> str:
@@ -610,6 +620,10 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
         stamp = date.fromisoformat(str(day)[:10])
         paths.append(sim_data.stored_bars_path(symbol, stamp, feed))
         paths.append(sim_data.news_path(symbol, stamp))
+        # The week before each session, which `abs_mean_minute_momentum` (and
+        # so the momentum confirmation's neutral band) is measured from.
+        for prior in minute_momentum.prior_week_days(stamp):
+            paths.append(sim_data.stored_bars_path(symbol, prior, feed))
     bundle = apple_models.get(config.model_key).path(symbol)
     paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
     return paths

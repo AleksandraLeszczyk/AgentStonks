@@ -730,9 +730,10 @@ FALLBACK_MOMENTUM_MIN = 5
 def _agent_momentum(state, sym_state) -> "tuple[int, str]":
     """How many chart bars the selected agent reads momentum over, and why.
 
-    * Apple Trader -- its momentum take and its no-buy-into-a-fall rule both
-      read `close - close[N bars ago]` over `fall_bars` (the running agent's
-      config while one runs, since that setting takes ▶ Start; else the form's).
+    * Apple Trader -- its momentum confirmation period, which both sides read
+      the behaviour table over (the running agent's config while one runs,
+      since that setting takes ▶ Start; else the form's). A legacy config
+      without it: the take / fall look-back, `fall_bars`.
     * Apple Trader 2 -- a rule set that reads any `mom.*` signal runs on the
       regime score over `MOMENTUM_DEFAULTS["horizon"]` bars.
     * LLM personalities and Automatic -- an armed tactic or pending alert on
@@ -753,6 +754,9 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
     if personality == APPLE_TRADER_KEY:
         running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
         config = running.get("config") or getattr(state, "apple_trader_config", None)
+        confirm = int(getattr(config, "momentum_confirmation_bars", 0) or 0)
+        if confirm:
+            return confirm, "Apple Trader"
         if config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
             return int(config.fall_bars), "Apple Trader"
     elif personality == APPLE_TRADER2_KEY:
@@ -870,11 +874,11 @@ def _live_chart_controls() -> None:
                 "- **Momentum Δ** — this bar's momentum minus the previous bar's: "
                 "above zero the move is speeding up (or a fall is easing), below "
                 "zero it is slowing (or a fall is steepening).\n\n"
-                "The semitransparent blue lines are the same two measures over the "
-                "look-back the selected agent decides on — Apple Trader's momentum "
-                "take / no-fall rule, Apple Trader 2's momentum signals, or an LLM "
-                "agent's armed momentum tactic — and over 5 minutes when it reads "
-                "no momentum.\n\n"
+                "The semitransparent blue lines are the same two measures averaged "
+                "per bar over the look-back the selected agent decides on — Apple "
+                "Trader's momentum confirmation period, Apple Trader 2's momentum "
+                "signals, or an LLM agent's armed momentum tactic — and over 5 "
+                "minutes when it reads no momentum.\n\n"
                 "Regular session only, and each day starts fresh.",
             )
 
@@ -2449,25 +2453,34 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- After a stop nothing more is bought that day.\n"
             "- 0 switches the stop off."
         ),
-        "negative_momentum_bars": (
-            "Takes gains short of the sell level when momentum stays negative.\n\n"
-            "- **Momentum** — the close now minus the close this-many bars ago, in "
-            "dollars.\n"
-            "- **Fires** when the position is in profit and that has been below zero on "
-            "each of the last *Negative for long enough* bars since the entry.\n"
-            "- Fewer bars react to short wobbles; more wait for the whole move to give out.\n"
-            "- 0 switches the take off, and with it the runner."
-        ),
-        "negative_for_bars": (
-            "How many bars in a row momentum has to stay negative before the take sells.\n\n"
-            "- Only bars after the fill count: the dip that reached the buy level was "
-            "falling anyway.\n"
-            "- One bar back above zero starts the count again.\n"
-            "- 1 sells on the first negative bar in profit."
+        "momentum_confirmation_bars": (
+            "One look-back, in bars, over which both the buy and the sells read the "
+            "momentum behaviour table.\n\n"
+            "- **Momentum** — the average move per bar over the period, "
+            "`(close − close N bars ago) / N`. **Change** — the average bar-to-bar "
+            "change of the 1-bar momentum, `(m1 − m1 N bars ago) / N`.\n"
+            "- Each is **neutral** while its size is under 0.1 × the ticker's mean "
+            "absolute one-minute move over last week (`abs_mean_minute_momentum`), "
+            "else positive or negative.\n"
+            "- **Buy** at the buy level only on positive momentum, or neutral momentum "
+            "whose change is not negative (flat, or about to rise).\n"
+            "- **At or above the sell level**, sell unless momentum is still positive "
+            "— then hold on while the price keeps rising. The breach exit likewise.\n"
+            "- **Below the sell level**, in profit: sell the *Take on negative "
+            "momentum* share while momentum is negative and its change neutral or "
+            "negative (still dropping, or dropping faster).\n"
+            "- Never gates the stop loss, the runner's breakeven or the closing "
+            "flatten.\n"
+            "- Until it can be read (the first N + 2 bars, or before last week's "
+            "mean move is known) nothing is bought or sold at the levels.\n"
+            "- 0 switches it off, and with it the momentum take and the runner."
         ),
         "take_fraction": (
             "How much of the position a momentum take sells when the rest is kept as a "
             "runner.\n\n"
+            "- The take fires below the sell level, in profit, while momentum over the "
+            "*Momentum confirmation period* is negative and its change neutral or "
+            "negative.\n"
             "- Whole shares, rounded down, and at least one."
         ),
         "hold_min_gain_k": (
@@ -2476,18 +2489,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- The gap is at most `buy − sell`: 0.15 on AAPL's default pair, 0.60 on "
             "GOOGL's — so 0.30 keeps a runner on GOOGL and INTC, never on AAPL.\n"
             "- A runner is sold at the sell level, at the flatten, or back at the fill."
-        ),
-        "max_fall_k": (
-            "Refuses a buy — the first one or an add — while the price is falling too "
-            "fast to catch.\n\n"
-            "- **The fall** — the close now minus the close N bars ago, where N is the "
-            "*Negative momentum* look-back (15 if the take is off).\n"
-            "- **Refused** when that is more than this many × {unit} down.\n"
-            "- Only that bar: the next one is judged again, so once the fall eases a "
-            "price still at the buy level is bought.\n"
-            "- 0.30 is a fall seen on about 1% of minutes on AAPL, GOOGL and INTC; the "
-            "0.10 default refuses far more often, waiting for the fall to flatten.\n"
-            "- 0 switches it off."
         ),
         "min_win_k": (
             "After a trade closes for no more than this many × {unit} **per share**, nothing "

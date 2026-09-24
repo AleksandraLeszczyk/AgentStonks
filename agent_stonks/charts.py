@@ -966,10 +966,14 @@ def _add_momentum_panels(
     mean absolute one-minute move -- drawn at plus and minus itself on the
     momentum panel, so a bar poking past it moved more than a usual minute.
 
-    `agent_bars` adds the same two measures over the look-back the selected
-    agent decides on -- `close - close[N bars ago]` and its bar-to-bar change --
-    as semitransparent lines over the bars, labelled with `agent_label`. A
-    look-back of one bar is the bars themselves, so it draws nothing extra.
+    `agent_bars` adds the same two measures averaged over the look-back the
+    selected agent decides on, as semitransparent lines over the bars, labelled
+    with `agent_label`: momentum `(close - close[N bars ago]) / N`, the average
+    per-bar move, and its change `(m1 - m1[N bars ago]) / N`, the average
+    bar-to-bar change of the 1-bar momentum. Per bar, so on the bars' own scale
+    -- and exactly what Apple Trader's momentum confirmation reads
+    (`apple_trader.momentum_read`). A look-back of one bar is the bars
+    themselves, so it draws nothing extra.
 
     The frame is rebuilt from the drawn bars via `momentum_regime`, which keeps
     to the regular session and to an exchange-local index -- so the series is
@@ -1010,9 +1014,9 @@ def _add_momentum_panels(
     n = int(agent_bars or 0)
     if n > 1 and len(frame):
         by_session = frame["session"]
-        mom_n = close - close.groupby(by_session, sort=False).shift(n)
-        change_n = mom_n - mom_n.groupby(by_session, sort=False).shift(1)
-        label = f"{n}-bar" + (f" \u00b7 {agent_label}" if agent_label else "")
+        mom_n = (close - close.groupby(by_session, sort=False).shift(n)) / n
+        change_n = (mom - mom.groupby(by_session, sort=False).shift(n)) / n
+        label = f"{n}-bar avg" + (f" \u00b7 {agent_label}" if agent_label else "")
         for row, series, what, drawn in (
             (momentum_row, mom_n, "momentum", mom),
             (change_row, change_n, "momentum change", change),

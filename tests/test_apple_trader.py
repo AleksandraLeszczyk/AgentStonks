@@ -200,7 +200,17 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     waits. `TestScaleIn` is where the ladder is switched on. So is `max_fall_k`:
     the notebook buys whatever the speed of the fall. `TestNoBuyIntoAFall` is
     where it is switched on.
+
+    `momentum_confirmation_bars` is pinned off too, and the take pinned to the
+    15-bar negative streak it replaced: most of this file is about that take,
+    which stored records still replay. `TestMomentumConfirmation` is where the
+    confirmation is switched on.
     """
+    kwargs.setdefault("momentum_confirmation_bars", 0)
+    if not kwargs["momentum_confirmation_bars"] and not (
+        kwargs.get("momentum_fade_bars") or kwargs.get("momentum_drop")
+    ):
+        kwargs.setdefault("negative_momentum_bars", 15)
     kwargs.setdefault("buy_k", 0.75)
     kwargs.setdefault("sell_k", 0.10)
     kwargs.setdefault("breach_update", "off")
@@ -2942,6 +2952,260 @@ class TestScaleIn:
         assert _apple_from_record({"position_pct": 50.0}).scale_in is False
 
 
+class TestMomentumReadTable:
+    """`momentum_read`: the averages over N bars and the user's behaviour table."""
+
+    # With N = 1 the averages are the plain 1-bar values: momentum is the last
+    # move, change the last move minus the one before. A mean minute move of
+    # 1.0 puts the neutral band at +-0.1.
+    @staticmethod
+    def read(moves):
+        closes = [100.0]
+        for m in moves:
+            closes.append(closes[-1] + m)
+        return at.momentum_read(closes, 1, 1.0)
+
+    @pytest.mark.parametrize(
+        "moves, mom, change, buy, take, sell_target",
+        [
+            ((-1.0, -0.5), "negative", "positive", False, False, True),
+            ((-0.5, -0.5), "negative", "neutral", False, True, True),
+            ((-0.5, -1.0), "negative", "negative", False, True, True),
+            ((-0.5, 0.0), "neutral", "positive", True, False, True),
+            ((0.0, 0.0), "neutral", "neutral", True, False, True),
+            ((0.5, 0.0), "neutral", "negative", False, False, True),
+            ((0.5, 1.0), "positive", "positive", True, False, False),
+            ((0.5, 0.5), "positive", "neutral", True, False, False),
+            ((1.0, 0.5), "positive", "negative", True, False, False),
+        ],
+    )
+    def test_every_row_of_the_table(self, moves, mom, change, buy, take, sell_target):
+        read = self.read(moves)
+        assert (read["mom_class"], read["change_class"]) == (mom, change)
+        row = read["row"]
+        assert (row.buy, row.take, row.sell_target) == (buy, take, sell_target)
+
+    def test_the_averages_over_n_bars(self):
+        closes = [100.0, 101.0, 101.5, 101.0, 102.0, 101.0]
+        read = at.momentum_read(closes, 3, 1.0)
+        # (101 - 101.5) / 3, and ((101 - 102) - (101.5 - 101)) / 3.
+        assert read["mom"] == pytest.approx(-0.5 / 3)
+        assert read["change"] == pytest.approx(-1.5 / 3)
+
+    def test_neutral_is_a_tenth_of_the_mean_minute_move(self):
+        read = at.momentum_read([100.0, 100.0, 100.19], 1, 2.0)
+        assert read["band"] == pytest.approx(0.2)
+        assert read["mom_class"] == "neutral"
+        assert at.momentum_read([100.0, 100.0, 100.21], 1, 2.0)["mom_class"] == "positive"
+
+    def test_cannot_read_without_the_mean_move_or_enough_bars(self):
+        assert at.momentum_read([100.0, 101.0, 102.0], 1, None) is None
+        assert at.momentum_read([100.0, 101.0, 102.0], 1, 0.0) is None
+        # The change over N bars needs N + 2 closes.
+        assert at.momentum_read([100.0, 101.0, 102.0, 103.0], 3, 1.0) is None
+        assert at.momentum_read([100.0, 101.0, 102.0, 103.0, 104.0], 3, 1.0) is not None
+
+
+class TestMomentumConfirmation:
+    """The behaviour table on the trader: what a buy at the buy level, a sell
+    at the sell level and the take short of it each need.
+
+    Notebook arithmetic (buy $102.50, sell $109.00), a 3-bar confirmation
+    period and a mean minute move of $0.50, so the neutral band is +-$0.05.
+    """
+
+    N = 3
+    MINUTE_MOVE = 0.5
+
+    def _trader(self, **kwargs):
+        kwargs.setdefault("momentum_confirmation_bars", self.N)
+        return at.DayRangeTrader(dayrange_config(**kwargs))
+
+    def _setup(self, state, monkeypatch, minute_move=MINUTE_MOVE, **kwargs):
+        broker = FakeBroker(101.4)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        state.sym(TICKER).abs_mean_minute_momentum = minute_move
+        return self._trader(**kwargs), tracker, tape
+
+    def _step(self, trader, tracker, tape, state, close, **kw):
+        tape.append(close, **kw)
+        return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+    def _status(self, state):
+        return [e["text"] for e in state.agent_log if e.get("type") == "status"]
+
+    def _enter(self, state, monkeypatch, **kwargs):
+        """Bought at $101.80, on a rising bar under the buy level."""
+        trader, tracker, tape = self._setup(state, monkeypatch, **kwargs)
+        # The opening window closes at 101.0 ... 101.4; 101.8 is +0.17 a bar
+        # over the last 3 -- positive momentum.
+        assert self._step(trader, tracker, tape, state, 101.8) == "bought"
+        return trader, tracker, tape
+
+    @staticmethod
+    def _force(monkeypatch, mom, change):
+        """Pin the read to one row of the table, whatever the tape says."""
+        row = at.MOMENTUM_TABLE[(mom, change)]
+        read = {
+            "n": 3, "mom": -1.0 if mom == "negative" else (1.0 if mom == "positive" else 0.0),
+            "change": 0.0, "band": 0.05, "mom_class": mom, "change_class": change, "row": row,
+        }
+        monkeypatch.setattr(at, "momentum_read", lambda *a, **k: dict(read))
+
+    # --- config ---------------------------------------------------------
+
+    def test_on_by_default_and_signed(self):
+        config = AppleTraderConfig()
+        assert config.momentum_confirmation_bars == 5
+        assert config.has_take
+        signature = config_signature(config)
+        assert ",confirm=5b" in signature and "@conf," in signature
+
+    def test_it_cannot_sit_beside_a_legacy_take(self):
+        with pytest.raises(ValueError, match="only one may be set"):
+            AppleTraderConfig(negative_momentum_bars=15)
+
+    def test_off_signs_as_before(self):
+        config = AppleTraderConfig(momentum_confirmation_bars=0)
+        assert "confirm=" not in config_signature(config)
+        assert not config.has_take
+
+    # --- buy --------------------------------------------------------------
+
+    def test_a_fall_to_the_buy_level_is_not_bought(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch)
+        for close in (104.0, 103.5, 103.0):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        assert self._step(trader, tracker, tape, state, 102.5) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        (line,) = [t for t in self._status(state) if "Not buying yet" in t]
+        assert "negative" in line and "$102.50 buy level" in line
+
+    def test_a_rise_under_the_buy_level_is_bought(self, state, market_open, monkeypatch):
+        _, tracker, _ = self._enter(state, monkeypatch)
+        assert tracker.position_for(TICKER) > 0
+
+    def test_neutral_momentum_turning_up_is_bought(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch)
+        for close in (103.0, 103.0, 103.0):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        # A slide under the buy level (negative momentum, not bought), then a
+        # turn: over the last 3 bars the price is where it was (+0.017 a bar,
+        # neutral) but the last move (+0.15) is far above the one 3 bars
+        # earlier (-0.2) -- change +0.12, "about to start rising".
+        for close in (102.2, 102.0, 101.95, 101.9):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        assert self._step(trader, tracker, tape, state, 102.05) == "bought"
+
+    def test_flat_at_the_buy_level_is_bought(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch)
+        # Just above the level, then a tick onto it: -0.03 a bar and a change
+        # of -0.03, both inside the +-0.05 band -- "still flat", bought.
+        for close in (102.6, 102.6, 102.6, 102.6):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        assert self._step(trader, tracker, tape, state, 102.5) == "bought"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_nothing_is_bought_before_the_mean_move_is_known(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._setup(state, monkeypatch, minute_move=None)
+        assert self._step(trader, tracker, tape, state, 101.8) == "hold"
+        assert any("not known yet" in t for t in self._status(state))
+
+    # --- sell at the sell level -------------------------------------------
+
+    def test_the_target_is_held_while_momentum_is_positive(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "positive", "negative")
+        assert self._step(trader, tracker, tape, state, 109.5, high=109.6) == "hold"
+        assert tracker.position_for(TICKER) == shares
+        (line,) = [t for t in self._status(state) if "Holding on" in t]
+        assert "$109.00 sell level" in line and "going up" in line
+
+    @pytest.mark.parametrize("mom", ["neutral", "negative"])
+    def test_the_target_sells_once_momentum_is_not_positive(
+        self, state, market_open, monkeypatch, mom
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        self._force(monkeypatch, mom, "positive")
+        assert self._step(trader, tracker, tape, state, 109.5, high=109.6) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_real_run_up_is_held_and_then_sold(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        for close in (104.0, 106.0):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        # Through the sell level, still rising: held, and held while the last
+        # 3 bars still climb.
+        assert self._step(trader, tracker, tape, state, 109.5) == "hold"
+        assert self._step(trader, tracker, tape, state, 109.5) == "hold"
+        assert self._step(trader, tracker, tape, state, 109.5) == "hold"
+        # Three bars flat at the top: neutral momentum, sold.
+        assert self._step(trader, tracker, tape, state, 109.5) == "sold"
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    # --- the take, short of the sell level ------------------------------------
+
+    @pytest.mark.parametrize("change", ["neutral", "negative"])
+    def test_negative_momentum_takes_the_share_in_profit(
+        self, state, market_open, monkeypatch, change
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", change)
+        assert self._step(trader, tracker, tape, state, 105.0) == "sold"
+        left = tracker.position_for(TICKER)
+        assert 0 < left < shares
+        assert "Momentum take" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_slowing_drop_is_not_taken(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "positive")
+        assert self._step(trader, tracker, tape, state, 105.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+
+    def test_no_take_at_a_loss(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "negative")
+        # Under the $101.80 fill, above the stop.
+        assert self._step(trader, tracker, tape, state, 101.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+
+    def test_a_real_drop_is_taken(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        for close in (104.0, 104.0, 104.0, 104.0):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        # -1.00 against three flat bars: momentum -0.33 a bar, change -0.33.
+        assert self._step(trader, tracker, tape, state, 103.0) == "sold"
+        assert 0 < tracker.position_for(TICKER) < shares
+
+    # --- never gated ------------------------------------------------------
+
+    def test_the_stop_is_not_gated(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        self._force(monkeypatch, "positive", "positive")
+        stop = 101.8 - 0.5 * TARGET_GAIN
+        assert self._step(trader, tracker, tape, state, 102.0, low=stop - 0.01) == "sold"
+        assert "Stop loss" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_flatten_is_not_gated(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        self._force(monkeypatch, "positive", "positive")
+        monkeypatch.setattr(trader, "closing_soon", lambda: True)
+        assert self._step(trader, tracker, tape, state, 104.0) == "sold"
+        assert "flattened" in tracker.snapshot()["decisions"][-1].reasoning
+
+
 class TestNoBuyIntoAFall:
     """No buy -- first or add -- while the price is falling too fast to catch.
 
@@ -2969,8 +3233,13 @@ class TestNoBuyIntoAFall:
     def _status(self, state):
         return [e["text"] for e in state.agent_log if e.get("type") == "status"]
 
-    def test_the_default_is_on(self):
-        assert AppleTraderConfig().max_fall_k == pytest.approx(0.10)
+    def test_a_new_config_leaves_it_to_the_momentum_confirmation(self):
+        # The legacy gate: records from 2026-09-23 to -24 replay it, nothing
+        # new sets it, and it cannot sit beside the confirmation.
+        assert AppleTraderConfig().max_fall_k == 0.0
+        assert AppleTraderConfig().momentum_confirmation_bars > 0
+        with pytest.raises(ValueError, match="momentum_confirmation_bars"):
+            AppleTraderConfig(max_fall_k=0.1)
 
     def test_a_steep_fall_to_the_buy_level_is_not_bought(self, state, market_open, monkeypatch):
         # $106.00 -> $102.50 is $3.50 down over 15 bars: 0.35 ADR, past 0.30.

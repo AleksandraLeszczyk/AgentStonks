@@ -234,14 +234,14 @@ class TestExpand:
         """`take_fraction` is not in the signature while the momentum take is
         off, so varying it there is one configuration however many values."""
         configs, refused = tu.expand(
-            self.base(negative_momentum_bars=0),
+            self.base(momentum_confirmation_bars=0),
             [{"name": "take_fraction", "values": [0.3, 0.6, 1.0]}],
         )
         assert len(configs) == 1 and refused == []
 
     def test_the_collapse_is_visible_against_the_grid(self):
         axes = [{"name": "take_fraction", "values": [0.3, 0.6, 1.0]}]
-        configs, refused = tu.expand(self.base(negative_momentum_bars=0), axes)
+        configs, refused = tu.expand(self.base(momentum_confirmation_bars=0), axes)
         assert tu.cell_count(axes) - len(configs) - len(refused) == 2
 
     def test_the_order_is_the_grids(self):
@@ -528,13 +528,13 @@ def stub_model(monkeypatch):
 
 class TestJob:
     def job_spec(self, **overrides):
-        # The managed exit and the no-buy-into-a-fall rule off, so the grid is
+        # The managed exit and the momentum confirmation off, so the grid is
         # about the two levels alone (the tape dives straight to the deeper
         # level), and the ADR unit because the tape below and the numbers
         # asserted on it are that arithmetic.
         base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10,
-                                 stop_gain_fraction=0.0, negative_momentum_bars=0,
-                                 max_fall_k=0.0, level_unit=UNIT_ADR)
+                                 stop_gain_fraction=0.0, momentum_confirmation_bars=0,
+                                 level_unit=UNIT_ADR)
         return spec(
             base=asdict(base),
             axes=[{"name": "buy_k", "values": [0.5, 0.75, 1.0]},
@@ -860,7 +860,7 @@ class TestDerivedGrids:
         return AppleTraderConfig(**{
             "ticker": TICKER, "buy_k": 0.75, "sell_k": 0.10,
             # A legacy record's take, which still reads back as the grid it was.
-            "momentum_drop": 1.0, "negative_momentum_bars": 0,
+            "momentum_drop": 1.0, "momentum_confirmation_bars": 0,
             **overrides,
         })
 

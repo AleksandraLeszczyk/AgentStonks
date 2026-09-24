@@ -275,6 +275,9 @@ class SimulationEngine:
                             continue
                 ss.day_volume = self._day_volume(ss.symbol, t)
             ss.daily_bars = self.market.daily_bars_at(ss.symbol, t)
+            # What the live stream start measures once a day
+            # (`agent_stonks.minute_momentum`), from the stored week before `t`.
+            ss.abs_mean_minute_momentum = self.market.abs_mean_minute_momentum(ss.symbol, t)
             prev = self.market.prev_close(ss.symbol, t)
             if prev is not None:
                 ss.prev_close = prev

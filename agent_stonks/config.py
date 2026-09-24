@@ -271,7 +271,9 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # wider one on GOOGL. 0 switches the stop off, which is what every record
 # written before the managed exit existed replays as.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
-# The momentum take (`DayRangeTrader._momentum_negative`): momentum is the
+# The momentum take as it was 2026-09-23 to -24 (`DayRangeTrader._momentum_negative`),
+# kept so the records made then replay; a new config uses the momentum
+# confirmation below instead, and leaves this look-back at 0. Momentum is the
 # N-bar price change, `close - close[N bars ago]` in dollars, and the take
 # fires once that has sat under zero for NEGATIVE_FOR_BARS bars in a row since
 # the entry.
@@ -282,6 +284,20 @@ APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
 # carry and replay (`simlab.rule_agents._APPLE_LEGACY`).
 APPLE_TRADER_NEGATIVE_MOMENTUM_BARS = 15
 APPLE_TRADER_NEGATIVE_FOR_BARS = 5
+# The momentum confirmation (2026-09-24, `DayRangeTrader._momentum_read`): one
+# look-back, in bars, for both sides. Momentum is the average per-bar move over
+# it, `(close - close[N bars ago]) / N`, and its change the average bar-to-bar
+# change of the 1-bar momentum, `(m1 - m1[N bars ago]) / N` -- so both are per
+# bar, the same scale as `abs_mean_minute_momentum`, which sets the neutral band:
+# a value is neutral while its size is under MOMENTUM_NEUTRAL_FRACTION of last
+# week's mean absolute one-minute move. The user's behaviour table then decides:
+# buy at the buy level only on positive momentum, or neutral with a change
+# that is not negative; sell at the sell level unless momentum is positive; below it, take
+# gains (in profit) on negative momentum whose change is neutral or negative.
+# 5 bars is not swept; 0 switches it off, which is what every SimLab record
+# written before it existed replays as (`simlab.rule_agents._APPLE_LEGACY`).
+APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS = 5
+MOMENTUM_NEUTRAL_FRACTION = 0.10
 APPLE_TRADER_TAKE_FRACTION = 0.70
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What the agent does when the session trades through the forecast it was given
@@ -499,7 +515,9 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # SimLab record written before the setting existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_SCALE_IN = True
-# No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`): an entry,
+# No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`), as it was
+# 2026-09-23 to -24 -- kept so the records made then replay. A new config
+# leaves it at 0: the momentum confirmation above decides entries now. An entry,
 # first buy or add alike, is refused while the price has dropped more than this
 # many level units over the momentum look-back (APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 # unless the run sets its own) -- the same `close - close[N bars ago]` the

@@ -6,6 +6,7 @@ only reads the local dataset store and replays agents against it.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import textwrap
@@ -58,6 +59,7 @@ from . import drift as sim_drift
 from . import experiments as sim_experiments
 from . import prompts as sim_prompts
 from . import results as sim_results
+from . import session_context as sim_session
 from . import tuning as sim_tuning
 from .engine import SimulationConfig, SimulationEngine
 from .market import SimMarket
@@ -1804,20 +1806,32 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "replays in its own units.\n"
             "- 0 switches the stop off."
         ),
-        "negative_momentum_bars": (
-            "The momentum take's look-back, in bars.\n\n"
-            "- Momentum is `close − close N bars ago`, in dollars (the live chart's "
-            "panel). Fires in profit once it has been negative for *Negative for long "
-            "enough* bars in a row since the entry.\n"
-            "- Signs as `take=70%@neg15b/5b`; records from before carry `@fade15b` (the "
-            "positive-to-balanced σ turn) or `@mom-1` (a σ fall from the peak) and "
-            "replay that rule.\n"
-            "- Sweepable; 0 switches the take off, and with it the runner."
-        ),
-        "negative_for_bars": (
-            "How many bars in a row the momentum has to stay negative before the take "
-            "sells. Only bars after the fill count. Sweepable; in the signature only "
-            "while the take is on."
+        "momentum_confirmation_bars": (
+            "One look-back, in bars, over which both the buy and the sells read the "
+            "momentum behaviour table.\n\n"
+            "- **Momentum** — the average move per bar over the period, "
+            "`(close − close N bars ago) / N`. **Change** — the average bar-to-bar "
+            "change of the 1-bar momentum, `(m1 − m1 N bars ago) / N`.\n"
+            "- Each is **neutral** while its size is under 0.1 × the ticker's mean "
+            "absolute one-minute move over last week (`abs_mean_minute_momentum`), "
+            "else positive or negative.\n"
+            "- **Buy** at the buy level only on positive momentum, or neutral momentum "
+            "whose change is not negative (flat, or about to rise).\n"
+            "- **At or above the sell level**, sell unless momentum is still positive "
+            "— then hold on while the price keeps rising. The breach exit likewise.\n"
+            "- **Below the sell level**, in profit: sell the *Take on negative "
+            "momentum* share while momentum is negative and its change neutral or "
+            "negative (still dropping, or dropping faster).\n"
+            "- Never gates the stop loss, the runner's breakeven or the closing "
+            "flatten.\n"
+            "- Until it can be read (the first N + 2 bars, or before last week's "
+            "mean move is known) nothing is bought or sold at the levels.\n"
+            "- Signs as `confirm=5b` with the take as `take=70%@conf`; a record from "
+            "before it replays with it off, under the take it carries (`@neg15b/5b`, "
+            "`@fade15b`, `@mom-1`) and any `nofall=` gate.\n"
+            "- SimLab measures last week's mean move from the 5 stored sessions "
+            "before each replayed day.\n"
+            "- Sweepable; 0 switches it off, and with it the take and the runner."
         ),
         "position_pct": (
             "The share of available cash each entry spends. In the signature as `size=`."
@@ -1841,13 +1855,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "until the last one.\n\n"
             "- Needs a position size under 100%.\n"
             "- In the signature as `adds=half` while it can change a trade."
-        ),
-        "max_fall_k": (
-            "No buy — first or add — while the close has fallen more than this many "
-            "× {unit} over the momentum look-back (15 bars with the take off).\n\n"
-            "- Refuses that bar only; the next is judged again.\n"
-            "- In the signature as `nofall=0.3R/15b` while it is on, and sweepable. A "
-            "record from before it existed replays with it off."
         ),
         "min_win_k": (
             "The session circuit breaker: after a trade closes for no more than this many "
@@ -3920,9 +3927,93 @@ def _tuning_session_moves(symbol: str, feed: str, days: list[str]) -> dict[str, 
     return moves
 
 
-def _tuning_daily_chart(job: dict) -> go.Figure:
+_BIAS_MARK = {
+    "bullish": ("▲", PALETTE["up"]),
+    "neutral": ("→", PALETTE["muted"]),
+    "bearish": ("▼", PALETTE["down"]),
+}
+
+
+def _tuning_pick_days(job: dict) -> dict[str, list[str]]:
+    """{feed: sessions the pick was scored on} across the tune and test datasets."""
+    spec = job["spec"]
+    by_feed: dict[str, list[str]] = {}
+    for cell, dataset in (
+        (job.get("best"), spec["tune_dataset"]), (job.get("best_test"), spec.get("test_dataset")),
+    ):
+        if sim_tuning.is_scored(cell) and dataset:
+            by_feed.setdefault(dataset["feed"], []).extend(cell["daily"])
+    return by_feed
+
+
+def _tuning_session_context(job: dict) -> dict:
+    """The VIX open and the pre-market bias of every session the pick was scored on.
+
+    Briefings are LLM calls, made once per session and cached on disk
+    (`session_context`); a day that failed is remembered for this browser
+    session so a rerun does not ask again, and "Retry" clears that.
+    """
+    symbol = job["spec"]["base"]["ticker"]
+    by_feed = _tuning_pick_days(job)
+    days = sorted({d for ds in by_feed.values() for d in ds})
+    context = {"vix": sim_session.vix_opens(days), "biases": {}, "errors": {}, "provider": None}
+    chosen = sim_session.briefing_provider()
+    if chosen is None:
+        return context
+    provider, model, api_key = chosen
+    context["provider"] = f"{provider} · {model}"
+    failed = st.session_state.setdefault("tune_briefing_failed", {})
+    wanted = {
+        feed: [d for d in ds if (symbol, d, provider, model) not in failed]
+        for feed, ds in by_feed.items()
+    }
+    uncached = sum(
+        1 for ds in wanted.values() for d in ds
+        if sim_session.cached_briefing(symbol, d, provider, model) is None
+    )
+    with st.spinner(
+        f"Writing {uncached} pre-market briefing{'s' if uncached != 1 else ''} "
+        f"({provider} · {model})…",
+        show_time=True,
+    ) if uncached else contextlib.nullcontext():
+        biases, errors = sim_session.session_biases(
+            symbol, wanted, provider, model, api_key,
+            os.getenv("ALPACA_API_KEY", ""), os.getenv("ALPACA_SECRET", ""),
+        )
+    for day, error in errors.items():
+        failed[(symbol, day, provider, model)] = error
+    context["biases"] = biases
+    context["errors"] = {
+        day: error for (sym, day, prov, mod), error in failed.items()
+        if sym == symbol and prov == provider and mod == model and day in days
+    }
+    return context
+
+
+def _tuning_day_label(day: str, context: dict) -> str:
+    lines = [day]
+    record = context["biases"].get(day)
+    if record:
+        icon, color = _BIAS_MARK.get(record["bias"], ("?", PALETTE["muted"]))
+        lines.append(f"<span style='color:{color}'>{icon} {record['bias']}</span>")
+    else:
+        lines.append(f"<span style='color:{PALETTE['muted']}'>no bias</span>")
+    vix = context["vix"].get(day)
+    lines.append(f"VIX {vix:.1f}" if vix is not None else "VIX –")
+    return "<br>".join(lines)
+
+
+def _tuning_day_hover(day: str, context: dict) -> str:
+    record = context["biases"].get(day)
+    vix = context["vix"].get(day)
+    bias = f"{record['bias']} ({record['confidence']} confidence)" if record else "no briefing"
+    return f"pre-market: {bias}<br>VIX open: " + (f"{vix:.2f}" if vix is not None else "–")
+
+
+def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
     spec = job["spec"]
     symbol = spec["base"]["ticker"]
+    context = context or {"vix": {}, "biases": {}}
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
         row_heights=[0.6, 0.4],
@@ -3938,6 +4029,7 @@ def _tuning_daily_chart(job: dict) -> go.Figure:
         fig.add_trace(go.Bar(
             x=days, y=[cell["daily"][d] for d in days],
             name=f"Pick on {dataset['name']}", marker_color=color,
+            hovertext=[_tuning_day_hover(d, context) for d in days],
         ), row=1, col=1)
         moves.update(_tuning_session_moves(symbol, dataset["feed"], days))
     if moves:
@@ -3955,11 +4047,76 @@ def _tuning_daily_chart(job: dict) -> go.Figure:
             ],
         ), row=2, col=1)
     fig.update_xaxes(type="category", categoryorder="category ascending", gridcolor=PALETTE["grid"])
+    # Each session's label carries what the morning looked like: the pre-market
+    # briefing's call and the VIX's opening print. Set on the bottom axis only,
+    # the one a shared x shows.
+    all_days = sorted({d for ds in _tuning_pick_days(job).values() for d in ds} | set(moves))
+    fig.update_xaxes(
+        tickvals=all_days, ticktext=[_tuning_day_label(d, context) for d in all_days],
+        row=2, col=1,
+    )
     fig.update_yaxes(title="Profit ($)", row=1, col=1)
     fig.update_yaxes(title=f"{symbol} ($/share)", row=2, col=1)
     fig.update_yaxes(gridcolor=PALETTE["grid"])
     fig.update_layout(title="The pick, session by session", barmode="group")
-    return _chart_layout(fig, height=460)
+    _chart_layout(fig, height=520)
+    fig.update_layout(margin=dict(b=80))
+    return fig
+
+
+def _render_tuning_session_context(job: dict, context: dict) -> None:
+    """Under the chart: where the labels come from, and each morning's briefing."""
+    if context["provider"] is None:
+        st.caption(
+            ":material/info: No LLM key in the environment (GEMINI_API_KEY, OPENAI_API_KEY "
+            "or ANTHROPIC_API_KEY), so the sessions carry no pre-market bias."
+        )
+    if context["errors"]:
+        first_day = min(context["errors"])
+        col_msg, col_retry = st.columns([5, 1], vertical_alignment="center")
+        col_msg.warning(
+            f"No pre-market briefing for {len(context['errors'])} session(s) — "
+            f"{first_day}: {context['errors'][first_day]}"
+        )
+        if col_retry.button("Retry", key=f"tune_briefing_retry_{job['job_id']}"):
+            st.session_state["tune_briefing_failed"] = {}
+            st.rerun()
+    if not context["biases"]:
+        return
+    profit = {}
+    for cell in (job.get("best"), job.get("best_test")):
+        if sim_tuning.is_scored(cell):
+            profit.update(cell["daily"])
+    rows = [
+        {
+            "day": day,
+            "bias": record["bias"],
+            "confidence": record["confidence"],
+            "vix_open": context["vix"].get(day),
+            "profit": profit.get(day),
+            "summary": record["summary"],
+        }
+        for day, record in sorted(context["biases"].items())
+    ]
+    with st.expander(
+        f"Pre-market briefings ({context['provider']})", icon=":material/wb_twilight:"
+    ):
+        st.caption(
+            "Written as of 09:25 ET each session from what was known then — the daily "
+            "closes and SPY/VIX/VIX3M closes before that day, the week's news up to "
+            "09:25, and the earnings schedule; no fundamentals, analyst targets or "
+            "alternative data, which have no point-in-time history. One LLM call per "
+            "session, cached: the first answer is the one kept. VIX open is ^VIX's "
+            "opening print that day."
+        )
+        st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={
+            "day": "Session",
+            "bias": "Bias",
+            "confidence": "Confidence",
+            "vix_open": st.column_config.NumberColumn("VIX open", format="%.2f"),
+            "profit": st.column_config.NumberColumn("Pick profit ($)", format="%+.2f"),
+            "summary": st.column_config.TextColumn("Summary", width="large"),
+        })
 
 
 def _render_tuning_notes(job: dict) -> None:
@@ -4170,7 +4327,9 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             })
 
     if sim_tuning.is_scored(best):
-        st.plotly_chart(_tuning_daily_chart(job), key=f"tune_daily_{job_id}")
+        context = _tuning_session_context(job)
+        st.plotly_chart(_tuning_daily_chart(job, context), key=f"tune_daily_{job_id}")
+        _render_tuning_session_context(job, context)
         picked = sim_tuning.make_config(spec["base"], best["overrides"])
         st.markdown("**The pick as a configuration**")
         st.code(rule_agent(APPLE_TRADER_KEY).signature(picked), language=None)

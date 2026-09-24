@@ -11,6 +11,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
+import pandas as pd
 from pydantic import BaseModel
 
 from . import clock
@@ -196,13 +197,26 @@ def _fmt_price(value: float) -> str:
     return f"{value:.0f}" if value > 100 else f"{value:.2f}"
 
 
+_PRICE_WINDOWS: tuple[tuple[str, int], ...] = (("7d", 7), ("30d", 30), ("90d", 90), ("1y", 365))
+
+
 def _price_context(symbol: str) -> tuple[str, dict[str, float]]:
     """Fetch daily closes for multiple lookback windows. Returns (text, last_closes_by_period)."""
+    return _price_block(symbol, lambda days: fetch_close_series(symbol, days))
+
+
+def _price_block(symbol: str, closes_for) -> tuple[str, dict[str, float]]:
+    """The price-history lines, from `closes_for(days)` -> daily close Series.
+
+    Split from the fetch so a replay can hand in closes clipped to the day it
+    is briefing (`generate_premarket_from_data`) and get the same wording the
+    live briefing gets.
+    """
     lines: list[str] = []
     last_close: dict[str, float] = {}
-    for label, days in [("7d", 7), ("30d", 30), ("90d", 90), ("1y", 365)]:
+    for label, days in _PRICE_WINDOWS:
         try:
-            series = fetch_close_series(symbol, days)
+            series = closes_for(days)
             if series.empty or len(series) < 2:
                 continue
             start, end = float(series.iloc[0]), float(series.iloc[-1])
@@ -411,7 +425,11 @@ def _macro_context(days: int = 30) -> str:
         mkt = fetch_market_indicators(days=days)
     except Exception:
         return "Macro data unavailable."
+    return _macro_block(mkt)
 
+
+def _macro_block(mkt: dict) -> str:
+    """The macro line from {"spy"|"vix"|"vix3m": daily close Series}."""
     parts: list[str] = []
     spy = mkt.get("spy")
     vix = mkt.get("vix")
@@ -536,14 +554,23 @@ def _corporate_actions_block(symbol: str, alpaca_key: str, alpaca_secret: str, d
     return f"Incoming corporate actions (next {days_ahead} days):\n" + "\n".join(lines)
 
 
-def _earnings_block(symbol: str) -> str:
+def _earnings_block(symbol: str, as_of: Optional[datetime] = None) -> str:
+    """The next earnings date after `as_of` (default: now).
+
+    A past `as_of` reads the same yfinance schedule, which lists past dates as
+    well as upcoming ones -- earnings dates are announced weeks ahead, so the
+    date after a past morning was known on that morning.
+    """
+    days = 60
+    if as_of is not None:
+        days += max(0, (datetime.now(timezone.utc) - as_of).days)
     try:
-        df = fetch_earnings_dates(symbol, days=60)
+        df = fetch_earnings_dates(symbol, days=days)
     except Exception:
         return ""
     if df.empty:
         return ""
-    now = datetime.now(tz=df.index.tz)
+    now = as_of.astimezone(df.index.tz) if as_of is not None else datetime.now(tz=df.index.tz)
     upcoming = df[df.index >= now]
     if upcoming.empty:
         return ""
@@ -645,6 +672,12 @@ def generate_premarket_analysis(
             context_parts.append(block)
     context = "\n\n".join(context_parts)
 
+    return _ask_for_briefing(sym, provider, api_key, model, phase, context)
+
+
+def _ask_for_briefing(
+    sym: str, provider: str, api_key: str, model: Optional[str], phase: str, context: str
+) -> Optional[PremarketBriefing]:
     chosen_model = model or DEFAULT_PREMARKET_MODELS.get(provider, DEFAULT_NEWS_MODELS[provider])
     subject = (
         f"an intraday situation briefing for {sym}"
@@ -659,6 +692,61 @@ def generate_premarket_analysis(
         f"Generate {subject} based on this context:\n\n{context}",
         PremarketBriefing,
     )
+
+
+@obs.observe(name="generate-premarket-from-data")
+def generate_premarket_from_data(
+    symbol: str,
+    provider: str,
+    api_key: str,
+    as_of: datetime,
+    closes: "pd.Series",
+    indicators: dict,
+    news_items: list[dict],
+    earnings_text: str = "",
+    model: Optional[str] = None,
+) -> Optional[PremarketBriefing]:
+    """A pre-market briefing for a past session, from data the caller has
+    already clipped to `as_of` (the moment before that session's open).
+
+    The live `generate_premarket_analysis` fetches everything itself against
+    the wall clock, which for a past day is the future. This takes the pieces
+    that have an honest point-in-time history -- the daily closes, SPY/VIX/VIX3M,
+    the news, the earnings schedule -- and leaves out the ones that do not
+    (fundamentals, analyst targets, alternative data, corporate actions), the
+    same line SimLab's `patches.py` draws for the replayed agents. Same system
+    prompt and wording as the live pre-market briefing otherwise.
+
+    `closes` is a daily close Series indexed by date; each lookback window is
+    measured back from `as_of`, as the live fetch measures from now. A close
+    dated `as_of`'s own day or later is dropped here as well, since before the
+    open that session has no close.
+    """
+    sym = symbol.strip().upper()
+    phase = "premarket"
+    as_of_day = pd.Timestamp(as_of.astimezone(market_hours.MARKET_TZ).date())
+    index = pd.DatetimeIndex(closes.index)
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    known = closes[index < as_of_day]
+    known_index = index[index < as_of_day]
+
+    def closes_for(days: int) -> "pd.Series":
+        return known[known_index >= as_of_day - pd.Timedelta(days=days)]
+
+    price_text, _ = _price_block(sym, closes_for)
+    macro_text = _macro_block(indicators)
+    news_text = _news_block(news_items)
+
+    as_of_et = as_of.astimezone(market_hours.MARKET_TZ)
+    context_parts = [
+        f"Symbol: {sym}",
+        f"Analysis time: {as_of_et.strftime('%Y-%m-%d %H:%M')} ET ({_PHASE_LABELS[phase]})",
+    ]
+    for block in [earnings_text, price_text, macro_text, news_text]:
+        if block:
+            context_parts.append(block)
+    return _ask_for_briefing(sym, provider, api_key, model, phase, "\n\n".join(context_parts))
 
 
 def briefing_to_prompt_text(briefing: PremarketBriefing, symbol: str) -> str:

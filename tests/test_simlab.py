@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from agent_stonks import minute_momentum
+
 from agent_stonks import apple_models, apple_trader, clock
 from agent_stonks.agent import MOMENTUM_SYSTEM_PROMPT
 from agent_stonks.apple_trader import (
@@ -168,6 +170,58 @@ class TestMarket:
         assert market.session_open_price("TEST", OPEN_UTC - timedelta(minutes=5)) is None
 
 
+class TestMinuteMoveInReplay:
+    """`abs_mean_minute_momentum` for a replayed day: the live measure, taken
+    from the stored sessions of the week before it."""
+
+    FRIDAY = date(2026, 6, 12)
+
+    def _store_friday(self, moves=(0.2, -0.2)):
+        """A session whose minutes alternate the given moves, plus one
+        pre-market bar far away that must not count."""
+        open_utc = OPEN_UTC - timedelta(days=3)
+        close, bars = 100.0, [_bar(open_utc - timedelta(minutes=30), 150.0)]
+        for i in range(40):
+            bars.append(_bar(open_utc + timedelta(minutes=i), close))
+            close += moves[i % len(moves)]
+        sim_data._write_gz(sim_data.bars_path("TEST", self.FRIDAY), bars)
+
+    def test_measured_from_the_week_before(self, store):
+        self._store_friday()
+        market = SimMarket(["TEST"], [DAY])
+        value = market.abs_mean_minute_momentum("TEST", OPEN_UTC + timedelta(minutes=30))
+        assert value == pytest.approx(0.2)
+
+    def test_unknown_without_a_stored_week(self, store):
+        market = SimMarket(["TEST"], [DAY])
+        assert market.abs_mean_minute_momentum("TEST", OPEN_UTC) is None
+
+    def test_the_replayed_day_itself_never_counts(self, store):
+        # DAY's own ramp moves 0.1 a minute; only Friday's 0.3 is last week.
+        self._store_friday(moves=(0.3,))
+        market = SimMarket(["TEST"], [DAY])
+        assert market.abs_mean_minute_momentum("TEST", OPEN_UTC) == pytest.approx(0.3)
+
+    def test_the_engine_hands_it_to_the_symbol_state(self, store):
+        self._store_friday()
+        market = SimMarket(["TEST"], [DAY])
+        engine = SimulationEngine(market, SimulationConfig(
+            personality="momentum", provider="openai", model="m", api_key="",
+            symbols=["TEST"], days=[DAY],
+        ))
+        try:
+            engine._apply_step(OPEN_UTC + timedelta(minutes=5))
+        finally:
+            clock.clear()
+        assert engine.app.sym("TEST").abs_mean_minute_momentum == pytest.approx(0.2)
+
+    def test_a_tuning_replay_reads_the_week_before(self, store):
+        paths = sim_tuning._replay_inputs(
+            AppleTraderConfig(model_key="dayrange"), [DAY.isoformat()], sim_data.DEFAULT_FEED,
+        )
+        assert sim_data.stored_bars_path("AAPL", self.FRIDAY, sim_data.DEFAULT_FEED) in paths
+
+
 class TestDatasetStore:
     def test_create_dataset_downloads_only_missing_days(self, store, monkeypatch):
         calls = []
@@ -182,8 +236,11 @@ class TestDatasetStore:
         monkeypatch.setattr(sim_data, "fetch_market_indicator_closes", lambda *a, **k: {"spy": [], "vix": [], "vix3m": []})
 
         ds = sim_data.create_dataset("wk", ["TEST"], date(2026, 6, 15), date(2026, 6, 17), "k", "s")
+        # The week before the first session comes first (what the momentum
+        # confirmation's neutral band is measured from), then the sessions:
         # 2026-06-15 already in the store (fixture) -- only 16th and 17th fetched.
-        assert calls == [date(2026, 6, 16), date(2026, 6, 17)]
+        before = minute_momentum.prior_week_days(date(2026, 6, 15))
+        assert calls == [*before, date(2026, 6, 16), date(2026, 6, 17)]
         assert ds.days == ["2026-06-15", "2026-06-16", "2026-06-17"]
         assert sim_data.get_dataset("wk").symbols == ["TEST"]
         sim_data.delete_dataset("wk")
@@ -225,7 +282,8 @@ class TestFeedIsPartOfTheData:
         sim_data.create_dataset("d-sip", ["TEST"], day, day, "k", "s", feed="sip")
 
         # The crux: the second request downloads rather than reusing the first.
-        assert calls == [(day, "iex"), (day, "sip")]
+        sessions = [c for c in calls if c[0] == day]
+        assert sessions == [(day, "iex"), (day, "sip")]
         assert sim_data.bars_path("TEST", day, "iex") != sim_data.bars_path("TEST", day, "sip")
         assert len(sim_data.load_day_bars("TEST", day, "iex")) == 3
         assert len(sim_data.load_day_bars("TEST", day, "sip")) == 5
@@ -438,7 +496,9 @@ class TestMinuteBarsComeFromYfinance:
         ds = sim_data.create_dataset("yf", ["TEST"], day, day)
 
         assert ds.feed == "yfinance"
-        assert calls == [(day, "yfinance")]
+        # The week before, less the fixture's own stored session.
+        before = [d for d in minute_momentum.prior_week_days(day) if d != DAY]
+        assert calls == [*((d, "yfinance") for d in before), (day, "yfinance")]
         assert sim_data.bars_path("TEST", day, "yfinance").exists()
         # The same day on the Alpaca tape is a different file and still absent.
         assert not sim_data.bars_path("TEST", day, "iex").exists()
@@ -661,7 +721,8 @@ class TestRuleAgentRecords:
         assert agent.signature(old) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert today.stop_gain_fraction > 0 and today.negative_momentum_bars > 0
+        assert today.stop_gain_fraction > 0 and today.momentum_confirmation_bars > 0
+        assert today.negative_momentum_bars == 0
         assert today.momentum_drop == 0 and today.momentum_fade_bars == 0
         assert agent.signature(today) != agent.signature(
             replace(today, stop_gain_fraction=0.0)
@@ -694,7 +755,8 @@ class TestRuleAgentRecords:
         assert "@mom-1," in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert "@neg15b/5b," in agent.signature(today)
+        assert "@conf," in agent.signature(today)
+        assert ",confirm=5b" in agent.signature(today)
 
     def test_a_record_from_before_negative_momentum_keeps_its_turn(self):
         """From 2026-09-21 to -23 the take fired on the sigma score turning from
@@ -836,6 +898,9 @@ class TestDayRangeEngine:
         seen = self._stub_model(monkeypatch)
         rules = {
             "model_key": "dayrange", "ticker": symbol, "buy_k": 0.75, "sell_k": 0.10,
+            # Written out, like a record made today: the tape here dives
+            # straight to the buy level, which the confirmation would not buy.
+            "momentum_confirmation_bars": 0,
             **(rule_config or {}),
         }
         market = SimMarket([symbol], [DAY])
@@ -956,6 +1021,52 @@ class TestDayRangeEngine:
         assert config_signature(
             AppleTraderConfig(model_key="dayrange")
         ).startswith("dayrange_AAPL(buy=")
+
+    def _store_last_week(self, symbol="AAPL"):
+        """The Friday before DAY, moving $0.50 a minute either way: a neutral
+        band of +-$0.05."""
+        friday = OPEN_UTC - timedelta(days=3)
+        bars = [_bar(friday + timedelta(minutes=i), 100.0 + 0.5 * (i % 2)) for i in range(40)]
+        sim_data._write_gz(sim_data.bars_path(symbol, date(2026, 6, 12)), bars)
+
+    def test_the_momentum_confirmation_replays_from_the_stored_week(
+        self, dayrange_store, monkeypatch
+    ):
+        """On, over its own tape: a slide under the $102.50 buy level that is
+        not bought, a turn that is (101.95: -0.02 a bar over 3, neutral; change
+        +0.10, positive -- "about to start rising"), a climb held through the
+        $105.10 sell level, and the sale once the top flattens out."""
+        self._store_last_week()
+        prices = (
+            [104.0] * 5
+            + [104.0 - 0.2 * (i + 1) for i in range(10)]    # down to 102.0
+            + [101.9, 101.85, 101.95]                        # the turn
+            + [101.95 + 0.25 * (i + 1) for i in range(15)]   # up to 105.7
+            + [105.5] * 5
+        )
+        sim_data._write_gz(sim_data.bars_path("AAPL", DAY), [
+            _bar(OPEN_UTC + timedelta(minutes=i), price) for i, price in enumerate(prices)
+        ])
+        _, plain = self._run(monkeypatch)
+        _, confirmed = self._run(monkeypatch, {"momentum_confirmation_bars": 3})
+        assert confirmed.error is None
+        fills = [d for d in confirmed.decisions if d["status"] == "filled"]
+        assert [d["action"] for d in fills] == ["buy", "sell"]
+        plain_fills = [d for d in plain.decisions if d["status"] == "filled"]
+        # Bought at the turn, after the plain rule bought the slide.
+        assert parse_ts(fills[0]["ts"]) > parse_ts(plain_fills[0]["ts"])
+        assert float(fills[0]["price"]) == pytest.approx(101.95)
+        # Held past the level while the climb went on, sold when it stopped.
+        assert "Target" in fills[1]["reasoning"]
+        assert float(fills[1]["price"]) == pytest.approx(105.5)
+        assert ",confirm=3b" in confirmed.config_summary["model"]
+
+    def test_without_last_week_the_confirmation_trades_nothing(
+        self, dayrange_store, monkeypatch
+    ):
+        _, result = self._run(monkeypatch, {"momentum_confirmation_bars": 3})
+        assert result.error is None
+        assert not [d for d in result.decisions if d["status"] == "filled"]
 
     def test_the_managed_exit_reaches_the_trader_through_the_record(
         self, dayrange_store, monkeypatch

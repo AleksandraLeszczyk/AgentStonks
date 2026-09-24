@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from . import historical
@@ -32,11 +32,28 @@ from .volume_baseline import (
     WEEK_LOOKBACK_DAYS,
     WEEK_SESSIONS,
     _bar_session_date,
+    _minute_of_day,
     _session_dates,
 )
 
 # One JSON file per symbol, overwritten by the first start of each day.
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "minute_momentum"
+
+# The regular session in minutes past ET midnight, [09:30, 16:00): the bars a
+# minute's move is measured over. The live history is regular-hours already;
+# SimLab's stored days carry pre- and post-market minutes too, whose thin
+# prints would move the mean.
+_RTH_MINUTES = (9 * 60 + 30, 16 * 60)
+
+
+def prior_week_days(day: date) -> "list[date]":
+    """The weekdays whose sessions can make up the week before `day`: the
+    `WEEK_LOOKBACK_DAYS` calendar days the live read fetches, oldest first."""
+    return [
+        d
+        for d in (day - timedelta(days=k) for k in range(WEEK_LOOKBACK_DAYS, 0, -1))
+        if d.weekday() < 5
+    ]
 
 
 def _close(bar: dict) -> "float | None":
@@ -61,14 +78,19 @@ def compute(history_bars: "list[dict]", today: str) -> "dict | None":
     Returns ``{"abs_mean_minute_momentum", "changes", "sessions", "dates"}``,
     or None when no prior session carries two bars.
     """
-    prior = [bar for bar in history_bars or [] if (_bar_session_date(bar) or "") < today]
+    prior = [
+        bar
+        for bar in history_bars or []
+        if (_bar_session_date(bar) or "") < today
+        and _RTH_MINUTES[0] <= (_minute_of_day(bar) or -1) < _RTH_MINUTES[1]
+    ]
     dates = _session_dates(prior)[-WEEK_SESSIONS:]
     chosen = set(dates)
     by_session: dict[str, list[dict]] = {}
     for bar in prior:
-        date = _bar_session_date(bar)
-        if date in chosen:
-            by_session.setdefault(date, []).append(bar)
+        session = _bar_session_date(bar)
+        if session in chosen:
+            by_session.setdefault(session, []).append(bar)
 
     total = 0.0
     count = 0

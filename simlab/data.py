@@ -52,6 +52,7 @@ from typing import Callable, Iterable, Optional
 
 import requests
 
+from agent_stonks import minute_momentum
 from agent_stonks.config import DATA_REST
 from agent_stonks.market_hours import MARKET_TZ
 
@@ -608,6 +609,20 @@ def create_dataset(
     else:
         progress("market indicators (SPY/VIX/VIX3M): downloading")
         _write_gz(market_path(), fetch_market_indicator_closes(daily_start, end))
+
+    # The week before the first session, bars only: what a replay measures
+    # `abs_mean_minute_momentum` from (`SimMarket.abs_mean_minute_momentum`),
+    # so the dataset's first days are read like the rest. Not part of the
+    # dataset's days, and a failure costs only that measure, never the dataset.
+    for day in minute_momentum.prior_week_days(start):
+        for sym in symbols:
+            if stored_bars_path(sym, day, feed).exists():
+                continue
+            progress(f"minute bars {sym} {day} [{feed}]: downloading (the week before)")
+            try:
+                _write_gz(bars_path(sym, day, feed), fetch_minute_bars_day(sym, day, key, secret, feed))
+            except Exception as exc:
+                progress(f"minute bars {sym} {day}: failed ({exc}); skipped")
 
     session_days: list[str] = []
     for day in weekdays(start, end):

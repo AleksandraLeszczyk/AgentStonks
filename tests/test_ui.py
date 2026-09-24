@@ -269,12 +269,21 @@ class TestAgentMomentum:
         return SimpleNamespace(tactics=tactics, alerts=[{"field": f} for f in alert_fields])
 
     @staticmethod
-    def trader(take=15, fade=0, drop=0.0, fall=0.1):
+    def trader(take=15, fade=0, drop=0.0, fall=0.1, confirm=0):
+        """A legacy config by default: the take / fall look-back."""
         from agent_stonks.apple_trader import AppleTraderConfig
 
         return AppleTraderConfig(
             model_key="dayrange", negative_momentum_bars=take, momentum_fade_bars=fade,
-            momentum_drop=drop, max_fall_k=fall,
+            momentum_drop=drop, max_fall_k=fall, momentum_confirmation_bars=confirm,
+        )
+
+    def test_apple_traders_confirmation_period(self):
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+
+        form = self.trader(take=0, fall=0.0, confirm=7)
+        assert _agent_momentum(self.state(APPLE_TRADER_KEY, form=form), self.sym()) == (
+            7, "Apple Trader",
         )
 
     def test_no_momentum_falls_back_to_five_minutes(self):

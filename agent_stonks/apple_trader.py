@@ -58,10 +58,11 @@ from .config import (
     APPLE_TRADER_MIN_WIN,
     APPLE_TRADER_MIN_WIN_K,
     APPLE_TRADER_MODEL,
+    APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS,
     APPLE_TRADER_NEGATIVE_FOR_BARS,
     APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     APPLE_TRADER_POSITION_PCT,
-    APPLE_TRADER_MAX_FALL_K,
+    MOMENTUM_NEUTRAL_FRACTION,
     APPLE_TRADER_SCALE_IN,
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_GAIN_FRACTION,
@@ -169,15 +170,24 @@ class AppleTraderConfig:
     # mutually exclusive (`__post_init__`); `stop_distance` reads whichever is
     # set.
     stop_k: float = 0.0
-    # The momentum take: gains are taken short of the sell level once the
-    # momentum over the last this-many bars -- `close - close[N bars ago]` in
-    # dollars -- has been negative for `negative_for_bars`
-    # bars in a row since the entry, with the position in profit. See
-    # `_momentum_take`. 0 switches the take off, and with it the runner and its
-    # breakeven.
-    negative_momentum_bars: int = APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
+    # The momentum confirmation: the one look-back, in bars, over which both
+    # sides read the user's behaviour table -- momentum as the average per-bar
+    # move, its change as the average change of the 1-bar momentum, each
+    # positive, neutral (under MOMENTUM_NEUTRAL_FRACTION of the ticker's
+    # `abs_mean_minute_momentum`) or negative. It gates the buy at the buy
+    # level, the sell at the sell level and the breach exit, and is the
+    # momentum take below the sell level (`take_fraction`, in profit only).
+    # Never the stop, the breakeven or the flatten. See `_momentum_read`. 0
+    # switches it off, and with it the take, the runner and its breakeven.
+    momentum_confirmation_bars: int = APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS
+    # The momentum take as it was 2026-09-23 to -24, kept only so a stored
+    # record replays and signs exactly as the run it describes: gains taken
+    # short of the sell level once `close - close[N bars ago]` had been
+    # negative for `negative_for_bars` bars in a row since the entry. A new
+    # config leaves it at 0; it cannot be set beside the confirmation.
+    negative_momentum_bars: int = 0
     # How many bars in a row that momentum has to stay under zero: "negative
-    # for long enough". Only read while the take above is on.
+    # for long enough". Only read while the legacy take above is on.
     negative_for_bars: int = APPLE_TRADER_NEGATIVE_FOR_BARS
     # The two earlier forms of the take, kept only so a stored record replays
     # and signs exactly as the run it describes -- nothing configures either
@@ -236,11 +246,11 @@ class AppleTraderConfig:
     # bottom of the range, `reference - 1 x unit`.
     scale_in: bool = APPLE_TRADER_SCALE_IN
     # No buy -- first entry or add -- while the price has fallen more than this
-    # many level units over the last `fall_bars` bars: the dip is still falling
-    # too fast to catch. The next bar is judged afresh, so a fall that eases
-    # with the price still under the buy level is bought then. 0 switches it
-    # off. See `DayRangeTrader._falling`.
-    max_fall_k: float = APPLE_TRADER_MAX_FALL_K
+    # many level units over the last `fall_bars` bars. The entry gate as it was
+    # 2026-09-23 to -24, kept only so a stored record replays: a new config
+    # leaves it at 0, and it cannot be set beside the momentum confirmation,
+    # which decides entries now. See `DayRangeTrader._falling`.
+    max_fall_k: float = 0.0
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -251,6 +261,7 @@ class AppleTraderConfig:
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
+            "momentum_confirmation_bars",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -269,7 +280,10 @@ class AppleTraderConfig:
                 "under, new configurations use stop_gain_fraction"
             )
         # Bar counts, whatever a form or a JSON record handed over.
-        for name in ("negative_momentum_bars", "negative_for_bars", "momentum_fade_bars"):
+        for name in (
+            "negative_momentum_bars", "negative_for_bars", "momentum_fade_bars",
+            "momentum_confirmation_bars",
+        ):
             if float(getattr(self, name)) != int(getattr(self, name)):
                 raise ValueError(
                     f"{name} {getattr(self, name)!r} is a number of bars and must be whole"
@@ -286,15 +300,27 @@ class AppleTraderConfig:
         # a config that does not say which rule it means.
         takes = [
             name
-            for name in ("negative_momentum_bars", "momentum_fade_bars", "momentum_drop")
+            for name in (
+                "momentum_confirmation_bars", "negative_momentum_bars",
+                "momentum_fade_bars", "momentum_drop",
+            )
             if getattr(self, name)
         ]
         if len(takes) > 1:
             raise ValueError(
                 f"{' and '.join(takes)} are different ways of writing the momentum take "
-                "and only one may be set; momentum_fade_bars and momentum_drop are the "
-                "legacy rules a stored record replays under, new configurations use "
-                "negative_momentum_bars"
+                "and only one may be set; negative_momentum_bars, momentum_fade_bars and "
+                "momentum_drop are the legacy rules a stored record replays under, new "
+                "configurations use momentum_confirmation_bars"
+            )
+        # The same for the entry: the confirmation's table decides what a buy
+        # at the buy level needs, and a second gate beside it would be a rule
+        # nobody configured.
+        if self.momentum_confirmation_bars and self.max_fall_k:
+            raise ValueError(
+                f"max_fall_k {self.max_fall_k!r} is the legacy entry gate a stored record "
+                "replays under and cannot be set beside momentum_confirmation_bars "
+                f"{self.momentum_confirmation_bars!r}, which decides entries itself"
             )
         if not 0 < self.take_fraction <= 1:
             raise ValueError(
@@ -419,9 +445,14 @@ class AppleTraderConfig:
 
     @property
     def has_take(self) -> bool:
-        """Whether the momentum take is on, in either of its forms -- and with
+        """Whether the momentum take is on, in any of its forms -- and with
         it the runner and the breakeven."""
-        return bool(self.negative_momentum_bars or self.momentum_fade_bars or self.momentum_drop)
+        return bool(
+            self.momentum_confirmation_bars
+            or self.negative_momentum_bars
+            or self.momentum_fade_bars
+            or self.momentum_drop
+        )
 
 
 def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
@@ -505,6 +536,11 @@ def stop_phrase(config: AppleTraderConfig) -> str:
 
 def fade_phrase(config: AppleTraderConfig) -> str:
     """The momentum take's trigger in words, in whichever form it is written."""
+    if config.momentum_confirmation_bars:
+        return (
+            f"momentum over the last {config.momentum_confirmation_bars} bars negative "
+            "and not recovering — its change neutral or negative"
+        )
     if config.negative_momentum_bars:
         return (
             f"the {config.negative_momentum_bars}-bar momentum negative for "
@@ -559,10 +595,14 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     elif c.stop_k:
         exits += f",stop=E-{c.stop_k:g}A"
     # The take is signed in the form it was configured in, like the stop:
+    # `@conf` is the momentum confirmation's table (its look-back is signed with
+    # the entry gate, `confirm=5b`, since one number drives both);
     # `@neg15b/5b` is the 15-bar momentum negative for 5 bars in a row;
     # `@fade15b` the legacy positive-to-balanced turn over 15 bars and `@mom-1`
     # the older 1σ fall from the peak, which stored records keep.
-    if c.negative_momentum_bars:
+    if c.momentum_confirmation_bars:
+        take = "conf"
+    elif c.negative_momentum_bars:
         take = f"neg{c.negative_momentum_bars}b/{c.negative_for_bars}b"
     elif c.momentum_fade_bars:
         take = f"fade{c.momentum_fade_bars}b"
@@ -586,6 +626,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # is off, and the same limit over 5 bars and over 30 is not one rule.
     if c.max_fall_k:
         adds += f",nofall={c.max_fall_k:g}{unit}/{c.fall_bars}b"
+    # The confirmation's look-back, written once for both sides. Only while on,
+    # so every record written before it existed keeps its filed signature.
+    if c.momentum_confirmation_bars:
+        adds += f",confirm={c.momentum_confirmation_bars}b"
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     # Both appear only while switched on, like every rule added since the
     # notebook's, so a record written before either existed keeps the signature
@@ -872,6 +916,95 @@ def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAUL
     )
 
 
+# --- the momentum confirmation's behaviour table ---------------------------
+#
+# The user's table (2026-09-24), keyed by (momentum, momentum change), each
+# "positive", "neutral" or "negative". What it reads the tape as, and what each
+# side may do on that bar:
+#
+#   buy          -- a buy at the buy level (first entry or an add) is allowed;
+#   take         -- below the sell level, in profit: sell `take_fraction`;
+#   sell_target  -- at or above the sell level: the target (and the breach
+#                   exit) may sell.
+#
+# The price column of the table (down / flat / up) is the momentum's own sign,
+# so it is not a key of its own. The stop, the breakeven and the flatten never
+# read this.
+POSITIVE, NEUTRAL, NEGATIVE = "positive", "neutral", "negative"
+
+
+@dataclass(frozen=True)
+class MomentumRow:
+    prediction: str
+    buy: bool
+    take: bool
+    sell_target: bool
+
+
+_GOING_UP = MomentumRow("the price is going up", buy=True, take=False, sell_target=False)
+MOMENTUM_TABLE: "dict[tuple[str, str], MomentumRow]" = {
+    (NEGATIVE, POSITIVE): MomentumRow("the drop is slowing down", False, False, True),
+    (NEGATIVE, NEUTRAL): MomentumRow("the price keeps dropping", False, True, True),
+    (NEGATIVE, NEGATIVE): MomentumRow("the drop is accelerating", False, True, True),
+    (NEUTRAL, POSITIVE): MomentumRow("the price is about to start rising", True, False, True),
+    # Allowed since 2026-09-24 (the user's change): a flat tape at the buy
+    # level is bought, only one about to start dropping is not.
+    (NEUTRAL, NEUTRAL): MomentumRow("the price is still flat", True, False, True),
+    (NEUTRAL, NEGATIVE): MomentumRow("the price is about to start dropping", False, False, True),
+    (POSITIVE, POSITIVE): _GOING_UP,
+    (POSITIVE, NEUTRAL): _GOING_UP,
+    (POSITIVE, NEGATIVE): _GOING_UP,
+}
+
+
+def momentum_class(value: float, band: float) -> str:
+    """Positive, neutral or negative: neutral while `|value| < band`."""
+    if abs(value) < band:
+        return NEUTRAL
+    return POSITIVE if value > 0 else NEGATIVE
+
+
+def momentum_read(closes, n: int, minute_move: "float | None") -> "dict | None":
+    """The confirmation's read of a session's closes, or None while it cannot be made.
+
+    `closes` are this session's closed bars, oldest first. Over the last `n`
+    bars:
+
+    * momentum -- the average per-bar move, `(close - close[n bars ago]) / n`;
+    * change -- the average bar-to-bar change of the 1-bar momentum,
+      `(m1 - m1[n bars ago]) / n`, where `m1 = close - previous close`.
+
+    Both are per bar, the scale of `minute_move` (the ticker's
+    `abs_mean_minute_momentum`), and neutral while their size is under
+    `MOMENTUM_NEUTRAL_FRACTION` of it. None without a look-back, without that
+    measure, or before the session has the `n + 2` bars the change needs.
+    """
+    n = int(n or 0)
+    if n < 1 or minute_move is None or not float(minute_move) > 0:
+        return None
+    c = [float(x) for x in closes]
+    if len(c) < n + 2:
+        return None
+    mom = (c[-1] - c[-1 - n]) / n
+    change = ((c[-1] - c[-2]) - (c[-1 - n] - c[-2 - n])) / n
+    band = MOMENTUM_NEUTRAL_FRACTION * float(minute_move)
+    key = (momentum_class(mom, band), momentum_class(change, band))
+    return {
+        "n": n, "mom": mom, "change": change, "band": band,
+        "mom_class": key[0], "change_class": key[1], "row": MOMENTUM_TABLE[key],
+    }
+
+
+def momentum_words(read: dict) -> str:
+    """One read in a log line's words."""
+    return (
+        f"momentum over the last {read['n']} bars is {read['mom']:+.3f} $/bar "
+        f"({read['mom_class']}) and its change {read['change']:+.3f} $/bar "
+        f"({read['change_class']}; neutral inside ±{read['band']:.3f}) — "
+        f"{read['row'].prediction}"
+    )
+
+
 class DayRangeTrader(BaseTrader):
     """The day-range rules: one forecast at 9:35, then two resting levels.
 
@@ -973,6 +1106,12 @@ class DayRangeTrader(BaseTrader):
         # The last sidebar edit refused for its unit, so it is reported once
         # rather than every minute (`_adopt_form_levels`).
         self._refused_form = None
+        # The ticker's `abs_mean_minute_momentum`, read off its state each
+        # cycle: what the momentum confirmation's neutral band is a share of.
+        self.minute_move: "float | None" = None
+        # Why this bar did not sell at the sell level, for `run_cycle` to log
+        # (`_exit` only returns what to sell).
+        self._held_note: "str | None" = None
 
     # --- one cycle --------------------------------------------------------
 
@@ -993,6 +1132,7 @@ class DayRangeTrader(BaseTrader):
                 {"type": "status", "text": f"No {self.ticker} bars yet today."},
             )
             return "no_data"
+        self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
 
         # Before anything reads the levels, so an edit made in the sidebar
         # during the last minute is what this bar is judged against.
@@ -1061,7 +1201,7 @@ class DayRangeTrader(BaseTrader):
         # Recorded from the same plan the line below prints, in the same cycle,
         # so the chart and the log cannot quote two different levels.
         self._record_levels(state, ts)
-        _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position)})
+        _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, frame)})
 
         # Trading starts after the opening window, since the forecast does not
         # exist before it -- the notebook's `start_after`. The bar the plan was
@@ -1075,6 +1215,8 @@ class DayRangeTrader(BaseTrader):
                 quantity, reason, kind = exit_
                 self._sell(state, tracker, quantity, last, reason, kind)
                 return "sold"
+            if self._held_note and fresh_bar:
+                _log(state, {"type": "status", "text": self._held_note})
             # After the exits, so a bar wide enough to reach the stop under the
             # next rung is the stop's. Never inside the flatten window: `_exit`
             # has already sold everything there.
@@ -1083,7 +1225,7 @@ class DayRangeTrader(BaseTrader):
                 and self._can_add()
                 and float(last["low"]) <= self.plan["buy_level"]
             ):
-                if self._refuse_falling(state, frame, ts):
+                if self._refuse_entry(state, frame, ts):
                     return "hold"
                 return "bought" if self._add(state, tracker, last, position) else "hold"
             return "hold"
@@ -1109,7 +1251,7 @@ class DayRangeTrader(BaseTrader):
                     },
                 )
                 return "hold"
-            if self._refuse_falling(state, frame, ts):
+            if self._refuse_entry(state, frame, ts):
                 return "hold"
             return "bought" if self._buy(state, tracker, last) else "hold"
         return "hold"
@@ -1474,6 +1616,68 @@ class DayRangeTrader(BaseTrader):
             and float(self.config.buy_k) < 1.0
         )
 
+    def _momentum_read(self, frame) -> "dict | None":
+        """This bar's read of the behaviour table (`momentum_read`), or None."""
+        return momentum_read(
+            frame["close"], self.config.momentum_confirmation_bars, self.minute_move
+        )
+
+    def _momentum_unknown(self, frame) -> str:
+        """Why the confirmation cannot read this bar -- for the log line that
+        says a level was reached and nothing was done about it."""
+        n = int(self.config.momentum_confirmation_bars)
+        if self.minute_move is None or not float(self.minute_move) > 0:
+            return (
+                f"{self.ticker}'s mean one-minute move over last week is not known yet, "
+                "so momentum has no neutral band to be read against"
+            )
+        return (
+            f"momentum over {n} bars needs {n + 2} bars of the session and there "
+            f"are {len(frame)}"
+        )
+
+    def _refuse_entry(self, state: AppState, frame, ts) -> bool:
+        """Log and refuse a buy at the buy level the tape does not support.
+
+        With the momentum confirmation on, the behaviour table decides: a buy
+        needs positive momentum, or neutral momentum whose change is not
+        negative -- flat, or about to rise.
+        Without it, the legacy fall gate a stored record replays under
+        (`_refuse_falling`). Either way this bar only: the next is judged again.
+        """
+        if not self.config.momentum_confirmation_bars:
+            return self._refuse_falling(state, frame, ts)
+        read = self._momentum_read(frame)
+        if read is not None and read["row"].buy:
+            return False
+        why = momentum_words(read) if read is not None else self._momentum_unknown(frame)
+        _log(
+            state,
+            {
+                "type": "status",
+                "text": (
+                    f"The {ts:%H:%M} bar traded down to the "
+                    f"${self.plan['buy_level']:,.2f} buy level, but {why}. Not buying "
+                    "yet; the next bar is judged again."
+                ),
+            },
+        )
+        return True
+
+    def _hold_at_target(self, frame) -> "str | None":
+        """Why the sell level is not sold on this bar, or None to sell it.
+
+        Only with the momentum confirmation on: the table holds past the target
+        while momentum is still positive -- the move has not ended -- and the
+        rule holds whenever it cannot read the bar at all.
+        """
+        if not self.config.momentum_confirmation_bars:
+            return None
+        read = self._momentum_read(frame)
+        if read is None:
+            return self._momentum_unknown(frame)
+        return None if read["row"].sell_target else momentum_words(read)
+
     def _falling(self, frame) -> "str | None":
         """Why the price is falling too fast to buy right now, or None if it is not.
 
@@ -1807,7 +2011,9 @@ class DayRangeTrader(BaseTrader):
            of what the trade is playing for (`stop_gain_fraction`): the day went
            the other way from the forecast. Everything is sold, and `run_cycle`
            takes no new entry for the rest of the session.
-        3. **target** -- a bar's high at the sell level. Everything.
+        3. **target** -- a bar's high at the sell level. Everything. With the
+           momentum confirmation on, held past the level while momentum is
+           still positive (or cannot be read yet); the breach exit likewise.
         4. **flatten** -- the closing bell. Everything.
         5. **momentum take** -- see `_momentum_take`.
 
@@ -1826,6 +2032,7 @@ class DayRangeTrader(BaseTrader):
         entry_price = entry.get("price") or 0.0
         price, low, high = float(bar["close"]), float(bar["low"]), float(bar["high"])
         pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
+        self._held_note = None
 
         if entry.get("runner") and low <= entry_price:
             return position, (
@@ -1852,7 +2059,24 @@ class DayRangeTrader(BaseTrader):
                     "nothing more is bought this session."
                 ), self.EXIT_STOP
 
-        if high >= plan["sell_level"]:
+        # Reached the sell level, or traded through the forecast: both are the
+        # table's "price above the sell target", so the confirmation may hold
+        # them past this bar. Computed only when one of them is in reach.
+        breached = plan.get("high_at_bar", plan["pred_high"])
+        in_reach = high >= plan["sell_level"] or (config.breach_exit and high > breached)
+        held = self._hold_at_target(frame) if in_reach else None
+        if held is not None:
+            self._held_note = (
+                f"The bar traded up to ${high:,.2f}, "
+                + (
+                    f"at or through the ${plan['sell_level']:,.2f} sell level"
+                    if high >= plan["sell_level"]
+                    else f"through the ${breached:,.2f} predicted high"
+                )
+                + f", but {held}. Holding on; the next bar is judged again."
+            )
+
+        if held is None and high >= plan["sell_level"]:
             return position, (
                 f"Target: the bar traded up to ${high:,.2f}, at or through the "
                 f"${plan['sell_level']:,.2f} sell level "
@@ -1866,8 +2090,7 @@ class DayRangeTrader(BaseTrader):
         # high the bar just traded through. What is left for this rule is the
         # case it exists for: "brownian", where the forecast leads the tape and
         # the target is carried past the bar that settled the bet.
-        breached = plan.get("high_at_bar", plan["pred_high"])
-        if config.breach_exit and high > breached:
+        if held is None and config.breach_exit and high > breached:
             return position, (
                 f"Breach exit: the bar traded up to ${high:,.2f}, through the "
                 f"${breached:,.2f} predicted high the levels were resting under. The "
@@ -1886,6 +2109,10 @@ class DayRangeTrader(BaseTrader):
                 f"({pnl_pct:+.2f}%)."
             ), self.EXIT_FLATTEN
 
+        # A bar held at the sell level is above the target, where the take (a
+        # sale *short* of it) does not apply.
+        if in_reach:
+            return None
         return self._momentum_take(frame, position, entry_price, price)
 
     def _momentum_take(
@@ -1893,12 +2120,14 @@ class DayRangeTrader(BaseTrader):
     ) -> "tuple[float, str, str] | None":
         """Bank gains short of the target once momentum has been negative for long enough.
 
-        Fires when the position is in profit and the momentum over the last
-        `negative_momentum_bars` bars has been negative on each of the last
-        `negative_for_bars` bars since the entry (`_momentum_negative`). Only
-        bars after the fill count, because the dip that reached the buy level
-        is falling by construction -- a streak it started is not this trade
-        going wrong. A legacy record reads the rule it was run under instead:
+        Fires when the position is in profit and the momentum confirmation's
+        table says take (`MOMENTUM_TABLE`): momentum over the look-back is
+        negative and its change neutral or negative -- the price is still
+        dropping, or dropping faster. A drop that is slowing (negative momentum,
+        positive change) is left alone. A legacy record reads the rule it was
+        run under instead: `negative_momentum_bars` the N-bar momentum negative
+        for `negative_for_bars` bars in a row since the entry
+        (`_momentum_negative`),
         `momentum_fade_bars` the positive-to-balanced turn (`_fade_turned`),
         `momentum_drop` the fall from the peak (`_fade_dropped`).
 
@@ -1924,7 +2153,10 @@ class DayRangeTrader(BaseTrader):
             return None
 
         since = entry.get("ts", frame.index[-1])
-        if config.negative_momentum_bars:
+        if config.momentum_confirmation_bars:
+            read = self._momentum_read(frame)
+            why = momentum_words(read) if read is not None and read["row"].take else None
+        elif config.negative_momentum_bars:
             why = self._momentum_negative(frame, since)
         elif config.momentum_fade_bars:
             why = self._fade_turned(frame, since)
@@ -2230,7 +2462,7 @@ class DayRangeTrader(BaseTrader):
             f"${plan['sell_level']:,.2f} (ref − {self.config.sell_k:g} × {self.config.unit_phrase}). {held}"
         )
 
-    def _read_summary(self, bar, ts, position: float) -> str:
+    def _read_summary(self, bar, ts, position: float, frame=None) -> str:
         price = float(bar["close"])
         plan = self.plan
         parts = [
@@ -2249,6 +2481,13 @@ class DayRangeTrader(BaseTrader):
             # The two levels above are this minute's, not the day's, and without
             # the reference there is nothing in the line that says so.
             parts.append(f"ref ${plan['reference']:,.2f} (intraday)")
+        if self.config.momentum_confirmation_bars and frame is not None:
+            read = self._momentum_read(frame)
+            if read is not None:
+                parts.append(
+                    f"mom {read['mom']:+.3f} ({read['mom_class']}), "
+                    f"Δ {read['change']:+.3f} ({read['change_class']})"
+                )
         if position > 0 and self.entry:
             entry_price = self.entry["price"]
             pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
@@ -2404,14 +2643,20 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             "price comes back to it"
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
-    no_fall = (
-        ""
-        if not config.max_fall_k
-        else (
+    if config.momentum_confirmation_bars:
+        no_fall = (
+            f" Both levels wait for momentum over the last "
+            f"{config.momentum_confirmation_bars} bars: it buys at the buy level only "
+            "while momentum is positive, or neutral and not turning down, and holds past the "
+            "sell level while momentum is still positive."
+        )
+    elif config.max_fall_k:
+        no_fall = (
             f" No buy while the price has fallen more than {config.max_fall_k:g} × "
             f"{config.unit_phrase} over the last {config.fall_bars} bars."
         )
-    )
+    else:
+        no_fall = ""
     breaker = (
         ""
         if not config.min_win_k

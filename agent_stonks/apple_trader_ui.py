@@ -235,12 +235,13 @@ def dayrange_params(
         disabled=float(position_pct) >= 100,
         help=copy.help.get("scale_in"),
     )
-    max_fall_k = col_b.number_input(
-        f"Don't buy into a fall steeper than (× {unit_label})",
-        min_value=0.0, max_value=3.0, value=defaults.max_fall_k, step=0.05,
-        format="%.2f",
-        key=copy.key("max_fall_k"),
-        help=copy.help.get("max_fall_k", "").format(unit=unit_label) or None,
+    # One look-back for both sides of the behaviour table: the buy at the buy
+    # level, and the sells at and short of the sell level (the Exits below).
+    momentum_confirmation_bars = col_b.number_input(
+        "Momentum confirmation period (bars)",
+        min_value=0, max_value=60, value=int(defaults.momentum_confirmation_bars), step=1,
+        key=copy.key("momentum_confirmation_bars"),
+        help=copy.help.get("momentum_confirmation_bars"),
     )
     # A pair the wrong way round is not a strategy -- it would sell at a price
     # below the one it bought at, on every bar. The config refuses it outright,
@@ -255,10 +256,10 @@ def dayrange_params(
         )
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
-    (
-        stop_gain_fraction, negative_momentum_bars, negative_for_bars, take_fraction,
-        hold_min_gain_k,
-    ) = exit_params(defaults, float(buy_k), float(sell_k), unit_label, copy)
+    stop_gain_fraction, take_fraction, hold_min_gain_k = exit_params(
+        defaults, float(buy_k), float(sell_k), unit_label, copy,
+        take_on=bool(momentum_confirmation_bars),
+    )
     min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
     return AppleTraderConfig(
         model_key=model_key,
@@ -267,14 +268,12 @@ def dayrange_params(
         sell_k=float(sell_k),
         position_pct=float(position_pct),
         scale_in=bool(scale_in),
-        max_fall_k=float(max_fall_k),
+        momentum_confirmation_bars=int(momentum_confirmation_bars),
         level_unit=level_unit,
         breach_update=breach_update,
         contain_range=contain_range,
         breach_exit=breach_exit,
         stop_gain_fraction=stop_gain_fraction,
-        negative_momentum_bars=negative_momentum_bars,
-        negative_for_bars=negative_for_bars,
         take_fraction=take_fraction,
         hold_min_gain_k=hold_min_gain_k,
         min_win_k=min_win_k,
@@ -423,8 +422,14 @@ def exit_params(
     sell_k: float,
     unit_label: str,
     copy: FormCopy,
-) -> "tuple[float, int, int, float, float]":
+    take_on: bool = True,
+) -> "tuple[float, float, float]":
     """The managed exit: a stop under the fill, a momentum take, and a runner.
+
+    The take has no trigger of its own here: it is the behaviour table's sell
+    short of the sell level, read over the momentum confirmation period set
+    beside the levels. `take_on` is whether that period is on, and greys out
+    the two knobs that only mean something while it is.
 
     Not keyed by ticker, unlike the levels: none of these was swept per
     instrument, so there is no per-symbol default for a switch to re-seed. The
@@ -455,25 +460,12 @@ def exit_params(
         ) if p),
     )
     stop_warning(col_a, float(stop_gain_fraction))
-    negative_momentum_bars = col_b.number_input(
-        "Negative momentum (look-back, bars)",
-        min_value=0, max_value=120, value=int(defaults.negative_momentum_bars), step=1,
-        key=copy.key("negative_momentum_bars"),
-        help=copy.help.get("negative_momentum_bars"),
-    )
-    negative_for_bars = col_b.number_input(
-        "Negative for long enough (bars in a row)",
-        min_value=1, max_value=120, value=max(int(defaults.negative_for_bars), 1), step=1,
-        key=copy.key("negative_for_bars"),
-        help=copy.help.get("negative_for_bars"),
-        disabled=not negative_momentum_bars,
-    )
-    take_pct = col_a.number_input(
+    take_pct = col_b.number_input(
         "Take on negative momentum (% of shares)",
         min_value=1.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
         key=copy.key("take_pct"),
         help=copy.help.get("take_fraction"),
-        disabled=not negative_momentum_bars,
+        disabled=not take_on,
     )
     hold_min_gain_k = col_a.number_input(
         f"Keep a runner if the target is ≥ (× {unit_label} above the fill)",
@@ -481,12 +473,9 @@ def exit_params(
         format="%.2f",
         key=copy.key("hold_min_gain_k"),
         help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
-        disabled=not negative_momentum_bars,
+        disabled=not take_on,
     )
-    return (
-        float(stop_gain_fraction), int(negative_momentum_bars), int(negative_for_bars),
-        float(take_pct) / 100.0, float(hold_min_gain_k),
-    )
+    return float(stop_gain_fraction), float(take_pct) / 100.0, float(hold_min_gain_k)
 
 
 def stop_note(
