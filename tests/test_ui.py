@@ -1,7 +1,6 @@
 from agent_stonks import config
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
-    _momentum_bars,
     _cash_label,
     _venue_badge,
     _portfolio_value_label,
@@ -237,45 +236,3 @@ class TestLiveOptionWalls:
         # A second render inside the poll interval must not fetch again.
         assert _live_option_walls(sym_state, ["call_wall"]) == {"call_wall": 105.0}
         assert calls == ["AAPL"]
-
-
-class TestMomentumBars:
-    """The live momentum panel's look-back: the Apple Trader's fade setting."""
-
-    @staticmethod
-    def state(running=False, form=None, levels=None):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            agent_running=running, apple_trader_config=form, apple_trader_levels=levels,
-        )
-
-    @staticmethod
-    def config(n):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(negative_momentum_bars=n)
-
-    def test_default_without_an_apple_trader(self):
-        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-
-        assert _momentum_bars(self.state()) == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-
-    def test_the_forms_look_back(self):
-        assert _momentum_bars(self.state(form=self.config(22))) == 22
-
-    def test_a_switched_off_take_falls_back_to_the_default(self):
-        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-
-        assert _momentum_bars(self.state(form=self.config(0))) == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-
-    def test_the_running_agents_look_back_wins_over_the_form(self):
-        state = self.state(
-            running=True, form=self.config(22), levels={"config": self.config(9)},
-        )
-        assert _momentum_bars(state) == 9
-
-    def test_a_stopped_agents_record_is_ignored(self):
-        state = self.state(form=self.config(22), levels={"config": self.config(9)})
-        assert _momentum_bars(state) == 22
-

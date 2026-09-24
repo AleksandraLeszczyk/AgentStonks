@@ -459,22 +459,18 @@ class TestSessionMarkers:
 
 
 class TestMomentumPanel:
-    """The session's absolute momentum, in its own row under the price.
+    """Bar-by-bar momentum and its change, in two rows under the volume.
 
-    Momentum is the dollar change over the last `momentum_bars` bars. These pin
-    that definition, that the panel is off unless asked for, that switching it
-    on leaves the price and price-profile subplots where `add_model_overlays`
-    addresses them, and that the warm-up stretch is drawn as a gap with a note
-    rather than as a run of zeros.
+    Momentum is `close - previous close`; its change is `momentum - previous
+    momentum`; both one value per chart bar. These pin those definitions, that
+    the panels are off unless asked for, that switching them on leaves the
+    price and price-profile subplots where `add_model_overlays` addresses them,
+    and that the warm-up is drawn as a gap with a note rather than as zeros.
     """
 
     @staticmethod
-    def rth_bars(n: int, start: str = "2024-01-15T14:30:00Z") -> list[dict]:
-        """`n` minute bars of a drifting tape from the open (14:30Z = 09:30 ET).
-
-        The steps have to actually vary: the score divides by the window's own
-        volatility, so a constant-drift ramp has no momentum to report.
-        """
+    def rth_bars(n: int, start: str = "2024-01-15T14:30:00Z", step_min: int = 1) -> list[dict]:
+        """`n` bars of a drifting tape from the open (14:30Z = 09:30 ET)."""
         t0 = pd.Timestamp(start)
         steps = np.random.default_rng(7).normal(0.02, 0.05, n)
         out = []
@@ -482,112 +478,132 @@ class TestMomentumPanel:
         for i, step in enumerate(steps):
             open_, close = close, close + float(step)
             out.append({
-                "t": (t0 + pd.Timedelta(minutes=i)).isoformat(),
+                "t": (t0 + pd.Timedelta(minutes=i * step_min)).isoformat(),
                 "o": open_, "h": max(open_, close) + 0.02,
                 "l": min(open_, close) - 0.02, "c": close, "v": 1000 + i,
             })
         return out
 
+    @staticmethod
+    def trace(fig, name):
+        (tr,) = [tr for tr in fig.data if tr.name == name]
+        return tr
+
     def test_off_by_default(self):
         fig = build_chart(BARS, [], [], "AAPL", SESSION_START)
         assert "yaxis5" not in fig.layout
-        assert "Momentum" not in [tr.name for tr in fig.data]
+        names = [tr.name for tr in fig.data]
+        assert "Momentum" not in names and "Momentum change" not in names
 
-    def test_adds_a_third_row_when_on(self):
+    def test_momentum_in_row_3_and_its_change_in_row_4(self):
         fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
-        mom = [tr for tr in fig.data if tr.name == "Momentum"]
-        assert len(mom) == 1
-        # Row 3, col 1 -- under the price (row 1) and the volume (row 2).
-        assert mom[0].yaxis == "y5"
+        # Two columns per row: row 3 col 1 is y5, row 4 col 1 is y7.
+        assert self.trace(fig, "Momentum").yaxis == "y5"
+        assert self.trace(fig, "Momentum change").yaxis == "y7"
 
     def test_price_profile_keeps_its_axis_ids(self):
         # add_model_overlays addresses the profile column as x2/y2, so the
-        # extra row has to be appended rather than inserted.
+        # extra rows have to be appended rather than inserted.
         fig = build_chart(self.rth_bars(60), [], TRADES, "AAPL", SESSION_START, show_momentum=True)
         assert any(tr.yaxis == "y2" for tr in fig.data)
 
-    def test_warmup_is_a_gap_not_zeros(self):
-        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
-        mom = [tr for tr in fig.data if tr.name == "Momentum"][0]
-        values = pd.Series(mom.y)
-        assert values.isna().any() and values.notna().any()
-        # The leading stretch is the NaN one.
-        assert pd.isna(values.iloc[0]) and pd.notna(values.iloc[-1])
+    @pytest.mark.parametrize("step_min", [1, 5])
+    def test_momentum_is_the_change_from_the_previous_bar(self, step_min):
+        bars = self.rth_bars(40, step_min=step_min)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True)
+        mom = self.trace(fig, "Momentum")
+        closes = [b["c"] for b in bars]
+        values = list(mom.y)
+        assert len(values) == len(bars)
+        assert pd.isna(values[0])
+        assert values[1:] == pytest.approx([closes[i] - closes[i - 1] for i in range(1, len(closes))])
+        # One bar per chart bar, at the chart's own resolution.
+        xs = pd.to_datetime(list(mom.x), utc=True)
+        assert (xs[1] - xs[0]) == pd.Timedelta(minutes=step_min)
 
-    def test_too_few_bars_draws_a_note_instead(self):
-        fig = build_chart(self.rth_bars(5), [], [], "AAPL", SESSION_START, show_momentum=True)
-        assert "Momentum" not in [tr.name for tr in fig.data]
+    def test_change_is_momentum_minus_the_previous_momentum(self):
+        bars = self.rth_bars(40)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True)
+        c = [b["c"] for b in bars]
+        values = list(self.trace(fig, "Momentum change").y)
+        assert pd.isna(values[0]) and pd.isna(values[1])
+        expected = [(c[i] - c[i - 1]) - (c[i - 1] - c[i - 2]) for i in range(2, len(c))]
+        assert values[2:] == pytest.approx(expected)
+
+    def test_bars_are_colored_by_sign(self):
+        fig = build_chart(self.rth_bars(40), [], [], "AAPL", SESSION_START, show_momentum=True)
+        for name in ("Momentum", "Momentum change"):
+            tr = self.trace(fig, name)
+            for v, color in zip(tr.y, tr.marker.color):
+                if pd.notna(v) and v != 0:
+                    assert color == (charts.PALETTE["up"] if v > 0 else charts.PALETTE["down"])
+
+    def test_each_session_starts_fresh(self):
+        # Yesterday's close to today's open is an overnight gap, not a bar's move.
+        day1 = self.rth_bars(10)
+        day2 = [dict(b, c=b["c"] + 5.0, o=b["o"] + 5.0, h=b["h"] + 5.0, l=b["l"] + 5.0)
+                for b in self.rth_bars(10, start="2024-01-16T14:30:00Z")]
+        fig = build_chart(day1 + day2, [], [], "AAPL", "2024-01-15T00:00:00Z", show_momentum=True)
+        values = list(self.trace(fig, "Momentum").y)
+        assert pd.isna(values[0]) and pd.isna(values[10])
+        assert all(abs(v) < 1.0 for v in values if pd.notna(v))
+
+    def test_one_bar_draws_notes_instead(self):
+        fig = build_chart(self.rth_bars(1), [], [], "AAPL", SESSION_START, show_momentum=True)
+        names = [tr.name for tr in fig.data]
+        assert "Momentum" not in names and "Momentum change" not in names
         texts = [a["text"] for a in fig.layout.annotations]
-        assert any("warms up" in t for t in texts)
+        assert any("second regular-session bar" in t for t in texts)
+        assert any("third regular-session bar" in t for t in texts)
 
-    def test_warming_up_panel_still_anchors_the_shared_time_axis(self):
+    def test_two_bars_draw_momentum_but_not_yet_its_change(self):
+        fig = build_chart(self.rth_bars(2), [], [], "AAPL", SESSION_START, show_momentum=True)
+        names = [tr.name for tr in fig.data]
+        assert "Momentum" in names and "Momentum change" not in names
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("third regular-session bar" in t for t in texts)
+
+    def test_warming_up_panels_still_anchor_the_shared_time_axis(self):
         # An empty momentum panel left its x axis (matched to the price and
         # volume axes) without data, and plotly then autoranged the whole
         # group over 1912-2034: right after the open the candles vanished.
-        bars = self.rth_bars(5)
+        bars = self.rth_bars(1)
         fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True)
-        anchors = [tr for tr in fig.data if tr.yaxis == "y5"]
-        assert len(anchors) == 1
-        xs = pd.to_datetime(list(anchors[0].x), utc=True)
-        assert xs[0] == pd.Timestamp(bars[0]["t"])
-        assert xs[-1] == pd.Timestamp(bars[-1]["t"])
-        assert all(y is None for y in anchors[0].y)
+        for axis in ("y5", "y7"):
+            anchors = [tr for tr in fig.data if tr.yaxis == axis]
+            assert len(anchors) == 1
+            assert all(y is None for y in anchors[0].y)
 
     def test_bars_outside_the_regular_session_draw_a_note(self):
         # 13:30Z is 08:30 ET: after SESSION_START, so the bars are drawn, but
         # pre-market, so the momentum frame drops every one of them.
-        pre = self.rth_bars(40, start="2024-01-15T13:30:00Z")
+        pre = self.rth_bars(40, start="2024-01-15T13:30:00Z")[:50]
+        pre = [b for b in pre if pd.Timestamp(b["t"]) < pd.Timestamp("2024-01-15T14:30:00Z")]
         fig = build_chart(pre, [], [], "AAPL", SESSION_START, show_momentum=True)
         texts = [a["text"] for a in fig.layout.annotations]
-        assert any("warms up" in t for t in texts)
+        assert any("second regular-session bar" in t for t in texts)
 
-    @pytest.mark.parametrize("n", [5, 15, 30])
-    def test_momentum_is_the_dollar_change_over_the_look_back(self, n):
+    def test_labels_the_latest_values_in_dollars(self):
         bars = self.rth_bars(60)
-        fig = build_chart(
-            bars, [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=n,
-        )
-        (mom,) = [tr for tr in fig.data if tr.name == "Momentum"]
-        closes = [b["c"] for b in bars]
-        expected = [None] * n + [closes[i] - closes[i - n] for i in range(n, len(closes))]
-        values = list(mom.y)
-        assert all(pd.isna(v) for v in values[:n])
-        assert values[n:] == pytest.approx(expected[n:])
-
-    def test_the_look_back_defaults_to_the_momentum_take_default(self):
-        from agent_stonks.config import APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-
-        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
-        (mom,) = [tr for tr in fig.data if tr.name == "Momentum"]
-        values = pd.Series(mom.y)
-        assert values.isna().sum() == APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-
-    def test_the_warm_up_note_names_the_look_back(self):
-        fig = build_chart(
-            self.rth_bars(5), [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=20,
-        )
-        texts = [a["text"] for a in fig.layout.annotations]
-        assert any("first 20 regular-session bars" in t for t in texts)
-
-    def test_labels_the_latest_value_in_dollars(self):
-        bars = self.rth_bars(60)
-        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=15)
-        change = bars[-1]["c"] - bars[-16]["c"]
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True)
+        c = [b["c"] for b in bars]
+        mom = c[-1] - c[-2]
+        change = mom - (c[-2] - c[-3])
         texts = [a["text"].strip() for a in fig.layout.annotations]
-        assert f"{'+' if change >= 0 else '-'}${abs(change):.2f}" in texts
+        for value in (mom, change):
+            assert f"{'+' if value >= 0 else '-'}${abs(value):.2f}" in texts
 
-    def test_the_axis_is_in_dollars_and_names_the_look_back(self):
-        fig = build_chart(
-            self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True, momentum_bars=12,
-        )
-        assert fig.layout.yaxis5.tickprefix == "$"
-        assert "12 bars" in fig.layout.yaxis5.title.text
-
-    def test_only_the_zero_line_is_drawn(self):
-        # The σ regime thresholds mean nothing on a dollar axis.
+    def test_the_axes_are_in_dollars(self):
         fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
-        levels = {s.y0 for s in fig.layout.shapes if s.yref == "y5"}
-        assert levels == {0}
+        assert fig.layout.yaxis5.tickprefix == "$"
+        assert fig.layout.yaxis7.tickprefix == "$"
+        assert fig.layout.yaxis5.title.text == "Momentum"
+        assert fig.layout.yaxis7.title.text == "Momentum Δ"
+
+    def test_only_the_zero_lines_are_drawn(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        assert {s.y0 for s in fig.layout.shapes if s.yref == "y5"} == {0}
+        assert {s.y0 for s in fig.layout.shapes if s.yref == "y7"} == {0}
 
 
 class TestVolumeBaseline:

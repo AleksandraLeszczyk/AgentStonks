@@ -10,7 +10,6 @@ from plotly.subplots import make_subplots
 
 from . import market_hours, momentum_regime
 from .config import (
-    APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     AVG_LINE_COLORS,
     CANDLE_PATTERN_COLORS,
     CANDLE_PATTERN_FILLED_ALPHA,
@@ -938,36 +937,78 @@ def _add_volume_baseline(
     )
 
 
-def _add_momentum_panel(
-    df: pd.DataFrame, fig: go.Figure, row: int, bars: int = APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
+def _add_momentum_panels(
+    df: pd.DataFrame, fig: go.Figure, momentum_row: int, change_row: int
 ) -> None:
-    """The session's absolute momentum, drawn in its own panel under the price.
+    """Bar-by-bar momentum and its change, in two rows under the volume.
 
-    Momentum here is the plain price change over the last `bars` bars --
-    `close - close[bars ago]`, in dollars -- rather than `momentum_regime`'s
-    score, which divides that move by the tape's own noise. The live chart
-    passes the Apple Trader's "Negative momentum" look-back as `bars`, so the
-    panel is the very series the momentum take counts negative bars on.
+    Both are measured over *one bar of the chart*, so they follow its
+    resolution: on 1-minute bars a value per minute, on 5-minute bars one per
+    five minutes.
 
-    Session-local, like the take: the first `bars` regular-session bars have
-    nothing to compare against, and that stretch is left as a gap rather than
+    * momentum -- `close - previous close`, in dollars: how far this bar moved.
+    * momentum change -- `momentum - previous momentum`: whether the move is
+      speeding up or slowing down. A positive change under a negative momentum
+      bar is a fall that is losing force.
+
+    Session-local: the first regular-session bar has no previous close to
+    compare with (yesterday's close is a gap, not a bar's move), and the change
+    needs two momentum bars, so those stretches are left as gaps rather than
     plotted as zero, which would read as "flat" when it means "not known yet".
 
     The frame is rebuilt from the drawn bars via `momentum_regime`, which keeps
     to the regular session and to an exchange-local index -- so the series is
     converted back to UTC here, the wall clock the price axis is drawn in.
     """
-    bars = max(int(bars), 1)
+    frame = momentum_regime.frame_from_bars(
+        [
+            {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+            for t, o, h, l, c, v in zip(
+                df["t"], df["o"], df["h"], df["l"], df["c"], df["v"]
+            )
+        ]
+    )
+    if len(frame):
+        close = frame["close"]
+        before = close.groupby(frame["session"], sort=False).shift(1)
+        mom = close - before
+        change = mom - mom.groupby(frame["session"], sort=False).shift(1)
+        pct = mom / before * 100.0
+    else:
+        mom = change = pct = pd.Series(dtype=float)
 
-    def _warming_up() -> None:
-        """Say why the panel is empty rather than leaving a blank box.
+    _add_bar_by_bar_panel(
+        df, fig, momentum_row, mom, pct,
+        name="Momentum",
+        hover="Momentum %{y:+$.2f} (%{customdata:+.2f}%)<extra></extra>",
+        warm_up="Momentum starts at the second regular-session bar",
+    )
+    _add_bar_by_bar_panel(
+        df, fig, change_row, change, None,
+        name="Momentum change",
+        hover="Momentum change %{y:+$.2f}<extra></extra>",
+        warm_up="Momentum change starts at the third regular-session bar",
+    )
 
-        The panel still gets one invisible trace over the drawn bars' span. Its
-        x axis is matched to the price and volume axes, and with no trace at all
-        plotly autoranges it as an empty linear axis. The matched group then
-        spans 1912-2034, so right after the open the candles collapse into a
-        sliver at the chart's edge.
-        """
+
+def _add_bar_by_bar_panel(
+    df: pd.DataFrame,
+    fig: go.Figure,
+    row: int,
+    values: pd.Series,
+    customdata: "pd.Series | None",
+    name: str,
+    hover: str,
+    warm_up: str,
+) -> None:
+    """One dollar series as a bar per chart bar, green above zero, red below."""
+    if not values.notna().any():
+        # Say why the panel is empty rather than leaving a blank box. The panel
+        # still gets one invisible trace over the drawn bars' span: its x axis
+        # is matched to the price and volume axes, and with no trace at all
+        # plotly autoranges it as an empty linear axis. The matched group then
+        # spans 1912-2034, so right after the open the candles collapse into a
+        # sliver at the chart's edge.
         fig.add_trace(
             go.Scatter(
                 x=[df["t"].iloc[0], df["t"].iloc[-1]],
@@ -981,89 +1022,50 @@ def _add_momentum_panel(
         )
         fig.add_annotation(
             xref="x domain", yref="y domain", x=0.5, y=0.5,
-            text=f"Momentum warms up over the first {bars} regular-session bars",
+            text=warm_up,
             font=dict(color=PALETTE["muted"], size=11),
             showarrow=False,
             row=row,
             col=1,
         )
+        return
 
-    frame = momentum_regime.frame_from_bars(
-        [
-            {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
-            for t, o, h, l, c, v in zip(
-                df["t"], df["o"], df["h"], df["l"], df["c"], df["v"]
-            )
-        ]
-    )
-    if not len(frame):
-        return _warming_up()
-    close = frame["close"]
-    before = close.groupby(frame["session"], sort=False).shift(bars)
-    mom = close - before
-    if not mom.notna().any():
-        return _warming_up()
-    pct = mom / before * 100.0
-
-    x = mom.index.tz_convert("UTC")
-
-    # Two clipped fills rather than one: the sign is the whole point of the
-    # series, and a single-color area hides it.
-    for clipped, color in (
-        (mom.clip(lower=0.0), PALETTE["up"]),
-        (mom.clip(upper=0.0), PALETTE["down"]),
-    ):
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=clipped,
-                mode="lines",
-                line=dict(width=0),
-                fill="tozeroy",
-                fillcolor=_rgba(color, 0.30),
-                hoverinfo="skip",
-                showlegend=False,
-            ),
-            row=row,
-            col=1,
-        )
     fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=mom,
-            customdata=pct,
-            mode="lines",
-            line=dict(color=PALETTE["text"], width=1.2),
-            name="Momentum",
+        go.Bar(
+            x=values.index.tz_convert("UTC"),
+            y=values,
+            customdata=customdata,
+            marker_color=[
+                PALETTE["up"] if v >= 0 else PALETTE["down"] for v in values.fillna(0.0)
+            ],
+            marker_line_width=0,
+            opacity=0.8,
+            width=_bar_width_ms(df),
+            name=name,
             showlegend=False,
-            hovertemplate=(
-                f"Momentum %{{y:+$.2f}} over {bars} bars "
-                "(%{customdata:+.2f}%)<extra></extra>"
-            ),
+            hovertemplate=hover,
         ),
         row=row,
         col=1,
     )
-
     fig.add_hline(y=0, line=dict(color=PALETTE["muted"], width=1), row=row, col=1)
 
-    last_at = mom.last_valid_index()
-    if last_at is not None:
-        value = float(mom.loc[last_at])
-        fig.add_annotation(
-            x=last_at.tz_convert("UTC"),
-            y=value,
-            text=f" {'+' if value >= 0 else '-'}${abs(value):.2f}",
-            font=dict(
-                color=PALETTE["up"] if value >= 0 else PALETTE["down"],
-                size=11,
-                family="monospace",
-            ),
-            showarrow=False,
-            xanchor="left",
-            row=row,
-            col=1,
-        )
+    last_at = values.last_valid_index()
+    value = float(values.loc[last_at])
+    fig.add_annotation(
+        x=last_at.tz_convert("UTC"),
+        y=value,
+        text=f" {'+' if value >= 0 else '-'}${abs(value):.2f}",
+        font=dict(
+            color=PALETTE["up"] if value >= 0 else PALETTE["down"],
+            size=11,
+            family="monospace",
+        ),
+        showarrow=False,
+        xanchor="left",
+        row=row,
+        col=1,
+    )
 
 
 def _fill_intraday_gaps(df: pd.DataFrame) -> pd.DataFrame:
@@ -1656,7 +1658,6 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
-    momentum_bars: int = APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
 ) -> go.Figure:
@@ -1681,20 +1682,21 @@ def build_chart(
         df_trades["t"] = pd.to_datetime(df_trades["t"])
         df_trades = df_trades[df_trades["t"] > session_start]
 
-    # Momentum gets a panel of its own under the volume rather than a second y
-    # axis on the price: it is a change in dollars, centred on zero, and
-    # sharing the price axis would either flatten it or stretch the candles.
-    # Appending the row keeps the price-profile column at (1, 2) -- and so at
-    # `x2`/`y2`, which `add_model_overlays` addresses by axis id.
+    # Momentum and its change get panels of their own under the volume rather
+    # than a second y axis on the price: they are changes in dollars, centred
+    # on zero, and sharing the price axis would either flatten them or stretch
+    # the candles. Appending the rows keeps the price-profile column at (1, 2)
+    # -- and so at `x2`/`y2`, which `add_model_overlays` addresses by axis id.
     momentum_row = 3 if show_momentum else None
+    change_row = 4 if show_momentum else None
     fig = make_subplots(
-        rows=3 if show_momentum else 2,
+        rows=4 if show_momentum else 2,
         cols=2,
         shared_xaxes=True,
         shared_yaxes=True,
         vertical_spacing=0.02,
         horizontal_spacing=0.02,
-        row_heights=[0.60, 0.18, 0.22] if show_momentum else [0.75, 0.25],
+        row_heights=[0.52, 0.16, 0.16, 0.16] if show_momentum else [0.75, 0.25],
         column_widths=[0.8, 0.2],
     )
 
@@ -1831,8 +1833,8 @@ def build_chart(
     )
     _add_volume_baseline(df, fig, volume_baseline, row=2)
 
-    if momentum_row is not None:
-        _add_momentum_panel(df, fig, momentum_row, bars=momentum_bars)
+    if show_momentum:
+        _add_momentum_panels(df, fig, momentum_row, change_row)
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])
     if not df_news.empty:
@@ -2000,27 +2002,26 @@ def build_chart(
         yaxis2=dict(showgrid=True, gridcolor=PALETTE["grid"], tickfont=dict(size=10)),
         legend=dict(orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)"),
         margin=dict(l=10, r=10, t=50, b=10),
-        height=660 if show_momentum else 520,
+        height=760 if show_momentum else 520,
     )
     # Volume on a log scale: the opening and closing bursts run many times a
     # midday bar, and on a linear axis they flatten everything between them.
     # Both columns of the row, because the profile column's axis is matched to
     # the volume axis by `shared_yaxes` and matched axes must share a type.
     fig.update_yaxes(type="log", row=2)
-    if momentum_row is not None:
-        fig.update_xaxes(
-            showgrid=True, gridcolor=PALETTE["grid"], row=momentum_row, col=1,
-        )
-        fig.update_yaxes(
-            showgrid=True,
-            gridcolor=PALETTE["grid"],
-            tickfont=dict(size=10),
-            zeroline=False,
-            tickprefix="$",
-            title=dict(text=f"Momentum ({momentum_bars} bars)", font=dict(size=10)),
-            row=momentum_row,
-            col=1,
-        )
+    if show_momentum:
+        for row, title in ((momentum_row, "Momentum"), (change_row, "Momentum Δ")):
+            fig.update_xaxes(showgrid=True, gridcolor=PALETTE["grid"], row=row, col=1)
+            fig.update_yaxes(
+                showgrid=True,
+                gridcolor=PALETTE["grid"],
+                tickfont=dict(size=10),
+                zeroline=False,
+                tickprefix="$",
+                title=dict(text=title, font=dict(size=10)),
+                row=row,
+                col=1,
+            )
     return fig
 
 

@@ -170,8 +170,8 @@ class AppleTraderConfig:
     # set.
     stop_k: float = 0.0
     # The momentum take: gains are taken short of the sell level once the
-    # momentum over the last this-many bars -- `close - close[N bars ago]`, the
-    # live chart's momentum panel -- has been negative for `negative_for_bars`
+    # momentum over the last this-many bars -- `close - close[N bars ago]` in
+    # dollars -- has been negative for `negative_for_bars`
     # bars in a row since the entry, with the position in profit. See
     # `_momentum_take`. 0 switches the take off, and with it the runner and its
     # breakeven.
@@ -408,8 +408,7 @@ class AppleTraderConfig:
         """The look-back `max_fall_k` measures the fall over, in bars.
 
         The momentum take's, so "falling too fast to buy" and "the move has
-        faded" read the same stretch of tape -- and the same one the live
-        chart's momentum panel draws. With the take off there is no look-back
+        faded" read the same stretch of tape. With the take off there is no look-back
         of the run's own, so the default one.
         """
         return (
@@ -1971,11 +1970,10 @@ class DayRangeTrader(BaseTrader):
         on each of the last `negative_for_bars` bars after `since` -- and if
         so, how to say so.
 
-        Momentum is `close - close[N bars ago]` in dollars, the series the live
-        chart's momentum panel draws, so the take fires where that panel has
-        sat under zero for the streak. The first N bars of the session have
-        nothing to compare against and break a streak rather than extend it,
-        like the panel's gap there. Recomputed over the session on each call,
+        Momentum is `close - close[N bars ago]` in dollars, and the take fires
+        once that has sat under zero for the streak. The first N bars of the
+        session have nothing to compare against and break a streak rather than
+        extend it. Recomputed over the session on each call,
         so a cycle that missed a bar still counts it.
         """
         n, needed = self.config.negative_momentum_bars, self.config.negative_for_bars
@@ -2004,7 +2002,7 @@ class DayRangeTrader(BaseTrader):
         of its own random-walk scale, smoothed (`compute_momentum` at `horizon
         = N`), and positive / balanced / negative are the Schmitt-trigger regime
         over it (`assign_regimes`) -- the same definitions the chart's momentum
-        panel draws with, at a look-back of the user's choosing. The hysteresis
+        panel drew with then, at a look-back of the user's choosing. The hysteresis
         is what keeps a score hovering at the line from counting as a turn: it
         becomes positive above 0.9σ and stops being positive under 0.4σ.
         """

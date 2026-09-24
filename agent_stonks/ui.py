@@ -62,7 +62,6 @@ from .config import (
     AGENT_LOG_POLL_SEC,
     AGENT_PERFORMANCE_POLL_SEC,
     APPLE_TRADER_CYCLE_SEC,
-    APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     CHART_POLL_SEC,
     DEFAULT_DATA_SOURCE,
     DEFAULT_HISTORY_FEED,
@@ -708,7 +707,6 @@ def _chart_panel() -> None:
             model_overlays=overlays["items"],
             candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
-            momentum_bars=_momentum_bars(state),
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
         )
@@ -717,20 +715,6 @@ def _chart_panel() -> None:
             st.caption(f":material/info: {sym} — {note}")
     if not rendered:
         st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
-
-
-def _momentum_bars(state) -> int:
-    """The look-back the live momentum panel is measured over.
-
-    The Apple Trader's negative-momentum look-back, so the panel shows the
-    series its momentum take watches: the running agent's while one runs (that
-    setting takes effect on ▶ Start, so the form may already differ), else the
-    form's. The default when there is neither, or the take is switched off (0).
-    """
-    running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
-    config = running.get("config") or getattr(state, "apple_trader_config", None)
-    bars = int(getattr(config, "negative_momentum_bars", 0) or 0)
-    return bars if bars > 0 else APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
 
 
 def _live_chart_controls() -> None:
@@ -815,12 +799,14 @@ def _live_chart_controls() -> None:
             show_momentum = st.checkbox(
                 "Momentum panel",
                 value=True,
-                help="Draw the session's momentum under the price: how many "
-                "dollars the close has moved over the last N bars. N is the "
-                "Apple Trader's *Negative momentum* look-back (the "
-                "running agent's while one runs), or "
-                f"{APPLE_TRADER_NEGATIVE_MOMENTUM_BARS} bars when that is off or "
-                "another personality is picked.",
+                help="Two panels under the volume, one bar per chart bar, so "
+                "they follow the timeframe (a bar a minute on 1Min, one per five "
+                "minutes on 5Min):\n\n"
+                "- **Momentum** — the close minus the previous close, in dollars.\n"
+                "- **Momentum Δ** — this bar's momentum minus the previous bar's: "
+                "above zero the move is speeding up (or a fall is easing), below "
+                "zero it is slowing (or a fall is steepening).\n\n"
+                "Regular session only, and each day starts fresh.",
             )
 
         st.markdown("**Price Profile Fit**")
@@ -2126,7 +2112,6 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     )["items"],
                     candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
-                    momentum_bars=_momentum_bars(state),
                 ),
             )
         )
@@ -2396,7 +2381,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "negative_momentum_bars": (
             "Takes gains short of the sell level when momentum stays negative.\n\n"
             "- **Momentum** — the close now minus the close this-many bars ago, in "
-            "dollars: the chart's momentum panel.\n"
+            "dollars.\n"
             "- **Fires** when the position is in profit and that has been below zero on "
             "each of the last *Negative for long enough* bars since the entry.\n"
             "- Fewer bars react to short wobbles; more wait for the whole move to give out.\n"
@@ -2425,8 +2410,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Refuses a buy — the first one or an add — while the price is falling too "
             "fast to catch.\n\n"
             "- **The fall** — the close now minus the close N bars ago, where N is the "
-            "*Negative momentum* look-back (15 if the take is off): the same number the "
-            "chart's momentum panel draws.\n"
+            "*Negative momentum* look-back (15 if the take is off).\n"
             "- **Refused** when that is more than this many × {unit} down.\n"
             "- Only that bar: the next one is judged again, so once the fall eases a "
             "price still at the buy level is bought.\n"

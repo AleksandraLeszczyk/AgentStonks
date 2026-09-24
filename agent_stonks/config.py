@@ -272,9 +272,9 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # written before the managed exit existed replays as.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
 # The momentum take (`DayRangeTrader._momentum_negative`): momentum is the
-# N-bar price change, `close - close[N bars ago]` in dollars -- exactly the
-# series the live chart's momentum panel draws, so the take fires where the
-# panel has sat under zero for NEGATIVE_FOR_BARS bars in a row since the entry.
+# N-bar price change, `close - close[N bars ago]` in dollars, and the take
+# fires once that has sat under zero for NEGATIVE_FOR_BARS bars in a row since
+# the entry.
 # The streak is what keeps a single down bar in an up move from counting: 5 of
 # 15 is a third of the look-back spent falling. Neither number was swept. 0
 # bars switches the take off. Replaced (2026-09-23) the positive-to-balanced
@@ -502,8 +502,8 @@ APPLE_TRADER_SCALE_IN = True
 # No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`): an entry,
 # first buy or add alike, is refused while the price has dropped more than this
 # many level units over the momentum look-back (APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
-# unless the run sets its own) -- the same `close - close[N bars ago]` the live
-# chart's momentum panel draws. The bar that reaches the buy level is usually a
+# unless the run sets its own) -- the same `close - close[N bars ago]` the
+# momentum take reads. The bar that reaches the buy level is usually a
 # falling one, so this does not refuse dips; it refuses the steep part of one
 # and lets the next bar buy once the fall eases, if the price is still there.
 #
