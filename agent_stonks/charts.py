@@ -938,7 +938,11 @@ def _add_volume_baseline(
 
 
 def _add_momentum_panels(
-    df: pd.DataFrame, fig: go.Figure, momentum_row: int, change_row: int
+    df: pd.DataFrame,
+    fig: go.Figure,
+    momentum_row: int,
+    change_row: int,
+    minute_ref: "float | None" = None,
 ) -> None:
     """Bar-by-bar momentum and its change, in two rows under the volume.
 
@@ -955,6 +959,10 @@ def _add_momentum_panels(
     compare with (yesterday's close is a gap, not a bar's move), and the change
     needs two momentum bars, so those stretches are left as gaps rather than
     plotted as zero, which would read as "flat" when it means "not known yet".
+
+    `minute_ref` is the ticker's `abs_mean_minute_momentum` -- last week's
+    mean absolute one-minute move -- drawn at plus and minus itself on the
+    momentum panel, so a bar poking past it moved more than a usual minute.
 
     The frame is rebuilt from the drawn bars via `momentum_regime`, which keeps
     to the regular session and to an exchange-local index -- so the series is
@@ -983,11 +991,61 @@ def _add_momentum_panels(
         hover="Momentum %{y:+$.2f} (%{customdata:+.2f}%)<extra></extra>",
         warm_up="Momentum starts at the second regular-session bar",
     )
+    if mom.notna().any():
+        _add_minute_momentum_ref(df, fig, momentum_row, minute_ref)
     _add_bar_by_bar_panel(
         df, fig, change_row, change, None,
         name="Momentum change",
         hover="Momentum change %{y:+$.2f}<extra></extra>",
         warm_up="Momentum change starts at the third regular-session bar",
+    )
+
+
+def _add_minute_momentum_ref(
+    df: pd.DataFrame, fig: go.Figure, row: int, level: "float | None"
+) -> None:
+    """Last week's mean absolute one-minute move, at +level and -level.
+
+    Only on one-minute bars. The value is a per-minute measure, and a
+    five-minute bar's move is not five one-minute moves added up -- they partly
+    cancel -- so there is no honest way to scale it to a coarser bar; drawn
+    there as-is it would sit well under a typical bar and make every bar look
+    unusual.
+
+    Traces rather than `add_hline` shapes, because shapes do not take part in
+    autorange: on a quiet stretch the lines would sit off the top of the axis.
+    """
+    if level is None or not level > 0 or _bar_minutes(df["t"]) != 1:
+        return
+    level = float(level)
+    x = [df["t"].min(), df["t"].max()]
+    for y in (level, -level):
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=[y, y],
+                mode="lines",
+                line=dict(color=PALETTE["orange"], width=1.2, dash="dash"),
+                name="Mean minute move",
+                showlegend=False,
+                hovertemplate=(
+                    "<b>Mean |1-min move|</b> \u2014 last week<br>"
+                    "%{y:+$.3f}<extra></extra>"
+                ),
+            ),
+            row=row,
+            col=1,
+        )
+    fig.add_annotation(
+        x=x[1],
+        y=level,
+        text=f"avg \u00b1${level:.2f} \u00b7 last week",
+        showarrow=False,
+        xanchor="right",
+        yanchor="bottom",
+        font=dict(size=9, color=PALETTE["orange"]),
+        row=row,
+        col=1,
     )
 
 
@@ -1658,6 +1716,7 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
+    minute_momentum_ref: Optional[float] = None,
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
 ) -> go.Figure:
@@ -1834,7 +1893,9 @@ def build_chart(
     _add_volume_baseline(df, fig, volume_baseline, row=2)
 
     if show_momentum:
-        _add_momentum_panels(df, fig, momentum_row, change_row)
+        _add_momentum_panels(
+            df, fig, momentum_row, change_row, minute_ref=minute_momentum_ref,
+        )
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])
     if not df_news.empty:

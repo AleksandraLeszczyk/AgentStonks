@@ -707,6 +707,7 @@ def _chart_panel() -> None:
             model_overlays=overlays["items"],
             candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
+            minute_momentum_ref=sym_state.abs_mean_minute_momentum,
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
         )
@@ -802,7 +803,9 @@ def _live_chart_controls() -> None:
                 help="Two panels under the volume, one bar per chart bar, so "
                 "they follow the timeframe (a bar a minute on 1Min, one per five "
                 "minutes on 5Min):\n\n"
-                "- **Momentum** — the close minus the previous close, in dollars.\n"
+                "- **Momentum** — the close minus the previous close, in dollars. "
+                "On 1Min bars the dashed orange lines at ± are last week's mean "
+                "absolute one-minute move, measured once a day on ▶ Start.\n"
                 "- **Momentum Δ** — this bar's momentum minus the previous bar's: "
                 "above zero the move is speeding up (or a fall is easing), below "
                 "zero it is slowing (or a fall is steepening).\n\n"
@@ -2112,6 +2115,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     )["items"],
                     candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
+                    minute_momentum_ref=sym_state.abs_mean_minute_momentum,
                 ),
             )
         )

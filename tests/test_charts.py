@@ -606,6 +606,45 @@ class TestMomentumPanel:
         assert {s.y0 for s in fig.layout.shapes if s.yref == "y7"} == {0}
 
 
+    def ref_traces(self, fig):
+        return [tr for tr in fig.data if tr.name == "Mean minute move"]
+
+    def test_the_minute_reference_is_drawn_at_plus_and_minus(self):
+        fig = build_chart(
+            self.rth_bars(40), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_ref=0.13,
+        )
+        refs = self.ref_traces(fig)
+        assert sorted(tr.y[0] for tr in refs) == [-0.13, 0.13]
+        # On the momentum panel, not the change panel.
+        assert {tr.yaxis for tr in refs} == {"y5"}
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("\u00b1$0.13" in t for t in texts)
+
+    def test_no_minute_reference_on_coarser_bars(self):
+        # A per-minute value says nothing about a 5-minute bar's move.
+        fig = build_chart(
+            self.rth_bars(40, step_min=5), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_ref=0.13,
+        )
+        assert not self.ref_traces(fig)
+
+    @pytest.mark.parametrize("ref", [None, 0.0])
+    def test_no_minute_reference_until_it_is_known(self, ref):
+        fig = build_chart(
+            self.rth_bars(40), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_ref=ref,
+        )
+        assert not self.ref_traces(fig)
+
+    def test_no_minute_reference_while_momentum_warms_up(self):
+        fig = build_chart(
+            self.rth_bars(1), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_ref=0.13,
+        )
+        assert not self.ref_traces(fig)
+
+
 class TestVolumeBaseline:
     """The "usual volume" references drawn under the live volume bars."""
 
