@@ -18,6 +18,7 @@ from . import (
     candle_patterns,
     market_hours,
     model_overlays,
+    momentum_regime,
 )
 from . import apple_trader_ui
 from .model_catalogue_ui import model_catalogue_panel
@@ -81,6 +82,7 @@ from .config import (
     POLL_SEC,
     PREMARKET_POLL_SEC,
     SESSION_START,
+    TACTICS_MOMENTUM_WINDOW_MIN,
     TIMEFRAMES,
     TRADE_FIXED_COST,
 )
@@ -135,6 +137,7 @@ from .trading_mode import (
     live_trading_enabled,
     resolve_broker,
 )
+from .stream_common import TF_MINUTES
 from .stream import (
     backfill_bars,
     launch_stream,
@@ -708,6 +711,7 @@ def _chart_panel() -> None:
             candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
             minute_momentum_ref=sym_state.abs_mean_minute_momentum,
+            **_agent_momentum_kwargs(state, sym_state),
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
         )
@@ -716,6 +720,63 @@ def _chart_panel() -> None:
             st.caption(f":material/info: {sym} — {note}")
     if not rendered:
         st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
+
+
+# The look-back drawn over the momentum panels when the selected agent decides
+# on no momentum at all, in minutes.
+FALLBACK_MOMENTUM_MIN = 5
+
+
+def _agent_momentum(state, sym_state) -> "tuple[int, str]":
+    """How many chart bars the selected agent reads momentum over, and why.
+
+    * Apple Trader -- its momentum take and its no-buy-into-a-fall rule both
+      read `close - close[N bars ago]` over `fall_bars` (the running agent's
+      config while one runs, since that setting takes ▶ Start; else the form's).
+    * Apple Trader 2 -- a rule set that reads any `mom.*` signal runs on the
+      regime score over `MOMENTUM_DEFAULTS["horizon"]` bars.
+    * LLM personalities and Automatic -- an armed tactic or pending alert on
+      `momentum_pct` compares against the close `TACTICS_MOMENTUM_WINDOW_MIN`
+      minutes back.
+
+    The rule traders count bars of the stream they run on, which is the
+    chart's timeframe; the tactic window is in minutes, so it is converted.
+    Anything else -- including an Apple Trader with the take and the fall rule
+    both off -- gets `FALLBACK_MOMENTUM_MIN` minutes.
+    """
+    bar_min = TF_MINUTES.get(getattr(state, "timeframe", "1Min"), 1)
+
+    def minutes_to_bars(minutes: int) -> int:
+        return max(1, round(minutes / bar_min))
+
+    personality = getattr(state, "llm_personality", None)
+    if personality == APPLE_TRADER_KEY:
+        running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
+        config = running.get("config") or getattr(state, "apple_trader_config", None)
+        if config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
+            return int(config.fall_bars), "Apple Trader"
+    elif personality == APPLE_TRADER2_KEY:
+        config = getattr(state, "apple_trader2_config", None)
+        if config is not None and config.rules.reads_momentum():
+            return int(momentum_regime.MOMENTUM_DEFAULTS["horizon"]), "Apple Trader 2"
+    elif _reads_momentum_pct(sym_state):
+        return minutes_to_bars(TACTICS_MOMENTUM_WINDOW_MIN), "armed tactic"
+    return minutes_to_bars(FALLBACK_MOMENTUM_MIN), f"{FALLBACK_MOMENTUM_MIN} min"
+
+
+def _reads_momentum_pct(sym_state) -> bool:
+    """Whether an armed tactic or a pending alert on this symbol waits on
+    `momentum_pct`."""
+    tactics = getattr(sym_state, "tactics", None)
+    if tactics is not None and tactics.status == "armed":
+        if any(c.field == "momentum_pct" for a in tactics.actions for c in a.conditions):
+            return True
+    return any(a.get("field") == "momentum_pct" for a in getattr(sym_state, "alerts", None) or [])
+
+
+def _agent_momentum_kwargs(state, sym_state) -> dict:
+    bars, label = _agent_momentum(state, sym_state)
+    return {"agent_momentum_bars": bars, "agent_momentum_label": label}
 
 
 def _live_chart_controls() -> None:
@@ -809,6 +870,11 @@ def _live_chart_controls() -> None:
                 "- **Momentum Δ** — this bar's momentum minus the previous bar's: "
                 "above zero the move is speeding up (or a fall is easing), below "
                 "zero it is slowing (or a fall is steepening).\n\n"
+                "The semitransparent blue lines are the same two measures over the "
+                "look-back the selected agent decides on — Apple Trader's momentum "
+                "take / no-fall rule, Apple Trader 2's momentum signals, or an LLM "
+                "agent's armed momentum tactic — and over 5 minutes when it reads "
+                "no momentum.\n\n"
                 "Regular session only, and each day starts fresh.",
             )
 
@@ -2116,6 +2182,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
                     minute_momentum_ref=sym_state.abs_mean_minute_momentum,
+                    **_agent_momentum_kwargs(state, sym_state),
                 ),
             )
         )
@@ -2676,6 +2743,7 @@ def _agent_panel(
     apple2_config = (
         _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
     )
+    state.apple_trader2_config = apple2_config
 
     trading_mode_choice = _execution_controls()
 

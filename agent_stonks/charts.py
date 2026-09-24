@@ -943,6 +943,8 @@ def _add_momentum_panels(
     momentum_row: int,
     change_row: int,
     minute_ref: "float | None" = None,
+    agent_bars: "int | None" = None,
+    agent_label: str = "",
 ) -> None:
     """Bar-by-bar momentum and its change, in two rows under the volume.
 
@@ -964,6 +966,11 @@ def _add_momentum_panels(
     mean absolute one-minute move -- drawn at plus and minus itself on the
     momentum panel, so a bar poking past it moved more than a usual minute.
 
+    `agent_bars` adds the same two measures over the look-back the selected
+    agent decides on -- `close - close[N bars ago]` and its bar-to-bar change --
+    as semitransparent lines over the bars, labelled with `agent_label`. A
+    look-back of one bar is the bars themselves, so it draws nothing extra.
+
     The frame is rebuilt from the drawn bars via `momentum_regime`, which keeps
     to the regular session and to an exchange-local index -- so the series is
     converted back to UTC here, the wall clock the price axis is drawn in.
@@ -983,7 +990,7 @@ def _add_momentum_panels(
         change = mom - mom.groupby(frame["session"], sort=False).shift(1)
         pct = mom / before * 100.0
     else:
-        mom = change = pct = pd.Series(dtype=float)
+        close = mom = change = pct = pd.Series(dtype=float)
 
     _add_bar_by_bar_panel(
         df, fig, momentum_row, mom, pct,
@@ -998,6 +1005,52 @@ def _add_momentum_panels(
         name="Momentum change",
         hover="Momentum change %{y:+$.2f}<extra></extra>",
         warm_up="Momentum change starts at the third regular-session bar",
+    )
+
+    n = int(agent_bars or 0)
+    if n > 1 and len(frame):
+        by_session = frame["session"]
+        mom_n = close - close.groupby(by_session, sort=False).shift(n)
+        change_n = mom_n - mom_n.groupby(by_session, sort=False).shift(1)
+        label = f"{n}-bar" + (f" \u00b7 {agent_label}" if agent_label else "")
+        for row, series, what, drawn in (
+            (momentum_row, mom_n, "momentum", mom),
+            (change_row, change_n, "momentum change", change),
+        ):
+            # Only over a panel that has its bars: a warming-up panel carries
+            # its note, and a line under it would contradict it.
+            if drawn.notna().any() and series.notna().any():
+                _add_agent_momentum_line(fig, row, series, label, what)
+
+
+def _add_agent_momentum_line(
+    fig: go.Figure, row: int, series: pd.Series, label: str, what: str
+) -> None:
+    """The agent's N-bar series as a semitransparent line over a panel's bars."""
+    fig.add_trace(
+        go.Scatter(
+            x=series.index.tz_convert("UTC"),
+            y=series,
+            mode="lines",
+            line=dict(color=PALETTE["accent"], width=1.6),
+            opacity=0.55,
+            connectgaps=False,
+            name=f"Agent {what}",
+            showlegend=False,
+            hovertemplate=f"{label} {what} %{{y:+$.2f}}<extra></extra>",
+        ),
+        row=row,
+        col=1,
+    )
+    fig.add_annotation(
+        xref="x domain", yref="y domain", x=0.0, y=1.0,
+        text=f"\u2014 {label}",
+        font=dict(color=PALETTE["accent"], size=9),
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+        row=row,
+        col=1,
     )
 
 
@@ -1717,6 +1770,8 @@ def build_chart(
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
     minute_momentum_ref: Optional[float] = None,
+    agent_momentum_bars: Optional[int] = None,
+    agent_momentum_label: str = "",
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
 ) -> go.Figure:
@@ -1895,6 +1950,7 @@ def build_chart(
     if show_momentum:
         _add_momentum_panels(
             df, fig, momentum_row, change_row, minute_ref=minute_momentum_ref,
+            agent_bars=agent_momentum_bars, agent_label=agent_momentum_label,
         )
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])

@@ -645,6 +645,54 @@ class TestMomentumPanel:
         assert not self.ref_traces(fig)
 
 
+    def agent_trace(self, fig, what):
+        return [tr for tr in fig.data if tr.name == f"Agent {what}"]
+
+    @pytest.mark.parametrize("n", [5, 15])
+    def test_agent_lines_are_the_n_bar_momentum_and_its_change(self, n):
+        bars = self.rth_bars(60)
+        fig = build_chart(
+            bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+            agent_momentum_bars=n, agent_momentum_label="Apple Trader",
+        )
+        c = [b["c"] for b in bars]
+        (mom,) = self.agent_trace(fig, "momentum")
+        (chg,) = self.agent_trace(fig, "momentum change")
+        assert (mom.yaxis, chg.yaxis) == ("y5", "y7")
+        assert mom.mode == "lines" and 0 < mom.opacity < 1
+        m = [None] * n + [c[i] - c[i - n] for i in range(n, len(c))]
+        assert all(pd.isna(v) for v in list(mom.y)[:n])
+        assert list(mom.y)[n:] == pytest.approx(m[n:])
+        d = [m[i] - m[i - 1] for i in range(n + 1, len(c))]
+        assert list(chg.y)[n + 1:] == pytest.approx(d)
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert sum(f"{n}-bar \u00b7 Apple Trader" in t for t in texts) == 2
+
+    def test_a_one_bar_look_back_draws_no_extra_line(self):
+        # It would be the bars themselves.
+        fig = build_chart(
+            self.rth_bars(40, step_min=5), [], [], "AAPL", SESSION_START,
+            show_momentum=True, agent_momentum_bars=1,
+        )
+        assert not self.agent_trace(fig, "momentum")
+
+    def test_no_agent_line_until_the_look_back_has_filled(self):
+        fig = build_chart(
+            self.rth_bars(10), [], [], "AAPL", SESSION_START,
+            show_momentum=True, agent_momentum_bars=15,
+        )
+        assert "Momentum" in [tr.name for tr in fig.data]
+        assert not self.agent_trace(fig, "momentum")
+
+    def test_no_agent_line_over_a_warming_up_panel(self):
+        fig = build_chart(
+            self.rth_bars(1), [], [], "AAPL", SESSION_START,
+            show_momentum=True, agent_momentum_bars=5,
+        )
+        assert not self.agent_trace(fig, "momentum")
+        assert not self.agent_trace(fig, "momentum change")
+
+
 class TestVolumeBaseline:
     """The "usual volume" references drawn under the live volume bars."""
 

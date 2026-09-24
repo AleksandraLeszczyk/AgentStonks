@@ -1,6 +1,7 @@
 from agent_stonks import config
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
+    _agent_momentum,
     _cash_label,
     _venue_badge,
     _portfolio_value_label,
@@ -236,3 +237,110 @@ class TestLiveOptionWalls:
         # A second render inside the poll interval must not fetch again.
         assert _live_option_walls(sym_state, ["call_wall"]) == {"call_wall": 105.0}
         assert calls == ["AAPL"]
+
+
+class TestAgentMomentum:
+    """The look-back the momentum panels' agent lines are drawn over."""
+
+    @staticmethod
+    def state(personality="momentum", timeframe="1Min", running=False, form=None,
+              levels=None, rules2=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            llm_personality=personality, timeframe=timeframe, agent_running=running,
+            apple_trader_config=form, apple_trader_levels=levels,
+            apple_trader2_config=(
+                SimpleNamespace(rules=SimpleNamespace(reads_momentum=lambda: rules2))
+                if rules2 is not None else None
+            ),
+        )
+
+    @staticmethod
+    def sym(tactic_fields=(), alert_fields=(), status="armed"):
+        from types import SimpleNamespace
+
+        tactics = None
+        if tactic_fields:
+            tactics = SimpleNamespace(
+                status=status,
+                actions=[SimpleNamespace(conditions=[SimpleNamespace(field=f) for f in tactic_fields])],
+            )
+        return SimpleNamespace(tactics=tactics, alerts=[{"field": f} for f in alert_fields])
+
+    @staticmethod
+    def trader(take=15, fade=0, drop=0.0, fall=0.1):
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        return AppleTraderConfig(
+            model_key="dayrange", negative_momentum_bars=take, momentum_fade_bars=fade,
+            momentum_drop=drop, max_fall_k=fall,
+        )
+
+    def test_no_momentum_falls_back_to_five_minutes(self):
+        assert _agent_momentum(self.state(), self.sym()) == (5, "5 min")
+
+    def test_five_minutes_is_one_bar_on_a_5min_chart(self):
+        assert _agent_momentum(self.state(timeframe="5Min"), self.sym()) == (1, "5 min")
+
+    def test_apple_traders_look_back(self):
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+
+        bars, label = _agent_momentum(
+            self.state(APPLE_TRADER_KEY, form=self.trader(take=22)), self.sym()
+        )
+        assert bars == 22 and label
+
+    def test_apple_trader_with_only_the_fall_rule_reads_the_default_look_back(self):
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+
+        bars, _ = _agent_momentum(
+            self.state(APPLE_TRADER_KEY, form=self.trader(take=0, fall=0.1)), self.sym()
+        )
+        assert bars == config.APPLE_TRADER_NEGATIVE_MOMENTUM_BARS
+
+    def test_apple_trader_reading_no_momentum_falls_back(self):
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+
+        state = self.state(APPLE_TRADER_KEY, form=self.trader(take=0, fall=0.0))
+        assert _agent_momentum(state, self.sym()) == (5, "5 min")
+
+    def test_the_running_apple_traders_look_back_wins_over_the_form(self):
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+
+        state = self.state(
+            APPLE_TRADER_KEY, running=True, form=self.trader(take=22),
+            levels={"config": self.trader(take=9)},
+        )
+        assert _agent_momentum(state, self.sym())[0] == 9
+
+    def test_apple_trader_2_reading_momentum_uses_the_regime_horizon(self):
+        from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY
+        from agent_stonks.momentum_regime import MOMENTUM_DEFAULTS
+
+        bars, _ = _agent_momentum(self.state(APPLE_TRADER2_KEY, rules2=True), self.sym())
+        assert bars == MOMENTUM_DEFAULTS["horizon"]
+
+    def test_apple_trader_2_without_momentum_rules_falls_back(self):
+        from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY
+
+        state = self.state(APPLE_TRADER2_KEY, rules2=False)
+        assert _agent_momentum(state, self.sym()) == (5, "5 min")
+
+    def test_an_armed_momentum_tactic_uses_its_window(self):
+        bars, label = _agent_momentum(self.state(), self.sym(tactic_fields=["momentum_pct"]))
+        assert bars == config.TACTICS_MOMENTUM_WINDOW_MIN and label == "armed tactic"
+
+    def test_the_tactic_window_is_converted_to_chart_bars(self):
+        bars, _ = _agent_momentum(
+            self.state(timeframe="5Min"), self.sym(tactic_fields=["momentum_pct"])
+        )
+        assert bars == 2
+
+    def test_a_momentum_alert_counts_too(self):
+        assert _agent_momentum(self.state(), self.sym(alert_fields=["momentum_pct"]))[0] == 10
+
+    def test_a_spent_or_non_momentum_tactic_does_not(self):
+        assert _agent_momentum(self.state(), self.sym(tactic_fields=["last_price"]))[0] == 5
+        executed = self.sym(tactic_fields=["momentum_pct"], status="executed")
+        assert _agent_momentum(self.state(), executed)[0] == 5
