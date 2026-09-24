@@ -137,6 +137,10 @@ class SymbolState:
         self.opening_range: dict | None = None
         self.volume_alert_triggered: bool = False
         self.volume_alert_ratio: float | None = None
+        # Mean |1-minute close change| in $ over the last trading week, measured
+        # once per ET day on a streaming start (see agent_stonks.minute_momentum).
+        # None until that background read lands.
+        self.abs_mean_minute_momentum: float | None = None
         # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
         # last ~minute. Used by last_price alerts to check any price in the window,
         # not only the single most-recent tick.

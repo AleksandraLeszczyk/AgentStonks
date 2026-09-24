@@ -126,7 +126,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
-from . import bar_history, newsimpact_model
+from . import bar_history, minute_momentum, newsimpact_model
 from .trade_sound import next_trade_cue, play_trade_sound
 from .trading_mode import (
     ENV_KEYS as TRADING_ENV_KEYS,
@@ -3295,6 +3295,9 @@ def _start_live_session(
             newsimpact_model.launch_refresh(
                 state.sym(sym), key, secret, state.history_feed_resolved, force=True
             )
+    # Once per ET day per ticker: the first start computes it from last week's
+    # minute bars and stores it, later starts read it back.
+    minute_momentum.launch_refresh(state.sym(sym) for sym in loaded)
     news_llm_provider = state.news_llm_provider
     llm_key = os.getenv(ENV_KEYS[news_llm_provider], "")
     if llm_key:
