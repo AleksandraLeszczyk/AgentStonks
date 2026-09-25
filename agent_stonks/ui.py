@@ -120,7 +120,6 @@ from .state import (
     PRICE_AXIS_ALERT_FIELDS,
     AppState,
     SymbolState,
-    current_volume_ratio,
     format_alert,
     format_tool_kv,
     momentum_pct,
@@ -587,33 +586,6 @@ def _quote_html(
     )
 
 
-def _volume_alert_banner(state: AppState, sym_state: SymbolState) -> None:
-    """Live relative-volume readout + a prominent banner once the alert fires."""
-    if not state.volume_alert_enabled:
-        return
-    with sym_state.lock:
-        day_volume = sym_state.day_volume
-        triggered = sym_state.volume_alert_triggered
-    multiplier = state.volume_alert_multiplier
-    daily_bars = sym_state.daily_bars
-    ratio, _ = current_volume_ratio(day_volume, daily_bars)
-    if ratio is None:
-        return
-    if triggered:
-        st.html(
-            f"<div style='background:{PALETTE['orange']};color:#1a1d27;"
-            "font-family:Inter,sans-serif;font-weight:600;border-radius:6px;"
-            "padding:8px 12px;margin:4px 0'>"
-            f"⚡ {sym_state.symbol} high volume: {ratio:.2f}× average daily volume "
-            f"(alert threshold {multiplier:.1f}×)</div>"
-        )
-    else:
-        st.caption(
-            f"📊 {sym_state.symbol} relative volume: {ratio:.2f}× avg daily volume "
-            f"(alerts at {multiplier:.1f}×)"
-        )
-
-
 @st.fragment(run_every=POLL_SEC)
 def _price_ticker() -> None:
     state = _get_state()
@@ -646,7 +618,6 @@ def _price_ticker() -> None:
         )
         if quote:
             st.html(quote)
-        _volume_alert_banner(state, sym_state)
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
@@ -1177,34 +1148,6 @@ def _live_candle_patterns(state: AppState, bars: "list[dict]") -> "list[dict]":
     )
 
 
-def _volume_alert_controls() -> None:
-    state = _get_state()
-    with st.expander("🔔 Volume Alert"):
-        st.caption(
-            "Alerts when any symbol's cumulative volume today exceeds a multiple of "
-            "its average daily volume (mean of the last 20 completed days; yesterday's "
-            "volume early on). Wakes the agent early when it fires. On by default."
-        )
-        c1, c2 = st.columns([1, 1.4])
-        enabled = c1.checkbox("Enabled", value=state.volume_alert_enabled, key="vol_alert_enabled")
-        multiplier = c2.number_input(
-            "× avg daily volume",
-            min_value=0.1,
-            value=float(state.volume_alert_multiplier),
-            step=0.1,
-            format="%.1f",
-            key="vol_alert_multiplier",
-        )
-    # Changing the threshold or re-enabling clears the one-shot latches so the
-    # alert can fire again under the new settings.
-    if enabled != state.volume_alert_enabled or multiplier != state.volume_alert_multiplier:
-        for sym_state in state.iter_symbol_states():
-            sym_state.volume_alert_triggered = False
-            sym_state.volume_alert_ratio = None
-    state.volume_alert_enabled = enabled
-    state.volume_alert_multiplier = multiplier
-
-
 def _news_model_credentials(state: AppState) -> "tuple[str, str, str]":
     """Alpaca key, secret and bar feed for the news-impact model's bar fetches."""
     return (
@@ -1332,7 +1275,6 @@ def _news_panel(symbols: list[str]) -> None:
 
 def _live_panel() -> None:
     _live_chart_controls()
-    # _volume_alert_controls()
     _price_ticker()
     _chart_panel()
 

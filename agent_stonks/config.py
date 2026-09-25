@@ -147,12 +147,10 @@ OPTIONS_POLL_SEC = 60
 OPTIONS_WALL_HISTORY_MAXLEN = 200
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]
 
-# High-volume alert: trigger when today's cumulative volume exceeds
-# VOLUME_ALERT_DEFAULT_MULTIPLIER x the average daily volume. The baseline is
-# the mean of the last VOLUME_ADV_WINDOW completed daily volumes; with fewer
-# than VOLUME_ADV_MIN_DAYS completed days (thin history / early session), it
-# falls back to yesterday's single-day volume.
-VOLUME_ALERT_DEFAULT_MULTIPLIER = 1.5
+# Average daily volume (`state.current_volume_ratio`): the mean of the last
+# VOLUME_ADV_WINDOW completed daily volumes; with fewer than
+# VOLUME_ADV_MIN_DAYS completed days (thin history / early session), it falls
+# back to yesterday's single-day volume.
 VOLUME_ADV_WINDOW = 20
 VOLUME_ADV_MIN_DAYS = 5
 

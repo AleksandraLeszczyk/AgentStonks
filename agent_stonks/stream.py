@@ -210,7 +210,6 @@ def _bars_socket(
                 # "last completed bar" -- publish it as such and let the
                 # profit-potential tracker see its extremes.
                 stream_common.record_bar_close(state, bar)
-                stream_common.check_volume_alert(state)
 
                 # Generic condition alerts: a bar moves previous_minute_high/low/day_volume
                 # (and the derived volume_ratio), so re-check after every bar.

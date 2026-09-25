@@ -55,7 +55,6 @@ from .state import AppState, SymbolState
 from .stream_common import (
     TF_MINUTES,
     bar_ts_key,
-    check_volume_alert,
     fire_due_alerts,
     floor_ts,
     record_bar_close,
@@ -244,8 +243,6 @@ def apply_trade(state: SymbolState, builder: CandleBuilder, trade: dict) -> None
         if size:
             state.day_volume = (state.day_volume or 0.0) + size
     scoring.record_price(app, state.symbol, price)
-    if size:
-        check_volume_alert(state)
 
     # Keep portfolio value marked-to-market independently of the agent loop --
     # it never has to fetch or compute this itself.

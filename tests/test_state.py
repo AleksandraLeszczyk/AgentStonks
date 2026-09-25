@@ -1,6 +1,6 @@
 import threading
 
-from agent_stonks.config import MAX_BARS, PAPER_STARTING_CASH, VOLUME_ALERT_DEFAULT_MULTIPLIER
+from agent_stonks.config import MAX_BARS, PAPER_STARTING_CASH
 from agent_stonks.state import (
     AppState,
     average_daily_volume,
@@ -90,14 +90,10 @@ def test_lock_is_reentrant_from_multiple_threads():
     assert len(ss.bars) == 50
 
 
-def test_volume_alert_defaults_on():
+def test_day_volume_starts_unset():
     s = AppState()
     s.set_symbols(["AAPL"])
-    ss = s.sym("AAPL")
-    assert s.volume_alert_enabled is True
-    assert s.volume_alert_multiplier == VOLUME_ALERT_DEFAULT_MULTIPLIER
-    assert ss.volume_alert_triggered is False
-    assert ss.day_volume is None
+    assert s.sym("AAPL").day_volume is None
 
 
 def test_completed_daily_bars_excludes_today():

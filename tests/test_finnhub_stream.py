@@ -281,21 +281,6 @@ class TestApplyTrade:
         assert app.agent_wake_event.is_set()
         assert state.alerts == []
 
-    def test_fires_the_high_volume_alert(self):
-        app, state = _app()
-        app.volume_alert_enabled = True
-        app.volume_alert_multiplier = 1.5
-        state.daily_bars = [{"t": "2023-12-29T05:00:00Z", "v": 100}]
-        state.day_volume = 140.0
-        builder = _builder(state)
-
-        finnhub_stream.apply_trade(
-            state, builder, {"S": "AAPL", "p": 10.0, "s": 20.0, "t": "2024-01-01T14:00:10Z"}
-        )
-
-        assert state.volume_alert_triggered
-        assert app.agent_wake_event.is_set()
-
     def test_a_trade_without_a_size_still_moves_the_price(self):
         app, state = _app()
         state.day_volume = 500.0

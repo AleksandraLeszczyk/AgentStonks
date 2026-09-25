@@ -22,7 +22,6 @@ from .state import (
     SymbolState,
     alert_field_value,
     alert_triggered,
-    current_volume_ratio,
     format_alert,
     today_daily_volume,
 )
@@ -61,34 +60,6 @@ def fire_due_alerts(sym_state: SymbolState) -> None:
         value_str = f"{value:,.4f}" if isinstance(value, (int, float)) else "n/a"
         app.agent_wake_reason = f"Alert hit: {format_alert(alert)} (now {value_str})."
         app.agent_wake_event.set()
-
-
-def check_volume_alert(state: SymbolState) -> None:
-    """High-volume alert: today's cumulative volume crossing multiplier x average
-    daily volume. Latched per symbol so it fires once per session rather than on
-    every later tick. Safe to call after any update to `day_volume`.
-    """
-    app = state.app
-    if not app.volume_alert_enabled:
-        return
-    with state.lock:
-        if state.volume_alert_triggered:
-            return
-        day_volume = state.day_volume
-        daily_bars = state.daily_bars
-    if day_volume is None:
-        return
-    ratio, baseline = current_volume_ratio(day_volume, daily_bars)
-    if ratio is None or ratio < app.volume_alert_multiplier:
-        return
-    state.volume_alert_triggered = True
-    state.volume_alert_ratio = ratio
-    app.agent_wake_reason = (
-        f"High-volume alert for {state.symbol}: today's volume {day_volume:,.0f} is "
-        f"{ratio:.2f}x average daily volume ({baseline:,.0f}), above "
-        f"the {app.volume_alert_multiplier:.2f}x threshold."
-    )
-    app.agent_wake_event.set()
 
 
 def record_bar_close(state: SymbolState, bar: dict) -> None:
@@ -220,11 +191,8 @@ def reset_symbol_for_new_stream(state: SymbolState) -> None:
         state.previous_minute_low = last_bar.get("l") if last_bar else None
         state.previous_minute_close = last_bar.get("c") if last_bar else None
         # Seed today's running volume from today's partial daily bar (0 if the
-        # latest daily bar isn't today, e.g. pre-open/weekend) and clear the
-        # one-shot alert latch for the new session.
+        # latest daily bar isn't today, e.g. pre-open/weekend).
         state.day_volume = today_daily_volume(state.daily_bars)
-        state.volume_alert_triggered = False
-        state.volume_alert_ratio = None
         state.last_price = None
         state.bid_price = None
         state.bid_size = None

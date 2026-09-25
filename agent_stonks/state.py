@@ -19,7 +19,6 @@ from .config import (
     TACTICS_MOMENTUM_WINDOW_MIN,
     VOLUME_ADV_MIN_DAYS,
     VOLUME_ADV_WINDOW,
-    VOLUME_ALERT_DEFAULT_MULTIPLIER,
 )
 from .market_hours import MARKET_OPEN, MARKET_TZ
 from .volume_baseline import DEFAULT_VOLUME_BASELINE
@@ -135,8 +134,6 @@ class SymbolState:
         # technical_analysis.compute_opening_range) so the ORB read survives
         # bar-buffer eviction and mid-session restarts. Keyed by its "date".
         self.opening_range: dict | None = None
-        self.volume_alert_triggered: bool = False
-        self.volume_alert_ratio: float | None = None
         # Mean |1-minute close change| in $ over the last trading week, measured
         # once per ET day on a streaming start (see agent_stonks.minute_momentum).
         # None until that background read lands.
@@ -210,14 +207,6 @@ class SymbolState:
     def portfolio_value(self) -> "float | None":
         return self.app.portfolio_value
 
-    @property
-    def volume_alert_enabled(self) -> bool:
-        return self.app.volume_alert_enabled
-
-    @property
-    def volume_alert_multiplier(self) -> float:
-        return self.app.volume_alert_multiplier
-
 
 _DEFAULTS: dict[str, object] = {
     "symbols": [],
@@ -256,8 +245,6 @@ _DEFAULTS: dict[str, object] = {
     "show_momentum": True,
     "volume_baseline_window": DEFAULT_VOLUME_BASELINE,
     "fill_gaps": True,
-    "volume_alert_enabled": True,
-    "volume_alert_multiplier": VOLUME_ALERT_DEFAULT_MULTIPLIER,
     "agent_log": [],
     "agent_running": False,
     "agent_stop_event": None,
@@ -384,8 +371,6 @@ class AppState:
         # Draw synthetic flat bars at feed minutes without any trade, so the
         # candle/volume series has no visual holes.
         self.fill_gaps: bool = True
-        self.volume_alert_enabled: bool = True
-        self.volume_alert_multiplier: float = VOLUME_ALERT_DEFAULT_MULTIPLIER
         self.agent_log: list[dict] = []
         self.agent_running: bool = False
         self.agent_stop_event: "threading.Event | None" = None
