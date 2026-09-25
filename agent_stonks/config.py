@@ -316,7 +316,8 @@ APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 #               kept so records made under it replay as run, not offered
 #   "brownian"  a breached side moves to the extreme and then past it by what
 #               a driftless walk with ADR-implied volatility is still expected
-#               to add, ADR x sqrt(session left)/2; the other side stays
+#               to add, ADR x sqrt(session left)/2; with APPLE_TRADER_KEEP_WIDTH
+#               the other side follows at the unit's width, without it it stays
 #
 # The forecast already refuses to sit under the opening window's high
 # (`dayrange_model.apply_open_constraint`); the moving policies carry that same
@@ -370,6 +371,26 @@ APPLE_TRADER_BREACH_UPDATE = BREACH_SHIFT
 # A SimLab record written before this existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_CONTAIN_RANGE = True
+
+# Whether a breach under "shift" or "brownian" keeps the range at the level
+# unit's width -- the 9:35 predicted range under "pred_range", the ADR under
+# "adr" -- rather than whatever width it had come to. The breached side goes
+# where the policy puts it (the extreme, or past it by the Brownian reach) and
+# the other side follows at that width; the only thing allowed to make the
+# range wider is a followed side that would exclude a price the session has
+# already printed (`dayrange_model.contain_session`). At the user's request,
+# 2026-09-25: a moved forecast is the same day moved, not a wider day.
+#
+# Without it "shift" keeps the width the range had just before the breach
+# (which containment may already have widened, and never narrows again) and
+# "brownian" moves only the breached side, so every breach widens the range by
+# the reach. Under "pred_range" that widening is also a wider unit, so the two
+# levels drift apart through a breached day; with it they stay the gap they
+# were written as.
+#
+# A SimLab record written before this existed replays with it off
+# (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
+APPLE_TRADER_KEEP_WIDTH = True
 
 # Whether a bar that trades through the predicted high closes an open position
 # (`apple_trader.DayRangeTrader._exit`).

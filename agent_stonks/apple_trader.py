@@ -48,6 +48,7 @@ from .state import append_agent_log as _log
 from .config import (
     APPLE_TRADER_BREACH_UPDATE,
     APPLE_TRADER_CONTAIN_RANGE,
+    APPLE_TRADER_KEEP_WIDTH,
     APPLE_TRADER_BREACH_EXIT,
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_CYCLE_SEC,
@@ -207,14 +208,21 @@ class AppleTraderConfig:
     # What to do when the session trades through the forecast the two levels
     # are built on -- one of `dayrange_model.BREACH_POLICIES`. "off" is the
     # notebook's rule (one forecast, held all day); "shift" moves both sides by
-    # the breach, "brownian" (and the earlier "extreme") the breached side
-    # only, and the levels with it. See `_update_range`.
+    # the breach, "brownian" past it by the expected excursion (both sides
+    # with `keep_width`, the breached one without), "extreme" the breached side
+    # only -- and the levels with it. See `_update_range`.
     breach_update: str = APPLE_TRADER_BREACH_UPDATE
     # Whether the forecast is always widened to hold what the session has
     # printed, whatever `breach_update` says (`dayrange_model.contain_session`).
     # With it on, "off" no longer keeps a predicted high the tape has traded
     # through -- and therefore agrees with "extreme" on a breached side.
     contain_range: bool = APPLE_TRADER_CONTAIN_RANGE
+    # Whether "shift" and "brownian" keep the range at the level unit's width
+    # through a breach -- the 9:35 predicted range, or the ADR -- widening it
+    # only to hold what the session has printed (`breach_width`). Off, "shift"
+    # keeps the width the range last had and "brownian" moves one side only,
+    # which is what a stored record replays.
+    keep_width: bool = APPLE_TRADER_KEEP_WIDTH
     # Whether a bar trading through the predicted high closes an open position.
     # Tested against the high as it stood when the bar opened, and after the
     # sell level, so a breach that also reaches the target logs as the target.
@@ -465,10 +473,11 @@ def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
     the results anyway.
 
     Under "adr" this is `adr14_abs`, fixed for the session. Under "pred_range"
-    it is the current `pred_high - pred_low`, which is *not* fixed: a breach
-    ratchets one side or both (`_update_range`), so the unit -- and with it the
-    dollar gap between the two levels -- widens as the day outgrows its
-    forecast. Callers that need a number frozen at a moment (the stop, once
+    it is the current `pred_high - pred_low`, which is *not* fixed: with
+    `keep_width` a breach keeps it until the session's own range is wider than
+    the forecast, and without it a breach can widen it on every move
+    (`_update_range`), so the unit -- and with it the dollar gap between the two
+    levels -- widens as the day outgrows its forecast. Callers that need a number frozen at a moment (the stop, once
     there is a fill) must hold the dollars rather than re-reading the k.
 
     Falls back to the ADR when the forecast has no usable width, which keeps a
@@ -481,6 +490,25 @@ def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
         return adr
     width = float(plan.get("pred_high") or 0.0) - float(plan.get("pred_low") or 0.0)
     return width if width > 0 else adr
+
+
+def breach_width(config: AppleTraderConfig, plan: "dict") -> "float | None":
+    """The width a breach keeps the forecast at, in dollars -- None for none.
+
+    The level unit as it stood at 9:35: the ADR under "adr", the forecast's own
+    `pred_high - pred_low` under "pred_range" -- read from `forecast_width`,
+    which the plan keeps from before any breach, not from `level_unit`, which
+    follows the range once containment has widened it. None when `keep_width`
+    is off or the policy moves only one side (or nothing), which leaves
+    `updated_range` doing what a stored record was run under.
+    """
+    if not config.keep_width or config.breach_update not in (BREACH_SHIFT, BREACH_BROWNIAN):
+        return None
+    adr = float(plan.get("adr14_abs") or 0.0)
+    if config.level_unit != UNIT_PRED_RANGE:
+        return adr or None
+    width = float(plan.get("forecast_width") or 0.0)
+    return width if width > 0 else (adr or None)
 
 
 def stop_unit(config: AppleTraderConfig, plan: "dict") -> float:
@@ -636,6 +664,11 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # it was filed under. They are separate tokens because they are separate
     # rules: one is about what the forecast is allowed to say, the other about
     # what closes a position.
+    # Only where it can change a trade (`breach_width`), so a run under "off"
+    # signs the same either way -- and every record written before it existed,
+    # which replays with it off, keeps the signature it was filed under.
+    if c.keep_width and c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+        breach += ",keep_width"
     if c.contain_range:
         breach += ",contain"
     if c.breach_exit:
@@ -1902,6 +1935,11 @@ class DayRangeTrader(BaseTrader):
         # without the breach rather than last minute's with it -- the breach's
         # own effect, which is what the line is about.
         self._set_levels(ts)
+        # The width the forecast was made at, kept before anything can move it
+        # -- this is the first bar past the opening window that gets here.
+        plan.setdefault(
+            "forecast_width", float(plan["pred_high"]) - float(plan["pred_low"])
+        )
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
         session_high = float(frame["high"].max())
@@ -1913,6 +1951,7 @@ class DayRangeTrader(BaseTrader):
             minutes_left=dayrange.minutes_left_at(ts),
             policy=config.breach_update,
             contain=config.contain_range,
+            width=breach_width(config, plan),
         )
         if high == before["pred_high"] and low == before["pred_low"]:
             return None
@@ -1952,12 +1991,20 @@ class DayRangeTrader(BaseTrader):
             moved.append(
                 f"it has traded down through the ${before['pred_low']:,.2f} predicted low"
             )
+        width = breach_width(config, plan)
         if config.breach_update == BREACH_BROWNIAN:
             left = dayrange.minutes_left_at(ts)
             reach = dayrange.brownian_reach(plan["adr14_abs"], left)
             how = (
                 f"the extreme so far, extended by the ${reach:,.2f} a driftless walk with "
                 f"this ADR's volatility is still expected to add over the {left:.0f} min left"
+            )
+            if width and breached_high != breached_low:
+                how += f", and the other side ${width:,.2f} from it"
+        elif width and breached_high != breached_low:
+            how = (
+                f"the breached side moved to the extreme so far and the other ${width:,.2f} "
+                "from it, no further than the session has printed"
             )
         elif config.breach_update == BREACH_SHIFT and breached_high != breached_low:
             how = (
@@ -2618,7 +2665,11 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
 
 def _breach_side(config: AppleTraderConfig) -> str:
     """What a breach moves under this policy, for the log lines that say so."""
-    return "both sides of it" if config.breach_update == BREACH_SHIFT else "the breached side"
+    if config.breach_update == BREACH_SHIFT or (
+        config.keep_width and config.breach_update == BREACH_BROWNIAN
+    ):
+        return "both sides of it"
+    return "the breached side"
 
 
 def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:

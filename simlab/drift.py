@@ -14,6 +14,10 @@ What each model is scored on
                 day's actual high and low (the stored daily bar), as a share of
                 that session's own average daily range. Needs the opening
                 minutes, so only sessions with stored minute bars.
+`highlow`       HighLow's 9:35 forecast of the same high and low, scored the
+                same way against the same daily bar. Its history is SIP minute
+                bars rolled up per session (`highlow_model`'s cache), its opening
+                minutes the stored tape's.
 `intraday_vol`  IntradayVolatility's daily-bar forecast of the log day range
                 against the day's ln(high/low) -- daily bars only, so the whole
                 stored daily history -- plus how well each session's 5-minute
@@ -47,11 +51,12 @@ session-level version of what the ML Models tab prints in its headline column,
 named by `DriftModel.headline`. For the open profile that is literally the same
 quantity the saved file was graded on -- an EMD in bps -- so the reference line
 on the chart is that grade and the series is the same measurement taken later.
-The other two are near misses, and `DriftModel.catalogue_metric` says which
+The others are near misses, and `DriftModel.catalogue_metric` says which
 kind on screen rather than letting the two pages look interchangeable when they
-are not: the day range is graded in the same unit (error as a share of ADR) but
-the ML Models tab has only one day's ADR in the saved file to divide by, where
-every session here is divided by its own; `intraday_vol` is graded by a
+are not: both day ranges are graded in the same unit (error as a share of ADR)
+but the ML Models tab has only one ADR to divide by -- the one day's the
+TimeToChange3 file records, the test window's mean for HighLow -- where every
+session here is divided by its own; `intraday_vol` is graded by a
 walk-forward R², which is a statistic of a window rather than of a session, so
 what is tracked is the error term inside it.
 
@@ -68,7 +73,7 @@ from __future__ import annotations
 import gzip
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable
@@ -656,6 +661,36 @@ def dayrange_training(ticker: str) -> dict:
     return dayrange_training_from_metadata(_read_json(path))
 
 
+def _range_row(iso: str, forecast: dict, outcome: dict) -> dict:
+    """One session's day-range metrics: a forecast's high and low against the
+    stored daily bar's. Shared by both day-range models, so the two are scored
+    against the same truth in the same arithmetic and their charts can be read
+    against each other."""
+    high, low = float(outcome["h"]), float(outcome["l"])
+    err_high = math.log(forecast["pred_high"] / high)
+    err_low = math.log(forecast["pred_low"] / low)
+    mae_usd = (abs(forecast["pred_high"] - high) + abs(forecast["pred_low"] - low)) / 2
+    # The session's own trailing range, which the forecast already carries
+    # because the trading rules need it. None rather than a guess when the
+    # bundle could not compute one: an unscored session is a gap in the
+    # series, which the chart draws as a gap.
+    adr = float(forecast.get("adr14_abs") or 0.0)
+    return {
+        "date": iso,
+        "mae_pct_adr": 100.0 * mae_usd / adr if adr > 0 else None,
+        "mae": (abs(err_high) + abs(err_low)) / 2,
+        "mae_usd": mae_usd,
+        "abs_err_high": abs(err_high),
+        "abs_err_low": abs(err_low),
+        "bias_high": err_high,
+        "bias_low": err_low,
+        "pred_high": forecast["pred_high"],
+        "pred_low": forecast["pred_low"],
+        "actual_high": high,
+        "actual_low": low,
+    }
+
+
 def evaluate_dayrange(ticker: str, feed: str) -> dict:
     """Every stored minute session's forecast against its actual high and low."""
     symbol = ticker.upper()
@@ -690,30 +725,145 @@ def evaluate_dayrange(ticker: str, feed: str) -> dict:
         except ValueError as exc:
             failures.setdefault(str(exc).rstrip("."), []).append(iso)
             continue
-        high, low = float(outcome["h"]), float(outcome["l"])
-        err_high = math.log(forecast["pred_high"] / high)
-        err_low = math.log(forecast["pred_low"] / low)
-        mae_usd = (abs(forecast["pred_high"] - high) + abs(forecast["pred_low"] - low)) / 2
-        # The session's own trailing range, which the forecast already carries
-        # because the trading rules need it. None rather than a guess when the
-        # bundle could not compute one: an unscored session is a gap in the
-        # series, which the chart draws as a gap.
-        adr = float(forecast.get("adr14_abs") or 0.0)
-        rows.append({
-            "date": iso,
-            "mae_pct_adr": 100.0 * mae_usd / adr if adr > 0 else None,
-            "mae": (abs(err_high) + abs(err_low)) / 2,
-            "mae_usd": mae_usd,
-            "abs_err_high": abs(err_high),
-            "abs_err_low": abs(err_low),
-            "bias_high": err_high,
-            "bias_low": err_low,
-            "pred_high": forecast["pred_high"],
-            "pred_low": forecast["pred_low"],
-            "actual_high": high,
-            "actual_low": low,
-        })
+        rows.append(_range_row(iso, forecast, outcome))
     return {"rows": rows, "notes": _failures_to_notes(failures)}
+
+
+# --- day range at 9:35 (HighLow) --------------------------------------------
+
+
+# The day-range metrics, since the two models answer the same question and are
+# worth one set of axes -- except for the log-unit MAE, whose help names the
+# project that reports its test error in them.
+HIGHLOW_METRICS = tuple(
+    replace(m, help="|log(predicted ÷ actual)| for the session high and for the low, "
+                    "averaged — the units HighLow reports its held-out test error in.")
+    if m.key == "mae" else m
+    for m in DAYRANGE_METRICS
+)
+
+
+def highlow_training_from_metadata(meta: dict, sessions: "dict | None" = None) -> dict:
+    """Cutoffs and references out of a HighLow bundle's JSON sidecar.
+
+    One cutoff: notebook 04 chooses its settings on a train/validation/test
+    split and then refits every model on every session before the held-out
+    week (`data.fit_through`), so the shipped bundle has seen its own test
+    window -- the references are what that window scored *before* the refit.
+    `sessions` is the SIP rollup cache the ADR share is measured off, read from
+    disk when not given (see `model_catalogue.highlow_error_pct_adr`).
+    """
+    cutoffs: "list[Cutoff]" = []
+    references: "list[Reference]" = []
+    if not meta:
+        return {"cutoffs": cutoffs, "references": references}
+    data = meta.get("data") or {}
+    if data.get("fit_through"):
+        cutoffs.append(Cutoff(
+            str(data["fit_through"])[:10], "Trained through",
+            f"every model in the blend refitted on {data.get('sessions', '?')} SIP "
+            f"sessions from {str(data.get('history_start') or '?')[:10]}",
+        ))
+    test = meta.get("test_metrics") or {}
+    window = (meta.get("splits") or {}).get("test") or []
+    where = (
+        f"the {str(window[0])[:10]} – {str(window[-1])[:10]} test window, scored before the "
+        "final refit" if len(window) == 2 else "the held-out test window"
+    )
+    measured = model_catalogue.highlow_error_pct_adr(meta, sessions=sessions)
+    if measured is not None:
+        references.append(Reference(
+            "mae_pct_adr", measured[0], "Held-out test window",
+            # Without the number of sessions the ADR was averaged over: it
+            # differs by ticker, and the tab groups references on their note.
+            f"the ML Models tab's headline: {where}, its mean error over the mean 14-day "
+            "range of the sessions in it the SIP cache holds — an estimate of this ratio "
+            "rather than a measurement of it",
+        ))
+    for metric, field in (
+        ("mae", "mae_mean"), ("mae_usd", "mae_usd_mean"),
+        ("abs_err_high", "mae_high"), ("abs_err_low", "mae_low"),
+    ):
+        if test.get(field) is not None:
+            references.append(Reference(
+                metric, float(test[field]), "Held-out test window",
+                f"{where}, against the SIP minute bars' extremes",
+            ))
+    if meta.get("walk_forward_mae_mean") is not None:
+        references.append(Reference(
+            "mae", float(meta["walk_forward_mae_mean"]), "Walk-forward",
+            "the notebook's walk-forward folds, each refitted on everything before it",
+        ))
+    return {"cutoffs": cutoffs, "references": references}
+
+
+def highlow_training(ticker: str) -> dict:
+    spec = model_catalogue.spec(apple_models.HIGHLOW_KEY, ticker)
+    path = next((f.path for f in spec.files if f.role == "metadata"), None) if spec else None
+    meta = _read_json(path)
+    # The sidecar's own ticker is the one its test window was graded on.
+    return highlow_training_from_metadata(
+        {**meta, "ticker": meta.get("ticker") or ticker.upper()} if meta else meta
+    )
+
+
+def evaluate_highlow(ticker: str, feed: str) -> dict:
+    """Every stored minute session's 9:35 forecast against its actual high and low.
+
+    The history is the model's own -- SIP minute bars rolled up per session,
+    read from `highlow_model`'s cache and fetched into it where the cache falls
+    short, exactly as a live run or a replay reads it, strictly before the day.
+    The opening five minutes come from the chosen tape, as a replay of that
+    tape would feed them. The outcome is the stored daily bar, as for
+    TimeToChange3, so the two day-range models are graded against one truth.
+    """
+    symbol = ticker.upper()
+    bundle = apple_models.load(apple_models.HIGHLOW_KEY, symbol)
+    if bundle is None:
+        return {"rows": [], "notes": [
+            apple_models.unavailable_reason(apple_models.HIGHLOW_KEY, symbol)
+        ]}
+    from agent_stonks import highlow_model  # torch + LightGBM, only once needed
+
+    days = stored_minute_days(symbol, feed)
+    notes: "list[str]" = []
+    if feed == "iex":
+        notes.append(
+            "The opening volumes come off the IEX tape and the history off SIP, so the "
+            "two opening-volume features read low on every session here."
+        )
+    # The history for the first and the last stored day, once each, before the
+    # loop: between them they stretch the cache over every day in between, so
+    # a missing key or a failed fetch is one note rather than one per session.
+    try:
+        for day in (days[:1] + days[-1:]):
+            highlow_model.history_frame(symbol, day)
+    except Exception as exc:  # noqa: BLE001 -- a network error is a note here
+        return {"rows": [], "notes": notes + [
+            f"No SIP history for the HighLow forecast — {str(exc).rstrip('.')}."
+        ]}
+    daily = _daily(symbol, feed)
+    by_date = {str(b["t"])[:10]: b for b in daily}
+    want = highlow_model.opening_minutes(bundle)
+    rows: "list[dict]" = []
+    failures: "dict[str, list[str]]" = {}
+    for day in days:
+        iso = day.isoformat()
+        outcome = by_date.get(iso)
+        if outcome is None:
+            failures.setdefault("no stored daily bar to score the day against", []).append(iso)
+            continue
+        session = _session_frame(symbol, day, feed)
+        if len(session) < want or float(session["minutes_from_open"].iloc[0]) >= 1.0:
+            failures.setdefault("the opening minutes are not stored", []).append(iso)
+            continue
+        try:
+            forecast = highlow_model.forecast_session(bundle, symbol, session.iloc[:want], day)
+        except ValueError as exc:
+            failures.setdefault(str(exc).rstrip("."), []).append(iso)
+            continue
+        rows.append(_range_row(iso, forecast, outcome))
+    return {"rows": rows, "notes": notes + _failures_to_notes(failures)}
 
 
 # --- intraday volatility (IntradayVolatility) -------------------------------
@@ -990,6 +1140,28 @@ MODELS: "dict[str, DriftModel]" = {
             "sessions instead of the held-out test window, and divided by each "
             "session's own average daily range rather than by the one day's ADR the "
             "saved file records"
+        ),
+    ),
+    apple_models.HIGHLOW_KEY: DriftModel(
+        key=apple_models.HIGHLOW_KEY,
+        label=apple_models.get(apple_models.HIGHLOW_KEY).label,
+        summary=(
+            "The 9:35 forecast of the session high and low against the day's actual ones, on "
+            "every stored session with its opening minutes — scored like TimeToChange3 above, "
+            "so the two can be read against each other. Refitted on every session before its "
+            "held-out week, so the sessions from that week on are the ones it never saw."
+        ),
+        tickers=apple_models.HIGHLOW_TICKERS,
+        needs_minute_bars=True,
+        metrics=HIGHLOW_METRICS,
+        evaluate=evaluate_highlow,
+        training=highlow_training,
+        headline="mae_pct_adr",
+        catalogue_metric=(
+            "MAE (% of ADR) — the same quantity the ML Models tab reports, on later "
+            "sessions instead of the test window, against the stored daily bar rather "
+            "than the SIP minute extremes, and divided by each session's own average "
+            "daily range rather than by the window's mean one"
         ),
     ),
     "intraday_vol": DriftModel(

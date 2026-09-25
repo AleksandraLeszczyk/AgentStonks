@@ -187,6 +187,10 @@ _APPLE_LEGACY = {
     # stayed the number every level was measured from. False is that rule, and
     # it is left out of the signature.
     "contain_range": False,
+    # And before a breach kept the unit's width (2026-09-25) "shift" kept the
+    # width the range last had and "brownian" moved only the breached side.
+    # False is that rule, and it is left out of the signature.
+    "keep_width": False,
     # And a breach moved the forecast rather than closing anything: under
     # "brownian" the sell level was carried past the bar that breached and the
     # position rode on. False replays that, so such a record's ledger and its

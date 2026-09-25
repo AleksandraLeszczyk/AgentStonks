@@ -189,7 +189,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     would rewrite what they assert. `TestIntradayRangeUpdate`,
     `TestIntradayLevelSource` and `TestMinimumWin` are where each is switched on.
 
-    `level_unit`, `contain_range` and `breach_exit` are pinned to what came
+    `level_unit`, `contain_range`, `keep_width` and `breach_exit` are pinned to what came
     before today's defaults, for the same reason and with the same consequence:
     `BUY_LEVEL` and `SELL_LEVEL` above are ADR arithmetic, and the breach
     policies in `TestIntradayRangeUpdate` are only separable from each other
@@ -217,6 +217,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("min_win_k", 0.0)
     kwargs.setdefault("level_unit", UNIT_ADR)
     kwargs.setdefault("contain_range", False)
+    kwargs.setdefault("keep_width", False)
     kwargs.setdefault("breach_exit", False)
     kwargs.setdefault("scale_in", False)
     kwargs.setdefault("max_fall_k", 0.0)
@@ -2181,6 +2182,59 @@ class TestRangeContainment:
         assert old.contain_range is False
         assert "contain" not in config_signature(old)
         assert "contain" in config_signature(AppleTraderConfig(model_key="dayrange"))
+
+
+class TestKeepWidth:
+    """A breach keeps the range at the level unit's width (2026-09-25).
+
+    FORECAST is $95 - $110 ($15) with a $10 ADR, so which of the two widths a
+    breach keeps shows in where the side that followed ends up.
+    """
+
+    def _run(self, policy, state, tape, **kwargs):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(94.0))
+        trader = at.DayRangeTrader(
+            dayrange_config(breach_update=policy, keep_width=True, **kwargs)
+        )
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return trader
+
+    def test_under_adr_the_high_follows_a_low_breach_one_adr_above_it(
+        self, state, market_open, monkeypatch
+    ):
+        tape = Tape(monkeypatch)
+        tape.append(94.5, low=94.0)
+        trader = self._run("shift", state, tape)
+
+        assert trader.plan["pred_low"] == pytest.approx(94.0)
+        assert trader.plan["pred_high"] == pytest.approx(104.0)
+        assert trader.plan["buy_level"] == pytest.approx(104.0 - 0.75 * 10)
+
+    def test_under_the_predicted_range_it_keeps_the_935_width(
+        self, state, market_open, monkeypatch
+    ):
+        tape = Tape(monkeypatch)
+        tape.append(94.5, low=94.0)
+        trader = self._run("brownian", state, tape, level_unit=UNIT_PRED_RANGE)
+
+        reach = at._dayrange().brownian_reach(10.0, 325.0)
+        assert trader.plan["pred_low"] == pytest.approx(94.0 - reach)
+        assert trader.plan["pred_high"] - trader.plan["pred_low"] == pytest.approx(15.0)
+        assert at.level_unit(trader.config, trader.plan) == pytest.approx(15.0)
+
+    def test_a_record_written_before_it_replays_without_it(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record(
+            {"model_key": "dayrange", "buy_k": 0.75, "breach_update": "brownian"}
+        )
+        assert old.keep_width is False
+        assert "keep_width" not in config_signature(old)
+        new = AppleTraderConfig(model_key="dayrange", breach_update="brownian")
+        assert "keep_width" in config_signature(new)
+        # Nothing to keep when nothing moves.
+        held = AppleTraderConfig(model_key="dayrange", breach_update="off")
+        assert "keep_width" not in config_signature(held)
 
 
 class TestBreachExit:

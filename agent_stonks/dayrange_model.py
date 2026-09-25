@@ -1031,6 +1031,7 @@ def updated_range(
     minutes_left: float,
     policy: str = BREACH_OFF,
     contain: bool = False,
+    width: "float | None" = None,
 ) -> "tuple[float, float]":
     """`(pred_high, pred_low)` after what the session has actually printed.
 
@@ -1057,6 +1058,16 @@ def updated_range(
     now. The first cannot over-reach and will always be a touch late; the second
     leads the tape and pays for that with a level the day may never come back to.
 
+    `width` (the level unit's dollars at 9:35 -- the predicted range, or the
+    ADR) changes what the side that was *not* breached does under `shift` and
+    `brownian`: it is put `width` away from the breached side, wherever that
+    landed, so the range keeps the width the levels were written against rather
+    than whatever width it had drifted to. It is then held to what the session
+    has printed (`contain_session`), which is the only thing ever allowed to
+    widen it. Without `width` the two policies behave as they did before it
+    existed -- `shift` keeps the current width, `brownian` moves one side --
+    which is what a stored record replays.
+
     An unknown policy reads as `off`. Callers get their policy from a stored
     record or a form, and a typo that silently traded a different strategy would
     be worse than one that traded the notebook's.
@@ -1070,7 +1081,31 @@ def updated_range(
     """
     high = float(forecast["pred_high"])
     low = float(forecast["pred_low"])
-    if policy == BREACH_SHIFT:
+    if width and width > 0 and policy in (BREACH_SHIFT, BREACH_BROWNIAN):
+        reach = (
+            brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
+            if policy == BREACH_BROWNIAN
+            else 0.0
+        )
+        up = session_high is not None and float(session_high) > high
+        down = session_low is not None and float(session_low) < low
+        # The breached side goes where the policy puts it and the other follows
+        # at `width`. A bar through both sides leaves no side to follow: both go
+        # to their extremes, which is already wider than the width.
+        if up:
+            high = float(session_high) + reach
+            if not down:
+                low = high - float(width)
+        if down:
+            low = float(session_low) - reach
+            if not up:
+                high = low + float(width)
+        # A followed side that would exclude a price already printed is the
+        # one reason the range may come out wider than `width`.
+        high, low = contain_session(
+            high, low, session_high=session_high, session_low=session_low
+        )
+    elif policy == BREACH_SHIFT:
         # The breach on each side, as a distance past the forecast. A bar wide
         # enough to breach both sides moves the range by the difference.
         up = max(0.0, float(session_high) - high) if session_high is not None else 0.0

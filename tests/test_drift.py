@@ -128,6 +128,57 @@ class TestTraining:
         assert ref.value == pytest.approx(0.3 * math.sqrt(2 / math.pi))
 
 
+HIGHLOW_META = {
+    "ticker": "AAPL",
+    "data": {"history_start": "2023-07-10", "fit_through": "2026-08-28", "sessions": 782},
+    "held_out_week": ["2026-08-31", "2026-09-04"],
+    "splits": {"train_end": "2025-06-30", "val": ["2025-07-01", "2025-12-31"],
+               "test": ["2026-01-01", "2026-07-09"]},
+    "test_metrics": {"mae_mean": 0.005, "mae_high": 0.0051, "mae_low": 0.0049,
+                     "mae_usd_mean": 1.37},
+    "walk_forward_mae_mean": 0.0048,
+}
+# SIP rollups whose every session spans log(1.02): the ADR the ratio divides by.
+HIGHLOW_SESSIONS = {
+    str(d.date()): {"high": 102.0, "low": 100.0}
+    for d in pd.bdate_range("2025-12-01", periods=40)
+}
+
+
+class TestHighLowTraining:
+    def test_the_one_cutoff_is_the_final_refit(self):
+        """Notebook 04 refits on every session before the held-out week, so the
+        train/validation/test split is not a cutoff of the shipped bundle."""
+        training = dr.highlow_training_from_metadata(HIGHLOW_META, HIGHLOW_SESSIONS)
+        [cutoff] = training["cutoffs"]
+        assert cutoff.date == "2026-08-28" and "782" in cutoff.note
+
+    def test_the_headline_reference_is_the_ml_models_tab_number(self):
+        training = dr.highlow_training_from_metadata(HIGHLOW_META, HIGHLOW_SESSIONS)
+        refs = {r.metric: r for r in training["references"] if r.label == "Held-out test window"}
+        assert refs["mae_pct_adr"].value == pytest.approx(100 * 0.005 / math.log(1.02))
+        assert refs["mae_pct_adr"].value == pytest.approx(
+            dr.model_catalogue.highlow_error_pct_adr(HIGHLOW_META, sessions=HIGHLOW_SESSIONS)[0]
+        )
+        assert (refs["mae"].value, refs["abs_err_high"].value, refs["mae_usd"].value) == (
+            0.005, 0.0051, 1.37
+        )
+
+    def test_the_walk_forward_error_is_a_second_mae_line(self):
+        training = dr.highlow_training_from_metadata(HIGHLOW_META, HIGHLOW_SESSIONS)
+        assert {(r.label, r.value) for r in training["references"] if r.metric == "mae"} == {
+            ("Held-out test window", 0.005), ("Walk-forward", 0.0048),
+        }
+
+    def test_no_cached_history_means_no_adr_line(self):
+        """Nothing to divide by -- a percentage of an assumed range would be worse."""
+        training = dr.highlow_training_from_metadata(HIGHLOW_META, {})
+        assert "mae_pct_adr" not in {r.metric for r in training["references"]}
+
+    def test_missing_metadata_is_no_cutoffs_rather_than_an_error(self):
+        assert dr.highlow_training_from_metadata({}) == {"cutoffs": [], "references": []}
+
+
 # --- scoring on a synthetic store --------------------------------------------
 
 
@@ -228,6 +279,76 @@ class TestDayRange:
     def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
         monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
         result = dr.evaluate_dayrange(TICKER, FEED)
+        assert result["rows"] == [] and result["notes"]
+
+
+class TestHighLow:
+    FORECAST = {"pred_high": 105.0, "pred_low": 99.0, "prev_avg": 100.0,
+                "adr14_abs": 2.0, "or_high": 101.2, "or_low": 100.8}
+
+    @pytest.fixture()
+    def highlow(self, monkeypatch):
+        highlow = pytest.importorskip("agent_stonks.highlow_model")
+        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: {"opening_minutes": 5})
+        monkeypatch.setattr(highlow, "history_frame", lambda *a, **k: pd.DataFrame())
+        return highlow
+
+    @pytest.fixture()
+    def stubbed(self, highlow, monkeypatch):
+        seen = []
+
+        def forecast(bundle, ticker, opening, session_date, key=None, secret=None):
+            seen.append({"ticker": ticker, "opening": opening, "day": session_date})
+            return dict(self.FORECAST)
+
+        monkeypatch.setattr(highlow, "forecast_session", forecast)
+        return seen
+
+    def test_scored_exactly_as_the_other_day_range_model(self, store, stubbed, monkeypatch):
+        """One truth and one arithmetic, so the two charts can be read side by side."""
+        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
+        monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: dict(self.FORECAST))
+        assert dr.evaluate_highlow(TICKER, FEED)["rows"] == dr.evaluate_dayrange(TICKER, FEED)["rows"]
+        assert [r["date"] for r in dr.evaluate_highlow(TICKER, FEED)["rows"]] == [str(d) for d in DAYS]
+
+    def test_the_forecast_is_fed_the_days_first_five_minutes(self, store, stubbed):
+        dr.evaluate_highlow(TICKER, FEED)
+        assert [c["day"] for c in stubbed] == DAYS
+        for call in stubbed:
+            opening = call["opening"]
+            assert len(opening) == 5 and set(opening.index.date) == {call["day"]}
+            assert opening.index[0].strftime("%H:%M") == "09:30"
+
+    def test_the_history_is_read_before_the_first_and_the_last_day(self, store, stubbed, highlow, monkeypatch):
+        asked = []
+        monkeypatch.setattr(highlow, "history_frame", lambda symbol, before, *a, **k: asked.append(before))
+        dr.evaluate_highlow(TICKER, FEED)
+        assert asked == [DAYS[0], DAYS[-1]]
+
+    def test_no_history_is_one_note_not_one_per_session(self, store, stubbed, highlow, monkeypatch):
+        def refuse(*a, **k):
+            raise ValueError("no Alpaca credentials are available.")
+
+        monkeypatch.setattr(highlow, "history_frame", refuse)
+        result = dr.evaluate_highlow(TICKER, FEED)
+        assert result["rows"] == [] and stubbed == []
+        [note] = result["notes"]
+        assert "no Alpaca credentials" in note
+
+    def test_a_forecast_refused_is_a_grouped_note(self, store, highlow, monkeypatch):
+        def refuse(*a, **k):
+            raise ValueError("only 90 complete SIP sessions of history.")
+
+        monkeypatch.setattr(highlow, "forecast_session", refuse)
+        result = dr.evaluate_highlow(TICKER, FEED)
+        assert result["rows"] == []
+        assert result["notes"] == [
+            f"2 sessions not scored — only 90 complete SIP sessions of history ({DAYS[0]}, {DAYS[1]})."
+        ]
+
+    def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
+        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
+        result = dr.evaluate_highlow(TICKER, FEED)
         assert result["rows"] == [] and result["notes"]
 
 

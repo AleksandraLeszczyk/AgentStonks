@@ -396,6 +396,73 @@ class TestIntradayUpdate:
         assert again == high
 
 
+class TestUpdatedRangeKeepsTheWidth:
+    """`width`: a breach moves the day, it does not make it wider.
+
+    The breached side goes where the policy puts it and the other side follows
+    at `width` -- the level unit's dollars at 9:35 -- so the only thing that
+    can make the range wider than that is a price the session already printed.
+    """
+
+    FORECAST = {"pred_high": 110.0, "pred_low": 100.0, "adr14_abs": 10.0}
+    NOON = 240.0
+
+    def _update(self, policy, high, low, width, forecast=None, minutes_left=NOON):
+        return D.updated_range(
+            forecast or self.FORECAST,
+            session_high=high, session_low=low,
+            minutes_left=minutes_left, policy=policy, width=width,
+        )
+
+    def test_shift_puts_the_other_side_the_width_away(self):
+        # The forecast's own $10: the same answer as without `width`.
+        assert self._update(D.BREACH_SHIFT, 112.5, 103.0, 10.0) == (112.5, 102.5)
+        # An $8 ADR under the "adr" unit: the low follows $8 under the high.
+        assert self._update(D.BREACH_SHIFT, 112.5, 106.0, 8.0) == (112.5, 104.5)
+        assert self._update(D.BREACH_SHIFT, 104.0, 97.0, 8.0) == (105.0, 97.0)
+
+    def test_brownian_moves_both_sides_and_keeps_the_width(self):
+        reach = D.brownian_reach(10.0, self.NOON)
+        high, low = self._update(D.BREACH_BROWNIAN, 112.5, 107.0, 10.0)
+        assert high == pytest.approx(112.5 + reach)
+        assert high - low == pytest.approx(10.0)
+        low, high = self._update(D.BREACH_BROWNIAN, 103.0, 99.0, 10.0)[::-1]
+        assert low == pytest.approx(99.0 - reach)
+        assert high - low == pytest.approx(10.0)
+
+    @pytest.mark.parametrize("policy", [D.BREACH_SHIFT, D.BREACH_BROWNIAN])
+    def test_it_widens_only_to_hold_what_the_session_printed(self, policy):
+        # Up through $110 while $101 has already traded: a low $10 under the
+        # new high would exclude it, so the low stops at $101 -- and no lower.
+        high, low = self._update(policy, 112.5, 101.0, 10.0)
+        assert low == 101.0
+        assert high >= 112.5
+
+    def test_a_range_that_was_widened_comes_back_to_the_width(self):
+        """The width is the unit's, not whatever the range last had: once the
+        session no longer needs the extra, the next breach drops it."""
+        widened = {**self.FORECAST, "pred_high": 115.0, "pred_low": 100.0}
+        assert self._update(D.BREACH_SHIFT, 116.0, 107.0, 10.0, forecast=widened) == (
+            116.0, 106.0
+        )
+        # Without `width`, "shift" keeps the $15 it had.
+        assert D.updated_range(
+            widened, session_high=116.0, session_low=107.0, minutes_left=self.NOON,
+            policy=D.BREACH_SHIFT,
+        ) == (116.0, 101.0)
+
+    def test_an_unbreached_range_is_untouched(self):
+        for policy in (D.BREACH_SHIFT, D.BREACH_BROWNIAN):
+            assert self._update(policy, 109.0, 101.0, 8.0) == (110.0, 100.0)
+
+    @pytest.mark.parametrize("policy", [D.BREACH_OFF, D.BREACH_EXTREME])
+    def test_the_one_sided_policies_ignore_it(self, policy):
+        assert self._update(policy, 112.5, 106.0, 8.0) == D.updated_range(
+            self.FORECAST, session_high=112.5, session_low=106.0,
+            minutes_left=self.NOON, policy=policy,
+        )
+
+
 class TestMinutesLeft:
     @staticmethod
     def _et(stamp):
