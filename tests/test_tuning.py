@@ -8,6 +8,7 @@ replay-backed minute frame -- are pinned against the scans they replaced,
 at every step of a stored session, because a faster replay that answered
 differently would make every tuned number wrong.
 """
+import os
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -59,16 +60,17 @@ class TestGrid:
             assert tu.axis_values(tunable.name, *tunable.default_range)
 
 
+def dataset(name: str = "d", day: date = TUNE_DAY, **overrides) -> dict:
+    return {"name": name, "days": [str(day)], "feed": sim_data.DEFAULT_FEED,
+            "symbols": [TICKER], **overrides}
+
+
 def spec(**overrides):
-    dataset = {"name": "d", "days": [str(TUNE_DAY)], "feed": sim_data.DEFAULT_FEED,
-               "symbols": [TICKER]}
     base = {
         "base": asdict(AppleTraderConfig(ticker=TICKER)),
         "axes": [{"name": "buy_k", "values": [0.5, 0.7]}],
-        "tune_dataset": dataset,
-        "test_dataset": {**dataset, "name": "e", "days": [str(TEST_DAY)]},
+        "datasets": [dataset("d", TUNE_DAY), dataset("e", TEST_DAY)],
         "starting_cash": 10_000.0,
-        "sweep_test_grid": False,
     }
     return {**base, **overrides}
 
@@ -279,8 +281,15 @@ class TestValidation:
         assert "twice" in tu.validate(spec(axes=axes))
 
     def test_a_dataset_without_the_instrument_is_refused(self):
-        other = {**spec()["tune_dataset"], "symbols": ["GOOGL"]}
-        assert "does not carry AAPL" in tu.validate(spec(tune_dataset=other))
+        other = dataset("f", symbols=["GOOGL"])
+        assert "does not carry AAPL" in tu.validate(spec(datasets=[dataset(), other]))
+
+    def test_at_least_one_dataset(self):
+        assert "at least one dataset" in tu.validate(spec(datasets=[]))
+
+    def test_the_same_dataset_twice_is_refused(self):
+        """Cells are kept by dataset name: twice would be one sweep summed twice."""
+        assert "twice" in tu.validate(spec(datasets=[dataset(), dataset()]))
 
     def test_a_rule_is_a_parameter_a_job_may_tune(self):
         """The levels under each forecast policy, which is the comparison the
@@ -306,10 +315,9 @@ class TestValidation:
                 {"name": "sell_k", "values": list(range(30))}]
         assert "more than" in tu.validate(spec(axes=axes))
 
-    def test_the_replay_count_follows_what_the_test_set_sweeps(self):
-        assert tu.total_replays(spec()) == 2 + 1 + 1 + 1
-        assert tu.total_replays(spec(sweep_test_grid=True)) == 2 + 1 + 2 + 1
-        assert tu.total_replays(spec(test_dataset=None)) == 2 + 1
+    def test_the_replay_count_is_the_grid_and_the_baseline_on_every_dataset(self):
+        assert tu.total_replays(spec()) == (2 + 1) * 2
+        assert tu.total_replays(spec(datasets=[dataset()])) == 2 + 1
 
 
 # --- the pick ---------------------------------------------------------------
@@ -409,6 +417,78 @@ class TestPick:
         assert tu.overlapping_days(["2026-06-15", "2026-06-16"], ["2026-06-16"]) == ["2026-06-16"]
 
 
+# --- the sum over datasets --------------------------------------------------
+
+
+def scored(overrides, profit, *, days=5, traded=5, worst=-10.0, best=20.0, run_id=None):
+    cell = {"overrides": overrides, "profit": profit, "return_pct": profit / 100.0,
+            "trades": traded, "sells": traded, "days": days, "days_traded": traded,
+            "days_up": 1 if profit > 0 else 0, "days_down": 0 if profit > 0 else 1,
+            "worst_day": worst, "best_day": best, "daily": {}, "no_forecast_days": [],
+            "error": None}
+    if run_id:
+        cell["run_id"] = run_id
+    return cell
+
+
+def job_record(datasets: "dict[str, list[dict]]", axes=None, **spec_overrides) -> dict:
+    """A job record over `{dataset name: cells}`, as the store keeps one."""
+    axes = axes or [{"name": "buy_k", "values": [0.3, 0.5]}]
+    return {
+        "job_id": "j", "status": tu.FINISHED,
+        "spec": {**spec(axes=axes, datasets=[dataset(n) for n in datasets]), **spec_overrides},
+        "cells": {n: list(cells) for n, cells in datasets.items()},
+        "baseline": {n: scored({}, 1.0) for n in datasets},
+        "best": None,
+    }
+
+
+class TestSum:
+    """The heatmap a job is picked on: every dataset's grid, added cell by cell."""
+
+    def test_profits_returns_and_counts_add_and_the_extremes_are_kept(self):
+        total = tu.combine({"buy_k": 0.3}, [
+            scored({"buy_k": 0.3}, 300.0, worst=-50.0, best=90.0, traded=4),
+            scored({"buy_k": 0.3}, -100.0, worst=-80.0, best=40.0, traded=2, run_id="r"),
+        ])
+        assert total["profit"] == 200.0 and total["return_pct"] == pytest.approx(2.0)
+        assert (total["days"], total["days_traded"], total["trades"]) == (10, 6, 6)
+        assert (total["worst_day"], total["best_day"]) == (-80.0, 90.0)
+        assert (total["datasets"], total["datasets_up"], total["reused"]) == (2, 1, 1)
+        assert tu.is_scored(total)
+
+    def test_a_dataset_not_yet_swept_leaves_a_hole(self):
+        """A partial total would read as a bad cell rather than an unfinished one."""
+        assert tu.combine({"buy_k": 0.3}, [scored({"buy_k": 0.3}, 300.0), None]) is None
+
+    def test_a_refused_cell_is_refused_in_the_sum(self):
+        total = tu.combine({"sell_k": 0.9}, [{"overrides": {"sell_k": 0.9}, "invalid": "no"}, None])
+        assert total == {"overrides": {"sell_k": 0.9}, "invalid": "no"}
+
+    def test_an_errored_replay_leaves_the_sum_unscored(self):
+        broken = {**scored({"buy_k": 0.3}, 0.0), "error": "boom"}
+        total = tu.combine({"buy_k": 0.3}, [scored({"buy_k": 0.3}, 300.0), broken])
+        assert total["error"] == "boom" and not tu.is_scored(total)
+
+    def test_the_pick_is_the_best_total_not_the_best_week(self):
+        """0.3 wins the first week by a mile and loses the second; 0.5 is
+        steady and wins the sum."""
+        record = job_record({
+            "w1": [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)],
+            "w2": [scored({"buy_k": 0.3}, -700.0), scored({"buy_k": 0.5}, 350.0)],
+        })
+        tu.refresh_pick(record)
+        assert record["best"]["overrides"] == {"buy_k": 0.5}
+        assert record["best"]["profit"] == 750.0
+        assert tu.pick_cell(record, "w2")["profit"] == 350.0
+        assert tu.summed_baseline(record)["profit"] == 2.0
+
+    def test_missing_replays_count_every_dataset(self):
+        record = job_record({"w1": [scored({"buy_k": 0.3}, 1.0)], "w2": []})
+        record["baseline"]["w2"] = None
+        assert tu.missing_replays(record) == 1 + 3
+
+
 # --- scoring ----------------------------------------------------------------
 
 
@@ -480,6 +560,102 @@ class TestStore:
             tu.submit(spec(axes=[]), launch=False)
         assert tu.list_jobs() == []
 
+    def test_a_dataset_is_removed_with_its_cells_and_the_pick_re_read(self, tuning_dir):
+        record = job_record({
+            "w1": [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)],
+            "w2": [scored({"buy_k": 0.3}, -700.0), scored({"buy_k": 0.5}, 350.0)],
+        })
+        tu._write(tu.refresh_pick(record))
+        assert record["best"]["overrides"] == {"buy_k": 0.5}
+        after = tu.remove_dataset("j", "w2")
+        assert tu.dataset_names(after["spec"]) == ["w1"] and set(after["cells"]) == {"w1"}
+        assert after["best"]["overrides"] == {"buy_k": 0.3}
+        assert after["progress"] == {"done": 3, "total": 3, "reused": 0}
+        assert tu.get_job("j")["best"]["overrides"] == {"buy_k": 0.3}
+
+    def test_the_last_dataset_is_not_removed(self, tuning_dir):
+        tu._write(job_record({"w1": [scored({"buy_k": 0.3}, 1.0)]}))
+        with pytest.raises(ValueError, match="at least one dataset"):
+            tu.remove_dataset("j", "w1")
+
+    def test_a_running_job_is_not_changed(self, tuning_dir):
+        record = job_record({"w1": [], "w2": []})
+        record.update(status=tu.RUNNING, pid=os.getpid())
+        tu._write(record)
+        with pytest.raises(ValueError, match="still running"):
+            tu.remove_dataset("j", "w2")
+        with pytest.raises(ValueError, match="still running"):
+            tu.add_dataset("j", dataset("w3"), runs=[], launch=False)
+
+    def test_removing_what_a_stopped_job_never_finished_finishes_it(self, tuning_dir):
+        record = job_record({
+            "w1": [scored({"buy_k": 0.3}, 1.0), scored({"buy_k": 0.5}, 2.0)],
+            "w2": [scored({"buy_k": 0.3}, 1.0)],
+        })
+        record.update(status=tu.FAILED, error=tu.STOPPED_ERROR)
+        tu._write(record)
+        after = tu.remove_dataset("j", "w2")
+        assert after["status"] == tu.FINISHED and after["error"] is None
+
+    def test_a_dataset_is_added_with_the_jobs_own_settings(self, tuning_dir):
+        tu._write(tu.refresh_pick(job_record({
+            "w1": [scored({"buy_k": 0.3}, 1.0), scored({"buy_k": 0.5}, 2.0)],
+        })))
+        record = tu.add_dataset("j", dataset("w2", TEST_DAY), runs=[], launch=False)
+        assert tu.dataset_names(record["spec"]) == ["w1", "w2"]
+        assert record["spec"]["axes"] == [{"name": "buy_k", "values": [0.3, 0.5]}]
+        assert record["status"] == tu.RUNNING and record["best"] is None
+        assert record["progress"] == {"done": 3, "total": 6, "reused": 0}
+        assert tu.missing_replays(record) == 3
+        with pytest.raises(ValueError, match="twice"):
+            record.update(status=tu.FINISHED)
+            tu._write(record)
+            tu.add_dataset("j", dataset("w2", TEST_DAY), runs=[], launch=False)
+
+
+class TestUpgrade:
+    """Jobs stored with a tune and a test dataset read as a job over both."""
+
+    def old_record(self, sweep_test_grid=True):
+        tune = [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)]
+        test = [scored({"buy_k": 0.3}, -700.0), scored({"buy_k": 0.5}, 350.0)]
+        return {
+            "job_id": "old", "status": tu.FINISHED, "pid": None, "error": None,
+            "created_at": "2026-09-23T18:19:47+00:00", "finished_at": None,
+            "spec": {
+                **{k: v for k, v in spec(axes=[{"name": "buy_k", "values": [0.3, 0.5]}]).items()
+                   if k != "datasets"},
+                "tune_dataset": dataset("w1"), "test_dataset": dataset("w2", TEST_DAY),
+                "sweep_test_grid": sweep_test_grid, "metric": "worst_day",
+            },
+            "progress": {"done": 6, "total": 6},
+            "cells": {tu.TUNE: tune, tu.TEST: test if sweep_test_grid else []},
+            "baseline": {tu.TUNE: scored({}, 1.0), tu.TEST: scored({}, 2.0)},
+            "best": tune[0],
+            "best_test": test[0],
+        }
+
+    def test_both_datasets_become_the_jobs_and_the_pick_is_read_off_the_sum(self, tuning_dir):
+        tu._write(self.old_record())
+        [job] = tu.list_jobs()
+        assert tu.dataset_names(job["spec"]) == ["w1", "w2"]
+        assert "tune_dataset" not in job["spec"] and "best_test" not in job
+        assert len(job["cells"]["w2"]) == 2 and job["baseline"]["w2"]["profit"] == 2.0
+        assert job["best"]["overrides"] == {"buy_k": 0.5}  # was 0.3, the tuning week's best
+        assert job["progress"]["total"] == 6 and tu.missing_replays(job) == 0
+
+    def test_an_unswept_test_grid_keeps_the_picks_replay_and_leaves_holes(self, tuning_dir):
+        tu._write(self.old_record(sweep_test_grid=False))
+        job = tu.get_job("old")
+        assert [c["overrides"] for c in job["cells"]["w2"]] == [{"buy_k": 0.3}]
+        assert tu.missing_replays(job) == 1
+        # Only 0.3 is summed so far, so it is the pick until the rest is swept.
+        assert job["best"]["overrides"] == {"buy_k": 0.3}
+
+    def test_the_new_shape_is_left_alone(self):
+        record = job_record({"w1": []})
+        assert tu._upgrade(record) is record
+
 
 # --- a whole job, end to end ------------------------------------------------
 
@@ -543,35 +719,55 @@ class TestJob:
             **overrides,
         )
 
-    def test_sweeps_picks_and_tests(self, store, stub_model, tuning_dir):
+    def test_sweeps_every_dataset_sums_and_picks(self, store, stub_model, tuning_dir):
         record = tu.submit(self.job_spec(), launch=False)
         done = tu.run_job(record["job_id"], progress=lambda m: None)
 
         assert done["status"] == tu.FINISHED
-        assert done["progress"]["done"] == done["progress"]["total"] == 6 + 1 + 1 + 1
-        cells = {tuple(c["overrides"].values()): c for c in done["cells"][tu.TUNE]}
+        assert done["progress"]["done"] == done["progress"]["total"] == (6 + 1) * 2
+        cells = {tuple(c["overrides"].values()): c for c in done["cells"]["d"]}
         # A sell level at or below the buy level is a hole in the grid, not a replay.
         assert "invalid" in cells[(0.5, 0.60)]
         # A buy level the day never dips to never trades.
         assert cells[(1.0, 0.10)]["trades"] == 0 and cells[(1.0, 0.10)]["profit"] == 0.0
         # The deeper entry buys the same recovery lower, so it wins.
         assert cells[(0.75, 0.10)]["profit"] > cells[(0.5, 0.10)]["profit"] > 0
-        assert done["best"]["overrides"] == {"buy_k": 0.75, "sell_k": 0.10}
-        assert tu.is_scored(done["best_test"]) and done["best_test"]["profit"] > 0
-        assert tu.is_scored(done["baseline"][tu.TUNE])
-        assert tu.is_scored(done["baseline"][tu.TEST])
-        assert done["cells"][tu.TEST] == []
+        assert len(done["cells"]["e"]) == 6
+        assert all(tu.is_scored(done["baseline"][name]) for name in ("d", "e"))
+        # The two sessions are the same tape, so the sum is each cell twice.
+        best = done["best"]
+        assert best["overrides"] == {"buy_k": 0.75, "sell_k": 0.10}
+        assert best["profit"] == pytest.approx(2 * cells[(0.75, 0.10)]["profit"])
+        assert best["datasets"] == best["datasets_up"] == 2
 
-    def test_the_test_grid_is_swept_when_asked(self, store, stub_model, tuning_dir):
-        record = tu.submit(self.job_spec(sweep_test_grid=True), launch=False)
+    def test_an_added_dataset_is_swept_alone(self, store, stub_model, tuning_dir):
+        record = tu.submit(self.job_spec(datasets=[dataset("d")]), launch=False)
+        first = tu.run_job(record["job_id"], progress=lambda m: None)
+        swept_d = first["cells"]["d"]
+        tu.add_dataset(record["job_id"], dataset("e", TEST_DAY), runs=[], launch=False)
+        lines = []
+        done = tu.run_job(record["job_id"], progress=lines.append)
+        assert len(lines) == 6 + 1 + 1  # e's grid and baseline, then "finished"
+        assert all(" e " in line for line in lines[:-1])
+        assert done["cells"]["d"] == swept_d
+        assert done["status"] == tu.FINISHED and tu.missing_replays(done) == 0
+        assert done["progress"]["done"] == done["progress"]["total"] == 14
+        assert done["best"]["datasets"] == 2
+
+    def test_a_stopped_job_resumes_where_it_stopped(self, store, stub_model, tuning_dir):
+        record = tu.submit(self.job_spec(), launch=False)
         done = tu.run_job(record["job_id"], progress=lambda m: None)
-        assert len(done["cells"][tu.TEST]) == 6
-        assert done["best_test"]["overrides"] == done["best"]["overrides"]
-        assert done["progress"]["done"] == done["progress"]["total"]
+        dropped = done["cells"]["e"].pop()
+        done.update(status=tu.FAILED, error=tu.STOPPED_ERROR)
+        tu._write(done)
+        tu.resume(record["job_id"], runs=[], launch=False)
+        again = tu.run_job(record["job_id"], progress=lambda m: None)
+        assert again["cells"]["e"][-1]["overrides"] == dropped["overrides"]
+        assert again["status"] == tu.FINISHED and tu.missing_replays(again) == 0
 
     def test_a_cell_is_exactly_a_simulate_run(self, store, stub_model):
         """What the grid scores is what Simulate would have done with that config."""
-        dataset = self.job_spec()["tune_dataset"]
+        dataset = self.job_spec()["datasets"][0]
         base = self.job_spec()["base"]
         cell = tu.evaluate(dataset, base, {"buy_k": 0.75}, 10_000.0)
 
@@ -658,12 +854,12 @@ class TestPriorRuns:
         return spec(**{
             "base": asdict(base),
             "axes": [{"name": "buy_k", "values": [0.5, 0.75]}],
-            "test_dataset": None,
+            "datasets": [dataset("d")],
             **overrides,
         })
 
     def cell(self, job, overrides, runs):
-        dataset = job["tune_dataset"]
+        dataset = job["datasets"][0]
         return tu.prior_cell(tu.index_runs(runs), job, dataset, overrides)
 
     def config(self, job, **overrides):
@@ -693,16 +889,16 @@ class TestPriorRuns:
         run = stored_run(self.config(job, buy_k=0.5, **{field: value}), [TUNE_DAY])
         assert self.cell(job, {"buy_k": 0.5}, [run]) is None
 
-    @pytest.mark.parametrize("dataset", [
+    @pytest.mark.parametrize("other", [
         {"days": [str(TEST_DAY)]},                    # other sessions
         {"days": [str(TUNE_DAY), str(TEST_DAY)]},     # more sessions
         {"feed": "iex"},                              # another tape
     ])
-    def test_a_run_over_a_different_dataset_is_a_different_replay(self, dataset):
+    def test_a_run_over_a_different_dataset_is_a_different_replay(self, other):
         job = self.job()
         config = self.config(job, buy_k=0.5)
-        days = [date.fromisoformat(d) for d in dataset.get("days", [str(TUNE_DAY)])]
-        run = stored_run(config, days, feed=dataset.get("feed", sim_data.DEFAULT_FEED))
+        days = [date.fromisoformat(d) for d in other.get("days", [str(TUNE_DAY)])]
+        run = stored_run(config, days, feed=other.get("feed", sim_data.DEFAULT_FEED))
         assert self.cell(job, {"buy_k": 0.5}, [run]) is None
 
     def test_a_run_on_other_starting_cash_is_a_different_replay(self):
@@ -712,10 +908,7 @@ class TestPriorRuns:
 
     def test_the_session_order_is_not_part_of_the_dataset(self):
         """The tape a replay reads, not the order a form happened to list it in."""
-        job = self.job(tune_dataset={
-            "name": "d", "days": [str(TEST_DAY), str(TUNE_DAY)],
-            "feed": sim_data.DEFAULT_FEED, "symbols": [TICKER],
-        })
+        job = self.job(datasets=[dataset("d", days=[str(TEST_DAY), str(TUNE_DAY)])])
         run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY, TEST_DAY])
         assert self.cell(job, {"buy_k": 0.5}, [run])["run_id"] == run["run_id"]
 
@@ -778,30 +971,30 @@ class TestPriorRuns:
             stored_run(self.config(job, buy_k=0.5), [TUNE_DAY], run_id="cell"),
             stored_run(self.config(job), [TUNE_DAY], run_id="base"),
         ]
-        found = tu.prior_cells(job, runs)[tu.TUNE]
+        found = tu.prior_cells(job, runs)["d"]
         assert found[tu.overrides_key({"buy_k": 0.5})]["run_id"] == "cell"
         assert found[tu.overrides_key({})]["run_id"] == "base"
         # buy_k 0.75 is the base's own value, so the baseline run answers that
         # cell too -- same configuration, same sessions, same replay.
         assert found[tu.overrides_key({"buy_k": 0.75})]["run_id"] == "base"
 
-    def test_the_test_grid_is_only_looked_up_when_it_is_swept(self):
-        dataset = {"name": "e", "days": [str(TEST_DAY)], "feed": sim_data.DEFAULT_FEED,
-                   "symbols": [TICKER]}
-        job = self.job(test_dataset=dataset)
+    def test_every_dataset_is_looked_up_on_its_own_sessions(self):
+        job = self.job(datasets=[dataset("d"), dataset("e", TEST_DAY)])
         runs = [
             stored_run(self.config(job, buy_k=0.5), [TEST_DAY], run_id="cell"),
             stored_run(self.config(job), [TEST_DAY], run_id="base"),
         ]
-        # The baseline is replayed either way, so it is always looked up.
-        assert set(tu.prior_cells(job, runs)[tu.TEST]) == {tu.overrides_key({})}
-        swept = tu.prior_cells({**job, "sweep_test_grid": True}, runs)[tu.TEST]
-        assert swept[tu.overrides_key({"buy_k": 0.5})]["run_id"] == "cell"
+        found = tu.prior_cells(job, runs)
+        assert found["d"] == {}
+        assert found["e"][tu.overrides_key({"buy_k": 0.5})]["run_id"] == "cell"
+        assert found["e"][tu.overrides_key({})]["run_id"] == "base"
+        # Or only the dataset about to be added.
+        assert set(tu.prior_cells(job, runs, [job["datasets"][1]])) == {"e"}
 
     def test_reuse_can_be_switched_off(self):
         job = self.job(reuse_runs=False)
         run = stored_run(self.config(job, buy_k=0.5), [TUNE_DAY])
-        assert tu.prior_cells(job, [run]) == {tu.TUNE: {}, tu.TEST: {}}
+        assert tu.prior_cells(job, [run]) == {"d": {}}
 
     def test_a_run_older_than_the_data_it_read_is_never_reused(self, store):
         """The `store` fixture writes this session's bars and daily history
@@ -876,8 +1069,8 @@ class TestDerivedGrids:
         [job] = tu.derived_jobs(runs)
         assert job["status"] == tu.DERIVED and tu.is_derived(job)
         assert job["spec"]["axes"] == [{"name": "buy_k", "values": [0.7, 0.8, 0.9]}]
-        assert [c["overrides"]["buy_k"] for c in job["cells"][tu.TUNE]] == [0.7, 0.8, 0.9]
-        assert all(c["run_id"] for c in job["cells"][tu.TUNE])
+        assert [c["overrides"]["buy_k"] for c in job["cells"]["d"]] == [0.7, 0.8, 0.9]
+        assert all(c["run_id"] for c in job["cells"]["d"])
 
     def test_a_two_axis_grid_keeps_its_holes(self):
         """The point of the whole thing: the lattice is the product of the
@@ -888,7 +1081,7 @@ class TestDerivedGrids:
         ])
         [job] = tu.derived_jobs(runs)
         assert [a["values"] for a in job["spec"]["axes"]] == [[0.7, 0.9], [0.1, 0.2]]
-        assert len(job["cells"][tu.TUNE]) == 3
+        assert len(job["cells"]["d"]) == 3
         assert len(tu.grid(job["spec"]["axes"])) == 4
         assert job["progress"] == {"done": 4, "total": 5, "reused": 4}
 
@@ -900,7 +1093,7 @@ class TestDerivedGrids:
         ])
         [job] = tu.derived_jobs(runs)
         assert job["spec"]["axes"][0]["values"] == [0.0, 0.4, 0.8, 1.2, 1.6, 2.0]
-        assert len(job["cells"][tu.TUNE]) == 5
+        assert len(job["cells"]["d"]) == 5
         assert job["progress"] == {"done": 6, "total": 7, "reused": 6}
 
     def test_settings_that_are_not_a_sweep_are_left_alone(self):
@@ -917,7 +1110,7 @@ class TestDerivedGrids:
         [job] = tu.derived_jobs(self.runs([self.base(buy_k=k) for k in values]))
         axis = job["spec"]["axes"][0]
         assert axis["values"] == values
-        assert all(c["overrides"]["buy_k"] in axis["values"] for c in job["cells"][tu.TUNE])
+        assert all(c["overrides"]["buy_k"] in axis["values"] for c in job["cells"]["d"])
         assert job["best"] is not None  # pick_best indexes the axis by value
 
     def test_an_integer_axis_stays_integer(self):
@@ -940,7 +1133,7 @@ class TestDerivedGrids:
         ]
         jobs = tu.derived_jobs(runs)
         assert len(jobs) == 2
-        assert {j["spec"]["tune_dataset"]["days"][0] for j in jobs} == {
+        assert {j["spec"]["datasets"][0]["days"][0] for j in jobs} == {
             str(TUNE_DAY), str(TEST_DAY)
         }
 
@@ -973,7 +1166,7 @@ class TestDerivedGrids:
         ])
         [job] = tu.derived_jobs(runs)
         assert [a["name"] for a in job["spec"]["axes"]] == ["buy_k", "sell_k"]
-        assert len(job["cells"][tu.TUNE]) == 9
+        assert len(job["cells"]["d"]) == 9
 
     def test_too_few_runs_to_be_a_sweep(self):
         runs = self.runs([self.base(buy_k=k) for k in (0.7, 0.9)])
@@ -992,11 +1185,11 @@ class TestDerivedGrids:
         runs = self.runs([self.base(buy_k=k) for k in (0.9, 0.8, 0.7)])  # r0 is newest
         [job] = tu.derived_jobs(runs)
         assert job["spec"]["base"]["buy_k"] == 0.9
-        assert job["baseline"][tu.TUNE]["run_id"] == "r0"
+        assert job["baseline"]["d"]["run_id"] == "r0"
         # The baseline reads as a job's does -- the configuration with nothing
         # overridden -- whichever cell of the grid it happens to sit on.
-        assert job["baseline"][tu.TUNE]["overrides"] == {}
-        assert job["baseline"][tu.TEST] is None and job["cells"][tu.TEST] == []
+        assert job["baseline"]["d"]["overrides"] == {}
+        assert tu.dataset_names(job["spec"]) == ["d"] and set(job["cells"]) == {"d"}
 
     def test_the_best_cell_is_the_highest_profit(self):
         runs = self.runs([self.base(buy_k=k) for k in (0.7, 0.8, 0.9)])
@@ -1014,7 +1207,7 @@ class TestDerivedGrids:
         filled = self.runs([*configs, self.base(buy_k=0.9, sell_k=0.2)])
         [after] = tu.derived_jobs(filled)
         assert before["job_id"] == after["job_id"]
-        assert len(after["cells"][tu.TUNE]) == 4
+        assert len(after["cells"]["d"]) == 4
 
     def test_the_grid_is_submittable_as_a_real_job(self, tuning_dir):
         """The one action a derived grid offers: it becomes a job that reuses
@@ -1038,7 +1231,7 @@ class TestSeededJob:
         return spec(**{
             "base": asdict(base),
             "axes": [{"name": "buy_k", "values": [0.5, 0.75]}],
-            "test_dataset": None,
+            "datasets": [dataset("d")],
             **overrides,
         })
 
@@ -1046,7 +1239,7 @@ class TestSeededJob:
         job = self.job()
         run = stored_run(tu.make_config(job["base"], {"buy_k": 0.5}), [TUNE_DAY])
         record = tu.submit(job, launch=False, runs=[run])
-        [cell] = record["cells"][tu.TUNE]
+        [cell] = record["cells"]["d"]
         assert cell["overrides"] == {"buy_k": 0.5} and cell["run_id"] == run["run_id"]
         # The total is still the whole grid: the job ran it, it just did not
         # have to replay this one.
@@ -1060,25 +1253,36 @@ class TestSeededJob:
 
         assert done["status"] == tu.FINISHED
         assert done["progress"]["done"] == done["progress"]["total"] == 3
-        by_cell = {tuple(c["overrides"].values()): c for c in done["cells"][tu.TUNE]}
+        by_cell = {tuple(c["overrides"].values()): c for c in done["cells"]["d"]}
         assert by_cell[(0.5,)]["run_id"] == run["run_id"]   # never replayed
         assert "run_id" not in by_cell[(0.75,)]             # swept here
         assert tu.reused_count(done) == 1
 
-    def test_the_picks_reused_test_replay_is_counted_once(self, store, stub_model, tuning_dir):
-        """A swept test grid already holds the pick's test cell, so counting
-        `best_test` again would claim more replays than the job has."""
-        dataset = {"name": "e", "days": [str(TEST_DAY)], "feed": sim_data.DEFAULT_FEED,
-                   "symbols": [TICKER]}
-        job = self.job(test_dataset=dataset, sweep_test_grid=True)
+    def test_a_job_the_store_answers_entirely_replays_nothing(
+        self, store, stub_model, tuning_dir
+    ):
+        job = self.job(datasets=[dataset("d"), dataset("e", TEST_DAY)])
         runs = [stored_run(tu.make_config(job["base"], o), days)
                 for o in ({"buy_k": 0.5}, {"buy_k": 0.75}, {})
                 for days in ([TUNE_DAY], [TEST_DAY])]
         record = tu.submit(job, launch=False, runs=runs)
-        done = tu.run_job(record["job_id"], progress=lambda m: None)
+        lines = []
+        done = tu.run_job(record["job_id"], progress=lines.append)
+        assert lines == [f"Tuning job {record['job_id']} finished."]
         assert done["progress"] == {"done": 6, "total": 6, "reused": 6}
         assert tu.reused_count(done) == 6
-        assert done["best_test"]["run_id"]
+        assert done["best"]["reused"] == 2
+
+    def test_an_added_dataset_is_seeded_from_the_store(self, tuning_dir):
+        job = self.job()
+        tu.submit(job, launch=False, runs=[])
+        [record] = tu.list_jobs()
+        record.update(status=tu.FINISHED)
+        tu._write(record)
+        run = stored_run(tu.make_config(job["base"], {"buy_k": 0.5}), [TEST_DAY])
+        added = tu.add_dataset(record["job_id"], dataset("e", TEST_DAY), runs=[run], launch=False)
+        assert [c["run_id"] for c in added["cells"]["e"]] == [run["run_id"]]
+        assert added["progress"] == {"done": 1, "total": 6, "reused": 1}
 
     def test_nothing_stored_leaves_the_job_exactly_as_it_was(
         self, store, stub_model, tuning_dir
@@ -1087,7 +1291,7 @@ class TestSeededJob:
         done = tu.run_job(record["job_id"], progress=lambda m: None)
         assert done["progress"] == {"done": 3, "total": 3, "reused": 0}
         assert tu.reused_count(done) == 0
-        assert len(done["cells"][tu.TUNE]) == 2 and tu.is_scored(done["baseline"][tu.TUNE])
+        assert len(done["cells"]["d"]) == 2 and tu.is_scored(done["baseline"]["d"])
 
     def test_a_reused_cell_is_what_the_sweep_would_have_produced(
         self, store, stub_model, tuning_dir, monkeypatch, tmp_path
@@ -1099,19 +1303,19 @@ class TestSeededJob:
         monkeypatch.setattr(sim_results, "RUNS_DIR", tmp_path / "runs")
         job = self.job()
         overrides = {"buy_k": 0.5}
-        swept = tu.evaluate(job["tune_dataset"], job["base"], overrides, job["starting_cash"])
+        swept = tu.evaluate(job["datasets"][0], job["base"], overrides, job["starting_cash"])
 
         config = tu.make_config(job["base"], overrides)
-        market = SimMarket([TICKER], [TUNE_DAY], job["tune_dataset"]["feed"])
+        market = SimMarket([TICKER], [TUNE_DAY], job["datasets"][0]["feed"])
         result = SimulationEngine(market, SimulationConfig(
             personality=APPLE_TRADER_KEY, provider="rules", model="x", api_key="",
             symbols=[TICKER], days=[TUNE_DAY], starting_cash=job["starting_cash"],
-            rule_config=asdict(config), feed=job["tune_dataset"]["feed"],
+            rule_config=asdict(config), feed=job["datasets"][0]["feed"],
         )).run()
         saved = sim_results.save_run(result, {}, dataset_name="d")
 
         reused = tu.prior_cell(
-            tu.index_runs([saved]), job, job["tune_dataset"], overrides
+            tu.index_runs([saved]), job, job["datasets"][0], overrides
         )
         assert reused["run_id"] == saved["run_id"]
         for field in ("profit", "return_pct", "trades", "sells", "days_up", "worst_day",

@@ -13,6 +13,7 @@ import textwrap
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
+from itertools import combinations
 from pathlib import Path
 
 import pandas as pd
@@ -3326,7 +3327,7 @@ def _derived_discriminators(jobs: list[dict]) -> dict[str, str]:
         key = (
             spec["base"]["ticker"],
             tuple(a["name"] for a in spec["axes"]),
-            spec["tune_dataset"]["name"],
+            tuple(sim_tuning.dataset_names(spec)),
         )
         groups.setdefault(key, []).append(job)
     text: dict[str, str] = {}
@@ -3347,37 +3348,45 @@ def _derived_discriminators(jobs: list[dict]) -> dict[str, str]:
     return text
 
 
+def _tuning_datasets_text(names: "list[str]", tick: str = "") -> str:
+    """A job's datasets for a label: all of them while few, else first … last."""
+    quoted = [f"{tick}{name}{tick}" for name in names]
+    if len(quoted) <= 3:
+        return " + ".join(quoted)
+    return f"{len(quoted)} datasets, {quoted[0]} … {quoted[-1]}"
+
+
 def _tuning_job_label(job: dict, markdown: bool = True, detail: str = "") -> str:
     spec = job["spec"]
     params = " × ".join(_tuning_param_label(a["name"]) for a in spec["axes"])
     tick = "`" if markdown else ""
     ticker = spec["base"]["ticker"]
-    head = f"{f'**{ticker}**' if markdown else ticker} · {params}"
+    # The model is part of what a grid is about -- the same levels mean
+    # different prices under the day-range and the high/low forecast -- and the
+    # picker otherwise shows two jobs of one ticker as the same line.
+    model = _apple_model_label(spec["base"].get("model_key", ""))
+    head = f"{f'**{ticker}**' if markdown else ticker} · {model} · {params}"
     started = (job.get("created_at") or "")[:16].replace("T", " ")
+    names = sim_tuning.dataset_names(spec)
     if sim_tuning.is_derived(job):
-        filled, total = len(job["cells"]["tune"]), len(sim_tuning.grid(spec["axes"]))
-        route = (
-            f"{filled}/{total} cells from stored runs on "
-            f"{tick}{spec['tune_dataset']['name']}{tick}"
-        )
+        filled = len(job["cells"].get(names[0]) or ())
+        total = len(sim_tuning.grid(spec["axes"]))
+        route = f"{filled}/{total} cells from stored runs on {tick}{names[0]}{tick}"
         return " · ".join(
             part for part in (head, route, detail, f"newest run {started} UTC") if part
         )
-    test = (spec.get("test_dataset") or {}).get("name")
-    route = f"tune {tick}{spec['tune_dataset']['name']}{tick}" + (
-        f" → test {tick}{test}{tick}" if test else ""
-    )
-    return f"{head} · {route} · {started} UTC"
+    return f"{head} · {_tuning_datasets_text(names, tick)} · {started} UTC"
 
 
 def render_tuning_tab() -> None:
     st.caption(
-        "Sweep a grid of Apple Trader's parameters, pick the best combination on one "
-        "dataset, and replay that pick on another. Every cell is a full replay through "
-        "the same engine and trader as Simulate — market fills, the managed exit, the "
-        "flatten — so a cell's number is what a Simulate run of that configuration "
-        "would show. A tuning grid always has a best cell; whether it still makes money "
-        "on the test dataset is the result worth reading."
+        "Sweep a grid of Apple Trader's parameters over one or more datasets — a heatmap "
+        "per dataset, then their sum — and pick the combination with the best total "
+        "profit. Every cell is a full replay through the same engine and trader as "
+        "Simulate — market fills, the managed exit, the flatten — so a cell's number is "
+        "what a Simulate run of that configuration would show. A finished job takes a "
+        "new dataset (a new week, say) with the same settings, and datasets can be "
+        "dropped again."
     )
     _render_tuning_jobs()
     submitted = sim_tuning.list_jobs()
@@ -3448,6 +3457,39 @@ def _tuning_dataset_spec(dataset) -> dict:
         "feed": dataset.feed,
         "symbols": [str(s).upper() for s in (dataset.symbols or [])],
     }
+
+
+def _tuning_describe_dataset(dataset) -> str:
+    """One dataset for a picker: name, size, span and tape."""
+    return (
+        f"{dataset.name} · {len(dataset.days)} sessions · {dataset.start} → {dataset.end} "
+        f"· {dataset.feed}"
+    )
+
+
+def _render_tuning_overlaps(datasets: "list[dict]") -> None:
+    """Warn about datasets that would be summed over the same sessions or tapes.
+
+    A session two datasets share is replayed on both and so counted twice in
+    the sum -- it weighs double in the pick. Mixed tapes are allowed but said
+    out loud: fills differ between them, so part of any difference between
+    two heatmaps is the tape.
+    """
+    for first, second in combinations(datasets, 2):
+        shared = sim_tuning.overlapping_days(first["days"], second["days"])
+        if shared:
+            st.warning(
+                f"`{first['name']}` and `{second['name']}` share {len(shared)} session"
+                f"{'s' if len(shared) != 1 else ''} ({', '.join(shared[:5])}"
+                f"{'…' if len(shared) > 5 else ''}). The sum counts those twice, so they "
+                "weigh double in the pick."
+            )
+    feeds = sorted({d["feed"] for d in datasets})
+    if len(feeds) > 1:
+        st.info(
+            f"These datasets read different tapes ({', '.join(feeds)}). Fills differ "
+            "between tapes, so part of any difference between their heatmaps is the tape."
+        )
 
 
 def _tuning_range(name: str) -> "tuple[list, str]":
@@ -3542,49 +3584,20 @@ def _render_tuning_form() -> None:
         st.warning(f"No stored dataset carries {base.ticker}. Download one in the Datasets tab.")
         return
     by_name = {d.name: d for d in carrying}
-
-    def describe(name: "str | None") -> str:
-        if name is None:
-            return "(no test — tune only)"
-        d = by_name[name]
-        return f"{name} · {len(d.days)} sessions · {d.start} → {d.end} · {d.feed}"
-
-    col_tune, col_test = st.columns(2)
-    tune_name = col_tune.selectbox(
-        "Tune on", list(by_name), format_func=describe, key=f"tune_on_{base.ticker}",
-        help="The grid is swept here and the pick is chosen here.",
+    newest = max(carrying, key=lambda d: str(d.end)).name
+    chosen = st.multiselect(
+        "Sweep on", list(by_name), default=[newest], format_func=lambda n: _tuning_describe_dataset(by_name[n]),
+        key=f"tune_datasets_{base.ticker}",
+        help="The grid is swept on every dataset picked here, each drawn as its own "
+        "heatmap, and the pick is the best total profit over all of them. A finished job "
+        "takes more datasets later with the same settings.",
     )
-    test_options = [*by_name, None]
-    default_test = next(
-        (i for i, n in enumerate(test_options) if n and n != tune_name), len(test_options) - 1
-    )
-    test_name = col_test.selectbox(
-        "Test on", test_options, index=default_test, format_func=describe,
-        key=f"tune_test_{base.ticker}",
-        help="The pick and the base configuration are replayed here. Use sessions the "
-        "grid never saw, or the test says nothing about whether the pick generalises.",
-    )
-    tune_ds, test_ds = by_name[tune_name], by_name.get(test_name) if test_name else None
-    if test_ds is not None:
-        shared = sim_tuning.overlapping_days(tune_ds.days, test_ds.days)
-        if shared:
-            st.warning(
-                f"The two datasets share {len(shared)} of the test's {len(test_ds.days)} "
-                f"sessions ({', '.join(shared[:5])}{'…' if len(shared) > 5 else ''}). On those "
-                "days the test is not out of sample: the pick was chosen partly on them."
-            )
-        if test_ds.feed != tune_ds.feed:
-            st.info(
-                f"Tuning reads the `{tune_ds.feed}` tape and the test `{test_ds.feed}`. Fills "
-                "differ between tapes, so part of any gap between the two is the tape."
-            )
+    picked = [by_name[name] for name in chosen]
+    _render_tuning_overlaps([_tuning_dataset_spec(d) for d in picked])
 
     st.markdown("**How the pick is chosen**")
-    col_metric, col_rule, col_share, col_cash = st.columns(4)
-    metric = col_metric.selectbox(
-        "Optimise", list(sim_tuning.METRICS), format_func=sim_tuning.METRICS.get,
-        key="tune_metric",
-    )
+    st.caption("On the sum of every dataset's heatmap: the best total profit.")
+    col_rule, col_share, col_cash = st.columns(3)
     rule = col_rule.selectbox(
         "Pick", list(_PICK_LABELS), format_func=_PICK_LABELS.get, key="tune_rule",
         help="The highest cell of a small grid is usually the luckiest. The plateau pick "
@@ -3594,18 +3607,15 @@ def _render_tuning_form() -> None:
     min_share = col_share.slider(
         "Must trade on at least", 0, 100, 50, step=5, format="%d%% of days",
         key="tune_min_traded",
-        help="A deep entry that filled on one lucky day cannot be the pick.",
+        help="Counted over every session of every dataset. A deep entry that filled on "
+        "one lucky day cannot be the pick.",
     ) / 100.0
     starting_cash = col_cash.number_input(
-        "Starting cash", value=100_000.0, step=10_000.0, key="tune_cash"
+        "Starting cash", value=100_000.0, step=10_000.0, key="tune_cash",
+        help="Each dataset is replayed from this cash, so a cell's summed return is its "
+        "total profit as a share of it.",
     )
-    col_sweep, col_reuse, col_workers = st.columns([3, 2, 1], vertical_alignment="bottom")
-    sweep_test = col_sweep.checkbox(
-        "Also sweep the whole grid on the test dataset", value=True, key="tune_sweep_test",
-        disabled=test_ds is None,
-        help="Twice the replays — and the only way to see whether the profitable region "
-        "itself moved, rather than only whether the one picked cell held.",
-    )
+    col_reuse, col_workers = st.columns([3, 1], vertical_alignment="bottom")
     reuse_runs = col_reuse.checkbox(
         "Reuse stored runs", value=True, key="tune_reuse_runs",
         help="A cell is the same replay a Simulate run of that configuration is, so a "
@@ -3623,13 +3633,10 @@ def _render_tuning_form() -> None:
     spec = {
         "base": rule_agent(APPLE_TRADER_KEY).to_record(base),
         "axes": axes,
-        "tune_dataset": _tuning_dataset_spec(tune_ds),
-        "test_dataset": _tuning_dataset_spec(test_ds) if test_ds is not None else None,
+        "datasets": [_tuning_dataset_spec(d) for d in picked],
         "starting_cash": float(starting_cash),
-        "metric": metric,
         "rule": rule,
         "min_traded_share": float(min_share),
-        "sweep_test_grid": bool(sweep_test and test_ds is not None),
         "reuse_runs": bool(reuse_runs),
         "workers": int(workers),
     }
@@ -3652,11 +3659,12 @@ def _render_tuning_form() -> None:
         st.caption(
             f"{len(cells)} combinations"
             + (f" ({refused} refused by the configuration, left blank)" if refused else "")
+            + f" × {len(picked)} dataset{'s' if len(picked) != 1 else ''}"
             + f" · {sim_tuning.total_replays(spec)} replays"
             + (f", {reused} of them already in the run store" if reused else "")
             + f" · {duration} with {workers} worker{'s' if workers != 1 else ''}."
         )
-        _render_tuning_prior(spec, axes, metric, prior, runs)
+        _render_tuning_prior(spec, axes, prior, runs)
     if st.button(
         "Run tuning", type="primary", icon=":material/play_arrow:",
         disabled=bool(problem), key="tune_run",
@@ -3673,7 +3681,7 @@ def _tuning_base_marks(spec: dict, axes: list[dict]) -> dict:
 
 
 def _render_tuning_prior(
-    spec: dict, axes: list[dict], metric: str, prior: dict, runs: list[dict]
+    spec: dict, axes: list[dict], prior: dict, runs: list[dict]
 ) -> None:
     """What the run store already says about this grid, before anything is queued.
 
@@ -3685,7 +3693,7 @@ def _render_tuning_prior(
 
     Only the cells with a stored run are filled; the rest of the surface is left
     transparent, which is the honest picture — an empty square here means "not
-    tried", never "tried and flat".
+    tried", never "tried and flat". One heatmap per dataset that has any.
     """
     base = spec["base"]
     ticker, model = base["ticker"], base.get("model_key", "")
@@ -3698,10 +3706,12 @@ def _render_tuning_prior(
         "forecast, so those have to be replayed rather than reused."
         if stale else ""
     )
-    swept = [
-        cell for key, cell in prior[sim_tuning.TUNE].items()
-        if key != sim_tuning.overrides_key({})
-    ]
+    base_key = sim_tuning.overrides_key({})
+    swept = {
+        name: [cell for key, cell in found.items() if key != base_key]
+        for name, found in prior.items()
+    }
+    swept = {name: cells for name, cells in swept.items() if cells}
     if not swept:
         if not stored:
             why = f"nothing has traded {pair} yet"
@@ -3715,45 +3725,84 @@ def _render_tuning_prior(
             )
         st.caption(f":material/history: No stored run covers this grid ({why})")
         return
-    st.markdown(f"**Already run** — {len(swept)} of {len(sim_tuning.grid(axes))} combinations")
-    st.plotly_chart(
-        _tuning_heatmap(
-            swept, axes, metric, _tuning_base_marks(spec, axes),
-            f"From stored runs · {spec['tune_dataset']['name']}",
-        ),
-        key="tune_prior_heat",
+    total = len(sim_tuning.grid(axes)) * len(prior)
+    st.markdown(
+        f"**Already run** — {sum(len(c) for c in swept.values())} of {total} "
+        "combinations over the datasets picked"
     )
+    _render_tuning_charts([
+        (
+            f"tune_prior_heat_{index}",
+            _tuning_heatmap(
+                cells, axes, _tuning_base_marks(spec, axes), f"From stored runs · {name}"
+            ),
+        )
+        for index, (name, cells) in enumerate(swept.items())
+    ])
     st.caption(
-        f"Stored {pair} runs over `{spec['tune_dataset']['name']}` matching this base "
-        "configuration in everything the grid does not sweep, and still current — "
-        "same sessions, same tape, same starting cash, and nothing they read has "
-        "changed since. Blank squares are combinations nobody has replayed, and they "
-        "are what the job would run." + aged
+        f"Stored {pair} runs matching this base configuration in everything the grid "
+        "does not sweep, and still current — same sessions, same tape, same starting "
+        "cash, and nothing they read has changed since. Blank squares are combinations "
+        "nobody has replayed, and they are what the job would run." + aged
     )
+
+
+def _render_tuning_charts(charts: "list[tuple[str, go.Figure]]") -> None:
+    """Heatmaps two to a row; a lone one gets the whole width."""
+    if len(charts) == 1:
+        key, fig = charts[0]
+        st.plotly_chart(fig, key=key)
+        return
+    for start in range(0, len(charts), 2):
+        for column, (key, fig) in zip(st.columns(2), charts[start:start + 2]):
+            column.plotly_chart(fig, key=key)
+
+
+def _tuning_hover_data(cell: "dict | None") -> list:
+    """[return %, a line on days and datasets] for one cell's hover.
+
+    Formatted here rather than in the hovertemplate: plotly ignores a format
+    spec on a heatmap's nested `customdata`.
+    """
+    if not sim_tuning.is_scored(cell):
+        return ["", ""]
+    note = f"{cell['days_traded']}/{cell['days']} days traded"
+    if "datasets" in cell:
+        note += f" · in profit on {cell['datasets_up']}/{cell['datasets']} datasets"
+    return [f"{cell['return_pct']:+.2f}%", note]
 
 
 def _tuning_heatmap(
-    cells: list[dict], axes: list[dict], metric: str, marks: dict, title: str
+    cells: list[dict], axes: list[dict], marks: dict, title: str, metric: str = "profit"
 ) -> go.Figure:
-    """The grid coloured by `metric`; `marks` outlines named cells (the pick, the base)."""
+    """The grid coloured by `metric`; `marks` outlines named cells (the pick, the base).
+
+    The hover carries the return beside the dollar profit: the profit is what
+    the cells are ranked on, the return is what it means against the cash.
+    """
     by_key = {sim_tuning.overrides_key(c["overrides"]): c for c in cells}
 
     def cell_at(overrides: dict) -> "dict | None":
         return by_key.get(sim_tuning.overrides_key(overrides))
 
+    metric_label = sim_tuning.METRICS[metric]
+    hover_tail = (
+        f"{metric_label}: %{{text}}<br>Return: %{{customdata[0]}}<br>"
+        "%{customdata[1]}<extra></extra>"
+    )
     mark_colors = {"Pick": PALETTE["text"], "Base configuration": PALETTE["muted"]}
     fig = go.Figure()
     if len(axes) == 1:
         axis = axes[0]
         xs = [sim_tuning.axis_tick(axis["name"], v) for v in axis["values"]]
-        ys = []
-        for value in axis["values"]:
-            cell = cell_at({axis["name"]: value})
-            ys.append(cell[metric] if sim_tuning.is_scored(cell) else None)
+        found = [cell_at({axis["name"]: value}) for value in axis["values"]]
+        ys = [cell[metric] if sim_tuning.is_scored(cell) else None for cell in found]
         fig.add_trace(go.Bar(
-            x=xs, y=ys, name=sim_tuning.METRICS[metric],
+            x=xs, y=ys, name=metric_label,
             marker_color=[PALETTE["up"] if (y or 0) >= 0 else PALETTE["down"] for y in ys],
             text=[_tuning_metric_text(metric, y) for y in ys], textposition="outside",
+            customdata=[_tuning_hover_data(cell) for cell in found],
+            hovertemplate=f"{_tuning_param_label(axis['name'])} %{{x}}<br>" + hover_tail,
         ))
         for label, overrides in marks.items():
             value = (overrides or {}).get(axis["name"])
@@ -3761,18 +3810,19 @@ def _tuning_heatmap(
                 y = ys[axis["values"].index(value)]
                 fig.add_trace(go.Scatter(
                     x=[sim_tuning.axis_tick(axis["name"], value)], y=[y or 0], mode="markers",
-                    name=label, marker=dict(symbol="star", size=16,
-                                            color=mark_colors.get(label, PALETTE["text"])),
+                    name=label, hoverinfo="skip",
+                    marker=dict(symbol="star", size=16,
+                                color=mark_colors.get(label, PALETTE["text"])),
                 ))
         fig.update_xaxes(title=_tuning_param_label(axis["name"]), type="category")
-        fig.update_yaxes(title=sim_tuning.METRICS[metric])
+        fig.update_yaxes(title=metric_label)
     else:
         row_axis, col_axis = axes
         xs = [sim_tuning.axis_tick(col_axis["name"], v) for v in col_axis["values"]]
         ys = [sim_tuning.axis_tick(row_axis["name"], v) for v in row_axis["values"]]
-        z, text = [], []
+        z, text, custom = [], [], []
         for row_value in row_axis["values"]:
-            z_row, text_row = [], []
+            z_row, text_row, custom_row = [], [], []
             for col_value in col_axis["values"]:
                 cell = cell_at({row_axis["name"]: row_value, col_axis["name"]: col_value})
                 if sim_tuning.is_scored(cell):
@@ -3781,17 +3831,18 @@ def _tuning_heatmap(
                 else:
                     z_row.append(None)
                     text_row.append("×" if cell and "invalid" in cell else "")
+                custom_row.append(_tuning_hover_data(cell))
             z.append(z_row)
             text.append(text_row)
+            custom.append(custom_row)
         centred = metric in ("profit", "return_pct", "worst_day")
         fig.add_trace(go.Heatmap(
             z=z, x=xs, y=ys, text=text, texttemplate="%{text}", colorscale="RdYlGn",
-            zmid=0 if centred else None, hoverongaps=False,
-            colorbar=dict(title=sim_tuning.METRICS[metric]),
+            zmid=0 if centred else None, hoverongaps=False, customdata=custom,
+            colorbar=dict(title=metric_label),
             hovertemplate=(
                 f"{_tuning_param_label(row_axis['name'])} %{{y}}<br>"
-                f"{_tuning_param_label(col_axis['name'])} %{{x}}<br>"
-                f"{sim_tuning.METRICS[metric]}: %{{text}}<extra></extra>"
+                f"{_tuning_param_label(col_axis['name'])} %{{x}}<br>" + hover_tail
             ),
         ))
         for label, overrides in marks.items():
@@ -3820,28 +3871,34 @@ def _tuning_heatmap(
 
 
 def _tuning_summary_rows(job: dict) -> list[dict]:
+    """The base configuration and the pick on each dataset, then summed."""
     spec = job["spec"]
-    base_values = {a["name"]: spec["base"][a["name"]] for a in spec["axes"]}
-    has_test = bool(spec.get("test_dataset"))
-    best = job.get("best")
-    rows = []
-    for label, values, tuned, tested in (
-        ("Base configuration", base_values, job["baseline"].get("tune"), job["baseline"].get("test")),
-        ("Pick", (best or {}).get("overrides"), best, job.get("best_test")),
-    ):
-        row = {"configuration": label, "values": _tuning_values_text(values)}
-        for role, cell in (("tune", tuned), ("test", tested)):
-            if role == "test" and not has_test:
-                continue
+    datasets = spec["datasets"]
+
+    def row(label: str, sessions: int, base: "dict | None", pick: "dict | None") -> dict:
+        out = {"dataset": label, "sessions": sessions}
+        for prefix, cell in (("base", base), ("pick", pick)):
             scored = sim_tuning.is_scored(cell)
-            row[f"{role}_profit"] = cell["profit"] if scored else None
-            row[f"{role}_return"] = cell["return_pct"] if scored else None
-            row[f"{role}_days"] = (
-                f"{cell['days_up']} up · {cell['days_traded']} traded / {cell['days']}"
-                if scored else "—"
-            )
-            row[f"{role}_worst"] = cell["worst_day"] if scored else None
-        rows.append(row)
+            out[f"{prefix}_profit"] = cell["profit"] if scored else None
+            out[f"{prefix}_return"] = cell["return_pct"] if scored else None
+        scored = sim_tuning.is_scored(pick)
+        out["pick_days"] = (
+            f"{pick['days_up']} up · {pick['days_traded']} traded / {pick['days']}"
+            if scored else "—"
+        )
+        out["pick_worst"] = pick["worst_day"] if scored else None
+        return out
+
+    rows = [
+        row(d["name"], len(d["days"]), job["baseline"].get(d["name"]),
+            sim_tuning.pick_cell(job, d["name"]))
+        for d in datasets
+    ]
+    if len(datasets) > 1:
+        rows.append(row(
+            f"Sum of {len(datasets)}", sum(len(d["days"]) for d in datasets),
+            sim_tuning.summed_baseline(job), job.get("best"),
+        ))
     return rows
 
 
@@ -3855,48 +3912,54 @@ def _tuning_usd(value: float) -> str:
 
 
 def _tuning_verdict(job: dict) -> "str | None":
-    """One line: did the pick keep making money on the test dataset?"""
+    """One line: how the pick did in total, and against the base configuration.
+
+    Every dataset is in sample -- the pick is read off their sum -- so the
+    robustness read is how many of them it made money on, not one held-out week.
+    """
     spec = job["spec"]
-    test = spec.get("test_dataset")
-    best, tested = job.get("best"), job.get("best_test")
-    base_test = job["baseline"].get("test")
-    if not test:
-        return None
+    names = sim_tuning.dataset_names(spec)
+    best, base = job.get("best"), sim_tuning.summed_baseline(job)
     if not sim_tuning.is_scored(best):
         if job["status"] == sim_tuning.FINISHED:
             return (
-                ":orange[**No pick.**] No combination traded on enough of the tuning days "
-                "to be eligible — lower the minimum share of days, or widen the grid."
+                ":orange[**No pick.**] No combination traded on enough of the days to be "
+                "eligible — lower the minimum share of days, or widen the grid."
             )
         return None
-    if not sim_tuning.is_scored(tested):
-        return None
+    where = f"summed over {len(names)} datasets" if len(names) > 1 else f"on `{names[0]}`"
     detail = (
-        f"The pick made **{_tuning_usd(best['profit'])}** on `{spec['tune_dataset']['name']}` "
-        f"and **{_tuning_usd(tested['profit'])}** on `{test['name']}`"
+        f"The pick made **{_tuning_usd(best['profit'])}** ({best['return_pct']:+.2f}%) {where}"
     )
-    if sim_tuning.is_scored(base_test):
-        detail += f"; the base configuration made {_tuning_usd(base_test['profit'])} there"
-    beat_base = not sim_tuning.is_scored(base_test) or tested["profit"] >= base_test["profit"]
-    if tested["profit"] > 0 and beat_base:
-        head = ":green[**Held up out of sample.**]"
-    elif tested["profit"] > 0:
-        head = ":orange[**Still profitable, but no better than the base configuration.**]"
+    if len(names) > 1:
+        detail += f", in profit on {best['datasets_up']} of them"
+    if sim_tuning.is_scored(base):
+        detail += (
+            f"; the base configuration made {_tuning_usd(base['profit'])} "
+            f"({base['return_pct']:+.2f}%)"
+        )
+    beat_base = not sim_tuning.is_scored(base) or best["profit"] >= base["profit"]
+    if best["profit"] > 0 and beat_base:
+        head = ":green[**Beats the base configuration.**]"
+    elif best["profit"] > 0:
+        head = ":orange[**Profitable, but no better than the base configuration.**]"
     else:
-        head = ":red[**Did not hold up out of sample.**]"
+        head = ":red[**The pick lost money.**]"
     return f"{head} {detail}."
 
 
 def _tuning_cell_rows(job: dict) -> list[dict]:
-    spec = job["spec"]
-    metric = spec.get("metric", "profit")
-    test_by_key = {
-        sim_tuning.overrides_key(c["overrides"]): c for c in job["cells"]["test"]
-    }
+    """Every summed combination, best total first, with each dataset's share."""
+    names = sim_tuning.dataset_names(job["spec"])
+    per_dataset = [
+        {sim_tuning.overrides_key(c["overrides"]): c for c in job["cells"].get(name) or ()}
+        for name in names
+    ]
     rows = []
-    for cell in job["cells"]["tune"]:
+    for cell in sim_tuning.summed_cells(job):
         if not sim_tuning.is_scored(cell):
             continue
+        key = sim_tuning.overrides_key(cell["overrides"])
         row = {
             _tuning_param_label(name): value for name, value in cell["overrides"].items()
         }
@@ -3905,13 +3968,15 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
             days_up=cell["days_up"], days_traded=cell["days_traded"],
             worst_day=cell["worst_day"],
         )
-        tested = test_by_key.get(sim_tuning.overrides_key(cell["overrides"]))
-        if job["cells"]["test"]:
-            row["test_profit"] = tested["profit"] if sim_tuning.is_scored(tested) else None
-        row["source"] = f"run {cell['run_id']}" if cell.get("run_id") else "swept"
-        row["_sort"] = cell[metric]
+        for index, found in enumerate(per_dataset):
+            part = found.get(key)
+            row[f"ds_{index}"] = part["profit"] if sim_tuning.is_scored(part) else None
+        row["source"] = (
+            f"{cell['reused']} of {cell['datasets']} from stored runs" if cell["reused"]
+            else "swept"
+        )
         rows.append(row)
-    rows.sort(key=lambda r: r.pop("_sort"), reverse=True)
+    rows.sort(key=lambda r: r["profit"], reverse=True)
     return rows
 
 
@@ -3938,14 +4003,17 @@ _BIAS_MARK = {
 }
 
 
+def _tuning_color(index: int) -> str:
+    """One dataset's colour, in the order the job lists them."""
+    return _DRIFT_SERIES_COLORS[index % len(_DRIFT_SERIES_COLORS)]
+
+
 def _tuning_pick_days(job: dict) -> dict[str, list[str]]:
-    """{feed: sessions the pick was scored on} across the tune and test datasets."""
-    spec = job["spec"]
+    """{feed: sessions the pick was scored on} across every dataset of the job."""
     by_feed: dict[str, list[str]] = {}
-    for cell, dataset in (
-        (job.get("best"), spec["tune_dataset"]), (job.get("best_test"), spec.get("test_dataset")),
-    ):
-        if sim_tuning.is_scored(cell) and dataset:
+    for dataset in job["spec"]["datasets"]:
+        cell = sim_tuning.pick_cell(job, dataset["name"])
+        if sim_tuning.is_scored(cell):
             by_feed.setdefault(dataset["feed"], []).extend(cell["daily"])
     return by_feed
 
@@ -4023,16 +4091,14 @@ def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
         row_heights=[0.6, 0.4],
     )
     moves: dict[str, dict] = {}
-    for cell, dataset, color in (
-        (job.get("best"), spec["tune_dataset"], PALETTE["accent"]),
-        (job.get("best_test"), spec.get("test_dataset"), PALETTE["up"]),
-    ):
-        if not sim_tuning.is_scored(cell) or not dataset:
+    for index, dataset in enumerate(spec["datasets"]):
+        cell = sim_tuning.pick_cell(job, dataset["name"])
+        if not sim_tuning.is_scored(cell):
             continue
         days = list(cell["daily"])
         fig.add_trace(go.Bar(
             x=days, y=[cell["daily"][d] for d in days],
-            name=f"Pick on {dataset['name']}", marker_color=color,
+            name=f"Pick on {dataset['name']}", marker_color=_tuning_color(index),
             hovertext=[_tuning_day_hover(d, context) for d in days],
         ), row=1, col=1)
         moves.update(_tuning_session_moves(symbol, dataset["feed"], days))
@@ -4088,7 +4154,8 @@ def _render_tuning_session_context(job: dict, context: dict) -> None:
     if not context["biases"]:
         return
     profit = {}
-    for cell in (job.get("best"), job.get("best_test")):
+    for name in sim_tuning.dataset_names(job["spec"]):
+        cell = sim_tuning.pick_cell(job, name)
         if sim_tuning.is_scored(cell):
             profit.update(cell["daily"])
     rows = [
@@ -4124,22 +4191,20 @@ def _render_tuning_session_context(job: dict, context: dict) -> None:
 
 
 def _render_tuning_notes(job: dict) -> None:
-    spec = job["spec"]
-    for role, dataset in (("tune", spec["tune_dataset"]), ("test", spec.get("test_dataset"))):
-        if not dataset:
-            continue
-        cells = [*job["cells"][role], job["baseline"].get(role)]
+    for dataset in job["spec"]["datasets"]:
+        name = dataset["name"]
+        cells = [*(job["cells"].get(name) or ()), job["baseline"].get(name)]
         errors = [c for c in cells if c and c.get("error")]
         if errors:
             st.warning(
-                f"{len(errors)} replay(s) on `{dataset['name']}` ended with an error — "
+                f"{len(errors)} replay(s) on `{name}` ended with an error — "
                 f"the first: {errors[0]['error']}"
             )
-        base = job["baseline"].get(role)
+        base = job["baseline"].get(name)
         missing = (base or {}).get("no_forecast_days") or []
         if missing:
             st.warning(
-                f"On `{dataset['name']}` the day-range model could not forecast "
+                f"On `{name}` the day-range model could not forecast "
                 f"{len(missing)} of {base['days']} sessions ({', '.join(missing)}), so no "
                 "configuration traded them. The usual cause is too little daily history "
                 "before the dataset's first day."
@@ -4152,7 +4217,7 @@ def _render_tuning_notes(job: dict) -> None:
             "over the same sessions, tape and starting cash — rather than being swept "
             "again. Which cells is in the table below."
         )
-    refused = sum(1 for c in job["cells"]["tune"] if "invalid" in c)
+    refused = sum(1 for c in sim_tuning.summed_cells(job) if "invalid" in c)
     if refused:
         st.caption(
             f":material/block: {refused} combination{'s' if refused != 1 else ''} the "
@@ -4166,22 +4231,23 @@ def _render_derived_header(job: dict) -> None:
 
     Nobody submitted this one: it is the stored runs that happen to agree on
     everything except its axes, read as the grid they describe. So it comes
-    with the caveats a submitted job does not have — no test dataset, no base
+    with the caveats a submitted job does not have — one dataset, no base
     configuration anyone nominated, no pick rule — and the one action worth
     offering is to turn it into a real job, which replays the holes and reuses
-    every cell already on screen.
+    every cell already on screen. Once it is a job, more datasets can be added.
     """
     spec = job["spec"]
     axes = spec["axes"]
+    [name] = sim_tuning.dataset_names(spec)
     cells = sim_tuning.grid(axes)
-    filled = len(job["cells"]["tune"])
+    filled = len(job["cells"].get(name) or ())
     missing = len(cells) - filled
     st.info(
         f"**Assembled from {filled} stored run{'s' if filled != 1 else ''}**, not swept as a "
         "job. They agree on every setting except "
         + " and ".join(f"**{_tuning_param_label(a['name'])}**" for a in axes)
         + f", so they read as a grid of {' × '.join(str(len(a['values'])) for a in axes)} "
-        f"over `{spec['tune_dataset']['name']}` — "
+        f"over `{name}` — "
         + (
             f"{missing} of its {len(cells)} combinations nobody has run, left blank below."
             if missing else "and every combination has been run."
@@ -4189,7 +4255,7 @@ def _render_derived_header(job: dict) -> None:
         icon=":material/auto_awesome_mosaic:",
     )
     st.caption(
-        "Incomplete by construction: there is no test dataset, the base configuration "
+        "Incomplete by construction: there is only the one dataset, the base configuration "
         "marked on the grid is simply the most recent of these runs, and the pick is the "
         "highest cell with no minimum share of days traded — nobody chose any of that. "
         "Read it as what has been tried, not as a tuned answer."
@@ -4206,11 +4272,10 @@ def _render_derived_header(job: dict) -> None:
     # the same match `prior_cells` makes -- so the estimate reads them off the
     # job rather than scoring the whole store again.
     filled_cells = {
-        sim_tuning.TUNE: {
+        name: {
             sim_tuning.overrides_key(c["overrides"]): c
-            for c in [*job["cells"]["tune"], job["baseline"]["tune"]] if c
+            for c in [*job["cells"][name], job["baseline"][name]] if c
         },
-        sim_tuning.TEST: {},
     }
     minutes = sim_tuning.estimated_seconds(spec, filled_cells) / 60.0
     duration = "under a minute" if minutes < 1 else f"roughly {minutes:.0f} min"
@@ -4226,8 +4291,89 @@ def _render_derived_header(job: dict) -> None:
             st.toast("Tuning job started", icon=":material/tune:")
             st.rerun()
         st.caption(
-            f"{duration} with {workers} workers. To add a test dataset, a metric or a "
-            "wider range, copy these settings into **New tuning job** instead."
+            f"{duration} with {workers} workers. Once it is a job, more datasets can be "
+            "added to it; for a wider range, copy these settings into **New tuning job**."
+        )
+
+
+def _render_tuning_dataset_controls(job: dict) -> None:
+    """Add a dataset to a finished job, finish a stopped one, or drop a dataset.
+
+    The weekly chore this tab is for: a new week of tape arrives, it is swept
+    with the job's own settings, and the sum and the pick are re-read with it.
+    """
+    spec = job["spec"]
+    job_id = job["job_id"]
+    ticker = spec["base"]["ticker"]
+    names = sim_tuning.dataset_names(spec)
+    addable = sorted(
+        (
+            d for d in sim_data.list_datasets()
+            if ticker in {str(s).upper() for s in (d.symbols or [])} and d.name not in names
+        ),
+        key=lambda d: str(d.end), reverse=True,
+    )
+    missing = sim_tuning.missing_replays(job)
+    col_add, col_actions = st.columns([3, 2], vertical_alignment="bottom")
+    chosen = None
+    if addable:
+        by_name = {d.name: d for d in addable}
+        chosen = by_name[col_add.selectbox(
+            "Add a dataset", list(by_name),
+            format_func=lambda n: _tuning_describe_dataset(by_name[n]),
+            key=f"tune_add_{job_id}",
+            help="Swept with this job's base configuration, grid, cash and pick rule, then "
+            "summed with the others.",
+        )]
+    else:
+        col_add.caption(f"Every stored dataset that carries {ticker} is already in this job.")
+    with col_actions.container(horizontal=True, vertical_alignment="bottom"):
+        if chosen is not None and st.button(
+            "Add and sweep", icon=":material/add:", type="primary",
+            key=f"tune_add_go_{job_id}",
+        ):
+            try:
+                sim_tuning.add_dataset(job_id, _tuning_dataset_spec(chosen), runs=_runs())
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.toast(f"Sweeping {chosen.name}", icon=":material/tune:")
+                st.rerun()
+        if missing and st.button(
+            f"Sweep {missing} missing", icon=":material/play_arrow:",
+            key=f"tune_resume_{job_id}",
+            help="Replays only what this job has no answer for yet — the rest of a stopped "
+            "job, say. Stored runs are reused where they match.",
+        ):
+            sim_tuning.resume(job_id, runs=_runs())
+            st.toast("Tuning job resumed", icon=":material/tune:")
+            st.rerun()
+        if len(names) > 1:
+            with st.popover("Remove a dataset", icon=":material/remove:"):
+                dropped = st.selectbox("Dataset", names, key=f"tune_remove_{job_id}")
+                st.caption(
+                    "Its cells are dropped and the sum and the pick are re-read from the "
+                    "rest; nothing is replayed. Adding it back sweeps it again, except "
+                    "where the run store answers a cell."
+                )
+                if st.button(
+                    "Remove", icon=":material/delete:", key=f"tune_remove_go_{job_id}",
+                ):
+                    sim_tuning.remove_dataset(job_id, dropped)
+                    st.toast(f"Removed {dropped}", icon=":material/remove:")
+                    st.rerun()
+    if chosen is not None:
+        added = _tuning_dataset_spec(chosen)
+        _render_tuning_overlaps([*spec["datasets"], added])
+        prior = sim_tuning.prior_cells(spec, _runs(), [added])
+        minutes = sim_tuning.estimated_seconds(spec, prior, [added]) / 60.0
+        found = len(prior[added["name"]])
+        st.caption(
+            f"Adding `{chosen.name}` is {len(sim_tuning.grid(spec['axes'])) + 1} replays"
+            + (f", {found} of them already in the run store" if found else "")
+            + " · " + ("under a minute" if minutes < 1 else f"roughly {minutes:.0f} min")
+            + f" with {spec.get('workers') or 1} worker"
+            + ("s" if int(spec.get("workers") or 1) != 1 else "") + "."
         )
 
 
@@ -4246,7 +4392,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     job = next(j for j in jobs if j["job_id"] == job_id)
     spec = job["spec"]
     axes = spec["axes"]
-    metric = spec.get("metric", "profit")
+    names = sim_tuning.dataset_names(spec)
 
     if job["status"] == sim_tuning.RUNNING:
         st.info("Still running — the heatmaps fill in as cells finish.",
@@ -4254,79 +4400,88 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     elif job["status"] == sim_tuning.FAILED:
         st.error(
             f"This job did not finish ({job.get('error')}). What was swept before it "
-            "stopped is shown below."
+            "stopped is shown below; **Sweep missing** replays the rest."
         )
     elif sim_tuning.is_derived(job):
         _render_derived_header(job)
 
     signature = rule_agent(APPLE_TRADER_KEY).signature(sim_tuning.make_config(spec["base"], {}))
     st.caption(
-        f"Base `{signature}` · optimising {sim_tuning.METRICS[metric].lower()} · pick: "
-        f"{_PICK_LABELS.get(spec.get('rule'), spec.get('rule')).lower()}, trading on at "
+        f"Base `{signature}` · pick: best total profit"
+        + (f" over {len(names)} datasets" if len(names) > 1 else "")
+        + f", {_PICK_LABELS.get(spec.get('rule'), spec.get('rule')).lower()}, trading on at "
         f"least {float(spec.get('min_traded_share') or 0):.0%} of days · starting cash "
-        f"\\${float(spec['starting_cash']):,.0f}."
+        f"\\${float(spec['starting_cash']):,.0f} per dataset."
     )
+    if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED):
+        _render_tuning_dataset_controls(job)
+
     verdict = _tuning_verdict(job)
     if verdict:
         st.markdown(verdict)
 
-    money = st.column_config.NumberColumn
-    has_test = bool(spec.get("test_dataset"))
-    config = {
-        "configuration": "Configuration",
-        "values": "Tuned values",
-        "tune_profit": money(f"Profit on {spec['tune_dataset']['name']} ($)", format="%+.2f"),
-        "tune_return": money("Return", format="%+.2f%%"),
-        "tune_days": "Days",
-        "tune_worst": money("Worst day ($)", format="%+.2f"),
-    }
-    if has_test:
-        config.update({
-            "test_profit": money(f"Profit on {spec['test_dataset']['name']} ($)", format="%+.2f"),
-            "test_return": money("Test return", format="%+.2f%%"),
-            "test_days": "Test days",
-            "test_worst": money("Test worst day ($)", format="%+.2f"),
-        })
-    st.dataframe(pd.DataFrame(_tuning_summary_rows(job)), hide_index=True, column_config=config)
-
     best = job.get("best")
+    base_values = {a["name"]: spec["base"][a["name"]] for a in axes}
+    st.caption(
+        f"Base configuration: {_tuning_values_text(base_values)}"
+        + (f" · Pick: {_tuning_values_text(best['overrides'])}" if best else "")
+    )
+    money = st.column_config.NumberColumn
+    st.dataframe(pd.DataFrame(_tuning_summary_rows(job)), hide_index=True, column_config={
+        "dataset": "Dataset",
+        "sessions": "Sessions",
+        "base_profit": money("Base profit ($)", format="%+.2f"),
+        "base_return": money("Base return", format="%+.2f%%"),
+        "pick_profit": money("Pick profit ($)", format="%+.2f"),
+        "pick_return": money("Pick return", format="%+.2f%%"),
+        "pick_days": "Pick days",
+        "pick_worst": money("Pick worst day ($)", format="%+.2f"),
+    })
+
     marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
-    tune_title = (
-        "From stored runs · " if sim_tuning.is_derived(job) else "Tuning · "
-    ) + spec["tune_dataset"]["name"]
-    if job["cells"]["test"]:
-        col_tune, col_test = st.columns(2)
-        col_tune.plotly_chart(
-            _tuning_heatmap(job["cells"]["tune"], axes, metric, marks, tune_title),
-            key=f"tune_heat_{job_id}",
+    prefix = "From stored runs · " if sim_tuning.is_derived(job) else ""
+    _render_tuning_charts([
+        (
+            f"tune_heat_{job_id}_{index}",
+            _tuning_heatmap(job["cells"].get(name) or [], axes, marks, f"{prefix}{name}"),
         )
-        col_test.plotly_chart(
-            _tuning_heatmap(job["cells"]["test"], axes, metric, marks,
-                            f"Test · {spec['test_dataset']['name']}"),
-            key=f"tune_heat_test_{job_id}",
-        )
-    else:
+        for index, name in enumerate(names)
+    ])
+    if len(names) > 1:
         st.plotly_chart(
-            _tuning_heatmap(job["cells"]["tune"], axes, metric, marks, tune_title),
-            key=f"tune_heat_{job_id}",
+            _tuning_heatmap(
+                sim_tuning.summed_cells(job), axes, marks,
+                f"Sum of all {len(names)} datasets",
+            ),
+            key=f"tune_heat_sum_{job_id}",
+        )
+        st.caption(
+            "A combination is summed once every dataset has replayed it. The pick is the "
+            "best cell of this sum, so every dataset above is in sample: a pick worth "
+            "keeping is in profit on most of them, not carried by one."
         )
     _render_tuning_notes(job)
 
     rows = _tuning_cell_rows(job)
     if rows:
+        per_dataset = {
+            f"ds_{index}": money(f"{name} ($)", format="%+.2f")
+            for index, name in enumerate(names)
+        }
         with st.expander(f"Every combination ({len(rows)})", icon=":material/table_rows:"):
             st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={
-                "profit": money("Profit ($)", format="%+.2f"),
-                "return_pct": money("Return", format="%+.2f%%"),
+                "profit": money("Total profit ($)", format="%+.2f"),
+                "return_pct": money("Total return", format="%+.2f%%"),
                 "trades": "Trades",
                 "days_up": "Days up",
                 "days_traded": "Days traded",
                 "worst_day": money("Worst day ($)", format="%+.2f"),
-                "test_profit": money("Test profit ($)", format="%+.2f"),
+                **per_dataset,
                 "source": st.column_config.TextColumn(
                     "Where from",
-                    help="`swept` — replayed by this job. `run <id>` — taken from a stored "
-                    "simulation run of the same configuration over the same sessions.",
+                    help="`swept` — replayed by this job. Otherwise how many of the "
+                    "datasets' replays were taken from a stored simulation run of the same "
+                    "configuration over the same sessions.",
                 ),
             })
 

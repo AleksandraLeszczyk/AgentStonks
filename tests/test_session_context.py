@@ -148,14 +148,15 @@ class TestSessionChart:
         from simlab import app as sim_app
 
         monkeypatch.setattr(sim_app, "_tuning_session_moves", lambda sym, feed, days: {})
-        cell = {"profit": 10.0, "daily": {"2026-09-14": 12.0, "2026-09-15": -2.0}}
+        cell = {"overrides": {}, "profit": 10.0,
+                "daily": {"2026-09-14": 12.0, "2026-09-15": -2.0}}
         job = {
             "spec": {
                 "base": {"ticker": "AAPL"},
-                "tune_dataset": {"name": "wk", "feed": "sip"},
-                "test_dataset": None,
+                "datasets": [{"name": "wk", "feed": "sip"}],
             },
-            "best": cell, "best_test": None,
+            "cells": {"wk": [cell]},
+            "best": cell,
         }
         monkeypatch.setattr(sim_app.sim_tuning, "is_scored", lambda c: bool(c))
         context = {

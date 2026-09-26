@@ -1,4 +1,4 @@
-"""Parameter tuning for Apple Trader: sweep a grid, pick on one dataset, test on another.
+"""Parameter tuning for Apple Trader: sweep one grid over several datasets and sum them.
 
 TimeToChange3's notebook 05 sweeps the buy and sell distances over its sessions
 and reads a profit heatmap; `scripts/sweep_levels.py` turned that into the
@@ -11,22 +11,35 @@ SimLab, with two differences that are the point of doing it here:
   of the rule. What a cell scores is what that configuration would have done in
   a Simulate run, down to the fill. The notebook's limit fills at the level are
   kinder, so expect lower numbers than its heatmap.
-* **the pick is tested out of sample.** A grid always has a best cell, and on a
-  handful of sessions it is mostly the luckiest one. So the grid is swept on a
-  *tuning* dataset, one cell is picked there, and that cell -- next to the
-  untuned base configuration -- is replayed on a separate *test* dataset.
-  Whether its profit survives is the actual finding; the tuning heatmap alone
-  is not. The whole grid can be swept on the test dataset too, which shows
-  whether the profitable region moved rather than just whether one cell held.
+* **the grid is swept on every dataset of the job, and the pick is read off
+  their sum.** A grid always has a best cell, and on a handful of sessions it
+  is mostly the luckiest one. One week's heatmap says little; the same grid
+  over several weeks, heatmap by heatmap and then summed, shows which region
+  keeps paying. The pick is the best total profit on that sum.
+
+A job grows. Tuning is a weekly chore -- a new week of tape arrives, and the
+question is whether the pick still holds with it -- so a finished job takes a
+new dataset (`add_dataset`): the same base configuration and axes are swept
+over it, and the sum and the pick are re-read. A dataset can be dropped again
+(`remove_dataset`), which costs no replay at all.
+
+Jobs written before this (2026-09-26) had exactly two datasets, a *tune* and a
+*test* one, under `spec.tune_dataset` / `spec.test_dataset`. `_upgrade` reads
+them as a job over those two datasets, so they take part in the new workflow
+like any other.
 
 What a job is
 -------------
-One JSON record under `data/simlab/tuning/`, plus a sidecar log. The work runs
-in a detached worker (`python -m simlab.tuning <job_id>`) for the same reason
-experiments do: the simulation clock and `simulation_context` are process
-globals, so one process can host one replay at a time. Cells fan out over a
-spawn-context process pool inside that worker, and the record is rewritten
-after every finished cell, which is what the Tuning tab's progress bar reads.
+One JSON record under `data/simlab/tuning/`, plus a sidecar log. Cells are kept
+per dataset, keyed by the dataset's name (`record["cells"][name]`, likewise
+`record["baseline"][name]`). The work runs in a detached worker
+(`python -m simlab.tuning <job_id>`) for the same reason experiments do: the
+simulation clock and `simulation_context` are process globals, so one process
+can host one replay at a time. Cells fan out over a spawn-context process pool
+inside that worker, and the record is rewritten after every finished cell,
+which is what the Tuning tab's progress bar reads. The worker replays whatever
+the record has no answer for yet, which is what makes adding a dataset or
+resuming a stopped job the same operation as running a new one.
 
 Up to two parameters are tuned at once -- two is what a heatmap can show. Every
 other field comes from the base configuration. A combination the config refuses
@@ -78,9 +91,14 @@ FINISHED = "finished"
 FAILED = "failed"
 STOPPED_ERROR = "stopped by user"
 
+# The two roles a job's datasets had before a job could hold any number of
+# them. Only `_upgrade` reads them now.
 TUNE = "tune"
 TEST = "test"
 BASELINE = "baseline"
+
+#: What the pick is chosen on: the total profit over every dataset of a job.
+PICK_METRIC = "profit"
 
 # How many parameters one job sweeps: two is what a heatmap can show.
 MAX_AXES = 2
@@ -336,20 +354,22 @@ def axis_tick(name: str, value) -> str:
 SECONDS_PER_SESSION = 0.25
 
 
-def estimated_seconds(spec: dict, prior: "dict | None" = None) -> float:
-    """Roughly how long a job takes, from its replay count and session counts.
+def estimated_seconds(
+    spec: dict, prior: "dict | None" = None, datasets: "list[dict] | None" = None
+) -> float:
+    """Roughly how long sweeping `datasets` (default: all of the job's) takes.
 
-    `prior` is `prior_cells`' answer: those replays are already on disk and the
-    job skips them, so they cost nothing but still count towards its total.
+    `prior` is `prior_cells`' answer, `{dataset name: {cell key: cell}}`: those
+    replays are already on disk and the job skips them, so they cost nothing
+    but still count towards its total.
     """
     cells = len(grid(spec["axes"]))
     prior = prior or {}
-    sessions = (cells + 1 - len(prior.get(TUNE) or ())) * len(spec["tune_dataset"]["days"])
-    test = spec.get("test_dataset")
-    if test:
-        planned = (cells if spec.get("sweep_test_grid") else 1) + 1
-        sessions += (planned - len(prior.get(TEST) or ())) * len(test["days"])
-    workers = max(1, min(int(spec.get("workers") or 1), total_replays(spec)))
+    datasets = spec["datasets"] if datasets is None else datasets
+    sessions = sum(
+        (cells + 1 - len(prior.get(d["name"]) or ())) * len(d["days"]) for d in datasets
+    )
+    workers = max(1, min(int(spec.get("workers") or 1), (cells + 1) * max(len(datasets), 1)))
     return SECONDS_PER_SESSION * max(sessions, 0) / workers
 
 
@@ -782,23 +802,20 @@ def prior_cell(
 
 
 def prior_cells(
-    spec: dict, runs: "list[dict] | None" = None
+    spec: dict, runs: "list[dict] | None" = None, datasets: "list[dict] | None" = None
 ) -> "dict[str, dict[str, dict]]":
     """Every cell of this job's grid the run store already answers.
 
-    Returns `{role: {overrides_key: cell}}` for the tuning and test datasets,
-    with the baseline under `overrides_key({})`. The test grid is only looked
-    up when the job would sweep it -- a job that does not sweep it is not
-    asking about those cells, and half-filling a heatmap it never draws would
-    put rows in Results tables for a comparison nobody asked for. Its baseline
-    is looked up either way, since every job with a test dataset replays that.
+    Returns `{dataset name: {overrides_key: cell}}` for `datasets` (default:
+    every dataset of the job), with the baseline under `overrides_key({})`.
 
     Nothing here runs a replay, so this is cheap enough for the form to call on
     every rerun -- it parses the store (cached upstream) and scores the records
     that land on the grid.
     """
-    found: "dict[str, dict[str, dict]]" = {TUNE: {}, TEST: {}}
-    if not spec.get("reuse_runs", True):
+    datasets = (spec.get("datasets") or []) if datasets is None else datasets
+    found: "dict[str, dict[str, dict]]" = {d["name"]: {} for d in datasets}
+    if not spec.get("reuse_runs", True) or not datasets:
         return found
     if runs is None:
         from .results import list_runs
@@ -808,33 +825,22 @@ def prior_cells(
     if not index:
         return found
     cells = grid(spec["axes"])
-    for role, dataset, swept in (
-        (TUNE, spec.get("tune_dataset"), True),
-        (TEST, spec.get("test_dataset"), bool(spec.get("sweep_test_grid"))),
-    ):
-        if not dataset:
-            continue
-        for overrides in ([*cells, {}] if swept else [{}]):
+    for dataset in datasets:
+        for overrides in [*cells, {}]:
             cell = prior_cell(index, spec, dataset, overrides)
             if cell is not None:
-                found[role][overrides_key(overrides)] = cell
+                found[dataset["name"]][overrides_key(overrides)] = cell
     return found
 
 
 def reused_count(record: dict) -> int:
     """How many of a job's replays came out of the run store rather than a
-    fresh sweep -- countable against `progress["total"]`.
-
-    `best_test` is only its own replay when the test grid was not swept; where
-    it was, the pick's test cell is already one of `cells[TEST]` and counting
-    it again would claim more replays than the job has.
-    """
+    fresh sweep -- countable against `progress["total"]`."""
     cells = [
-        *record["cells"][TUNE], *record["cells"][TEST],
-        record["baseline"].get(TUNE), record["baseline"].get(TEST),
+        cell
+        for name in dataset_names(record["spec"])
+        for cell in [*(record["cells"].get(name) or ()), record["baseline"].get(name)]
     ]
-    if not record["spec"].get("sweep_test_grid"):
-        cells.append(record.get("best_test"))
     return sum(1 for c in cells if c and c.get("run_id"))
 
 
@@ -850,7 +856,7 @@ def reused_count(record: dict) -> int:
 # So the Tuning tab also offers *derived* jobs: job records assembled out of
 # the run store, with the cells the runs answer filled and the rest of the
 # lattice left as holes. They are incomplete by construction -- nobody chose a
-# base configuration, a test dataset or a pick rule, and the grid is only as
+# base configuration, a second dataset or a pick rule, and the grid is only as
 # dense as the runs happen to be -- and the tab offers to finish one, which
 # submits a real job that reuses every filled cell and replays only the holes.
 
@@ -946,6 +952,9 @@ def _derived_job(names: "tuple[str, ...]", bucket: tuple, found: dict) -> dict:
     """
     _, feed, days, cash = bucket
     newest, base_config, _ = next(iter(found.values()))
+    # A dataset's name is what a job keys its cells by, so it cannot be empty
+    # even for a run that was stored without one.
+    name = newest.get("dataset") or f"{days[0]} → {days[-1]}"
     axes = [
         {
             "name": name,
@@ -958,24 +967,21 @@ def _derived_job(names: "tuple[str, ...]", bucket: tuple, found: dict) -> dict:
     spec = {
         "base": asdict(base_config),
         "axes": axes,
-        "tune_dataset": {
-            "name": newest.get("dataset") or "",
+        "datasets": [{
+            "name": name,
             "days": list(days),
             "feed": feed,
             # What the replay needs, rather than whatever basket the runs were
             # handed: a rule agent trades one symbol and `validate` only asks
             # that the dataset carries it.
             "symbols": [base_config.ticker],
-        },
-        "test_dataset": None,
+        }],
         "starting_cash": cash,
         # Nobody chose these. The least-assuming pair -- the highest cell, no
         # minimum share of days traded -- so the marker says "the best anyone
         # has run" and nothing more; the form is where a real pick is set up.
-        "metric": "profit",
         "rule": PICK_MAX,
         "min_traded_share": 0.0,
-        "sweep_test_grid": False,
         "reuse_runs": True,
         "workers": 1,
     }
@@ -999,7 +1005,7 @@ def _derived_job(names: "tuple[str, ...]", bucket: tuple, found: dict) -> dict:
         ),
         None,
     )
-    return {
+    record = {
         "job_id": _derived_id(names, bucket),
         "created_at": newest.get("created_at") or "",
         "finished_at": newest.get("created_at") or "",
@@ -1012,11 +1018,11 @@ def _derived_job(names: "tuple[str, ...]", bucket: tuple, found: dict) -> dict:
         "progress": {
             "done": len(cells) + 1, "total": len(order) + 1, "reused": len(cells) + 1,
         },
-        "cells": {TUNE: cells, TEST: []},
-        "baseline": {TUNE: baseline, TEST: None},
-        "best": pick_best(cells, axes, "profit", PICK_MAX, 0.0),
-        "best_test": None,
+        "cells": {name: cells},
+        "baseline": {name: baseline},
+        "best": None,
     }
+    return refresh_pick(record)
 
 
 def derived_jobs(runs: "list[dict] | None" = None) -> "list[dict]":
@@ -1101,7 +1107,9 @@ def pick_best(
     rule: str = PICK_MAX,
     min_traded_share: float = 0.0,
 ) -> "dict | None":
-    """The cell to carry to the test dataset, with the `pick_score` it won on.
+    """The best of `cells`, with the `pick_score` it won on.
+
+    A job hands it the grid summed over all of its datasets (`summed_cells`).
 
     `PICK_MAX` takes the highest metric. `PICK_PLATEAU` takes the cell whose
     neighbourhood -- itself and every adjacent cell on the grid, diagonals
@@ -1148,8 +1156,120 @@ def pick_best(
 
 
 def overlapping_days(first: "list[str]", second: "list[str]") -> "list[str]":
-    """Sessions two datasets share -- a test on them is not out of sample."""
+    """Sessions two datasets share -- summed, those sessions count twice."""
     return sorted(set(first) & set(second))
+
+
+# --- the sum over datasets --------------------------------------------------
+
+
+def dataset_names(spec: dict) -> "list[str]":
+    """A job's datasets by name, in the order they were added."""
+    return [d["name"] for d in spec.get("datasets") or ()]
+
+
+def _cells_by_key(record: dict, name: str) -> "dict[str, dict]":
+    return {overrides_key(c["overrides"]): c for c in record["cells"].get(name) or ()}
+
+
+def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
+    """One grid cell summed over datasets, or None while a dataset has no answer.
+
+    Each dataset is its own replay starting from the same cash, so profits add,
+    and so do returns: the summed return is the total profit as a share of the
+    starting cash. Counts add too; the worst and best day are the extremes over
+    every session.
+
+    A cell the configuration refuses is refused on every dataset, so one
+    `invalid` part makes the sum invalid. A replay that errored makes the sum
+    unscored rather than a number missing one dataset's share. A dataset that
+    has not been swept yet leaves the sum a hole -- a partial total would read
+    as a bad cell rather than an unfinished one.
+    """
+    if not parts:
+        return None
+    refused = next((p for p in parts if p and "invalid" in p), None)
+    if refused is not None:
+        return {"overrides": dict(overrides), "invalid": refused["invalid"]}
+    if any(p is None for p in parts):
+        return None
+    errored = next((p for p in parts if p.get("error")), None)
+    if errored is not None:
+        return {"overrides": dict(overrides), "error": errored["error"]}
+    total = lambda field: sum(p.get(field) or 0 for p in parts)  # noqa: E731
+    return {
+        "overrides": dict(overrides),
+        "profit": round(total("profit"), 2),
+        "return_pct": round(total("return_pct"), 4),
+        "trades": total("trades"),
+        "sells": total("sells"),
+        "days": total("days"),
+        "days_traded": total("days_traded"),
+        "days_up": total("days_up"),
+        "days_down": total("days_down"),
+        "worst_day": min(p["worst_day"] for p in parts),
+        "best_day": max(p["best_day"] for p in parts),
+        "datasets": len(parts),
+        "datasets_up": sum(1 for p in parts if p["profit"] > _FLAT_DAY_USD),
+        "reused": sum(1 for p in parts if p.get("run_id")),
+        "error": None,
+    }
+
+
+def summed_cells(record: dict) -> "list[dict]":
+    """The grid summed over every dataset of the job, in grid order.
+
+    Only cells every dataset has answered are summed (plus refused ones), so
+    while a job runs the sum fills in as each combination completes everywhere.
+    """
+    names = dataset_names(record["spec"])
+    by_name = [_cells_by_key(record, name) for name in names]
+    out = []
+    for overrides in grid(record["spec"]["axes"]):
+        key = overrides_key(overrides)
+        cell = combine(overrides, [cells.get(key) for cells in by_name])
+        if cell is not None:
+            out.append(cell)
+    return out
+
+
+def summed_baseline(record: dict) -> "dict | None":
+    """The base configuration summed over every dataset of the job."""
+    names = dataset_names(record["spec"])
+    return combine({}, [(record.get("baseline") or {}).get(name) for name in names])
+
+
+def pick_cell(record: dict, name: str) -> "dict | None":
+    """The pick's own cell on one dataset: its share of the summed total."""
+    best = record.get("best")
+    if not best:
+        return None
+    return _cells_by_key(record, name).get(overrides_key(best["overrides"]))
+
+
+def refresh_pick(record: dict) -> dict:
+    """Re-read the pick off the summed grid; returns the record.
+
+    The best total profit, under the job's pick rule and minimum share of days
+    traded -- counted over every session of every dataset.
+    """
+    spec = record["spec"]
+    record["best"] = pick_best(
+        summed_cells(record), spec["axes"], PICK_METRIC,
+        spec.get("rule", PICK_MAX), float(spec.get("min_traded_share") or 0.0),
+    )
+    return record
+
+
+def missing_replays(record: dict) -> int:
+    """How many replays the record still has no answer for, over all datasets."""
+    keys = [overrides_key(c) for c in grid(record["spec"]["axes"])]
+    missing = 0
+    for name in dataset_names(record["spec"]):
+        have = _cells_by_key(record, name)
+        missing += sum(1 for key in keys if key not in have)
+        missing += (record.get("baseline") or {}).get(name) is None
+    return missing
 
 
 # --- the job store ----------------------------------------------------------
@@ -1178,7 +1298,7 @@ def _write(record: dict) -> None:
 
 def get_job(job_id: str) -> "dict | None":
     try:
-        return json.loads(_path(job_id).read_text())
+        return _upgrade(json.loads(_path(job_id).read_text()))
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -1190,10 +1310,73 @@ def list_jobs() -> "list[dict]":
     jobs = []
     for path in sorted(TUNING_DIR.glob("*.json"), reverse=True):
         try:
-            jobs.append(_reap(json.loads(path.read_text())))
+            jobs.append(_upgrade(_reap(json.loads(path.read_text()))))
         except (OSError, json.JSONDecodeError):
             continue
     return jobs
+
+
+def _answered(record: dict) -> int:
+    """How many replays the record holds an answer for, over all datasets."""
+    return sum(
+        len(record["cells"].get(name) or ()) + (record["baseline"].get(name) is not None)
+        for name in dataset_names(record["spec"])
+    )
+
+
+def _upgrade(record: dict) -> dict:
+    """A job stored with a tune and a test dataset, read as a job over both.
+
+    Before 2026-09-26 a job had exactly two roles: the grid was swept on the
+    *tune* dataset, the pick chosen there, and either the whole grid or only
+    the pick (plus the baseline) replayed on the *test* dataset. Both become
+    ordinary datasets of the job, in that order. A test dataset whose grid was
+    not swept keeps only the replays it had -- the pick and the baseline -- so
+    the rest of its grid is holes that resuming the job fills.
+
+    The pick is re-read off the sum, which is what a pick means now, so an old
+    job's marker moves from the tuning week's best cell to the best total over
+    both weeks. The stored metric goes with it: the sum is ranked on profit.
+
+    In memory only: the file keeps its old shape until something rewrites it
+    (adding or removing a dataset, resuming), and a worker still running under
+    the old code keeps writing the shape it knows.
+    """
+    spec = record.get("spec") or {}
+    if "datasets" in spec:
+        return record
+    datasets: "list[dict]" = []
+    cells: "dict[str, list[dict]]" = {}
+    baseline: "dict[str, dict | None]" = {}
+    for role, key in ((TUNE, "tune_dataset"), (TEST, "test_dataset")):
+        dataset = spec.get(key)
+        if not dataset or dataset["name"] in cells:
+            continue
+        found = list((record.get("cells") or {}).get(role) or ())
+        if role == TEST and not spec.get("sweep_test_grid"):
+            found = [c for c in (record.get("best_test"),) if c]
+        datasets.append(dataset)
+        cells[dataset["name"]] = found
+        baseline[dataset["name"]] = (record.get("baseline") or {}).get(role)
+    upgraded = {
+        k: v for k, v in record.items() if k not in ("best_test",)
+    }
+    upgraded["spec"] = {
+        **{k: v for k, v in spec.items()
+           if k not in ("tune_dataset", "test_dataset", "sweep_test_grid", "metric")},
+        "datasets": datasets,
+    }
+    upgraded["cells"] = cells
+    upgraded["baseline"] = baseline
+    upgraded["progress"] = {
+        **(record.get("progress") or {}),
+        "done": _answered(upgraded),
+        "total": total_replays(upgraded["spec"]),
+    }
+    upgraded["progress"]["reused"] = reused_count(upgraded)
+    if upgraded.get("status") != RUNNING:
+        refresh_pick(upgraded)
+    return upgraded
 
 
 def delete_job(job_id: str) -> None:
@@ -1203,14 +1386,8 @@ def delete_job(job_id: str) -> None:
 
 
 def total_replays(spec: dict) -> int:
-    """How many replays a job runs: the grid on the tuning dataset plus the
-    baseline, then on the test dataset either the grid or just the pick, plus
-    the baseline again."""
-    cells = len(grid(spec["axes"]))
-    total = cells + 1
-    if spec.get("test_dataset"):
-        total += (cells if spec.get("sweep_test_grid") else 1) + 1
-    return total
+    """How many replays a job runs: the grid plus the baseline, on every dataset."""
+    return (len(grid(spec["axes"])) + 1) * len(spec.get("datasets") or ())
 
 
 def validate(spec: dict) -> "str | None":
@@ -1237,26 +1414,68 @@ def validate(spec: dict) -> "str | None":
     cells = len(grid(axes))
     if cells > MAX_CELLS:
         return f"{cells} combinations is more than the {MAX_CELLS} one job may sweep."
+    datasets = spec.get("datasets") or []
+    if not datasets:
+        return "Pick at least one dataset."
+    names = [d["name"] for d in datasets]
+    # Cells are kept per dataset name, so a name twice would be one set of
+    # cells counted twice in the sum.
+    if len(set(names)) != len(names):
+        return "The same dataset is in the job twice."
     ticker = spec["base"]["ticker"]
-    for role in ("tune_dataset", "test_dataset"):
-        dataset = spec.get(role)
-        if dataset is None:
-            continue
+    for dataset in datasets:
         if ticker not in (dataset.get("symbols") or []):
             return f"Dataset {dataset['name']} does not carry {ticker}."
-    if not spec.get("tune_dataset"):
-        return "Pick a dataset to tune on."
     return None
+
+
+def _seed(record: dict, runs: "list[dict] | None", datasets: "list[dict]") -> int:
+    """Fill the record's holes on `datasets` from the run store; how many it filled.
+
+    A cell or baseline the record already holds is never replaced -- it is the
+    same replay either way, and the one on the record is the one on screen.
+    """
+    prior = prior_cells(record["spec"], runs, datasets)
+    base_key = overrides_key({})
+    filled = 0
+    for dataset in datasets:
+        name = dataset["name"]
+        have = _cells_by_key(record, name)
+        cells = record["cells"].setdefault(name, [])
+        for key, cell in prior[name].items():
+            if key == base_key:
+                if record["baseline"].get(name) is None:
+                    record["baseline"][name] = cell
+                    filled += 1
+            elif key not in have:
+                cells.append(cell)
+                filled += 1
+    return filled
+
+
+def _launch(record: dict) -> dict:
+    """Start the detached worker for this record, and write it."""
+    TUNING_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(log_path(record["job_id"]), "ab")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "simlab.tuning", record["job_id"]],
+        cwd=_PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    record["pid"] = proc.pid
+    _write(record)
+    return record
 
 
 def submit(spec: dict, launch: bool = True, runs: "list[dict] | None" = None) -> dict:
     """Store a job and start its worker. Raises ValueError for an invalid spec.
 
     The record is seeded with every cell the run store already answers
-    (`prior_cells`), so the heatmap is partly drawn the moment the job appears
-    and the worker only replays the holes. Those cells count as done against
-    the job's full total, which stays what the grid asks for -- a job that
-    reused half its grid ran the whole grid, it just did not have to replay it.
+    (`prior_cells`), so the heatmaps are partly drawn the moment the job
+    appears and the worker only replays the holes. Those cells count as done
+    against the job's full total, which stays what the grid asks for -- a job
+    that reused half its grid ran the whole grid, it just did not have to
+    replay it.
 
     `runs` is the already-parsed store when the caller has one (the UI caches
     it); left out, the store is read here.
@@ -1265,9 +1484,7 @@ def submit(spec: dict, launch: bool = True, runs: "list[dict] | None" = None) ->
     if problem:
         raise ValueError(problem)
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    prior = prior_cells(spec, runs)
-    base_key = overrides_key({})
-    reused = sum(len(found) for found in prior.values())
+    names = dataset_names(spec)
     record = {
         "job_id": job_id,
         "created_at": _now_iso(),
@@ -1276,26 +1493,95 @@ def submit(spec: dict, launch: bool = True, runs: "list[dict] | None" = None) ->
         "pid": None,
         "error": None,
         "spec": spec,
-        "progress": {"done": reused, "total": total_replays(spec), "reused": reused},
-        "cells": {
-            role: [cell for key, cell in prior[role].items() if key != base_key]
-            for role in (TUNE, TEST)
-        },
-        "baseline": {role: prior[role].get(base_key) for role in (TUNE, TEST)},
+        "progress": {"done": 0, "total": total_replays(spec), "reused": 0},
+        "cells": {name: [] for name in names},
+        "baseline": {name: None for name in names},
         "best": None,
-        "best_test": None,
     }
+    reused = _seed(record, runs, spec["datasets"])
+    record["progress"].update(done=reused, reused=reused)
     _write(record)
-    if launch:
-        TUNING_DIR.mkdir(parents=True, exist_ok=True)
-        log = open(log_path(job_id), "ab")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "simlab.tuning", job_id],
-            cwd=_PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        record["pid"] = proc.pid
-        _write(record)
+    return _launch(record) if launch else record
+
+
+def _editable(job_id: str) -> dict:
+    """A stored job that may be changed now -- not running, not derived."""
+    record = get_job(job_id)
+    if record is None:
+        raise ValueError(f"No tuning job {job_id}.")
+    if record.get("status") == RUNNING:
+        raise ValueError("The job is still running — wait for it to finish, or stop it.")
+    return record
+
+
+def _restart(record: dict, reused: int, launch: bool) -> dict:
+    """Set the record running again over whatever it still lacks."""
+    record["progress"] = {
+        "done": _answered(record),
+        "total": total_replays(record["spec"]),
+        "reused": int((record.get("progress") or {}).get("reused") or 0) + reused,
+    }
+    record.update(status=RUNNING, error=None, finished_at=None, best=None, pid=None)
+    _write(record)
+    return _launch(record) if launch else record
+
+
+def add_dataset(
+    job_id: str, dataset: dict, runs: "list[dict] | None" = None, launch: bool = True
+) -> dict:
+    """Sweep the job's grid over one more dataset, then re-read the sum and the pick.
+
+    The base configuration, the axes, the cash and the pick rule are the job's
+    own, so the new heatmap is directly comparable with the ones already there.
+    Cells the run store answers are filled in first, as at submit.
+    """
+    record = _editable(job_id)
+    spec = {**record["spec"], "datasets": [*record["spec"]["datasets"], dataset]}
+    problem = validate(spec)
+    if problem:
+        raise ValueError(problem)
+    record["spec"] = spec
+    record["cells"][dataset["name"]] = []
+    record["baseline"][dataset["name"]] = None
+    return _restart(record, _seed(record, runs, [dataset]), launch)
+
+
+def resume(job_id: str, runs: "list[dict] | None" = None, launch: bool = True) -> dict:
+    """Replay whatever a stopped or failed job, or an upgraded one, still lacks."""
+    record = _editable(job_id)
+    return _restart(record, _seed(record, runs, record["spec"]["datasets"]), launch)
+
+
+def remove_dataset(job_id: str, name: str) -> dict:
+    """Drop one dataset and its cells from a job, and re-read the sum and the pick.
+
+    Nothing is replayed. The dropped cells are gone with it -- adding the
+    dataset back sweeps it again, except where the run store answers a cell.
+    A job keeps at least one dataset; deleting the job is the way to lose that.
+    """
+    record = _editable(job_id)
+    names = dataset_names(record["spec"])
+    if name not in names:
+        raise ValueError(f"{name} is not a dataset of this job.")
+    if len(names) == 1:
+        raise ValueError("A job needs at least one dataset — delete the job instead.")
+    record["spec"] = {
+        **record["spec"],
+        "datasets": [d for d in record["spec"]["datasets"] if d["name"] != name],
+    }
+    record["cells"].pop(name, None)
+    record["baseline"].pop(name, None)
+    record["progress"] = {
+        "done": _answered(record),
+        "total": total_replays(record["spec"]),
+        "reused": reused_count(record),
+    }
+    # A job that stopped part-way through the dataset just dropped may have
+    # nothing left to replay: it is then as finished as any other.
+    if record.get("status") == FAILED and not missing_replays(record):
+        record.update(status=FINISHED, error=None, finished_at=_now_iso())
+    refresh_pick(record)
+    _write(record)
     return record
 
 
@@ -1321,7 +1607,8 @@ def stop(job_id: str) -> "dict | None":
     """Kill the worker and its pool (one process group) and mark the job failed.
 
     The cells finished so far stay in the record: unlike an experiment, a
-    half-swept grid is still a picture of the half that was swept.
+    half-swept grid is still a picture of the half that was swept, and
+    `resume` replays only the rest.
     """
     record = get_job(job_id)
     if record is None or record["status"] != RUNNING:
@@ -1334,6 +1621,7 @@ def stop(job_id: str) -> "dict | None":
     record = get_job(job_id) or record
     if record["status"] == RUNNING:
         record.update(status=FAILED, error=STOPPED_ERROR, finished_at=_now_iso())
+        refresh_pick(record)
         _write(record)
     return record
 
@@ -1355,125 +1643,72 @@ def _run_tasks(
     workers: int,
     on_done: "Callable[[str, str, dict], None]",
 ) -> None:
-    """Evaluate (role, kind, overrides) tasks, calling `on_done` as each lands.
+    """Evaluate (dataset name, kind, overrides) tasks, calling `on_done` as each lands.
 
     One worker runs them in this process, in order -- which is what the tests
     use. More fan out over a spawn-context pool: spawn rather than fork,
     because every child ends up importing torch through the day-range model and
     a forked OpenMP runtime is not something to rely on.
     """
-    def dataset_for(role: str) -> dict:
-        return spec["tune_dataset"] if role == TUNE else spec["test_dataset"]
-
+    by_name = {d["name"]: d for d in spec["datasets"]}
     cash = spec["starting_cash"]
     if workers <= 1:
-        for role, kind, overrides in tasks:
-            on_done(role, kind, evaluate(dataset_for(role), spec["base"], overrides, cash))
+        for name, kind, overrides in tasks:
+            on_done(name, kind, evaluate(by_name[name], spec["base"], overrides, cash))
         return
     context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
         futures = {
-            pool.submit(evaluate, dataset_for(role), spec["base"], overrides, cash): (role, kind)
-            for role, kind, overrides in tasks
+            pool.submit(evaluate, by_name[name], spec["base"], overrides, cash): (name, kind)
+            for name, kind, overrides in tasks
         }
         for future in as_completed(futures):
-            role, kind = futures[future]
-            on_done(role, kind, future.result())
-
-
-def _stored_cell(spec: dict, dataset: dict, overrides: dict) -> "dict | None":
-    """One cell answered out of the run store, reading the store on the spot.
-
-    `prior_cells` covers everything a job knows about at submit; this is for
-    the one replay it cannot -- the pick's, on a test dataset whose grid is not
-    being swept, since which cell wins is only settled once the sweep is done.
-    """
-    if not spec.get("reuse_runs", True):
-        return None
-    from .results import list_runs
-
-    return prior_cell(index_runs(list_runs()), spec, dataset, overrides)
+            name, kind = futures[future]
+            on_done(name, kind, future.result())
 
 
 def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
-    """Sweep, pick, test -- the whole job, writing the record as it goes.
+    """Sweep every dataset, sum, pick -- writing the record as it goes.
 
-    Only the replays the record does not already hold are run: `submit` seeds
-    it with every cell the run store answers, and what is left is the holes.
+    Only the replays the record does not already hold are run: `submit`,
+    `add_dataset` and `resume` seed it with every cell the run store answers,
+    and what is left is the holes -- on a new job the whole grid, on an added
+    dataset that dataset's grid, on a resumed job whatever was not reached.
     """
     record = get_job(job_id)
     if record is None:
         raise RuntimeError(f"unknown tuning job {job_id}")
     spec = record["spec"]
-    axes = spec["axes"]
-    cells = grid(axes)
+    cells = grid(spec["axes"])
     workers = max(1, int(spec.get("workers") or 1))
-    has_test = bool(spec.get("test_dataset"))
 
-    def on_done(role: str, kind: str, result: dict) -> None:
+    def on_done(name: str, kind: str, result: dict) -> None:
         if kind == BASELINE:
-            record["baseline"][role] = result
-        elif kind == "pick":
-            record["best_test"] = result
+            record["baseline"][name] = result
         else:
-            record["cells"][role].append(result)
+            record["cells"][name].append(result)
         record["progress"]["done"] += 1
         _write(record)
         detail = result.get("invalid") or result.get("error") or f"${result.get('profit', 0):+,.2f}"
         progress(
-            f"[{record['progress']['done']}/{record['progress']['total']}] {role} "
+            f"[{record['progress']['done']}/{record['progress']['total']}] {name} "
             f"{kind} {result['overrides'] or 'base'}: {detail}"
         )
 
-    def missing(role: str) -> "list[dict]":
-        """The grid's cells this record has no answer for yet, in grid order."""
-        have = {overrides_key(c["overrides"]) for c in record["cells"][role]}
-        return [c for c in cells if overrides_key(c) not in have]
+    tasks = []
+    for name in dataset_names(spec):
+        record["cells"].setdefault(name, [])
+        record["baseline"].setdefault(name, None)
+        have = _cells_by_key(record, name)
+        tasks += [(name, "cell", c) for c in cells if overrides_key(c) not in have]
+        if record["baseline"][name] is None:
+            tasks.append((name, BASELINE, {}))
+    _run_tasks(tasks, spec, workers, on_done)
 
-    first = [(TUNE, "cell", c) for c in missing(TUNE)]
-    if record["baseline"][TUNE] is None:
-        first.append((TUNE, BASELINE, {}))
-    if has_test:
-        if record["baseline"][TEST] is None:
-            first.append((TEST, BASELINE, {}))
-        if spec.get("sweep_test_grid"):
-            first += [(TEST, "cell", c) for c in missing(TEST)]
-    _run_tasks(first, spec, workers, on_done)
-
-    record["cells"][TUNE].sort(key=lambda c: cells.index(c["overrides"]))
-    record["cells"][TEST].sort(key=lambda c: cells.index(c["overrides"]))
-    best = pick_best(
-        record["cells"][TUNE], axes, spec.get("metric", "profit"),
-        spec.get("rule", PICK_MAX), float(spec.get("min_traded_share") or 0.0),
-    )
-    record["best"] = best
-    _write(record)
-
-    if has_test and spec.get("sweep_test_grid"):
-        # The pick was already replayed on the test dataset as part of its grid.
-        if best is not None:
-            record["best_test"] = next(
-                (c for c in record["cells"][TEST] if c["overrides"] == best["overrides"]), None
-            )
-    elif has_test:
-        if best is None:
-            record["progress"]["done"] += 1  # the pick's replay: nothing was eligible
-        else:
-            # The pick is only known now, so its test replay could not be
-            # seeded at submit -- but the store may still answer it.
-            stored = _stored_cell(spec, spec["test_dataset"], best["overrides"])
-            if stored is None:
-                _run_tasks([(TEST, "pick", best["overrides"])], spec, 1, on_done)
-            else:
-                record["best_test"] = stored
-                record["progress"]["done"] += 1
-                record["progress"]["reused"] = record["progress"].get("reused", 0) + 1
-                _write(record)
-                progress(
-                    f"[{record['progress']['done']}/{record['progress']['total']}] {TEST} "
-                    f"pick {best['overrides']}: reused run {stored['run_id']}"
-                )
-
+    order = [overrides_key(c) for c in cells]
+    for name in dataset_names(spec):
+        record["cells"][name].sort(key=lambda c: order.index(overrides_key(c["overrides"])))
+    refresh_pick(record)
     record.update(status=FINISHED, finished_at=_now_iso())
     _write(record)
     progress(f"Tuning job {job_id} finished.")
