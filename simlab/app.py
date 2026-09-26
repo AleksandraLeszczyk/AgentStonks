@@ -1736,17 +1736,17 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "distance most of the day — expect the two settings to be much less than additive."
         ),
         "buy_k": (
-            "Starts at **{buy_k}** on {ticker}.\n\n"
-            "- Notebook 05 specified 0.75 and swept it over only five sessions.\n"
-            "- This default comes from the same 195-cell grid over every session with a "
-            "forecast: cells that trade on at least half of them, taking the middle of the "
-            "best 3×3 plateau rather than its sharpest cell.\n"
-            "- Still in-sample, and how well it holds up differs by instrument — "
-            "`config.APPLE_TRADER_DAYRANGE_LEVELS` records each ticker's two halves."
+            "Starts at **{buy_k}** on {ticker}, for this model.\n\n"
+            "- The pick of this model and instrument's Tuning-tab job: the best total "
+            "profit of a buy × sell grid summed over three weeks of tape.\n"
+            "- A pair never tuned (the intraday-volatility model) starts from notebook 05's "
+            "per-ticker sweep instead.\n"
+            "- In-sample, and swept under the exit rules of 2026-09-23 — "
+            "`config.APPLE_TRADER_TUNED_LEVELS` records each pick's weeks and caveats."
         ),
         "sell_k": (
             "Where the exit rests below the same predicted high.\n\n"
-            "- **{sell_k}** on {ticker}, from the same sweep.\n"
+            "- **{sell_k}** on {ticker} for this model, from the same tuning job.\n"
             "- The smaller of the two numbers, since it is the higher price.\n"
             "- A day that never reaches it is held to the closing flatten."
         ),

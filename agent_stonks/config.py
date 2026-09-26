@@ -239,11 +239,46 @@ PREMARKET_WAIT_POLL_SEC = 30.0
 APPLE_TRADER_MODEL = "dayrange"
 APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
-# (buy_k, sell_k) per instrument -- see the day-range block above.
+# (buy_k, sell_k) per instrument -- see the day-range block above. Since
+# 2026-09-26 only the fallback for a (model, instrument) pair with no SimLab
+# tuning pick below: today that is the Day Range × Intraday Volatility model.
 APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
     "AAPL": (0.40, 0.25),
     "GOOGL": (0.65, 0.05),
     "INTC": (0.50, 0.05),
+}
+# (buy_k, sell_k) per (model, instrument): the pick of SimLab's Tuning tab, one
+# job per pair, each a buy × sell grid (buy 0.45..0.95, sell 0.05..0.45, step
+# 0.10) replayed through the real engine -- market fills, the managed exit --
+# on three weeks of yfinance tape (tech_week_2026-09-07, -09-14, -09-19;
+# 14 sessions) at $100,000 per week. The pick is the best total profit of the
+# three weeks' heatmaps summed (highest cell, no minimum share of days traded):
+#
+#   model     ticker  buy   sell  total   return  weeks up  days traded  job
+#   dayrange  AAPL    0.55  0.05  +3757   +3.76%    3/3        14/14     20260923-181947-96f7cb
+#   dayrange  GOOGL   0.85  0.45  +1317   +1.32%    2/3         9/14     20260923-182822-178bfa
+#   dayrange  INTC    0.65  0.05  +7191   +7.19%    2/3         9/14     20260923-182628-bdbe37
+#   highlow   AAPL    0.75  0.35  +3775   +3.77%    3/3        12/14     20260923-191233-fd16ae
+#   highlow   INTC    0.85  0.35  +5971   +5.97%    3/3         7/14     20260923-191641-b7ded5
+#
+# How far to trust them. Every week is in sample -- the pick is read off the
+# sum it is scored on -- and three weeks is 14 sessions. The grids were swept
+# under the managed exit as it stood on 2026-09-23 (momentum confirmation off,
+# the legacy fade / negative-momentum take on, no scale-in, no keep_width, and
+# the brownian breach rule on dayrange), not under today's defaults, so a
+# replay with today's exit will not reproduce these totals. On INTC and GOOGL
+# (dayrange) the picked cell is well clear of the runner-up, i.e. a peak rather
+# than a plateau. Every pick made most of its total in the first week
+# (tech_week_2026-09-07); dayrange GOOGL and INTC lost money on the third. On
+# dayrange INTC the untuned 0.50/0.05 made +7262 on the same weeks, more than
+# the pick (0.50 sits between the grid's 0.10 steps). Re-read the Tuning tab's
+# jobs after adding a week before trusting any of these over the fallback.
+APPLE_TRADER_TUNED_LEVELS: "dict[tuple[str, str], tuple[float, float]]" = {
+    ("dayrange", "AAPL"): (0.55, 0.05),
+    ("dayrange", "GOOGL"): (0.85, 0.45),
+    ("dayrange", "INTC"): (0.65, 0.05),
+    ("highlow", "AAPL"): (0.75, 0.35),
+    ("highlow", "INTC"): (0.85, 0.35),
 }
 # The day-range managed exit, on top of the sell level and the closing flatten
 # (`DayRangeTrader._exit`). Unlike the levels these were never swept: they are
@@ -526,6 +561,9 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # empty; it stays for the same reason the levels are per instrument
 # (APPLE_TRADER_DAYRANGE_LEVELS): the number only means something against that
 # symbol's own buy/sell distances. Counted in the level unit, like every k.
+# With the tuned pairs of 2026-09-26 (APPLE_TRADER_TUNED_LEVELS) the target is
+# 0.40 to 0.60 units on every model and instrument, so 0.10 stands a run down
+# only on an exit well short of it.
 APPLE_TRADER_MIN_WIN_K = 0.10
 APPLE_TRADER_MIN_WIN: "dict[str, float]" = {}
 APPLE_TRADER_CYCLE_SEC = 60

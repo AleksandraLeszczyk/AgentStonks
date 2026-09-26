@@ -2310,16 +2310,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         ),
         "buy_k": (
             "How far under the predicted high the entry rests.\n\n"
-            "- {ticker} starts at **{buy_k}** — the middle of the most profitable stretch "
-            "of notebook 05's grid, re-run over every {ticker} session with a forecast, "
-            "among settings that traded on at least half the days.\n"
+            "- {ticker} starts at **{buy_k}** on this model — the most profitable cell of "
+            "a buy × sell grid replayed in SimLab over three weeks of {ticker} tape and "
+            "summed. A model never tuned on {ticker} starts from notebook 05's sweep.\n"
             "- Shallower entries fill on more days; deeper ones pay a better price on fewer.\n"
             "- It was picked on the sessions it was scored on: the best-evidenced starting "
             "point, not an edge."
         ),
         "sell_k": (
             "Where the exit rests, below the same predicted high.\n\n"
-            "- {ticker} starts at **{sell_k}**, from the same sweep.\n"
+            "- {ticker} starts at **{sell_k}** on this model, from the same sweep.\n"
             "- It must be the smaller of the two numbers — the higher price.\n"
             "- A day that never reaches it is held to the closing flatten."
         ),
@@ -2383,7 +2383,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- Each buy spends *Position size* of the cash that is left.\n"
             "- After every buy the next one rests **half-way to the bottom of the "
             "range** — the predicted low, or one ADR under H, depending on what the "
-            "distances are counted in. AAPL's 0.40 becomes 0.70, then 0.85, 0.925…\n"
+            "distances are counted in. A buy at 0.40 becomes 0.70, then 0.85, 0.925…\n"
             "- While another buy is possible the stop sits its usual distance under "
             "**the next buy**, not under the fill; after the last one, under that "
             "last fill.\n"

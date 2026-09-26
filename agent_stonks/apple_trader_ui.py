@@ -187,12 +187,12 @@ def dayrange_params(
 ) -> AppleTraderConfig:
     """The day-range rules: two resting levels below the predicted high.
 
-    Both start from the instrument's own swept pair, and the widget keys carry
-    the ticker so that switching instrument re-seeds them with that symbol's
-    pair rather than carrying the last symbol's numbers across.
+    Both start from the model and instrument's own tuned pair, and the widget
+    keys carry both so that switching either re-seeds them with that pair
+    rather than carrying the last one's numbers across.
     """
     section("Levels", copy.sections.get("dayrange"))
-    default_buy, default_sell = dayrange_levels(ticker)
+    default_buy, default_sell = dayrange_levels(ticker, model_key)
     levels = dict(ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}")
     # Before the two distances, because it decides what they are counted in and
     # a label that named the wrong unit would be worse than no label at all.
@@ -210,13 +210,13 @@ def dayrange_params(
     buy_k = col_a.number_input(
         f"Buy distance (× {unit_label} below H)",
         min_value=0.05, max_value=3.0, value=start_buy, step=0.05, format="%.2f",
-        key=copy.key(f"buy_k_{ticker}"),
+        key=copy.key(f"buy_k_{model_key}_{ticker}"),
         help=copy.help.get("buy_k", "").format(**levels),
     )
     sell_k = col_b.number_input(
         f"Sell distance (× {unit_label} below H)",
         min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
-        key=copy.key(f"sell_k_{ticker}"),
+        key=copy.key(f"sell_k_{model_key}_{ticker}"),
         help=copy.help.get("sell_k", "").format(**levels),
     )
     position_pct = col_a.number_input(

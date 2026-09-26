@@ -2067,12 +2067,26 @@ UNMODELLED = "MSFT"
 
 
 class TestDayRangeLevelDefaults:
-    """Each instrument starts from its own swept pair, not the notebook's."""
+    """Each model and instrument starts from its own tuned pair, not the notebook's."""
 
-    def test_each_instrument_starts_from_its_own_pair(self):
-        for ticker, (buy_k, sell_k) in at.APPLE_TRADER_DAYRANGE_LEVELS.items():
-            config = AppleTraderConfig(model_key="dayrange", ticker=ticker.lower())
+    def test_each_tuned_pair_starts_from_its_own_levels(self):
+        for (model_key, ticker), (buy_k, sell_k) in at.APPLE_TRADER_TUNED_LEVELS.items():
+            config = AppleTraderConfig(model_key=model_key, ticker=ticker.lower())
             assert (config.buy_k, config.sell_k) == (buy_k, sell_k)
+
+    def test_every_tuned_pair_is_a_model_the_instrument_is_wired_up_for(self):
+        for model_key, ticker in at.APPLE_TRADER_TUNED_LEVELS:
+            assert ticker in apple_models.MODELS[model_key].tickers
+
+    def test_the_same_instrument_differs_by_model(self):
+        """The same distance is a different price under a different forecast."""
+        assert at.dayrange_levels("AAPL", "dayrange") != at.dayrange_levels("AAPL", "highlow")
+
+    def test_a_pair_never_tuned_falls_back_to_the_instruments_sweep(self):
+        untuned = apple_models.DAYRANGE_INTRADAY_KEY
+        for ticker in apple_models.MODELS[untuned].tickers:
+            assert (untuned, ticker) not in at.APPLE_TRADER_TUNED_LEVELS
+            assert at.dayrange_levels(ticker, untuned) == at.APPLE_TRADER_DAYRANGE_LEVELS[ticker]
 
     def test_every_ticker_the_model_is_wired_up_for_has_a_pair(self):
         assert set(apple_models.DAYRANGE_TICKERS) <= set(at.APPLE_TRADER_DAYRANGE_LEVELS)
@@ -2083,12 +2097,12 @@ class TestDayRangeLevelDefaults:
         assert (config.buy_k, config.sell_k) == (0.75, 0.10)
 
     def test_a_level_given_explicitly_wins_and_the_other_keeps_its_default(self):
-        _, googl_sell = at.dayrange_levels("GOOGL")
+        _, googl_sell = at.dayrange_levels("GOOGL", "dayrange")
         config = AppleTraderConfig(model_key="dayrange", ticker="GOOGL", buy_k=0.9)
         assert (config.buy_k, config.sell_k) == (0.9, googl_sell)
 
     def test_the_default_pair_signs_the_run(self):
-        buy_k, sell_k = at.dayrange_levels("AAPL")
+        buy_k, sell_k = at.dayrange_levels("AAPL", "dayrange")
         assert config_signature(AppleTraderConfig(model_key="dayrange")).startswith(
             f"dayrange_AAPL(buy=H-{buy_k:g}R,sell=H-{sell_k:g}R,size=95%"
         )

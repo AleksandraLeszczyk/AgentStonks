@@ -68,6 +68,7 @@ from .config import (
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
+    APPLE_TRADER_TUNED_LEVELS,
     BREACH_BROWNIAN,
     BREACH_LABELS,
     BREACH_OFF,
@@ -103,18 +104,21 @@ RULE_PROVIDER = "rules"
 DEFAULT_TICKER = apple_models.DEFAULT_TICKER
 
 
-def dayrange_levels(ticker: str) -> "tuple[float, float]":
-    """The day-range `(buy_k, sell_k)` a run on this symbol starts from.
+def dayrange_levels(ticker: str, model_key: "str | None" = None) -> "tuple[float, float]":
+    """The `(buy_k, sell_k)` a run of this model on this symbol starts from.
 
-    Per instrument, from re-running notebook 05's grid over every session with
-    a forecast -- `config.APPLE_TRADER_DAYRANGE_LEVELS` carries the table and
-    how far each pair deserves trust. A symbol never swept gets the notebook's
-    specified pair.
+    Per model and instrument, since the same distances are different prices
+    under a different forecast: SimLab's tuning pick for the pair
+    (`config.APPLE_TRADER_TUNED_LEVELS`, with how far each deserves trust).
+    A pair never tuned falls back to the instrument's notebook-05 sweep
+    (`config.APPLE_TRADER_DAYRANGE_LEVELS`), and a symbol never swept at all
+    to the notebook's specified pair.
     """
-    return APPLE_TRADER_DAYRANGE_LEVELS.get(
-        (ticker or DEFAULT_TICKER).strip().upper(),
-        (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K),
-    )
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    tuned = APPLE_TRADER_TUNED_LEVELS.get((str(model_key or APPLE_TRADER_MODEL), symbol))
+    if tuned is not None:
+        return tuned
+    return APPLE_TRADER_DAYRANGE_LEVELS.get(symbol, (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K))
 
 
 def min_win_for(ticker: str) -> float:
@@ -370,7 +374,7 @@ class AppleTraderConfig:
             )
         # Resolved per field, so a config that names only one level still
         # gets the instrument's default for the other.
-        default_buy, default_sell = dayrange_levels(self.ticker)
+        default_buy, default_sell = dayrange_levels(self.ticker, self.model_key)
         if self.buy_k is None:
             self.buy_k = default_buy
         if self.sell_k is None:

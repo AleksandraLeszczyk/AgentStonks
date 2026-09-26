@@ -559,6 +559,10 @@ class TestAgainstTheNotebook:
         bundle = D.load_bundle(ticker)
         if bundle is None:
             pytest.skip(f"the TimeToChange3 {ticker} bundle is not installed")
+        if "sim_date_forecast" not in bundle["metadata"]:
+            # A retrain that recorded no forecast of its own (INTC's 2026-09-26
+            # cutoff-moved refit) leaves nothing to reproduce.
+            pytest.skip(f"the TimeToChange3 {ticker} bundle recorded no forecast to check")
         day = pd.Timestamp(bundle["metadata"]["sim_date_forecast"]["date"])
         minute = pd.read_parquet(minute_file)
         daily = pd.read_parquet(daily_file)[["open", "high", "low", "close", "volume"]]
