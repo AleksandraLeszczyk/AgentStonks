@@ -176,13 +176,83 @@ def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:
         return sum(1 for b in missing if bar_ts_key(b["t"]) in kept_keys)
 
 
+def merge_live_bars(
+    state: SymbolState, fetched: list[dict], provisional: "set[str] | None" = None
+) -> "tuple[int, int]":
+    """Merge a `bar_history.fetch_live_bars` result into the live buffer.
+
+    A fetched bar goes in where its timestamp is missing, and replaces an
+    existing bar only when that bar is provisional and the fetched one is not
+    -- a settled consolidated bar over an IEX bar or a partial live minute.
+    Everything else already in the buffer wins, so a streamed bar is never
+    overwritten by REST and IEX never overwrites anything.
+
+    Returns (added, replaced), counting only bars still in the buffer after
+    the ring's truncation (see `merge_missing_bars`).
+    """
+    provisional = provisional or set()
+    if not fetched:
+        return 0, 0
+    with state.lock:
+        by_key = {bar_ts_key(b["t"]): b for b in state.bars if "t" in b}
+        added: set[str] = set()
+        replaced: set[str] = set()
+        for bar in fetched:
+            if "t" not in bar:
+                continue
+            k = bar_ts_key(bar["t"])
+            if k not in by_key:
+                by_key[k] = bar
+                added.add(k)
+                if k in provisional:
+                    state.provisional_bar_keys.add(k)
+            elif k in state.provisional_bar_keys and k not in provisional:
+                by_key[k] = bar
+                replaced.add(k)
+                state.provisional_bar_keys.discard(k)
+        if not added and not replaced:
+            return 0, 0
+        kept = [by_key[k] for k in sorted(by_key)][-MAX_BARS:]
+        state.bars.clear()
+        state.bars.extend(kept)
+        kept_keys = {bar_ts_key(b["t"]) for b in kept}
+        state.provisional_bar_keys &= kept_keys
+        return len(added & kept_keys), len(replaced & kept_keys)
+
+
+def load_live_bars(state: SymbolState, fetched: list[dict], provisional: "set[str]") -> None:
+    """Replace the whole live buffer with a `fetch_live_bars` result -- a first
+    load, or a timeframe change, where nothing already buffered still applies."""
+    with state.lock:
+        state.bars.clear()
+        state.bars.extend(fetched[-MAX_BARS:])
+        kept_keys = {bar_ts_key(b["t"]) for b in state.bars if "t" in b}
+        state.provisional_bar_keys = set(provisional) & kept_keys
+
+
+def mark_newest_bar_provisional(state: SymbolState) -> None:
+    """Flag the buffer's newest bar for replacement by settled data.
+
+    Called where a live stream stops or starts: the minute it was building when
+    it stopped holds only the trades before the stop, and nothing else would
+    ever top it up. Flagging a bar that happens to be complete costs nothing:
+    it is later replaced by a consolidated bar for the same minute.
+    """
+    with state.lock:
+        if state.bars and "t" in state.bars[-1]:
+            state.provisional_bar_keys.add(bar_ts_key(state.bars[-1]["t"]))
+
+
 def reset_symbol_for_new_stream(state: SymbolState) -> None:
     """Clear the per-session live fields before a (re)start of any data source.
 
     Everything here is either seeded by the first tick of the new stream or is
     an explicit "we don't know yet" -- carrying the previous session's last
     price or bid/ask across a restart would make a stale number look live.
+    The newest bar is the last minute the previous stream was building, cut
+    short by the stop, so it is flagged for replacement.
     """
+    mark_newest_bar_provisional(state)
     with state.lock:
         if state.bars:
             state.prev_close = state.bars[-1].get("c")

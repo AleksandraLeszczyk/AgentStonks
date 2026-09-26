@@ -126,7 +126,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
-from . import bar_history, minute_momentum, newsimpact_model
+from . import bar_history, minute_momentum, newsimpact_model, stream_common
 from .trade_sound import next_trade_cue, play_trade_sound
 from .trading_mode import (
     ENV_KEYS as TRADING_ENV_KEYS,
@@ -896,8 +896,11 @@ def _live_chart_controls() -> None:
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
             disabled=not (state.symbols and state.api_key),
-            help="Re-fetch each symbol's session bars via REST (yfinance if that "
-            "fails) and merge any that the stream missed, e.g. during a reconnect.",
+            help="Re-fetch each symbol's session bars via REST and merge any that the "
+            "stream missed, e.g. while it was stopped. Bars older than 15 minutes come "
+            "from yfinance (regular session) or the history feed (pre/post-market); "
+            "younger ones from IEX, replaced once they are 15 minutes old. The minute "
+            "in progress is left to the live stream.",
         )
         if backfill_clicked:
             with st.spinner("Backfilling…"):
@@ -3229,7 +3232,13 @@ def _start_live_session(
     streams were launched, False when loading any symbol failed.
 
     History, news and daily bars come from Alpaca REST whichever live source is
-    chosen; `data_source` only decides which WebSocket takes over from there."""
+    chosen; `data_source` only decides which WebSocket takes over from there.
+
+    A symbol that already has bars at this timeframe and history feed (a Stop
+    followed by a Start) keeps them: the fetched history is merged in, filling
+    the gap the stop left, and replacing only provisional bars."""
+    prior_timeframe = state.timeframe
+    prior_history_feed = state.history_feed_resolved
     state.set_symbols(syms)
     state.feed = feed
     state.timeframe = timeframe
@@ -3247,7 +3256,7 @@ def _start_live_session(
         sym_state = state.sym(sym)
         with st.spinner(f"Loading history for {sym}…"):
             try:
-                historical_bars, _ = bar_history.fetch_and_log(
+                historical = bar_history.fetch_live_bars(
                     sym, timeframe, key, secret, state.history_feed_resolved,
                     limit=MAX_BARS, what="bars (initial load)",
                 )
@@ -3276,8 +3285,30 @@ def _start_live_session(
                 return False
             sym_state.daily_bars = daily_bars
             with sym_state.lock:
-                sym_state.bars.clear()
-                sym_state.bars.extend(historical_bars)
+                cached = bool(sym_state.bars)
+            reuse = (
+                cached
+                and prior_timeframe == timeframe
+                and prior_history_feed == state.history_feed_resolved
+            )
+            if reuse:
+                added, replaced = stream_common.merge_live_bars(
+                    sym_state, historical.bars, historical.provisional
+                )
+                detail = (
+                    f"cached buffer kept; {added} {timeframe} bar(s) added, "
+                    f"{replaced} provisional replaced"
+                )
+            else:
+                stream_common.load_live_bars(
+                    sym_state, historical.bars, historical.provisional
+                )
+                detail = f"{len(historical.bars)} {timeframe} bars"
+            log_fetch(
+                "bars (initial load)", historical.source, symbol=sym,
+                detail=detail, failures=historical.failures,
+            )
+            with sym_state.lock:
                 sym_state.trades.clear()
                 sym_state.trades.extend(historical_trades)
             sym_state.news = news
@@ -3393,7 +3424,13 @@ def build_ui() -> None:
                     "trailing 15 minutes. Delayed SIP is still the right backfill source: "
                     "backfill repairs *holes*, and the live stream already owns the recent "
                     "window. Failing that it uses yfinance (within 1.5% of SIP, free, ~15 min "
-                    "delayed, ~7 days of minute history), and IEX only when neither answers."
+                    "delayed, ~7 days of minute history), and IEX only when neither answers.\n\n"
+                    "Whatever is chosen here, the live buffer takes regular-session bars "
+                    "older than 15 minutes from yfinance, and this source serves the rest "
+                    "(pre/post-market, where yfinance reports zero volume). The last 15 "
+                    "minutes come from IEX and are replaced once they settle; the minute in "
+                    "progress is the live stream's. A Stop then Start keeps the buffered "
+                    "bars and fills only the gap."
                 ),
             )
             finnhub_token_input = st.text_input(
@@ -3445,7 +3482,7 @@ def build_ui() -> None:
                 for sym_state in state.iter_symbol_states():
                     sym = sym_state.symbol
                     try:
-                        historical_bars, _ = bar_history.fetch_and_log(
+                        historical = bar_history.fetch_live_bars(
                             sym, timeframe, state.api_key, state.api_secret,
                             bar_history.resolve_history_feed(
                                 state.history_feed, sym, state.api_key,
@@ -3462,12 +3499,13 @@ def build_ui() -> None:
                         reloaded = False
                         break
                     log_fetch(
-                        "bars (timeframe reload)", "Alpaca REST", symbol=sym,
-                        detail=f"{len(historical_bars)} {timeframe} bars",
+                        "bars (timeframe reload)", historical.source, symbol=sym,
+                        detail=f"{len(historical.bars)} {timeframe} bars",
+                        failures=historical.failures,
                     )
-                    with sym_state.lock:
-                        sym_state.bars.clear()
-                        sym_state.bars.extend(historical_bars)
+                    stream_common.load_live_bars(
+                        sym_state, historical.bars, historical.provisional
+                    )
                 if reloaded:
                     state.timeframe = timeframe
                     launch_stream(

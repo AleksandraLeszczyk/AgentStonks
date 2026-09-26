@@ -100,6 +100,46 @@ def fetch_intraday_bars(symbol: str, interval: str = "1m") -> list[dict]:
     ]
 
 
+def fetch_intraday_bars_window(
+    symbol: str, start: datetime, end: datetime, interval: str = "1m"
+) -> list[dict]:
+    """yfinance intraday bars in [start, end), regular session only.
+
+    Pre/post-market is not requested: yfinance reports those minutes with zero
+    volume, which is worse than no bar for a buffer that sums volume. yfinance
+    serves 1-minute bars for roughly the last 7 days. Same {"t","o","h","l","c","v"}
+    shape and UTC timestamps as fetch_intraday_bars.
+    """
+    try:
+        df = yf.download(
+            symbol, start=start, end=end, interval=interval,
+            prepost=False, auto_adjust=False, progress=False,
+        )
+    except Exception as exc:
+        log_fetch_failure("intraday bars (window)", [("yfinance", exc)], symbol=symbol)
+        raise
+    if df.empty:
+        return []
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    idx = df.index
+    if idx.tz is None:
+        idx = idx.tz_localize("America/New_York")
+    idx = idx.tz_convert("UTC")
+    return [
+        {
+            "t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "o": float(row.Open),
+            "h": float(row.High),
+            "l": float(row.Low),
+            "c": float(row.Close),
+            "v": float(row.Volume),
+        }
+        for ts, row in zip(idx, df.itertuples(index=False))
+        if not pd.isna(row.Close)
+    ]
+
+
 def fetch_intraday_bars_for_date(symbol: str, date: str, interval: str = "1m") -> list[dict]:
     """Intraday bars for a single past trading day (`date`, "YYYY-MM-DD") from
     yfinance. Used to build a volume-by-price profile of a prior session.

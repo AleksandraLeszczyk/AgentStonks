@@ -25,7 +25,6 @@ from .config import (
     DEFAULT_DATA_SOURCE,
     DEFAULT_HISTORY_FEED,
     FALLBACK_POLL_SEC,
-    MAX_BARS,
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
 )
@@ -75,26 +74,29 @@ def backfill_bars(
     volume of the ones around them, which is worse than leaving the hole: a gap
     is visible, a 26x-understated bar is not. See `agent_stonks.bar_history`.
 
-    Returns (bars_added, source_name), where `bars_added` is what is in the
-    buffer now and was not before -- see `merge_missing_bars` for why that can
-    be fewer than the holes the fetch covered.
+    Each bar comes from the source its age calls for (`bar_history.fetch_live_bars`):
+    settled bars from yfinance / the resolved feed, the last
+    SETTLED_BAR_AGE_MIN minutes from IEX as provisional bars, and never the
+    minute in progress. Settled bars also replace provisional ones -- IEX
+    backfill and the partial minutes either side of a stop/start.
+
+    Returns (bars_added_or_replaced, source_name), counting only what is in the
+    buffer now -- see `merge_missing_bars` for why that can be fewer than the
+    holes the fetch covered.
     """
-    try:
-        fetched, source, failures = bar_history.fetch_history_bars(
-            symbol, timeframe, key, secret, history_feed, what="bar backfill"
-        )
-    except Exception:
-        # fetch_history_bars already logged every source it tried.
-        raise
-    added = merge_missing_bars(state, fetched)
+    # fetch_live_bars logs every source it tried when it raises.
+    live = bar_history.fetch_live_bars(
+        symbol, timeframe, key, secret, history_feed, what="bar backfill"
+    )
+    added, replaced = stream_common.merge_live_bars(state, live.bars, live.provisional)
     log_fetch(
         "bar backfill",
-        source,
+        live.source,
         symbol=symbol,
-        detail=f"{added} missing {timeframe} bar(s) added",
-        failures=failures,
+        detail=f"{added} missing {timeframe} bar(s) added, {replaced} provisional replaced",
+        failures=live.failures,
     )
-    return added, source
+    return added + replaced, live.source
 
 
 def _backfill_quietly(
@@ -292,20 +294,21 @@ def _poll_symbol_via_rest(
 ) -> "str | None":
     """One REST fallback refresh of a single symbol's bars/price/quote.
 
-    This one *replaces* the whole bar buffer rather than merging into it, so the
-    feed it reads decides the volume units of the entire series until the socket
-    comes back -- all the more reason for it to be the same consolidated source
-    the rest of the session uses. Quotes and the latest trade still come off the
-    Alpaca `feed`, which is the only place either is available.
+    The bars are merged into the buffer the same way the backfill merges them,
+    so what the socket streamed before it dropped stays; the minute it was
+    building when it dropped is flagged provisional, since it was cut short.
+    Quotes and the latest trade still come off the Alpaca `feed`, which is the
+    only place either is available.
 
     Returns the bar source name on success, None when no bars were available."""
     try:
-        bars, source, bar_failures = bar_history.fetch_history_bars(
+        live = bar_history.fetch_live_bars(
             symbol, timeframe, key, secret, history_feed, what="bars"
         )
     except Exception:
-        # fetch_history_bars already logged every source it tried.
+        # fetch_live_bars already logged every source it tried.
         return None
+    bars, source, bar_failures = live.bars, live.source, live.failures
     if not bars:
         log_fetch(
             "bars", source, symbol=symbol, detail="0 bars returned", failures=bar_failures
@@ -314,6 +317,8 @@ def _poll_symbol_via_rest(
     log_fetch(
         "bars", source, symbol=symbol, detail=f"{len(bars)} bars", failures=bar_failures
     )
+    stream_common.mark_newest_bar_provisional(state)
+    stream_common.merge_live_bars(state, bars, live.provisional)
 
     last_price = bars[-1].get("c")
     price_source = f"{source} (last bar close)"
@@ -354,12 +359,10 @@ def _poll_symbol_via_rest(
         )
 
     with state.lock:
-        state.bars.clear()
-        state.bars.extend(bars[-MAX_BARS:])
         state.last_price = last_price
         if last_price is not None:
             state.recent_prices.append((time.monotonic(), float(last_price)))
-        last_bar = bars[-1] if bars else {}
+        last_bar = state.bars[-1] if state.bars else {}
         state.previous_minute_high = last_bar.get("h")
         state.previous_minute_low = last_bar.get("l")
         state.previous_minute_close = last_bar.get("c")

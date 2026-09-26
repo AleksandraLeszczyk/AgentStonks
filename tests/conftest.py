@@ -35,3 +35,15 @@ def _no_real_alpaca_credentials(monkeypatch):
     """Remove every Alpaca credential from the environment for each test."""
     for var in _ALPACA_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_bar_tiers(monkeypatch):
+    """Stub the network tiers `bar_history.fetch_live_bars` adds on top of the
+    resolved feed -- the yfinance regular-session window and the young IEX
+    window -- so a test that fakes `fetch_bars` does not also download real
+    yfinance bars. Tests of those tiers patch them back in themselves."""
+    from agent_stonks import bar_history
+
+    monkeypatch.setattr(bar_history, "_yfinance_window", lambda *a, **k: [])
+    monkeypatch.setattr(bar_history, "_fetch_recent_bars", lambda *a, **k: [])

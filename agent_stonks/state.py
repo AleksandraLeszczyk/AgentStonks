@@ -102,6 +102,10 @@ class SymbolState:
         self.app = app
         self.lock = threading.Lock()
         self.bars: deque[dict] = deque(maxlen=MAX_BARS)
+        # Keys (`bar_history.bar_key`) of bars in `bars` that a settled
+        # consolidated bar should replace: IEX backfill, and the partial live
+        # minutes either side of a stop/start. Guarded by `lock`.
+        self.provisional_bar_keys: set[str] = set()
         self.daily_bars: list[dict] = []
         self.trades: list[dict] = []
         self.news: list[dict] = []

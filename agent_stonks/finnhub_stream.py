@@ -35,10 +35,10 @@ Three things follow from building bars locally rather than receiving them:
   Alpaca REST, which repairs anything missed while the socket was down.
 
 Volume is Finnhub's consolidated tape rather than a single venue's, so it runs
-*higher* than the IEX feed's volume for the same minute and is not directly
-comparable with historical IEX bars sitting earlier in the same buffer. It is
-much closer to the truth than an IEX-only count; the mismatch is at the seam
-between backfilled and streamed bars, not within either.
+far *higher* than the IEX feed's volume for the same minute. The backfill only
+puts IEX bars in the buffer for the last few minutes, flagged provisional, and
+replaces them with consolidated bars once those exist (see
+`bar_history.fetch_live_bars`).
 """
 import json
 import logging
@@ -123,6 +123,10 @@ class CandleBuilder:
         self.state = state
         self.tf_minutes = tf_minutes
         self.open_bucket: "str | None" = None
+        # The first bar this builder opens starts at whatever trade arrived
+        # first, not at the top of its minute, so it is flagged provisional for
+        # the backfill to replace once a settled bar for it exists.
+        self.opened_any = False
 
     def _open_bar_locked(self) -> "dict | None":
         """The bar this builder is filling, or None if it is no longer there.
@@ -184,6 +188,9 @@ class CandleBuilder:
                  "v": size, "vw": price, "n": 1}
             )
             self.open_bucket = bucket
+            if not self.opened_any:
+                self.opened_any = True
+                state.provisional_bar_keys.add(bar_ts_key(bucket))
         return closed
 
     def close_if_elapsed(self, now: "float | None" = None) -> "dict | None":
@@ -258,8 +265,8 @@ def _flush_loop(
     """Close elapsed in-progress bars on a timer for every streamed symbol.
 
     Runs only while the Finnhub socket is the live source; when it drops, the
-    REST fallback in `stream` owns the bar series instead and rewrites it whole,
-    so there is no in-progress bar of ours left to close.
+    REST fallback in `stream` merges into the bar series instead and flags the
+    bar we were building as provisional, so there is nothing of ours to close.
     """
     while not stop_event.wait(FINNHUB_BAR_FLUSH_SEC):
         if not app.bars_connected:

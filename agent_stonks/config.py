@@ -143,6 +143,15 @@ NEWS_FALLBACK_POLL_SEC = 60
 # a reconnect, and thin symbols get no bar at all for minutes without a trade
 # on the subscribed feed.
 BACKFILL_POLL_SEC = 60
+
+# The age at which a backfilled bar counts as settled. Older bars come from a
+# consolidated source (yfinance for regular-session minutes, the resolved
+# history feed for the rest). Younger bars, other than the minute in progress,
+# come from Alpaca IEX and are kept as provisional: IEX carries ~3-4% of the
+# consolidated volume, so they are replaced once they are old enough for a
+# consolidated source to serve them. The minute in progress is never backfilled;
+# the live socket owns it. See `bar_history.fetch_live_bars`.
+SETTLED_BAR_AGE_MIN = 15
 OPTIONS_POLL_SEC = 60
 OPTIONS_WALL_HISTORY_MAXLEN = 200
 TIMEFRAMES = ["1Min", "5Min", "15Min", "30Min", "1Hour", "1Day"]

@@ -38,11 +38,21 @@ the streamed half. It matters on the Alpaca IEX stream too, just in the other
 direction: there the *history* becomes the odd one out instead.
 """
 import logging
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .config import DEFAULT_HISTORY_FEED, HISTORY_FEEDS, MAX_BARS, SIP_DELAY_MIN
+from . import clock
+from .config import (
+    DEFAULT_HISTORY_FEED,
+    HISTORY_FEEDS,
+    MAX_BARS,
+    SETTLED_BAR_AGE_MIN,
+    SIP_DELAY_MIN,
+)
 from .datalog import log_fetch, log_fetch_failure
-from .historical import fetch_intraday_bars
+from .historical import fetch_intraday_bars, fetch_intraday_bars_window
+from .market_hours import MARKET_CLOSE, MARKET_OPEN, MARKET_TZ
 from .rest import KEEP_NEWEST, fetch_bars, fetch_bars_window, fetch_daily_bars
 
 logger = logging.getLogger(__name__)
@@ -329,3 +339,194 @@ def fetch_and_log(
         failures=failures,
     )
     return bars, source
+
+
+# -- the live buffer's tiered fetch --------------------------------------------
+#
+# The buffer the live socket fills gets its REST bars by age, because no single
+# source is right for all of them (measured on AAPL, 2026-09-25):
+#
+#   older than SETTLED_BAR_AGE_MIN, regular session   yfinance
+#       within 0.5% of SIP minute by minute, and the source asked for.
+#   older than SETTLED_BAR_AGE_MIN, pre/post-market   the resolved feed
+#       yfinance reports these minutes with volume 0 (and 3,565 shares for the
+#       16:00 ET minute that carries SIP's 5.1M-share closing auction), so it
+#       cannot stand in for them. Delayed SIP can.
+#   younger, up to the minute in progress             Alpaca IEX, provisional
+#       nothing consolidated is free that recently, and IEX is ~3-4% of the
+#       volume -- so these bars are flagged and replaced once they settle.
+#   the minute in progress                            never fetched
+#       the live socket owns it. A REST snapshot of a half-finished minute
+#       would sit in the buffer and make the socket refuse that minute's trades.
+
+# yfinance downloads are ~1 s each and the stream-down poll asks every 15 s, so
+# a window is reused for this long. Keyed by (symbol, interval).
+_YF_WINDOW_TTL_SEC = 30.0
+_yf_window_cache: "dict[tuple[str, str], tuple[float, datetime, list[dict]]]" = {}
+
+
+@dataclass
+class LiveBars:
+    """What `fetch_live_bars` found: the bars, which of them are provisional
+    (by `bar_key`), a label naming every source that contributed, and the
+    (source, error) pairs that failed along the way."""
+
+    bars: list[dict]
+    provisional: "set[str]" = field(default_factory=set)
+    source: str = ""
+    failures: "list[tuple[str, object]]" = field(default_factory=list)
+
+
+def bar_key(ts: object) -> str:
+    """One spelling per bar timestamp ('Z' and '+00:00' agree). The same key
+    `stream_common.bar_ts_key` produces, repeated here to keep this module free
+    of the tick path's imports."""
+    return clock.parse_iso_strict(ts).isoformat()
+
+
+def _in_regular_session(ts: object) -> bool:
+    et = clock.parse_iso_strict(ts).astimezone(MARKET_TZ)
+    return et.weekday() < 5 and MARKET_OPEN <= et.time() < MARKET_CLOSE
+
+
+def _bucket_start(now: datetime, timeframe: str) -> datetime:
+    """Start of the `timeframe` bucket holding `now` -- the bar in progress."""
+    minutes = {"5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60}.get(timeframe, 1)
+    total = now.hour * 60 + now.minute
+    floored = (total // minutes) * minutes
+    return now.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
+
+
+def _yfinance_window(symbol: str, interval: str, start: datetime, end: datetime) -> "list[dict]":
+    """yfinance bars in [start, end), through a short cache."""
+    cache_key = (symbol, interval)
+    hit = _yf_window_cache.get(cache_key)
+    if hit is not None and time.monotonic() - hit[0] < _YF_WINDOW_TTL_SEC and hit[1] <= start:
+        bars = hit[2]
+    else:
+        bars = fetch_intraday_bars_window(symbol, start, end, interval=interval)
+        _yf_window_cache[cache_key] = (time.monotonic(), start, bars)
+    return [b for b in bars if start <= clock.parse_iso_strict(b["t"]) < end]
+
+
+def _fetch_recent_bars(
+    symbol: str, timeframe: str, start: datetime, end: datetime,
+    key: str, secret: str, feed: str,
+) -> "list[dict]":
+    """The young tier: Alpaca bars in [start, end) off `feed`."""
+    return fetch_bars_window(
+        symbol, timeframe, start, end, key, secret, feed, limit=200, keep=KEEP_NEWEST,
+    )
+
+
+def fetch_live_bars(
+    symbol: str,
+    timeframe: str,
+    key: str,
+    secret: str,
+    feed: str,
+    limit: int = MAX_BARS,
+    lookback_hours: int = 16,
+    what: str = "bars",
+    now: "datetime | None" = None,
+) -> LiveBars:
+    """REST bars for the live buffer, each from the source its age calls for.
+
+    `feed` is the session's resolved history feed; it serves the settled bars
+    yfinance cannot (pre/post-market, the 1Day timeframe, a yfinance outage).
+    Bars that came off IEX are listed in `provisional` so the buffer knows to
+    replace them. A real-time SIP key serves the young tier too, and then
+    nothing is provisional.
+
+    Raises only when no tier returned anything and something failed.
+    """
+    now = now or datetime.now(timezone.utc)
+    settled_cut = now - timedelta(minutes=SETTLED_BAR_AGE_MIN)
+    current = _bucket_start(now, timeframe)
+    failures: list[tuple[str, object]] = []
+    by_key: dict[str, dict] = {}
+    provisional: set[str] = set()
+    sources: list[str] = []
+
+    # Settled, from the resolved feed. Anything it returns from the young window
+    # is dropped: that window has its own tier.
+    try:
+        base, base_label, base_failures = fetch_history_bars(
+            symbol, timeframe, key, secret, feed,
+            limit=limit, lookback_hours=lookback_hours, what=what,
+        )
+    except Exception:
+        base, base_label, base_failures = [], "", []
+    failures.extend(base_failures)
+    base_is_iex = base_label == SOURCE_LABELS["iex"]
+    kept = 0
+    for bar in base:
+        if "t" in bar and clock.parse_iso_strict(bar["t"]) < settled_cut:
+            by_key[bar_key(bar["t"])] = bar
+            kept += 1
+            if base_is_iex:
+                provisional.add(bar_key(bar["t"]))
+    if kept:
+        sources.append(base_label)
+
+    # Settled regular-session minutes from yfinance, over whatever the resolved
+    # feed said for them.
+    yf_interval = YF_INTERVALS.get(timeframe)
+    if yf_interval is not None and base_label != SOURCE_LABELS["yfinance"]:
+        start = now - timedelta(hours=lookback_hours)
+        try:
+            yf_bars = _yfinance_window(symbol, yf_interval, start, settled_cut)
+        except Exception as exc:
+            failures.append((SOURCE_LABELS["yfinance"], exc))
+            yf_bars = []
+        replaced = 0
+        for bar in yf_bars:
+            if "t" in bar and _in_regular_session(bar["t"]):
+                k = bar_key(bar["t"])
+                by_key[k] = bar
+                provisional.discard(k)
+                replaced += 1
+        if replaced:
+            sources.append(f"{SOURCE_LABELS['yfinance']} regular session")
+
+    # The young tier, up to (not including) the bar in progress.
+    recent_feed = "sip" if feed == "sip" else "iex"
+    recent_start = min(settled_cut, now - timedelta(minutes=SIP_DELAY_MIN))
+    if current > recent_start:
+        try:
+            recent = _fetch_recent_bars(
+                symbol, timeframe, recent_start, current, key, secret, recent_feed
+            )
+        except Exception as exc:
+            failures.append((SOURCE_LABELS[recent_feed], exc))
+            recent = []
+        added = 0
+        for bar in recent:
+            if "t" not in bar:
+                continue
+            k = bar_key(bar["t"])
+            if k in by_key:
+                continue
+            by_key[k] = bar
+            added += 1
+            if recent_feed == "iex":
+                provisional.add(k)
+        if added:
+            sources.append(
+                f"{SOURCE_LABELS[recent_feed]} last {SETTLED_BAR_AGE_MIN}min"
+                + (", provisional" if recent_feed == "iex" else "")
+            )
+
+    if not by_key and failures:
+        log_fetch_failure(
+            what, failures, symbol=symbol, consequence="no bar source available this cycle"
+        )
+        raise RuntimeError(f"every bar source failed for {symbol}: {failures}")
+    bars = [by_key[k] for k in sorted(by_key)][-limit:]
+    present = {bar_key(b["t"]) for b in bars}
+    return LiveBars(
+        bars=bars,
+        provisional=provisional & present,
+        source=" + ".join(sources) or "no bars",
+        failures=failures,
+    )
