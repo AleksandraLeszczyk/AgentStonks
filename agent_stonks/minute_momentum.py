@@ -16,11 +16,21 @@ again.
 The history is the same yfinance week the volume baseline uses
 (`volume_baseline.WEEK_SESSIONS` sessions, regular hours, consolidated), so the
 two references describe the same five days.
+
+Alongside the one number, the same changes are kept per clock minute
+(`per_minute_moves`, keyed by minutes past ET midnight of the bar that closed
+the move), and `band` turns them into how far *this* minute of the session
+usually moves: mean + 1 sigma of the absolute moves around it. The open's first
+minutes move several times what midday does, so the flat mean understates the
+one and overstates the other; the live chart's momentum panel draws the band.
+A clock minute holds one change per session -- five samples, too few for a
+sigma -- so `band` pools the minutes either side of it too.
 """
 
 from __future__ import annotations
 
 import json
+import statistics
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -44,6 +54,14 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "minute_momentum"
 # SimLab's stored days carry pre- and post-market minutes too, whose thin
 # prints would move the mean.
 _RTH_MINUTES = (9 * 60 + 30, 16 * 60)
+
+# `band` pools each clock minute's moves with this many minutes either side:
+# five sessions are five samples a minute, too few to read a shape through,
+# let alone a sigma. Five either side makes ~55.
+SMOOTH_MINUTES = 5
+
+# How many standard deviations of the pooled moves `band` adds to their mean.
+BAND_SIGMAS = 1.0
 
 
 def prior_week_days(day: date) -> "list[date]":
@@ -75,8 +93,11 @@ def compute(history_bars: "list[dict]", today: str) -> "dict | None":
     overnight gap from one close to the next open is not a minute's move and
     would dominate the mean on any gap day.
 
-    Returns ``{"abs_mean_minute_momentum", "changes", "sessions", "dates"}``,
-    or None when no prior session carries two bars.
+    Returns ``{"abs_mean_minute_momentum", "per_minute_moves", "changes",
+    "sessions", "dates"}``, or None when no prior session carries two bars.
+    `per_minute_moves` maps minutes past ET midnight -- of the later bar of
+    each change, where the chart draws that bar's momentum -- to the absolute
+    changes at that clock minute, one per session.
     """
     prior = [
         bar
@@ -94,20 +115,52 @@ def compute(history_bars: "list[dict]", today: str) -> "dict | None":
 
     total = 0.0
     count = 0
+    by_minute: dict[int, list[float]] = {}
     for bars in by_session.values():
         bars.sort(key=lambda bar: str(bar.get("t")))
-        closes = [c for c in (_close(bar) for bar in bars) if c is not None]
-        for prev, cur in zip(closes, closes[1:]):
-            total += abs(cur - prev)
+        priced = [(bar, c) for bar, c in ((bar, _close(bar)) for bar in bars) if c is not None]
+        for (_, prev), (bar, cur) in zip(priced, priced[1:]):
+            move = abs(cur - prev)
+            total += move
             count += 1
+            by_minute.setdefault(_minute_of_day(bar), []).append(round(move, 6))
     if not count:
         return None
     return {
         "abs_mean_minute_momentum": total / count,
+        "per_minute_moves": dict(sorted(by_minute.items())),
         "changes": count,
         "sessions": len(dates),
         "dates": dates,
     }
+
+
+def band(
+    moves_by_minute: "dict[int, list[float]]",
+    half_width: int = SMOOTH_MINUTES,
+    sigmas: float = BAND_SIGMAS,
+) -> "dict[int, float]":
+    """Mean + `sigmas` standard deviations of the absolute moves within
+    `half_width` clock minutes of each minute in `moves_by_minute`.
+
+    The moves are pooled, not the per-minute means averaged, so the sigma is
+    the spread of the moves themselves (sample standard deviation; zero for a
+    single move). Over clock minutes, not list positions, so a minute missing
+    from the week does not pull a farther one into the window; at the
+    session's edges the window is simply shorter (09:31 pools 09:31-09:36).
+    """
+    out: dict[int, float] = {}
+    for m in moves_by_minute:
+        pooled = [
+            move
+            for k in range(m - half_width, m + half_width + 1)
+            for move in moves_by_minute.get(k, ())
+        ]
+        if not pooled:
+            continue
+        spread = statistics.stdev(pooled) if len(pooled) > 1 else 0.0
+        out[m] = statistics.fmean(pooled) + sigmas * spread
+    return out
 
 
 def _today_et() -> str:
@@ -128,6 +181,14 @@ def _read_cached(symbol: str, today: str) -> "dict | None":
         return None
     if not isinstance(record.get("abs_mean_minute_momentum"), (int, float)):
         return None
+    # A file written before the per-minute moves were stored is recomputed,
+    # not kept for the rest of the day with nothing to draw.
+    if not isinstance(record.get("per_minute_moves"), dict):
+        return None
+    # JSON keys are strings; the minute is an int everywhere else.
+    record["per_minute_moves"] = {
+        int(m): [float(v) for v in moves] for m, moves in record["per_minute_moves"].items()
+    }
     return record
 
 
@@ -170,7 +231,8 @@ def load_or_compute(symbol: str, today: "str | None" = None) -> "dict | None":
 
 
 def refresh(state) -> "float | None":
-    """Set `state.abs_mean_minute_momentum` (a `SymbolState`) and return it."""
+    """Set `state.abs_mean_minute_momentum` and `state.minute_momentum_profile`
+    (a `SymbolState`; the profile is `band`) and return the former."""
     try:
         record = load_or_compute(state.symbol)
     except Exception as exc:
@@ -182,6 +244,7 @@ def refresh(state) -> "float | None":
     value = record["abs_mean_minute_momentum"] if record else None
     if value is not None:
         state.abs_mean_minute_momentum = value
+        state.minute_momentum_profile = band(record.get("per_minute_moves") or {}) or None
     return value
 
 

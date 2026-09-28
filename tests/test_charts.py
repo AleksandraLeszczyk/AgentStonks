@@ -609,38 +609,66 @@ class TestMomentumPanel:
     def ref_traces(self, fig):
         return [tr for tr in fig.data if tr.name == "Mean minute move"]
 
-    def test_the_minute_reference_is_drawn_at_plus_and_minus(self):
+    # 09:30 ET = 570; a profile that grows by a cent per minute of the session.
+    PROFILE = {570 + m: 0.10 + 0.01 * m for m in range(390)}
+
+    def test_the_minute_profile_is_drawn_at_plus_and_minus(self):
         fig = build_chart(
             self.rth_bars(40), [], [], "AAPL", SESSION_START,
-            show_momentum=True, minute_momentum_ref=0.13,
+            show_momentum=True, minute_momentum_profile=self.PROFILE,
         )
         refs = self.ref_traces(fig)
-        assert sorted(tr.y[0] for tr in refs) == [-0.13, 0.13]
+        assert len(refs) == 2
+        upper, lower = sorted(refs, key=lambda tr: np.nanmax(tr.y), reverse=True)
+        # Each bar gets its own clock minute's value, not one flat level.
+        assert list(upper.y) == pytest.approx([self.PROFILE[570 + i] for i in range(40)])
+        assert list(lower.y) == pytest.approx([-self.PROFILE[570 + i] for i in range(40)])
         # On the momentum panel, not the change panel.
         assert {tr.yaxis for tr in refs} == {"y5"}
         texts = [a["text"] for a in fig.layout.annotations]
-        assert any("\u00b1$0.13" in t for t in texts)
+        assert any("by minute" in t for t in texts)
+
+    def test_the_profile_is_a_dark_band_behind_the_bars(self):
+        fig = build_chart(
+            self.rth_bars(40), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_profile=self.PROFILE,
+        )
+        refs = self.ref_traces(fig)
+        assert {tr.fill for tr in refs} == {"tozeroy"}
+        bars = [tr for tr in fig.data if tr.name == "Momentum"]
+        # Plotly puts bar traces over scatter traces unless zorder says otherwise.
+        assert all(tr.zorder < (bars[0].zorder or 0) for tr in refs)
+
+    def test_a_minute_the_profile_lacks_is_a_gap(self):
+        profile = {m: v for m, v in self.PROFILE.items() if m != 575}
+        fig = build_chart(
+            self.rth_bars(10), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_profile=profile,
+        )
+        upper = max(self.ref_traces(fig), key=lambda tr: np.nanmax(tr.y))
+        assert np.isnan(upper.y[5])
+        assert upper.y[4] == pytest.approx(self.PROFILE[574])
 
     def test_no_minute_reference_on_coarser_bars(self):
         # A per-minute value says nothing about a 5-minute bar's move.
         fig = build_chart(
             self.rth_bars(40, step_min=5), [], [], "AAPL", SESSION_START,
-            show_momentum=True, minute_momentum_ref=0.13,
+            show_momentum=True, minute_momentum_profile=self.PROFILE,
         )
         assert not self.ref_traces(fig)
 
-    @pytest.mark.parametrize("ref", [None, 0.0])
-    def test_no_minute_reference_until_it_is_known(self, ref):
+    @pytest.mark.parametrize("profile", [None, {}])
+    def test_no_minute_reference_until_it_is_known(self, profile):
         fig = build_chart(
             self.rth_bars(40), [], [], "AAPL", SESSION_START,
-            show_momentum=True, minute_momentum_ref=ref,
+            show_momentum=True, minute_momentum_profile=profile,
         )
         assert not self.ref_traces(fig)
 
     def test_no_minute_reference_while_momentum_warms_up(self):
         fig = build_chart(
             self.rth_bars(1), [], [], "AAPL", SESSION_START,
-            show_momentum=True, minute_momentum_ref=0.13,
+            show_momentum=True, minute_momentum_profile=self.PROFILE,
         )
         assert not self.ref_traces(fig)
 

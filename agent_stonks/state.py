@@ -142,6 +142,10 @@ class SymbolState:
         # once per ET day on a streaming start (see agent_stonks.minute_momentum).
         # None until that background read lands.
         self.abs_mean_minute_momentum: float | None = None
+        # The same week's |1-minute close change| per clock minute, mean + 1
+        # sigma over the moves within +/-5 minutes (minutes past ET midnight ->
+        # $; `minute_momentum.band`), drawn on the momentum panel.
+        self.minute_momentum_profile: dict[int, float] | None = None
         # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
         # last ~minute. Used by last_price alerts to check any price in the window,
         # not only the single most-recent tick.

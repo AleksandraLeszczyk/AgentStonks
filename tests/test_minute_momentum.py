@@ -1,5 +1,6 @@
 """`abs_mean_minute_momentum`: last week's mean absolute one-minute move."""
 
+import statistics
 from datetime import datetime, timedelta
 
 import pytest
@@ -51,6 +52,42 @@ class TestCompute:
         result = compute(list(reversed(bars(WEEK[0], [100.0, 101.0, 100.0]))), "2026-09-21")
         assert result["abs_mean_minute_momentum"] == pytest.approx(1.0)
 
+    def test_per_minute_moves_are_kept_by_clock_minute(self):
+        # 09:31 moves 0.10 then 0.30; 09:32 moves 0.20 then 0.40.
+        history = bars(WEEK[0], [100.0, 100.1, 100.3]) + bars(WEEK[1], [100.0, 99.7, 100.1])
+        moves = compute(history, "2026-09-21")["per_minute_moves"]
+        assert moves.keys() == {571, 572}
+        assert moves[571] == pytest.approx([0.10, 0.30])
+        assert moves[572] == pytest.approx([0.20, 0.40])
+
+    def test_band_is_mean_plus_one_sigma_of_the_pooled_moves(self):
+        moves = {570 + m: [float(m), float(m) + 1.0] for m in range(10)}
+        pooled = [3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 7.0, 8.0]  # 09:33-09:37
+        expected = statistics.fmean(pooled) + statistics.stdev(pooled)
+        assert minute_momentum.band(moves, half_width=2)[575] == pytest.approx(expected)
+
+    def test_band_edge_window_is_shorter(self):
+        moves = {570 + m: [float(m), float(m) + 1.0] for m in range(10)}
+        pooled = [0.0, 1.0, 1.0, 2.0, 2.0, 3.0]  # 09:30-09:32
+        expected = statistics.fmean(pooled) + statistics.stdev(pooled)
+        assert minute_momentum.band(moves, half_width=2)[570] == pytest.approx(expected)
+
+    def test_band_goes_by_clock_minute_not_position(self):
+        # 09:35 is missing: 09:37's window is 09:36-09:39 only, not 09:34.
+        moves = {570 + m: [float(m)] for m in range(10) if m != 5}
+        pooled = [6.0, 7.0, 8.0, 9.0]
+        expected = statistics.fmean(pooled) + statistics.stdev(pooled)
+        assert minute_momentum.band(moves, half_width=2)[577] == pytest.approx(expected)
+
+    def test_the_default_window_is_five_minutes_either_side(self):
+        moves = {570 + m: [float(m)] for m in range(20)}
+        pooled = [float(m) for m in range(5, 16)]  # 09:35-09:45 around 09:40
+        expected = statistics.fmean(pooled) + statistics.stdev(pooled)
+        assert minute_momentum.band(moves)[580] == pytest.approx(expected)
+
+    def test_a_single_move_has_no_spread(self):
+        assert minute_momentum.band({571: [0.25]}) == pytest.approx({571: 0.25})
+
     def test_nothing_to_measure(self):
         assert compute([], "2026-09-21") is None
         assert compute(bars(WEEK[0], [100.0]), "2026-09-21") is None
@@ -76,6 +113,18 @@ class TestOncePerDay:
         assert second == first
         assert len(self.fetches) == 1
 
+    def test_the_profile_survives_the_json_round_trip(self):
+        load_or_compute("AAPL", today="2026-09-21")
+        stored = load_or_compute("AAPL", today="2026-09-21")
+        assert stored["per_minute_moves"] == {571: pytest.approx([0.25])}
+
+    def test_a_file_without_the_profile_is_recomputed(self):
+        first = load_or_compute("AAPL", today="2026-09-21")
+        del first["per_minute_moves"]
+        minute_momentum._write_cached("AAPL", first)
+        assert "per_minute_moves" in load_or_compute("AAPL", today="2026-09-21")
+        assert len(self.fetches) == 2
+
     def test_a_new_day_computes_again(self):
         load_or_compute("AAPL", today="2026-09-21")
         load_or_compute("AAPL", today="2026-09-22")
@@ -90,7 +139,9 @@ class TestOncePerDay:
         class State:
             symbol = "AAPL"
             abs_mean_minute_momentum = None
+            minute_momentum_profile = None
 
         state = State()
         assert refresh(state) == pytest.approx(0.25)
         assert state.abs_mean_minute_momentum == pytest.approx(0.25)
+        assert state.minute_momentum_profile == pytest.approx({571: 0.25})

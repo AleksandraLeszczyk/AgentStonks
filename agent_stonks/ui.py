@@ -693,7 +693,7 @@ def _chart_panel() -> None:
             model_overlays=overlays["items"],
             candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
-            minute_momentum_ref=sym_state.abs_mean_minute_momentum,
+            minute_momentum_profile=sym_state.minute_momentum_profile,
             **_agent_momentum_kwargs(state, sym_state),
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
@@ -2142,7 +2142,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     )["items"],
                     candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
-                    minute_momentum_ref=sym_state.abs_mean_minute_momentum,
+                    minute_momentum_profile=sym_state.minute_momentum_profile,
                     **_agent_momentum_kwargs(state, sym_state),
                 ),
             )

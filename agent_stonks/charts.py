@@ -942,7 +942,7 @@ def _add_momentum_panels(
     fig: go.Figure,
     momentum_row: int,
     change_row: int,
-    minute_ref: "float | None" = None,
+    minute_profile: "dict[int, float] | None" = None,
     agent_bars: "int | None" = None,
     agent_label: str = "",
 ) -> None:
@@ -962,9 +962,10 @@ def _add_momentum_panels(
     needs two momentum bars, so those stretches are left as gaps rather than
     plotted as zero, which would read as "flat" when it means "not known yet".
 
-    `minute_ref` is the ticker's `abs_mean_minute_momentum` -- last week's
-    mean absolute one-minute move -- drawn at plus and minus itself on the
-    momentum panel, so a bar poking past it moved more than a usual minute.
+    `minute_profile` is the ticker's `minute_momentum_profile` -- the mean
+    absolute one-minute move at each clock minute over the last five sessions
+    -- drawn at plus and minus itself on the momentum panel, so a bar poking
+    past it moved more than that minute of the session usually does.
 
     `agent_bars` adds the same two measures averaged over the look-back the
     selected agent decides on, as semitransparent lines over the bars, labelled
@@ -1003,7 +1004,7 @@ def _add_momentum_panels(
         warm_up="Momentum starts at the second regular-session bar",
     )
     if mom.notna().any():
-        _add_minute_momentum_ref(df, fig, momentum_row, minute_ref)
+        _add_minute_momentum_profile(df, fig, momentum_row, minute_profile)
     _add_bar_by_bar_panel(
         df, fig, change_row, change, None,
         name="Momentum change",
@@ -1058,35 +1059,57 @@ def _add_agent_momentum_line(
     )
 
 
-def _add_minute_momentum_ref(
-    df: pd.DataFrame, fig: go.Figure, row: int, level: "float | None"
+# The usual-minute-move band: near-black, so it reads as a shadow behind the
+# momentum bars on the dark panel rather than as a line competing with them.
+MINUTE_MOVE_BAND = "rgba(0, 0, 0, 0.7)"
+
+
+def _add_minute_momentum_profile(
+    df: pd.DataFrame, fig: go.Figure, row: int, profile: "dict[int, float] | None"
 ) -> None:
-    """Last week's mean absolute one-minute move, at +level and -level.
+    """How far each bar's clock minute usually moves -- mean + 1 sigma of the
+    absolute one-minute moves within +/-5 minutes of it over the last five
+    sessions (`minute_momentum.band`) -- as a dark band
+    from -value to +value behind the bars: a backdrop to read them against,
+    not a series of its own. A bar reaching out of the band moved more than
+    that minute of the session does on all but its larger moves.
 
-    Only on one-minute bars. The value is a per-minute measure, and a
+    Only on one-minute bars. The values are per-minute measures, and a
     five-minute bar's move is not five one-minute moves added up -- they partly
-    cancel -- so there is no honest way to scale it to a coarser bar; drawn
-    there as-is it would sit well under a typical bar and make every bar look
-    unusual.
+    cancel -- so there is no honest way to scale them to a coarser bar; drawn
+    there as-is they would sit well under a typical bar and make every bar
+    look unusual.
 
-    Traces rather than `add_hline` shapes, because shapes do not take part in
-    autorange: on a quiet stretch the lines would sit off the top of the axis.
+    Drawn only where the chart has bars, so the reference never widens the x
+    axis, and left as a gap at a minute the week has no move for rather than
+    at zero. Traces rather than shapes, so autorange includes them; plotly
+    draws bar traces over scatter traces only by `zorder`, so the band's is
+    below the bars' default of 0.
     """
-    if level is None or not level > 0 or _bar_minutes(df["t"]) != 1:
+    if not profile or _bar_minutes(df["t"]) != 1:
         return
-    level = float(level)
-    x = [df["t"].min(), df["t"].max()]
+    et = df["t"].dt.tz_convert(market_hours.MARKET_TZ)
+    minutes = et.dt.hour * 60 + et.dt.minute
+    level = pd.Series(
+        [profile.get(int(m), float("nan")) for m in minutes], index=df.index, dtype=float
+    )
+    if not level.notna().any():
+        return
     for y in (level, -level):
         fig.add_trace(
             go.Scatter(
-                x=x,
-                y=[y, y],
+                x=df["t"],
+                y=y,
                 mode="lines",
-                line=dict(color=PALETTE["orange"], width=1.2, dash="dash"),
+                line=dict(width=0),
+                fill="tozeroy",
+                fillcolor=MINUTE_MOVE_BAND,
+                zorder=-1,
+                connectgaps=False,
                 name="Mean minute move",
                 showlegend=False,
                 hovertemplate=(
-                    "<b>Mean |1-min move|</b> \u2014 last week<br>"
+                    "<b>|1-min move| mean + 1\u03c3</b> \u2014 this minute \u00b15, last 5 sessions<br>"
                     "%{y:+$.3f}<extra></extra>"
                 ),
             ),
@@ -1094,13 +1117,12 @@ def _add_minute_momentum_ref(
             col=1,
         )
     fig.add_annotation(
-        x=x[1],
-        y=level,
-        text=f"avg \u00b1${level:.2f} \u00b7 last week",
+        xref="x domain", yref="y domain", x=1.0, y=1.0,
+        text="\u00b1 |1-min move| mean + 1\u03c3 by minute \u00b7 last 5 sessions",
         showarrow=False,
         xanchor="right",
-        yanchor="bottom",
-        font=dict(size=9, color=PALETTE["orange"]),
+        yanchor="top",
+        font=dict(size=9, color=PALETTE["muted"]),
         row=row,
         col=1,
     )
@@ -1773,7 +1795,7 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
-    minute_momentum_ref: Optional[float] = None,
+    minute_momentum_profile: Optional[dict] = None,
     agent_momentum_bars: Optional[int] = None,
     agent_momentum_label: str = "",
     volume_baseline: Optional[dict] = None,
@@ -1953,7 +1975,7 @@ def build_chart(
 
     if show_momentum:
         _add_momentum_panels(
-            df, fig, momentum_row, change_row, minute_ref=minute_momentum_ref,
+            df, fig, momentum_row, change_row, minute_profile=minute_momentum_profile,
             agent_bars=agent_momentum_bars, agent_label=agent_momentum_label,
         )
 
