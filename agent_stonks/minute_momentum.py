@@ -25,6 +25,10 @@ minutes move several times what midday does, so the flat mean understates the
 one and overstates the other; the live chart's momentum panel draws the band.
 A clock minute holds one change per session -- five samples, too few for a
 sigma -- so `band` pools the minutes either side of it too.
+
+The same is kept for the momentum's own change (`per_minute_deltas`: the
+absolute difference between consecutive one-minute moves, signed moves, so
+`|m1 - m1[1]|`), which the chart's momentum-change panel draws the same way.
 """
 
 from __future__ import annotations
@@ -93,11 +97,13 @@ def compute(history_bars: "list[dict]", today: str) -> "dict | None":
     overnight gap from one close to the next open is not a minute's move and
     would dominate the mean on any gap day.
 
-    Returns ``{"abs_mean_minute_momentum", "per_minute_moves", "changes",
-    "sessions", "dates"}``, or None when no prior session carries two bars.
-    `per_minute_moves` maps minutes past ET midnight -- of the later bar of
-    each change, where the chart draws that bar's momentum -- to the absolute
-    changes at that clock minute, one per session.
+    Returns ``{"abs_mean_minute_momentum", "per_minute_moves",
+    "per_minute_deltas", "changes", "sessions", "dates"}``, or None when no
+    prior session carries two bars. `per_minute_moves` maps minutes past ET
+    midnight -- of the later bar of each change, where the chart draws that
+    bar's momentum -- to the absolute changes at that clock minute, one per
+    session. `per_minute_deltas` does the same for the momentum change
+    `|(c - c[1]) - (c[1] - c[2])|`, keyed by the latest of its three bars.
     """
     prior = [
         bar
@@ -116,19 +122,26 @@ def compute(history_bars: "list[dict]", today: str) -> "dict | None":
     total = 0.0
     count = 0
     by_minute: dict[int, list[float]] = {}
+    deltas_by_minute: dict[int, list[float]] = {}
     for bars in by_session.values():
         bars.sort(key=lambda bar: str(bar.get("t")))
         priced = [(bar, c) for bar, c in ((bar, _close(bar)) for bar in bars) if c is not None]
+        last_move = None
         for (_, prev), (bar, cur) in zip(priced, priced[1:]):
-            move = abs(cur - prev)
-            total += move
+            move = cur - prev
+            total += abs(move)
             count += 1
-            by_minute.setdefault(_minute_of_day(bar), []).append(round(move, 6))
+            minute = _minute_of_day(bar)
+            by_minute.setdefault(minute, []).append(round(abs(move), 6))
+            if last_move is not None:
+                deltas_by_minute.setdefault(minute, []).append(round(abs(move - last_move), 6))
+            last_move = move
     if not count:
         return None
     return {
         "abs_mean_minute_momentum": total / count,
         "per_minute_moves": dict(sorted(by_minute.items())),
+        "per_minute_deltas": dict(sorted(deltas_by_minute.items())),
         "changes": count,
         "sessions": len(dates),
         "dates": dates,
@@ -181,14 +194,13 @@ def _read_cached(symbol: str, today: str) -> "dict | None":
         return None
     if not isinstance(record.get("abs_mean_minute_momentum"), (int, float)):
         return None
-    # A file written before the per-minute moves were stored is recomputed,
+    # A file written before the per-minute series were stored is recomputed,
     # not kept for the rest of the day with nothing to draw.
-    if not isinstance(record.get("per_minute_moves"), dict):
-        return None
-    # JSON keys are strings; the minute is an int everywhere else.
-    record["per_minute_moves"] = {
-        int(m): [float(v) for v in moves] for m, moves in record["per_minute_moves"].items()
-    }
+    for key in ("per_minute_moves", "per_minute_deltas"):
+        if not isinstance(record.get(key), dict):
+            return None
+        # JSON keys are strings; the minute is an int everywhere else.
+        record[key] = {int(m): [float(v) for v in moves] for m, moves in record[key].items()}
     return record
 
 
@@ -231,8 +243,9 @@ def load_or_compute(symbol: str, today: "str | None" = None) -> "dict | None":
 
 
 def refresh(state) -> "float | None":
-    """Set `state.abs_mean_minute_momentum` and `state.minute_momentum_profile`
-    (a `SymbolState`; the profile is `band`) and return the former."""
+    """Set `state.abs_mean_minute_momentum`, `state.minute_momentum_profile`
+    and `state.minute_momentum_change_profile` (a `SymbolState`; the profiles
+    are `band`s) and return the first."""
     try:
         record = load_or_compute(state.symbol)
     except Exception as exc:
@@ -245,6 +258,9 @@ def refresh(state) -> "float | None":
     if value is not None:
         state.abs_mean_minute_momentum = value
         state.minute_momentum_profile = band(record.get("per_minute_moves") or {}) or None
+        state.minute_momentum_change_profile = (
+            band(record.get("per_minute_deltas") or {}) or None
+        )
     return value
 
 

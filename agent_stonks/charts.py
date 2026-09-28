@@ -943,6 +943,7 @@ def _add_momentum_panels(
     momentum_row: int,
     change_row: int,
     minute_profile: "dict[int, float] | None" = None,
+    change_profile: "dict[int, float] | None" = None,
     agent_bars: "int | None" = None,
     agent_label: str = "",
 ) -> None:
@@ -966,6 +967,8 @@ def _add_momentum_panels(
     absolute one-minute move at each clock minute over the last five sessions
     -- drawn at plus and minus itself on the momentum panel, so a bar poking
     past it moved more than that minute of the session usually does.
+    `change_profile` (`minute_momentum_change_profile`) is the same band for
+    the momentum change, on the change panel.
 
     `agent_bars` adds the same two measures averaged over the look-back the
     selected agent decides on, as semitransparent lines over the bars, labelled
@@ -1011,6 +1014,11 @@ def _add_momentum_panels(
         hover="Momentum change %{y:+$.2f}<extra></extra>",
         warm_up="Momentum change starts at the third regular-session bar",
     )
+    if change.notna().any():
+        _add_minute_momentum_profile(
+            df, fig, change_row, change_profile,
+            name="Mean minute move change", what="|1-min momentum \u0394|",
+        )
 
     n = int(agent_bars or 0)
     if n > 1 and len(frame):
@@ -1065,7 +1073,12 @@ MINUTE_MOVE_BAND = "rgba(0, 0, 0, 0.7)"
 
 
 def _add_minute_momentum_profile(
-    df: pd.DataFrame, fig: go.Figure, row: int, profile: "dict[int, float] | None"
+    df: pd.DataFrame,
+    fig: go.Figure,
+    row: int,
+    profile: "dict[int, float] | None",
+    name: str = "Mean minute move",
+    what: str = "|1-min move|",
 ) -> None:
     """How far each bar's clock minute usually moves -- mean + 1 sigma of the
     absolute one-minute moves within +/-5 minutes of it over the last five
@@ -1085,6 +1098,9 @@ def _add_minute_momentum_profile(
     at zero. Traces rather than shapes, so autorange includes them; plotly
     draws bar traces over scatter traces only by `zorder`, so the band's is
     below the bars' default of 0.
+
+    The momentum-change panel gets the same band built from the momentum
+    change instead (`name` and `what` label it).
     """
     if not profile or _bar_minutes(df["t"]) != 1:
         return
@@ -1106,10 +1122,10 @@ def _add_minute_momentum_profile(
                 fillcolor=MINUTE_MOVE_BAND,
                 zorder=-1,
                 connectgaps=False,
-                name="Mean minute move",
+                name=name,
                 showlegend=False,
                 hovertemplate=(
-                    "<b>|1-min move| mean + 1\u03c3</b> \u2014 this minute \u00b15, last 5 sessions<br>"
+                    f"<b>{what} mean + 1\u03c3</b> \u2014 this minute \u00b15, last 5 sessions<br>"
                     "%{y:+$.3f}<extra></extra>"
                 ),
             ),
@@ -1118,7 +1134,7 @@ def _add_minute_momentum_profile(
         )
     fig.add_annotation(
         xref="x domain", yref="y domain", x=1.0, y=1.0,
-        text="\u00b1 |1-min move| mean + 1\u03c3 by minute \u00b7 last 5 sessions",
+        text=f"\u00b1 {what} mean + 1\u03c3 by minute \u00b7 last 5 sessions",
         showarrow=False,
         xanchor="right",
         yanchor="top",
@@ -1796,6 +1812,7 @@ def build_chart(
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
     minute_momentum_profile: Optional[dict] = None,
+    minute_momentum_change_profile: Optional[dict] = None,
     agent_momentum_bars: Optional[int] = None,
     agent_momentum_label: str = "",
     volume_baseline: Optional[dict] = None,
@@ -1976,6 +1993,7 @@ def build_chart(
     if show_momentum:
         _add_momentum_panels(
             df, fig, momentum_row, change_row, minute_profile=minute_momentum_profile,
+            change_profile=minute_momentum_change_profile,
             agent_bars=agent_momentum_bars, agent_label=agent_momentum_label,
         )
 

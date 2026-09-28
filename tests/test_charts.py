@@ -673,6 +673,38 @@ class TestMomentumPanel:
         assert not self.ref_traces(fig)
 
 
+    def change_ref_traces(self, fig):
+        return [tr for tr in fig.data if tr.name == "Mean minute move change"]
+
+    def test_the_change_profile_is_a_band_on_the_change_panel(self):
+        change_profile = {m: v / 2 for m, v in self.PROFILE.items()}
+        fig = build_chart(
+            self.rth_bars(40), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_profile=self.PROFILE,
+            minute_momentum_change_profile=change_profile,
+        )
+        refs = self.change_ref_traces(fig)
+        assert len(refs) == 2
+        assert {tr.yaxis for tr in refs} == {"y7"}
+        assert {tr.fill for tr in refs} == {"tozeroy"}
+        assert all(tr.zorder < 0 for tr in refs)
+        upper = max(refs, key=lambda tr: np.nanmax(tr.y))
+        assert list(upper.y) == pytest.approx([change_profile[570 + i] for i in range(40)])
+        # The momentum panel keeps its own band.
+        assert {tr.yaxis for tr in self.ref_traces(fig)} == {"y5"}
+        texts = [a["text"] for a in fig.layout.annotations]
+        assert any("\u0394| mean + 1\u03c3" in t for t in texts)
+
+    def test_no_change_band_while_the_change_warms_up(self):
+        # Two bars: one momentum bar, no change yet.
+        fig = build_chart(
+            self.rth_bars(2), [], [], "AAPL", SESSION_START,
+            show_momentum=True, minute_momentum_profile=self.PROFILE,
+            minute_momentum_change_profile=self.PROFILE,
+        )
+        assert self.ref_traces(fig)
+        assert not self.change_ref_traces(fig)
+
     def agent_trace(self, fig, what):
         return [tr for tr in fig.data if tr.name == f"Agent {what}"]
 

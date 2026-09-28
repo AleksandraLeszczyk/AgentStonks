@@ -146,6 +146,9 @@ class SymbolState:
         # sigma over the moves within +/-5 minutes (minutes past ET midnight ->
         # $; `minute_momentum.band`), drawn on the momentum panel.
         self.minute_momentum_profile: dict[int, float] | None = None
+        # The same band for the momentum change |m1 - m1[1]|, drawn on the
+        # momentum-change panel.
+        self.minute_momentum_change_profile: dict[int, float] | None = None
         # Ring buffer of (monotonic_timestamp, price) for every trade tick in the
         # last ~minute. Used by last_price alerts to check any price in the window,
         # not only the single most-recent tick.

@@ -60,6 +60,19 @@ class TestCompute:
         assert moves[571] == pytest.approx([0.10, 0.30])
         assert moves[572] == pytest.approx([0.20, 0.40])
 
+    def test_per_minute_deltas_are_the_momentum_change(self):
+        # Moves +0.10, +0.20, -0.30 -> momentum changes +0.10 (09:32), -0.50
+        # (09:33); a second session's 09:32 change is |-0.30 - 0.20| = 0.50.
+        history = (
+            bars(WEEK[0], [100.0, 100.1, 100.3, 100.0])
+            + bars(WEEK[1], [100.0, 100.2, 99.9])
+        )
+        deltas = compute(history, "2026-09-21")["per_minute_deltas"]
+        # The first move of a session has no momentum before it to change from.
+        assert deltas.keys() == {572, 573}
+        assert deltas[572] == pytest.approx([0.10, 0.50])
+        assert deltas[573] == pytest.approx([0.50])
+
     def test_band_is_mean_plus_one_sigma_of_the_pooled_moves(self):
         moves = {570 + m: [float(m), float(m) + 1.0] for m in range(10)}
         pooled = [3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 7.0, 8.0]  # 09:33-09:37
@@ -120,9 +133,9 @@ class TestOncePerDay:
 
     def test_a_file_without_the_profile_is_recomputed(self):
         first = load_or_compute("AAPL", today="2026-09-21")
-        del first["per_minute_moves"]
+        del first["per_minute_deltas"]
         minute_momentum._write_cached("AAPL", first)
-        assert "per_minute_moves" in load_or_compute("AAPL", today="2026-09-21")
+        assert "per_minute_deltas" in load_or_compute("AAPL", today="2026-09-21")
         assert len(self.fetches) == 2
 
     def test_a_new_day_computes_again(self):
@@ -140,8 +153,11 @@ class TestOncePerDay:
             symbol = "AAPL"
             abs_mean_minute_momentum = None
             minute_momentum_profile = None
+            minute_momentum_change_profile = None
 
         state = State()
         assert refresh(state) == pytest.approx(0.25)
         assert state.abs_mean_minute_momentum == pytest.approx(0.25)
         assert state.minute_momentum_profile == pytest.approx({571: 0.25})
+        # Two bars make one move and no change of it: nothing to band.
+        assert state.minute_momentum_change_profile is None
