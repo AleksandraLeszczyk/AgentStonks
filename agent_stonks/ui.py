@@ -2473,8 +2473,9 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
         )
         if running.get("config") is not None:
             st.caption(
-                "The running agent picks up a change to the buy or sell distance "
-                "at its next bar. Every other setting takes effect on ▶ Start."
+                "The running agent picks up a change to the model or to the buy or "
+                "sell distance at its next bar. Every other setting takes effect on "
+                "▶ Start."
             )
     # Published for the chart's buy/sell overlay, which is drawn from a
     # configuration rather than from a model and should show the one on screen,

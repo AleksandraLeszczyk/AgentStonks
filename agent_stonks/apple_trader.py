@@ -1166,6 +1166,12 @@ class DayRangeTrader(BaseTrader):
         # The last sidebar edit refused for its unit, so it is reported once
         # rather than every minute (`_adopt_form_levels`).
         self._refused_form = None
+        # The bundle of a model switched to from the sidebar mid-run
+        # (`_adopt_form_model`), used in place of the one the loop was started
+        # with. None while the run is still on the model it started on.
+        self._bundle: "dict | None" = None
+        # The last model switch refused, so it is reported once.
+        self._refused_model = None
         # The ticker's `abs_mean_minute_momentum`, read off its state each
         # cycle: what the momentum confirmation's neutral band is a share of.
         self.minute_move: "float | None" = None
@@ -1195,8 +1201,11 @@ class DayRangeTrader(BaseTrader):
         self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
 
         # Before anything reads the levels, so an edit made in the sidebar
-        # during the last minute is what this bar is judged against.
+        # during the last minute is what this bar is judged against. The model
+        # first: a switch brings its own pair of distances with it.
+        replanned = self._adopt_form_model(state, frame, today)
         self._adopt_form_levels(state, frame.index[-1])
+        bundle = self._bundle or bundle
 
         want = _dayrange().opening_minutes(bundle)
         if self.plan is None:
@@ -1248,7 +1257,9 @@ class DayRangeTrader(BaseTrader):
         # actually about to be measured against rather than last bar's. The
         # forecast moves first and the levels are then rebuilt from it at this
         # minute, which is also what re-reads a reference that follows the clock.
-        if fresh_bar and self.plan is not None:
+        # A forecast just re-made for a switched model is the 9:35 one and has
+        # not yet seen this bar, so it is moved even when the bar is not new.
+        if (fresh_bar or replanned) and self.plan is not None:
             # The high this bar is judged a breach of, recorded before the bar
             # is allowed to move it. Testing against the updated number would
             # be testing the bar against a level it had just pushed out of its
@@ -1332,13 +1343,16 @@ class DayRangeTrader(BaseTrader):
     # --- the forecast ------------------------------------------------------
 
     def _plan_session(
-        self, bundle: dict, state: AppState, frame, today, want: int
+        self, bundle: dict, state: AppState, frame, today, want: int,
+        switching: bool = False,
     ) -> bool:
         """Forecast the day and set the two levels. False if it cannot be done.
 
         Every failure here is fatal for the session rather than for the bar --
         a daily history that is too short at 9:35 is still too short at 14:00
-        -- so it is recorded in `self.blocked` and reported once.
+        -- so it is recorded in `self.blocked` and reported once. Except for a
+        model switched to mid-run (`switching`): the failure is raised, and the
+        run stays on the model it had (`_adopt_form_model`).
         """
         try:
             opening, tape = self._opening_window(state, frame, want)
@@ -1352,6 +1366,8 @@ class DayRangeTrader(BaseTrader):
                 secret=None if replayed else state.api_secret,
             )
         except Exception as exc:
+            if switching:
+                raise
             self.blocked = {"date": today, "reason": str(exc)}
             _log(
                 state,
@@ -1427,6 +1443,110 @@ class DayRangeTrader(BaseTrader):
         return shape
 
     # --- the sidebar, and the record the chart draws ------------------------
+
+    def _adopt_form_model(self, state: AppState, frame, today) -> bool:
+        """Switch to the model the sidebar now names, if it changed.
+
+        Returns True when the session's forecast was re-made, which `run_cycle`
+        needs to know: the new forecast is the new model's 9:35 one and has not
+        yet been moved by what the session has printed since.
+
+        The model is what the levels hang off, so a switch re-forecasts the day
+        with it -- from the same opening window -- and rebuilds both levels.
+        The distances come with it: the form re-seeds them with the new model's
+        tuned pair, so the old model's numbers under the new forecast would be
+        a pair nobody picked. So does the reference the model implies (the flat
+        high, or the intraday curve). Everything else stays, as for a distance
+        edit (`_adopt_form_levels`): the unit, the exits and the breach rules
+        still need ▶ Start, and a form in another unit is refused.
+
+        What the session has already decided carries over: an open position
+        keeps its fill and its stop, a stood-down session stays stood down, and
+        the chart's record keeps the old model's levels up to this minute (the
+        re-forecast continues it, as a restart does). A new model that cannot
+        forecast -- a missing file, a pairing it was never fitted on, a history
+        it cannot read -- is refused and logged once, and the run carries on
+        with the model it had.
+        """
+        form = getattr(state, "apple_trader_config", None)
+        config = self.config
+        if (
+            form is None
+            or (form.ticker or "").upper() != self.ticker.upper()
+            or form.model_key == config.model_key
+        ):
+            # Back on the run's own model: a later switch is news again.
+            self._refused_model = None
+            return False
+        ts = frame.index[-1]
+        new, bundle, refusal = None, None, None
+        if form.level_unit != config.level_unit:
+            refusal = (
+                f"its distances are counted in {form.unit_phrase} and this run counts in "
+                f"{config.unit_phrase}; a new unit needs ▶ Start"
+            )
+        else:
+            try:
+                new = replace(
+                    config, model_key=form.model_key, level_source=form.level_source,
+                    buy_k=float(form.buy_k), sell_k=float(form.sell_k),
+                )
+            except ValueError as exc:
+                refusal = str(exc)
+            else:
+                refusal = config_error(new)
+                if refusal is None:
+                    bundle = apple_models.load(new.model_key, self.ticker)
+                    if bundle is None:
+                        refusal = apple_models.unavailable_reason(new.model_key, self.ticker)
+
+        was, now = apple_models.get(config.model_key).label, apple_models.get(form.model_key).label
+        if refusal is None and self.plan is not None:
+            before = (float(self.plan["buy_level"]), float(self.plan["sell_level"]))
+            old = (self.config, self._bundle, self.plan)
+            kept = {k: self.plan[k] for k in ("stand_down",) if k in self.plan}
+            self.config, self._bundle = new, bundle
+            try:
+                self._plan_session(
+                    bundle, state, frame, today, _dayrange().opening_minutes(bundle),
+                    switching=True,
+                )
+            except Exception as exc:
+                self.config, self._bundle, self.plan = old
+                refusal = f"it cannot forecast today's {self.ticker} range: {exc}"
+            else:
+                self.plan.update(kept)
+
+        if refusal is not None:
+            if self._refused_model != form.model_key:
+                self._refused_model = form.model_key
+                _log(state, {"type": "error", "text": (
+                    f"The sidebar names {now}, but the run stays on {was}: {refusal}."
+                )})
+            return False
+
+        self._refused_model = None
+        text = (
+            f"{self.ticker} model switched from the sidebar at {pd.Timestamp(ts):%H:%M}: "
+            f"{was} → {now}, buy {config.buy_k:g} → {new.buy_k:g}, sell "
+            f"{config.sell_k:g} → {new.sell_k:g} × {new.unit_phrase}."
+        )
+        if self.plan is None:
+            # Before 9:35 there is nothing to re-make: the forecast will simply
+            # be the new model's. A model that could not forecast is not this
+            # one, so its refusal does not stand either.
+            self.config, self._bundle, self.blocked = new, bundle, None
+            _log(state, {"type": "analysis", "text": text})
+            return False
+        text += (
+            f" Re-forecast from the opening window: buy ${self.plan['buy_level']:,.2f} "
+            f"(was ${before[0]:,.2f}), sell ${self.plan['sell_level']:,.2f} "
+            f"(was ${before[1]:,.2f}), before this bar moves the range."
+        )
+        if self.entry is not None:
+            text += " The open position keeps its fill and its stop."
+        _log(state, {"type": "analysis", "text": text})
+        return True
 
     def _adopt_form_levels(self, state: AppState, ts) -> None:
         """Take the buy and sell distances the sidebar now holds, if they changed.
@@ -1504,7 +1624,8 @@ class DayRangeTrader(BaseTrader):
         bar the cycle read; a second write for the same bar replaces the first.
 
         `stop` is the position's own stop while long -- the number the log line
-        quotes -- and otherwise where it would sit under a fill at the buy.
+        quotes -- and None while flat: it is measured from the actual fill, so
+        before a buy there is no stop to draw.
         """
         plan = self.plan
         row = _levels_row(self.config, plan, ts)
@@ -2638,14 +2759,18 @@ class DayRangeTrader(BaseTrader):
 
 def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
     """One bar's levels off a plan: what `session_levels` walks and a live run
-    records (`DayRangeTrader._record_levels`), in the one shape the chart reads."""
-    buy = float(plan["buy_level"])
-    risk = stop_distance(config, stop_unit(config, plan))
+    records (`DayRangeTrader._record_levels`), in the one shape the chart reads.
+
+    `stop` is None: a stop hangs under the actual fill, so before a buy there
+    is none to draw. `_record_levels` fills it in while a position is open.
+    `model_key` is the model the levels hang off, which a run can switch
+    mid-session (`_adopt_form_model`)."""
     return {
         "t": ts,
-        "buy": buy,
+        "model_key": config.model_key,
+        "buy": float(plan["buy_level"]),
         "sell": float(plan["sell_level"]),
-        "stop": buy - risk if risk else None,
+        "stop": None,
         "reference": float(plan["reference"]),
         "pred_high": float(plan["pred_high"]),
         "pred_low": float(plan["pred_low"]),
@@ -2677,17 +2802,13 @@ def session_levels(
     minute bars and `opening_end` the last bar of the window the forecast was
     built on -- bars at or before it are skipped, exactly as the loop skips
     trading them. Returns one
-    `{"t", "buy", "sell", "stop", "reference", "pred_high", "pred_low"}` for
+    `{"t", "model_key", "buy", "sell", "stop", "reference", "pred_high", "pred_low"}` for
     `opening_end` itself -- the levels the forecast alone rests -- and then one
     per bar after that, in order, each holding the levels once that bar has
     been read. Empty while no bar has closed after the forecast.
 
-    `stop` is where the stop would sit under a fill *at* the buy level --
-    `stop_distance` read off the plan exactly as `_buy` reads it -- or None when
-    the configuration has no stop. A real fill prints at the close of the bar
-    that reached the level, so it can sit a little above the buy and take its
-    stop up with it; and once filled the stop is frozen in dollars (`_risk`)
-    while this line keeps following the levels.
+    `stop` is always None here: the stop hangs under the actual fill, and a
+    walk places no orders, so there is no fill for it to hang under.
 
     The forecast is in each row as well as the levels because the two must be
     drawn from the same walk: the levels hang off the predicted high, so a

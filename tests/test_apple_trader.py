@@ -2832,6 +2832,134 @@ class TestSidebarLevelEdits:
         assert len(rows) == len(before) + 1
 
 
+class TestSidebarModelSwitch:
+    """A running agent switches to the model the sidebar names, from its next
+    bar: it re-forecasts the day with that model and rests the new model's
+    levels, and the chart's record shows both, each for its own minutes."""
+
+    HIGHLOW = {"kind": "highlow", "opening_minutes": 5}
+
+    def _stub_highlow(self, monkeypatch, pred_high=120.0, fails=False):
+        original = at.session_forecast
+
+        def forecast(bundle, *args, **kwargs):
+            if bundle.get("kind") != "highlow":
+                return original(bundle, *args, **kwargs)
+            if fails:
+                raise RuntimeError("no SIP history")
+            return {**FORECAST, "pred_high": pred_high}, None
+
+        monkeypatch.setattr(at, "session_forecast", forecast)
+        monkeypatch.setattr(
+            at.apple_models, "load",
+            lambda key, ticker: self.HIGHLOW if key == "highlow" else DAYRANGE_BUNDLE,
+        )
+
+    def _started(self, state, monkeypatch, broker=None, close=108.0, **bar):
+        broker = broker or FakeBroker(close)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config())
+        state.apple_trader_config = trader.config
+        tape.append(close, **bar)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return trader, tracker, tape
+
+    def _switch(self, state, **kwargs):
+        kwargs.setdefault("buy_k", 0.5)
+        kwargs.setdefault("sell_k", 0.1)
+        state.apple_trader_config = replace(dayrange_config(**kwargs), model_key="highlow")
+
+    def test_a_switch_reforecasts_and_moves_the_levels_from_the_next_bar(
+        self, state, market_open, monkeypatch
+    ):
+        self._stub_highlow(monkeypatch)
+        trader, tracker, tape = self._started(state, monkeypatch)
+        self._switch(state)
+        tape.append(108.0)
+        # The loop still hands over the bundle it was started with.
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+        assert trader.config.model_key == "highlow"
+        assert (trader.config.buy_k, trader.config.sell_k) == (0.5, 0.1)
+        assert trader.plan["pred_high"] == pytest.approx(120.0)
+        assert trader.plan["buy_level"] == pytest.approx(120.0 - 5.0)
+        assert trader.plan["sell_level"] == pytest.approx(120.0 - 1.0)
+        rows = state.apple_trader_levels["rows"]
+        assert [r["model_key"] for r in rows] == ["dayrange", "dayrange", "highlow"]
+        assert [r["buy"] for r in rows] == pytest.approx([BUY_LEVEL, BUY_LEVEL, 115.0])
+        assert state.apple_trader_levels["config"].model_key == "highlow"
+        switched = [e["text"] for e in state.agent_log if "model switched" in e.get("text", "")]
+        assert len(switched) == 1 and "was $102.50" in switched[0]
+
+        # And it keeps trading on the new model: the forecast is not re-made.
+        tape.append(108.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert state.apple_trader_levels["rows"][-1]["buy"] == pytest.approx(115.0)
+
+    def test_an_open_position_keeps_its_fill_and_its_stop(
+        self, state, market_open, monkeypatch
+    ):
+        self._stub_highlow(monkeypatch)
+        broker = FakeBroker(103.0)
+        trader, tracker, tape = self._started(
+            state, monkeypatch, broker=broker, close=103.0, low=102.0
+        )
+        assert tracker.position_for(TICKER) > 0
+        entry = dict(trader.entry)
+        self._switch(state)
+        tape.append(104.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.entry["price"] == entry["price"]
+        assert trader._stop_price() == pytest.approx(103.0 - entry["risk"])
+        assert state.apple_trader_levels["rows"][-1]["stop"] == pytest.approx(
+            103.0 - entry["risk"]
+        )
+
+    def test_a_model_that_cannot_forecast_is_refused_once_and_the_run_carries_on(
+        self, state, market_open, monkeypatch
+    ):
+        self._stub_highlow(monkeypatch, fails=True)
+        trader, tracker, tape = self._started(state, monkeypatch)
+        self._switch(state)
+        for _ in range(3):
+            tape.append(108.0)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.config.model_key == "dayrange"
+        assert trader.blocked is None
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        refused = [e for e in state.agent_log if "run stays on" in e.get("text", "")]
+        assert len(refused) == 1 and "no SIP history" in refused[0]["text"]
+
+    def test_a_missing_model_file_is_refused(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._started(state, monkeypatch)
+        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker: None)
+        self._switch(state)
+        tape.append(108.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.config.model_key == "dayrange"
+        assert any("run stays on" in e.get("text", "") for e in state.agent_log)
+
+    def test_before_the_forecast_the_new_model_simply_makes_it(
+        self, state, market_open, monkeypatch
+    ):
+        self._stub_highlow(monkeypatch)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        tape = Tape(monkeypatch, minutes=3)
+        trader = at.DayRangeTrader(dayrange_config())
+        self._switch(state)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "warming_up"
+        assert trader.config.model_key == "highlow" and trader.plan is None
+        for i in (3, 4):
+            tape.append(101.0, offset=i)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["pred_high"] == pytest.approx(120.0)
+
+    def test_no_stop_is_recorded_before_a_buy(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._started(state, monkeypatch)
+        assert all(r["stop"] is None for r in state.apple_trader_levels["rows"])
+
+
 class TestReadsClosedBarsOnly:
     """Through the real `minute_frame`, not `Tape`'s stand-in: with a Finnhub
     buffer the newest row is the minute still trading, and the agent must act

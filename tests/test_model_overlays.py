@@ -553,26 +553,16 @@ class TestTraderLevelsOverlay:
                           "Sell level": pytest.approx(209.70)}
         assert not [i for i in items if i["kind"] == "band"]
 
-    def test_the_stop_is_drawn_under_the_buy_level(self, monkeypatch):
-        """Where the agent's stop would sit under a fill at the buy: half the
-        0.65 ADR the trade plays for, off the $3 ADR -- $0.975 under 207.75."""
-        items = self.items(monkeypatch, self.config(stop_gain_fraction=0.5))["items"]
-        stop = next(i for i in items if i["label"] == "Stop level")
-        assert stop["kind"] == "level"
-        assert stop["value"] == pytest.approx(207.75 - 0.5 * 0.65 * 3.0)
-        buy = next(i for i in items if i["label"] == "Buy level")
-        assert (stop["x0"], stop["x1"]) == (buy["x0"], buy["x1"])
+    def test_no_stop_is_drawn_before_a_buy(self, monkeypatch):
+        """The stop hangs under the actual fill, and a walk fills nothing --
+        whatever the stop is written in."""
+        for config in (self.config(stop_gain_fraction=0.5),
+                       self.config(stop_gain_fraction=0.0, stop_k=0.2)):
+            items = self.items(monkeypatch, config)["items"]
+            assert not [i for i in items if i["label"] == "Stop level"]
+            assert {i["label"] for i in items} == {"Buy level", "Sell level"}
 
-    def test_the_legacy_adr_stop_is_drawn_in_adrs(self, monkeypatch):
-        items = self.items(
-            monkeypatch, self.config(stop_gain_fraction=0.0, stop_k=0.2)
-        )["items"]
-        stop = next(i for i in items if i["label"] == "Stop level")
-        assert stop["value"] == pytest.approx(207.75 - 0.2 * 3.0)
-
-    def test_a_stop_follows_moving_levels(self, monkeypatch):
-        """Under a breach the buy moves, and the stop hangs off it -- drawn as
-        its own line, not a second tinted band."""
+    def test_moving_levels_carry_no_stop_either(self, monkeypatch):
         pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
@@ -581,13 +571,7 @@ class TestTraderLevelsOverlay:
             [mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[], session_date=SESSION,
             trader_config=self.config(breach_update="extreme", stop_gain_fraction=0.5),
         )["items"]
-        band = next(i for i in items if i["kind"] == "band")
-        path = next(i for i in items if i["kind"] == "path")
-        assert path["label"] == "Stop level"
-        assert path["t"] == band["t"]
-        risk = 0.5 * 0.65 * 3.0
-        assert path["values"][0] == pytest.approx(band["lower"][0] - risk)
-        assert path["values"][-1] == pytest.approx(band["lower"][-1] - risk)
+        assert [i["kind"] for i in items] == ["band"]
 
     def test_the_two_distances_are_the_configured_ones(self, monkeypatch):
         items = self.items(monkeypatch, self.config(buy_k=1.0, sell_k=0.5))["items"]
@@ -764,6 +748,42 @@ class TestRecordedTraderLevels:
         assert [(t.hour, t.minute) for t in stamps] == [(9, 34), (9, 35), (9, 36), (9, 37)]
         stop = next(i for i in items if i["kind"] == "path")
         assert stop["values"] == [206.0, 206.0, 204.5, 204.5]
+
+    def test_the_stop_is_drawn_only_while_a_position_was_open(self, monkeypatch):
+        """Flat until 09:35, long 09:35 to 09:36 under a $205.00 stop, flat
+        again: the stop line has gaps where there was no position."""
+        import math
+
+        history = self.history([207.0] * 4)
+        for row, stop in zip(history["rows"], [None, 205.0, 205.0, None]):
+            row["stop"] = stop
+        items = self.compute([mo.TRADER_LEVELS_KEY], history, monkeypatch)
+        stop = next(i for i in items if i["label"] == "Stop level")
+        assert stop["kind"] == "path" and stop["step"]
+        assert math.isnan(stop["values"][0]) and math.isnan(stop["values"][-1])
+        assert stop["values"][1:3] == [205.0, 205.0]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Buy level": 207.0, "Sell level": 209.0}
+
+    def test_a_flat_record_draws_no_stop(self, monkeypatch):
+        history = self.history([207.0] * 3)
+        for row in history["rows"]:
+            row["stop"] = None
+        items = self.compute([mo.TRADER_LEVELS_KEY], history, monkeypatch)
+        assert not [i for i in items if i["label"] == "Stop level"]
+
+    def test_a_switched_run_draws_each_range_only_for_its_own_minutes(self, monkeypatch):
+        """TimeToChange3 until 09:36, HighLow from then: HighLow's range
+        starts at the switch, not at the TimeToChange3 forecast."""
+        history = self.history([207.0] * 4, highs=[210.0, 210.0, 206.0, 206.0],
+                               model_key="highlow")
+        for row, model in zip(history["rows"], ["dayrange"] * 2 + ["highlow"] * 2):
+            row["model_key"] = model
+        items = self.compute([mo.HIGHLOW_RANGE_KEY], history, monkeypatch)
+        high = next(i for i in items if i["label"] == "Pred. high")
+        assert high["value"] == 206.0
+        stamp = pd.Timestamp(high["x0"]).tz_convert("America/New_York")
+        assert (stamp.hour, stamp.minute) == (9, 36)
 
     def test_levels_that_never_moved_are_still_two_flat_lines(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY], self.history([207.0] * 3), monkeypatch)

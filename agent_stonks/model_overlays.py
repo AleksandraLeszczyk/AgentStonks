@@ -431,6 +431,7 @@ def _path(key: str, label_: str, ts, values, color: str,
     it -- Apple Trader's stop follows its buy level, but the gap between the two
     is not a range anyone predicted, and tinting it would say it was. Clipped
     like a band, and shares its overlay's legend entry. `step` as for a band.
+    A None value is a gap: the line is not drawn there.
     """
     stamps = pd.DatetimeIndex(ts)
     if stamps.tz is None:
@@ -441,7 +442,7 @@ def _path(key: str, label_: str, ts, values, color: str,
         "label": label_,
         "group": OVERLAYS[key].label if key in OVERLAYS else key,
         "t": [stamp.isoformat() for stamp in stamps.tz_convert("UTC")],
-        "values": [float(v) for v in values],
+        "values": [float("nan") if v is None else float(v) for v in values],
         "color": color,
         "dash": dash,
         "note": note,
@@ -563,10 +564,14 @@ def compute(
     recorded = _recorded_levels(trader_history, symbol, day)
 
     def range_items(key: str, forecast) -> "tuple[list[dict], str]":
-        if recorded is not None and OVERLAYS[key].draws(recorded[1].model_key):
-            return _day_range_items(
-                _recorded_result(recorded[0]), day, symbol, key=key, walked=recorded[0]
-            )
+        # Only the minutes the run spent on this overlay's model: a run switched
+        # from one model to another mid-session drew each range for its part.
+        own = [] if recorded is None else [
+            row for row in recorded[0]
+            if OVERLAYS[key].draws(row.get("model_key") or recorded[1].model_key)
+        ]
+        if own and OVERLAYS[key].draws(recorded[1].model_key):
+            return _day_range_items(_recorded_result(own), day, symbol, key=key, walked=own)
         return _day_range_items(
             forecast(), day, symbol, session,
             open_price if key == DAY_RANGE_KEY else None, trader_config, key=key,
@@ -1028,14 +1033,15 @@ def _trader_levels_items(
            else "the intraday band's upper curve")
         + (" (HighLow)" if config.model_key == apple_models.HIGHLOW_KEY else "")
     )
-    stops = [row["stop"] for row in levels if row["stop"] is not None]
-    stop_color = MODEL_OVERLAY_COLORS["trader_stop"]
-    stop_note = (
-        f"Apple Trader's stop: the open position's own while it is long, otherwise "
-        f"{stop_phrase(config)} under a fill at the buy level"
-        if recorded else
-        f"Apple Trader's stop, {stop_phrase(config)} under a fill at the buy level "
-        "(a fill above the buy stops that much higher, and is then fixed in dollars)"
+    # Only while a position is open: the stop hangs under the actual fill, so
+    # before a buy there is none, and a walk (which fills nothing) never has one.
+    stops = [row.get("stop") for row in levels]
+    stop_path = (
+        [_path(TRADER_LEVELS_KEY, "Stop level", [row["t"] for row in levels], stops,
+               MODEL_OVERLAY_COLORS["trader_stop"], step=True,
+               note=f"Apple Trader's stop, {stop_phrase(config)} under the actual fill, "
+                    "while a position is open")]
+        if recorded and any(v is not None for v in stops) else []
     )
     moves = min(buys) != max(buys) or min(sells) != max(sells)
     if not moves:
@@ -1046,15 +1052,7 @@ def _trader_levels_items(
             _level(TRADER_LEVELS_KEY, "Sell level", sells[0], color, dash="dashdot",
                    note=f"Apple Trader's resting sell — {how}", x0=x0, x1=x1),
         ]
-        if stops:
-            items.append(_level(TRADER_LEVELS_KEY, "Stop level", stops[0], stop_color,
-                                dash="dot", note=stop_note, x0=x0, x1=x1))
-        return items, ""
-    stop_path = (
-        [_path(TRADER_LEVELS_KEY, "Stop level", [row["t"] for row in levels], stops,
-               stop_color, note=f"{stop_note}; it follows the buy level", step=True)]
-        if stops else []
-    )
+        return items + stop_path, ""
     return (
         [
             _band(
