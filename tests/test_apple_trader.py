@@ -2946,6 +2946,29 @@ class TestScaleIn:
         # Under the add's own fill, not the average cost, which is above it.
         assert trader._stop_price() == pytest.approx(self.RUNG_2 - self.RISK)
 
+    def test_an_add_must_close_under_the_last_fill(
+        self, state, market_open, monkeypatch
+    ):
+        """A first buy at $100.90 is already under the $101.25 rung. The next
+        bar reaches the rung but closes at $101.00, above the fill: no add.
+        One closing at $100.50 is lower, and adds."""
+        trader, tracker, tape = self._bought_once(state, monkeypatch, at_price=100.9)
+        first = tracker.position_for(TICKER)
+        assert self._cycle(trader, state, tracker, tape, 101.0) == "hold"
+        assert tracker.position_for(TICKER) == first
+        status = [e["text"] for e in state.agent_log if e.get("type") == "status"][-1]
+        assert "not under the $100.90 last fill" in status
+        assert self._cycle(trader, state, tracker, tape, 100.5) == "bought"
+        assert trader.entry["last_fill"] == pytest.approx(100.5)
+
+    def test_legacy_an_add_fills_at_any_price_on_the_rung(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(
+            state, monkeypatch, at_price=100.9, add_under_fill=False
+        )
+        assert self._cycle(trader, state, tracker, tape, 101.0) == "bought"
+
     def test_a_bar_through_the_fills_stop_sells_rather_than_adds(
         self, state, market_open, monkeypatch
     ):
@@ -3055,6 +3078,13 @@ class TestScaleIn:
         assert "stop@fill" not in config_signature(
             AppleTraderConfig(model_key="dayrange", stop_gain_fraction=0.0)
         )
+        assert "add<fill" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "add<fill" not in config_signature(
+            AppleTraderConfig(model_key="dayrange", add_under_fill=False)
+        )
+        assert "add<fill" not in config_signature(
+            AppleTraderConfig(model_key="dayrange", position_pct=100.0)
+        )
         assert "adds=half" not in config_signature(
             AppleTraderConfig(model_key="dayrange", position_pct=100.0)
         )
@@ -3073,6 +3103,7 @@ class TestScaleIn:
         old = _apple_from_record({"position_pct": 50.0, "scale_in": True})
         assert old.stop_under_next_buy is True
         assert "stop@fill" not in config_signature(old)
+        assert old.add_under_fill is False and "add<fill" not in config_signature(old)
 
 
 class TestMomentumReadTable:

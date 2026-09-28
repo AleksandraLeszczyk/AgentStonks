@@ -265,6 +265,13 @@ class AppleTraderConfig:
     # next rung, as it was 2026-09-23 to -28, kept only so a record made then
     # replays and signs exactly as it was run. See `_after_fill`.
     stop_under_next_buy: bool = False
+    # Whether an add must fill under the last fill: "buy again lower" taken
+    # literally. The rung is a forecast level, so a first buy the momentum
+    # confirmation held back until the price was already under the next rung
+    # would otherwise add on the very next bar at no better a price. True for
+    # every new config since 2026-09-28; False, what every record made before
+    # then replays as, adds on any bar that reaches the rung.
+    add_under_fill: bool = True
     # No buy -- first entry or add -- while the price has fallen more than this
     # many level units over the last `fall_bars` bars. The entry gate as it was
     # 2026-09-23 to -24, kept only so a stored record replays: a new config
@@ -666,6 +673,8 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # record from before it keeps the `adds=half` it was filed under.
     if c.can_scale_in and c.has_stop and not c.stop_under_next_buy:
         adds += ",stop@fill"
+    if c.can_scale_in and c.add_under_fill:
+        adds += ",add<fill"
     # Only while on, like every rule added since the notebook's. The look-back
     # rides along because it is not otherwise in the signature when the take
     # is off, and the same limit over 5 bars and over 30 is not one rule.
@@ -1276,6 +1285,8 @@ class DayRangeTrader(BaseTrader):
                 and self._can_add()
                 and float(last["low"]) <= self.plan["buy_level"]
             ):
+                if self._above_last_fill(state, last):
+                    return "hold"
                 if self._refuse_entry(state, frame, ts):
                     return "hold"
                 return "bought" if self._add(state, tracker, last, position) else "hold"
@@ -1649,6 +1660,34 @@ class DayRangeTrader(BaseTrader):
         """
         buy_k = float(self.config.buy_k)
         return 1.0 - (1.0 - buy_k) / 2 ** fills
+
+    def _above_last_fill(self, state: AppState, bar) -> bool:
+        """Whether this bar's add is refused for not being lower (`add_under_fill`).
+
+        The add fills at the close, so that is what has to be under the last
+        fill -- a bar that dipped to the rung and closed back above the price
+        already paid would buy more of the same position dearer, not lower.
+        Logged, because a rung touched and not bought otherwise looks like a
+        missed order. The next bar is judged again.
+        """
+        if not self.config.add_under_fill:
+            return False
+        close, fill = float(bar["close"]), float(self.entry["last_fill"])
+        if close < fill:
+            return False
+        _log(
+            state,
+            {
+                "type": "status",
+                "text": (
+                    f"The {bar.name:%H:%M} bar reached the ${self.plan['buy_level']:,.2f} "
+                    f"next buy, but closed at ${close:,.2f}, not under the "
+                    f"${fill:,.2f} last fill. Not buying again at no better a price; "
+                    "the next bar is judged again."
+                ),
+            },
+        )
+        return True
 
     def _can_add(self) -> bool:
         """Whether the open position may still be added to.

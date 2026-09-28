@@ -208,6 +208,10 @@ _APPLE_LEGACY = {
     # under the next rung rather than under the fill. True is that rule, and
     # such a record keeps the `adds=half` signature it was filed under.
     "stop_under_next_buy": True,
+    # And an add filled on any bar that reached the rung, even one closing at
+    # or above the last fill (before 2026-09-28). False is that rule, and it is
+    # left out of the signature.
+    "add_under_fill": False,
     # And an entry was never refused for the speed of the fall that reached the
     # buy level. 0 is that rule, and it is left out of the signature.
     "max_fall_k": 0.0,

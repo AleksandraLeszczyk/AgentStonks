@@ -582,7 +582,9 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # stop (half the predicted gain) and a fill at the buy level the first rung is
 # above it on most model/ticker pairs, but not on Day Range x Intraday Volatility
 # for AAPL (stop 0.075, rung 0.30 units down) or INTC (0.225 vs 0.25), and a fill
-# under the level leaves less room. Not swept.
+# under the level leaves less room. An add also has to close under the last
+# fill (since 2026-09-28), so a first buy made under the next rung is not
+# added to at once at no better a price. Not swept.
 # A SimLab record written before the setting existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_SCALE_IN = True

@@ -2386,6 +2386,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "distances are counted in. A buy at 0.40 becomes 0.70, then 0.85, 0.925…\n"
             "- The stop sits its usual distance under **the last actual fill**, so "
             "the next buy is placed only while it is above that stop.\n"
+            "- An add fills only on a bar that closes **under the last fill**, so "
+            "every buy is lower than the one before.\n"
             "- The target, the momentum take and the breakeven measure from the "
             "average cost.\n"
             "- Needs a position size under 100%."
