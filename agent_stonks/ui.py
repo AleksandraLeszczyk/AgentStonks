@@ -3031,11 +3031,6 @@ def _agent_panel(
             f"**Not {_venue_badge(state.trading_mode_requested)}.** This run is on "
             f"{_venue_badge(state.trading_mode)} instead — {state.trading_status}"
         )
-    elif state.trading_mode == "alpaca_live":
-        st.error(
-            "🔴 **LIVE** — orders are going to your real Alpaca account. "
-            f"{state.trading_status}"
-        )
     elif state.trading_mode == "alpaca_paper":
         st.info(
             f"📝 Orders routed to your Alpaca **paper** account. {state.trading_status}"
