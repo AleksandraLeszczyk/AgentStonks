@@ -1856,8 +1856,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         "scale_in": (
             "Adds to an open position on the way down while the cash left can pay for "
             "a share: each next buy rests half-way from the last one to the bottom of "
-            "the range (reference − 1 unit), and the stop sits under the next buy "
-            "until the last one.\n\n"
+            "the range (reference − 1 unit) — placed only while it is above the "
+            "stop, which sits under the last actual fill.\n\n"
             "- Needs a position size under 100%.\n"
             "- In the signature as `adds=half` while it can change a trade."
         ),

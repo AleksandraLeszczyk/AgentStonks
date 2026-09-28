@@ -575,10 +575,15 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # (reference - 1 unit: the predicted low under "pred_range", H - ADR under
 # "adr"), so with AAPL's 0.40 the ladder is 0.40, 0.70, 0.85, 0.925... units
 # under the reference -- each add half as far below the last, never past the
-# bottom. While cash can still pay for the next add the stop sits its usual
-# distance under that add rather than under the fill, because a stop above the
-# next rung would always fire first and no add would ever happen. Not swept. A
-# SimLab record written before the setting existed replays with it off
+# bottom. The stop sits its usual distance under the last actual fill (since
+# 2026-09-28; before that it sat under the next rung while an add was
+# affordable), so an add is placed only while its rung is above that stop -- a
+# bar that reaches a rung under the stop is stopped out first. At the default
+# stop (half the predicted gain) and a fill at the buy level the first rung is
+# above it on most model/ticker pairs, but not on Day Range x Intraday Volatility
+# for AAPL (stop 0.075, rung 0.30 units down) or INTC (0.225 vs 0.25), and a fill
+# under the level leaves less room. Not swept.
+# A SimLab record written before the setting existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_SCALE_IN = True
 # No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`), as it was

@@ -2870,7 +2870,9 @@ class TestScaleIn:
     Notebook arithmetic (H $110, ADR $10, buy 0.75): the first buy rests at
     $102.50 and the bottom of the range is $100.00, one ADR under H, so the
     ladder is $102.50 → $101.25 → $100.625, each rung half-way down what is
-    left. The stop is half the $6.50 predicted gain, $3.25.
+    left. The stop is half the $6.50 predicted gain, $3.25, under the last
+    actual fill -- so $99.25 under a fill at the buy level, and every rung here
+    is above it.
     """
 
     RISK = 0.5 * TARGET_GAIN  # 3.25
@@ -2902,10 +2904,30 @@ class TestScaleIn:
     ):
         trader, tracker, tape = self._bought_once(state, monkeypatch)
         assert trader.plan["buy_level"] == pytest.approx(self.RUNG_2)
-        # Under the next buy, not under the fill: the fill's own stop, $99.25,
-        # sits above $101.25 - nothing, so the price could never get there.
-        assert trader._stop_price() == pytest.approx(self.RUNG_2 - self.RISK)
+        assert trader._stop_price() == pytest.approx(BUY_LEVEL - self.RISK)
         assert any("Next buy at $101.25" in line for line in self._analysis(state))
+
+    def test_the_stop_hangs_under_the_actual_fill_not_the_buy_level(
+        self, state, market_open, monkeypatch
+    ):
+        """A fill under the level -- the price went on falling until the
+        momentum confirmed -- takes the stop down with it."""
+        trader, tracker, tape = self._bought_once(state, monkeypatch, at_price=101.5)
+        assert trader.entry["last_fill"] == pytest.approx(101.5)
+        assert trader._stop_price() == pytest.approx(101.5 - self.RISK)
+
+    def test_a_rung_at_or_under_the_stop_is_never_bought(
+        self, state, market_open, monkeypatch
+    ):
+        """A stop of 0.1 x the gain is $0.65 under the $102.50 fill, $101.85 --
+        above the $101.25 rung, so a bar reaching the rung stops out first."""
+        trader, tracker, tape = self._bought_once(
+            state, monkeypatch, stop_gain_fraction=0.1
+        )
+        assert trader._stop_price() == pytest.approx(BUY_LEVEL - 0.65)
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert "at or under the stop" in self._analysis(state)[-1]
+        assert self._cycle(trader, state, tracker, tape, 101.2) == "sold"
 
     def test_a_bar_that_reaches_the_next_rung_adds_to_the_position(
         self, state, market_open, monkeypatch
@@ -2921,21 +2943,38 @@ class TestScaleIn:
         average = (48 * BUY_LEVEL + 25 * self.RUNG_2) / 73
         assert trader.entry["price"] == pytest.approx(average)
         assert trader.plan["buy_level"] == pytest.approx(self.RUNG_3)
-        assert trader._stop_price() == pytest.approx(self.RUNG_3 - self.RISK)
+        # Under the add's own fill, not the average cost, which is above it.
+        assert trader._stop_price() == pytest.approx(self.RUNG_2 - self.RISK)
 
-    def test_the_bar_that_would_have_stopped_a_single_buy_adds_instead(
+    def test_a_bar_through_the_fills_stop_sells_rather_than_adds(
         self, state, market_open, monkeypatch
     ):
-        """$99.00 is through a single $102.50 buy's $99.25 stop. With the ladder
-        the stop sits under the next rung instead, so the bar adds at $101.25."""
+        """$99.00 is through the $102.50 fill's $99.25 stop: the stop is read
+        first, so the bar sells everything even though it passed the rung."""
         trader, tracker, tape = self._bought_once(state, monkeypatch)
+        assert self._cycle(trader, state, tracker, tape, 101.0, low=99.0) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "$99.25 stop" in reasoning and "$102.50 fill" in reasoning
+
+    def test_legacy_the_bar_that_would_have_stopped_a_single_buy_adds_instead(
+        self, state, market_open, monkeypatch
+    ):
+        """A record from 2026-09-23 to -28: the stop under the next rung, so
+        $99.00 is above it and the bar adds at $101.25."""
+        trader, tracker, tape = self._bought_once(
+            state, monkeypatch, stop_under_next_buy=True
+        )
+        assert trader._stop_price() == pytest.approx(self.RUNG_2 - self.RISK)
         assert self._cycle(trader, state, tracker, tape, 101.0, low=99.0) == "bought"
         assert tracker.position_for(TICKER) > 48
 
-    def test_a_bar_through_the_stop_under_the_next_rung_sells_everything(
+    def test_legacy_a_bar_through_the_stop_under_the_next_rung_sells_everything(
         self, state, market_open, monkeypatch
     ):
-        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        trader, tracker, tape = self._bought_once(
+            state, monkeypatch, stop_under_next_buy=True
+        )
         stop = self.RUNG_2 - self.RISK                                  # 98.00
         assert self._cycle(trader, state, tracker, tape, 97.5, low=97.9) == "sold"
         assert tracker.position_for(TICKER) == 0
@@ -3001,12 +3040,21 @@ class TestScaleIn:
         self._cycle(trader, state, tracker, tape, 102.0)
         row = state.apple_trader_levels["rows"][-1]
         assert row["buy"] == pytest.approx(self.RUNG_2)
-        assert row["stop"] == pytest.approx(self.RUNG_2 - self.RISK)
+        assert row["stop"] == pytest.approx(BUY_LEVEL - self.RISK)
         line = [x for x in self._analysis(state) if " · " in x][-1]
         assert f"buy ${row['buy']:,.2f}" in line and f"stop ${row['stop']:,.2f}" in line
 
     def test_signed_only_where_it_can_change_a_trade(self):
-        assert "adds=half" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "adds=half,stop@fill" in config_signature(
+            AppleTraderConfig(model_key="dayrange")
+        )
+        legacy = config_signature(
+            AppleTraderConfig(model_key="dayrange", stop_under_next_buy=True)
+        )
+        assert "adds=half" in legacy and "stop@fill" not in legacy
+        assert "stop@fill" not in config_signature(
+            AppleTraderConfig(model_key="dayrange", stop_gain_fraction=0.0)
+        )
         assert "adds=half" not in config_signature(
             AppleTraderConfig(model_key="dayrange", position_pct=100.0)
         )
@@ -3018,6 +3066,13 @@ class TestScaleIn:
         from simlab.rule_agents import _apple_from_record
 
         assert _apple_from_record({"position_pct": 50.0}).scale_in is False
+
+    def test_a_record_from_before_the_fill_stop_replays_under_the_rung(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({"position_pct": 50.0, "scale_in": True})
+        assert old.stop_under_next_buy is True
+        assert "stop@fill" not in config_signature(old)
 
 
 class TestMomentumReadTable:

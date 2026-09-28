@@ -204,6 +204,10 @@ _APPLE_LEGACY = {
     # bought until it had closed. False is that rule, and it is left out of the
     # signature.
     "scale_in": False,
+    # And while it existed without this key (2026-09-23 to -28) the stop sat
+    # under the next rung rather than under the fill. True is that rule, and
+    # such a record keeps the `adds=half` signature it was filed under.
+    "stop_under_next_buy": True,
     # And an entry was never refused for the speed of the fall that reached the
     # buy level. 0 is that rule, and it is left out of the signature.
     "max_fall_k": 0.0,
