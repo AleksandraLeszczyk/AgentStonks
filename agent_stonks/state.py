@@ -256,6 +256,8 @@ _DEFAULTS: dict[str, object] = {
     "starting_budget": PAPER_STARTING_CASH,
     "agent_start_time": None,
     "agent_equity_history": [],
+    "session_date": "",
+    "session_restored": None,
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
@@ -382,6 +384,12 @@ class AppState:
         self.starting_budget: float = PAPER_STARTING_CASH
         self.agent_start_time: "datetime | None" = None
         self.agent_equity_history: list[dict] = []
+        # The ET trading day the ledger above belongs to, and -- when it came
+        # back from disk after a restart -- a summary of what was restored
+        # (see agent_stonks.session_store). ▶ Start continues a ledger that is
+        # today's and on the same venue instead of opening a new one.
+        self.session_date: str = ""
+        self.session_restored: "dict | None" = None
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()
         self.agent_wake_reason: str | None = None

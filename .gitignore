@@ -229,3 +229,4 @@ tests/__pycache__/*
 data/simlab/
 data/highlow/
 data/minute_momentum/
+data/sessions/

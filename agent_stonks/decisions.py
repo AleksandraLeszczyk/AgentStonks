@@ -413,6 +413,21 @@ class DecisionTracker:
             self.positions = dict(snapshot["positions"])
         return True
 
+    def carry_over(self, prior: "DecisionTracker") -> None:
+        """Continue `prior`'s ledger on this tracker: its cash, positions and
+        every decision so far. ▶ Start does this within a trading day (see
+        agent_stonks.session_store) instead of opening a new ledger. `buys_halted`
+        is not carried -- a new run is what lifts it. On a real venue call
+        `sync_from_broker` afterwards: the account, not the copy, is the truth."""
+        with prior.lock:
+            cash = prior.cash
+            positions = dict(prior.positions)
+            decisions = list(prior.decisions)
+        with self.lock:
+            self.cash = cash
+            self.positions = positions
+            self.decisions = decisions
+
     def snapshot(self) -> dict:
         # Read outside the ledger lock: venue_value takes its own, and it must
         # not be possible to order the two differently anywhere.

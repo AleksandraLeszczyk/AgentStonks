@@ -2832,6 +2832,90 @@ class TestSidebarLevelEdits:
         assert len(rows) == len(before) + 1
 
 
+class TestRestartMemory:
+    """A restart the same day picks up what the earlier run knew and the ledger
+    does not: the open position's own fill and stop, and a stand-down."""
+
+    def _bought(self, state, monkeypatch):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config())
+        tape.append(103.0, low=102.0)             # touches 102.50: bought at 103
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        trader.publish_memory(state)
+        assert tracker.position_for(TICKER) > 0
+        return trader, tracker, tape
+
+    def test_the_published_memory_carries_the_entry(self, state, market_open, monkeypatch):
+        trader, _, _ = self._bought(state, monkeypatch)
+        memory = state.apple_trader_levels["memory"]
+        assert memory["entry"]["price"] == pytest.approx(103.0)
+        assert memory["entry"]["risk"] == trader.entry["risk"]
+        assert memory["stand_down"] is None
+
+    def test_a_restart_resumes_the_position_at_its_own_fill(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought(state, monkeypatch)
+        risk = trader.entry["risk"]
+
+        restarted = at.DayRangeTrader(dayrange_config())
+        tape.append(104.0)
+        restarted.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        # Not re-adopted at this bar's 104 close: the fill it was bought at.
+        assert restarted.entry["price"] == pytest.approx(103.0)
+        assert restarted.entry["risk"] == risk
+        assert state.apple_trader_levels["rows"][-1]["stop"] == pytest.approx(103.0 - risk)
+
+    def test_a_remembered_entry_is_dropped_when_the_ledger_is_flat(
+        self, state, market_open, monkeypatch
+    ):
+        _, _, tape = self._bought(state, monkeypatch)
+        fresh = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        restarted = at.DayRangeTrader(dayrange_config())
+        tape.append(104.0)
+        restarted.run_cycle(DAYRANGE_BUNDLE, state, fresh)
+        assert restarted.entry is None
+
+    def test_a_restart_keeps_the_sessions_stand_down(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._bought(state, monkeypatch)
+        trader.plan["stand_down"] = "stopped out"
+        trader.publish_memory(state)
+
+        restarted = at.DayRangeTrader(dayrange_config())
+        tape.append(104.0)
+        restarted.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert restarted.plan["stand_down"] == "stopped out"
+        assert any("still no new entries" in e.get("text", "") for e in state.agent_log)
+
+    def test_the_memory_survives_the_session_file(
+        self, state, market_open, monkeypatch, tmp_path
+    ):
+        """Through disk, as an app restart takes it: save, restore onto a new
+        state, continue the ledger, restart the trader."""
+        from agent_stonks import session_store
+
+        _, tracker, tape = self._bought(state, monkeypatch)
+        state.decision_tracker = tracker
+        session_store.claim(state)
+        assert session_store.save(state) is not None
+
+        restored = AppState()
+        restored.set_symbols([TICKER])
+        restored.api_key, restored.api_secret, restored.feed = "k", "s", "iex"
+        assert session_store.restore(restored) is not None
+        continued = DecisionTracker(starting_cash=0.0, broker=FakeBroker(104.0))
+        continued.carry_over(restored.decision_tracker)
+        assert continued.position_for(TICKER) == tracker.position_for(TICKER)
+
+        restarted = at.DayRangeTrader(dayrange_config())
+        tape.append(104.0)
+        restarted.run_cycle(DAYRANGE_BUNDLE, restored, continued)
+        assert restarted.entry["price"] == pytest.approx(103.0)
+        assert restarted.entry["ts"] == tape.index[-2]
+
+
 class TestSidebarModelSwitch:
     """A running agent switches to the model the sidebar names, from its next
     bar: it re-forecasts the day with that model and rests the new model's

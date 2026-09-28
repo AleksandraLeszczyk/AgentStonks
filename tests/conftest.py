@@ -47,3 +47,13 @@ def _no_live_bar_tiers(monkeypatch):
 
     monkeypatch.setattr(bar_history, "_yfinance_window", lambda *a, **k: [])
     monkeypatch.setattr(bar_history, "_fetch_recent_bars", lambda *a, **k: [])
+
+
+@pytest.fixture(autouse=True)
+def _session_files_in_tmp(monkeypatch, tmp_path):
+    """Keep `session_store`'s day files out of the real data/sessions/, and
+    start every test with no state owning a day."""
+    from agent_stonks import session_store
+
+    monkeypatch.setattr(session_store, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(session_store, "_owners", {})

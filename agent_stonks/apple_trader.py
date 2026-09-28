@@ -1404,6 +1404,8 @@ class DayRangeTrader(BaseTrader):
             # stays on the chart. This run's levels start at the bar it first
             # reads, not at 09:35 -- it rested nothing before it existed.
             self.plan["history"] = list(prior["rows"])
+            if not switching:
+                self._resume(state, prior.get("memory"))
         else:
             self._record_levels(state, opening.index[-1])
 
@@ -1644,7 +1646,58 @@ class DayRangeTrader(BaseTrader):
             "date": plan["date"],
             "config": self.config,
             "rows": history,
+            "memory": self.memory(),
         }
+
+    def memory(self) -> dict:
+        """What this run knows about the day that the ledger does not: the open
+        position's own record (its fill, stop, ladder, what a partial exit has
+        banked) and a session stand-down. Published beside the levels and saved
+        with the session (`session_store`), so a restart the same day picks the
+        position up where it was rather than re-adopting it at the last close,
+        and does not re-arm a session that had stood down."""
+        return {
+            "entry": dict(self.entry) if self.entry is not None else None,
+            "stand_down": (self.plan or {}).get("stand_down"),
+        }
+
+    def publish_memory(self, state: AppState) -> None:
+        """Refresh `memory` on the published levels after a cycle -- an order
+        placed after this cycle's levels were recorded would otherwise reach the
+        session file only a cycle later."""
+        levels = getattr(state, "apple_trader_levels", None)
+        if (
+            not levels
+            or self.plan is None
+            or levels.get("ticker") != self.ticker
+            or pd.Timestamp(levels.get("date")) != pd.Timestamp(self.plan["date"])
+        ):
+            return
+        state.apple_trader_levels = {**levels, "memory": self.memory()}
+
+    def _resume(self, state: AppState, memory: "dict | None") -> None:
+        """Take back what an earlier run today knew (`memory`), on a restart.
+
+        The entry is only a candidate: `run_cycle` drops it at once if the
+        ledger it continues is flat, and keeps it only while shares are held."""
+        if not memory:
+            return
+        stand_down = memory.get("stand_down")
+        if stand_down and not self.plan.get("stand_down"):
+            self.plan["stand_down"] = stand_down
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        f"{self.ticker}: continuing today's run, which had stood down "
+                        f"({stand_down}) — still no new entries today."
+                    ),
+                },
+            )
+        entry = memory.get("entry")
+        if entry and self.entry is None:
+            self.entry = dict(entry)
 
     # --- the levels, and the forecast they hang off ------------------------
 
@@ -2974,10 +3027,16 @@ def _apple_trader_loop(
 
     trader = build_trader(config, bundle)
     _log(state, {"type": "status", "text": _armed_summary(config, model, bundle)})
+
+    def cycle() -> str:
+        outcome = trader.run_cycle(bundle, state, tracker)
+        publish = getattr(trader, "publish_memory", None)
+        if publish is not None:
+            publish(state)
+        return outcome
+
     rule_agent.run_loop(
-        state, tracker,
-        lambda: trader.run_cycle(bundle, state, tracker),
-        stop_event, cycle_sec, "Apple Trader",
+        state, tracker, cycle, stop_event, cycle_sec, "Apple Trader",
     )
 
 

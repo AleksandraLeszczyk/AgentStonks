@@ -1,5 +1,6 @@
 import base64
 import html
+import logging
 import os
 import re
 import threading
@@ -19,6 +20,7 @@ from . import (
     market_hours,
     model_overlays,
     momentum_regime,
+    session_store,
 )
 from . import apple_trader_ui
 from .model_catalogue_ui import model_catalogue_panel
@@ -120,6 +122,7 @@ from .state import (
     PRICE_AXIS_ALERT_FIELDS,
     AppState,
     SymbolState,
+    append_agent_log,
     format_alert,
     format_tool_kv,
     momentum_pct,
@@ -237,8 +240,17 @@ def _get_state() -> AppState:
     # has gone for good (see stream.reap_dead_sessions).
     reap_dead_sessions(_session_is_active)
     if "app_state" not in st.session_state:
-        st.session_state["app_state"] = AppState()
+        fresh = AppState()
+        # Today's session as it was saved before a restart (or in another tab):
+        # the ledger, the log and the levels come back; the agent stays stopped
+        # until ▶ Start, which continues them.
+        try:
+            session_store.restore(fresh)
+        except Exception:
+            logging.getLogger(__name__).exception("Restoring today's saved session failed")
+        st.session_state["app_state"] = fresh
     state = st.session_state["app_state"]
+    session_store.start_autosave(state)
     # Streamlit's dev-mode autoreload reruns this script on every save but keeps
     # the same AppState instance alive in session_state. If a field was added to
     # AppState after this instance was constructed, the instance's __class__ (and
@@ -2466,11 +2478,15 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
 def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     """Apple Trader's instrument and tunables, inside the dashboard's expander."""
     state = _get_state()
-    running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
+    levels = getattr(state, "apple_trader_levels", None) or {}
+    running = levels if state.agent_running else {}
+    # After a restart the form reopens on the restored run's buy and sell, so
+    # the ▶ Start that continues it does not quietly move them.
+    seed = running.get("config") or (
+        levels.get("config") if getattr(state, "session_restored", None) else None
+    )
     with st.expander("Apple Trader rules", expanded=True):
-        config = apple_trader_ui.params(
-            symbols, _APPLE_TRADER_COPY, seed=running.get("config")
-        )
+        config = apple_trader_ui.params(symbols, _APPLE_TRADER_COPY, seed=seed)
         if running.get("config") is not None:
             st.caption(
                 "The running agent picks up a change to the model or to the buy or "
@@ -2710,6 +2726,25 @@ def _agent_panel(
         "sound after you interact with the page, which starting the agent satisfies.",
     )
 
+    # A ledger from earlier today -- this run's, or one restored after a restart
+    # -- is carried on by ▶ Start unless this is unticked.
+    continue_today = True
+    if (
+        state.decision_tracker is not None
+        and getattr(state, "session_date", "") == session_store.session_date()
+    ):
+        kept = len(state.decision_tracker.decisions)
+        continue_today = st.checkbox(
+            f"Continue today's session ({kept} decision{'s' if kept != 1 else ''} so far)",
+            value=True,
+            key="agent_continue_today",
+            help="▶ Start carries on today's ledger — cash, positions and every "
+            "decision — with the agent log, the equity curve and Apple Trader's "
+            "levels, an open position and a stand-down. Unticked, Start opens a "
+            "fresh ledger on the starting budget; today's saved session is kept "
+            "beside it in data/sessions/ rather than overwritten. A different "
+            "venue always starts fresh.",
+        )
     c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.3])
     starting_budget = c1.number_input(
         "Starting budget ($)",
@@ -2803,6 +2838,9 @@ def _agent_panel(
             live_broker, effective_mode, broker_message = resolve_broker(
                 trading_mode_choice
             )
+            # Read before `trading_mode` becomes the new venue: a ledger is only
+            # continued on the venue it was kept on.
+            continuing = continue_today and session_store.continues(state, effective_mode)
             state.trading_mode = effective_mode
             state.trading_mode_requested = trading_mode_choice
             state.trading_status = broker_message
@@ -2812,14 +2850,31 @@ def _agent_panel(
             if effective_mode == trading_mode_choice == "local":
                 st.success(broker_message)
 
-            state.starting_budget = starting_budget
-            state.decision_tracker = DecisionTracker(
+            # Today's ledger goes on (session_store): a restart or a Stop is not
+            # the end of the trading day.
+            prior = state.decision_tracker
+            tracker = DecisionTracker(
                 starting_cash=starting_budget,
                 broker=live_broker,
                 # A real venue applies its own costs inside the cash it reports;
                 # the modelled per-trade cost belongs to the simulation only.
                 trade_cost=TRADE_FIXED_COST if effective_mode == "local" else 0.0,
             )
+            if continuing:
+                tracker.carry_over(prior)
+            else:
+                # Starting over must not destroy what the day already did.
+                session_store.archive()
+                state.starting_budget = starting_budget
+                levels = getattr(state, "apple_trader_levels", None)
+                if levels:
+                    # The rows stay on the chart; a fresh ledger has no position
+                    # and no stand-down to resume.
+                    state.apple_trader_levels = {**levels, "memory": None}
+            state.decision_tracker = tracker
+            state.session_date = session_store.session_date()
+            state.session_restored = None
+            session_store.claim(state)
             if effective_mode != "local":
                 # Open on the account's real balance and holdings rather than a
                 # configured budget, and surface a position the app did not open
@@ -2830,12 +2885,14 @@ def _agent_panel(
                     # is the account's *value*, not its cash. On an account that
                     # already holds something, cash is only part of what it is
                     # worth, and using it would report a return the moment the
-                    # agent did nothing at all.
-                    state.starting_budget = (
-                        snap["venue_value"]
-                        if snap.get("venue_value") is not None
-                        else snap["cash"]
-                    )
+                    # agent did nothing at all. A continued day keeps the
+                    # baseline it opened on.
+                    if not continuing:
+                        state.starting_budget = (
+                            snap["venue_value"]
+                            if snap.get("venue_value") is not None
+                            else snap["cash"]
+                        )
                     held = {s: q for s, q in snap["positions"].items() if q}
                     if held:
                         st.info(
@@ -2848,9 +2905,31 @@ def _agent_panel(
                         "Could not read the account balance; the ledger starts from "
                         "the configured budget and will reconcile on the first order."
                     )
-            state.agent_log = []
-            state.agent_start_time = datetime.now(tz=timezone.utc)
-            state.agent_equity_history = []
+            if continuing:
+                snap = state.decision_tracker.snapshot()
+                held = {s: q for s, q in snap["positions"].items() if q}
+                append_agent_log(
+                    state,
+                    {
+                        "type": "status",
+                        "text": (
+                            f"Continuing today's session: {len(snap['decisions'])} "
+                            f"decisions so far, cash ${snap['cash']:,.2f}, "
+                            + (
+                                "holding " + ", ".join(f"{s} {q:g}" for s, q in held.items())
+                                if held
+                                else "flat"
+                            )
+                            + "."
+                        ),
+                    },
+                )
+                if state.agent_start_time is None:
+                    state.agent_start_time = datetime.now(tz=timezone.utc)
+            else:
+                state.agent_log = []
+                state.agent_start_time = datetime.now(tz=timezone.utc)
+                state.agent_equity_history = []
             if is_apple_trader:
                 launch_apple_trader(
                     state,
@@ -2926,6 +3005,20 @@ def _agent_panel(
     else:
         venue = " · no venue resolved yet — press ▶ Start"
     st.caption(f"Status: {status}{venue}{watching}")
+    restored = getattr(state, "session_restored", None)
+    if restored and not state.agent_running:
+        held = restored.get("positions") or {}
+        saved = str(restored.get("saved_at") or "")
+        try:
+            saved = pd.Timestamp(saved).tz_convert(market_hours.MARKET_TZ).strftime("%H:%M:%S ET")
+        except (ValueError, TypeError):
+            pass
+        st.info(
+            f"Restored today's session ({restored['date']}, saved {saved}): "
+            f"{restored['decisions']} decisions, {restored['fills']} fills, "
+            + ("holding " + ", ".join(f"{s} {q:g}" for s, q in held.items()) if held else "flat")
+            + ". ▶ Start continues it."
+        )
     _trade_sound_fragment()
 
     # A run that did not get the venue it asked for. This is the whole reason
