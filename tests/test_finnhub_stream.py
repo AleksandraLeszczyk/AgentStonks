@@ -89,7 +89,7 @@ class TestCandleBuilder:
 
         assert list(state.bars) == [
             {"t": "2024-01-01T14:00:00Z", "o": 10.0, "h": 10.0, "l": 10.0,
-             "c": 10.0, "v": 50.0, "vw": 10.0, "n": 1}
+             "c": 10.0, "v": 50.0, "vw": 10.0, "n": 1, "src": "finnhub"}
         ]
 
     def test_later_trades_in_the_same_minute_extend_the_open_bar(self):

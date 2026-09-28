@@ -38,6 +38,7 @@ the streamed half. It matters on the Alpaca IEX stream too, just in the other
 direction: there the *history* becomes the odd one out instead.
 """
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -53,7 +54,7 @@ from .config import (
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars, fetch_intraday_bars_window
 from .market_hours import MARKET_CLOSE, MARKET_OPEN, MARKET_TZ
-from .rest import KEEP_NEWEST, fetch_bars, fetch_bars_window, fetch_daily_bars
+from .rest import KEEP_NEWEST, fetch_bars, fetch_bars_range, fetch_bars_window, fetch_daily_bars
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,24 @@ logger = logging.getLogger(__name__)
 YF_INTERVALS: dict[str, str] = {
     "1Min": "1m", "5Min": "5m", "15Min": "15m", "30Min": "30m", "1Hour": "60m",
 }
+
+# The tape each buffered bar came off, stored on the bar as `bar["src"]` so a
+# reader that compares volumes (the volume panel's band) can compare like with
+# like: one of "yfinance", "sip", "iex" or "finnhub". Keyed by the feed names
+# REST sources go by; delayed SIP is the same tape as SIP.
+BAR_SOURCE_OF_FEED: dict[str, str] = {
+    "sip": "sip",
+    "sip_delayed": "sip",
+    "iex": "iex",
+    "yfinance": "yfinance",
+}
+
+
+def tag_source(bars: "list[dict]", src: str) -> "list[dict]":
+    """`bars` with `src` recorded on each (copies; the inputs are not touched,
+    since fetchers cache the lists they return)."""
+    return [{**bar, "src": src} for bar in bars]
+
 
 SOURCE_LABELS: dict[str, str] = {
     "sip": "Alpaca REST (SIP, consolidated)",
@@ -459,6 +478,12 @@ def fetch_live_bars(
         base, base_label, base_failures = [], "", []
     failures.extend(base_failures)
     base_is_iex = base_label == SOURCE_LABELS["iex"]
+    base_src = next(
+        (BAR_SOURCE_OF_FEED[f] for f, label in SOURCE_LABELS.items() if label == base_label),
+        None,
+    )
+    if base_src:
+        base = tag_source(base, base_src)
     kept = 0
     for bar in base:
         if "t" in bar and clock.parse_iso_strict(bar["t"]) < settled_cut:
@@ -480,7 +505,7 @@ def fetch_live_bars(
             failures.append((SOURCE_LABELS["yfinance"], exc))
             yf_bars = []
         replaced = 0
-        for bar in yf_bars:
+        for bar in tag_source(yf_bars, "yfinance"):
             if "t" in bar and _in_regular_session(bar["t"]):
                 k = bar_key(bar["t"])
                 by_key[k] = bar
@@ -501,7 +526,7 @@ def fetch_live_bars(
             failures.append((SOURCE_LABELS[recent_feed], exc))
             recent = []
         added = 0
-        for bar in recent:
+        for bar in tag_source(recent, recent_feed):
             if "t" not in bar:
                 continue
             k = bar_key(bar["t"])
@@ -530,3 +555,57 @@ def fetch_live_bars(
         source=" + ".join(sources) or "no bars",
         failures=failures,
     )
+
+
+# -- a trading week of one-minute history per Alpaca feed ----------------------
+#
+# The volume band compares each bar against the same tape's history, so it needs
+# a week of minutes off whichever Alpaca feed a bar came from -- not just the
+# session's resolved one. Prior sessions do not change during a day, so each
+# (symbol, feed) is fetched once per ET day and kept in memory; a failure is
+# remembered for `_WEEK_RETRY_SEC` so a chart polling every few seconds does not
+# turn a refused feed into a request per rerun.
+_WEEK_RETRY_SEC = 300.0
+_week_minute_cache: "dict[tuple[str, str], tuple[str, float, list[dict] | None]]" = {}
+_week_minute_lock = threading.Lock()
+
+
+def fetch_week_minute_bars(
+    symbol: str, feed: str, key: str, secret: str, days: int, now: "datetime | None" = None
+) -> "list[dict]":
+    """The last `days` calendar days of one-minute bars off Alpaca `feed`
+    ("sip" or "iex"), pre- and post-market included, oldest first.
+
+    Ends SIP_DELAY_MIN before now, which a delayed-SIP key is allowed and a
+    prior-sessions reader loses nothing by. Returns [] when the feed refuses
+    (no key, or no SIP on this plan).
+    """
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(MARKET_TZ).strftime("%Y-%m-%d")
+    cache_key = (symbol.upper(), feed)
+    with _week_minute_lock:
+        hit = _week_minute_cache.get(cache_key)
+    if hit is not None and hit[0] == today:
+        if hit[2] is not None:
+            return hit[2]
+        if time.monotonic() - hit[1] < _WEEK_RETRY_SEC:
+            return []
+    if not (key and secret):
+        return []
+    end = now - timedelta(minutes=SIP_DELAY_MIN)
+    try:
+        bars = fetch_bars_range(symbol, "1Min", end - timedelta(days=days), end, key, secret, feed)
+    except Exception as exc:
+        log_fetch_failure(
+            "week of minute bars", [(SOURCE_LABELS.get(feed, feed), exc)],
+            symbol=symbol, consequence="no volume band for this feed's bars",
+        )
+        bars = None
+    else:
+        log_fetch(
+            "week of minute bars", SOURCE_LABELS.get(feed, feed), symbol=symbol,
+            detail=f"{len(bars)} 1Min bars over {days} days",
+        )
+    with _week_minute_lock:
+        _week_minute_cache[cache_key] = (today, time.monotonic(), bars)
+    return bars or []

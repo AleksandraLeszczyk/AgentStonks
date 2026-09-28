@@ -35,7 +35,7 @@ def test_fallback_bars_loop_updates_state_from_rest_when_disconnected(monkeypatc
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(1))
 
-    assert list(state.bars) == bars
+    assert list(state.bars) == [{**b, "src": "sip"} for b in bars]  # answered as SIP, first in auto's order
     assert state.last_price == 1.6
     assert state.previous_minute_high == 2
     assert state.previous_minute_low == 0.5
@@ -60,8 +60,8 @@ def test_fallback_bars_loop_polls_every_symbol(monkeypatch):
     stream._fallback_bars_loop(["AAPL", "TSLA"], "k", "s", "iex", app, "1Min", _StopAfter(1))
 
     assert polled == ["AAPL", "TSLA"]
-    assert list(app.sym("AAPL").bars) == bars
-    assert list(app.sym("TSLA").bars) == bars
+    assert list(app.sym("AAPL").bars) == [{**b, "src": "sip"} for b in bars]
+    assert list(app.sym("TSLA").bars) == [{**b, "src": "sip"} for b in bars]
 
 
 def test_fallback_bars_loop_refreshes_quote_when_disconnected(monkeypatch):
@@ -130,7 +130,7 @@ def test_fallback_bars_loop_backfills_instead_of_polling_when_stream_connected(m
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(2))
 
-    assert list(state.bars) == [live_bar, missed_bar]  # hole filled, live bar untouched
+    assert list(state.bars) == [live_bar, {**missed_bar, "src": "sip"}]  # hole filled, live bar untouched
     assert app.status == "✅ Streaming AAPL (IEX)"  # no fallback warning
     assert state.last_price is None  # snapshot-replace path did not run
 
@@ -148,7 +148,7 @@ def test_fallback_bars_loop_falls_back_to_yfinance_when_rest_fails(monkeypatch):
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(1))
 
-    assert list(state.bars) == bars
+    assert list(state.bars) == [{**b, "src": "yfinance"} for b in bars]
     assert "yfinance" in app.status
 
 

@@ -849,6 +849,76 @@ def _bar_minutes(times: "pd.Series") -> int:
     return max(minutes, 1)
 
 
+# How the volume band names the history a bar is compared against.
+_VOLUME_BAND_SOURCE_NAMES = {"sip": "SIP", "iex": "IEX", "yfinance": "yfinance"}
+
+
+def _add_volume_band(df: "pd.DataFrame", fig: go.Figure, baseline: dict, row: int) -> None:
+    """The mean + 1 sigma volume band (`volume_baseline.volume_band`) as a dark
+    fill behind the volume bars -- the same backdrop the momentum panels use.
+
+    Per bar, from the band of *that bar's* source (`src`): a buffer mixes
+    yfinance, SIP, IEX and streamed bars, and IEX volume is ~4% of the others,
+    so each is read against its own tape's week. A bar with no recorded source,
+    or a bucket the week never traded, is a gap. A gap-filled placeholder takes
+    the source of the bar before it.
+
+    The band was built for `baseline["span"]`-minute buckets; on a chart whose
+    bars are another width it would be the wrong scale, so nothing is drawn.
+    """
+    by_source = baseline.get("band_by_source") or {}
+    if not by_source or "src" not in df.columns:
+        return
+    span = _bar_minutes(df["t"])
+    if span != baseline.get("span"):
+        return
+    et = df["t"].dt.tz_convert(market_hours.MARKET_TZ)
+    minutes = et.dt.hour * 60 + et.dt.minute
+    sources = df["src"].ffill()
+    levels = []
+    names = []
+    for minute, src in zip(minutes, sources):
+        band = by_source.get(src) if isinstance(src, str) else None
+        level = (band or {}).get("per_minute", {}).get(int(minute))
+        levels.append(float("nan") if level is None else level)
+        history = _VOLUME_BAND_SOURCE_NAMES.get((band or {}).get("history"), "")
+        names.append(history if src != "finnhub" else f"{history} (Finnhub bar)")
+    if all(v != v for v in levels):
+        return
+    sessions = max((b.get("sessions") or 0) for b in by_source.values())
+    fig.add_trace(
+        go.Scatter(
+            x=df["t"],
+            y=levels,
+            customdata=names,
+            mode="lines",
+            line=dict(width=0),
+            fill="tozeroy",
+            fillcolor=MINUTE_MOVE_BAND,
+            zorder=-1,
+            connectgaps=False,
+            name="Volume band",
+            showlegend=False,
+            hovertemplate=(
+                "<b>Usual volume, mean + 1\u03c3</b> \u2014 %{customdata}, "
+                f"last {sessions} sessions<br>%{{y:,.0f}}<extra></extra>"
+            ),
+        ),
+        row=row,
+        col=1,
+    )
+    fig.add_annotation(
+        xref="x domain", yref="y domain", x=1.0, y=1.0,
+        text=f"usual volume mean + 1\u03c3 \u00b7 last {sessions} sessions \u00b7 bar's own source",
+        showarrow=False,
+        xanchor="right",
+        yanchor="top",
+        font=dict(size=9, color=PALETTE["muted"]),
+        row=row,
+        col=1,
+    )
+
+
 def _add_volume_baseline(
     df: "pd.DataFrame", fig: go.Figure, baseline: Optional[dict], row: int
 ) -> None:
@@ -861,6 +931,9 @@ def _add_volume_baseline(
     are, so the reference never widens the x axis past the live session.
     """
     if not baseline:
+        return
+    if "band_by_source" in baseline:
+        _add_volume_band(df, fig, baseline, row)
         return
     span = _bar_minutes(df["t"])
     label = baseline.get("label", "Average")

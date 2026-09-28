@@ -756,6 +756,84 @@ class TestMomentumPanel:
         assert not self.agent_trace(fig, "momentum change")
 
 
+class TestVolumeBand:
+    """The per-source mean + 1 sigma band behind the volume bars."""
+
+    MINUTE = 9 * 60  # BARS sit at 09:00-09:02 ET
+
+    def band(self, level: float, history: str = "sip") -> dict:
+        return {"per_minute": {self.MINUTE + i: level for i in range(3)}, "sessions": 5,
+                "dates": [], "history": history}
+
+    def baseline(self, span: int = 1, **by_source) -> dict:
+        return {"key": "week_band", "label": "x", "span": span, "band_by_source": by_source}
+
+    def tagged(self, *sources):
+        return [{**b, "src": s} for b, s in zip(BARS, sources)]
+
+    def trace(self, fig):
+        return [t for t in fig.data if t.name == "Volume band"]
+
+    def test_each_bar_reads_its_own_sources_band(self):
+        fig = build_chart(
+            self.tagged("sip", "iex", "sip"), [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(sip=self.band(9000.0), iex=self.band(300.0, "iex")),
+        )
+        (band,) = self.trace(fig)
+        assert list(band.y) == [9000.0, 300.0, 9000.0]
+        assert list(band.customdata) == ["SIP", "IEX", "SIP"]
+        assert band.fill == "tozeroy"
+        assert band.zorder < 0  # behind the volume bars
+        # Instead of, not as well as, the mean line and shape.
+        assert not [t for t in fig.data if (t.name or "").startswith(("Mean volume", "Avg volume"))]
+
+    def test_a_finnhub_bar_names_the_history_it_is_read_against(self):
+        fig = build_chart(
+            self.tagged("finnhub", "finnhub", "finnhub"), [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(finnhub=self.band(9000.0)),
+        )
+        (band,) = self.trace(fig)
+        assert band.customdata[0] == "SIP (Finnhub bar)"
+
+    def test_a_source_without_a_band_is_a_gap(self):
+        fig = build_chart(
+            self.tagged("sip", "iex", "sip"), [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(sip=self.band(9000.0)),
+        )
+        (band,) = self.trace(fig)
+        assert np.isnan(band.y[1])
+
+    def test_untagged_bars_get_no_band(self):
+        fig = build_chart(
+            BARS, [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(sip=self.band(9000.0)),
+        )
+        assert not self.trace(fig)
+
+    def test_a_band_for_another_bar_width_is_not_drawn(self):
+        fig = build_chart(
+            self.tagged("sip", "sip", "sip"), [], [], "AAPL", SESSION_START,
+            volume_baseline=self.baseline(span=5, sip=self.band(9000.0)),
+        )
+        assert not self.trace(fig)
+
+    def test_a_gap_filled_minute_takes_the_source_before_it(self):
+        bars = [
+            {**BARS[0], "src": "sip"},
+            {**BARS[1], "src": "iex"},
+            {**BARS[2], "t": "2024-01-15T14:03:00Z", "src": "sip"},  # 09:02 missing
+        ]
+        levels = {"per_minute": {self.MINUTE + i: 300.0 + i for i in range(4)}, "sessions": 5,
+                  "dates": [], "history": "iex"}
+        fig = build_chart(
+            bars, [], [], "AAPL", SESSION_START, fill_gaps=True,
+            volume_baseline=self.baseline(sip=self.band(9000.0), iex=levels),
+        )
+        (band,) = self.trace(fig)
+        # 09:03 has no SIP level in `band` (it covers 09:00-09:02): a gap.
+        assert list(band.y[:3]) == [9000.0, 301.0, 302.0]
+
+
 class TestVolumeBaseline:
     """The "usual volume" references drawn under the live volume bars."""
 

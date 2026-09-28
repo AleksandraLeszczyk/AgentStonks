@@ -159,10 +159,12 @@ from .technical_analysis import (
     get_put_call_walls_and_gamma,
 )
 from .volume_baseline import (
+    BAND_WINDOWS,
     DEFAULT_VOLUME_BASELINE,
     VOLUME_BASELINE_WINDOWS,
     lookback_days,
     minute_volume_baseline,
+    volume_band,
 )
 
 
@@ -180,9 +182,111 @@ def _volume_baseline(symbol: str, bars: "list[dict]", state: AppState) -> "dict 
     window = state.volume_baseline_window
     if window not in VOLUME_BASELINE_WINDOWS or window == "off":
         return None
+    if window in BAND_WINDOWS:
+        return _volume_band_baseline(symbol, bars, state, window)
     days = lookback_days(window)
     history = fetch_intraday_history_bars(symbol, days) if days else []
     return minute_volume_baseline(window, bars, history)
+
+
+# Which history each bar source's band is built from, best first. Finnhub has
+# no minute history of its own; it streams the consolidated tape, so its bars
+# are read against SIP, or yfinance's rendering of the same tape without SIP.
+_BAND_HISTORY_FOR_SOURCE: dict[str, tuple[str, ...]] = {
+    "yfinance": ("yfinance",),
+    "sip": ("sip",),
+    "iex": ("iex",),
+    "finnhub": ("sip", "yfinance"),
+}
+
+
+def _volume_band_baseline(
+    symbol: str, bars: "list[dict]", state: AppState, window: str
+) -> "dict | None":
+    """The mean + 1 sigma volume band, one per tape the chart's bars came off.
+
+    Each bar carries its source (`bar["src"]`, see
+    `bar_history.BAR_SOURCE_OF_FEED`), and the band behind it is built from
+    that source's own last trading week: IEX is ~4% of SIP, so one band for a
+    buffer mixing the two would be wrong for one of them everywhere. A bar with
+    no recorded source (a buffer loaded before sources were recorded) gets no
+    band.
+    """
+    span = stream_common.TF_MINUTES.get(state.timeframe)
+    if not span or span > 60:
+        return None
+    sources = {b.get("src") for b in bars} & set(_BAND_HISTORY_FOR_SOURCE)
+    if not sources:
+        return None
+    dates = _session_dates_of(bars)
+    today = dates[-1] if dates else None
+    if today is None:
+        return None
+    days = lookback_days(window)
+    built: dict[str, "dict | None"] = {}
+
+    def band_of(history_source: str) -> "dict | None":
+        if history_source not in built:
+            if history_source == "yfinance":
+                history = fetch_intraday_history_bars(symbol, days)
+            else:
+                history = bar_history.fetch_week_minute_bars(
+                    symbol, history_source, state.api_key, state.api_secret, days
+                )
+            built[history_source] = _cached_volume_band(
+                symbol, history_source, history, today, span
+            )
+        return built[history_source]
+
+    by_source: dict[str, dict] = {}
+    for src in sorted(sources):
+        for history_source in _BAND_HISTORY_FOR_SOURCE[src]:
+            band = band_of(history_source)
+            if band is not None:
+                by_source[src] = band
+                break
+    if not by_source:
+        return None
+    return {
+        "key": window,
+        "label": VOLUME_BASELINE_WINDOWS[window],
+        "span": span,
+        "band_by_source": by_source,
+    }
+
+
+# Bands by (symbol, history source, ET day, span), each with a signature of the
+# history it was built from. Building one parses a week of minute bars (~0.3 s
+# for SIP's ~8,000), and the chart fragment reruns every few seconds over the
+# same, day-cached history -- so it is rebuilt only when that history changes.
+_VOLUME_BAND_CACHE: "dict[tuple[str, str, str, int], tuple[tuple, dict | None]]" = {}
+
+
+def _cached_volume_band(
+    symbol: str, history_source: str, history: "list[dict]", today: str, span: int
+) -> "dict | None":
+    signature = (
+        len(history),
+        history[0].get("t") if history else None,
+        history[-1].get("t") if history else None,
+    )
+    key = (symbol, history_source, today, span)
+    hit = _VOLUME_BAND_CACHE.get(key)
+    if hit is not None and hit[0] == signature:
+        return hit[1]
+    band = volume_band(history, today, span=span)
+    result = {**band, "history": history_source} if band is not None else None
+    _VOLUME_BAND_CACHE[key] = (signature, result)
+    return result
+
+
+def _session_dates_of(bars: "list[dict]") -> "list[str]":
+    """The ET session dates in `bars`, oldest first."""
+    return sorted({
+        pd.Timestamp(b["t"]).tz_convert(market_hours.MARKET_TZ).strftime("%Y-%m-%d")
+        for b in bars
+        if b.get("t")
+    })
 
 
 def _session_id() -> str:
@@ -829,14 +933,18 @@ def _live_chart_controls() -> None:
                 )
             baseline_keys = list(VOLUME_BASELINE_WINDOWS)
             with _help_row(
-                "What the volume panel compares today's bars against. The dashed "
-                "line is the window's mean volume per bar; the shaded backdrop is "
-                "the average volume of each *clock minute* across the window, "
-                "which is the fairer read — the open and the close carry several "
-                "times what midday does. \"This session\" has no backdrop, since "
-                "its shape is the bars themselves. Prior windows come from "
-                "yfinance's consolidated tape, so they stay comparable whichever "
-                "live feed is streaming.",
+                "What the volume panel compares today's bars against.\n\n"
+                "- **Last trading week, mean + 1σ** (default) — a dark band behind "
+                "the bars: for each bar's clock bucket, the mean + one standard "
+                "deviation of its volume over the last five sessions, pooled with "
+                "the buckets 5 minutes either side. Built from **the same source "
+                "as the bar** — IEX bars against IEX history, SIP against SIP, "
+                "yfinance against yfinance (Finnhub bars against SIP) — since IEX "
+                "is only ~4% of the consolidated volume.\n"
+                "- The other windows draw a dashed line at the window's mean "
+                "volume per bar and a shaded backdrop at each clock minute's "
+                "average, from yfinance's consolidated tape. \"This session\" "
+                "has no backdrop, since its shape is the bars themselves.",
                 icon_ratio=_HALF_WIDTH_ICON,
             ):
                 volume_baseline_window = st.selectbox(
@@ -853,11 +961,13 @@ def _live_chart_controls() -> None:
                 "they follow the timeframe (a bar a minute on 1Min, one per five "
                 "minutes on 5Min):\n\n"
                 "- **Momentum** — the close minus the previous close, in dollars. "
-                "On 1Min bars the dashed orange lines at ± are last week's mean "
-                "absolute one-minute move, measured once a day on ▶ Start.\n"
+                "On 1Min bars the dark band at ± is the mean + 1σ of the absolute "
+                "one-minute move at that time of day over the last five sessions "
+                "(±5 minutes pooled), measured once a day on ▶ Start.\n"
                 "- **Momentum Δ** — this bar's momentum minus the previous bar's: "
                 "above zero the move is speeding up (or a fall is easing), below "
-                "zero it is slowing (or a fall is steepening).\n\n"
+                "zero it is slowing (or a fall is steepening). Its dark band is the "
+                "same mean + 1σ, of the absolute Δ.\n\n"
                 "The semitransparent blue lines are the same two measures averaged "
                 "per bar over the look-back the selected agent decides on — Apple "
                 "Trader's momentum confirmation period, Apple Trader 2's momentum "

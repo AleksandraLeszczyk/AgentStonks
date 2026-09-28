@@ -353,3 +353,71 @@ class TestAgentMomentum:
         assert _agent_momentum(self.state(), self.sym(tactic_fields=["last_price"]))[0] == 5
         executed = self.sym(tactic_fields=["momentum_pct"], status="executed")
         assert _agent_momentum(self.state(), executed)[0] == 5
+
+
+class TestVolumeBandSources:
+    """`_volume_band_baseline`: one band per source on the chart, each from that
+    source's own history."""
+
+    TODAY = "2026-09-21"
+    WEEK = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18"]
+
+    def history(self, volume: float) -> list[dict]:
+        return [
+            {"t": f"{day}T16:00:00Z", "o": 1, "h": 1, "l": 1, "c": 1, "v": volume}
+            for day in self.WEEK
+        ]
+
+    def setup(self, monkeypatch, sip=True):
+        from agent_stonks import ui
+
+        fetched = []
+        monkeypatch.setattr(ui, "_VOLUME_BAND_CACHE", {})
+        monkeypatch.setattr(
+            ui, "fetch_intraday_history_bars",
+            lambda symbol, days: fetched.append("yfinance") or self.history(900.0),
+        )
+
+        def week(symbol, feed, key, secret, days):
+            fetched.append(feed)
+            if feed == "sip" and not sip:
+                return []
+            return self.history({"sip": 1000.0, "iex": 40.0}[feed])
+
+        monkeypatch.setattr(ui.bar_history, "fetch_week_minute_bars", week)
+        state = AppState()
+        state.timeframe = "1Min"
+        return ui, state, fetched
+
+    def bars(self, *sources):
+        return [
+            {"t": f"{self.TODAY}T16:0{i}:00Z", "o": 1, "h": 1, "l": 1, "c": 1, "v": 1, "src": s}
+            for i, s in enumerate(sources)
+        ]
+
+    def test_each_source_is_read_against_its_own_history(self, monkeypatch):
+        ui, state, fetched = self.setup(monkeypatch)
+        base = ui._volume_band_baseline("AAPL", self.bars("yfinance", "iex", "sip"), state, "week_band")
+        levels = {src: band["per_minute"][12 * 60] for src, band in base["band_by_source"].items()}
+        assert levels == {"yfinance": 900.0, "iex": 40.0, "sip": 1000.0}
+        assert sorted(fetched) == ["iex", "sip", "yfinance"]
+
+    def test_finnhub_bars_read_sip_or_else_yfinance(self, monkeypatch):
+        ui, state, _ = self.setup(monkeypatch)
+        base = ui._volume_band_baseline("AAPL", self.bars("finnhub"), state, "week_band")
+        assert base["band_by_source"]["finnhub"]["history"] == "sip"
+
+        ui, state, _ = self.setup(monkeypatch, sip=False)
+        base = ui._volume_band_baseline("AAPL", self.bars("finnhub"), state, "week_band")
+        assert base["band_by_source"]["finnhub"]["history"] == "yfinance"
+
+    def test_untagged_bars_fetch_nothing(self, monkeypatch):
+        ui, state, fetched = self.setup(monkeypatch)
+        bars = [{k: v for k, v in b.items() if k != "src"} for b in self.bars("sip")]
+        assert ui._volume_band_baseline("AAPL", bars, state, "week_band") is None
+        assert not fetched
+
+    def test_the_daily_bars_timeframe_has_no_band(self, monkeypatch):
+        ui, state, _ = self.setup(monkeypatch)
+        state.timeframe = "1Day"
+        assert ui._volume_band_baseline("AAPL", self.bars("sip"), state, "week_band") is None

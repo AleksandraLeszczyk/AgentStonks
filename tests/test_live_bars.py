@@ -1,7 +1,7 @@
 """The live buffer's tiered backfill: which source each bar comes from, and
 which bars a later backfill may replace (`bar_history.fetch_live_bars`,
 `stream_common.merge_live_bars`)."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agent_stonks import bar_history, finnhub_stream, stream, stream_common
 from agent_stonks.state import AppState
@@ -64,6 +64,11 @@ class TestFetchLiveBars:
         assert by_t[_key(regular_yf["t"])]["v"] == 59813    # yfinance wins in session
         assert by_t[_key(young_iex["t"])]["v"] == 160
         assert live.provisional == {_key(young_iex["t"])}
+        # Each bar records the tape it came off.
+        assert by_t[_key(premarket["t"])]["src"] == "sip"
+        assert by_t[_key(regular_yf["t"])]["src"] == "yfinance"
+        assert by_t[_key(young_iex["t"])]["src"] == "iex"
+        assert "src" not in young_iex  # the fetchers' own (cached) bars are untouched
         # The young window stops short of the minute in progress, on IEX.
         start, end, feed = calls["recent"]
         assert end == datetime(2026, 9, 25, 18, 0, tzinfo=timezone.utc)
@@ -202,3 +207,40 @@ class _FrozenDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
         return NOW
+
+
+class TestWeekMinuteBars:
+    """`fetch_week_minute_bars`: a week of one feed's minutes, once a day."""
+
+    def _patch(self, monkeypatch, result):
+        calls = []
+
+        def _range(symbol, timeframe, start, end, key, secret, feed):
+            calls.append((symbol, feed, start, end))
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        monkeypatch.setattr(bar_history, "fetch_bars_range", _range)
+        monkeypatch.setattr(bar_history, "_week_minute_cache", {})
+        return calls
+
+    def test_fetched_once_per_feed_per_day(self, monkeypatch):
+        calls = self._patch(monkeypatch, [_bar("2026-09-24T14:00:00Z")])
+        for _ in range(3):
+            assert len(bar_history.fetch_week_minute_bars("AAPL", "iex", "k", "s", 12, now=NOW)) == 1
+        bar_history.fetch_week_minute_bars("AAPL", "sip", "k", "s", 12, now=NOW)
+        assert [c[1] for c in calls] == ["iex", "sip"]
+        # Ends SIP_DELAY_MIN back, which delayed SIP allows.
+        assert calls[0][3] == NOW - timedelta(minutes=bar_history.SIP_DELAY_MIN)
+
+    def test_a_refusal_is_not_retried_every_rerun(self, monkeypatch):
+        calls = self._patch(monkeypatch, RuntimeError("403"))
+        assert bar_history.fetch_week_minute_bars("AAPL", "sip", "k", "s", 12, now=NOW) == []
+        assert bar_history.fetch_week_minute_bars("AAPL", "sip", "k", "s", 12, now=NOW) == []
+        assert len(calls) == 1
+
+    def test_no_key_no_request(self, monkeypatch):
+        calls = self._patch(monkeypatch, [])
+        assert bar_history.fetch_week_minute_bars("AAPL", "sip", "", "", 12, now=NOW) == []
+        assert not calls

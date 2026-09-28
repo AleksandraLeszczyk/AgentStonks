@@ -13,12 +13,21 @@ sessions into the two references that make the panel readable:
   this minute usually is?"
 
 Both are built from the same window so the panel never mixes references, and
-the window is the user's choice (`VOLUME_BASELINE_WINDOWS`). Everything here is
+the window is the user's choice (`VOLUME_BASELINE_WINDOWS`).
+
+The default window, "week_band", replaces both with a **band**: per bar, the
+mean + 1 sigma of the volume that clock bucket carried over the last trading
+week, drawn as a dark backdrop behind the bars (`volume_band`). It is built
+from the same tape as the bar it sits behind -- an IEX bar against IEX
+history, a SIP bar against SIP history, a yfinance bar against yfinance -- so
+the chart's mixed-source buffer never compares one venue's slice with the
+whole market's volume. Everything here is
 a pure function over bars; the fetching lives in `agent_stonks.historical`.
 """
 
 from __future__ import annotations
 
+import statistics
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -33,8 +42,24 @@ VOLUME_BASELINE_WINDOWS: dict[str, str] = {
     "session": "This session",
     "yesterday": "Yesterday",
     "week": "Last trading week",
+    "week_band": "Last trading week, mean + 1\u03c3",
 }
-DEFAULT_VOLUME_BASELINE = "week"
+DEFAULT_VOLUME_BASELINE = "week_band"
+
+# Windows drawn as a per-source mean + sigma band (`volume_band`) rather than
+# the mean line and per-minute shape of `minute_volume_baseline`.
+BAND_WINDOWS = ("week_band",)
+
+# `volume_band` pools each bucket with the buckets this many *minutes* either
+# side of it (so +/-5 one-minute bars, +/-1 five-minute bar, none coarser):
+# five sessions are five samples a bucket, too few for a sigma. Same width as
+# the momentum bands (`minute_momentum.SMOOTH_MINUTES`).
+BAND_POOL_MINUTES = 5
+BAND_SIGMAS = 1.0
+
+# Minutes past ET midnight of the regular session's open and close.
+_OPEN_MINUTE = 9 * 60 + 30
+_CLOSE_MINUTE = 16 * 60
 
 # "Last trading week" is five *sessions*, not seven days: a holiday-shortened
 # week should average the days that traded, not dilute itself with the ones
@@ -101,7 +126,80 @@ def lookback_days(window: str) -> int:
         # A Monday's "yesterday" is the previous Friday, and a Tuesday after a
         # long weekend reaches back four days.
         return 5
-    return WEEK_LOOKBACK_DAYS if window == "week" else 0
+    return WEEK_LOOKBACK_DAYS if window in ("week", "week_band") else 0
+
+
+def _band_segment(minute: int, span: int) -> str:
+    """Which stretch of the day a bucket starting at `minute` belongs to.
+
+    `volume_band` never pools across these: pre-market minutes carry a few
+    percent of a regular minute, so a window reaching over the open would
+    inflate the pre-market's last minutes and sink the open's. On one-minute
+    bars the two auction minutes are stretches of their own -- SIP's 16:00 bar
+    holds the closing cross, often more than the whole last half hour -- so
+    their neighbours do not inherit it.
+    """
+    if span == 1 and minute in (_OPEN_MINUTE, _CLOSE_MINUTE):
+        return str(minute)
+    if minute < _OPEN_MINUTE:
+        return "pre"
+    return "regular" if minute < _CLOSE_MINUTE else "post"
+
+
+def volume_band(
+    history_bars: "list[dict]",
+    today: str,
+    span: int = 1,
+    pool_minutes: int = BAND_POOL_MINUTES,
+    sigmas: float = BAND_SIGMAS,
+) -> "dict | None":
+    """Mean + `sigmas` sigma of the volume per `span`-minute bucket over the
+    last `WEEK_SESSIONS` sessions before `today`.
+
+    `history_bars` are one-minute bars of a single source. Each session's
+    minutes are summed into buckets starting on multiples of `span` past ET
+    midnight -- where Alpaca and yfinance start their coarser bars -- so a
+    bucket's samples are that bucket's volume, one per session that traded it.
+    Each bucket then pools the samples of the buckets within `pool_minutes`
+    of it in the same stretch of the day (`_band_segment`), and the band is
+    their mean plus `sigmas` sample standard deviations (zero for a single
+    sample).
+
+    Returns ``{"per_minute": {bucket start minute: level}, "sessions",
+    "dates"}``, or None when no prior session has a bar.
+    """
+    span = max(int(span), 1)
+    prior = [bar for bar in history_bars or [] if (_bar_session_date(bar) or "") < today]
+    dates = _session_dates(prior)[-WEEK_SESSIONS:]
+    chosen = set(dates)
+    sums: dict[tuple[str, int], float] = {}
+    for bar in prior:
+        session = _bar_session_date(bar)
+        minute = _minute_of_day(bar)
+        volume = _volume(bar)
+        if session not in chosen or minute is None or volume is None:
+            continue
+        bucket = minute // span * span
+        sums[(session, bucket)] = sums.get((session, bucket), 0.0) + volume
+    if not sums:
+        return None
+    samples: dict[int, list[float]] = {}
+    for (_, bucket), volume in sums.items():
+        samples.setdefault(bucket, []).append(volume)
+
+    reach = pool_minutes // span * span
+    per_minute: dict[int, float] = {}
+    for bucket in sorted(samples):
+        segment = _band_segment(bucket, span)
+        pooled = [
+            v
+            for other in range(bucket - reach, bucket + reach + 1, span)
+            if other in samples and _band_segment(other, span) == segment
+            for v in samples[other]
+        ]
+        spread = statistics.stdev(pooled) if len(pooled) > 1 else 0.0
+        per_minute[bucket] = statistics.fmean(pooled) + sigmas * spread
+    return {"per_minute": per_minute, "sessions": len(dates), "dates": dates}
 
 
 def minute_volume_baseline(
@@ -124,11 +222,12 @@ def minute_volume_baseline(
 
     where `per_minute` maps minutes-past-ET-midnight to the average volume that
     minute carried across the window's sessions. It is empty for "session",
-    whose shape is the chart's own bars. Returns None when the window is off or
+    whose shape is the chart's own bars. Returns None for a band window (see
+    `volume_band`), when the window is off, or
     the history is too thin to average anything -- callers draw nothing rather
     than a line built from one stray bar.
     """
-    if window not in VOLUME_BASELINE_WINDOWS or window == "off":
+    if window not in VOLUME_BASELINE_WINDOWS or window == "off" or window in BAND_WINDOWS:
         return None
     label = VOLUME_BASELINE_WINDOWS[window]
 

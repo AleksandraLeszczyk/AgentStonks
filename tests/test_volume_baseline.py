@@ -1,5 +1,6 @@
 """The volume panel's "usual volume" reference."""
 
+import statistics
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -13,6 +14,7 @@ from agent_stonks.volume_baseline import (
     WEEK_SESSIONS,
     lookback_days,
     minute_volume_baseline,
+    volume_band,
 )
 
 OPEN_UTC = "T13:30:00+00:00"  # 09:30 ET
@@ -290,3 +292,71 @@ class TestFetchingTheHistory:
         (bar,) = historical.fetch_intraday_history_bars("AAPL", 7)
         assert set(bar) == {"t", "o", "h", "l", "c", "v"}
         assert bar["t"] == "2026-09-14T13:30:00Z"  # 09:30 ET, in UTC
+
+
+def band_level(samples: "list[float]") -> float:
+    return statistics.fmean(samples) + statistics.stdev(samples)
+
+
+class TestVolumeBand:
+    """`volume_band`: mean + 1 sigma per clock bucket over last week."""
+
+    NOON = 150  # minutes past the open: 12:00 ET
+    TODAY = "2026-09-21"
+
+    def test_the_default_window_is_the_band(self):
+        assert DEFAULT_VOLUME_BASELINE == "week_band"
+        assert lookback_days("week_band") == lookback_days("week")
+        # The band is drawn by `volume_band`, not the mean/shape builder.
+        assert minute_volume_baseline("week_band", [], []) is None
+
+    def test_mean_plus_sigma_of_the_buckets_five_minutes_either_side(self):
+        # Session i trades 1000 * (i + 1) every minute: the noon bucket pools
+        # 11 minutes x 5 sessions of those.
+        history = [
+            b for i, day in enumerate(WEEK) for b in bars(day, range(390), 1000.0 * (i + 1))
+        ]
+        result = volume_band(history, self.TODAY)
+        expected = band_level([1000.0 * (i + 1) for i in range(5) for _ in range(11)])
+        assert result["per_minute"][570 + self.NOON] == pytest.approx(expected)
+        assert result["dates"] == WEEK
+        assert result["sessions"] == 5
+
+    def test_today_and_older_sessions_are_left_out(self):
+        older = bars("2026-09-11", range(390), 1e9)
+        week = [b for day in WEEK for b in bars(day, range(390), 1000.0)]
+        todays = bars(self.TODAY, range(390), 1e9)
+        result = volume_band(older + week + todays, self.TODAY)
+        assert result["per_minute"][570 + self.NOON] == pytest.approx(1000.0)
+
+    def test_the_auction_minutes_are_not_pooled(self):
+        # A huge 09:30 print; 09:31-09:40 quiet, varying by session.
+        history = []
+        for i, day in enumerate(WEEK):
+            history += bars(day, [0], 500_000.0 + 1000 * i)
+            history += bars(day, range(1, 20), 1000.0 + 10 * i)
+        per_minute = volume_band(history, self.TODAY)["per_minute"]
+        assert per_minute[570] == pytest.approx(band_level([500_000.0 + 1000 * i for i in range(5)]))
+        # 09:31 pools 09:31-09:36 (09:26-09:30 are other stretches of the day).
+        assert per_minute[571] == pytest.approx(
+            band_level([1000.0 + 10 * i for i in range(5) for _ in range(6)])
+        )
+
+    def test_the_pre_market_is_not_pooled_with_the_session(self):
+        history = []
+        for day in WEEK:
+            history += bars(day, range(-10, 0), 100.0)
+            history += bars(day, range(1, 20), 50_000.0)
+        per_minute = volume_band(history, self.TODAY)["per_minute"]
+        assert per_minute[569] == pytest.approx(100.0)
+
+    def test_coarser_bars_sum_each_sessions_bucket_first(self):
+        # Five-minute buckets of five 1,000-share minutes: 5,000 a bucket.
+        history = [b for day in WEEK for b in bars(day, range(390), 1000.0)]
+        per_minute = volume_band(history, self.TODAY, span=5)["per_minute"]
+        assert per_minute[570 + self.NOON] == pytest.approx(5000.0)
+        assert all(m % 5 == 0 for m in per_minute)
+
+    def test_nothing_to_measure(self):
+        assert volume_band([], self.TODAY) is None
+        assert volume_band(bars(self.TODAY, range(10), 100.0), self.TODAY) is None

@@ -179,6 +179,8 @@ def _bars_socket(
 
             if t == "b":
                 bar = {k: msg[k] for k in ("t", "o", "h", "l", "c", "v", "vw") if k in msg}
+                # The tape it is, for readers comparing volumes (bar_history.BAR_SOURCE_OF_FEED).
+                bar["src"] = "iex" if feed == "iex" else "sip"
                 # First bar after a (re)connect logs at INFO; identical repeats
                 # log at DEBUG (see datalog de-duplication).
                 log_fetch(

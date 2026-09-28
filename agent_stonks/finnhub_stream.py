@@ -185,7 +185,7 @@ class CandleBuilder:
                     return None
             state.bars.append(
                 {"t": bucket, "o": price, "h": price, "l": price, "c": price,
-                 "v": size, "vw": price, "n": 1}
+                 "v": size, "vw": price, "n": 1, "src": "finnhub"}
             )
             self.open_bucket = bucket
             if not self.opened_any:
