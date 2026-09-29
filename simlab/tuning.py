@@ -193,6 +193,10 @@ TUNABLES: "dict[str, Tunable]" = {
         ),
         Tunable("take_fraction", "Share taken on negative momentum", 0.05, 1.0, 0.05, (0.30, 1.0, 0.10)),
         Tunable(
+            "take_min_gain_fraction", "Take only after gaining (× predicted gain)",
+            0.0, 1.0, 0.05, (0.0, 0.50, 0.10),
+        ),
+        Tunable(
             "hold_min_gain_k", "Keep a runner if target ≥ (× unit)", 0.0, 3.0, 0.05,
             (0.0, 0.60, 0.10),
         ),
@@ -285,6 +289,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "stop_gain_fraction",
     "momentum_confirmation_bars",
     "take_fraction",
+    "take_min_gain_fraction",
     "hold_min_gain_k",
     "min_win_k",
     "position_pct",

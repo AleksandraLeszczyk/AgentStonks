@@ -205,8 +205,13 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     15-bar negative streak it replaced: most of this file is about that take,
     which stored records still replay. `TestMomentumConfirmation` is where the
     confirmation is switched on.
+
+    `take_min_gain_fraction` is pinned to 0, the take on any profit: what every
+    take test here was written against. `TestMomentumConfirmation` is where the
+    realised-gain gate is switched on.
     """
     kwargs.setdefault("momentum_confirmation_bars", 0)
+    kwargs.setdefault("take_min_gain_fraction", 0.0)
     if not kwargs["momentum_confirmation_bars"] and not (
         kwargs.get("momentum_fade_bars") or kwargs.get("momentum_drop")
     ):
@@ -3426,7 +3431,7 @@ class TestMomentumConfirmation:
         assert config.momentum_confirmation_bars == 5
         assert config.has_take
         signature = config_signature(config)
-        assert ",confirm=5b" in signature and "@conf," in signature
+        assert ",confirm=5b" in signature and "@conf>=0.2G," in signature
 
     def test_it_cannot_sit_beside_a_legacy_take(self):
         with pytest.raises(ValueError, match="only one may be set"):
@@ -3554,6 +3559,36 @@ class TestMomentumConfirmation:
         # -1.00 against three flat bars: momentum -0.33 a bar, change -0.33.
         assert self._step(trader, tracker, tape, state, 103.0) == "sold"
         assert 0 < tracker.position_for(TICKER) < shares
+
+    # --- the take waits for a share of the predicted gain ------------------
+
+    def test_the_gain_gate_is_on_by_default_and_signed(self):
+        config = AppleTraderConfig()
+        assert config.take_min_gain_fraction == 0.2
+        assert "@conf>=0.2G," in config_signature(config)
+        assert ">=0G" not in config_signature(replace(config, take_min_gain_fraction=0.0))
+        assert "G," not in config_signature(
+            AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
+        )
+        with pytest.raises(ValueError, match="take_min_gain_fraction"):
+            AppleTraderConfig(take_min_gain_fraction=-0.1)
+
+    def test_no_take_short_of_the_gain_gate(self, state, market_open, monkeypatch):
+        # The predicted gain is $109.00 - $102.50 = $6.50, so 0.2 of it is
+        # $1.30 over the $101.80 fill: $103.10.
+        trader, tracker, tape = self._enter(state, monkeypatch, take_min_gain_fraction=0.2)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 103.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+
+    def test_the_take_fires_past_the_gain_gate(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_min_gain_fraction=0.2)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 103.2) == "sold"
+        assert 0 < tracker.position_for(TICKER) < shares
+        assert "Momentum take" in tracker.snapshot()["decisions"][-1].reasoning
 
     # --- never gated ------------------------------------------------------
 

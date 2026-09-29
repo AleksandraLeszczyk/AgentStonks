@@ -256,7 +256,7 @@ def dayrange_params(
         )
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
-    stop_gain_fraction, take_fraction, hold_min_gain_k = exit_params(
+    stop_gain_fraction, take_fraction, hold_min_gain_k, take_min_gain_fraction = exit_params(
         defaults, float(buy_k), float(sell_k), unit_label, copy,
         take_on=bool(momentum_confirmation_bars),
     )
@@ -275,6 +275,7 @@ def dayrange_params(
         breach_exit=breach_exit,
         stop_gain_fraction=stop_gain_fraction,
         take_fraction=take_fraction,
+        take_min_gain_fraction=take_min_gain_fraction,
         hold_min_gain_k=hold_min_gain_k,
         min_win_k=min_win_k,
     )
@@ -475,7 +476,18 @@ def exit_params(
         help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
         disabled=not take_on,
     )
-    return float(stop_gain_fraction), float(take_pct) / 100.0, float(hold_min_gain_k)
+    take_min_gain_fraction = col_b.number_input(
+        "Take only after gaining (× the predicted gain)",
+        min_value=0.0, max_value=1.0, value=defaults.take_min_gain_fraction, step=0.05,
+        format="%.2f",
+        key=copy.key("take_min_gain_fraction"),
+        help=copy.help.get("take_min_gain_fraction"),
+        disabled=not take_on,
+    )
+    return (
+        float(stop_gain_fraction), float(take_pct) / 100.0, float(hold_min_gain_k),
+        float(take_min_gain_fraction),
+    )
 
 
 def stop_note(

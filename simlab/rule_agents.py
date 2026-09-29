@@ -220,6 +220,9 @@ _APPLE_LEGACY = {
     # of the rules above the record carries. 0 is that, and it is left out of
     # the signature, so every stored run keeps the identity it was filed under.
     "momentum_confirmation_bars": 0,
+    # And before 2026-09-29 the take fired on any profit at all, however small.
+    # 0 is that rule, and it is left out of the signature.
+    "take_min_gain_fraction": 0.0,
 }
 
 

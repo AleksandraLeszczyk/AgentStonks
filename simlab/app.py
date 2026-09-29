@@ -1846,6 +1846,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- In the signature only while the take is on.\n"
             "- Whole shares, rounded down, and at least one."
         ),
+        "take_min_gain_fraction": (
+            "The momentum take fires only once the price is this share of the predicted "
+            "gain (`buy − sell`) above the fill.\n\n"
+            "- In the signature as `take=70%@conf>=0.2G` while the take is on; a record "
+            "from before it replays at 0 (any profit).\n"
+            "- 0 takes on any profit at all."
+        ),
         "hold_min_gain_k": (
             "Keep a runner only if the sell level is still this far above the fill; "
             "otherwise the take sells everything.\n\n"

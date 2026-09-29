@@ -341,6 +341,14 @@ APPLE_TRADER_NEGATIVE_FOR_BARS = 5
 APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS = 5
 MOMENTUM_NEUTRAL_FRACTION = 0.10
 APPLE_TRADER_TAKE_FRACTION = 0.70
+# The momentum take waits for the trade to have banked something first
+# (2026-09-29, at the user's request): it fires only once the close is at least
+# this share of the predicted gain -- `(buy_k - sell_k)` level units, the gap
+# the stop is written against too -- above the fill. Under it a negative read is
+# noise around the entry, and the stop is what covers the downside. Not swept.
+# 0 is the rule before it existed (any profit at all), which is what every
+# SimLab record written before then replays as (`simlab.rule_agents._APPLE_LEGACY`).
+APPLE_TRADER_TAKE_MIN_GAIN_FRACTION = 0.20
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What the agent does when the session trades through the forecast it was given
 # at 9:35 -- the vocabulary lives here rather than in `dayrange_model`, which

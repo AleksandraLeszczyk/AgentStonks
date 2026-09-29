@@ -68,6 +68,7 @@ from .config import (
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
+    APPLE_TRADER_TAKE_MIN_GAIN_FRACTION,
     APPLE_TRADER_TUNED_LEVELS,
     BREACH_BROWNIAN,
     BREACH_LABELS,
@@ -206,6 +207,10 @@ class AppleTraderConfig:
     momentum_drop: float = 0.0
     # The share of the position that take sells when a runner is kept.
     take_fraction: float = APPLE_TRADER_TAKE_FRACTION
+    # How much of the predicted gain the close has to be above the fill before
+    # the take may fire at all -- a share of `target_gain_k` level units, like
+    # the stop. 0 is any profit, the rule before it existed.
+    take_min_gain_fraction: float = APPLE_TRADER_TAKE_MIN_GAIN_FRACTION
     # The gain still left to the sell level, in ADRs above the fill, that is
     # worth keeping a runner for. Short of it the take sells everything.
     hold_min_gain_k: float = APPLE_TRADER_HOLD_MIN_GAIN_K
@@ -288,7 +293,7 @@ class AppleTraderConfig:
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
-            "momentum_confirmation_bars",
+            "momentum_confirmation_bars", "take_min_gain_fraction",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -658,10 +663,12 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     else:
         take = ""
     if take:
-        exits += (
-            f",take={c.take_fraction * 100:g}%@{take},"
-            f"runner>={c.hold_min_gain_k:g}{unit}"
-        )
+        exits += f",take={c.take_fraction * 100:g}%@{take}"
+        # The realised-gain gate, only while set, so every record written
+        # before it existed (which replays at 0) keeps its filed signature.
+        if c.take_min_gain_fraction:
+            exits += f">={c.take_min_gain_fraction:g}G"
+        exits += f",runner>={c.hold_min_gain_k:g}{unit}"
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
     # Only where it can change a trade (`can_scale_in`), so a run at 100% signs
@@ -2424,7 +2431,9 @@ class DayRangeTrader(BaseTrader):
     ) -> "tuple[float, str, str] | None":
         """Bank gains short of the target once momentum has been negative for long enough.
 
-        Fires when the position is in profit and the momentum confirmation's
+        Fires when the position is in profit by at least
+        `take_min_gain_fraction` of the predicted gain (`target_gain_k` level
+        units, the same yardstick as the stop) and the momentum confirmation's
         table says take (`MOMENTUM_TABLE`): momentum over the look-back is
         negative and its change neutral or negative -- the price is still
         dropping, or dropping faster. A drop that is slowing (negative momentum,
@@ -2455,6 +2464,12 @@ class DayRangeTrader(BaseTrader):
             or price <= entry_price
         ):
             return None
+        # Not before the trade has banked its share of what it is playing for:
+        # short of that a negative read is noise around the fill, which the
+        # stop is there for. Read at the current unit, like the runner test.
+        unit = level_unit(config, plan)
+        if price - entry_price < config.take_min_gain_fraction * config.target_gain_k * unit:
+            return None
 
         since = entry.get("ts", frame.index[-1])
         if config.momentum_confirmation_bars:
@@ -2469,7 +2484,6 @@ class DayRangeTrader(BaseTrader):
         if why is None:
             return None
 
-        unit = level_unit(config, plan)
         left = plan["sell_level"] - entry_price
         pnl_pct = (price / entry_price - 1) * 100
         fade = (
@@ -2945,7 +2959,12 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         )
     if config.has_take:
         exits.append(
-            f"a {config.take_fraction:.0%} take in profit once momentum gives out "
+            f"a {config.take_fraction:.0%} take in profit"
+            + (
+                f" (at least {config.take_min_gain_fraction:g} × the predicted gain)"
+                if config.take_min_gain_fraction else ""
+            )
+            + " once momentum gives out "
             f"({fade_phrase(config)}), the rest kept for the sell level only if "
             f"it is {config.hold_min_gain_k:g} × {config.unit_phrase} or more above the fill and sold if the "
             "price comes back to it"

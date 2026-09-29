@@ -755,7 +755,7 @@ class TestRuleAgentRecords:
         assert "@mom-1," in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert "@conf," in agent.signature(today)
+        assert "@conf>=0.2G," in agent.signature(today)
         assert ",confirm=5b" in agent.signature(today)
 
     def test_a_record_from_before_negative_momentum_keeps_its_turn(self):

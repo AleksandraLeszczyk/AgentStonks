@@ -2556,6 +2556,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "negative.\n"
             "- Whole shares, rounded down, and at least one."
         ),
+        "take_min_gain_fraction": (
+            "The momentum take fires only once the price is at least this share of the "
+            "predicted gain (`buy − sell`, the gap the stop is written against) above "
+            "the fill.\n\n"
+            "- Below it a negative momentum read is left alone; the stop covers the "
+            "downside.\n"
+            "- 0 takes on any profit at all."
+        ),
         "hold_min_gain_k": (
             "Keep a runner only if the sell level is still this many × {unit} above the fill; "
             "otherwise a momentum take sells everything.\n\n"
