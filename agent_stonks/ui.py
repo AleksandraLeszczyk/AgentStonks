@@ -2676,7 +2676,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "target exit can pay.\n"
             "- {stop_gain_fraction} risks \\$0.50 for every \\$1.00 the trade plays for — "
             "on any instrument, at any levels.\n"
-            "- After a stop nothing more is bought that day.\n"
+            "- After a stop the agent stops; press ▶ Start Agent to trade again.\n"
             "- 0 switches the stop off."
         ),
         "momentum_confirmation_bars": (

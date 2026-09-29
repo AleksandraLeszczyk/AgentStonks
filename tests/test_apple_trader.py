@@ -378,6 +378,8 @@ class TestDayRangeExit:
 
         tape.append(STOP_PRICE - 0.5)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        # The live loop stops the agent on this; a replay just holds.
+        assert trader.halt == "stopped out"
         for _ in range(3):
             tape.append(100.0, low=BUY_LEVEL - 3)
             assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
@@ -1518,6 +1520,8 @@ class TestMinimumWin:
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
 
         assert trader.plan["stand_down"]
+        # The breaker stands the session down but does not stop the agent.
+        assert trader.halt is None
         assert not self._rearms(trader, tracker, tape, state)
         assert tracker.position_for(TICKER) == 0
 
@@ -2693,6 +2697,38 @@ class TestInstrument:
         assert asked == [("dayrange", NON_AAPL)]
 
 
+class TestStopOutEndsTheRun:
+    def test_the_loop_stops_the_agent_after_a_stop_out(self, state, monkeypatch):
+        cycles: list = []
+
+        class StoppedOut:
+            halt = None
+
+            def run_cycle(self, bundle, state, tracker):
+                cycles.append(1)
+                self.halt = "stopped out"
+                return "sold"
+
+        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: DAYRANGE_BUNDLE)
+        monkeypatch.setattr(at, "config_error", lambda config, bundle=None: None)
+        monkeypatch.setattr(at, "build_trader", lambda config, bundle=None: StoppedOut())
+        state.agent_running = True
+        stop_event = threading.Event()
+        loop = threading.Thread(
+            target=at._apple_trader_loop,
+            args=(state, tracker_for_loop(), AppleTraderConfig(), 60, stop_event),
+            daemon=True,
+        )
+        loop.start()
+        loop.join(timeout=10)
+
+        assert not loop.is_alive()
+        assert stop_event.is_set()
+        assert cycles == [1]
+        assert state.agent_running is False
+        assert any("Press ▶ Start Agent" in e.get("text", "") for e in state.agent_log)
+
+
 def tracker_for_loop() -> DecisionTracker:
     return DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
 
@@ -2945,16 +2981,31 @@ class TestRestartMemory:
         restarted.run_cycle(DAYRANGE_BUNDLE, state, fresh)
         assert restarted.entry is None
 
-    def test_a_restart_keeps_the_sessions_stand_down(self, state, market_open, monkeypatch):
+    def test_a_restart_keeps_the_breakers_stand_down(self, state, market_open, monkeypatch):
         trader, tracker, tape = self._bought(state, monkeypatch)
-        trader.plan["stand_down"] = "stopped out"
+        trader.plan["stand_down"] = "closed for +0.05 × ADR"
         trader.publish_memory(state)
 
         restarted = at.DayRangeTrader(dayrange_config())
         tape.append(104.0)
         restarted.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert restarted.plan["stand_down"] == "stopped out"
+        assert restarted.plan["stand_down"] == "closed for +0.05 × ADR"
         assert any("still no new entries" in e.get("text", "") for e in state.agent_log)
+
+    def test_start_after_a_stop_out_buys_again(self, state, market_open, monkeypatch):
+        """A stop ends the run; pressing ▶ Start again is the say-so to trade
+        the levels again today."""
+        trader, tracker, tape = self._bought(state, monkeypatch)
+        tape.append(STOP_PRICE - 0.5)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        trader.publish_memory(state)
+        assert state.apple_trader_levels["memory"]["stand_down"] == "stopped out"
+
+        restarted = at.DayRangeTrader(dayrange_config())
+        tape.append(100.0, low=BUY_LEVEL - 3)
+        assert restarted.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert not restarted.plan.get("stand_down")
+        assert restarted.halt is None
 
     def test_the_memory_survives_the_session_file(
         self, state, market_open, monkeypatch, tmp_path

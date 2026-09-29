@@ -1164,6 +1164,10 @@ class DayRangeTrader(BaseTrader):
     # line says so.
     ENTRY_TRIGGER_TEXT = "Buy level touched"
 
+    #: The stand-down a stop leaves. Unlike the breaker's, it ends the live run
+    #: (`halt`) and is not carried into the next ▶ Start (`_resume`).
+    STOPPED_OUT = "stopped out"
+
     def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
         super().__init__(config or AppleTraderConfig())
         # The session's forecast and the two levels derived from it, or None
@@ -1185,6 +1189,10 @@ class DayRangeTrader(BaseTrader):
         # Why this bar did not sell at the sell level, for `run_cycle` to log
         # (`_exit` only returns what to sell).
         self._held_note: "str | None" = None
+        # Set by a stop-out: the live loop stops the agent on it, and only a
+        # fresh ▶ Start trades again. SimLab never reads it -- a replay has no
+        # ▶ Start, so there the stand-down simply lasts the session.
+        self.halt: "str | None" = None
 
     # --- one cycle --------------------------------------------------------
 
@@ -1751,11 +1759,27 @@ class DayRangeTrader(BaseTrader):
         """Take back what an earlier run today knew (`memory`), on a restart.
 
         The entry is only a candidate: `run_cycle` drops it at once if the
-        ledger it continues is flat, and keeps it only while shares are held."""
+        ledger it continues is flat, and keeps it only while shares are held.
+
+        A stop-out's stand-down is the one thing not taken back: the stop ended
+        that run, and pressing ▶ Start again is the say-so to trade again today.
+        The breaker's stand-down (`_close_out`) did not stop the run, so it
+        still holds."""
         if not memory:
             return
         stand_down = memory.get("stand_down")
-        if stand_down and not self.plan.get("stand_down"):
+        if stand_down == self.STOPPED_OUT:
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        f"{self.ticker}: today's earlier run was stopped out; started "
+                        "again, so the levels are armed again."
+                    ),
+                },
+            )
+        elif stand_down and not self.plan.get("stand_down"):
             self.plan["stand_down"] = stand_down
             _log(
                 state,
@@ -2727,11 +2751,12 @@ class DayRangeTrader(BaseTrader):
         if kind == self.EXIT_STOP:
             self._stand_down(
                 state,
-                "stopped out",
+                self.STOPPED_OUT,
                 "The day did not go the way the forecast said, and the buy level is by now "
                 "usually just above the price — re-arming it would buy the same slide "
                 "again, one stop lower each time.",
             )
+            self.halt = self.STOPPED_OUT
 
         # What this position has realised so far, carried across a partial exit
         # so that a trade taken off in two pieces is judged on the whole of it
@@ -3019,8 +3044,8 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     exits = []
     if config.has_stop:
         exits.append(
-            f"a stop {stop_phrase(config)} under the fill, after which it buys nothing "
-            "more that day"
+            f"a stop {stop_phrase(config)} under the fill, after which the agent stops "
+            "until ▶ Start Agent is pressed again"
         )
     if config.has_take:
         exits.append(
@@ -3117,6 +3142,16 @@ def _apple_trader_loop(
         publish = getattr(trader, "publish_memory", None)
         if publish is not None:
             publish(state)
+        halt = getattr(trader, "halt", None)
+        if halt and not stop_event.is_set():
+            # A stop-out says the strategy is wrong about today: the run ends
+            # here, as if ▶ Stop had been pressed, and buys again only after
+            # ▶ Start Agent.
+            _log(state, {"type": "status", "text": (
+                f"{config.ticker} {halt} — Apple Trader stops. Press ▶ Start Agent to "
+                "trade again today."
+            )})
+            stop_event.set()
         return outcome
 
     rule_agent.run_loop(
