@@ -573,6 +573,27 @@ def _today_range(
     return low, high, open_
 
 
+def _signed_dollars(value: float) -> str:
+    """Compact signed dollar amount: +$1.23B, -$456.70M, +$12.30K."""
+    sign = "+" if value >= 0 else "-"
+    mag = abs(value)
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if mag >= div:
+            return f"{sign}${mag / div:,.2f}{suffix}"
+    return f"{sign}${mag:,.0f}"
+
+
+def _live_net_gamma(sym_state: SymbolState) -> float | None:
+    """Total net dealer gamma ($ per 1% move) from the symbol's latest options
+    chain, or None before one has arrived. Also kicks off a background refresh."""
+    _refresh_option_chain(sym_state)
+    with sym_state.lock:
+        data = sym_state.options_chain
+    if not data or not data.get("strikes"):
+        return None
+    return float(sum(data["calls_gamma_exposure"]) + sum(data["puts_gamma_exposure"]))
+
+
 def _quote_html(
     price: float | None,
     prev_close: float | None,
@@ -580,13 +601,12 @@ def _quote_html(
     bid_size: float | None,
     ask: float | None,
     ask_size: float | None,
-    previous_minute_high: float | None,
-    previous_minute_low: float | None,
     symbol: str,
     today_low: float | None = None,
     today_high: float | None = None,
     current_momentum: float | None = None,
     daily_momentum: float | None = None,
+    net_gamma: float | None = None,
 ) -> str:
     if price is None and bid is None and ask is None:
         return ""
@@ -634,10 +654,10 @@ def _quote_html(
             f'</div>'
         )
 
-    low_card = _side("Prev Min Low", previous_minute_low, None, PALETTE["muted"])
+    low_card = _side("Day Low", today_low, None, PALETTE["muted"])
     bid_card = _side("Bid", bid, bid_size, "#ef5350")
     ask_card = _side("Ask", ask, ask_size, "#26c6a2")
-    high_card = _side("Prev Min High", previous_minute_high, None, PALETTE["muted"])
+    high_card = _side("Day High", today_high, None, PALETTE["muted"])
     spread_row = ""
     if bid is not None and ask is not None:
         spread = ask - bid
@@ -670,14 +690,6 @@ def _quote_html(
             return PALETTE["muted"]
         return "#26c6a2" if m > 0 else "#ef5350"
 
-    day_low_card = (
-        _stat_card("Day Low", f"${today_low:,.4f}", PALETTE["muted"])
-        if today_low is not None else ""
-    )
-    day_high_card = (
-        _stat_card("Day High", f"${today_high:,.4f}", PALETTE["muted"])
-        if today_high is not None else ""
-    )
     cur_mom_card = (
         _stat_card("Momentum (10m)", f"{current_momentum:+.2f}%", _momentum_color(current_momentum))
         if current_momentum is not None else ""
@@ -686,12 +698,18 @@ def _quote_html(
         _stat_card("Momentum (day)", f"{daily_momentum:+.2f}%", _momentum_color(daily_momentum))
         if daily_momentum is not None else ""
     )
+    # Dollar gamma per 1% move, summed over the nearest expiry's strikes (the
+    # same total behind the Options tab's "Net gamma regime").
+    gamma_card = (
+        _stat_card("Net Gamma (1%)", _signed_dollars(net_gamma), _momentum_color(net_gamma))
+        if net_gamma is not None else ""
+    )
 
     stats_row = ""
-    if day_low_card or day_high_card or cur_mom_card or day_mom_card:
+    if cur_mom_card or day_mom_card or gamma_card:
         stats_row = (
             f'<div style="display:flex;gap:10px;align-items:stretch;margin-top:10px;">'
-            f'{day_low_card}{day_high_card}{cur_mom_card}{day_mom_card}'
+            f'{cur_mom_card}{day_mom_card}{gamma_card}'
             f'</div>'
         )
 
@@ -716,8 +734,6 @@ def _price_ticker() -> None:
             bid_size = sym_state.bid_size
             ask_price = sym_state.ask_price
             ask_size = sym_state.ask_size
-            previous_minute_high = sym_state.previous_minute_high
-            previous_minute_low = sym_state.previous_minute_low
             bars = list(sym_state.bars)
         today_low, today_high, today_open = _today_range(sym_state.daily_bars, bars)
         current_momentum = momentum_pct(sym_state)
@@ -728,9 +744,10 @@ def _price_ticker() -> None:
         )
         quote = _quote_html(
             last_price, prev_close, bid_price, bid_size, ask_price, ask_size,
-            previous_minute_high, previous_minute_low, sym_state.symbol,
+            sym_state.symbol,
             today_low=today_low, today_high=today_high,
             current_momentum=current_momentum, daily_momentum=daily_momentum,
+            net_gamma=_live_net_gamma(sym_state),
         )
         if quote:
             st.html(quote)
