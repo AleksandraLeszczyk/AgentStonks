@@ -990,6 +990,31 @@ class TestBarMinutes:
         assert charts._bar_minutes(self.make(["2024-01-15T14:00Z"])) == 1
 
 
+class TestDayRangeLines:
+    def _annotations(self, fig):
+        return [a.text.strip() for a in fig.layout.annotations if a.text]
+
+    def test_both_lines_drawn(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          day_range_lines={"day_low": 99.0, "day_high": 103.0})
+        texts = self._annotations(fig)
+        assert "Day low 99.00" in texts
+        assert "Day high 103.00" in texts
+        levels = {s.y0 for s in fig.layout.shapes if s.y0 == s.y1}
+        assert {99.0, 103.0} <= levels
+
+    def test_only_selected_line_drawn(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          day_range_lines={"day_high": 103.0})
+        texts = self._annotations(fig)
+        assert "Day high 103.00" in texts
+        assert not any(t.startswith("Day low") for t in texts)
+
+    def test_none_by_default(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START)
+        assert not any(t.startswith("Day ") for t in self._annotations(fig))
+
+
 class TestOptionWalls:
     def _annotations(self, fig):
         return [a.text.strip() for a in fig.layout.annotations if a.text]

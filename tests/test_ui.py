@@ -5,6 +5,7 @@ from agent_stonks.ui import (
     _cash_label,
     _venue_badge,
     _portfolio_value_label,
+    _quote_html,
     _starting_value_label,
     build_news_html,
     wrap_text,
@@ -421,3 +422,24 @@ class TestVolumeBandSources:
         ui, state, _ = self.setup(monkeypatch)
         state.timeframe = "1Day"
         assert ui._volume_band_baseline("AAPL", self.bars("sip"), state, "week_band") is None
+
+
+class TestQuoteHtml:
+    def _html(self, **kw):
+        return _quote_html(
+            100.0, 99.0, 99.9, 100, 100.1, 200, "AAPL",
+            today_low=98.0, today_high=101.0, **kw,
+        )
+
+    def test_day_cards_are_clickable_toggles(self):
+        html = self._html()
+        assert 'data-toggle="day_low"' in html
+        assert 'data-toggle="day_high"' in html
+        assert "Prev Min" not in html
+
+    def test_shown_line_card_is_highlighted(self):
+        html = self._html(day_lines={"day_high"})
+        high = html.split('data-toggle="day_high"')[1].split(">")[0]
+        low = html.split('data-toggle="day_low"')[1].split(">")[0]
+        assert config.PALETTE["accent"] in high and "Hide" in high
+        assert config.PALETTE["accent"] not in low and "Show" in low

@@ -739,6 +739,39 @@ def _add_option_walls(
             )
 
 
+_DAY_RANGE_LINES = (("day_high", "Day high"), ("day_low", "Day low"))
+
+
+def _add_day_range_lines(day_range: dict, fig: go.Figure, x0: datetime, x1: datetime) -> None:
+    """Dotted lines at today's low and high, switched on by clicking the Day
+    Low / Day High cards in the Live tab's quote.
+
+    Expects {"day_low": float | None, "day_high": float | None}; a missing key
+    or None skips that line. Both are inside the session's range by
+    definition, so neither can stretch the price axis.
+    """
+    color = PALETTE["text"]
+    for key, label in _DAY_RANGE_LINES:
+        level = day_range.get(key)
+        if level is None:
+            continue
+        fig.add_shape(
+            type="line",
+            x0=x0, x1=x1,
+            y0=level, y1=level,
+            line=dict(color=color, width=1, dash="dot"),
+            row=1, col=1,
+        )
+        fig.add_annotation(
+            xref="x", yref="y",
+            x=x1, y=level,
+            text=f" {label} {level:.2f}",
+            font=dict(color=color, size=10, family="monospace"),
+            showarrow=False,
+            xanchor="left",
+        )
+
+
 # A hover label is one long line unless the text says otherwise, and the
 # reasoning behind a trade is free prose -- a rule agent's few sentences, or a
 # whole LLM paragraph. These are about the widest and tallest tooltip that
@@ -1890,6 +1923,7 @@ def build_chart(
     agent_momentum_label: str = "",
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
+    day_range_lines: Optional[dict] = None,
 ) -> go.Figure:
     if not bars:
         return empty_chart("Waiting for data…")
@@ -2186,6 +2220,8 @@ def build_chart(
             option_walls, fig, df["t"].iloc[0], df["t"].iloc[-1],
             price_low=float(df["l"].min()), price_high=float(df["h"].max()),
         )
+    if day_range_lines:
+        _add_day_range_lines(day_range_lines, fig, df["t"].iloc[0], df["t"].iloc[-1])
     if model_overlays:
         add_model_overlays(
             model_overlays, fig, df["t"].iloc[0], df["t"].iloc[-1],

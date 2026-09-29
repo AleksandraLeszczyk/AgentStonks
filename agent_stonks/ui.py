@@ -131,6 +131,7 @@ from .state import (
 from .tactics import tactic_price_levels, tactics_summaries
 from . import bar_history, minute_momentum, newsimpact_model, stream_common
 from .trade_sound import next_trade_cue, play_trade_sound
+from .quote_card import quote_card
 from .trading_mode import (
     ENV_KEYS as TRADING_ENV_KEYS,
     MODE_LABELS,
@@ -607,7 +608,11 @@ def _quote_html(
     current_momentum: float | None = None,
     daily_momentum: float | None = None,
     net_gamma: float | None = None,
+    day_lines: "set[str] | frozenset[str]" = frozenset(),
 ) -> str:
+    """`day_lines` holds which of "day_low" / "day_high" are drawn on the price
+    chart; those cards get an accent border. Both cards carry a `data-toggle`
+    that `quote_card` reports when clicked."""
     if price is None and bid is None and ask is None:
         return ""
     change = price - prev_close if price is not None and prev_close else None
@@ -639,13 +644,25 @@ def _quote_html(
     else:
         price_row = f'<div style="margin-bottom:6px;">{symbol_chip}</div>'
 
-    def _side(label: str, p: float | None, sz: float | None, color: str) -> str:
+    def _side(
+        label: str, p: float | None, sz: float | None, color: str,
+        toggle: str | None = None,
+    ) -> str:
         if p is None:
             return ""
         size_str = f'<span style="font-size:11px;color:{PALETTE["muted"]};margin-left:4px;">{sz:,.0f}</span>' if sz else ""
+        border = PALETTE["grid"]
+        extra = ""
+        if toggle is not None:
+            shown = toggle in day_lines
+            if shown:
+                border = PALETTE["accent"]
+            verb = "Hide" if shown else "Show"
+            extra = f' data-toggle="{toggle}" title="{verb} this line on the price chart"'
+        cursor = "cursor:pointer;" if toggle is not None else ""
         return (
-            f'<div style="display:flex;flex-direction:column;align-items:center;'
-            f'background:{PALETTE["panel"]};border:1px solid {PALETTE["grid"]};'
+            f'<div{extra} style="display:flex;flex-direction:column;align-items:center;'
+            f'background:{PALETTE["panel"]};border:1px solid {border};{cursor}'
             f'border-radius:8px;padding:8px 16px;min-width:100px;">'
             f'<span style="font-size:10px;font-weight:600;color:{PALETTE["muted"]};'
             f'letter-spacing:0.08em;text-transform:uppercase;margin-bottom:4px;">{label}</span>'
@@ -654,10 +671,10 @@ def _quote_html(
             f'</div>'
         )
 
-    low_card = _side("Day Low", today_low, None, PALETTE["muted"])
+    low_card = _side("Day Low", today_low, None, PALETTE["muted"], toggle="day_low")
     bid_card = _side("Bid", bid, bid_size, "#ef5350")
     ask_card = _side("Ask", ask, ask_size, "#26c6a2")
-    high_card = _side("Day High", today_high, None, PALETTE["muted"])
+    high_card = _side("Day High", today_high, None, PALETTE["muted"], toggle="day_high")
     spread_row = ""
     if bid is not None and ask is not None:
         spread = ask - bid
@@ -720,6 +737,28 @@ def _quote_html(
     )
 
 
+# Day Low / Day High lines on the Live price chart, switched by clicking those
+# cards in the quote: {symbol: {"day_low", "day_high"} subset}.
+_DAY_LINES_STATE_KEY = "live_day_lines"
+_DAY_LINE_KEYS = ("day_low", "day_high")
+
+
+def _day_lines_shown(symbol: str) -> "set[str]":
+    return set(st.session_state.get(_DAY_LINES_STATE_KEY, {}).get(symbol, ()))
+
+
+def _day_range_lines(symbol: str, daily_bars: list[dict], bars: list[dict]) -> "dict | None":
+    """{"day_low": ..., "day_high": ...} for the lines switched on for
+    `symbol`, from the same `_today_range` the quote card shows; None when none
+    are on."""
+    shown = _day_lines_shown(symbol)
+    if not shown:
+        return None
+    low, high, _ = _today_range(daily_bars, bars)
+    levels = {"day_low": low, "day_high": high}
+    return {k: levels[k] for k in _DAY_LINE_KEYS if k in shown}
+
+
 @st.fragment(run_every=POLL_SEC)
 def _price_ticker() -> None:
     state = _get_state()
@@ -742,15 +781,26 @@ def _price_ticker() -> None:
             if last_price is not None and today_open
             else None
         )
+        day_lines = _day_lines_shown(sym_state.symbol)
         quote = _quote_html(
             last_price, prev_close, bid_price, bid_size, ask_price, ask_size,
             sym_state.symbol,
             today_low=today_low, today_high=today_high,
             current_momentum=current_momentum, daily_momentum=daily_momentum,
             net_gamma=_live_net_gamma(sym_state),
+            day_lines=day_lines,
         )
-        if quote:
-            st.html(quote)
+        if not quote:
+            continue
+        clicked = quote_card(quote, key=f"live_quote_{sym_state.symbol}")
+        if clicked in _DAY_LINE_KEYS:
+            st.session_state[_DAY_LINES_STATE_KEY] = {
+                **st.session_state.get(_DAY_LINES_STATE_KEY, {}),
+                sym_state.symbol: day_lines ^ {clicked},
+            }
+            # The chart fragment only polls every CHART_POLL_SEC; rerun the
+            # whole app so the line appears (or goes) straight away.
+            st.rerun(scope="app")
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
@@ -785,6 +835,7 @@ def _chart_panel() -> None:
             sym_state, bars, state.model_overlay_keys
         )
         option_walls = _live_option_walls(sym_state, state.option_walls)
+        day_range_lines = _day_range_lines(sym, sym_state.daily_bars, bars)
 
         fig = build_chart(
             bars,
@@ -819,6 +870,7 @@ def _chart_panel() -> None:
             **_agent_momentum_kwargs(state, sym_state),
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
+            day_range_lines=day_range_lines,
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
