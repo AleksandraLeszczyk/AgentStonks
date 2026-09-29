@@ -155,6 +155,7 @@ def _levels_record(levels: "dict | None") -> "dict | None":
         "config": asdict(config) if is_dataclass(config) else None,
         "rows": list(levels.get("rows") or []),
         "memory": levels.get("memory"),
+        "seed": levels.get("seed"),
     }
 
 
@@ -292,6 +293,7 @@ def _levels_from(record: "dict | None") -> "dict | None":
         "config": config,
         "rows": list(record["rows"]),
         "memory": record.get("memory"),
+        "seed": record.get("seed"),
     }
 
 

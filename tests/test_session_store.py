@@ -48,6 +48,9 @@ def _running_state() -> AppState:
                   "stop": None, "reference": 310.0, "pred_high": 310.0, "pred_low": 290.0}],
         "memory": {"entry": {"price": 300.0, "bars": 3, "ts": bar, "risk": 2.5},
                    "stand_down": None},
+        "seed": {"forecast": {"pred_high": 310.0, "pred_low": 290.0, "adr14_abs": 6.0},
+                 "opening_end": pd.Timestamp("2026-09-28 09:34", tz="America/New_York"),
+                 "open_price": 300.5},
     }
     session_store.claim(state)
     return state
@@ -87,6 +90,8 @@ def test_a_saved_session_comes_back_whole():
     assert row == state.apple_trader_levels["rows"][0]
     assert str(row["t"].tz) == "America/New_York"
     assert levels["memory"]["entry"]["ts"] == row["t"]
+    # What the chart carries the forecast on from after ▶ Stop.
+    assert levels["seed"] == state.apple_trader_levels["seed"]
 
 
 def test_nothing_is_restored_from_another_day(monkeypatch):

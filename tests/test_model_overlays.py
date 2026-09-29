@@ -252,12 +252,16 @@ class TestDayRangeOverlay:
 
     def test_a_breached_forecast_is_drawn_as_a_stepped_band(self, monkeypatch):
         """The tape bottoms at 196.80, under the 198.00 predicted low, so the
-        low is revised and the flat pair becomes two curves -- and under the
-        default "move to the extreme so far" the high follows it down."""
+        low is revised and the flat pair becomes two curves -- and under
+        "move to the extreme so far" the high follows it down."""
         pytest.importorskip("agent_stonks.dayrange_model")
+        from agent_stonks.apple_trader import AppleTraderConfig
+
         self.stub_forecast(monkeypatch)
         items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
-                           daily_bars=[], session_date=SESSION)["items"]
+                           daily_bars=[], session_date=SESSION,
+                           trader_config=AppleTraderConfig(
+                               ticker="AAPL", breach_update="shift"))["items"]
         assert [i["kind"] for i in items] == ["band"]
         band = items[0]
         assert band["label"] == "Pred. high / low"
@@ -270,6 +274,20 @@ class TestDayRangeOverlay:
         assert band["upper"][0] == pytest.approx(210.0)
         assert band["upper"][-1] == pytest.approx(208.80, abs=0.01)
         assert band["upper"][-1] - band["lower"][-1] == pytest.approx(12.0)
+
+    def test_the_default_brownian_revision_ends_at_the_last_bar(self, monkeypatch):
+        """Under the default Brownian update the breached low goes past the
+        session's own 196.80 by the reach still to come and the high follows at
+        the forecast's width -- and nothing is drawn past the newest bar."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+        bars = minute_bars()
+        band = mo.compute([mo.DAY_RANGE_KEY], "AAPL", bars,
+                          daily_bars=[], session_date=SESSION)["items"][0]
+        assert band["kind"] == "band" and not band["forward"]
+        assert band["lower"][-1] < 196.80
+        assert band["upper"][-1] - band["lower"][-1] == pytest.approx(12.0)
+        assert pd.Timestamp(band["t"][-1]) == pd.Timestamp(bars[-1]["t"])
 
     def test_a_breach_on_the_first_bar_still_shows_the_935_forecast_before_it(
         self, monkeypatch
@@ -737,6 +755,30 @@ class TestRecordedTraderLevels:
         monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
         return mo.compute(keys, "AAPL", minute_bars(), daily_bars=[],
                           session_date=SESSION, trader_history=history)["items"]
+
+    def test_a_stopped_runs_forecast_carries_on_to_the_newest_bar(self, monkeypatch):
+        """A run stopped at 09:36 recorded three rows. The prediction is about
+        the session so far, so the bars after them are walked from the run's
+        own forecast (its seed) -- the low revised at the bar that first traded
+        under it, and nothing drawn past the newest bar."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        bars = minute_bars()
+        history = self.history([207.0] * 3, highs=[210.0] * 3)
+        history["seed"] = {
+            "forecast": {"pred_high": 210.0, "pred_low": 198.0, "prev_avg": 200.0,
+                         "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0},
+            "opening_end": pd.Timestamp(f"{SESSION} 09:34", tz="America/New_York"),
+            "open_price": bars[0]["o"],
+        }
+        band = next(i for i in self.compute([mo.DAY_RANGE_KEY], history, monkeypatch)
+                    if i["kind"] == "band")
+        stamps = [pd.Timestamp(t) for t in band["t"]]
+        assert stamps[-1] == pd.Timestamp(bars[-1]["t"])
+        assert band["upper"][:3] == [210.0, 210.0, 210.0]
+        first_under = next(pd.Timestamp(b["t"]) for b in bars if b["l"] < 198.0)
+        at = stamps.index(first_under)
+        assert band["lower"][at - 1] == pytest.approx(198.0)
+        assert band["lower"][at] < 198.0
 
     def test_an_edit_is_drawn_as_a_step_at_the_minute_it_was_adopted(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY],

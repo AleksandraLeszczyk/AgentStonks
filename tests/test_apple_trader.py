@@ -2030,10 +2030,10 @@ class TestStrategySelection:
             dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0, level_source="intraday")
         ) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,levels=intraday,size=95%)"
 
-    def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
-        """`dayrange_config` pins it off; the app's own default does not. "Move
-        to the extreme so far" is "shift" since 2026-09-23."""
-        assert AppleTraderConfig().breach_update == "shift"
+    def test_the_intraday_update_defaults_to_brownian(self):
+        """`dayrange_config` pins it off; the app's own default does not. The
+        Brownian extension since 2026-09-29 ("shift" before)."""
+        assert AppleTraderConfig().breach_update == "brownian"
 
     def test_an_unknown_update_policy_is_refused(self):
         """Read as "off" once a record carries it, but refused while a config is
@@ -2734,6 +2734,68 @@ class TestRecordedLevels:
             line = self._analysis(state)[-1]
             assert f"buy ${row['buy']:,.2f}" in line
             assert f"sell ${row['sell']:,.2f}" in line
+
+
+class TestLateStart:
+    """A run started after 9:35 walks the bars it missed one at a time, so each
+    revision of the forecast lands on the bar that breached it -- not on the
+    minute ▶ Start was pressed -- and under "brownian" is extended by the reach
+    left at that bar. It ends up exactly where a run up since 9:35 would be."""
+
+    BARS = [(108.0, 108.2), (111.0, 112.5), (110.0, 110.5), (113.0, 114.0), (112.0, 112.4)]
+
+    @staticmethod
+    def _state() -> AppState:
+        fresh = AppState()
+        fresh.set_symbols([TICKER])
+        fresh.api_key, fresh.api_secret, fresh.feed = "k", "s", "iex"
+        return fresh
+
+    @staticmethod
+    def _levels(rows):
+        return [(r["t"], r["pred_high"], r["pred_low"], r["buy"], r["sell"]) for r in rows]
+
+    def test_a_late_start_matches_a_run_that_was_up_all_along(
+        self, state, market_open, monkeypatch
+    ):
+        config = dayrange_config(breach_update="brownian", keep_width=True)
+        tape = Tape(monkeypatch)
+        early = at.DayRangeTrader(config)
+        early_tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        for close, high in self.BARS:
+            tape.append(close, high=high)
+            early.run_cycle(DAYRANGE_BUNDLE, state, early_tracker)
+
+        late_state = self._state()
+        late = at.DayRangeTrader(config)
+        late.run_cycle(
+            DAYRANGE_BUNDLE, late_state,
+            DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0)),
+        )
+        # Row for row, the same arithmetic on the same bars.
+        assert self._levels(late_state.apple_trader_levels["rows"]) == self._levels(
+            state.apple_trader_levels["rows"]
+        )
+        for key in ("pred_high", "pred_low", "buy_level", "sell_level"):
+            assert late.plan[key] == pytest.approx(early.plan[key])
+
+    def test_the_revision_is_dated_at_the_breach_not_at_the_start(
+        self, state, market_open, monkeypatch
+    ):
+        tape = Tape(monkeypatch)
+        for close, high in self.BARS:
+            tape.append(close, high=high)
+        trader = at.DayRangeTrader(dayrange_config(breach_update="brownian"))
+        trader.run_cycle(
+            DAYRANGE_BUNDLE, state,
+            DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0)),
+        )
+        rows = {r["t"]: r["pred_high"] for r in state.apple_trader_levels["rows"]}
+        first_breach, before_it = tape.index[6], tape.index[5]
+        assert rows[before_it] == pytest.approx(FORECAST["pred_high"])
+        assert rows[first_breach] > 112.5      # the extreme plus the reach left then
+        caught_up = [e["text"] for e in state.agent_log if "caught up" in e["text"]]
+        assert len(caught_up) == 1 and f"{first_breach:%H:%M}" in caught_up[0]
 
 
 class TestSidebarLevelEdits:

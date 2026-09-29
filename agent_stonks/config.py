@@ -400,7 +400,12 @@ BREACH_LABELS = {
 # setting changes. A SimLab record written before the setting existed replays
 # under "off" and one written under "extreme" replays that
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
-APPLE_TRADER_BREACH_UPDATE = BREACH_SHIFT
+#
+# Since 2026-09-29 the default is "brownian", at the user's request: a breached
+# side goes past the extreme by what the rest of the session is still expected
+# to add, rather than stopping at it. Records name their policy in full
+# (`asdict`), so one made under "shift" still replays as "shift".
+APPLE_TRADER_BREACH_UPDATE = BREACH_BROWNIAN
 
 # Whether the forecast is always widened to hold what the session has actually
 # printed (`dayrange_model.contain_session`). The 9:35 forecast is already

@@ -571,7 +571,8 @@ def compute(
             if OVERLAYS[key].draws(row.get("model_key") or recorded[1].model_key)
         ]
         if own and OVERLAYS[key].draws(recorded[1].model_key):
-            return _day_range_items(_recorded_result(own), day, symbol, key=key, walked=own)
+            walked = own + _after_record(own, trader_history, session, recorded[1])
+            return _day_range_items(_recorded_result(own), day, symbol, key=key, walked=walked)
         return _day_range_items(
             forecast(), day, symbol, session,
             open_price if key == DAY_RANGE_KEY else None, trader_config, key=key,
@@ -859,6 +860,34 @@ def _recorded_levels(
             stamp = stamp.tz_localize(market_hours.MARKET_TZ)
         rows.append({**row, "t": stamp.tz_convert(market_hours.MARKET_TZ)})
     return rows, history["config"]
+
+
+def _after_record(rows: "list[dict]", history: dict, session: pd.DataFrame, config) -> "list[dict]":
+    """The forecast carried on past the last bar a run recorded, or [].
+
+    A run that has been stopped leaves a record ending at the minute it stopped,
+    and the prediction is about the whole session so far. So the bars after it
+    are walked (`session_levels`) from the forecast the run itself started
+    from -- its `seed`, not a fresh model call -- under its configuration, which
+    reproduces the run's own path to the bar and then carries it on. [] when
+    the record predates the seed, or nothing has closed after it.
+    """
+    seed = (history or {}).get("seed")
+    if not seed or not rows or not len(session):
+        return []
+    last = pd.Timestamp(rows[-1]["t"])
+    if session.index[-1] <= last:
+        return []
+    from .apple_trader import session_levels  # heavy-ish, and only here
+
+    opening_end = pd.Timestamp(seed["opening_end"])
+    if opening_end.tzinfo is None:
+        opening_end = opening_end.tz_localize(market_hours.MARKET_TZ)
+    walk = session_levels(
+        config, dict(seed["forecast"]), session,
+        opening_end.tz_convert(session.index.tz), open_price=seed.get("open_price"),
+    )
+    return [row for row in walk if pd.Timestamp(row["t"]) > last]
 
 
 def _recorded_result(rows: "list[dict]") -> dict:

@@ -791,11 +791,11 @@ class TestRuleAgentRecords:
         assert "breach" not in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert today.breach_update == "shift"
+        assert today.breach_update == "brownian"
         assert "levels=" not in agent.signature(today)   # the default source signs nothing
-        assert ",breach=shift" in agent.signature(today)
+        assert ",breach=brownian" in agent.signature(today)
         assert agent.signature(today) != agent.signature(
-            replace(today, breach_update="brownian")
+            replace(today, breach_update="shift")
         )
 
 
@@ -2875,9 +2875,12 @@ class TestBreachShiftRecords:
         assert old.breach_update == "extreme"
         assert ",breach=extreme" in agent.signature(old)
 
-    def test_todays_default_signs_as_shift(self):
+    def test_a_shift_record_still_signs_as_shift(self):
+        """The default moved to "brownian" on 2026-09-29; a record made under
+        "shift" names it, so it keeps its signature."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        assert ",breach=shift" in agent.signature(AppleTraderConfig(model_key="dayrange"))
+        record = agent.to_record(AppleTraderConfig(model_key="dayrange", breach_update="shift"))
+        assert ",breach=shift" in agent.signature(agent.from_record(record))
 
     def test_the_earlier_rule_is_a_valid_sweep_value_but_not_offered(self):
         from simlab import tuning as tu

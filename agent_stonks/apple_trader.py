@@ -1400,6 +1400,15 @@ class DayRangeTrader(BaseTrader):
             "vol_shape": self._vol_shape(state),
             **forecast,
         }
+        # What the forecast started from, published with the record so the
+        # chart can carry the prediction on past the last bar this run read --
+        # after ▶ Stop -- without running the model again
+        # (`model_overlays._after_record`).
+        self.plan["seed"] = {
+            "forecast": dict(forecast),
+            "opening_end": opening.index[-1],
+            "open_price": self.plan["open_price"],
+        }
         self._set_levels(opening.index[-1])
         prior = getattr(state, "apple_trader_levels", None) or {}
         if (
@@ -1420,7 +1429,62 @@ class DayRangeTrader(BaseTrader):
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
         _log(state, {"type": "analysis", "text": self._plan_summary()})
+        self._catch_up(state, frame)
         return True
+
+    def _catch_up(self, state: AppState, frame) -> None:
+        """Walk the bars between the forecast and the newest one, one at a time.
+
+        A run started (or restarted, or switched to another model) after 9:35
+        makes the 9:35 forecast in `_plan_session`, and without this its first
+        cycle would move the range once against everything the session has
+        printed: a breach at 10:15 would be dated at the minute the agent
+        started, and under "brownian" extended by the reach left at *that*
+        minute rather than at 10:15. Walking each bar as `session_levels` does
+        puts every revision at the bar that caused it, and leaves the plan where
+        a run that had been up since 9:35 would have it. The newest bar is left
+        to `run_cycle`, which reads it as its fresh bar.
+
+        Bars the record does not have yet get a row, so the chart draws each
+        revision where it happened; bars an earlier run today already recorded
+        keep what it recorded. No orders and no stop on those rows -- nothing
+        was running to rest one.
+        """
+        plan = self.plan
+        missed = [ts for ts in frame.index[:-1] if ts > plan["opening_end"]]
+        if not missed:
+            return
+        history = plan.setdefault("history", [])
+        recorded_to = pd.Timestamp(history[-1]["t"]) if history else None
+        revised, added = [], False
+        for ts in missed:
+            if self._move_range(frame[frame.index <= ts], ts) is not None:
+                revised.append(ts)
+            self._set_levels(ts)
+            if recorded_to is None or ts > recorded_to:
+                history.append(_levels_row(self.config, plan, ts))
+                added = True
+        if added:
+            # Re-writes the last caught-up row (with an open position's stop, if
+            # a restart resumed one) and publishes the record for the chart.
+            self._record_levels(state, missed[-1])
+        if revised:
+            times = ", ".join(f"{ts:%H:%M}" for ts in revised[:8])
+            if len(revised) > 8:
+                times += f" and {len(revised) - 8} more"
+            _log(
+                state,
+                {
+                    "type": "analysis",
+                    "text": (
+                        f"{self.ticker}: caught up on the {len(missed)} bars since "
+                        f"{plan['opening_end']:%H:%M}. The forecast was revised at the "
+                        f"bars that traded outside it ({times}); predicted range is now "
+                        f"${float(plan['pred_low']):,.2f} – ${float(plan['pred_high']):,.2f}, "
+                        f"buy ${plan['buy_level']:,.2f}, sell ${plan['sell_level']:,.2f}."
+                    ),
+                },
+            )
 
     def _opening_window(self, state: AppState, frame, want: int):
         return fetch_opening_window(state, frame, want, ticker=self.ticker)
@@ -1654,6 +1718,7 @@ class DayRangeTrader(BaseTrader):
             "config": self.config,
             "rows": history,
             "memory": self.memory(),
+            "seed": plan.get("seed"),
         }
 
     def memory(self) -> dict:
