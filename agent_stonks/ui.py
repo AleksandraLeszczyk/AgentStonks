@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -113,7 +113,7 @@ from .premarket import (
     PremarketBriefing,
     launch_premarket_analysis,
 )
-from .options import fetch_options_walls_data
+from .options import fetch_options_walls_data, net_gamma_exposure
 from .performance import compute_equity_curve, decision_markers, summarize
 from .profile_model import predicted_open_profile
 from .report import build_report_html
@@ -584,15 +584,36 @@ def _signed_dollars(value: float) -> str:
     return f"{sign}${mag:,.0f}"
 
 
-def _live_net_gamma(sym_state: SymbolState) -> float | None:
+def _live_net_gamma(sym_state: SymbolState, spot: float | None = None) -> float | None:
     """Total net dealer gamma ($ per 1% move) from the symbol's latest options
-    chain, or None before one has arrived. Also kicks off a background refresh."""
+    chain, at `spot` when given (so the card and the chart panel's last bar
+    agree), or None before a chain has arrived. Also kicks off a background
+    refresh."""
     _refresh_option_chain(sym_state)
     with sym_state.lock:
         data = sym_state.options_chain
     if not data or not data.get("strikes"):
         return None
+    if spot:
+        at_spot = net_gamma_exposure(data, [spot])
+        if at_spot is not None:
+            return float(at_spot[0])
     return float(sum(data["calls_gamma_exposure"]) + sum(data["puts_gamma_exposure"]))
+
+
+def _live_gamma_series(sym_state: SymbolState, bars: list[dict]) -> dict:
+    """The chart's net gamma panel: the latest chain re-priced at each bar's
+    close (`options.net_gamma_exposure`), or a note saying why there is none."""
+    _refresh_option_chain(sym_state)
+    with sym_state.lock:
+        data = sym_state.options_chain
+    if not data or not data.get("strikes"):
+        return {"t": [], "value": [], "note": "Waiting for the options chain (yfinance)"}
+    values = net_gamma_exposure(data, [float(b["c"]) for b in bars])
+    if values is None:
+        return {"t": [], "value": [],
+                "note": "Waiting for the next options chain refresh (within a minute)"}
+    return {"t": [b["t"] for b in bars], "value": values.tolist(), "note": ""}
 
 
 def _quote_html(
@@ -787,7 +808,7 @@ def _price_ticker() -> None:
             sym_state.symbol,
             today_low=today_low, today_high=today_high,
             current_momentum=current_momentum, daily_momentum=daily_momentum,
-            net_gamma=_live_net_gamma(sym_state),
+            net_gamma=_live_net_gamma(sym_state, last_price),
             day_lines=day_lines,
         )
         if not quote:
@@ -801,6 +822,33 @@ def _price_ticker() -> None:
             # The chart fragment only polls every CHART_POLL_SEC; rerun the
             # whole app so the line appears (or goes) straight away.
             st.rerun(scope="app")
+
+
+# How far before the 09:30 open the live chart starts, unless pre-market is on.
+CHART_LEAD_MIN = 5
+
+
+def _chart_start(bars: list[dict], pre_market: bool) -> datetime:
+    """Where the live chart's time axis starts, in UTC: CHART_LEAD_MIN before
+    the open of the latest bar's ET trading day, or that day's midnight -- so
+    every pre-market bar -- with `pre_market` on.
+
+    From the bars' own date rather than the clock (or `SESSION_START`, fixed
+    at import in UTC), so a chart left running overnight, or viewed in the
+    evening, is still about the day its bars are from, and 09:25 is 09:25 ET
+    in winter too.
+    """
+    last = pd.Timestamp(bars[-1]["t"])
+    if last.tzinfo is None:
+        last = last.tz_localize("UTC")
+    day = last.tz_convert(market_hours.MARKET_TZ).normalize()
+    if pre_market:
+        start = day
+    else:
+        start = day + timedelta(
+            hours=market_hours.MARKET_OPEN.hour, minutes=market_hours.MARKET_OPEN.minute,
+        ) - timedelta(minutes=CHART_LEAD_MIN)
+    return start.tz_convert("UTC").to_pydatetime()
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
@@ -821,6 +869,17 @@ def _chart_panel() -> None:
         if not bars:
             continue
         rendered = True
+        chart_start = _chart_start(bars, state.show_pre_market)
+        if pd.Timestamp(bars[-1]["t"]) <= pd.Timestamp(chart_start):
+            st.plotly_chart(
+                empty_chart(
+                    f"{sym}: pre-market — the chart starts at "
+                    f"{pd.Timestamp(chart_start).tz_convert(market_hours.MARKET_TZ):%H:%M} ET "
+                    "(Chart Settings → Pre-market shows it now)"
+                ),
+                width='stretch', key=f"live_chart_{sym}",
+            )
+            continue
 
         # Price levels at which armed tactics (standing conditional orders) execute.
         tactic_levels = tactic_price_levels(sym_state.tactics)
@@ -836,13 +895,14 @@ def _chart_panel() -> None:
         )
         option_walls = _live_option_walls(sym_state, state.option_walls)
         day_range_lines = _day_range_lines(sym, sym_state.daily_bars, bars)
+        net_gamma = _live_gamma_series(sym_state, bars) if state.show_net_gamma else None
 
         fig = build_chart(
             bars,
             sym_state.news,
             sym_state.trades,
             sym,
-            SESSION_START,
+            chart_start,
             ma_periods=state.ma_periods,
             show_fib=state.show_fib,
             show_7d_avg=state.show_7d_avg,
@@ -871,6 +931,7 @@ def _chart_panel() -> None:
             volume_baseline=_volume_baseline(sym, bars, state),
             option_walls=option_walls,
             day_range_lines=day_range_lines,
+            net_gamma=net_gamma,
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
@@ -958,6 +1019,13 @@ def _live_chart_controls() -> None:
                 "without any trade (common on IEX for thin symbols).",
             )
             show_vwap = st.checkbox("VWAP", value=False)
+            show_pre_market = st.checkbox(
+                "Pre-market",
+                value=False,
+                help=f"Show the whole day from its first bar. Off, the chart starts "
+                f"{CHART_LEAD_MIN} minutes before the 09:30 ET open, and every "
+                "panel under it — momentum, net gamma — starts there too.",
+            )
         with c2:
             st.markdown("**Overlays**")
             with _help_row(
@@ -1044,6 +1112,20 @@ def _live_chart_controls() -> None:
                 "minutes when it reads no momentum.\n\n"
                 "Regular session only, and each day starts fresh.",
             )
+            show_net_gamma = st.checkbox(
+                "Net gamma panel",
+                value=True,
+                help="A panel at the bottom, under Momentum Δ: the options "
+                "market's net dealer gamma, in $M per 1% move, at each bar's "
+                "close. Green where dealers are long gamma — their hedging sells "
+                "rallies and buys dips, damping moves — red where they are short "
+                "and their hedging amplifies them.\n\n"
+                "From the nearest expiry within 45 days (yfinance, refreshed every "
+                "minute — the same chain as the Put/Call Walls tab and the Net "
+                "Gamma card). Open interest only changes overnight, so the latest "
+                "chain is re-priced at every bar's close to fill the whole "
+                "session; implied volatility is held at the latest fetch's.",
+            )
 
         st.markdown("**Price Profile Fit**")
         with _help_row(
@@ -1120,6 +1202,8 @@ def _live_chart_controls() -> None:
     state.show_percentile_body = show_percentile_body
     state.show_whiskers = show_whiskers
     state.show_momentum = show_momentum
+    state.show_net_gamma = show_net_gamma
+    state.show_pre_market = show_pre_market
     state.volume_baseline_window = volume_baseline_window
     state.fill_gaps = fill_gaps
     state.vwap_style = "dot" if show_vwap else "hide"
@@ -2294,7 +2378,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     sym_state.news,
                     trades,
                     sym,
-                    SESSION_START,
+                    _chart_start(bars, state.show_pre_market),
                     ma_periods=state.ma_periods,
                     show_fib=state.show_fib,
                     show_7d_avg=state.show_7d_avg,

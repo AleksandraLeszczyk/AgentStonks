@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from agent_stonks.options import _bs_gamma, _select_expiry, fetch_option_chain
+from agent_stonks.options import (
+    _bs_gamma,
+    _select_expiry,
+    fetch_option_chain,
+    net_gamma_exposure,
+)
 
 
 def _future_date(days: int) -> str:
@@ -90,3 +95,30 @@ class TestFetchOptionChain:
 
         data = fetch_option_chain("AAPL", spot=123.0)
         assert data["spot"] == 123.0
+
+
+class TestNetGammaExposure:
+    def _chain(self, monkeypatch):
+        calls, puts = _chain_frames()
+        ticker = FakeTicker([_future_date(30)], calls, puts, spot=100.0)
+        monkeypatch.setattr("agent_stonks.options.yf.Ticker", lambda symbol: ticker)
+        return fetch_option_chain("AAPL")
+
+    def test_at_the_fetch_spot_it_is_the_chains_own_total(self, monkeypatch):
+        data = self._chain(monkeypatch)
+        total = sum(data["calls_gamma_exposure"]) + sum(data["puts_gamma_exposure"])
+        assert net_gamma_exposure(data, [100.0])[0] == pytest.approx(total)
+
+    def test_repriced_at_other_spots_matches_a_fresh_fetch_there(self, monkeypatch):
+        data = self._chain(monkeypatch)
+        spots = [97.0, 103.5]
+        values = net_gamma_exposure(data, spots)
+        for spot, value in zip(spots, values):
+            there = fetch_option_chain("AAPL", spot=spot)
+            total = sum(there["calls_gamma_exposure"]) + sum(there["puts_gamma_exposure"])
+            assert value == pytest.approx(total)
+
+    def test_a_chain_without_ivs_gives_none(self, monkeypatch):
+        data = self._chain(monkeypatch)
+        del data["calls_iv"]
+        assert net_gamma_exposure(data, [100.0]) is None

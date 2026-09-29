@@ -1142,6 +1142,32 @@ def _add_momentum_panels(
                 _add_agent_momentum_line(fig, row, series, label, what)
 
 
+# One panel under the price in the chart with the net gamma row, in pixels.
+GAMMA_PANEL_PX = 122.0
+
+
+def _add_net_gamma_panel(df: pd.DataFrame, fig: go.Figure, row: int, net_gamma: dict) -> None:
+    """Net dealer gamma at each bar's close, a bar per chart bar in $M per 1%
+    move: green where dealers are long gamma (their hedging damps moves), red
+    where short (it amplifies them). See `build_chart`'s `net_gamma`."""
+    stamps = pd.to_datetime(pd.Series(net_gamma.get("t") or [], dtype=object), utc=True)
+    values = pd.Series(
+        [float(v) / 1e6 for v in net_gamma.get("value") or []],
+        index=pd.DatetimeIndex(stamps), dtype=float,
+    )
+    # Only over the candles drawn: the caller's series can reach back into
+    # pre-market bars the chart's start has cut.
+    if len(values):
+        values = values[values.index >= df["t"].iloc[0]]
+    _add_bar_by_bar_panel(
+        df, fig, row, values, None,
+        name="Net gamma",
+        hover="Net gamma %{y:+$,.1f}M per 1% move<extra></extra>",
+        warm_up=net_gamma.get("note") or "No options chain yet",
+        unit="M",
+    )
+
+
 def _add_agent_momentum_line(
     fig: go.Figure, row: int, series: pd.Series, label: str, what: str
 ) -> None:
@@ -1259,8 +1285,10 @@ def _add_bar_by_bar_panel(
     name: str,
     hover: str,
     warm_up: str,
+    unit: str = "",
 ) -> None:
-    """One dollar series as a bar per chart bar, green above zero, red below."""
+    """One dollar series as a bar per chart bar, green above zero, red below.
+    `unit` follows the last value's label ("M" for a series in $M)."""
     if not values.notna().any():
         # Say why the panel is empty rather than leaving a blank box. The panel
         # still gets one invisible trace over the drawn bars' span: its x axis
@@ -1314,7 +1342,7 @@ def _add_bar_by_bar_panel(
     fig.add_annotation(
         x=last_at.tz_convert("UTC"),
         y=value,
-        text=f" {'+' if value >= 0 else '-'}${abs(value):.2f}",
+        text=f" {'+' if value >= 0 else '-'}${abs(value):.2f}{unit}",
         font=dict(
             color=PALETTE["up"] if value >= 0 else PALETTE["down"],
             size=11,
@@ -1924,7 +1952,17 @@ def build_chart(
     volume_baseline: Optional[dict] = None,
     option_walls: Optional[dict] = None,
     day_range_lines: Optional[dict] = None,
+    net_gamma: Optional[dict] = None,
 ) -> go.Figure:
+    """The live price chart: candles and volume, the optional momentum panels
+    and overlays.
+
+    `net_gamma` adds a panel at the bottom -- under the momentum Δ one when
+    that is shown -- with the options chain's net dealer gamma at each bar's
+    close: `{"t": [...], "value": [...], "note": str}`, values in $ per 1%
+    move (`options.net_gamma_exposure`). Empty values draw the panel with
+    `note` in it; None draws no panel.
+    """
     if not bars:
         return empty_chart("Waiting for data…")
 
@@ -1953,14 +1991,29 @@ def build_chart(
     # -- and so at `x2`/`y2`, which `add_model_overlays` addresses by axis id.
     momentum_row = 3 if show_momentum else None
     change_row = 4 if show_momentum else None
+    # Net gamma goes last, so it sits under momentum Δ when that is shown.
+    n_rows = 4 if show_momentum else 2
+    gamma_row = None
+    if net_gamma is not None:
+        n_rows += 1
+        gamma_row = n_rows
+    if gamma_row is None:
+        row_heights = [0.52, 0.16, 0.16, 0.16] if show_momentum else [0.75, 0.25]
+        height = 760 if show_momentum else 520
+    else:
+        # A row more without squeezing the candles: the chart grows by one
+        # panel's worth, and the price keeps the height it has without it.
+        pixels = [395.0] + [GAMMA_PANEL_PX] * (n_rows - 1)
+        row_heights = [p / sum(pixels) for p in pixels]
+        height = int(sum(pixels))
     fig = make_subplots(
-        rows=4 if show_momentum else 2,
+        rows=n_rows,
         cols=2,
         shared_xaxes=True,
         shared_yaxes=True,
         vertical_spacing=0.02,
         horizontal_spacing=0.02,
-        row_heights=[0.52, 0.16, 0.16, 0.16] if show_momentum else [0.75, 0.25],
+        row_heights=row_heights,
         column_widths=[0.8, 0.2],
     )
 
@@ -2103,6 +2156,8 @@ def build_chart(
             change_profile=minute_momentum_change_profile,
             agent_bars=agent_momentum_bars, agent_label=agent_momentum_label,
         )
+    if gamma_row is not None:
+        _add_net_gamma_panel(df, fig, gamma_row, net_gamma)
 
     df_news = pd.DataFrame(news) if news else pd.DataFrame(columns=["created_at", "headline"])
     if not df_news.empty:
@@ -2272,7 +2327,7 @@ def build_chart(
         yaxis2=dict(showgrid=True, gridcolor=PALETTE["grid"], tickfont=dict(size=10)),
         legend=dict(orientation="h", y=1.04, bgcolor="rgba(0,0,0,0)"),
         margin=dict(l=10, r=10, t=50, b=10),
-        height=760 if show_momentum else 520,
+        height=height,
     )
     # Volume on a log scale: the opening and closing bursts run many times a
     # midday bar, and on a linear axis they flatten everything between them.
@@ -2292,6 +2347,19 @@ def build_chart(
                 row=row,
                 col=1,
             )
+    if gamma_row is not None:
+        fig.update_xaxes(showgrid=True, gridcolor=PALETTE["grid"], row=gamma_row, col=1)
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor=PALETTE["grid"],
+            tickfont=dict(size=10),
+            zeroline=False,
+            tickprefix="$",
+            ticksuffix="M",
+            title=dict(text="Net gamma", font=dict(size=10)),
+            row=gamma_row,
+            col=1,
+        )
     return fig
 
 

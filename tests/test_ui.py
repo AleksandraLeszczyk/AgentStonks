@@ -2,6 +2,7 @@ from agent_stonks import config
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
     _agent_momentum,
+    _chart_start,
     _cash_label,
     _venue_badge,
     _portfolio_value_label,
@@ -443,3 +444,30 @@ class TestQuoteHtml:
         low = html.split('data-toggle="day_low"')[1].split(">")[0]
         assert config.PALETTE["accent"] in high and "Hide" in high
         assert config.PALETTE["accent"] not in low and "Show" in low
+
+
+class TestChartStart:
+    """The live chart starts five minutes before the open of its bars' own
+    ET day, or at that day's first bar with pre-market on."""
+
+    @staticmethod
+    def _et(stamp):
+        import pandas as pd
+
+        return pd.Timestamp(stamp).tz_convert("America/New_York")
+
+    def test_five_minutes_before_the_open_in_summer_and_winter(self):
+        for last_bar in ("2026-09-29T15:00:00+00:00", "2026-12-15T16:00:00+00:00"):
+            start = self._et(_chart_start([{"t": last_bar}], pre_market=False))
+            assert (start.hour, start.minute) == (9, 25)
+            assert start.date() == self._et(last_bar).date()
+
+    def test_pre_market_starts_at_the_days_first_bar(self):
+        start = self._et(_chart_start([{"t": "2026-09-29T15:00:00+00:00"}], pre_market=True))
+        assert (start.hour, start.minute) == (0, 0)
+        assert str(start.date()) == "2026-09-29"
+
+    def test_an_evening_bar_is_still_its_own_day(self):
+        # 23:30 ET on the 29th is 03:30 UTC on the 30th.
+        start = self._et(_chart_start([{"t": "2026-09-30T03:30:00+00:00"}], pre_market=False))
+        assert str(start.date()) == "2026-09-29"

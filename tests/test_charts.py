@@ -501,6 +501,53 @@ class TestMomentumPanel:
         assert self.trace(fig, "Momentum").yaxis == "y5"
         assert self.trace(fig, "Momentum change").yaxis == "y7"
 
+    def gamma(self, bars, sign=1.0):
+        return {"t": [b["t"] for b in bars],
+                "value": [sign * 2.5e8 * (i + 1) for i in range(len(bars))], "note": ""}
+
+    def test_net_gamma_sits_under_momentum_change(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          net_gamma=self.gamma(bars))
+        # Row 5 col 1 is y9, under momentum Δ's y7.
+        tr = self.trace(fig, "Net gamma")
+        assert tr.yaxis == "y9"
+        assert list(tr.y)[:2] == pytest.approx([250.0, 500.0])   # $M
+        # The candles keep their height: the chart grows instead.
+        assert fig.layout.height > 760
+
+    def test_net_gamma_is_under_the_volume_without_momentum(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          net_gamma=self.gamma(bars, sign=-1.0))
+        tr = self.trace(fig, "Net gamma")
+        assert tr.yaxis == "y5"
+        assert set(tr.marker.color) == {charts.PALETTE["down"]}
+
+    def test_net_gamma_only_over_the_candles_drawn(self):
+        """The series can reach back into pre-market bars the chart's start
+        has cut; none of those are drawn."""
+        bars = self.rth_bars(60)
+        early = pd.Timestamp(bars[0]["t"]) - pd.Timedelta(hours=5)
+        series = self.gamma(bars)
+        series["t"] = [early.isoformat()] + series["t"]
+        series["value"] = [9.9e9] + series["value"]
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          net_gamma=series)
+        tr = self.trace(fig, "Net gamma")
+        assert pd.to_datetime(list(tr.x), utc=True).min() >= pd.Timestamp(bars[0]["t"])
+        assert len(tr.y) == len(bars)
+
+    def test_no_chain_yet_says_so_in_the_panel(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True,
+                          net_gamma={"t": [], "value": [], "note": "Waiting for the chain"})
+        assert any(a.text == "Waiting for the chain" for a in fig.layout.annotations)
+
+    def test_no_net_gamma_panel_by_default(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        assert "Net gamma" not in [tr.name for tr in fig.data]
+        assert fig.layout.height == 760
+
     def test_price_profile_keeps_its_axis_ids(self):
         # add_model_overlays addresses the profile column as x2/y2, so the
         # extra rows have to be appended rather than inserted.

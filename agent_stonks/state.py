@@ -254,6 +254,8 @@ _DEFAULTS: dict[str, object] = {
     "show_percentile_body": False,
     "show_whiskers": True,
     "show_momentum": True,
+    "show_net_gamma": True,
+    "show_pre_market": False,
     "volume_baseline_window": DEFAULT_VOLUME_BASELINE,
     "fill_gaps": True,
     "agent_log": [],
@@ -378,6 +380,11 @@ class AppState:
         self.show_whiskers: bool = True
         # Draw the session momentum score in a panel under the price/volume.
         self.show_momentum: bool = True
+        # Draw the options chain's net dealer gamma in a panel under momentum Δ.
+        self.show_net_gamma: bool = True
+        # Start the live chart at the day's first bar rather than
+        # CHART_LEAD_MIN before the open (`ui._chart_start`).
+        self.show_pre_market: bool = False
         # Which prior window the volume panel's "usual volume" references are
         # built from -- a key of volume_baseline.VOLUME_BASELINE_WINDOWS.
         self.volume_baseline_window: str = DEFAULT_VOLUME_BASELINE
