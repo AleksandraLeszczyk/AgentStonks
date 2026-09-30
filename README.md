@@ -35,6 +35,9 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 ### 🌅 Pre-Market tab
 - **Premarket briefing** — an LLM synthesis of recent news, historical price context, macro indicators, and fundamentals into a structured morning briefing (catalysts, technical levels, outlook) per symbol, generated on demand before the session opens
 
+<img width="938" height="705" alt="obraz" src="https://github.com/user-attachments/assets/1389c411-41b6-4023-95de-bd3ec4584060" />
+
+
 ### 🗂️ Historical tab
 - **Price history** — daily closes over 7 days to 5 years, plotted against SPY and VIX
 - **Expert price targets** — each analyst firm's dated price targets (from Yahoo's analyst actions feed) drawn as piecewise lines over the shown period, toggleable per symbol and per firm (via the chart legend)
