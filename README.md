@@ -1,4 +1,4 @@
-<img width="1025" height="672" alt="image" src="https://github.com/user-attachments/assets/6f68cbeb-dfa3-40dc-b7dd-222f1583a07b" />
+<img width="1396" height="729" alt="Screenshot 2026-09-30 at 10 48 45" src="https://github.com/user-attachments/assets/e09bac30-4167-43e3-a9f1-4b9b40964068" />
 
 
 # AgentStonks
@@ -100,6 +100,8 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - **Daily accuracy scoring** — a per-session scorecard accumulates a deterministic grounding check (every number the model states in a decision must trace back to a number it was actually shown) plus tool errors and tactics-validation rejections; at most once per UTC day, and only once the day has accumulated an hour of agent runtime, these are aggregated into a scoring report and, when Langfuse is configured, registered there as a `daily-grounding` score; each finished session additionally registers a `session-profit-efficiency` score — the session's portfolio return divided by the maximum profit an oracle's best single round trip could have made on the session's symbols (buy the session minimum and sell the highest later price, or sell the session maximum having bought the lowest earlier price, whichever is larger)
 - **Optional LLM observability** — when Langfuse credentials are set, each agent cycle is traced end-to-end (tool calls, token usage, latency) via `observability.py`; a no-op otherwise
 - **Data-source logging** — every fetch (WebSocket stream, Alpaca REST, yfinance, WorldNews) logs which source served the data and which fallbacks were tried, de-duplicated so repeated identical outcomes don't flood the console
+
+<img width="796" height="615" alt="Screenshot 2026-09-30 at 10 54 31" src="https://github.com/user-attachments/assets/f4cec5aa-53a9-4313-ac7d-7ded9d6c1467" />
 
 ### 🧪 SimLab — strategy testing suite (`sim_main.py`)
 A separate app that replays the trading agents against **stored historical sessions** instead of the live tape — same prompts, same tools, same execution path (`run_agent_cycle`, `DecisionTracker`, `TacticsExecutor`), so a strategy tested here is exactly the strategy that trades live. Hours of "wait for the condition" collapse into minutes: between LLM cycles the engine fast-forwards bar by bar, firing armed tactics, condition alerts, and news wake-ups deterministically from the stored data.
