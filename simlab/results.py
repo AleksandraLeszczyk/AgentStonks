@@ -38,18 +38,10 @@ MULTI_INSTRUMENT = "(multi-instrument)"
 # file is JSON on disk and a breakdown should not lose a run to a missing key.
 UNKNOWN_INSTRUMENT = "(unknown)"
 
-# A rule run whose rules name no saved model -- a set written on price, the
-# momentum regime, the position and the clock is a complete strategy and
-# deliberately loads nothing. It is a real answer to "which ML model", not a
-# missing one, and it is the row that says what the models are worth.
-NO_ML_MODEL = "(no model — tape rules)"
 # An LLM run has no saved model at all, so on this axis it is grouped by
 # provider. Prefixed so the two kinds of thing sharing the axis stay
 # distinguishable: `results` keeps the key, the UI renders the label.
 LLM_MODEL_PREFIX = "llm:"
-# Several models in one rule set join with this, in `apple_models` registry
-# order so the same combination always produces the same key.
-ML_MODEL_JOIN = "+"
 
 
 # ---------------------------------------------------------------------------
@@ -241,16 +233,8 @@ def ml_models(record: dict) -> "list[str] | None":
     per run, with an answer for every run so none falls out of a breakdown.
     This one wants the models themselves, so the Results chart can draw what
     they predicted (`model_overlays.for_models`), and there an honest "I don't
-    know" is better than a sentinel -- an LLM run and a record whose rule set
-    no longer decodes both mean "do not claim a model made these trades".
-
-    `[]` is a real answer and a different one: a rule set written on price, the
-    regime and the clock loaded no model at all.
-
-    Rule sets are decoded rather than string-matched, so a condition renamed in
-    `apple_rules` moves this answer with it instead of silently naming a model
-    that is no longer read. Nothing heavy is imported: `apple_rules` reaches
-    `apple_models` for the registry and neither pulls in PyTorch.
+    know" is better than a sentinel -- an LLM run and a rule record that names
+    no model both mean "do not claim a model made these trades".
     """
     config = record.get("config_summary") or {}
     if not config.get("rule_based"):
@@ -260,15 +244,6 @@ def ml_models(record: dict) -> "list[str] | None":
     named = str(rule_config.get("model_key") or "").strip()
     if named:
         return [named]
-    # Apple Trader 2: whatever its enabled conditions name.
-    if "rules" in rule_config:
-        try:
-            from agent_stonks.apple_rules import RuleSet
-
-            return RuleSet.from_record(rule_config["rules"]).models()
-        except Exception:
-            # A stored record is JSON on disk and may predate a rule schema.
-            return None
     return None
 
 
@@ -277,25 +252,20 @@ def ml_model_key(record: dict) -> str:
 
     A different question from `model_key`, which is the *LLM* behind a run (and
     the rule set's signature where there is no LLM). This one asks what the app
-    actually loaded out of `Code/Models`, and the three kinds of run answer it
+    actually loaded out of `Code/Models`, and the two kinds of run answer it
     differently:
 
     * **Apple Trader** is one model by construction -- the model it names is
       the strategy, and picking a different one changes which rules exist. Its
       `model_key` is the answer.
-    * **Apple Trader 2** names models per *condition*, so a rule set reads
-      however many it mentions: none (price and momentum alone), one, or
-      several. The set is the key, joined in registry order so the same
-      combination is always the same row.
     * an **LLM agent** loads no saved model at all. Grouping every LLM run into
       one row would hide the comparison worth making on this axis, so they are
       grouped by **provider** -- which is the closest thing an LLM run has to
       "which model produced this", at a granularity that stays readable beside
       four ML rows.
 
-    Which models a rule run loaded is `ml_models`' answer; this adds the
-    grouping rules on top of it -- the join, and a name for the two cases that
-    have no model to name.
+    Which model a rule run loaded is `ml_models`' answer; this adds a name for
+    the case that has none to name.
     """
     config = record.get("config_summary") or {}
     if not config.get("rule_based"):
@@ -305,11 +275,9 @@ def ml_model_key(record: dict) -> str:
     models = ml_models(record)
     # An unreadable configuration is still a run that happened; losing it from
     # the breakdown would be worse than filing it as unknown.
-    if models is None:
+    if not models:
         return UNKNOWN_INSTRUMENT
-    if models:
-        return ML_MODEL_JOIN.join(models)
-    return NO_ML_MODEL
+    return models[0]
 
 
 def agent_key(record: dict) -> str:
@@ -320,7 +288,7 @@ def agent_key(record: dict) -> str:
 
 # Sentinels are answers, not names, and they read as noise at the top of an
 # option list -- so every option list sorts them to the end.
-_SENTINELS = (NO_DATASET, NO_ML_MODEL, MULTI_INSTRUMENT, UNKNOWN_INSTRUMENT)
+_SENTINELS = (NO_DATASET, MULTI_INSTRUMENT, UNKNOWN_INSTRUMENT)
 
 
 def _sorted_options(keys: "set[str]") -> list[str]:
@@ -391,7 +359,7 @@ def filter_runs(
 # -0.52% off the $89.93 high..." is a complete answer -- and this only adds the
 # headline, so a chart hover says *which kind* of thing fired before the reader
 # has parsed the sentence. Every opening below is a literal from
-# `apple_trader`, `apple_trader2` or the LLM agent's tactic executor.
+# `apple_trader` or the LLM agent's tactic executor.
 #
 # Order matters: the first marker that matches wins, so more specific openings
 # come before the prefixes they extend. Anything unrecognised falls back to no
@@ -399,7 +367,7 @@ def filter_runs(
 # changes loses the headline and never gains a wrong one.
 _DECISION_TRIGGERS: "tuple[tuple[str, str], ...]" = (
     # --- Apple Trader's removed momentum strategy: kept so stored runs keep
-    # their tags (the trailing stop is also what Apple Trader 2 rules write) ---
+    # their tags ---
     ("trailing stop:", "Trailing stop"),
     ("forecast reversal:", "ML forecast — reversal"),
     ("momentum regime is still", "ML forecast — anticipated turn"),
@@ -414,8 +382,6 @@ _DECISION_TRIGGERS: "tuple[tuple[str, str], ...]" = (
     ("the model puts the next 15 bars at", "ML forecast — turn upwards"),
     # --- every Apple Trader strategy: the closing bell, not a signal ---
     ("session ends in", "Flattened at the close"),
-    # --- Apple Trader 2: the rule set says which rule, and its label says why ---
-    ("rule ", "Rule fired"),
     # --- the LLM agents, whose fills come from tactics they armed earlier ---
     ("tactics triggered", "Armed tactic"),
 )

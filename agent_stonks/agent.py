@@ -96,9 +96,8 @@ from .agent_tools import (  # noqa: F401
 
 
 # The agent log belongs to the state, not to this module -- see
-# `state.append_agent_log`. Kept as a name here because `apple_trader`,
-# `apple_trader2` and `automatic` have imported `_log` from `agent` since
-# before that was true.
+# `state.append_agent_log`. Kept as a name here because `apple_trader` and
+# `automatic` have imported `_log` from `agent` since before that was true.
 _log = append_agent_log
 
 

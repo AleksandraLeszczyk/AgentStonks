@@ -953,11 +953,8 @@ def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAUL
     IEX bars under the name of whichever consolidated feed was asked first, and
     the caveat that should have been logged would not be.
 
-    Module-level rather than a method because both day-range consumers need it
-    and they are not related by inheritance: `DayRangeTrader` here, and Apple
-    Trader 2's `SessionForecaster`, which makes the same forecast only when some
-    rule asks for it. `ticker` is the symbol the caller trades, and only matters on
-    the re-fetch path, since `frame` is already the right symbol's bars.
+    `ticker` is the symbol the caller trades, and only matters on the re-fetch
+    path, since `frame` is already the right symbol's bars.
     """
     buffered = frame.iloc[:want]
     covers_open = float(buffered["minutes_from_open"].iloc[0]) < 1.0

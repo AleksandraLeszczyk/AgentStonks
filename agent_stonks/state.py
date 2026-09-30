@@ -337,10 +337,6 @@ class AppState:
         # `DayRangeTrader._record_levels`. The chart draws this in place of a
         # re-derived walk, so its levels are the ones the log quotes.
         self.apple_trader_levels = None
-        # The Apple Trader 2 rule set the sidebar currently holds, so the chart
-        # can tell whether the selected agent reads momentum. None whenever
-        # another personality is selected. Written only by the form.
-        self.apple_trader2_config = None
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"

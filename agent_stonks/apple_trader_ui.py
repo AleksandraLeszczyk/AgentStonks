@@ -1,8 +1,8 @@
 """The Streamlit form Apple Trader is configured in, for both apps.
 
-One module rather than one per app, for the reason `apple_rules_ui` gives about
-the rule builder: the live dashboard and SimLab both offer this agent, and two
-copies of a form drift the first time a range is widened or a knob is added.
+One module rather than one per app: the live dashboard and SimLab both offer
+this agent, and two copies of a form drift the first time a range is widened or
+a knob is added.
 They had already been forked once -- `ui.py` and `simlab/app.py` each carried
 their own copy of these functions -- and the copies still agreed on every
 range, step and format, which is exactly the state in which merging them is
@@ -124,9 +124,7 @@ def instrument_row(
 ) -> str:
     """The symbol this run trades, out of the ones a model exists for.
 
-    Not a free-text field, unlike Apple Trader 2's: there every signal but the
-    model forecasts is computed from the tape, so any symbol is a working
-    configuration. Here the model *is* the strategy, so the list is exactly
+    Not a free-text field: the model *is* the strategy, so the list is exactly
     `apple_models.tickers()`.
     """
     options = apple_models.tickers()

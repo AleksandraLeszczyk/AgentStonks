@@ -722,8 +722,7 @@ class TestTraderLevelsOverlay:
 
     def test_it_is_never_auto_selected_by_a_runs_model(self):
         """`for_models` pre-selects what a model said. These are one agent's
-        orders, and an Apple Trader 2 run that merely reads the same forecast
-        rested nothing of the kind."""
+        orders, not a forecast of the day."""
         for key in apple_models.keys():
             assert mo.TRADER_LEVELS_KEY not in mo.for_models([key], "AAPL")["keys"]
 

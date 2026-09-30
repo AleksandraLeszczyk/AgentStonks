@@ -41,8 +41,6 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
 )
 from agent_stonks import apple_trader_ui
-from agent_stonks.apple_rules_ui import rules_panel, signal_catalogue
-from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
 from agent_stonks.charts import (
     add_candle_patterns,
     add_model_overlays,
@@ -208,95 +206,15 @@ def _render_rule_agent(personality: str) -> None:
     """A rule agent's "prompt": its rules, and whatever they depend on.
 
     There is nothing to edit here the way a system prompt is edited -- the
-    thresholds (Apple Trader) and the rule list (Apple Trader 2) are
-    per-simulation settings, picked in the Simulate tab -- so this is a
-    read-only description of what the loop does.
+    thresholds are per-simulation settings, picked in the Simulate tab -- so
+    this is a read-only description of what the loop does.
     """
     st.subheader(_agent_label(personality))
     st.caption(
         ":material/function: Rule-based — no LLM, no prompt, no tools. The same tape "
         "always produces the same trades."
     )
-    if personality == APPLE_TRADER2_KEY:
-        _render_apple2_rules()
-        return
     _render_apple_rules()
-
-
-def _render_apple2_rules() -> None:
-    """What Apple Trader 2 is: a vocabulary, and whatever list is written in it.
-
-    Nothing to describe as *the* strategy, because there isn't one -- so what
-    this page owes the reader instead is the vocabulary itself, the rules the
-    engine applies around whatever list it is handed, and which of the shipped
-    strategies can be reproduced in it (all of them).
-    """
-    st.markdown(
-        "The same fixed loop over one symbol's minute bars as Apple Trader, with the "
-        "strategy taken out of the code. A run is configured with an **instrument** and "
-        "a **list of action items**, each one a buy or a sell, a size, and the "
-        "conditions that arm it — written in the **Simulate** tab and carried on the "
-        "experiment record, the way a prompt is for an LLM agent. Like Apple Trader it "
-        "states no reasoning of its own, so the judge never scores it: profit, profit "
-        "efficiency and the oracle ceiling are the whole verdict."
-    )
-
-    st.markdown("##### What one rule is")
-    st.markdown(
-        "- **An action** — buy or sell.\n"
-        "- **A size** — a percentage (of cash on a buy, of the position on a sell), a "
-        "dollar amount, or a share count. Every mode is clipped to what the ledger can "
-        "do, so a rule set is portable across starting balances.\n"
-        "- **Conditions** — one or more, each a signal against a number, joined by "
-        "**AND** or **OR**. One joiner per rule: `A and B or C` has no meaning without "
-        "precedence rules, and a genuine mix is two rules.\n"
-        "- Optionally a **cooldown**: bars the rule sits out after firing, so a "
-        "condition that stays true ladders in only if that was the intent."
-    )
-
-    st.markdown("##### What the engine adds")
-    st.markdown(
-        "- **At most one action per closed bar**, and the **first matching rule wins** — "
-        "the list is a priority order. A rule that matches but cannot transact (a sell "
-        "with the book flat, a buy with no cash) is passed over rather than eating the "
-        "bar, so an exit written above an entry does not block it.\n"
-        "- **An absent signal never matches** — not in an AND and not in an OR. A model "
-        "asked about a bar it was not fitted for, a day-range forecast before 9:35, a "
-        "P&L with no position: all read as nothing, and nothing fires a rule.\n"
-        "- **The flatten before the close is not a rule** and cannot be deleted. Every "
-        "signal here is intraday and none survives the overnight gap.\n"
-        "- **Nothing is computed that no rule reads.** The bundles loaded are the ones "
-        "the conditions name, the day-range forecast is made only if something asks, and "
-        "conditions short-circuit within a rule."
-    )
-
-    st.markdown("##### The signals a condition can read")
-    st.caption(
-        "The day-range model is here as *signals*, not as a strategy: a rule set can "
-        "read its forecast without adopting Apple Trader's two levels. What the "
-        "forecast is worth is the same open question it is under Apple Trader — see "
-        "that agent's page. This is the full catalogue, which is what "
-        f"{apple_models.DEFAULT_TICKER} offers; every other instrument gets the subset "
-        "its models cover — "
-        + "; ".join(
-            f"**{symbol}**: "
-            + ", ".join(
-                apple_models.get(k).label for k in apple_models.keys_for(symbol)
-            )
-            for symbol in apple_models.tickers()
-        )
-        + ". Anything else reads the tape, the momentum regime, the position and the "
-        "clock only."
-    )
-    signal_catalogue()
-
-    st.info(
-        ":material/lightbulb: Apple Trader's strategy is expressible here, and ships as "
-        "a preset — so a rule set can be compared against the thing it was meant to "
-        "improve on rather than against an intuition. What the vocabulary adds beyond "
-        "it is partial exits, scaled entries, and the forecast crossed with the tape's "
-        "momentum regime."
-    )
 
 
 def _render_apple_rules() -> None:
@@ -606,9 +524,7 @@ def _decision_hover(decision: dict) -> str:
 
     The "why" is the reason the trader wrote at decision time, which already
     names the condition that fired -- a trailing stop names the give-back it
-    passed, a model entry names the probability and the threshold it cleared,
-    an Apple Trader 2 fill names the rule and every condition with the value it
-    held. None of that was reachable from the chart before; it was in the
+    passed, an Apple Trader fill names the level it reached. None of that was reachable from the chart before; it was in the
     Decisions table, several scrolls from the marker that raised the question.
 
     `results.decision_trigger` supplies the headline above it, so the kind of
@@ -1521,12 +1437,11 @@ def _render_rule_params(
     it is swept (`_render_apple_sweep`) and a grid of them after, and nothing
     downstream needs to know which setup a configuration came from.
 
-    `symbols` is every symbol the selected datasets carry, offered to the agents
-    that pick their own instrument.
+    `symbols` is every symbol the selected datasets carry, offered to the
+    instrument pickers.
     """
     renderers = {
         APPLE_TRADER_KEY: _render_apple_setup,
-        APPLE_TRADER2_KEY: _render_apple2_setup,
     }
     return {
         key: _render_agent_setups(key, symbols, renderers[key])
@@ -1620,46 +1535,6 @@ def _render_agent_setups(personality: str, symbols: list[str], renderer) -> list
             "something the signature carries (it is shown under each setup)."
         )
     return configs
-
-
-def _render_apple2_setup(
-    symbols: list[str], prefix: str
-) -> "list[AppleTrader2Config]":
-    """Apple Trader 2's entry in the Simulate tab, as a one-element grid.
-
-    Every setup the tab renders hands back a list of configurations, so that a
-    swept one and a plain one queue through the same path. This agent has no
-    sweep: its strategy is a list of action items rather than a handful of
-    numbers, so "every combination of the selected rules" is not a grid over a
-    few fields -- add a second setup to compare two rule sets.
-    """
-    return [_render_apple2_params(symbols, prefix)]
-
-
-def _render_apple2_params(symbols: list[str], prefix: str) -> AppleTrader2Config:
-    """One Apple Trader 2 setup.
-
-    The same builder the live dashboard renders, under its own widget prefix --
-    the two apps run in separate processes, but the prefix is what keeps a rule
-    set edited here from being confused with one edited there if they ever do
-    not.
-
-    There is no model picker: which bundles a run loads falls out of which
-    signals the rules read, so a rule set written on price and momentum queues
-    without needing any saved artifact at all. There *is* an instrument picker,
-    seeded with the symbols the selected datasets carry -- a run reads one
-    symbol's bars and a dataset without it cannot be replayed, which is what
-    `_rule_agents_missing_ticker` checks before anything is queued.
-    """
-    st.caption(
-        "One list of buy/sell rules, checked in order on every closed minute bar. "
-        "Each rule is an action, a size and the conditions that arm it, joined by "
-        "AND or OR; the first rule that matches *and* can transact takes the bar. "
-        "The instrument and the rule set together are the configuration Results "
-        "groups these runs by, so moving one number queues a new configuration to "
-        "compare rather than a repeat."
-    )
-    return rules_panel(prefix, symbols=symbols)
 
 
 # SimLab's half of the Apple Trader form (see `agent_stonks.apple_trader_ui`).
@@ -2330,33 +2205,28 @@ def _ml_model_label(key: str) -> str:
     """One ML-model breakdown row, named for a reader rather than for the store.
 
     Three shapes, because `results.ml_model_key` produces three: a provider for
-    an LLM run, a set of `apple_models` keys for a rule run, and the sentinels
-    for a rule set that names none. Model names come from the registry, so
-    renaming a model there moves the row label with it.
+    an LLM run, an `apple_models` key for a rule run, and the sentinel for a
+    rule run that names none. Model names come from the registry, so renaming a
+    model there moves the row label with it.
 
     The names are shortened to what identifies the model -- the breakdown table
-    does not wrap, and a rule set naming two models would otherwise put a
-    hundred characters in the first column.
+    does not wrap.
     """
     if key.startswith(sim_results.LLM_MODEL_PREFIX):
         return f"{key[len(sim_results.LLM_MODEL_PREFIX):]} (LLM)"
-    if not key or key in (sim_results.NO_ML_MODEL, sim_results.UNKNOWN_INSTRUMENT):
+    if not key or key == sim_results.UNKNOWN_INSTRUMENT:
         return key or sim_results.UNKNOWN_INSTRUMENT
-
-    def _short(model_key: str) -> str:
-        # Membership, not `apple_models.get`: that deliberately falls back to
-        # the default model for an unknown key so a stored run still replays,
-        # which here would print a real model's name over a key that is not
-        # one. A key this does not recognise is shown as itself.
-        model = apple_models.MODELS.get(model_key)
-        if model is None:
-            return model_key
-        label = model.label
-        for cut in (" (", " →"):
-            label = label.split(cut)[0]
-        return label.strip() or model_key
-
-    return " + ".join(_short(k) for k in key.split(sim_results.ML_MODEL_JOIN))
+    # Membership, not `apple_models.get`: that deliberately falls back to the
+    # default model for an unknown key so a stored run still replays, which
+    # here would print a real model's name over a key that is not one. A key
+    # this does not recognise is shown as itself.
+    model = apple_models.MODELS.get(key)
+    if model is None:
+        return key
+    label = model.label
+    for cut in (" (", " →"):
+        label = label.split(cut)[0]
+    return label.strip() or key
 
 # Ranking metrics for the top-runs cards, mapped to their `summary` keys.
 # "Return" rather than "Best return": which end of the ranking is shown is a
@@ -2677,9 +2547,7 @@ def render_summary_tab() -> None:
     if dimension == "ml_model":
         st.caption(
             ":material/info: What the run's decisions actually came out of. Apple "
-            "Trader names one model and that model *is* its strategy; Apple Trader 2 "
-            "names them per condition, so a rule set reads none, one or several and "
-            "the set is the row. An LLM agent loads no saved model at all, so those "
+            "Trader names one model and that model *is* its strategy. An LLM agent loads no saved model at all, so those "
             "runs are grouped by **provider** — the rows are comparable as "
             "*approaches*, not as one model against another."
         )

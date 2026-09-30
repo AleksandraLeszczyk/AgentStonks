@@ -14,10 +14,10 @@ Results, and how to build a trader exposing a uniform
 ``run_cycle(state, tracker)`` -- which is what hides Apple Trader's extra
 ``bundle`` argument from the day loop.
 
-The ticker is asked of the *config* rather than of the agent, because both of
-them pick their instrument -- Apple Trader from the symbols its chosen model was
-fitted on, Apple Trader 2 from anything the dataset carries. Both are still
-single-symbol per run, which is what the dataset check depends on.
+The ticker is asked of the *config* rather than of the agent, because the agent
+picks its instrument -- Apple Trader from the symbols its chosen model was
+fitted on. It is still single-symbol per run, which is what the dataset check
+depends on.
 """
 from __future__ import annotations
 
@@ -43,17 +43,6 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
-from agent_stonks.apple_trader2 import (
-    APPLE_TRADER2_AVATAR,
-    APPLE_TRADER2_KEY,
-    APPLE_TRADER2_LABEL,
-    AppleTrader2Config,
-)
-from agent_stonks.apple_trader2 import DEFAULT_TICKER as APPLE_TRADER2_TICKER
-from agent_stonks.apple_trader2 import build_trader as build_apple2
-from agent_stonks.apple_trader2 import config_error as apple2_config_error
-from agent_stonks.apple_trader2 import config_signature as apple2_config_signature
-from agent_stonks.apple_trader2 import load_bundles as apple2_load_bundles
 
 
 @dataclass(frozen=True)
@@ -238,29 +227,6 @@ def _apple_from_record(raw: "dict | None") -> AppleTraderConfig:
     return AppleTraderConfig(**{k: v for k, v in merged.items() if k in _APPLE_FIELDS})
 
 
-# ---------------------------------------------------------- Apple Trader 2
-
-
-def _build_apple2(config: AppleTrader2Config):
-    """Apple Trader 2 plus whichever bundles its rules name, or a clear failure.
-
-    Same shape as `_build_apple` and for the same reason -- a missing model
-    would otherwise produce a run that never trades, which reads like a strategy
-    result rather than an installation problem. The difference is which bundles
-    get loaded: here it is whatever the *rules* name, which for a set written
-    out of price and momentum alone is none at all.
-
-    No `_BundleBound` wrapper: this trader's `run_cycle` already takes only
-    (state, tracker), since the bundles it needs are decided by the rules and
-    held on the trader.
-    """
-    bundles = apple2_load_bundles(config)
-    mismatch = apple2_config_error(config, bundles)
-    if mismatch is not None:
-        raise RuntimeError(mismatch)
-    return build_apple2(config, bundles)
-
-
 # ------------------------------------------------------------------ registry
 
 RULE_AGENTS: dict[str, RuleAgent] = {
@@ -277,22 +243,6 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         signature=apple_config_signature,
         to_record=asdict,
         from_record=_apple_from_record,
-    ),
-    APPLE_TRADER2_KEY: RuleAgent(
-        key=APPLE_TRADER2_KEY,
-        label=APPLE_TRADER2_LABEL,
-        avatar=APPLE_TRADER2_AVATAR,
-        ticker=lambda config: config.ticker,
-        default_ticker=APPLE_TRADER2_TICKER,
-        build=_build_apple2,
-        signature=apple2_config_signature,
-        # The config owns its own JSON shape here rather than falling out of
-        # `asdict`: it nests (a rule set of action items of conditions), and the
-        # decoder has to rebuild those dataclasses rather than hand the trader
-        # dicts. There is no legacy-defaults map to go with it, because no
-        # record of this agent predates any of its fields.
-        to_record=AppleTrader2Config.to_record,
-        from_record=AppleTrader2Config.from_record,
     ),
 }
 

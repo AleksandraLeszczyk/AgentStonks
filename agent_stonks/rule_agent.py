@@ -1,11 +1,9 @@
 """What every rule-based (non-LLM) agent does the same way.
 
-Two state machines live in `apple_trader` and `apple_trader2`, and they trade
-on unrelated ideas: a day-range forecast and a user-written rule list. What
-they do *around* the idea is identical, and was once written out per agent --
-the same
-pre-flight guards, the same position sizing, the same order and log calls, the
-same clock-aligned loop, the same launcher.
+The state machine in `apple_trader` trades on a day-range forecast, but what
+it does *around* that idea is not specific to it, and was once written out per
+agent -- the same pre-flight guards, the same position sizing, the same order
+and log calls, the same clock-aligned loop, the same launcher.
 
 That shared half is here. The split is deliberate and narrow: this module owns
 nothing about *when to trade*. It never inspects a bar, a probability or a
@@ -17,14 +15,14 @@ template method over them would have been an abstraction over a coincidence.
 What is shared, and why each piece is
 -------------------------------------
 * **the pre-flight**. An agent whose symbol is not streamed, or a session that
-  is closed, is the same non-event for all four; both return before anything
-  reads a bar.
+  is closed, is the same non-event for every strategy; each returns before
+  anything reads a bar.
 * **the flatten window**. Intraday features do not survive the overnight gap,
   so every strategy here closes before the bell. It is one rule and one
   setting.
-* **buy / sell / log**. The paper ledger is the same ledger. All four size a
-  position the same way, place the same market order through the same
-  `DecisionTracker`, and write the same decision entry to the same log -- the
+* **buy / sell / log**. The paper ledger is the same ledger. Every strategy
+  sizes a position the same way, places the same market order through the same
+  `DecisionTracker`, and writes the same decision entry to the same log -- the
   differences were a price to read, a sentence to log, and whether the position
   record carries a trailing peak.
 * **the loop**. One cycle per closed bar, aligned to the clock rather than
@@ -50,8 +48,8 @@ if TYPE_CHECKING:
 
 
 # The outcome tags `run_cycle` returns. SimLab counts them and the live loop
-# ignores them, but naming them keeps the four implementations answering with
-# the same vocabulary.
+# ignores them, but naming them keeps every implementation answering with the
+# same vocabulary.
 BOUGHT = "bought"
 SOLD = "sold"
 HOLD = "hold"

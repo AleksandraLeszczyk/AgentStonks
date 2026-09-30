@@ -215,9 +215,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         tickers=apple_models.DAYRANGE_TICKERS,
         # Deliberately not `models=(DAYRANGE_KEY,)`, though it is built on that
         # forecast: `for_models` pre-selects what a *model* said, and these are
-        # one agent's orders. Auto-selecting on any run that loaded the bundle
-        # would draw Apple Trader's levels over an Apple Trader 2 run whose
-        # rules merely read the same forecast, which rested nothing of the kind.
+        # one agent's orders, not a forecast of the day.
         models=(),
     ),
 }

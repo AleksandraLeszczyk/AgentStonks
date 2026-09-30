@@ -246,16 +246,12 @@ class TestAgentMomentum:
 
     @staticmethod
     def state(personality="momentum", timeframe="1Min", running=False, form=None,
-              levels=None, rules2=None):
+              levels=None):
         from types import SimpleNamespace
 
         return SimpleNamespace(
             llm_personality=personality, timeframe=timeframe, agent_running=running,
             apple_trader_config=form, apple_trader_levels=levels,
-            apple_trader2_config=(
-                SimpleNamespace(rules=SimpleNamespace(reads_momentum=lambda: rules2))
-                if rules2 is not None else None
-            ),
         )
 
     @staticmethod
@@ -324,19 +320,6 @@ class TestAgentMomentum:
             levels={"config": self.trader(take=9)},
         )
         assert _agent_momentum(state, self.sym())[0] == 9
-
-    def test_apple_trader_2_reading_momentum_uses_the_regime_horizon(self):
-        from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY
-        from agent_stonks.momentum_regime import MOMENTUM_DEFAULTS
-
-        bars, _ = _agent_momentum(self.state(APPLE_TRADER2_KEY, rules2=True), self.sym())
-        assert bars == MOMENTUM_DEFAULTS["horizon"]
-
-    def test_apple_trader_2_without_momentum_rules_falls_back(self):
-        from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY
-
-        state = self.state(APPLE_TRADER2_KEY, rules2=False)
-        assert _agent_momentum(state, self.sym()) == (5, "5 min")
 
     def test_an_armed_momentum_tactic_uses_its_window(self):
         bars, label = _agent_momentum(self.state(), self.sym(tactic_fields=["momentum_pct"]))

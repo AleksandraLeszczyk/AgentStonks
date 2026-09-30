@@ -1,6 +1,6 @@
 """The momentum/regime pipeline mirrored from mshift.
 
-These pin the definitions Apple Trader 2's momentum signals are computed with.
+These pin the definitions the rule agents and chart overlays read momentum with.
 The numbers themselves were checked bar-for-bar against mshift's own output on
 the notebooks' cached AAPL history; what is pinned here is the behaviour that
 check would catch changing.

@@ -6,8 +6,7 @@ SimLab shows it beside its Agents tab because a replay is only interpretable
 if you know what the model behind it was fitted on. A page that drifted between
 the two -- one app quoting a metric the other had already stopped showing --
 would be worse than no page, so there is one of it, here, and both apps call
-`model_catalogue_panel()`. The same reason `apple_rules_ui` is a shared module
-rather than a copy in each app.
+`model_catalogue_panel()`.
 
 Everything rendered comes from `model_catalogue`, which reads the saved bundles
 and their JSON sidecars and deliberately imports neither PyTorch nor LightGBM.

@@ -19,7 +19,6 @@ from . import (
     candle_patterns,
     market_hours,
     model_overlays,
-    momentum_regime,
     session_store,
 )
 from . import apple_trader_ui
@@ -41,14 +40,6 @@ from .apple_trader import (
     launch_apple_trader,
 )
 from .apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
-from .apple_rules_ui import rules_panel, signal_catalogue
-from .apple_trader2 import (
-    APPLE_TRADER2_AVATAR,
-    APPLE_TRADER2_KEY,
-    APPLE_TRADER2_LABEL,
-    AppleTrader2Config,
-    launch_apple_trader2,
-)
 from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
     build_analysis_gauges,
@@ -384,17 +375,16 @@ def _effective_symbols(state: AppState, symbols_input: str) -> list[str]:
 
 
 # Agents that aren't LLM personalities and so have no entry in
-# AGENT_PERSONALITIES: the Automatic orchestrator and the two rule-based Apple
-# Traders. They still need a label and a face in the picker.
+# AGENT_PERSONALITIES: the Automatic orchestrator and the rule-based Apple
+# Trader. They still need a label and a face in the picker.
 _NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
     AUTOMATIC_KEY: (AUTOMATIC_LABEL, AUTOMATIC_AVATAR),
     APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
-    APPLE_TRADER2_KEY: (APPLE_TRADER2_LABEL, APPLE_TRADER2_AVATAR),
 }
 
 # The agents that place their own orders from a fixed loop: no LLM key needed,
 # one symbol only, and their own parameter panel instead of provider/model.
-RULE_AGENT_KEYS = (APPLE_TRADER_KEY, APPLE_TRADER2_KEY)
+RULE_AGENT_KEYS = (APPLE_TRADER_KEY,)
 
 
 def _personality_label(key: str) -> str:
@@ -952,13 +942,11 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
       the behaviour table over (the running agent's config while one runs,
       since that setting takes ▶ Start; else the form's). A legacy config
       without it: the take / fall look-back, `fall_bars`.
-    * Apple Trader 2 -- a rule set that reads any `mom.*` signal runs on the
-      regime score over `MOMENTUM_DEFAULTS["horizon"]` bars.
     * LLM personalities and Automatic -- an armed tactic or pending alert on
       `momentum_pct` compares against the close `TACTICS_MOMENTUM_WINDOW_MIN`
       minutes back.
 
-    The rule traders count bars of the stream they run on, which is the
+    The rule trader counts bars of the stream they run on, which is the
     chart's timeframe; the tactic window is in minutes, so it is converted.
     Anything else -- including an Apple Trader with the take and the fall rule
     both off -- gets `FALLBACK_MOMENTUM_MIN` minutes.
@@ -977,10 +965,6 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
             return confirm, "Apple Trader"
         if config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
             return int(config.fall_bars), "Apple Trader"
-    elif personality == APPLE_TRADER2_KEY:
-        config = getattr(state, "apple_trader2_config", None)
-        if config is not None and config.rules.reads_momentum():
-            return int(momentum_regime.MOMENTUM_DEFAULTS["horizon"]), "Apple Trader 2"
     elif _reads_momentum_pct(sym_state):
         return minutes_to_bars(TACTICS_MOMENTUM_WINDOW_MIN), "armed tactic"
     return minutes_to_bars(FALLBACK_MOMENTUM_MIN), f"{FALLBACK_MOMENTUM_MIN} min"
@@ -1107,8 +1091,8 @@ def _live_chart_controls() -> None:
                 "same mean + 1σ, of the absolute Δ.\n\n"
                 "The semitransparent blue lines are the same two measures averaged "
                 "per bar over the look-back the selected agent decides on — Apple "
-                "Trader's momentum confirmation period, Apple Trader 2's momentum "
-                "signals, or an LLM agent's armed momentum tactic — and over 5 "
+                "Trader's momentum confirmation period or an LLM agent's armed "
+                "momentum tactic — and over 5 "
                 "minutes when it reads no momentum.\n\n"
                 "Regular session only, and each day starts fresh.",
             )
@@ -2773,30 +2757,6 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     return config
 
 
-@st.fragment
-def _apple_trader2_params(symbols: list[str]) -> AppleTrader2Config:
-    """Apple Trader 2's instrument and rules.
-
-    No model picker here, unlike Apple Trader: a model is not a strategy in this
-    agent, it is a signal a condition may name, and which ones get loaded falls
-    out of what the rules read. What *is* picked is the instrument, because it
-    decides which of those signals exist -- the streamed symbols are offered
-    alongside the modelled ones, since a symbol that is not being streamed has
-    no bars to read.
-    """
-    with st.expander("Apple Trader 2 rules", expanded=True):
-        st.caption(
-            "Each rule is one action — buy or sell, how much, and the conditions that "
-            "arm it, joined by AND or OR. At most one rule fires per closed minute bar "
-            "and the first match wins, so the order is the priority. Start from a preset "
-            "and edit, or build one from scratch."
-        )
-        config = rules_panel("apple_trader2", symbols=symbols)
-        with st.expander(f"Every signal a condition can read on {config.ticker}"):
-            signal_catalogue(config.ticker)
-    return config
-
-
 def _execution_controls() -> str:
     """Where this agent run's orders go. Returns the requested mode.
 
@@ -2936,19 +2896,6 @@ def _agent_panel(
                 "the ones the model was fitted on — every rule here is a model's output, "
                 "so the instrument and the model constrain each other."
             )
-        if personality == APPLE_TRADER2_KEY:
-            st.caption(
-                "🍏 Apple Trader 2 runs no LLM either, and no fixed strategy: it runs a "
-                "list of **buy/sell rules you write**. Each rule is an action (buy or "
-                "sell), a size (a percentage, a dollar amount or a share count) and the "
-                "conditions that arm it — a model's forecast, the momentum regime, the "
-                "price, the open position's P&L or give-back, the clock — joined with "
-                "AND or OR. One action per closed bar, first matching rule wins, and the "
-                "book is flattened before the close whatever the list says. Unlike Apple "
-                "Trader it picks **which symbol** it trades: the saved models decide "
-                "which forecasts are offered for it, and on a symbol none was fitted on "
-                "the rules read the tape alone."
-            )
         if personality in RULE_AGENT_KEYS:
             # No LLM in the loop, so no LLM settings on screen. The stored
             # choice is left untouched for when an LLM personality is picked again.
@@ -2980,10 +2927,6 @@ def _agent_panel(
     else:
         apple_config = None
         state.apple_trader_config = None
-    apple2_config = (
-        _apple_trader2_params(symbols) if personality == APPLE_TRADER2_KEY else None
-    )
-    state.apple_trader2_config = apple2_config
 
     trading_mode_choice = _execution_controls()
 
@@ -3049,13 +2992,11 @@ def _agent_panel(
         syms = list(symbols or state.symbols)
         is_apple_trader = personality == APPLE_TRADER_KEY
         is_rule_agent = personality in RULE_AGENT_KEYS
-        # The one symbol this run trades: fixed for Apple Trader, configured for
-        # Apple Trader 2. Either way it has to be streamed, or there are no bars
-        # to read and the agent would idle all session.
+        # The one symbol this run trades, as configured for Apple Trader. It has
+        # to be streamed, or there are no bars to read and the agent would idle
+        # all session.
         rule_ticker = APPLE_TRADER_TICKER
-        if personality == APPLE_TRADER2_KEY and apple2_config is not None:
-            rule_ticker = apple2_config.ticker
-        elif personality == APPLE_TRADER_KEY and apple_config is not None:
+        if personality == APPLE_TRADER_KEY and apple_config is not None:
             rule_ticker = apple_config.ticker
         stream_ready = False
         if not syms:
@@ -3208,13 +3149,6 @@ def _agent_panel(
                     state,
                     state.decision_tracker,
                     config=apple_config or AppleTraderConfig(),
-                    cycle_sec=APPLE_TRADER_CYCLE_SEC,
-                )
-            elif personality == APPLE_TRADER2_KEY:
-                launch_apple_trader2(
-                    state,
-                    state.decision_tracker,
-                    config=apple2_config or AppleTrader2Config(),
                     cycle_sec=APPLE_TRADER_CYCLE_SEC,
                 )
             elif personality == AUTOMATIC_KEY:

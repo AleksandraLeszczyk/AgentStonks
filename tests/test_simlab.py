@@ -18,7 +18,6 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
     config_signature,
 )
-from agent_stonks.apple_trader2 import APPLE_TRADER2_KEY, AppleTrader2Config
 from simlab import app as sim_app
 from simlab import data as sim_data
 from simlab import prompts as sim_prompts
@@ -1084,141 +1083,17 @@ class TestDayRangeEngine:
         assert fills[-1]["action"] == "sell"
 
 
-class TestAppleTrader2Engine:
-    """Apple Trader 2 on the same rule day loop, driven by a rule list.
-
-    The rule sets here are written on price and the position alone, which is
-    the point: a strategy that names no model needs no bundle on disk, so these
-    exercise the engine wiring rather than a stubbed forecast.
-    """
-
-    @pytest.fixture()
-    def apple_store(self, tmp_path, monkeypatch):
-        """A stored AAPL session that climbs, then gives back."""
-        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
-        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
-        prices = (
-            [100.0 + 0.03 * (i + 1) for i in range(40)]
-            + [101.2 - 0.06 * (i + 1) for i in range(20)]
-        )
-        bars = [
-            _bar(OPEN_UTC + timedelta(minutes=i), price, volume=1000.0 + 37 * (i % 13))
-            for i, price in enumerate(prices)
-        ]
-        sim_data._write_gz(sim_data.bars_path("AAPL", DAY), bars)
-        sim_data._write_gz(sim_data.daily_path("AAPL"), {
-            "symbol": "AAPL", "start": "2026-05-16", "end": "2026-06-15", "bars": [],
-        })
-        return tmp_path
-
-    RULES = {
-        "rules": {
-            "items": [
-                {
-                    "action": "sell", "size_mode": "pct", "size": 100.0, "join": "all",
-                    "label": "Trailing stop", "enabled": True, "cooldown_bars": 0,
-                    "conditions": [
-                        {"field": "pos.drawdown_pct", "op": "below", "value": -0.5}
-                    ],
-                },
-                {
-                    "action": "buy", "size_mode": "pct", "size": 95.0, "join": "all",
-                    "label": "Buy the dip", "enabled": True, "cooldown_bars": 0,
-                    # "while flat" is a condition here rather than a property of
-                    # the agent -- without it the same rule would add on every
-                    # later bar its price condition still holds.
-                    "conditions": [
-                        {"field": "pos.shares", "op": "below", "value": 0.0},
-                        {"field": "bar.price", "op": "above", "value": 100.5},
-                    ],
-                },
-            ]
-        }
-    }
-
-    def _run(self, rule_config: "dict | None" = None, symbol: str = "AAPL"):
-        market = SimMarket([symbol], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER2_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=[symbol], days=[DAY], starting_cash=10_000.0,
-            rule_config=rule_config or self.RULES,
-        )
-        return SimulationEngine(market, config).run()
-
-    def test_a_rule_list_replays_with_no_llm_and_no_model(self, apple_store):
-        result = self._run()
-        assert result.error is None
-        assert result.prompt_used is None and result.tool_names == []
-        assert result.cycles_run == 60
-
-    def test_it_buys_on_its_entry_rule_and_exits_on_its_stop(self, apple_store):
-        result = self._run()
-        actions = [(d["action"], d["status"]) for d in result.decisions]
-        assert actions[:2] == [("buy", "filled"), ("sell", "filled")]
-        buy, sell = result.decisions[0], result.decisions[1]
-        assert "Buy the dip" in buy["reasoning"] and "Rule 2" in buy["reasoning"]
-        assert "Trailing stop" in sell["reasoning"] and "Rule 1" in sell["reasoning"]
-        assert float(buy["price"]) < float(sell["price"])
-
-    def test_the_rule_list_is_what_the_record_carries(self, apple_store):
-        result = self._run()
-        assert result.config_summary["rule_based"] is True
-        stored = result.config_summary["rule_config"]
-        assert stored["rules"]["items"][1]["conditions"][1]["field"] == "bar.price"
-
-    def test_a_rule_set_that_cannot_work_fails_loudly(self, apple_store):
-        """Before the run, not after: an unrunnable set would otherwise finish
-        clean with an empty ledger that reads like a strategy result."""
-        result = self._run({"rules": {"items": []}})
-        assert "no enabled rules" in (result.error or "")
-
-    def test_a_dataset_without_the_ticker_fails_loudly(self, store):
-        market = SimMarket(["TEST"], [DAY])
-        config = SimulationConfig(
-            personality=APPLE_TRADER2_KEY, provider=RULE_PROVIDER, model="rules",
-            api_key="", symbols=["TEST"], days=[DAY], rule_config=self.RULES,
-        )
-        assert "only trades AAPL" in (SimulationEngine(market, config).run().error or "")
-
-    def test_the_symbol_it_trades_comes_from_the_record(self, tmp_path, monkeypatch):
-        """The same rules over another instrument. Nothing about the day loop
-        changes -- which is the claim worth pinning, since the ticker moved from
-        a constant on the agent to a field on the config."""
-        monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
-        monkeypatch.setattr(sim_data, "MANIFEST_PATH", tmp_path / "datasets.json")
-        prices = (
-            [100.0 + 0.03 * (i + 1) for i in range(40)]
-            + [101.2 - 0.06 * (i + 1) for i in range(20)]
-        )
-        sim_data._write_gz(
-            sim_data.bars_path("GOOGL", DAY),
-            [_bar(OPEN_UTC + timedelta(minutes=i), price) for i, price in enumerate(prices)],
-        )
-
-        result = self._run({**self.RULES, "ticker": "GOOGL"}, symbol="GOOGL")
-        assert result.error is None
-        assert [d["symbol"] for d in result.decisions][:2] == ["GOOGL", "GOOGL"]
-        assert result.config_summary["rule_config"]["ticker"] == "GOOGL"
-
-    def test_the_dataset_is_checked_against_the_configured_symbol(self, apple_store):
-        """An AAPL dataset and a GOOGL rule set is a run that cannot trade, and
-        it is caught before it produces an empty ledger."""
-        result = self._run({**self.RULES, "ticker": "GOOGL"})
-        assert "only trades GOOGL" in (result.error or "")
-
-
 class TestRuleAgentRegistry:
     """What the engine, the runner and the UI rely on being true of *every*
     rule agent, so adding one cannot half-wire it."""
 
     def test_every_rule_agent_is_replayable(self):
-        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY, APPLE_TRADER2_KEY}
+        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY}
         for key, agent in RULE_AGENTS.items():
             assert agent.key == key
             assert agent.default_ticker and agent.label
-            # The symbol is asked of a config, not of the agent: one of the two
-            # has it fixed and the other configurable, and the engine's dataset
-            # check has to work the same way for both.
+            # The symbol is asked of a config, not of the agent, so the engine's
+            # dataset check reads whatever instrument the config picked.
             assert agent.ticker(agent.from_record(None)) == agent.default_ticker
             # Prompt-driven and rule-driven are the two kinds of agent, and no
             # agent is both: the UI splits the picker on exactly this.
@@ -1644,8 +1519,8 @@ class TestInstrumentBreakdown:
 class TestDecisionTrigger:
     """What fired a fill, named in two or three words.
 
-    The strings below are copied verbatim from `apple_trader`,
-    `apple_trader2` and the tactic executor -- the whole classifier is a bet on
+    The strings below are copied verbatim from `apple_trader` and the tactic
+    executor -- the whole classifier is a bet on
     those openings, so the test has to be a sample of the real thing rather
     than a paraphrase. If a trader is reworded, this fails and the tag is
     updated; the failure mode in the app meanwhile is a missing headline, never
@@ -1723,13 +1598,6 @@ class TestDecisionTrigger:
             "Session ends in 5 min. Momentum, regimes and every model feature are "
             "intraday, so the position is flattened rather than carried overnight."
         )) == "Flattened at the close"
-
-    def test_a_rule_agent_fill_is_named(self):
-        assert sim_results.decision_trigger(self._reason(
-            "Rule 2 — Buy the dip below the predicted high, while flat: buy 50% of "
-            "cash when pos.shares <= 0 (0 now) and dayrange.pred_high_dip_adr >= "
-            "-0.75 (0.528 now)."
-        )) == "Rule fired"
 
     def test_an_llm_tactic_fill_is_named(self):
         assert sim_results.decision_trigger(self._reason(
@@ -1845,23 +1713,6 @@ class TestMLModelBreakdown:
             "summary": {"return_pct": return_pct, "profit_efficiency": 0.5},
         }
 
-    def _apple2(self, fields=(), return_pct=1.0):
-        """An Apple Trader 2 run whose one rule reads the given signal fields."""
-        rules = {"items": [{
-            "action": "buy", "size_mode": "pct", "size": 50.0,
-            "conditions": [{"field": f, "op": "above", "value": 0.0} for f in fields],
-            "join": "all", "enabled": True,
-        }]}
-        return {
-            "run_id": "r1", "dataset": "ds1",
-            "config_summary": {
-                "provider": "rules", "model": "sig", "personality": APPLE_TRADER2_KEY,
-                "symbols": ["AAPL"], "rule_based": True,
-                "rule_config": {"rules": rules, "ticker": "AAPL"},
-            },
-            "summary": {"return_pct": return_pct, "profit_efficiency": 0.5},
-        }
-
     def test_apple_trader_is_the_model_it_names(self):
         assert sim_results.ml_model_key(self._apple("dayrange")) == "dayrange"
 
@@ -1879,35 +1730,10 @@ class TestMLModelBreakdown:
         rows = sim_results.breakdown(runs, by="ml_model")
         assert len(rows) == 1 and rows[0]["runs"] == 2
 
-    def test_apple_trader_2_reads_its_conditions(self):
-        assert sim_results.ml_model_key(
-            self._apple2(["dayrange.pred_high_dip_adr"])
-        ) == "dayrange"
-
-    def test_a_rule_set_naming_a_removed_models_signal_is_not_lost(self):
-        """A stored rule set reading a signal the catalogue no longer has cannot
-        be decoded, so it is filed as unknown rather than dropped."""
-        assert sim_results.ml_model_key(
-            self._apple2(["persistence.proba"])
-        ) == sim_results.UNKNOWN_INSTRUMENT
-
-    def test_a_tape_only_rule_set_is_its_own_answer(self):
-        """Not a missing value: a set on price and the position is a complete
-        strategy, and it is the row that says what the models are worth."""
-        assert sim_results.ml_model_key(
-            self._apple2(["bar.price", "pos.shares"])
-        ) == sim_results.NO_ML_MODEL
-
-    def test_an_undecodable_rule_set_is_not_lost(self):
-        record = self._apple2([])
-        record["config_summary"]["rule_config"]["rules"] = {"items": "not a list"}
-        assert sim_results.ml_model_key(record) == sim_results.UNKNOWN_INSTRUMENT
-
     def test_every_run_lands_in_exactly_one_group(self):
         runs = [
             self._llm("openai"), self._llm("gemini"),
-            self._apple("nbeats"), self._apple("persistence"),
-            self._apple2(["persistence.proba"]), self._apple2(["bar.price"]),
+            self._apple("nbeats"), self._apple("persistence"), self._apple(""),
         ]
         rows = sim_results.breakdown(runs, by="ml_model")
         assert sum(r["runs"] for r in rows) == len(runs)
@@ -1926,21 +1752,12 @@ class TestMLModelBreakdown:
     # breakdown must file every run somewhere, a chart must not claim a model
     # made trades it cannot name.
 
-    def test_ml_models_lists_the_bundles_a_rule_run_loaded(self):
+    def test_ml_models_lists_the_bundle_a_rule_run_loaded(self):
         assert sim_results.ml_models(self._apple("dayrange")) == ["dayrange"]
-        assert sim_results.ml_models(
-            self._apple2(["dayrange.pred_high_dip_adr", "bar.price"])
-        ) == ["dayrange"]
-
-    def test_ml_models_is_empty_for_a_rule_set_that_loaded_none(self):
-        """Empty, not unknown: a set on price and the position is a complete
-        strategy that simply has no forecast to draw."""
-        assert sim_results.ml_models(self._apple2(["bar.price"])) == []
 
     def test_ml_models_refuses_to_guess_where_the_record_cannot_say(self):
-        undecodable = self._apple2([])
-        undecodable["config_summary"]["rule_config"]["rules"] = {"items": "not a list"}
-        assert sim_results.ml_models(undecodable) is None
+        assert sim_results.ml_models(self._apple("")) is None
+        assert sim_results.ml_model_key(self._apple("")) == sim_results.UNKNOWN_INSTRUMENT
         # An LLM run loads no saved model, and its provider -- which is what
         # the breakdown files it under -- is not one.
         assert sim_results.ml_models(self._llm("openai")) is None
@@ -1980,14 +1797,10 @@ class TestMLModelLabels:
     def test_a_provider_is_marked_as_an_llm(self):
         assert sim_app._ml_model_label("llm:openai") == "openai (LLM)"
 
-    def test_a_combination_joins_both_names(self):
-        assert sim_app._ml_model_label("persistence+dayrange") == (
-            "persistence + Day-range forecast"
+    def test_the_sentinel_is_shown_as_it_is(self):
+        assert sim_app._ml_model_label(sim_results.UNKNOWN_INSTRUMENT) == (
+            sim_results.UNKNOWN_INSTRUMENT
         )
-
-    def test_sentinels_are_shown_as_they_are(self):
-        for key in (sim_results.NO_ML_MODEL, sim_results.UNKNOWN_INSTRUMENT):
-            assert sim_app._ml_model_label(key) == key
 
     def test_an_unknown_key_is_never_shown_as_a_real_model(self):
         """`apple_models.get` falls back to the default model for an unknown
@@ -1999,7 +1812,7 @@ class TestMLModelLabels:
     def test_labels_stay_short_enough_for_the_table(self):
         """The breakdown table does not wrap, so every label a real run can
         produce has to fit a first column."""
-        for key in list(apple_models.MODELS) + ["llm:anthropic", "persistence+dayrange"]:
+        for key in list(apple_models.MODELS) + ["llm:anthropic"]:
             assert len(sim_app._ml_model_label(key)) <= 48
 
 
@@ -2548,11 +2361,6 @@ class TestRuleSetupSlots:
         sim_app._drop_rule_slot(APPLE_TRADER_KEY, "not-a-slot")
         assert sim_app._rule_slots(APPLE_TRADER_KEY)[0] == slots[0]
 
-    def test_the_two_agents_keep_separate_slots(self):
-        sim_app._add_rule_slot(APPLE_TRADER_KEY)
-        assert len(sim_app._rule_slots(APPLE_TRADER_KEY)) == 2
-        assert len(sim_app._rule_slots(APPLE_TRADER2_KEY)) == 1
-
 
 class TestSweptSetupTitles:
     """How a setup that expands into a grid names itself.
@@ -2684,20 +2492,6 @@ class TestRuleCombinations:
         assert len(combos) == 2
         assert len({c[2] for c in combos}) == 2
 
-    def test_both_agents_contribute_their_own_setups(self):
-        combos, _ = sim_app._rule_combinations(
-            {
-                APPLE_TRADER_KEY: [
-                    AppleTraderConfig(buy_k=0.35),
-                    AppleTraderConfig(buy_k=0.50),
-                ],
-                APPLE_TRADER2_KEY: [AppleTrader2Config()],
-            },
-            ["ds1"],
-        )
-        assert len(combos) == 3
-        assert {c[0] for c in combos} == {APPLE_TRADER_KEY, APPLE_TRADER2_KEY}
-
     def test_no_datasets_is_no_combinations(self):
         assert sim_app._rule_combinations(self.setups(AppleTraderConfig()), []) == ([], {})
 
@@ -2727,11 +2521,6 @@ class TestExperimentSymbols:
             AppleTraderConfig(model_key="dayrange", ticker="INTC"),
             ["AAPL"],
         ) == ["INTC"]
-
-    def test_apple_trader_2_gets_its_own_instrument_too(self):
-        assert sim_app._experiment_symbols(
-            APPLE_TRADER2_KEY, AppleTrader2Config(ticker="SPY"), ["AAPL", "SPY"]
-        ) == ["SPY"]
 
     def test_an_llm_agent_gets_the_whole_basket(self):
         assert sim_app._experiment_symbols(
@@ -2792,29 +2581,18 @@ class TestConfiguredRuleTickers:
             APPLE_TRADER_KEY: ["AAPL"]
         }
 
-    def test_a_free_text_instrument_is_normalised(self, session):
-        """Apple Trader 2's box accepts anything typed into it, so what comes
-        back has to be squared with the dataset's own spelling."""
-        slot = sim_app._rule_slots(APPLE_TRADER2_KEY)[0]
-        session[f"sim_rule_{APPLE_TRADER2_KEY}_{slot}_ticker"] = "  spy "
-        assert sim_app._configured_rule_tickers([APPLE_TRADER2_KEY]) == {
-            APPLE_TRADER2_KEY: ["SPY"]
+    def test_a_stored_instrument_is_normalised(self, session):
+        """What comes back has to be squared with the dataset's own spelling."""
+        slot = sim_app._rule_slots(APPLE_TRADER_KEY)[0]
+        session[f"sim_rule_{APPLE_TRADER_KEY}_{slot}_ticker"] = "  intc "
+        assert sim_app._configured_rule_tickers([APPLE_TRADER_KEY]) == {
+            APPLE_TRADER_KEY: ["INTC"]
         }
 
     def test_an_llm_agent_contributes_nothing(self, session):
         """It has no instrument of its own -- it trades the basket it is
         handed, which is the one thing on that row still worth choosing."""
         assert sim_app._configured_rule_tickers(["momentum"]) == {}
-
-    def test_both_rule_agents_are_reported_separately(self, session):
-        apple = sim_app._rule_slots(APPLE_TRADER_KEY)[0]
-        apple2 = sim_app._rule_slots(APPLE_TRADER2_KEY)[0]
-        session[f"sim_rule_{APPLE_TRADER_KEY}_{apple}_ticker"] = "AAPL"
-        session[f"sim_rule_{APPLE_TRADER2_KEY}_{apple2}_ticker"] = "GOOGL"
-        assert sim_app._configured_rule_tickers(
-            [APPLE_TRADER_KEY, APPLE_TRADER2_KEY]
-        ) == {APPLE_TRADER_KEY: ["AAPL"], APPLE_TRADER2_KEY: ["GOOGL"]}
-
 
 class TestRuleSetupTickerCheck:
     """A setup whose symbol a dataset does not carry cannot trade at all.

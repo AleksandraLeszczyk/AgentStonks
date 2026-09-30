@@ -338,9 +338,8 @@ class SimulationEngine:
 
         The ticker check catches a configuration mistake that would otherwise
         show up as an empty run: the one symbol this run trades not being in the
-        dataset. Which symbol that is comes from the decoded config -- fixed for
-        Apple Trader, a setting for Apple Trader 2 -- so the config is built
-        first. Whatever else the agent needs (Apple Trader's saved bundle) is
+        dataset. Which symbol that is comes from the decoded config, so the
+        config is built first. Whatever else the agent needs (Apple Trader's saved bundle) is
         the registry's problem, and fails just as loudly.
 
         Every indicator these agents read is session-local, so one stored day

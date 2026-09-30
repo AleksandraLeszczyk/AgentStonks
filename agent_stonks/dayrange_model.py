@@ -180,8 +180,8 @@ from .model_store import ModelStore  # noqa: E402
 # pipeline was run over AAPL, GOOGL and INTC and each produced its own daily
 # models, its own opening ridge and its own metadata. Nothing here is shared
 # between them but the code, so the ticker is an argument rather than a setting
-# -- `apple_models.DAYRANGE_TICKERS` is the list, and `apple_trader2` passes the
-# one its config names.
+# -- `apple_models.DAYRANGE_TICKERS` is the list, and the caller passes the one
+# it trades.
 MODEL_PATH_ENV = "APPLE_DAYRANGE_MODEL"
 DEFAULT_TICKER = model_store.DEFAULT_TICKER
 
