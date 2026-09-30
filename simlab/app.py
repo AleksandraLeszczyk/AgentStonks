@@ -3227,18 +3227,9 @@ def _derived_discriminators(jobs: list[dict]) -> dict[str, str]:
     return text
 
 
-def _tuning_datasets_text(names: "list[str]", tick: str = "") -> str:
-    """A job's datasets for a label: all of them while few, else first … last."""
-    quoted = [f"{tick}{name}{tick}" for name in names]
-    if len(quoted) <= 3:
-        return " + ".join(quoted)
-    return f"{len(quoted)} datasets, {quoted[0]} … {quoted[-1]}"
-
-
 def _tuning_job_label(job: dict, markdown: bool = True, detail: str = "") -> str:
     spec = job["spec"]
     params = " × ".join(_tuning_param_label(a["name"]) for a in spec["axes"])
-    tick = "`" if markdown else ""
     ticker = spec["base"]["ticker"]
     # The model is part of what a grid is about -- the same levels mean
     # different prices under the day-range and the high/low forecast -- and the
@@ -3246,15 +3237,16 @@ def _tuning_job_label(job: dict, markdown: bool = True, detail: str = "") -> str
     model = _apple_model_label(spec["base"].get("model_key", ""))
     head = f"{f'**{ticker}**' if markdown else ticker} · {model} · {params}"
     started = (job.get("created_at") or "")[:16].replace("T", " ")
-    names = sim_tuning.dataset_names(spec)
+    # No dataset names: a job's datasets change as they are added and dropped,
+    # and the results below list them anyway.
     if sim_tuning.is_derived(job):
-        filled = len(job["cells"].get(names[0]) or ())
+        filled = len(job["cells"].get(sim_tuning.dataset_names(spec)[0]) or ())
         total = len(sim_tuning.grid(spec["axes"]))
-        route = f"{filled}/{total} cells from stored runs on {tick}{names[0]}{tick}"
+        route = f"{filled}/{total} cells from stored runs"
         return " · ".join(
             part for part in (head, route, detail, f"newest run {started} UTC") if part
         )
-    return f"{head} · {_tuning_datasets_text(names, tick)} · {started} UTC"
+    return f"{head} · {started} UTC"
 
 
 def render_tuning_tab() -> None:
@@ -3305,7 +3297,7 @@ def _render_tuning_jobs_body(auto_refresh: bool) -> None:
     if not active:
         return
     st.markdown("##### :material/grid_on: Running")
-    for job in active:
+    for job in sorted(active, key=lambda j: _tuning_job_label(j, markdown=False).casefold()):
         with st.container(border=True):
             st.markdown(_tuning_job_label(job))
             done = int(job["progress"]["done"])
@@ -4258,15 +4250,16 @@ def _render_tuning_dataset_controls(job: dict) -> None:
 
 def _render_tuning_results(jobs: list[dict]) -> None:
     st.markdown("##### :material/grid_on: Tuning results")
-    ids = [j["job_id"] for j in jobs]
     wanted = st.session_state.get("tune_selected_job")
     detail = _derived_discriminators(jobs)
+    labels = {
+        j["job_id"]: _tuning_job_label(j, markdown=False, detail=detail.get(j["job_id"], ""))
+        for j in jobs
+    }
+    ids = sorted(labels, key=lambda i: labels[i].casefold())
     job_id = st.selectbox(
         "Tuning job", ids, index=ids.index(wanted) if wanted in ids else 0,
-        format_func={
-            j["job_id"]: _tuning_job_label(j, markdown=False, detail=detail.get(j["job_id"], ""))
-            for j in jobs
-        }.get,
+        format_func=labels.get,
     )
     job = next(j for j in jobs if j["job_id"] == job_id)
     spec = job["spec"]
