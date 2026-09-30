@@ -45,9 +45,30 @@ INTC_FORECASTS = {
     "2026-09-04": (95.81487950584402, 91.81971111056774, 3.8367785714285736),
     "2026-09-11": (104.88463667029384, 101.07, 3.8160571428571433),
 }
-NOTEBOOK_FORECASTS = {"AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS}
+# MU, saved 2026-09-30, reads its opening five minutes from IEX. Beside the
+# held-out week: three sessions whose IEX window is short (2024-05-03: 3 bars;
+# 2024-05-09: 4, no 09:30 bar; 2025-08-26: 4) and two after 2025-03-10, the one
+# session IEX printed nothing in the window of -- its opening row is missing from
+# the 28-session `or_volume_z` windows these read.
+MU_FORECASTS = {
+    "2024-05-03": (115.30969869214596, 112.23142878513893, 4.4696),
+    "2024-05-09": (119.7100917670105, 117.35568271451045, 3.551385714285715),
+    "2025-03-11": (89.83187273312511, 86.43684487323075, 4.9813857142857145),
+    "2025-04-01": (88.8252353457782, 86.27698365175549, 3.6731214285714304),
+    "2025-08-26": (118.87739195199754, 115.53119054623781, 4.19375),
+    "2026-03-02": (425.0276091905608, 397.27, 21.79093571428572),
+    "2026-08-31": (958.5099101163877, 920.1623735778495, 41.976057142857144),
+    "2026-09-01": (965.8477957297089, 930.9890304491993, 41.60462142857143),
+    "2026-09-02": (958.998621751499, 924.1214764145235, 42.375335714285725),
+    "2026-09-03": (959.63, 902.2897049413292, 39.47127142857145),
+    "2026-09-04": (1020.1816140024187, 969.415, 40.40555000000001),
+    "2026-09-11": (1004.0314071814445, 973.5282062200738, 39.09912142857146),
+}
+NOTEBOOK_FORECASTS = {"AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS}
 # The candidates each bundle ships with non-zero weight.
-SHIPPED = {"AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"]}
+SHIPPED = {"AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"]}
+# The tape each bundle reads the opening from.
+OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex"}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -91,7 +112,7 @@ class FakeSip:
         self.tape = tape
         self.calls: "list[tuple[date, date]]" = []
 
-    def __call__(self, symbol, first, before, key, secret):
+    def __call__(self, symbol, first, before, key, secret, opening_feed="sip"):
         self.calls.append((first, before))
         bars = [b for d, day_bars in self.tape.items() if first <= d < before for b in day_bars]
         return H.session_rollups(H.minute_frame_from_bars(bars))
@@ -105,7 +126,7 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC"):
+        for symbol in ("AAPL", "INTC", "MU"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
@@ -133,6 +154,72 @@ class TestRollups:
             for part in (days[:4], days[4:])
         ]
         pd.testing.assert_frame_equal(pd.concat(halves), whole)
+
+
+class TestThinOpeningFeed:
+    """An IEX-opening bundle's rollups: SIP decides which sessions exist, IEX
+    supplies their opening summaries, and a session IEX missed keeps its row."""
+
+    def test_the_opening_summary_is_the_thin_feeds(self):
+        tape = _tape(date(2026, 3, 2), date(2026, 3, 3))
+        sip = H.minute_frame_from_bars([b for d in sorted(tape) for b in tape[d]])
+        iex_bars = [
+            {**b, "h": b["h"] * 0.9999, "v": 10} for d in sorted(tape) for b in tape[d][:5]
+        ]
+        rollups, _ = H.session_rollups(sip, H.minute_frame_from_bars(iex_bars))
+        sip_only, _ = H.session_rollups(sip)
+        pd.testing.assert_frame_equal(rollups[H._ROLLUP_COLS], sip_only[H._ROLLUP_COLS])
+        assert (rollups["volume5"] == 50).all()
+        assert (rollups["high5"] < sip_only["high5"]).all()
+
+    def test_a_session_the_thin_feed_missed_keeps_its_daily_row(self):
+        tape = _tape(date(2026, 3, 2), date(2026, 3, 4))
+        sip = H.minute_frame_from_bars([b for d in sorted(tape) for b in tape[d]])
+        # three bars on the 2nd, none on the 3rd, a late start on the 4th
+        iex = H.minute_frame_from_bars(
+            tape[date(2026, 3, 2)][:3] + tape[date(2026, 3, 4)][1:5]
+        )
+        rollups, _ = H.session_rollups(sip, iex)
+        assert len(rollups) == 3
+        assert np.isnan(rollups.loc["2026-03-03", "open5"])
+        assert rollups.loc["2026-03-04", "open5"] == pytest.approx(tape[date(2026, 3, 4)][1]["o"])
+
+    def test_a_cache_of_the_other_feeds_openings_is_rebuilt(self, cache_dir, monkeypatch):
+        sip = FakeSip(_tape(date(2025, 12, 1), date(2026, 9, 30)))
+        monkeypatch.setattr(H, "_fetch_rollups", sip)
+        H.history_frame("MU", date(2026, 9, 14), "k", "s")
+        assert len(sip.calls) == 1
+
+        H.history_frame("MU", date(2026, 9, 14), "k", "s", opening_feed="iex")
+        assert len(sip.calls) == 2  # SIP openings are not IEX ones: refetched whole
+        assert H._read_cache("MU", "iex")["opening_feed"] == "iex"
+        assert H._read_cache("MU")["sessions"] == {}  # and the SIP reader sees none
+
+    def test_forecast_session_reads_the_window_from_the_bundles_feed(self, monkeypatch):
+        H._forecast_cache.clear()
+        asked = {}
+        monkeypatch.setattr(
+            H, "history_frame",
+            lambda symbol, before, key=None, secret=None, opening_feed="sip":
+                asked.setdefault("history", opening_feed) and pd.DataFrame(),
+        )
+        monkeypatch.setattr(
+            H, "fetch_opening_window",
+            lambda symbol, day, want, feed, key=None, secret=None:
+                asked.setdefault("window", feed) and pd.DataFrame(),
+        )
+        monkeypatch.setattr(
+            H, "forecast_from",
+            lambda bundle, history, opening, day, window=None: {"window": window},
+        )
+        opening = H.minute_frame_from_bars(_tape(date(2026, 7, 1), date(2026, 7, 1))[date(2026, 7, 1)][:5])
+        H.forecast_session({"opening_feed": "iex", "path": "mu"}, "MU", opening, date(2026, 7, 1))
+        assert asked == {"history": "iex", "window": "iex"}
+
+        asked.clear()
+        out = H.forecast_session({"path": "aapl"}, "AAPL", opening, date(2026, 7, 1))
+        assert asked == {"history": "sip"} and out["window"] is None
+        H._forecast_cache.clear()
 
 
 class TestHalfDays:
@@ -249,18 +336,34 @@ def notebook_inputs(ticker: str):
     cleaning (half days included) is part of what is checked."""
     if ticker in _NOTEBOOK_INPUTS:
         return _NOTEBOOK_INPUTS[ticker]
-    files = sorted((NOTEBOOK / "data" / ticker / "raw").glob("*.parquet"))
+    folder = NOTEBOOK / "data" / ticker / "raw"
+    files = sorted(folder.glob(f"{ticker}_20??.parquet"))
     if not files:
         pytest.skip(f"the HighLow_5m {ticker} notebook data is not on this machine")
     bundle = H.load_bundle(ticker)
     if bundle is None:
         pytest.skip(f"the HighLow {ticker} bundle is not installed")
-    raw = pd.concat(pd.read_parquet(f) for f in files).sort_index()
-    raw = raw[~raw.index.duplicated()].loc["2023-01-01":"2026-09-11 23:59"]
-    raw = raw.tz_convert("America/New_York").between_time("09:30", "15:59")[H.OHLCV]
-    history, _ = H.session_rollups(raw)
-    _NOTEBOOK_INPUTS[ticker] = (bundle, raw, history)
+
+    def tape(paths):
+        raw = pd.concat(pd.read_parquet(f) for f in paths).sort_index()
+        raw = raw[~raw.index.duplicated()].loc["2023-01-01":"2026-09-11 23:59"]
+        return raw.tz_convert("America/New_York").between_time("09:30", "15:59")[H.OHLCV]
+
+    raw = tape(files)
+    thin = None
+    feed = H.opening_feed(bundle)
+    if feed != "sip":
+        thin = tape(sorted(folder.glob(f"{ticker}_20??_{feed}.parquet")))
+    history, _ = H.session_rollups(raw, thin)
+    _NOTEBOOK_INPUTS[ticker] = (bundle, raw, thin, history)
     return _NOTEBOOK_INPUTS[ticker]
+
+
+def _one_day(frame, stamp, minutes=None):
+    day = frame[frame.index.normalize().tz_localize(None) == stamp]
+    if minutes is None or day.empty:
+        return day
+    return day[day.index < day.index[0].normalize() + pd.Timedelta(hours=9, minutes=30 + minutes)]
 
 
 class TestAgainstTheNotebook:
@@ -274,18 +377,34 @@ class TestAgainstTheNotebook:
         [(t, d) for t, days in NOTEBOOK_FORECASTS.items() for d in sorted(days)],
     )
     def test_reproduces_the_notebook_forecast(self, ticker, day):
-        bundle, raw, history = notebook_inputs(ticker)
+        bundle, raw, thin, history = notebook_inputs(ticker)
         stamp = pd.Timestamp(day)
-        opening = raw[raw.index.normalize().tz_localize(None) == stamp].iloc[:5]
-        out = H.forecast_from(bundle, history, opening, stamp)
+        opening = _one_day(raw, stamp).iloc[:5]
+        window = None if thin is None else _one_day(thin, stamp, 5)
+        out = H.forecast_from(bundle, history, opening, stamp, window)
         high, low, adr = NOTEBOOK_FORECASTS[ticker][day]
-        assert out["pred_high"] == pytest.approx(high, abs=1e-5)
-        assert out["pred_low"] == pytest.approx(low, abs=1e-5)
+        # MU trades near $1,000: the same float32 noise is a larger dollar figure.
+        assert out["pred_high"] == pytest.approx(high, abs=1e-5, rel=1e-8)
+        assert out["pred_low"] == pytest.approx(low, abs=1e-5, rel=1e-8)
         assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)
+
+    def test_a_session_iex_printed_nothing_in_is_refused(self):
+        """MU 2025-03-10: the notebook's panel has no row for it."""
+        bundle, raw, thin, history = notebook_inputs("MU")
+        stamp = pd.Timestamp("2025-03-10")
+        assert _one_day(thin, stamp, 5).empty
+        with pytest.raises(ValueError, match="IEX printed nothing"):
+            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp,
+                            _one_day(thin, stamp, 5))
+
+    @pytest.mark.parametrize("ticker", sorted(OPENING_FEEDS))
+    def test_the_opening_feed_is_read_off_the_sidecar(self, ticker):
+        bundle, *_ = notebook_inputs(ticker)
+        assert H.opening_feed(bundle) == OPENING_FEEDS[ticker]
 
     @pytest.mark.parametrize("ticker", sorted(SHIPPED))
     def test_only_the_weighted_candidates_are_loaded(self, ticker):
-        bundle, _, _ = notebook_inputs(ticker)
+        bundle, *_ = notebook_inputs(ticker)
         assert bundle["kind"] == "highlow"
         assert bundle["ticker"] == ticker  # the file that loaded is the right one
         assert sorted(bundle["daily_models"]) == SHIPPED[ticker]

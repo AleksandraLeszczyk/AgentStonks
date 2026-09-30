@@ -1433,7 +1433,12 @@ class DayRangeTrader(BaseTrader):
         else:
             self._record_levels(state, opening.index[-1])
 
-        warning = _dayrange().volume_scale_warning(tape)
+        # A HighLow bundle fitted on IEX openings (MU) fetched its own IEX window
+        # and was fitted on IEX volume, so the IEX caveat does not describe it.
+        warning = (
+            None if (bundle.get("opening_feed") or "sip") != "sip"
+            else _dayrange().volume_scale_warning(tape)
+        )
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
         _log(state, {"type": "analysis", "text": self._plan_summary()})

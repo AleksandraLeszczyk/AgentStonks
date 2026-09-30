@@ -13,8 +13,8 @@ asked of a much larger dataset and anchored differently. FinNotebooks'
 `close5`, `high5`, `low5` come from the first five 1-minute bars; `adr14` is the
 mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
 on validation and the bundle records it: AAPL ships 0.5 LightGBM + 0.5 N-BEATS,
-INTC ships N-HiTS alone; every other candidate is in the bundle at weight 0 and
-is not loaded. On the 129-session test window AAPL scores 0.0050 mean absolute
+INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS; every
+other candidate is in the bundle at weight 0 and is not loaded. On the 129-session test window AAPL scores 0.0050 mean absolute
 log error per extreme ($1.37) against TimeToChange3's 0.0077, INTC 0.0150
 ($1.22) against 0.0216.
 
@@ -73,7 +73,32 @@ bars, so that is the open it was fitted on.
 
 Minute volume is on the consolidated scale here too: `or_volume_rel` and
 `or_volume_z` read today's opening five minutes against SIP history, so an IEX
-opening window biases both. `dayrange_model.volume_scale_warning` applies as is.
+opening window biases both. `dayrange_model.volume_scale_warning` applies as is,
+except to a bundle fitted on IEX openings (below), which is on IEX's scale.
+
+IEX openings (MU)
+-----------------
+A bundle whose sidecar says `"opening_feed": "iex"` (MU, saved 2026-09-30) was
+fitted with everything about *this morning* read from IEX, because SIP is 15
+minutes behind on the notebook's Alpaca plan and IEX is the only tape there is
+at 9:35: the opening summary, the `close5` anchor, the `high5`/`low5` clip, and
+the 28-session `or_volume_z` history of opening volumes. The daily rollups (and
+so every other feature and the targets) stay on SIP. For such a bundle:
+
+* the history cache holds SIP rollups joined to *IEX* opening summaries (the
+  cache records which, and is rebuilt if asked for the other), IEX bars trimmed
+  to the sessions SIP kept with no bar count of their own -- IEX is thin, and
+  the notebook keeps a window of three or four bars, or one missing 09:30;
+* a session IEX printed nothing in during the window (MU 2025-03-10) keeps its
+  SIP rollup but has no opening row, so it drops out of the panel as it does in
+  the notebook's inner join;
+* `forecast_session` fetches today's IEX window itself, whatever tape the
+  caller's bars are on, so a SIP replay forecasts from IEX exactly as live does.
+
+Today's *open* (`gap_adr`, `open_vs_avg_adr`) is still the caller's first bar,
+as for every bundle: the notebook read it from SIP. A replay on a SIP dataset is
+therefore the notebook exactly; live at 9:35 the only 09:30 bar is IEX's, a
+median 6 bp (p90 22 bp) off SIP's on MU, about 0.01-0.05 ADR on those two features.
 """
 
 from __future__ import annotations
@@ -83,9 +108,10 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import warnings
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -116,6 +142,10 @@ DEFAULT_TICKER = model_store.DEFAULT_TICKER
 
 # How much of the open the forecast may look at (`config.OPENING_MINUTES`).
 OPENING_MINUTES = 5
+# Which tape the opening window is read from (`Settings.opening_feed`); a
+# sidecar without the key predates it and read SIP.
+OPENING_FEED_SIP = "sip"
+OPENING_FEED_IEX = "iex"
 SESSION_MINUTES = 390
 # A full session has 390 bars. Anything under this is a half day or a feed gap
 # (`config.MIN_BARS_PER_SESSION`), and the notebook drops those sessions.
@@ -381,7 +411,17 @@ _OPENING_COLS = [
 ]
 
 
-def session_rollups(raw: pd.DataFrame) -> "tuple[pd.DataFrame, list[pd.Timestamp]]":
+def opening_minute_frame(raw: pd.DataFrame, keep_dates) -> pd.DataFrame:
+    """A thin feed's minute bars as the notebook reads its opening from them:
+    sane bars on the sessions the SIP tape kept, and no bar count of their own
+    (notebook 1's `trim`)."""
+    frame = add_session_columns(raw[sane_bars(raw)][OHLCV])
+    return frame[frame["date"].isin(keep_dates)]
+
+
+def session_rollups(
+    raw: pd.DataFrame, opening_raw: "pd.DataFrame | None" = None
+) -> "tuple[pd.DataFrame, list[pd.Timestamp]]":
     """Raw regular-hours minute bars -> `(rollups, dropped_dates)`.
 
     `rollups` has one row per kept session with `_ROLLUP_COLS` and the opening
@@ -389,6 +429,10 @@ def session_rollups(raw: pd.DataFrame) -> "tuple[pd.DataFrame, list[pd.Timestamp
     feed gaps), remembered so the cache knows it has already looked at them.
     Every step groups by date, so rolling up in chunks gives the same rows as
     rolling up the whole history at once.
+
+    `opening_raw` is another feed's bars for the same stretch (an IEX-opening
+    bundle's): the opening summary is then read from it, and a kept session it
+    printed nothing in has NaN there rather than no row.
     """
     if raw.empty:
         return pd.DataFrame(columns=_ROLLUP_COLS + _OPENING_COLS), []
@@ -396,8 +440,16 @@ def session_rollups(raw: pd.DataFrame) -> "tuple[pd.DataFrame, list[pd.Timestamp
     dropped = list(rep.index[~rep["kept"]])
     if minute.empty:
         return pd.DataFrame(columns=_ROLLUP_COLS + _OPENING_COLS), dropped
-    opening = opening_features(minute)[_OPENING_COLS]
-    return daily_bars(minute).join(opening, how="inner"), dropped
+    daily = daily_bars(minute)
+    if opening_raw is None:
+        opening = opening_features(minute)[_OPENING_COLS]
+        return daily.join(opening, how="inner"), dropped
+    thin = opening_minute_frame(opening_raw, daily.index)
+    opening = opening_features(thin)[_OPENING_COLS] if len(thin) else None
+    return daily.join(
+        opening if opening is not None else pd.DataFrame(columns=_OPENING_COLS, dtype=float),
+        how="left",
+    ), dropped
 
 
 # --- models (mirrors the inference half of highlow.models) --------------------
@@ -705,6 +757,7 @@ def _build_bundle(path: Path) -> "dict | None":
         "metadata": metadata,
         "daily_models": list(models),
         "opening_minutes": int(metadata.get("opening_minutes") or OPENING_MINUTES),
+        "opening_feed": str(metadata.get("opening_feed") or OPENING_FEED_SIP).lower(),
         "lookback": model.lookback,
         "trained_at": metadata.get("created"),
         "path": str(path),
@@ -723,6 +776,11 @@ def opening_minutes(bundle: "dict | None" = None) -> int:
         return OPENING_MINUTES
 
 
+def opening_feed(bundle: "dict | None" = None) -> str:
+    """The tape the bundle read this morning from: "sip", or "iex" (MU)."""
+    return str((bundle or {}).get("opening_feed") or OPENING_FEED_SIP)
+
+
 # --- the SIP history, cached per session -------------------------------------
 
 _history_lock = threading.Lock()
@@ -732,13 +790,18 @@ def history_path(symbol: str) -> Path:
     return HISTORY_DIR / f"{symbol.upper()}_sip_sessions.json"
 
 
-def _read_cache(symbol: str) -> dict:
+def _read_cache(symbol: str, opening_feed: str = OPENING_FEED_SIP) -> dict:
+    """The symbol's cache, or an empty one if it holds another feed's openings
+    (a file written before the key existed holds SIP's)."""
     try:
         payload = json.loads(history_path(symbol).read_text())
     except (OSError, ValueError):
-        return _empty_cache()
+        return _empty_cache(opening_feed)
+    if payload.get("opening_feed", OPENING_FEED_SIP) != opening_feed:
+        return _empty_cache(opening_feed)
     payload.setdefault("sessions", {})
     payload.setdefault("dropped", [])
+    payload["opening_feed"] = opening_feed
     return payload
 
 
@@ -763,8 +826,12 @@ def _credentials(key: "str | None", secret: "str | None") -> "tuple[str, str]":
     return key, secret
 
 
-def _fetch_rollups(symbol: str, first: date, before: date, key: str, secret: str):
-    """Rollups for the sessions in [first, before), straight from Alpaca SIP."""
+def _fetch_rollups(
+    symbol: str, first: date, before: date, key: str, secret: str,
+    opening_feed: str = OPENING_FEED_SIP,
+):
+    """Rollups for the sessions in [first, before), straight from Alpaca SIP --
+    with the opening summaries from `opening_feed` when that is not SIP."""
     from .datalog import log_fetch
     from .rest import fetch_bars_range
 
@@ -772,9 +839,16 @@ def _fetch_rollups(symbol: str, first: date, before: date, key: str, secret: str
     start = datetime.combine(first, datetime.min.time(), tzinfo=tz)
     end = datetime.combine(before, datetime.min.time(), tzinfo=tz)
     bars = fetch_bars_range(symbol, "1Min", start, end, key, secret, feed="sip", adjustment="split")
-    rollups, dropped = session_rollups(minute_frame_from_bars(bars))
+    opening_raw = None
+    if opening_feed != OPENING_FEED_SIP:
+        opening_raw = minute_frame_from_bars(fetch_bars_range(
+            symbol, "1Min", start, end, key, secret, feed=opening_feed, adjustment="split",
+        ))
+    rollups, dropped = session_rollups(minute_frame_from_bars(bars), opening_raw)
     log_fetch(
-        "minute bars (HighLow history)", "Alpaca REST (SIP, split-adjusted)",
+        "minute bars (HighLow history)",
+        "Alpaca REST (SIP, split-adjusted)" if opening_raw is None
+        else f"Alpaca REST (SIP + {opening_feed.upper()} openings, split-adjusted)",
         symbol=symbol, detail=f"{len(bars)} bars, {len(rollups)} sessions from {first}",
     )
     return rollups, dropped
@@ -787,8 +861,9 @@ def _rows(frame: pd.DataFrame) -> dict:
     }
 
 
-def _empty_cache() -> dict:
-    return {"sessions": {}, "dropped": [], "from": None, "through": None}
+def _empty_cache(opening_feed: str = OPENING_FEED_SIP) -> dict:
+    return {"sessions": {}, "dropped": [], "from": None, "through": None,
+            "opening_feed": opening_feed}
 
 
 def _merge(cache: dict, rollups: pd.DataFrame, dropped, seam: "str | None") -> bool:
@@ -811,9 +886,11 @@ def history_frame(
     before,
     key: "str | None" = None,
     secret: "str | None" = None,
+    opening_feed: str = OPENING_FEED_SIP,
 ) -> pd.DataFrame:
     """Per-session rollups of the SIP tape for the sessions strictly before
-    `before`, oldest first: `_ROLLUP_COLS` plus the opening summary.
+    `before`, oldest first: `_ROLLUP_COLS` plus the opening summary, read from
+    `opening_feed` (NaN on a session that feed printed nothing in).
 
     The cache remembers which calendar days it has looked at (`from` ..
     `through`), and only the days outside that stretch are fetched -- so a live
@@ -827,37 +904,37 @@ def history_frame(
     first_wanted = before - timedelta(days=HISTORY_CALENDAR_DAYS)
     last_wanted = before - timedelta(days=1)
     with _history_lock:
-        cache = _read_cache(symbol)
+        cache = _read_cache(symbol, opening_feed)
         lo = date.fromisoformat(cache["from"]) if cache.get("from") else None
         hi = date.fromisoformat(cache["through"]) if cache.get("through") else None
         if lo is None or hi is None or not cache["sessions"]:
-            cache, lo, hi = _empty_cache(), None, None
+            cache, lo, hi = _empty_cache(opening_feed), None, None
 
         if lo is None or lo > first_wanted or hi < last_wanted:
             key, secret = _credentials(key, secret)
+
+            def fetch(first: date, upto: date):
+                return _fetch_rollups(symbol, first, upto, key, secret, opening_feed)
+
             ok = True
             if lo is None or hi < first_wanted or lo > last_wanted:
                 # Nothing usable overlaps: fetch the whole window.
-                cache = _empty_cache()
-                _merge(cache, *_fetch_rollups(symbol, first_wanted, before, key, secret), None)
+                cache = _empty_cache(opening_feed)
+                _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             else:
                 if lo > first_wanted:
                     seam = min(cache["sessions"])
                     upto = date.fromisoformat(seam) + timedelta(days=1)
-                    ok = _merge(cache, *_fetch_rollups(symbol, first_wanted, upto, key, secret), seam)
+                    ok = _merge(cache, *fetch(first_wanted, upto), seam)
                     lo = first_wanted
                 if ok and hi < last_wanted:
                     seam = max(cache["sessions"])
-                    ok = _merge(
-                        cache,
-                        *_fetch_rollups(symbol, date.fromisoformat(seam), before, key, secret),
-                        seam,
-                    )
+                    ok = _merge(cache, *fetch(date.fromisoformat(seam), before), seam)
                     hi = last_wanted
             if not ok:
-                cache = _empty_cache()
-                _merge(cache, *_fetch_rollups(symbol, first_wanted, before, key, secret), None)
+                cache = _empty_cache(opening_feed)
+                _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             cache["from"], cache["through"] = lo.isoformat(), hi.isoformat()
             _write_cache(symbol, cache)
@@ -876,15 +953,64 @@ def history_frame(
 _forecast_cache: "dict[tuple, dict]" = {}
 _FORECAST_CACHE_MAX = 512
 
+# Live, the window is fetched the moment the caller's 09:34 bar has closed, and
+# Alpaca can publish that minute a moment later: re-asked this many times, this
+# far apart, while the window is this fresh. Never in a replay (the window is
+# long past on the real clock).
+_WINDOW_RETRIES = 3
+_WINDOW_RETRY_SEC = 2.0
+_WINDOW_FRESH_SEC = 90
+
+
+def _market_indexed(frame: pd.DataFrame) -> pd.DataFrame:
+    """`frame` with its index in exchange-local time (naive read as local)."""
+    out = frame.copy()
+    idx = pd.DatetimeIndex(out.index)
+    out.index = (
+        idx.tz_localize(market_hours.MARKET_TZ) if idx.tz is None
+        else idx.tz_convert(market_hours.MARKET_TZ)
+    )
+    return out
+
+
+def fetch_opening_window(
+    symbol: str, session_date, want: int, feed: str,
+    key: "str | None" = None, secret: "str | None" = None,
+) -> pd.DataFrame:
+    """The session's first `want` minutes on `feed`, straight from Alpaca, in
+    the notebook's raw minute shape. Possibly short: a thin feed misses minutes."""
+    from .rest import fetch_bars_range
+
+    key, secret = _credentials(key, secret)
+    day = pd.Timestamp(session_date).date()
+    start = datetime(day.year, day.month, day.day, 9, 30, tzinfo=market_hours.MARKET_TZ)
+    end = start + timedelta(minutes=want)
+    for attempt in range(_WINDOW_RETRIES):
+        bars = fetch_bars_range(symbol, "1Min", start, end, key, secret, feed=feed, adjustment="split")
+        frame = minute_frame_from_bars(bars)
+        complete = len(frame) and frame.index[-1] >= end - timedelta(minutes=1)
+        fresh = datetime.now(timezone.utc) < end + timedelta(seconds=_WINDOW_FRESH_SEC)
+        if complete or not fresh or attempt == _WINDOW_RETRIES - 1:
+            return frame
+        time.sleep(_WINDOW_RETRY_SEC)
+    return frame
+
 
 def forecast_from(
     bundle: dict,
     history: pd.DataFrame,
     opening_bars: pd.DataFrame,
     session_date,
+    opening_window: "pd.DataFrame | None" = None,
 ) -> dict:
     """The day's predicted high and low from a history of session rollups
     (`history_frame`) and today's first five minute bars.
+
+    `opening_window` is today's window on the bundle's opening feed when that
+    is not SIP (`opening_feed`): the opening summary, anchor and clip are read
+    from it, and `opening_bars` then supplies only today's open. It may be
+    short -- the notebook keeps a window IEX printed three bars in -- but not
+    empty.
 
     Returns the keys `dayrange_model.forecast_session` returns --
     `{"pred_high", "pred_low", "prev_avg", "adr14_abs", "or_high", "or_low"}`
@@ -911,23 +1037,31 @@ def forecast_from(
     # `want` bars and nothing else. `daily_features` reads only today's open
     # from the daily row (every other statistic is shifted a day), so the
     # partial row cannot leak the session's outcome.
-    raw = opening_bars.iloc[:want][OHLCV].copy()
-    idx = pd.DatetimeIndex(raw.index)
-    raw.index = (
-        idx.tz_localize(market_hours.MARKET_TZ) if idx.tz is None
-        else idx.tz_convert(market_hours.MARKET_TZ)
-    )
-    minute = add_session_columns(raw)
+    minute = add_session_columns(_market_indexed(opening_bars.iloc[:want][OHLCV]))
     if int(minute["minute"].iloc[0]) != 0:
         raise ValueError("the opening window does not start at 09:30.")
     minute = minute[minute["date"] == day]
     if len(minute) < want:
         raise ValueError(f"the opening window is not {day.date()}'s first {want} minutes.")
     today_daily = daily_bars(minute)
-    today_opening = opening_features(minute, want)[_OPENING_COLS]
+    feed = opening_feed(bundle)
+    if feed == OPENING_FEED_SIP:
+        today_opening = opening_features(minute, want)[_OPENING_COLS]
+    else:
+        thin = pd.DataFrame(columns=OHLCV) if opening_window is None else opening_window[OHLCV]
+        thin = opening_minute_frame(_market_indexed(thin), [day]) if len(thin) else thin
+        if not len(thin) or not (thin["minute"] < want).any():
+            raise ValueError(
+                f"{feed.upper()} printed nothing in {day.date()}'s first {want} minutes, and "
+                f"this model reads the open from {feed.upper()} only; the notebook drops "
+                "such a session."
+            )
+        today_opening = opening_features(thin, want)[_OPENING_COLS]
 
     daily = pd.concat([history[_ROLLUP_COLS], today_daily[_ROLLUP_COLS]])
-    opening = pd.concat([history[_OPENING_COLS], today_opening])
+    # A past session the opening feed printed nothing in keeps its daily row but
+    # leaves the panel, as the notebook's inner join leaves it out.
+    opening = pd.concat([history.loc[history["open5"].notna(), _OPENING_COLS], today_opening])
     panel = panel_from(daily, opening, want)
     row = panel.loc[[day]]
 
@@ -963,19 +1097,27 @@ def forecast_session(
 
     Memoised on the inputs: a SimLab tuning grid replays the same session under
     dozens of configurations, and the forecast depends on none of them.
+
+    A bundle that reads the open from IEX (`opening_feed`) is handed today's
+    IEX window fetched here, whatever tape `opening_bars` is on, so a replay of
+    a SIP dataset forecasts from what a live run would have seen at 9:35.
     """
     want = opening_minutes(bundle)
+    feed = opening_feed(bundle)
     window = opening_bars.iloc[:want]
     memo = (
-        bundle.get("path"), str(ticker).upper(), pd.Timestamp(session_date).date(),
+        bundle.get("path"), str(ticker).upper(), pd.Timestamp(session_date).date(), feed,
         tuple(map(str, window.index)),
         tuple(np.round(window[OHLCV].to_numpy(dtype=float), 6).ravel()),
     )
     cached = _forecast_cache.get(memo)
     if cached is not None:
         return dict(cached)
-    history = history_frame(ticker, session_date, key, secret)
-    out = forecast_from(bundle, history, opening_bars, session_date)
+    history = history_frame(ticker, session_date, key, secret, feed)
+    thin = None
+    if feed != OPENING_FEED_SIP:
+        thin = fetch_opening_window(ticker, session_date, want, feed, key, secret)
+    out = forecast_from(bundle, history, opening_bars, session_date, thin)
     if len(_forecast_cache) >= _FORECAST_CACHE_MAX:
         _forecast_cache.clear()
     _forecast_cache[memo] = dict(out)

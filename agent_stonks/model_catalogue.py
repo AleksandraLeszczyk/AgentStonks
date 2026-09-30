@@ -688,6 +688,10 @@ def _highlow_spec(ticker: str) -> ModelSpec:
             f"~127 sessions of SIP minute bars rolled up to daily (a "
             f"{meta.get('lookback', 32)}-day sequence inside it) + the first "
             f"{meta.get('opening_minutes', 5)} minutes of today"
+            + (
+                f", read from {str(meta['opening_feed']).upper()}"
+                if str(meta.get("opening_feed") or "sip").lower() != "sip" else ""
+            )
         ),
         metrics=metrics,
         headline=(

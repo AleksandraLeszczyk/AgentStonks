@@ -827,7 +827,13 @@ def evaluate_highlow(ticker: str, feed: str) -> dict:
 
     days = stored_minute_days(symbol, feed)
     notes: "list[str]" = []
-    if feed == "iex":
+    opening_feed = highlow_model.opening_feed(bundle)
+    if opening_feed != highlow_model.OPENING_FEED_SIP:
+        notes.append(
+            f"This model reads the opening minutes from {opening_feed.upper()} whatever the "
+            "tape, fetched for each session, so the stored opening bars only set the open."
+        )
+    elif feed == "iex":
         notes.append(
             "The opening volumes come off the IEX tape and the history off SIP, so the "
             "two opening-volume features read low on every session here."
@@ -837,7 +843,7 @@ def evaluate_highlow(ticker: str, feed: str) -> dict:
     # a missing key or a failed fetch is one note rather than one per session.
     try:
         for day in (days[:1] + days[-1:]):
-            highlow_model.history_frame(symbol, day)
+            highlow_model.history_frame(symbol, day, opening_feed=opening_feed)
     except Exception as exc:  # noqa: BLE001 -- a network error is a note here
         return {"rows": [], "notes": notes + [
             f"No SIP history for the HighLow forecast — {str(exc).rstrip('.')}."
