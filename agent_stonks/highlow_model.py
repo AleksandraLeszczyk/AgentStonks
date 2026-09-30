@@ -13,8 +13,9 @@ asked of a much larger dataset and anchored differently. FinNotebooks'
 `close5`, `high5`, `low5` come from the first five 1-minute bars; `adr14` is the
 mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
 on validation and the bundle records it: AAPL ships 0.5 LightGBM + 0.5 N-BEATS,
-INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS; every
-other candidate is in the bundle at weight 0 and is not loaded. On the 129-session test window AAPL scores 0.0050 mean absolute
+INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS, BE 0.75
+N-BEATS + 0.25 N-HiTS; every other candidate is in the bundle at weight 0 and
+is not loaded. On the 129-session test window AAPL scores 0.0050 mean absolute
 log error per extreme ($1.37) against TimeToChange3's 0.0077, INTC 0.0150
 ($1.22) against 0.0216.
 
@@ -24,6 +25,7 @@ linear median, which ships at weight 0 -- so the shipped forecast reads the base
 48 features alone and none of the groups is mirrored here. A retrain that gives
 a candidate reading them a weight would need them copied first;
 `_build_bundle` refuses such a bundle rather than predicting off missing columns.
+The one group that is mirrored is BE's "theme" (below).
 
 Half days: the notebook drops an explicit list of NYSE 13:00 closes (a bar
 count misses some -- INTC's 28 Nov 2025 passed it). That list ends in 2025, so
@@ -99,6 +101,34 @@ Today's *open* (`gap_adr`, `open_vs_avg_adr`) is still the caller's first bar,
 as for every bundle: the notebook read it from SIP. A replay on a SIP dataset is
 therefore the notebook exactly; live at 9:35 the only 09:30 bar is IEX's, a
 median 6 bp (p90 22 bp) off SIP's on MU, about 0.01-0.05 ADR on those two features.
+
+Theme peers (BE)
+----------------
+BE's bundle (saved 2026-09-30) is the first whose shipped candidates read a
+custom column: both nets (N-BEATS 0.75 + N-HiTS 0.25) take `lead_or_ret_adr`,
+the lead peer's (VST's) opening five minutes in VST's own ADR, falling back to
+the mean over all three peers (VST, PLUG, XLU) on a morning VST did not print --
+13 of the notebook's 767 sessions, the latest 2025-12-31. So the "theme" group
+is mirrored (`theme_from`, verbatim but for reading cached opening summaries)
+and every peer is fed to it. Each peer is read as the notebook's `load_peers`
+reads it: SIP rollups cleaned at the standard 385 bars, openings from IEX
+(`PEER_OPENING_FEED`), cached like any other symbol, plus today's IEX window
+fetched at 9:35. The group's other columns are unshipped and match the
+notebook to ~1e-11, except `theme_gap`: it reads the peer's open today, which
+is IEX's first bar here and SIP's in the notebook (0.02-0.04 ADR apart on the
+days checked). A retrain that weights `theme_gap` inherits that seam, the
+same one `gap_adr` has.
+
+A peer whose SIP session today turns out incomplete would have no row in the
+notebook, so its `lead_or_ret_adr` would fall back. At 9:35 nobody knows that
+yet, so the mirror counts it. VST on 2025-12-31 (380 bars) is one: $0.0009 on
+BE's predicted high. The mirror test hands the peers the windows the notebook
+kept, so it pins the code and not this seam.
+
+BE also keeps sessions of 370 bars or more rather than 385 (the sidecar's
+`min_bars_per_session`, 44 quiet sessions). The own history is cleaned at that
+threshold, and the cache records the threshold it was cleaned at; at 385,
+2025-03-20's forecast would be $0.08 off.
 """
 
 from __future__ import annotations
@@ -146,9 +176,13 @@ OPENING_MINUTES = 5
 # sidecar without the key predates it and read SIP.
 OPENING_FEED_SIP = "sip"
 OPENING_FEED_IEX = "iex"
+# The feed a theme peer's opening is read from (`highlow.data.load_peers`'
+# default, whatever the modelled ticker's own opening feed).
+PEER_OPENING_FEED = OPENING_FEED_IEX
 SESSION_MINUTES = 390
 # A full session has 390 bars. Anything under this is a half day or a feed gap
-# (`config.MIN_BARS_PER_SESSION`), and the notebook drops those sessions.
+# (`config.MIN_BARS_PER_SESSION`), and the notebook drops those sessions. A
+# thin name's sidecar can lower it (`min_bars_per_session`, BE's 370).
 MIN_BARS_PER_SESSION = 385
 
 # Prior sessions the feature row needs: 126-day momentum and volatility read
@@ -258,7 +292,8 @@ _SCALE_BY_ADR = [
 ]
 
 
-def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPENING_MINUTES) -> pd.DataFrame:
+def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPENING_MINUTES,
+               peers: "tuple[dict, dict] | None" = None) -> pd.DataFrame:
     """`highlow.features.build_panel` from its two inputs' summaries.
 
     The notebook's `build_panel(minute, daily)` is `daily_features(daily)`
@@ -267,6 +302,10 @@ def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPEN
     today's row has no targets, and the caller checks the feature row itself.
     Split at the join because the live path caches per-session opening
     summaries rather than re-reading months of minute bars.
+
+    `peers` is `({ticker: opening summaries}, {ticker: daily bars})`: given, the
+    "theme" group is joined as `build_panel` joins it. No other custom group is
+    mirrored.
     """
     f = daily_features(daily).join(opening, how="inner")
 
@@ -279,6 +318,10 @@ def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPEN
     f["or_volume_z"] = (lv5 - lv5.rolling(28).mean().shift(1)) / lv5.rolling(28).std().shift(1)
     f["adr_trend"] = np.log(f["adr7"] / f["adr28"])  # range expanding or drying up
     f["vol_trend"] = np.log(f["vol7"] / f["vol28"])
+
+    if peers is not None:
+        f = f.join(theme_from(peers[0], peers[1], daily))
+        f["own_vs_theme"] = f["or_ret"] / f["adr14"] - f["theme_or_ret"]
     return f
 
 
@@ -301,6 +344,52 @@ FEATURE_COLS: "list[str]" = [
     "adr14", "vol63", "vol126", "mom28", "mom63", "mom126", "dist_high126", "dist_low126",
     "dow",
 ]
+
+
+# --- the "theme" group (mirrors highlow.features.theme_features) -------------
+
+THEME_COLS: "list[str]" = [
+    "theme_or_ret", "theme_gap", "theme_range", "theme_dispersion", "lead_or_ret_adr",
+    "beta_theme63", "own_vs_theme",
+]
+
+
+def theme_from(peer_openings: "dict[str, pd.DataFrame]", peer_dailies: "dict[str, pd.DataFrame]",
+               own_daily: pd.DataFrame) -> pd.DataFrame:
+    """`highlow.features.theme_features`, verbatim, except that each peer's
+    opening arrives already summarised (`opening_features`' columns, one row per
+    session, NaN where the feed printed nothing) rather than as minute bars --
+    the same split as `panel_from`. Peers in the notebook's order: the first is
+    the lead."""
+    f = pd.DataFrame(index=own_daily.index)
+    rets, gaps, ranges = [], [], []
+    peer_returns = []
+    for i, (name, po) in enumerate(peer_openings.items()):
+        pd_daily = peer_dailies[name]
+        pf = daily_features(pd_daily)
+        ret = (po["or_ret"] / pf["adr14"]).reindex(f.index)
+        rets.append(ret)
+        gaps.append((pf["gap"] / pf["adr14"]).reindex(f.index))
+        ranges.append((po["or_range"] / pf["adr14"]).reindex(f.index))
+        peer_returns.append(np.log(pd_daily["close"]).diff())
+        if i == 0:  # the closest peer keeps its own column
+            f["lead_or_ret_adr"] = ret
+
+    f["theme_or_ret"] = pd.concat(rets, axis=1).mean(axis=1)
+    f["theme_gap"] = pd.concat(gaps, axis=1).mean(axis=1)
+    f["theme_range"] = pd.concat(ranges, axis=1).mean(axis=1)
+    # all peers moving the same way is a theme day; disagreement is stock-specific news
+    f["theme_dispersion"] = pd.concat(rets, axis=1).std(axis=1).fillna(0.0)
+    # a peer that did not print this morning falls back to the rest of the group
+    f["lead_or_ret_adr"] = f["lead_or_ret_adr"].fillna(f["theme_or_ret"])
+
+    # sort=True is what the notebook's pandas does unasked (and 3.x warns about)
+    theme_ret = pd.concat(peer_returns, axis=1, sort=True).mean(axis=1)
+    both = own_daily.index.intersection(theme_ret.dropna().index)
+    r_own = np.log(own_daily.loc[both, "close"]).diff()
+    r_theme = theme_ret.loc[both]
+    f["beta_theme63"] = (r_own.rolling(63).cov(r_theme) / r_theme.rolling(63).var()).shift(1).reindex(f.index)
+    return f
 
 
 def to_prices(pred: np.ndarray, frame: pd.DataFrame) -> pd.DataFrame:
@@ -338,7 +427,7 @@ def sane_bars(minute: pd.DataFrame) -> pd.Series:
     )
 
 
-def session_report(minute: pd.DataFrame) -> pd.DataFrame:
+def session_report(minute: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION) -> pd.DataFrame:
     """One row per session: bar count, first and last minute, and whether it is kept."""
     rep = minute.groupby("date").agg(
         n_bars=("close", "size"), first_minute=("minute", "min"),
@@ -349,19 +438,19 @@ def session_report(minute: pd.DataFrame) -> pd.DataFrame:
     # INTC's 28 Nov 2025 passed the count. The list stops at 2025, so the rule
     # that generates it -- identical on every date it covers -- stands in here.
     rep["half_day"] = early_close(pd.DatetimeIndex(rep.index))
-    rep["short"] = rep["n_bars"] < MIN_BARS_PER_SESSION
+    rep["short"] = rep["n_bars"] < min_bars
     rep["no_open_bar"] = rep["first_minute"] != 0
     rep["early_end"] = rep["last_minute"] < SESSION_MINUTES - 5
     rep["kept"] = ~(rep["half_day"] | rep["short"] | rep["no_open_bar"] | rep["early_end"])
     return rep
 
 
-def clean_minute(raw: pd.DataFrame) -> "tuple[pd.DataFrame, pd.DataFrame]":
+def clean_minute(raw: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Drop broken bars and incomplete sessions (half days, feed gaps)."""
     minute = raw[sane_bars(raw)]
     minute = add_session_columns(minute[OHLCV])
     minute["volume"] = minute["volume"].astype("int64")
-    rep = session_report(minute)
+    rep = session_report(minute, min_bars)
     kept = rep.index[rep["kept"]]
     return minute[minute["date"].isin(kept)], rep
 
@@ -420,7 +509,8 @@ def opening_minute_frame(raw: pd.DataFrame, keep_dates) -> pd.DataFrame:
 
 
 def session_rollups(
-    raw: pd.DataFrame, opening_raw: "pd.DataFrame | None" = None
+    raw: pd.DataFrame, opening_raw: "pd.DataFrame | None" = None,
+    min_bars: int = MIN_BARS_PER_SESSION,
 ) -> "tuple[pd.DataFrame, list[pd.Timestamp]]":
     """Raw regular-hours minute bars -> `(rollups, dropped_dates)`.
 
@@ -436,7 +526,7 @@ def session_rollups(
     """
     if raw.empty:
         return pd.DataFrame(columns=_ROLLUP_COLS + _OPENING_COLS), []
-    minute, rep = clean_minute(raw)
+    minute, rep = clean_minute(raw, min_bars)
     dropped = list(rep.index[~rep["kept"]])
     if minute.empty:
         return pd.DataFrame(columns=_ROLLUP_COLS + _OPENING_COLS), dropped
@@ -731,21 +821,26 @@ def _build_bundle(path: Path) -> "dict | None":
         return None
     if not models:
         return None
-    # Only the base feature set is mirrored. A weighted candidate reading one of
-    # the notebook's custom groups (INTC's market / regime / microstructure)
-    # would hit columns this module never builds, so the bundle is refused
-    # here rather than failing -- or worse, predicting -- at 9:35.
-    read = set(blob["feature_cols"])
-    for m in models.values():
-        read |= set(getattr(m, "feature_cols", None) or ())
-    if read - set(FEATURE_COLS):
-        return None
 
     meta_file = metadata_path(path)
     try:
         metadata = json.loads(meta_file.read_text()) if meta_file.exists() else {}
     except (OSError, ValueError):
         metadata = {}
+    peers = tuple(str(t).upper() for t in (metadata.get("peers") or ()))
+
+    # The base feature set is mirrored, and the "theme" group when the sidecar
+    # names the peers it reads (BE). A weighted candidate reading any other
+    # custom group (INTC's market / regime / microstructure) would hit columns
+    # this module never builds, so the bundle is refused here rather than
+    # failing -- or worse, predicting -- at 9:35.
+    read = set(blob["feature_cols"])
+    for m in models.values():
+        read |= set(getattr(m, "feature_cols", None) or ())
+    if read - set(FEATURE_COLS) - (set(THEME_COLS) if peers else set()):
+        return None
+    if not read & set(THEME_COLS):
+        peers = ()  # built for the notebook's search, read by nothing shipped
 
     model = HighLowModel(
         models=models, weights=weights, lookback=int(blob["lookback"]),
@@ -758,6 +853,8 @@ def _build_bundle(path: Path) -> "dict | None":
         "daily_models": list(models),
         "opening_minutes": int(metadata.get("opening_minutes") or OPENING_MINUTES),
         "opening_feed": str(metadata.get("opening_feed") or OPENING_FEED_SIP).lower(),
+        "min_bars": int(metadata.get("min_bars_per_session") or MIN_BARS_PER_SESSION),
+        "peers": peers,
         "lookback": model.lookback,
         "trained_at": metadata.get("created"),
         "path": str(path),
@@ -781,6 +878,19 @@ def opening_feed(bundle: "dict | None" = None) -> str:
     return str((bundle or {}).get("opening_feed") or OPENING_FEED_SIP)
 
 
+def min_bars(bundle: "dict | None" = None) -> int:
+    """The bar count a session needs to be kept: 385, or the sidecar's (BE 370)."""
+    try:
+        return int((bundle or {})["min_bars"])
+    except (KeyError, TypeError, ValueError):
+        return MIN_BARS_PER_SESSION
+
+
+def peers(bundle: "dict | None" = None) -> "tuple[str, ...]":
+    """The theme peers the shipped blend reads, lead first; () for most bundles."""
+    return tuple((bundle or {}).get("peers") or ())
+
+
 # --- the SIP history, cached per session -------------------------------------
 
 _history_lock = threading.Lock()
@@ -790,18 +900,23 @@ def history_path(symbol: str) -> Path:
     return HISTORY_DIR / f"{symbol.upper()}_sip_sessions.json"
 
 
-def _read_cache(symbol: str, opening_feed: str = OPENING_FEED_SIP) -> dict:
+def _read_cache(
+    symbol: str, opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION
+) -> dict:
     """The symbol's cache, or an empty one if it holds another feed's openings
-    (a file written before the key existed holds SIP's)."""
+    or sessions cleaned at another bar count (a file written before either key
+    existed holds SIP's, at 385)."""
     try:
         payload = json.loads(history_path(symbol).read_text())
     except (OSError, ValueError):
-        return _empty_cache(opening_feed)
-    if payload.get("opening_feed", OPENING_FEED_SIP) != opening_feed:
-        return _empty_cache(opening_feed)
+        return _empty_cache(opening_feed, min_bars)
+    if (payload.get("opening_feed", OPENING_FEED_SIP) != opening_feed
+            or int(payload.get("min_bars", MIN_BARS_PER_SESSION)) != min_bars):
+        return _empty_cache(opening_feed, min_bars)
     payload.setdefault("sessions", {})
     payload.setdefault("dropped", [])
     payload["opening_feed"] = opening_feed
+    payload["min_bars"] = min_bars
     return payload
 
 
@@ -828,7 +943,7 @@ def _credentials(key: "str | None", secret: "str | None") -> "tuple[str, str]":
 
 def _fetch_rollups(
     symbol: str, first: date, before: date, key: str, secret: str,
-    opening_feed: str = OPENING_FEED_SIP,
+    opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
 ):
     """Rollups for the sessions in [first, before), straight from Alpaca SIP --
     with the opening summaries from `opening_feed` when that is not SIP."""
@@ -844,7 +959,7 @@ def _fetch_rollups(
         opening_raw = minute_frame_from_bars(fetch_bars_range(
             symbol, "1Min", start, end, key, secret, feed=opening_feed, adjustment="split",
         ))
-    rollups, dropped = session_rollups(minute_frame_from_bars(bars), opening_raw)
+    rollups, dropped = session_rollups(minute_frame_from_bars(bars), opening_raw, min_bars)
     log_fetch(
         "minute bars (HighLow history)",
         "Alpaca REST (SIP, split-adjusted)" if opening_raw is None
@@ -861,9 +976,9 @@ def _rows(frame: pd.DataFrame) -> dict:
     }
 
 
-def _empty_cache(opening_feed: str = OPENING_FEED_SIP) -> dict:
+def _empty_cache(opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION) -> dict:
     return {"sessions": {}, "dropped": [], "from": None, "through": None,
-            "opening_feed": opening_feed}
+            "opening_feed": opening_feed, "min_bars": min_bars}
 
 
 def _merge(cache: dict, rollups: pd.DataFrame, dropped, seam: "str | None") -> bool:
@@ -887,10 +1002,12 @@ def history_frame(
     key: "str | None" = None,
     secret: "str | None" = None,
     opening_feed: str = OPENING_FEED_SIP,
+    min_bars: int = MIN_BARS_PER_SESSION,
 ) -> pd.DataFrame:
     """Per-session rollups of the SIP tape for the sessions strictly before
     `before`, oldest first: `_ROLLUP_COLS` plus the opening summary, read from
-    `opening_feed` (NaN on a session that feed printed nothing in).
+    `opening_feed` (NaN on a session that feed printed nothing in), sessions
+    kept at `min_bars`.
 
     The cache remembers which calendar days it has looked at (`from` ..
     `through`), and only the days outside that stretch are fetched -- so a live
@@ -904,22 +1021,22 @@ def history_frame(
     first_wanted = before - timedelta(days=HISTORY_CALENDAR_DAYS)
     last_wanted = before - timedelta(days=1)
     with _history_lock:
-        cache = _read_cache(symbol, opening_feed)
+        cache = _read_cache(symbol, opening_feed, min_bars)
         lo = date.fromisoformat(cache["from"]) if cache.get("from") else None
         hi = date.fromisoformat(cache["through"]) if cache.get("through") else None
         if lo is None or hi is None or not cache["sessions"]:
-            cache, lo, hi = _empty_cache(opening_feed), None, None
+            cache, lo, hi = _empty_cache(opening_feed, min_bars), None, None
 
         if lo is None or lo > first_wanted or hi < last_wanted:
             key, secret = _credentials(key, secret)
 
             def fetch(first: date, upto: date):
-                return _fetch_rollups(symbol, first, upto, key, secret, opening_feed)
+                return _fetch_rollups(symbol, first, upto, key, secret, opening_feed, min_bars)
 
             ok = True
             if lo is None or hi < first_wanted or lo > last_wanted:
                 # Nothing usable overlaps: fetch the whole window.
-                cache = _empty_cache(opening_feed)
+                cache = _empty_cache(opening_feed, min_bars)
                 _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             else:
@@ -933,7 +1050,7 @@ def history_frame(
                     ok = _merge(cache, *fetch(date.fromisoformat(seam), before), seam)
                     hi = last_wanted
             if not ok:
-                cache = _empty_cache(opening_feed)
+                cache = _empty_cache(opening_feed, min_bars)
                 _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             cache["from"], cache["through"] = lo.isoformat(), hi.isoformat()
@@ -996,12 +1113,44 @@ def fetch_opening_window(
     return frame
 
 
+def _peer_inputs(
+    peer_data: "dict[str, tuple[pd.DataFrame, pd.DataFrame | None]]", day: pd.Timestamp, want: int,
+) -> "tuple[dict, dict]":
+    """`theme_from`'s `(openings, dailies)` from each peer's cached history and
+    today's IEX window, in the peers' order.
+
+    Today's row is what 9:35 knows: the window's opening summary, and a daily
+    row rolled up from the window, whose only column the features read is the
+    open (every other statistic is shifted a day). A peer IEX printed nothing
+    for gets no row today, and so falls back as in the notebook.
+    """
+    openings, dailies = {}, {}
+    for name, (history, window) in peer_data.items():
+        history = history[history.index < day]
+        today_open = today_daily = None
+        if window is not None and len(window):
+            thin = opening_minute_frame(_market_indexed(window[OHLCV]), [day])
+            thin = thin[thin["minute"] < want]
+            if len(thin):
+                today_open = opening_features(thin, want)[_OPENING_COLS]
+                today_daily = daily_bars(thin)[_ROLLUP_COLS]
+        openings[name] = pd.concat(
+            [history.loc[history["open5"].notna(), _OPENING_COLS]]
+            + ([today_open] if today_open is not None else [])
+        )
+        dailies[name] = pd.concat(
+            [history[_ROLLUP_COLS]] + ([today_daily] if today_daily is not None else [])
+        )
+    return openings, dailies
+
+
 def forecast_from(
     bundle: dict,
     history: pd.DataFrame,
     opening_bars: pd.DataFrame,
     session_date,
     opening_window: "pd.DataFrame | None" = None,
+    peer_data: "dict[str, tuple[pd.DataFrame, pd.DataFrame | None]] | None" = None,
 ) -> dict:
     """The day's predicted high and low from a history of session rollups
     (`history_frame`) and today's first five minute bars.
@@ -1011,6 +1160,11 @@ def forecast_from(
     from it, and `opening_bars` then supplies only today's open. It may be
     short -- the notebook keeps a window IEX printed three bars in -- but not
     empty.
+
+    `peer_data` is `{peer: (history, today's IEX window)}` for a bundle that
+    reads the theme group (`peers`, BE): each peer's `history_frame` on
+    `PEER_OPENING_FEED`, and its window as `fetch_opening_window` returns it
+    (None or empty when IEX printed nothing).
 
     Returns the keys `dayrange_model.forecast_session` returns --
     `{"pred_high", "pred_low", "prev_avg", "adr14_abs", "or_high", "or_low"}`
@@ -1058,11 +1212,19 @@ def forecast_from(
             )
         today_opening = opening_features(thin, want)[_OPENING_COLS]
 
+    theme = None
+    if peers(bundle):
+        missing_peers = [t for t in peers(bundle) if t not in (peer_data or {})]
+        if missing_peers:
+            raise ValueError(f"this model reads its theme peers and {', '.join(missing_peers)} "
+                             "was not supplied.")
+        theme = _peer_inputs({t: peer_data[t] for t in peers(bundle)}, day, want)
+
     daily = pd.concat([history[_ROLLUP_COLS], today_daily[_ROLLUP_COLS]])
     # A past session the opening feed printed nothing in keeps its daily row but
     # leaves the panel, as the notebook's inner join leaves it out.
     opening = pd.concat([history.loc[history["open5"].notna(), _OPENING_COLS], today_opening])
-    panel = panel_from(daily, opening, want)
+    panel = panel_from(daily, opening, want, theme)
     row = panel.loc[[day]]
 
     model = bundle["model"]
@@ -1071,7 +1233,11 @@ def forecast_from(
         raise ValueError(
             "the feature row is incomplete "
             f"({', '.join(missing[:4])}{'…' if len(missing) > 4 else ''}); "
-            "the SIP history is too short or has gaps."
+            + ("the SIP history is too short or has gaps"
+               if not set(missing) <= set(THEME_COLS)
+               else f"none of the theme peers ({', '.join(peers(bundle))}) has an IEX opening "
+                    "and 14 sessions of history this morning")
+            + "."
         )
     seq = make_sequences(channel_frame(daily), row, model.lookback)
     pred = model.predict_prices(row, seq).iloc[0]
@@ -1083,6 +1249,16 @@ def forecast_from(
         "or_high": float(row["high5"].iloc[0]),
         "or_low": float(row["low5"].iloc[0]),
     }
+
+
+def warm_history(
+    bundle: dict, ticker: str, before, key: "str | None" = None, secret: "str | None" = None,
+) -> None:
+    """Stretch the history caches `forecast_session` reads -- the ticker's and
+    each theme peer's -- over the sessions before `before`."""
+    history_frame(ticker, before, key, secret, opening_feed(bundle), min_bars(bundle))
+    for peer in peers(bundle):
+        history_frame(peer, before, key, secret, PEER_OPENING_FEED)
 
 
 def forecast_session(
@@ -1100,7 +1276,8 @@ def forecast_session(
 
     A bundle that reads the open from IEX (`opening_feed`) is handed today's
     IEX window fetched here, whatever tape `opening_bars` is on, so a replay of
-    a SIP dataset forecasts from what a live run would have seen at 9:35.
+    a SIP dataset forecasts from what a live run would have seen at 9:35. So is
+    a bundle that reads theme peers (BE), for each peer, beside its history.
     """
     want = opening_minutes(bundle)
     feed = opening_feed(bundle)
@@ -1113,11 +1290,20 @@ def forecast_session(
     cached = _forecast_cache.get(memo)
     if cached is not None:
         return dict(cached)
-    history = history_frame(ticker, session_date, key, secret, feed)
+    history = history_frame(ticker, session_date, key, secret, feed, min_bars(bundle))
     thin = None
     if feed != OPENING_FEED_SIP:
         thin = fetch_opening_window(ticker, session_date, want, feed, key, secret)
-    out = forecast_from(bundle, history, opening_bars, session_date, thin)
+    peer_data = None
+    if peers(bundle):
+        peer_data = {
+            peer: (
+                history_frame(peer, session_date, key, secret, PEER_OPENING_FEED),
+                fetch_opening_window(peer, session_date, want, PEER_OPENING_FEED, key, secret),
+            )
+            for peer in peers(bundle)
+        }
+    out = forecast_from(bundle, history, opening_bars, session_date, thin, peer_data)
     if len(_forecast_cache) >= _FORECAST_CACHE_MAX:
         _forecast_cache.clear()
     _forecast_cache[memo] = dict(out)

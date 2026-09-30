@@ -839,11 +839,12 @@ def evaluate_highlow(ticker: str, feed: str) -> dict:
             "two opening-volume features read low on every session here."
         )
     # The history for the first and the last stored day, once each, before the
-    # loop: between them they stretch the cache over every day in between, so
-    # a missing key or a failed fetch is one note rather than one per session.
+    # loop: between them they stretch the cache (and each theme peer's, on BE)
+    # over every day in between, so a missing key or a failed fetch is one note
+    # rather than one per session.
     try:
         for day in (days[:1] + days[-1:]):
-            highlow_model.history_frame(symbol, day, opening_feed=opening_feed)
+            highlow_model.warm_history(bundle, symbol, day)
     except Exception as exc:  # noqa: BLE001 -- a network error is a note here
         return {"rows": [], "notes": notes + [
             f"No SIP history for the HighLow forecast — {str(exc).rstrip('.')}."

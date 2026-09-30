@@ -81,12 +81,14 @@ DEFAULT_TICKER = "AAPL"
 DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 
 # Which symbols HighLow_5m has saved a bundle for (`highlow15m_<TICKER>.*`).
-# AAPL (saved 2026-09-15), INTC (2026-09-21) and MU (2026-09-30, its opening
-# read from IEX -- see `highlow_model`); GOOGL is in the notebook's config but
-# has not been run through it. Adding one is this tuple plus its files in
-# `Code/Models` -- and a check that the bundle's shipped candidates read only
-# the base features, since `highlow_model` mirrors no custom group.
-HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU")
+# AAPL (saved 2026-09-15), INTC (2026-09-21), MU (2026-09-30, its opening
+# read from IEX -- see `highlow_model`) and BE (2026-09-30, IEX opening plus its
+# theme peers VST, PLUG and XLU); GOOGL is in the notebook's config but has not
+# been run through it. Adding one is this tuple plus its files in `Code/Models`
+# -- and a check that the bundle's shipped candidates read only the base
+# features and the "theme" group, the one custom group `highlow_model` mirrors
+# (`_build_bundle` refuses anything else).
+HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE")
 
 
 @dataclass(frozen=True)
@@ -279,11 +281,13 @@ MODELS: "dict[str, AppleModel]" = {
             "will land, made once at 9:35 -- measured from the 9:35 price in units "
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + N-BEATS + "
-            "N-HiTS), fitted on every session since 2023 with its first five minutes "
-            "(MU's read from IEX, the only tape there is at 9:35 on a basic plan). On "
-            "the 129-session test window its error is 35% below TimeToChange3's on "
-            "AAPL ($1.37 per extreme against $2.11) and 31% below on INTC; MU has no "
-            "TimeToChange3 bundle, and beats that approach retrained on MU by 25%. "
+            "N-HiTS; BE: N-BEATS + N-HiTS), fitted on every session since 2023 with its "
+            "first five minutes (MU's and BE's read from IEX, the only tape there is at "
+            "9:35 on a basic plan; BE's also with VST's opening move, its lead AI-power "
+            "peer). On the 129-session test window its error is 35% below "
+            "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
+            "INTC; MU and BE have no TimeToChange3 bundle, and beat that approach "
+            "retrained on them by 25% and 33%. "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -291,7 +295,7 @@ MODELS: "dict[str, AppleModel]" = {
         requires=(
             "PyTorch, LightGBM, scikit-learn and joblib, the N-BEATS checkpoint, and "
             "Alpaca credentials for ~150 sessions of SIP minute history (plus IEX "
-            "openings on MU)"
+            "openings on MU and BE, and BE's peers VST, PLUG and XLU)"
         ),
         strategy=STRATEGY_DAYRANGE,
         tickers=HIGHLOW_TICKERS,

@@ -64,11 +64,34 @@ MU_FORECASTS = {
     "2026-09-04": (1020.1816140024187, 969.415, 40.40555000000001),
     "2026-09-11": (1004.0314071814445, 973.5282062200738, 39.09912142857146),
 }
-NOTEBOOK_FORECASTS = {"AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS}
+# BE, saved 2026-09-30: IEX opening, sessions kept from 370 bars, and both nets
+# read `lead_or_ret_adr` -- VST's opening move, or the three peers' mean when VST
+# has no session (2024-01-25, 2024-01-30 and 2025-12-31 are such days).
+# 2025-03-20 follows a 380-bar session the 385 threshold would have dropped.
+BE_FORECASTS = {
+    "2024-01-25": (12.385294410373472, 11.885134703937394, 0.6581000000000004),
+    "2024-01-30": (11.881398568113182, 11.366851973681667, 0.6709571428571429),
+    "2025-03-03": (24.983474312555384, 23.119309288859345, 1.6507214285714285),
+    "2025-03-20": (26.055005754281275, 24.464228977126428, 1.8423714285714288),
+    "2025-12-31": (89.345984174502, 84.049977889037, 7.901228571428571),
+    "2026-03-02": (159.82499929282542, 148.27041193059029, 15.58590714285714),
+    "2026-08-31": (210.73049738457146, 198.0394663021734, 15.116421428571426),
+    "2026-09-01": (210.54852122632903, 198.7941043872093, 14.943564285714283),
+    "2026-09-02": (212.38925753695253, 201.09077201113618, 14.754278571428566),
+    "2026-09-03": (219.88020886985672, 206.8663942954915, 14.263428571428566),
+    "2026-09-04": (246.9925999891292, 230.829461243144, 14.648428571428566),
+    "2026-09-11": (277.22314330940884, 261.28178609658266, 15.301199999999994),
+}
+NOTEBOOK_FORECASTS = {
+    "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS, "BE": BE_FORECASTS,
+}
 # The candidates each bundle ships with non-zero weight.
-SHIPPED = {"AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"]}
+SHIPPED = {
+    "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
+    "BE": ["nbeats", "nhits"],
+}
 # The tape each bundle reads the opening from.
-OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex"}
+OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex"}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -112,10 +135,11 @@ class FakeSip:
         self.tape = tape
         self.calls: "list[tuple[date, date]]" = []
 
-    def __call__(self, symbol, first, before, key, secret, opening_feed="sip"):
+    def __call__(self, symbol, first, before, key, secret, opening_feed="sip",
+                 min_bars=H.MIN_BARS_PER_SESSION):
         self.calls.append((first, before))
         bars = [b for d, day_bars in self.tape.items() if first <= d < before for b in day_bars]
-        return H.session_rollups(H.minute_frame_from_bars(bars))
+        return H.session_rollups(H.minute_frame_from_bars(bars), min_bars=min_bars)
 
 
 @pytest.fixture
@@ -126,7 +150,7 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU"):
+        for symbol in ("AAPL", "INTC", "MU", "BE"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
@@ -200,7 +224,7 @@ class TestThinOpeningFeed:
         asked = {}
         monkeypatch.setattr(
             H, "history_frame",
-            lambda symbol, before, key=None, secret=None, opening_feed="sip":
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385:
                 asked.setdefault("history", opening_feed) and pd.DataFrame(),
         )
         monkeypatch.setattr(
@@ -210,7 +234,7 @@ class TestThinOpeningFeed:
         )
         monkeypatch.setattr(
             H, "forecast_from",
-            lambda bundle, history, opening, day, window=None: {"window": window},
+            lambda bundle, history, opening, day, window=None, peer_data=None: {"window": window},
         )
         opening = H.minute_frame_from_bars(_tape(date(2026, 7, 1), date(2026, 7, 1))[date(2026, 7, 1)][:5])
         H.forecast_session({"opening_feed": "iex", "path": "mu"}, "MU", opening, date(2026, 7, 1))
@@ -220,6 +244,89 @@ class TestThinOpeningFeed:
         out = H.forecast_session({"path": "aapl"}, "AAPL", opening, date(2026, 7, 1))
         assert asked == {"history": "sip"} and out["window"] is None
         H._forecast_cache.clear()
+
+
+class TestThemePeers:
+    """BE's bundle reads its theme peers: each one's history and IEX window go
+    to the forecast in the sidecar's order, lead first."""
+
+    def test_forecast_session_hands_every_peer_its_history_and_window(self, monkeypatch):
+        H._forecast_cache.clear()
+        histories, windows = [], []
+        monkeypatch.setattr(
+            H, "history_frame",
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385:
+                histories.append((symbol, opening_feed, min_bars)) or pd.DataFrame({"s": [symbol]}),
+        )
+        monkeypatch.setattr(
+            H, "fetch_opening_window",
+            lambda symbol, day, want, feed, key=None, secret=None:
+                windows.append((symbol, feed)) or pd.DataFrame({"w": [symbol]}),
+        )
+        monkeypatch.setattr(
+            H, "forecast_from",
+            lambda bundle, history, opening, day, window=None, peer_data=None: {"peers": peer_data},
+        )
+        opening = H.minute_frame_from_bars(_tape(date(2026, 7, 1), date(2026, 7, 1))[date(2026, 7, 1)][:5])
+        bundle = {"opening_feed": "iex", "min_bars": 370, "peers": ("VST", "PLUG", "XLU"), "path": "be"}
+        out = H.forecast_session(bundle, "BE", opening, date(2026, 7, 1))
+        assert histories == [("BE", "iex", 370), ("VST", "iex", 385), ("PLUG", "iex", 385),
+                             ("XLU", "iex", 385)]
+        assert windows == [("BE", "iex"), ("VST", "iex"), ("PLUG", "iex"), ("XLU", "iex")]
+        assert list(out["peers"]) == ["VST", "PLUG", "XLU"]
+        assert out["peers"]["VST"][0]["s"][0] == "VST" and out["peers"]["VST"][1]["w"][0] == "VST"
+        H._forecast_cache.clear()
+
+    def test_a_bundle_reading_peers_refuses_without_them(self):
+        bundle, raw, thin, history, _ = notebook_inputs("BE")
+        stamp = pd.Timestamp("2026-09-04")
+        with pytest.raises(ValueError, match="theme peers"):
+            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp,
+                            _one_day(thin, stamp, 5))
+
+    def test_a_lead_peer_without_a_window_falls_back_to_the_group(self):
+        """2025-12-31: VST's SIP session was short (380 bars), so the notebook has
+        no VST row and reads the mean of PLUG and XLU. Handing the mirror VST's
+        IEX window instead -- which is all 9:35 knows live -- moves the forecast."""
+        bundle, raw, thin, history, peer_tapes = notebook_inputs("BE")
+        stamp = pd.Timestamp("2025-12-31")
+        peer_data = _peer_data(peer_tapes, stamp)
+        assert peer_data["VST"][1].empty
+        opening, window = _one_day(raw, stamp).iloc[:5], _one_day(thin, stamp, 5)
+        kept = H.forecast_from(bundle, history, opening, stamp, window, peer_data)
+        vst_raw = peer_tapes["VST"][2]
+        live = H.forecast_from(bundle, history, opening, stamp, window,
+                               {**peer_data, "VST": (peer_data["VST"][0], _one_day(vst_raw, stamp, 5))})
+        assert kept["pred_high"] == pytest.approx(BE_FORECASTS["2025-12-31"][0], abs=1e-5)
+        assert 1e-5 < abs(live["pred_high"] - kept["pred_high"]) < 0.01
+
+    def test_a_cache_cleaned_at_another_bar_count_is_rebuilt(self, cache_dir, monkeypatch):
+        sip = FakeSip(_tape(date(2025, 12, 1), date(2026, 9, 30)))
+        monkeypatch.setattr(H, "_fetch_rollups", sip)
+        H.history_frame("BE", date(2026, 9, 14), "k", "s", "iex")
+        H.history_frame("BE", date(2026, 9, 14), "k", "s", "iex", min_bars=370)
+        assert len(sip.calls) == 2
+        assert H._read_cache("BE", "iex", 370)["min_bars"] == 370
+        assert H._read_cache("BE", "iex")["sessions"] == {}
+
+    def test_a_short_quiet_session_is_kept_at_the_bundles_threshold(self):
+        tape = _tape(date(2026, 3, 2), date(2026, 3, 2))
+        # 380 bars: the last ten minutes of a quiet day dropped, still printing near the close
+        bars = tape[date(2026, 3, 2)][:375] + tape[date(2026, 3, 2)][385:]
+        frame = H.minute_frame_from_bars(bars)
+        assert H.session_rollups(frame)[0].empty
+        assert len(H.session_rollups(frame, min_bars=370)[0]) == 1
+
+    def test_theme_columns_need_the_sidecar_to_name_the_peers(self, tmp_path):
+        src = H.model_path("BE")
+        if not src.exists():
+            pytest.skip("the HighLow BE bundle is not installed")
+        import json
+        for extra in (src, src.with_name(f"{src.stem}_nbeats.pt"), src.with_name(f"{src.stem}_nhits.pt")):
+            (tmp_path / extra.name).write_bytes(extra.read_bytes())
+        meta = json.loads(src.with_suffix(".json").read_text())
+        (tmp_path / src.with_suffix(".json").name).write_text(json.dumps({**meta, "peers": []}))
+        assert H._build_bundle(tmp_path / src.name) is None
 
 
 class TestHalfDays:
@@ -354,9 +461,22 @@ def notebook_inputs(ticker: str):
     feed = H.opening_feed(bundle)
     if feed != "sip":
         thin = tape(sorted(folder.glob(f"{ticker}_20??_{feed}.parquet")))
-    history, _ = H.session_rollups(raw, thin)
-    _NOTEBOOK_INPUTS[ticker] = (bundle, raw, thin, history)
+    history, _ = H.session_rollups(raw, thin, H.min_bars(bundle))
+    # Each theme peer as the notebook's `load_peers` reads it: SIP rollups at 385
+    # bars, IEX openings trimmed to the sessions SIP kept -- and the raw IEX tape.
+    peer_tapes = {}
+    for peer in H.peers(bundle):
+        peer_raw = NOTEBOOK / "data" / peer / "raw"
+        p_iex = tape(sorted(peer_raw.glob(f"{peer}_20??_iex.parquet")))
+        p_history, _ = H.session_rollups(tape(sorted(peer_raw.glob(f"{peer}_20??.parquet"))), p_iex)
+        peer_tapes[peer] = (p_history, H.opening_minute_frame(p_iex, p_history.index)[H.OHLCV], p_iex)
+    _NOTEBOOK_INPUTS[ticker] = (bundle, raw, thin, history, peer_tapes)
     return _NOTEBOOK_INPUTS[ticker]
+
+
+def _peer_data(peer_tapes, stamp):
+    """`forecast_from`'s `peer_data` for one day, windows as the notebook kept them."""
+    return {p: (h, _one_day(kept, stamp, 5)) for p, (h, kept, _) in peer_tapes.items()} or None
 
 
 def _one_day(frame, stamp, minutes=None):
@@ -377,11 +497,11 @@ class TestAgainstTheNotebook:
         [(t, d) for t, days in NOTEBOOK_FORECASTS.items() for d in sorted(days)],
     )
     def test_reproduces_the_notebook_forecast(self, ticker, day):
-        bundle, raw, thin, history = notebook_inputs(ticker)
+        bundle, raw, thin, history, peer_tapes = notebook_inputs(ticker)
         stamp = pd.Timestamp(day)
         opening = _one_day(raw, stamp).iloc[:5]
         window = None if thin is None else _one_day(thin, stamp, 5)
-        out = H.forecast_from(bundle, history, opening, stamp, window)
+        out = H.forecast_from(bundle, history, opening, stamp, window, _peer_data(peer_tapes, stamp))
         high, low, adr = NOTEBOOK_FORECASTS[ticker][day]
         # MU trades near $1,000: the same float32 noise is a larger dollar figure.
         assert out["pred_high"] == pytest.approx(high, abs=1e-5, rel=1e-8)
@@ -390,7 +510,7 @@ class TestAgainstTheNotebook:
 
     def test_a_session_iex_printed_nothing_in_is_refused(self):
         """MU 2025-03-10: the notebook's panel has no row for it."""
-        bundle, raw, thin, history = notebook_inputs("MU")
+        bundle, raw, thin, history, _ = notebook_inputs("MU")
         stamp = pd.Timestamp("2025-03-10")
         assert _one_day(thin, stamp, 5).empty
         with pytest.raises(ValueError, match="IEX printed nothing"):

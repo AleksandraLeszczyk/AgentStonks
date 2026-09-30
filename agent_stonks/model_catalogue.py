@@ -692,6 +692,13 @@ def _highlow_spec(ticker: str) -> ModelSpec:
                 f", read from {str(meta['opening_feed']).upper()}"
                 if str(meta.get("opening_feed") or "sip").lower() != "sip" else ""
             )
+            + (
+                # BE: the theme group, whose lead-peer column its nets read
+                f"; the same first minutes of its theme peers {', '.join(meta['peers'])} "
+                "(from IEX), with their SIP history"
+                if meta.get("peers") and "lead_or_ret_adr" in (meta.get("custom_features_kept") or ())
+                else ""
+            )
         ),
         metrics=metrics,
         headline=(
