@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 import uuid
 
 from .config import ORDER_FILL_TIMEOUT_SEC
@@ -41,6 +42,11 @@ class Broker(abc.ABC):
         `filled_qty` and `filled_price`. A simulated broker echoes back what it
         was asked for; a real one reports what the venue actually did, which may
         be less, at a different price, or nothing at all.
+
+        A limit is passed as a keyword, `limit_price=`, and only when there is
+        one -- a simulated broker never sees it, because `DecisionTracker`
+        applies the limit to the quoted price itself before asking (see
+        `record_trade`).
         """
 
     @property
@@ -233,12 +239,28 @@ class AlpacaBroker(Broker):
         return max(0.0, snap["positions"].get(symbol.upper(), 0.0))
 
     # --- orders ---------------------------------------------------------
-    def submit_order(self, symbol: str, side: str, quantity: float, price: float) -> dict:
-        """Place a market order and report what the venue actually did.
+    def submit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        limit_price: "float | None" = None,
+    ) -> dict:
+        """Place a market order -- or a limit order at `limit_price` -- and
+        report what the venue actually did.
 
         Never raises for an ordinary refusal -- a rejected order is a result,
         not an error, and the tracker records it as a rejected decision with the
         broker's own reason attached.
+
+        A limit order that has not filled when the wait runs out is cancelled,
+        unlike a market order, which is left working. A market order still
+        working is one the venue will fill within moments at about the price
+        asked; a limit still working is waiting for a price that has not come,
+        and filling later -- after the stop, after the levels have moved, after
+        the agent has stopped -- would be a buy nobody decided on. What filled
+        before the cancel is kept and reported (`limit_missed` when nothing did).
         """
         symbol = symbol.upper()
         qty = self.normalize_quantity(symbol, quantity)
@@ -252,10 +274,15 @@ class AlpacaBroker(Broker):
                     "shares rounds down to zero whole shares"
                 ),
             }
+        limit = None if limit_price is None else _limit_cents(side, limit_price)
         try:
             order = trading_rest.submit_order(
                 symbol, side, qty, self.creds,
                 client_order_id=f"agentstonks-{uuid.uuid4().hex[:20]}",
+                **(
+                    {"order_type": "limit", "limit_price": limit}
+                    if limit is not None else {}
+                ),
             )
         except (TradingError, ValueError) as exc:
             return {
@@ -268,6 +295,11 @@ class AlpacaBroker(Broker):
             final = trading_rest.wait_for_fill(
                 order_id, self.creds, self.fill_timeout_sec, sleep=self._sleep
             )
+            if (
+                limit is not None
+                and final.get("status") not in trading_rest.TERMINAL_ORDER_STATUSES
+            ):
+                final = self._cancel_limit(order_id, final)
         except TradingError as exc:
             # The order is out there; we just could not read it back. Report
             # nothing filled rather than inventing a fill -- the next account
@@ -290,15 +322,63 @@ class AlpacaBroker(Broker):
             "order_id": order_id,
             "broker_status": status,
         }
+        if limit is not None:
+            report["limit_price"] = limit
         if filled_qty <= 0:
-            report["reason"] = _no_fill_reason(final, status, self.fill_timeout_sec)
+            if limit is not None and not final.get("reject_reason"):
+                report["limit_missed"] = True
+                report["reason"] = (
+                    f"the ${limit:,.2f} limit was not reached within "
+                    f"{self.fill_timeout_sec:.0f}s (order {status}); nothing filled"
+                )
+            else:
+                report["reason"] = _no_fill_reason(final, status, self.fill_timeout_sec)
         elif filled_qty < qty:
             report["status"] = "filled"
             report["reason"] = (
                 f"partial fill: {filled_qty:g} of {qty:g} shares "
                 f"(order {status}); the rest is still with the broker"
+                if limit is None else
+                f"partial fill: {filled_qty:g} of {qty:g} shares at the "
+                f"${limit:,.2f} limit; the rest was cancelled"
             )
         return report
+
+    def _cancel_limit(self, order_id: str, last: dict) -> dict:
+        """Cancel a limit order still working and return how it ended.
+
+        The order can fill between the last poll and the cancel -- the venue
+        then refuses the cancel -- so the answer is always read back rather
+        than assumed to be "cancelled, nothing filled". A read that fails
+        leaves the last one seen, which undercounts at worst; the next account
+        sync takes the position from the broker either way.
+        """
+        try:
+            trading_rest.cancel_order(order_id, self.creds)
+        except TradingError as exc:
+            logger.info("%s: cancel of limit order %s refused: %s", self.venue, order_id, exc)
+        try:
+            return trading_rest.wait_for_fill(
+                order_id, self.creds, LIMIT_CANCEL_WAIT_SEC, sleep=self._sleep
+            )
+        except TradingError as exc:
+            logger.warning("%s: could not re-read order %s: %s", self.venue, order_id, exc)
+            return last
+
+
+#: How long a cancelled limit order is polled for its final state.
+LIMIT_CANCEL_WAIT_SEC = 5.0
+
+
+def _limit_cents(side: str, limit_price: float) -> float:
+    """The limit rounded to a cent the venue accepts, on the side of the limit
+    it is a limit on: a buy never above it, a sell never below. A plain round
+    could put a buy limit half a cent over the level it was asked not to pay
+    more than. The inner round absorbs float noise (315.82 x 100 is not quite
+    31582) so an exact cent is not pushed a cent away."""
+    cents = round(limit_price * 100, 6)
+    cents = math.floor(cents) if side.lower() == "buy" else math.ceil(cents)
+    return cents / 100
 
 
 def _no_fill_reason(order: dict, status: str, timeout_sec: float) -> str:

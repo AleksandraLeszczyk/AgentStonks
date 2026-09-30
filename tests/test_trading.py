@@ -243,6 +243,119 @@ class TestAlpacaBroker:
         assert "still working" in report["reason"]
         assert "NOT cancelled" in report["reason"]
 
+    def test_a_limit_buy_is_sent_as_a_limit_floored_to_the_cent(self, requests_mock):
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        posted = requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            json={"id": "o1", "status": "filled", "filled_qty": "10",
+                  "filled_avg_price": "315.80"},
+        )
+        report = self._broker().submit_order(
+            "AAPL", "buy", 10, price=316.0, limit_price=315.8279
+        )
+        body = posted.last_request.json()
+        # Never a cent over the level it was asked not to pay more than.
+        assert body["type"] == "limit" and body["limit_price"] == "315.82"
+        assert report["status"] == "filled" and report["limit_price"] == 315.82
+        assert report["filled_price"] == 315.80
+
+    def test_an_exact_cent_limit_is_not_pushed_a_cent_away(self, requests_mock):
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        posted = requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            json={"id": "o1", "status": "filled", "filled_qty": "1",
+                  "filled_avg_price": "315.82"},
+        )
+        self._broker().submit_order("AAPL", "buy", 1, price=316.0, limit_price=315.82)
+        assert posted.last_request.json()["limit_price"] == "315.82"
+
+    def test_a_market_order_stays_a_market_order(self, requests_mock):
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        posted = requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            json={"id": "o1", "status": "filled", "filled_qty": "1",
+                  "filled_avg_price": "100"},
+        )
+        self._broker().submit_order("AAPL", "buy", 1, price=100.0)
+        body = posted.last_request.json()
+        assert body["type"] == "market" and "limit_price" not in body
+
+    def test_an_unfilled_limit_is_cancelled_and_reported_as_missed(self, requests_mock):
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            [
+                {"json": {"id": "o1", "status": "new", "filled_qty": "0"}},
+                {"json": {"id": "o1", "status": "canceled", "filled_qty": "0"}},
+            ],
+        )
+        cancelled = requests_mock.delete(f"{PAPER_URL}/v2/orders/o1", status_code=204)
+        broker = AlpacaBroker(PAPER, fill_timeout_sec=0, sleep=lambda _: None)
+        report = broker.submit_order("AAPL", "buy", 10, price=101.0, limit_price=100.0)
+        assert cancelled.call_count == 1
+        assert report["status"] == "rejected" and report["limit_missed"] is True
+        assert "$100.00 limit was not reached" in report["reason"]
+
+    def test_a_limit_that_filled_before_the_cancel_keeps_its_fill(self, requests_mock):
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            [
+                {"json": {"id": "o1", "status": "new", "filled_qty": "0"}},
+                {"json": {"id": "o1", "status": "filled", "filled_qty": "10",
+                          "filled_avg_price": "99.98"}},
+            ],
+        )
+        requests_mock.delete(
+            f"{PAPER_URL}/v2/orders/o1", status_code=422,
+            json={"message": "order is already in \"filled\" state"},
+        )
+        broker = AlpacaBroker(PAPER, fill_timeout_sec=0, sleep=lambda _: None)
+        report = broker.submit_order("AAPL", "buy", 10, price=101.0, limit_price=100.0)
+        assert report["status"] == "filled" and report["filled_qty"] == 10.0
+        assert "limit_missed" not in report
+
+    def test_a_partly_filled_limit_cancels_the_rest(self, requests_mock):
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            [
+                {"json": {"id": "o1", "status": "partially_filled", "filled_qty": "4",
+                          "filled_avg_price": "100"}},
+                {"json": {"id": "o1", "status": "canceled", "filled_qty": "4",
+                          "filled_avg_price": "100"}},
+            ],
+        )
+        cancelled = requests_mock.delete(f"{PAPER_URL}/v2/orders/o1", status_code=204)
+        broker = AlpacaBroker(PAPER, fill_timeout_sec=0, sleep=lambda _: None)
+        report = broker.submit_order("AAPL", "buy", 10, price=100.0, limit_price=100.0)
+        assert cancelled.call_count == 1
+        assert report["filled_qty"] == 4.0
+        assert "the rest was cancelled" in report["reason"]
+
+    def test_the_tracker_records_a_missed_live_limit(self, requests_mock):
+        _account(requests_mock, cash="10000", buying_power="10000")
+        requests_mock.get(f"{PAPER_URL}/v2/assets/AAPL", json={"fractionable": True})
+        requests_mock.post(f"{PAPER_URL}/v2/orders", json={"id": "o1"})
+        requests_mock.get(
+            f"{PAPER_URL}/v2/orders/o1",
+            json={"id": "o1", "status": "canceled", "filled_qty": "0"},
+        )
+        broker = AlpacaBroker(PAPER, fill_timeout_sec=0, sleep=lambda _: None)
+        broker.get_current_price = lambda *a, **k: 101.0
+        tracker = DecisionTracker(starting_cash=0.0, broker=broker)
+        decision = tracker.record_trade(
+            "AAPL", "buy", 10, "dip", "k", "s", limit_price=100.0
+        )
+        assert decision.status == "rejected"
+        assert decision.limit_missed and decision.limit_price == 100.0
+
     def test_max_quantity_uses_buying_power_not_the_local_ledger(self, requests_mock):
         _account(requests_mock, cash="10000", buying_power="500")
         assert self._broker().max_quantity("AAPL", "buy", 100.0) == 5.0

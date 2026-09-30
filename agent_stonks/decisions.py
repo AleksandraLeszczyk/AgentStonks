@@ -25,6 +25,11 @@ from .config import TRADE_FIXED_COST, VENUE_VALUE_REFRESH_SEC
 logger = logging.getLogger(__name__)
 
 
+def _beyond_limit(action: str, price: float, limit_price: float) -> bool:
+    """Whether `price` is on the side of the limit an order must not fill on."""
+    return price > limit_price if action == "buy" else price < limit_price
+
+
 def whole_shares(quantity: float) -> float:
     """`quantity` rounded down to a whole number of shares (0.0 when not positive).
 
@@ -57,6 +62,13 @@ class Decision:
     # Snapshot of every symbol's position after the trade, so the multi-symbol
     # equity curve can be replayed from decisions alone.
     positions_after: dict[str, float] = field(default_factory=dict)
+    # The price a limited order could not pay more than (a buy) or take less
+    # than (a sell), or None for a market order. See `record_trade`.
+    limit_price: Optional[float] = None
+    # True when the order went unfilled because the price was on the wrong
+    # side of `limit_price` -- a miss, not a refusal: the same order may fill
+    # on the next try, which a rejection for cash or tradability will not.
+    limit_missed: bool = False
 
 
 class DecisionTracker:
@@ -227,6 +239,7 @@ class DecisionTracker:
         key: str,
         secret: str,
         feed: str = "iex",
+        limit_price: Optional[float] = None,
     ) -> Decision:
         """Record a buy/sell decision for one symbol. Fetches the fill price
         independently via `broker`. Cash is shared across symbols; the position
@@ -234,7 +247,15 @@ class DecisionTracker:
 
         Only whole shares are ever traded: the request, and every clamp applied
         to it (affordable cash, position held, venue ceiling), is rounded down
-        with `whole_shares`. A request below one share is rejected."""
+        with `whole_shares`. A request below one share is rejected.
+
+        `limit_price` makes it a limit order: a buy never pays more, a sell
+        never takes less. A simulated broker fills at the quoted price or not
+        at all, so the limit is applied here, to that price -- an order the
+        quote is on the wrong side of fills nothing, recorded as a rejected
+        decision with `limit_missed` set. It is not left resting: the ledger
+        has no working orders, and the caller asks again if it still wants to.
+        A real venue is sent the limit itself (`_record_live_trade`)."""
         if action not in ("buy", "sell"):
             raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
 
@@ -251,7 +272,23 @@ class DecisionTracker:
         price = self.broker.get_current_price(symbol, key, secret, feed)
 
         if not self.broker.is_simulated:
-            return self._record_live_trade(symbol, action, quantity, reasoning, price)
+            return self._record_live_trade(
+                symbol, action, quantity, reasoning, price, limit_price
+            )
+
+        if limit_price is not None and _beyond_limit(action, price, limit_price):
+            side = "above" if action == "buy" else "below"
+            with self.lock:
+                decision = self._noop_decision(
+                    symbol, action,
+                    f"{reasoning} [not placed: ${price:,.2f} is {side} the "
+                    f"${limit_price:,.2f} limit]",
+                    status="rejected", price=price,
+                    limit_price=limit_price, limit_missed=True,
+                )
+                decision.requested_quantity = quantity
+                self.decisions.append(decision)
+            return decision
 
         with self.lock:
             position = self.positions.get(symbol, 0.0)
@@ -291,12 +328,19 @@ class DecisionTracker:
                 position_after=position,
                 fee=fee,
                 positions_after=dict(self.positions),
+                limit_price=limit_price,
             )
             self.decisions.append(decision)
         return decision
 
     def _record_live_trade(
-        self, symbol: str, action: str, quantity: float, reasoning: str, price: float
+        self,
+        symbol: str,
+        action: str,
+        quantity: float,
+        reasoning: str,
+        price: float,
+        limit_price: Optional[float] = None,
     ) -> Decision:
         """Route one order to a real venue and record what it did.
 
@@ -329,10 +373,14 @@ class DecisionTracker:
             else:
                 reason = "no whole share held at the broker to sell"
             return self._record_broker_decision(
-                symbol, action, requested, 0.0, price, f"{reasoning} [{reason}]", "rejected"
+                symbol, action, requested, 0.0, price, f"{reasoning} [{reason}]", "rejected",
+                limit_price=limit_price,
             )
 
-        report = self.broker.submit_order(symbol, action, quantity, price)
+        # Only when there is one, so a broker that predates limits (and every
+        # test double) is called exactly as before.
+        extra = {} if limit_price is None else {"limit_price": limit_price}
+        report = self.broker.submit_order(symbol, action, quantity, price, **extra)
         filled_qty = float(report.get("filled_qty") or 0.0)
         fill_price = float(report.get("filled_price") or price)
         status = "filled" if filled_qty > 0 else "rejected"
@@ -341,7 +389,9 @@ class DecisionTracker:
             reasoning = f"{reasoning} [{self.broker.venue}: {note}]"
 
         return self._record_broker_decision(
-            symbol, action, requested, filled_qty, fill_price, reasoning, status
+            symbol, action, requested, filled_qty, fill_price, reasoning, status,
+            limit_price=report.get("limit_price", limit_price),
+            limit_missed=bool(report.get("limit_missed")),
         )
 
     def _record_broker_decision(
@@ -353,6 +403,8 @@ class DecisionTracker:
         price: float,
         reasoning: str,
         status: str,
+        limit_price: Optional[float] = None,
+        limit_missed: bool = False,
     ) -> Decision:
         """Append a decision whose cash and positions come from the venue.
 
@@ -391,6 +443,8 @@ class DecisionTracker:
                 # a cost the broker has itself applied.
                 fee=0.0,
                 positions_after=dict(self.positions),
+                limit_price=limit_price,
+                limit_missed=limit_missed,
             )
             self.decisions.append(decision)
         return decision

@@ -212,6 +212,10 @@ _APPLE_LEGACY = {
     # And before 2026-09-29 the take fired on any profit at all, however small.
     # 0 is that rule, and it is left out of the signature.
     "take_min_gain_fraction": 0.0,
+    # And every buy was a market order, filling near the close of the bar that
+    # reached the level even when that was above it (before 2026-09-30). False
+    # is that rule, and it is left out of the signature.
+    "limit_entry": False,
 }
 
 

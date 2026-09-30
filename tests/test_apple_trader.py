@@ -209,7 +209,12 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     `take_min_gain_fraction` is pinned to 0, the take on any profit: what every
     take test here was written against. `TestMomentumConfirmation` is where the
     realised-gain gate is switched on.
+
+    `limit_entry` is pinned off, the market buy: most tests here enter on a bar
+    that dipped to the level and closed above it, filling at the close, which
+    a limit at the level refuses. `TestLimitEntry` is where it is switched on.
     """
+    kwargs.setdefault("limit_entry", False)
     kwargs.setdefault("momentum_confirmation_bars", 0)
     kwargs.setdefault("take_min_gain_fraction", 0.0)
     if not kwargs["momentum_confirmation_bars"] and not (
@@ -3434,6 +3439,107 @@ class TestScaleIn:
         assert old.stop_under_next_buy is True
         assert "stop@fill" not in config_signature(old)
         assert old.add_under_fill is False and "add<fill" not in config_signature(old)
+
+
+class TestLimitEntry:
+    """Buys are limit orders at the buy level (`limit_entry`).
+
+    The order goes out after the bar that reached the level has closed, so on
+    a bar that dipped and recovered a market order would pay the recovery. The
+    limit refuses that, and the level stays armed for the next touch.
+    """
+
+    def _trader(self, **kwargs):
+        kwargs.setdefault("limit_entry", True)
+        return at.DayRangeTrader(dayrange_config(**kwargs))
+
+    def _setup(self, monkeypatch, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        return self._trader(**kwargs), tracker, Tape(monkeypatch, broker), broker
+
+    def test_on_for_every_new_config(self):
+        assert AppleTraderConfig().limit_entry is True
+
+    def test_a_dip_that_recovered_above_the_level_is_not_bought(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape, broker = self._setup(monkeypatch)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert broker.orders == []
+        assert tracker.position_for(TICKER) == 0
+        decision = tracker.snapshot()["decisions"][-1]
+        assert decision.status == "rejected" and decision.limit_missed
+        assert decision.limit_price == pytest.approx(BUY_LEVEL)
+        assert "above the $102.50 limit" in decision.reasoning
+        status = [e["text"] for e in state.agent_log if e.get("type") == "status"][-1]
+        assert "stays armed" in status
+
+    def test_the_level_stays_armed_and_the_next_touch_buys_at_or_under_it(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape, broker = self._setup(monkeypatch)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        tape.append(102.3, low=102.2)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        decision = tracker.snapshot()["decisions"][-1]
+        assert decision.status == "filled" and decision.price == pytest.approx(102.3)
+        assert decision.limit_price == pytest.approx(BUY_LEVEL)
+        assert trader.entry["price"] == pytest.approx(102.3)
+
+    def test_a_price_exactly_at_the_level_is_bought(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape, _ = self._setup(monkeypatch)
+        tape.append(BUY_LEVEL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_legacy_a_market_buy_pays_the_close(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape, _ = self._setup(monkeypatch, limit_entry=False)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert tracker.snapshot()["decisions"][-1].price == pytest.approx(103.0)
+
+    def test_a_missed_add_keeps_the_ladder(self, state, market_open, monkeypatch):
+        """Scale-in notebook arithmetic: first buy at $102.50, next rung
+        $101.25. A bar reaching the rung that closes at $102.00 is under the
+        last fill but above the rung: not bought, and the rung is still there
+        for the bar after."""
+        trader, tracker, tape, _ = self._setup(
+            monkeypatch, scale_in=True, position_pct=50.0
+        )
+        tape.append(BUY_LEVEL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        first = tracker.position_for(TICKER)
+        rung = trader.plan["buy_level"]
+        assert rung == pytest.approx(101.25)
+
+        tape.append(102.0, low=rung - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == first
+        assert trader.entry.get("can_add", True) is not False
+        assert trader.plan["buy_level"] == pytest.approx(rung)
+
+        tape.append(101.2)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert tracker.position_for(TICKER) > first
+        assert trader.entry["last_fill"] == pytest.approx(101.2)
+
+    def test_signed_only_while_on(self):
+        assert ",limit" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert ",limit" not in config_signature(
+            AppleTraderConfig(model_key="dayrange", limit_entry=False)
+        )
+
+    def test_a_record_from_before_it_replays_with_market_buys(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({"position_pct": 50.0})
+        assert old.limit_entry is False and ",limit" not in config_signature(old)
 
 
 class TestMomentumReadTable:

@@ -286,9 +286,12 @@ def _render_apple_rules() -> None:
     st.caption(
         ":material/compare_arrows: **Against the notebook**, one difference matters and it "
         "runs against the strategy: the notebook rests limit orders and fills a touch *at* "
-        "the level, while this ledger is market-order only and buys near the close of the "
-        "bar that touched it. A bar that dipped to the level and recovered fills worse "
-        "here than there. Read the two side by side with that in mind."
+        "the level, while this ledger sends its order only after the bar that touched it "
+        "has closed. That order is a limit at the buy level, so it never pays more than "
+        "the level — but a bar that dipped to the level and recovered buys nothing here, "
+        "where the notebook bought. (Runs recorded before 2026-09-30 used a market order "
+        "and bought such a bar near its close, above the level.) Read the two side by "
+        "side with that in mind."
     )
 
     st.markdown("##### Models")

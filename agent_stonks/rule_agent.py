@@ -105,6 +105,8 @@ class BaseTrader:
         # session. Kept so the failure is logged once rather than every minute
         # for six and a half hours.
         self.blocked: "dict | None" = None
+        # The decision the last `buy` produced; see there.
+        self.last_buy = None
 
     # --- pre-flight -------------------------------------------------------
 
@@ -152,8 +154,15 @@ class BaseTrader:
         price: float,
         reasoning: str,
         log_extra: "dict | None" = None,
+        limit_price: "float | None" = None,
     ) -> bool:
-        """Deploy `position_pct` of the cash balance; False if it buys nothing."""
+        """Deploy `position_pct` of the cash balance; False if it buys nothing.
+
+        `limit_price` is the most a share may cost (`record_trade`). The
+        decision is kept in `last_buy` -- None when nothing was even sent --
+        so a caller can tell a limit the price was above, which may fill next
+        time, from a refusal that will not."""
+        self.last_buy = None
         cash = tracker.snapshot()["cash"]
         quantity = order_quantity(cash, price, self.config.position_pct)
         if quantity <= 0:
@@ -172,7 +181,9 @@ class BaseTrader:
         decision = tracker.record_trade(
             self.ticker, "buy", quantity, reasoning,
             state.api_key, state.api_secret, state.feed,
+            limit_price=limit_price,
         )
+        self.last_buy = decision
         self.log_decision(state, decision, log_extra)
         if decision.status == "filled":
             self.entry = {"price": decision.price, "bars": 0}

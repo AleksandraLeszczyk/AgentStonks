@@ -151,3 +151,44 @@ class TestSnapshotAndMarkers:
         markers = tracker.trade_markers()
         assert len(markers) == 2
         assert {m["action"] for m in markers} == {"buy", "sell"}
+
+
+class TestLimitOrders:
+    """A simulated broker fills at the quote or not at all, so the tracker
+    applies the limit to the quote itself."""
+
+    def _tracker(self, price):
+        broker = FakeBroker(price=price)
+        return DecisionTracker(starting_cash=1000.0, broker=broker, trade_cost=0.0), broker
+
+    def test_a_buy_quoted_above_its_limit_fills_nothing(self):
+        tracker, broker = self._tracker(100.5)
+        decision = tracker.record_trade("AAPL", "buy", 5, "dip", "k", "s", limit_price=100.0)
+        assert decision.status == "rejected"
+        assert decision.limit_missed and decision.limit_price == 100.0
+        assert decision.filled_quantity == 0 and decision.requested_quantity == 5
+        assert "$100.50 is above the $100.00 limit" in decision.reasoning
+        assert broker.orders == []
+        assert tracker.cash == 1000.0 and tracker.positions.get("AAPL", 0.0) == 0.0
+
+    def test_a_buy_at_or_under_its_limit_fills_at_the_quote(self):
+        for quote in (100.0, 99.5):
+            tracker, _ = self._tracker(quote)
+            decision = tracker.record_trade(
+                "AAPL", "buy", 5, "dip", "k", "s", limit_price=100.0
+            )
+            assert decision.status == "filled" and decision.price == quote
+            assert decision.limit_price == 100.0 and not decision.limit_missed
+
+    def test_a_sell_quoted_below_its_limit_fills_nothing(self):
+        tracker, _ = self._tracker(100.0)
+        tracker.record_trade("AAPL", "buy", 5, "x", "k", "s")
+        tracker.broker.price = 99.0
+        decision = tracker.record_trade("AAPL", "sell", 5, "x", "k", "s", limit_price=100.0)
+        assert decision.status == "rejected" and decision.limit_missed
+        assert tracker.positions["AAPL"] == 5
+
+    def test_without_a_limit_nothing_changes(self):
+        tracker, _ = self._tracker(100.5)
+        decision = tracker.record_trade("AAPL", "buy", 5, "x", "k", "s")
+        assert decision.status == "filled" and decision.limit_price is None

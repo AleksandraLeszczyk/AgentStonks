@@ -283,6 +283,15 @@ class AppleTraderConfig:
     # leaves it at 0, and it cannot be set beside the momentum confirmation,
     # which decides entries now. See `DayRangeTrader._falling`.
     max_fall_k: float = 0.0
+    # Whether a buy -- first entry or add -- is a limit order at the buy level
+    # rather than a market order. The trigger is a bar whose low reached the
+    # level, but the order goes out after that bar has closed, and on a bar
+    # that dipped and recovered a market order pays the recovery: above the
+    # price the rule said to buy at. With the limit it pays the level at most,
+    # or buys nothing and the level stays armed for the next touch. True for
+    # every new config since 2026-09-30; False, what every record made before
+    # then replays as, is the market order.
+    limit_entry: bool = True
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -682,6 +691,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         adds += ",stop@fill"
     if c.can_scale_in and c.add_under_fill:
         adds += ",add<fill"
+    # Only while on, so every record written before it existed (which replays
+    # with market buys) keeps the signature it was filed under.
+    if c.limit_entry:
+        adds += ",limit"
     # Only while on, like every rule added since the notebook's. The look-back
     # rides along because it is not otherwise in the signature when the take
     # is off, and the same limit over 5 bars and over 30 is not one rule.
@@ -1136,12 +1149,16 @@ class DayRangeTrader(BaseTrader):
     * **the fill**. The notebook rests limit orders and fills a buy at
       `min(bar_open, buy_level)` -- a touch fills *at* the level. Live there is
       no resting order in this ledger: the loop sees the bar after it closed
-      and sends a market order, which fills near that bar's close. On a bar
-      that dipped to the level and recovered, the notebook buys at the level
-      and this buys higher. That is a real cost and it runs one way, against
-      the strategy; it is the price of the paper ledger being market-order
-      only, not a modelling choice. Read a SimLab result against the notebook's
-      with that in mind.
+      and only then sends the order. It is a limit at the buy level
+      (`limit_entry`), so it never pays more than the level -- but on a bar
+      that dipped to the level and recovered it buys nothing, where the
+      notebook's resting order would have filled at the level; the level stays
+      armed for the next touch. A paper or SimLab buy fills at the quote if
+      that is at or under the limit, a real one is a day limit order cancelled
+      if unfilled after `ORDER_FILL_TIMEOUT_SEC`. Records made before
+      2026-09-30 replay the old market order, which filled near the close,
+      above the level on such a bar. Read a SimLab result against the
+      notebook's with either in mind.
     * **the flatten**. The notebook closes at the 15:59 bar, so the whole
       session is available. Here `flatten_before_close_min` applies as it does
       to every other agent -- at the default of 5 the position is closed around
@@ -2213,7 +2230,16 @@ class DayRangeTrader(BaseTrader):
             f"buy to the bottom of the range. Adding to the {position:g} sh bought at an "
             f"average ${float(before['price']):,.2f}."
         )
-        if not self.buy(state, tracker, float(bar["close"]), reasoning):
+        if not self.buy(
+            state, tracker, float(bar["close"]), reasoning,
+            limit_price=self._buy_limit(),
+        ):
+            if self._limit_missed():
+                # The price was back above the rung when the order went out.
+                # Not a reason to end the ladder: the rung is still where it
+                # was, and the next bar that reaches it tries again.
+                self._note_limit_miss(state, "next buy")
+                return False
             # Nothing bought -- the cash at this close did not stretch to a share,
             # or the order was refused. The ladder ends here; the stop stays
             # where the last fill put it, since it must not move on its own.
@@ -2702,9 +2728,12 @@ class DayRangeTrader(BaseTrader):
 
     def _buy(self, state: AppState, tracker: DecisionTracker, bar) -> bool:
         bought = self.buy(
-            state, tracker, float(bar["close"]), self._entry_reasoning(bar)
+            state, tracker, float(bar["close"]), self._entry_reasoning(bar),
+            limit_price=self._buy_limit(),
         )
-        if bought:
+        if not bought:
+            self._note_limit_miss(state, "buy level")
+        else:
             # Where the momentum take starts counting for this position.
             self.entry["ts"] = bar.name
             # And how far under it the stop sits, in dollars, decided once here.
@@ -2717,6 +2746,35 @@ class DayRangeTrader(BaseTrader):
             self.entry["last_fill"] = float(self.entry["price"])
             self._after_fill(state, tracker, bar)
         return bought
+
+    def _buy_limit(self) -> "float | None":
+        """The most a share may cost on this buy: the level that triggered it,
+        when buys are limit orders (`limit_entry`)."""
+        if not self.config.limit_entry:
+            return None
+        return float(self.plan["buy_level"])
+
+    def _limit_missed(self) -> bool:
+        """Whether the last buy went unfilled for its limit alone."""
+        return bool(self.last_buy is not None and self.last_buy.limit_missed)
+
+    def _note_limit_miss(self, state: AppState, what: str) -> None:
+        """Say that a missed limit leaves the level armed, since the rejected
+        decision alone reads as the end of it."""
+        if not self._limit_missed():
+            return
+        _log(
+            state,
+            {
+                "type": "status",
+                "text": (
+                    f"Not bought: the price had moved back above the "
+                    f"${self.last_buy.limit_price:,.2f} {what} by the time the order "
+                    "went out. The level stays armed; the next bar that reaches it "
+                    "tries again."
+                ),
+            },
+        )
 
     def _entry_reasoning(self, bar) -> str:
         plan, config = self.plan, self.config
