@@ -917,6 +917,33 @@ class TestHighLowOverlay:
         assert buy("dayrange") == pytest.approx(210.0 - 0.75 * 3.0)
         assert buy("highlow") == pytest.approx(206.0 - 0.75 * 3.0)
 
+    def test_a_symbol_only_highlow_covers_draws_highlows_levels(self, monkeypatch):
+        """MU has no TimeToChange3 bundle: the agent's levels are offered there,
+        and hang off HighLow's forecast with or without a MU configuration."""
+        pytest.importorskip("agent_stonks.highlow_model")
+        import agent_stonks.dayrange_model as dr
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        self.stub_both(monkeypatch)
+
+        def no_ttc3(*a, **k):
+            raise AssertionError("MU has no TimeToChange3 bundle to ask")
+
+        monkeypatch.setattr(dr, "forecast_session", no_ttc3)
+        assert mo.TRADER_LEVELS_KEY in mo.keys_for("MU")
+        assert mo.DAY_RANGE_KEY not in mo.keys_for("MU")
+
+        def buy(config):
+            items = mo.compute(
+                [mo.TRADER_LEVELS_KEY], "MU", minute_bars(), daily_bars=[],
+                session_date=SESSION, trader_config=config,
+            )["items"]
+            return next(i["value"] for i in items if i["label"] == "Buy level")
+
+        mu_highlow = buy(AppleTraderConfig(ticker="MU", model_key="highlow"))
+        assert buy(None) == mu_highlow
+        assert buy(self.config(model_key="dayrange")) == mu_highlow  # an AAPL agent's
+
     def test_the_credentials_reach_the_sip_history(self, monkeypatch):
         pytest.importorskip("agent_stonks.highlow_model")
         seen = self.stub_both(monkeypatch)

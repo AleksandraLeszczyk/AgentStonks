@@ -211,8 +211,10 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
             "sell, each a distance in ADRs under the day-range forecast. The only "
             "overlay here that draws an agent's orders rather than a model's answer."
         ),
-        requires="PyTorch, LightGBM and the day-range bundle",
-        tickers=apple_models.DAYRANGE_TICKERS,
+        requires="PyTorch, LightGBM and the forecast bundle of the model the agent runs",
+        # Every symbol some Apple Trader model covers: the levels hang off
+        # whichever forecast the configured model makes (HighLow alone on MU).
+        tickers=tuple(apple_models.tickers()),
         # Deliberately not `models=(DAYRANGE_KEY,)`, though it is built on that
         # forecast: `for_models` pre-selects what a *model* said, and these are
         # one agent's orders, not a forecast of the day.
@@ -552,10 +554,7 @@ def compute(
         return memo["highlow"]
 
     def trader_forecast() -> dict:
-        named = getattr(trader_config, "model_key", None)
-        if named == apple_models.HIGHLOW_KEY and (
-            (getattr(trader_config, "ticker", "") or "").upper() == symbol
-        ):
+        if trader_model(trader_config, symbol) == apple_models.HIGHLOW_KEY:
             return highlow_forecast()
         return day_range_forecast()
 
@@ -1007,6 +1006,26 @@ def _intraday_dayrange_items(
 # --- Apple Trader's resting orders ------------------------------------------
 
 
+def trader_model(config, symbol: str) -> str:
+    """The model whose forecast `trader_levels` hangs the levels off on `symbol`.
+
+    The configured one when the configuration is for this symbol and that model
+    covers it; otherwise the default model if it covers the symbol, else the
+    first that does -- so a symbol only HighLow was fitted on (MU) draws
+    HighLow's levels rather than asking for a day-range bundle it never had.
+    """
+    named = getattr(config, "model_key", None)
+    if (
+        named
+        and (getattr(config, "ticker", "") or "").upper() == symbol
+        and apple_models.covers(named, symbol)
+    ):
+        return named
+    if apple_models.covers(apple_models.DEFAULT_MODEL, symbol):
+        return apple_models.DEFAULT_MODEL
+    return next(iter(apple_models.keys_for(symbol)), apple_models.DEFAULT_MODEL)
+
+
 def _trader_levels_items(
     symbol: str,
     session: pd.DataFrame,
@@ -1039,7 +1058,7 @@ def _trader_levels_items(
     if config is None or (config.ticker or "").upper() != symbol:
         # A configuration for another symbol is not this chart's strategy, and
         # its distances were swept on that symbol's tape. The shipped ones are.
-        config = AppleTraderConfig(ticker=symbol)
+        config = AppleTraderConfig(ticker=symbol, model_key=trader_model(None, symbol))
 
     made_at = result["made_at"]
     recorded = levels is not None
