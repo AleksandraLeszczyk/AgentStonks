@@ -5,7 +5,8 @@ import os
 import re
 import threading
 import time
-from dataclasses import asdict
+from contextlib import contextmanager
+from dataclasses import asdict, fields
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -118,6 +119,7 @@ from .trading_mode import (
 )
 from .stream_common import TF_MINUTES
 from .stream import (
+    adopt_orphaned_session,
     backfill_bars,
     launch_stream,
     launch_stream_news,
@@ -287,6 +289,18 @@ def _get_state() -> AppState:
     # Any rerun, in any session, stops the streams of sessions whose browser
     # has gone for good (see stream.reap_dead_sessions).
     reap_dead_sessions(_session_is_active)
+    if "app_state" not in st.session_state:
+        # A browser coming back from a dropped connection, or a reload, is a
+        # new session: it takes over the state that kept running without it
+        # rather than opening a stopped copy beside it.
+        session_id = _session_id()
+        adopted = (
+            adopt_orphaned_session(session_id, _session_is_active) if session_id else None
+        )
+        if adopted is not None:
+            if not (adopted.recovery or {}).get("pending"):
+                adopted.recovery = {"kind": "reconnect", "at": time.time()}
+            st.session_state["app_state"] = adopted
     if "app_state" not in st.session_state:
         fresh = AppState()
         # Today's session as it was saved before a restart (or in another tab):
@@ -2707,6 +2721,231 @@ def _execution_controls() -> str:
     return mode
 
 
+def _start_agent(
+    state: AppState,
+    syms: "list[str]",
+    *,
+    personality: str,
+    provider: str,
+    model: str,
+    apple_config: "AppleTraderConfig | None",
+    trading_mode_choice: str,
+    starting_budget: float,
+    continue_today: bool,
+    alpaca_key: str = "",
+    alpaca_secret: str = "",
+    feed: str = "iex",
+    data_source: str = DEFAULT_DATA_SOURCE,
+    finnhub_token: str = "",
+    history_feed: str = DEFAULT_HISTORY_FEED,
+) -> bool:
+    """What ▶ Start Agent does: check the setup, start the live stream when it
+    is not running for `syms`, resolve the venue, open or continue today's
+    ledger and launch `personality`. True when the agent was launched.
+
+    Shared by the button and by `_resume_after_restart`, which starts again
+    the run a restart interrupted from what `state.run_spec` recorded of it."""
+    env_var = ENV_KEYS[provider]
+    llm_key = os.getenv(env_var, "")
+    is_apple_trader = personality == APPLE_TRADER_KEY
+    is_rule_agent = personality in RULE_AGENT_KEYS
+    # The one symbol this run trades, as configured for Apple Trader. It has
+    # to be streamed, or there are no bars to read and the agent would idle
+    # all session.
+    rule_ticker = APPLE_TRADER_TICKER
+    if personality == APPLE_TRADER_KEY and apple_config is not None:
+        rule_ticker = apple_config.ticker
+    stream_ready = False
+    if not syms:
+        st.error("Enter at least one symbol in the sidebar first.")
+    elif is_rule_agent and rule_ticker not in syms:
+        st.error(
+            f"{_personality_label(personality)} is configured to trade "
+            f"{rule_ticker}; add {rule_ticker} to the symbols in the sidebar."
+        )
+    elif not llm_key and not is_rule_agent:
+        st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
+    else:
+        # The live stream feeds every tool the agent reads. If it isn't
+        # running for these symbols yet, start it here rather than sending
+        # the user back to the sidebar first.
+        stream_ready = bool(state.api_key) and all(state.sym(s) is not None for s in syms)
+        if not stream_ready:
+            key = alpaca_key.strip() or os.getenv("ALPACA_API_KEY", "")
+            secret = alpaca_secret.strip() or os.getenv("ALPACA_SECRET", "")
+            if not key or not secret:
+                st.error(
+                    "Alpaca API key and secret are required to start the live stream "
+                    "(sidebar Connection expander, or the ALPACA_API_KEY / "
+                    "ALPACA_SECRET environment variables)."
+                )
+            else:
+                timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
+                stream_ready = _start_live_session(
+                    state, syms, key, secret, feed, timeframe,
+                    data_source=data_source, finnhub_token=finnhub_token,
+                    history_feed=history_feed,
+                )
+    if stream_ready:
+        if not market_hours.is_market_open():
+            open_et = market_hours.next_market_open().astimezone(market_hours.MARKET_TZ)
+            st.info(
+                f"The trading session hasn't started yet (next open: "
+                f"{open_et.strftime('%a %Y-%m-%d %H:%M')} ET). The agent is told the "
+                "market is closed and adapts: the Premarket Analyst prepares opening "
+                "tactics, other strategies study structure and arm plans for the "
+                "open instead of trading the stale tape."
+                + (
+                    " The Apple Traders simply idle until the bell — they score "
+                    "closed minute bars and there are none."
+                    if is_rule_agent
+                    else ""
+                )
+            )
+        # Resolve the venue before anything starts. Every refusal inside
+        # resolve_broker degrades to local simulation and says so, so a
+        # misconfigured or blocked account can never silently become a
+        # different account than the one the user picked.
+        live_broker, effective_mode, broker_message = resolve_broker(
+            trading_mode_choice
+        )
+        # Read before `trading_mode` becomes the new venue: a ledger is only
+        # continued on the venue it was kept on.
+        continuing = continue_today and session_store.continues(state, effective_mode)
+        state.trading_mode = effective_mode
+        state.trading_mode_requested = trading_mode_choice
+        state.trading_status = broker_message
+        # Only local simulation is announced here: a degraded, paper or live
+        # venue gets its banner from the persistent status block below,
+        # and announcing it here too would stack two banners saying the same.
+        if effective_mode == trading_mode_choice == "local":
+            st.success(broker_message)
+
+        # Today's ledger goes on (session_store): a restart or a Stop is not
+        # the end of the trading day.
+        prior = state.decision_tracker
+        tracker = DecisionTracker(
+            starting_cash=starting_budget,
+            broker=live_broker,
+            # A real venue applies its own costs inside the cash it reports;
+            # the modelled per-trade cost belongs to the simulation only.
+            trade_cost=TRADE_FIXED_COST if effective_mode == "local" else 0.0,
+        )
+        if continuing:
+            tracker.carry_over(prior)
+        else:
+            # Starting over must not destroy what the day already did.
+            session_store.archive()
+            state.starting_budget = starting_budget
+            levels = getattr(state, "apple_trader_levels", None)
+            if levels:
+                # The rows stay on the chart; a fresh ledger has no position
+                # and no stand-down to resume.
+                state.apple_trader_levels = {**levels, "memory": None}
+        state.decision_tracker = tracker
+        state.session_date = session_store.session_date()
+        state.session_restored = None
+        session_store.claim(state)
+        if effective_mode != "local":
+            # Open on the account's real balance and holdings rather than a
+            # configured budget, and surface a position the app did not open
+            # (left over from a previous run, or placed in Alpaca directly).
+            if state.decision_tracker.sync_from_broker():
+                snap = state.decision_tracker.snapshot()
+                # The baseline every return percentage is measured against
+                # is the account's *value*, not its cash. On an account that
+                # already holds something, cash is only part of what it is
+                # worth, and using it would report a return the moment the
+                # agent did nothing at all. A continued day keeps the
+                # baseline it opened on.
+                if not continuing:
+                    state.starting_budget = (
+                        snap["venue_value"]
+                        if snap.get("venue_value") is not None
+                        else snap["cash"]
+                    )
+                held = {s: q for s, q in snap["positions"].items() if q}
+                if held:
+                    st.info(
+                        "Existing positions on this account: "
+                        + ", ".join(f"{s} {q:g}" for s, q in held.items())
+                        + " — the agent starts from these, not from flat."
+                    )
+            else:
+                st.warning(
+                    "Could not read the account balance; the ledger starts from "
+                    "the configured budget and will reconcile on the first order."
+                )
+        if continuing:
+            snap = state.decision_tracker.snapshot()
+            held = {s: q for s, q in snap["positions"].items() if q}
+            append_agent_log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        f"Continuing today's session: {len(snap['decisions'])} "
+                        f"decisions so far, cash ${snap['cash']:,.2f}, "
+                        + (
+                            "holding " + ", ".join(f"{s} {q:g}" for s, q in held.items())
+                            if held
+                            else "flat"
+                        )
+                        + "."
+                    ),
+                },
+            )
+            if state.agent_start_time is None:
+                state.agent_start_time = datetime.now(tz=timezone.utc)
+        else:
+            state.agent_log = []
+            state.agent_start_time = datetime.now(tz=timezone.utc)
+            state.agent_equity_history = []
+        # How this run was started, saved with the day while it runs, so a
+        # restart of the app can start it again the same way.
+        state.run_spec = {
+            "personality": personality,
+            "provider": provider,
+            "model": model,
+            "symbols": list(syms),
+            "trading_mode": trading_mode_choice,
+            "starting_budget": float(starting_budget),
+            "apple_config": asdict(apple_config) if apple_config is not None else None,
+        }
+        if is_apple_trader:
+            launch_apple_trader(
+                state,
+                state.decision_tracker,
+                config=apple_config or AppleTraderConfig(),
+                cycle_sec=APPLE_TRADER_CYCLE_SEC,
+            )
+        elif personality == AUTOMATIC_KEY:
+            launch_automatic(
+                state,
+                state.decision_tracker,
+                syms,
+                llm_key,
+                provider=provider,
+                model=model or None,
+                cycle_sec=AGENT_CYCLE_SEC,
+            )
+        else:
+            launch_agent(
+                state,
+                state.decision_tracker,
+                syms,
+                llm_key,
+                provider=provider,
+                model=model or None,
+                cycle_sec=AGENT_CYCLE_SEC,
+                personality=personality,
+            )
+        # On disk now rather than at the next autosave: a crash in the next
+        # few seconds must still find the run to start again.
+        session_store.save(state)
+    return stream_ready
+
+
 def _agent_panel(
     symbols: list[str],
     alpaca_key: str = "",
@@ -2841,6 +3080,18 @@ def _agent_panel(
             "beside it in data/sessions/ rather than overwritten. A different "
             "venue always starts fresh.",
         )
+    st.checkbox(
+        "Resume automatically after a restart",
+        value=True,
+        key=AUTO_RESUME_KEY,
+        help="If the app goes down while the live stream or the agent is running "
+        "— a crash, a hang the supervisor (run_app.py) restarted, or a restart "
+        "of the server — the first page to open afterwards starts them again "
+        "as they were, on the same venue, continuing today's ledger. A run "
+        "that was stopped (⏹ Stop Agent, a stop-out) stays stopped. A page "
+        "that only lost its connection needs none of this: it takes back the "
+        "session that kept running.",
+    )
     c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.3])
     starting_budget = c1.number_input(
         "Starting budget ($)",
@@ -2865,199 +3116,34 @@ def _agent_panel(
         "session bought.",
     )
 
-    env_var = ENV_KEYS[provider]
-    llm_key = os.getenv(env_var, "")
-
     if start_clicked:
-        syms = list(symbols or state.symbols)
-        is_apple_trader = personality == APPLE_TRADER_KEY
-        is_rule_agent = personality in RULE_AGENT_KEYS
-        # The one symbol this run trades, as configured for Apple Trader. It has
-        # to be streamed, or there are no bars to read and the agent would idle
-        # all session.
-        rule_ticker = APPLE_TRADER_TICKER
-        if personality == APPLE_TRADER_KEY and apple_config is not None:
-            rule_ticker = apple_config.ticker
-        stream_ready = False
-        if not syms:
-            st.error("Enter at least one symbol in the sidebar first.")
-        elif is_rule_agent and rule_ticker not in syms:
-            st.error(
-                f"{_personality_label(personality)} is configured to trade "
-                f"{rule_ticker}; add {rule_ticker} to the symbols in the sidebar."
-            )
-        elif not llm_key and not is_rule_agent:
-            st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
-        else:
-            # The live stream feeds every tool the agent reads. If it isn't
-            # running for these symbols yet, start it here rather than sending
-            # the user back to the sidebar first.
-            stream_ready = bool(state.api_key) and all(state.sym(s) is not None for s in syms)
-            if not stream_ready:
-                key = alpaca_key.strip() or os.getenv("ALPACA_API_KEY", "")
-                secret = alpaca_secret.strip() or os.getenv("ALPACA_SECRET", "")
-                if not key or not secret:
-                    st.error(
-                        "Alpaca API key and secret are required to start the live stream "
-                        "(sidebar Connection expander, or the ALPACA_API_KEY / "
-                        "ALPACA_SECRET environment variables)."
-                    )
-                else:
-                    timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
-                    stream_ready = _start_live_session(
-                        state, syms, key, secret, feed, timeframe,
-                        data_source=data_source, finnhub_token=finnhub_token,
-                        history_feed=history_feed,
-                    )
-        if stream_ready:
-            if not market_hours.is_market_open():
-                open_et = market_hours.next_market_open().astimezone(market_hours.MARKET_TZ)
-                st.info(
-                    f"The trading session hasn't started yet (next open: "
-                    f"{open_et.strftime('%a %Y-%m-%d %H:%M')} ET). The agent is told the "
-                    "market is closed and adapts: the Premarket Analyst prepares opening "
-                    "tactics, other strategies study structure and arm plans for the "
-                    "open instead of trading the stale tape."
-                    + (
-                        " The Apple Traders simply idle until the bell — they score "
-                        "closed minute bars and there are none."
-                        if is_rule_agent
-                        else ""
-                    )
-                )
-            # Resolve the venue before anything starts. Every refusal inside
-            # resolve_broker degrades to local simulation and says so, so a
-            # misconfigured or blocked account can never silently become a
-            # different account than the one the user picked.
-            live_broker, effective_mode, broker_message = resolve_broker(
-                trading_mode_choice
-            )
-            # Read before `trading_mode` becomes the new venue: a ledger is only
-            # continued on the venue it was kept on.
-            continuing = continue_today and session_store.continues(state, effective_mode)
-            state.trading_mode = effective_mode
-            state.trading_mode_requested = trading_mode_choice
-            state.trading_status = broker_message
-            # Only local simulation is announced here: a degraded, paper or live
-            # venue gets its banner from the persistent status block below,
-            # and announcing it here too would stack two banners saying the same.
-            if effective_mode == trading_mode_choice == "local":
-                st.success(broker_message)
-
-            # Today's ledger goes on (session_store): a restart or a Stop is not
-            # the end of the trading day.
-            prior = state.decision_tracker
-            tracker = DecisionTracker(
-                starting_cash=starting_budget,
-                broker=live_broker,
-                # A real venue applies its own costs inside the cash it reports;
-                # the modelled per-trade cost belongs to the simulation only.
-                trade_cost=TRADE_FIXED_COST if effective_mode == "local" else 0.0,
-            )
-            if continuing:
-                tracker.carry_over(prior)
-            else:
-                # Starting over must not destroy what the day already did.
-                session_store.archive()
-                state.starting_budget = starting_budget
-                levels = getattr(state, "apple_trader_levels", None)
-                if levels:
-                    # The rows stay on the chart; a fresh ledger has no position
-                    # and no stand-down to resume.
-                    state.apple_trader_levels = {**levels, "memory": None}
-            state.decision_tracker = tracker
-            state.session_date = session_store.session_date()
-            state.session_restored = None
-            session_store.claim(state)
-            if effective_mode != "local":
-                # Open on the account's real balance and holdings rather than a
-                # configured budget, and surface a position the app did not open
-                # (left over from a previous run, or placed in Alpaca directly).
-                if state.decision_tracker.sync_from_broker():
-                    snap = state.decision_tracker.snapshot()
-                    # The baseline every return percentage is measured against
-                    # is the account's *value*, not its cash. On an account that
-                    # already holds something, cash is only part of what it is
-                    # worth, and using it would report a return the moment the
-                    # agent did nothing at all. A continued day keeps the
-                    # baseline it opened on.
-                    if not continuing:
-                        state.starting_budget = (
-                            snap["venue_value"]
-                            if snap.get("venue_value") is not None
-                            else snap["cash"]
-                        )
-                    held = {s: q for s, q in snap["positions"].items() if q}
-                    if held:
-                        st.info(
-                            "Existing positions on this account: "
-                            + ", ".join(f"{s} {q:g}" for s, q in held.items())
-                            + " — the agent starts from these, not from flat."
-                        )
-                else:
-                    st.warning(
-                        "Could not read the account balance; the ledger starts from "
-                        "the configured budget and will reconcile on the first order."
-                    )
-            if continuing:
-                snap = state.decision_tracker.snapshot()
-                held = {s: q for s, q in snap["positions"].items() if q}
-                append_agent_log(
-                    state,
-                    {
-                        "type": "status",
-                        "text": (
-                            f"Continuing today's session: {len(snap['decisions'])} "
-                            f"decisions so far, cash ${snap['cash']:,.2f}, "
-                            + (
-                                "holding " + ", ".join(f"{s} {q:g}" for s, q in held.items())
-                                if held
-                                else "flat"
-                            )
-                            + "."
-                        ),
-                    },
-                )
-                if state.agent_start_time is None:
-                    state.agent_start_time = datetime.now(tz=timezone.utc)
-            else:
-                state.agent_log = []
-                state.agent_start_time = datetime.now(tz=timezone.utc)
-                state.agent_equity_history = []
-            if is_apple_trader:
-                launch_apple_trader(
-                    state,
-                    state.decision_tracker,
-                    config=apple_config or AppleTraderConfig(),
-                    cycle_sec=APPLE_TRADER_CYCLE_SEC,
-                )
-            elif personality == AUTOMATIC_KEY:
-                launch_automatic(
-                    state,
-                    state.decision_tracker,
-                    syms,
-                    llm_key,
-                    provider=provider,
-                    model=model or None,
-                    cycle_sec=AGENT_CYCLE_SEC,
-                )
-            else:
-                launch_agent(
-                    state,
-                    state.decision_tracker,
-                    syms,
-                    llm_key,
-                    provider=provider,
-                    model=model or None,
-                    cycle_sec=AGENT_CYCLE_SEC,
-                    personality=personality,
-                )
+        _start_agent(
+            state,
+            list(symbols or state.symbols),
+            personality=personality,
+            provider=provider,
+            model=model,
+            apple_config=apple_config,
+            trading_mode_choice=trading_mode_choice,
+            starting_budget=starting_budget,
+            continue_today=continue_today,
+            alpaca_key=alpaca_key,
+            alpaca_secret=alpaca_secret,
+            feed=feed,
+            data_source=data_source,
+            finnhub_token=finnhub_token,
+            history_feed=history_feed,
+        )
 
     if stop_clicked:
         stop_agent(state)
+        # At once, not at the next autosave: a crash right after a Stop must
+        # not start the stopped run again.
+        session_store.save(state)
 
     if sell_all_clicked:
         sold, errors = sell_everything_and_stop(state)
+        session_store.save(state)
         filled = [d for d in sold if d.status == "filled"]
         refused = [d for d in sold if d.status != "filled"]
         if filled:
@@ -3078,7 +3164,11 @@ def _agent_panel(
 
     _agent_status_line()
     restored = getattr(state, "session_restored", None)
-    if restored and not state.agent_running:
+    if (
+        restored
+        and not state.agent_running
+        and (restored.get("decisions") or restored.get("log"))
+    ):
         held = restored.get("positions") or {}
         saved = str(restored.get("saved_at") or "")
         try:
@@ -3530,6 +3620,205 @@ def _start_live_session(
     return True
 
 
+# --- recovery after a dropped connection or a restart ---------------------------
+
+# The Agent tab's "Resume automatically after a restart" box (kept in last_setup).
+AUTO_RESUME_KEY = "agent_auto_resume"
+# How often a resume that could not start (no network yet) is tried again.
+RESUME_RETRY_SEC = 30
+# How long the banner saying what was recovered stays above the tabs.
+RECOVERY_BANNER_SEC = 10 * 60
+
+
+def _apple_config_from(raw: "dict | None") -> "AppleTraderConfig | None":
+    if not raw:
+        return None
+    known = {f.name for f in fields(AppleTraderConfig)}
+    return AppleTraderConfig(**{k: v for k, v in raw.items() if k in known})
+
+
+def _run_label(run: dict) -> str:
+    """'the live stream and Apple Trader' -- what `run` started, for the banner."""
+    parts = []
+    if run.get("stream"):
+        parts.append(f"the live stream ({', '.join(run['stream'].get('symbols') or [])})")
+    if run.get("agent"):
+        parts.append(_personality_label(run["agent"].get("personality", "")))
+    return " and ".join(parts) or "nothing"
+
+
+def _resume_after_restart(
+    state: AppState, alpaca_key: str, alpaca_secret: str, finnhub_token: str
+) -> None:
+    """Start again what the app went down in the middle of.
+
+    The day's file says what was running when the process last saved
+    (`session_store.take_resume`): the live stream, the agent, or both. The
+    first session after a restart starts them as they were -- the agent on the
+    same venue, continuing today's ledger, Apple Trader taking back its open
+    position and stand-down -- unless the Agent tab's "Resume automatically
+    after a restart" is unticked. A stream that cannot start yet (whatever
+    took the app down may have taken the network with it) is tried again
+    every RESUME_RETRY_SEC; an agent the setup refuses is reported, not retried.
+    """
+    if not st.session_state.get(AUTO_RESUME_KEY, True):
+        if (state.recovery or {}).get("pending"):
+            state.recovery = None
+        return
+    pending = (state.recovery or {}).get("pending")
+    if pending is not None and time.time() < (state.recovery or {}).get("retry_at", 0):
+        return
+    run = pending or session_store.take_resume(state)
+    if not run:
+        return
+    attempts = (state.recovery or {}).get("attempts", 0) + 1 if pending else 1
+    stream, agent = run.get("stream") or {}, run.get("agent")
+    key = alpaca_key.strip() or os.getenv("ALPACA_API_KEY", "")
+    secret = alpaca_secret.strip() or os.getenv("ALPACA_SECRET", "")
+    if not key or not secret:
+        state.recovery = {
+            "kind": "restart", "at": time.time(), "run": run,
+            "error": "the Alpaca API key and secret are not in the environment "
+            "(ALPACA_API_KEY / ALPACA_SECRET), so nothing was started — enter them "
+            "and press ▶ Start.",
+        }
+        return
+    connection = {
+        "feed": stream.get("feed") or "iex",
+        "data_source": stream.get("data_source") or DEFAULT_DATA_SOURCE,
+        "history_feed": stream.get("history_feed") or DEFAULT_HISTORY_FEED,
+    }
+    error = ""
+    started = True
+    if stream:
+        try:
+            started = _start_live_session(
+                state, list(stream["symbols"]), key, secret, connection["feed"],
+                stream.get("timeframe") or TIMEFRAMES[0],
+                data_source=connection["data_source"], finnhub_token=finnhub_token,
+                history_feed=connection["history_feed"],
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Resuming the live stream failed")
+            started, error = False, f"{type(exc).__name__}: {exc}"
+        if not started:
+            state.recovery = {
+                "kind": "restart", "at": time.time(), "run": run, "pending": run,
+                "attempts": attempts, "retry_at": time.time() + RESUME_RETRY_SEC,
+                "error": error or state.status,
+            }
+            # The day's run is handed out once per process, to this state: a
+            # reload has to find it again (adopt_orphaned_session) to go on trying.
+            session_id = _session_id()
+            if session_id:
+                register_live_session(session_id, state)
+            return
+    if agent:
+        try:
+            started = _start_agent(
+                state,
+                list(agent.get("symbols") or stream.get("symbols") or []),
+                personality=agent.get("personality") or DEFAULT_PERSONALITY,
+                provider=agent.get("provider") or state.llm_provider,
+                model=agent.get("model") or "",
+                apple_config=_apple_config_from(agent.get("apple_config")),
+                trading_mode_choice=agent.get("trading_mode") or DEFAULT_TRADING_MODE,
+                starting_budget=float(agent.get("starting_budget") or PAPER_STARTING_CASH),
+                continue_today=True,
+                alpaca_key=key,
+                alpaca_secret=secret,
+                finnhub_token=finnhub_token,
+                **connection,
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Resuming the agent failed")
+            started, error = False, f"{type(exc).__name__}: {exc}"
+        if started:
+            append_agent_log(state, {"type": "status", "text": (
+                f"{_personality_label(agent.get('personality', ''))} started again "
+                "automatically: the app restarted while it was running."
+            )})
+        else:
+            error = error or "the agent's setup was refused — see the message above."
+    state.recovery = {"kind": "restart", "at": time.time(), "run": run, "error": error}
+
+
+@st.fragment(run_every=RESUME_RETRY_SEC)
+def _resume_retry_timer() -> None:
+    """Rerun the whole app once a pending resume is due to be tried again --
+    only a full run can start a stream. Drawn only while one is pending."""
+    recovery = _get_state().recovery or {}
+    if recovery.get("pending") and time.time() >= recovery.get("retry_at", 0):
+        st.rerun(scope="app")
+
+
+def _recovery_banner(state: AppState) -> None:
+    """Say, above the tabs, what came back after a dropped connection or a
+    restart, for RECOVERY_BANNER_SEC -- or that it has not yet."""
+    recovery = state.recovery
+    if not recovery:
+        return
+    run = recovery.get("run") or {}
+    if recovery.get("pending"):
+        st.warning(
+            f"♻️ The app restarted while {_run_label(run)} was running. Starting it "
+            f"again failed ({recovery.get('error') or 'unknown error'}); trying again "
+            f"every {RESUME_RETRY_SEC} s (attempt {recovery.get('attempts', 1)}). "
+            "▶ Start or ⏹ Stop takes over."
+        )
+        _resume_retry_timer()
+        return
+    if time.time() - recovery.get("at", 0) > RECOVERY_BANNER_SEC:
+        return
+    if recovery["kind"] == "reconnect":
+        running = [
+            label for label, on in (
+                ("the live stream", session_store.is_streaming(state)),
+                (_personality_label(state.llm_personality), state.agent_running),
+            ) if on
+        ]
+        if running:
+            st.info(
+                "🔌 The connection to the app dropped and came back. This page took "
+                f"over the session that kept running meanwhile: {' and '.join(running)} "
+                "never stopped."
+            )
+    elif recovery.get("error"):
+        st.error(
+            f"♻️ The app restarted while {_run_label(run)} was running, and could not "
+            f"start all of it again: {recovery['error']}"
+        )
+    else:
+        st.success(
+            f"♻️ The app restarted while {_run_label(run)} was running, and started it "
+            "again" + (" — continuing today's ledger" if run.get("agent") else "")
+            + ". Untick \"Resume automatically after a restart\" in the Agent tab to "
+            "leave it stopped next time."
+        )
+
+
+@contextmanager
+def _panel_guard(label: str):
+    """Keep one tab's failure from taking the whole page down.
+
+    An exception escaping a tab used to end the script run where it was raised:
+    every tab after it -- the Agent tab among them -- was left undrawn behind a
+    traceback, and a dropped connection to any one data source was enough. The
+    error is shown in its own tab instead and the run goes on. Streamlit's own
+    rerun/stop signals are BaseExceptions and pass through."""
+    try:
+        yield
+    except Exception as exc:
+        logging.getLogger(__name__).exception("%s failed to draw", label)
+        st.warning(
+            f"⚠️ {label} hit an error and was skipped this time ({type(exc).__name__}: "
+            f"{exc}). The rest of the app, the stream and the agent are not affected; "
+            "it is drawn again on the next refresh."
+        )
+        with st.expander("Error details"):
+            st.exception(exc)
+
+
 def build_ui() -> None:
     st.set_page_config(
         page_title="Agent Stonks",
@@ -3622,6 +3911,9 @@ def build_ui() -> None:
             )
     finnhub_token = finnhub_token_input.strip() or os.getenv("FINNHUB_API_KEY", "")
     state = _get_state()
+    with _panel_guard("Restart recovery"):
+        _resume_after_restart(state, api_key, api_secret, finnhub_token)
+        _recovery_banner(state)
     symbols = _effective_symbols(state, symbols_input)
 
     (
@@ -3630,7 +3922,7 @@ def build_ui() -> None:
         ["🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🔬 Technical Analysis", "🧱 Put/Call Walls", "🧠 ML Models"]
     )
 
-    with tab_live:
+    with tab_live, _panel_guard("The Live tab"):
         st.caption(
             "Live candles are built locally from the Finnhub trade tape by default, so the "
             "newest candle is the minute in progress. Bid/ask, the bar backfill and the "
@@ -3704,22 +3996,23 @@ def build_ui() -> None:
 
         if stop_clicked:
             stop_streams(state)
+            session_store.save(state)
 
         _live_panel()
 
-    with tab_news:
+    with tab_news, _panel_guard("The News tab"):
         _news_panel(symbols)
 
-    with tab_premarket:
+    with tab_premarket, _panel_guard("The Pre-Market tab"):
         _premarket_panel(symbols)
 
-    with tab_analysis:
+    with tab_analysis, _panel_guard("The Technical Analysis tab"):
         _technical_analysis_panel(symbols)
 
-    with tab_walls:
+    with tab_walls, _panel_guard("The Put/Call Walls tab"):
         _options_walls_panel(symbols)
 
-    with tab_agent:
+    with tab_agent, _panel_guard("The Agent tab"):
         _agent_panel(
             symbols,
             alpaca_key=api_key,
@@ -3730,7 +4023,7 @@ def build_ui() -> None:
             history_feed=history_feed,
         )
 
-    with tab_models:
+    with tab_models, _panel_guard("The ML Models tab"):
         model_catalogue_panel()
 
     last_setup.remember()

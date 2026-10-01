@@ -29,9 +29,11 @@ widgets are drawn.
   is written once it differs from what this session first saw for it, so a
   default nobody touched is never stored either -- and a shipped default that
   changes later (a re-tuned buy/sell pair) still reaches the form.
-- **Nothing is started.** The stream and the agent wait for ▶ Start, and so
-  does the venue: a restored Alpaca LIVE comes back selected, with its warning
-  above the button, and trades nothing until that is pressed.
+- **Nothing is started here.** A restored Alpaca LIVE comes back selected,
+  with its warning above the button, and trades nothing until ▶ Start is
+  pressed. What *was running* when the app went down is a different thing,
+  kept with the day in session_store and started again by
+  `ui._resume_after_restart` (2026-10-01).
 """
 from __future__ import annotations
 
@@ -85,6 +87,7 @@ KEYS = frozenset({
     "agent_trading_mode",
     "agent_trade_sound_volume",
     "agent_starting_budget",
+    "agent_auto_resume",
 })
 # Keys built from the instrument, the model or the provider on screen.
 PREFIXES = ("apple_trader_", "agent_llm_model_", "premarket_model_")

@@ -129,11 +129,23 @@ streamlit run sim_main.py
 ```bash
 cp .env.example .env        # fill in your Alpaca credentials (and FINNHUB_API_KEY for the default live source)
 pip install -r requirements.txt
-streamlit run main.py       # live dashboard
+python run_app.py           # live dashboard, restarted automatically if it crashes or hangs
 streamlit run sim_main.py   # SimLab strategy testing
 ```
 
-Open http://localhost:8501.
+Open http://localhost:8501. (`streamlit run main.py` still works; it just has nobody watching it.)
+
+## Recovery from crashes and dropped connections
+
+The live app used to need a manual restart after a "Connection error". Three layers now handle it without one:
+
+- **A dropped connection.** A browser that loses the app for more than Streamlit's 2-minute grace (laptop sleep, a frozen background tab, a network change), or a page reload, comes back as a *new* session. That session now **takes over** the session that kept running without it — same stream, same agent, nothing restarted — instead of opening a stopped copy beside it while the old agent traded out of sight. A banner says so. A second tab opened beside a live one still gets a state of its own.
+- **A crash or a hang.** `python run_app.py` (any `streamlit` option passes through, e.g. `--server.port 8533`; `python run_app.py sim_main.py` for SimLab) runs the app under a supervisor. It restarts the app when the process exits, and when it stops answering `/_stcore/health` for six checks in a row (about 1½ minutes). Before killing a hung app it asks it for every thread's stack (SIGUSR1), so the log shows where it was stuck. Restarts back off from 2 s to 60 s and stop after 5 within 15 minutes, with a macOS notification. Everything the app prints is also written to `data/logs/main.log` (rotated at 10 MB, 5 kept).
+- **What was running starts again.** While the live stream or the agent runs, today's `data/sessions/<date>.json` also records how they were started. After a restart, the open browser tab reconnects by itself, and the first session restores the day and **starts them again**: the stream on the same symbols and connection, and the agent on the same venue, continuing today's ledger. Apple Trader takes back its open position and stand-down. Anything stopped on purpose (⏹ Stop, ⏹ Stop Agent, a stop-out) stays stopped. If the stream can't start yet, it is retried every 30 s. Untick **Resume automatically after a restart** in the Agent tab to turn this off. Credentials come from the environment, since sidebar-typed keys are not kept.
+
+Two smaller safety nets: the 5-minute reaper of abandoned sessions no longer stops the streams under an agent that is still trading (it used to leave a headless agent holding a position on a frozen tape, its stop unable to fire), and an error in one tab — a data source refusing a connection, say — is shown in that tab instead of ending the page there and leaving every tab after it, the Agent tab included, undrawn.
+
+The supervisor only helps while the app is reachable from a browser tab: agents run inside a page's session, so a restart resumes them when the tab reconnects. Leave the tab open.
 
 ## Docker
 
@@ -309,6 +321,7 @@ simlab/
   app.py        — the SimLab Streamlit UI (agents / ML models / drift / datasets / simulate /
                   tuning / summary / results)
 main.py         — entry point (loads .env, launches Streamlit)
+run_app.py      — supervisor: runs main.py, restarts it on a crash or a hang, logs to data/logs/
 sim_main.py     — SimLab entry point (streamlit run sim_main.py)
 tests/          — pytest suite, mirrors most modules 1:1
 ```

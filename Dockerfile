@@ -6,8 +6,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent_stonks/ agent_stonks/
-COPY main.py .
+COPY main.py run_app.py ./
 
 EXPOSE 8501
 
-CMD ["streamlit", "run", "main.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# run_app.py restarts the app on a crash or a hang (see README, "Recovery").
+CMD ["python", "run_app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

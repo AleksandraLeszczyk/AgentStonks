@@ -205,3 +205,113 @@ def test_a_running_session_without_a_date_is_dated_by_its_start():
     state.session_date = ""
     session_store.start_autosave(state, interval=60)
     assert state.session_date == "2026-09-28"
+
+
+# --- what was running, and starting it again after a restart -------------------
+
+_RUN_SPEC = {
+    "personality": "apple_trader", "provider": "openai", "model": "", "symbols": ["AAPL"],
+    "trading_mode": "alpaca_paper", "starting_budget": 10_000.0,
+    "apple_config": {"ticker": "AAPL", "buy_k": 0.9, "sell_k": 0.2},
+}
+
+
+def _streaming(state: AppState) -> AppState:
+    import threading
+
+    state.set_symbols(["AAPL", "MSFT"])
+    state.timeframe, state.feed = "1Min", "iex"
+    state.data_source, state.history_feed = "finnhub", "auto"
+    state.bars_fallback_stop_event = threading.Event()
+    return state
+
+
+def _trading(state: AppState) -> AppState:
+    _streaming(state)
+    state.run_spec = dict(_RUN_SPEC)
+    state.agent_running = True
+    return state
+
+
+def _restart_and_restore() -> AppState:
+    session_store._owners.clear()             # a new process
+    session_store._resumed.clear()
+    state = AppState()
+    session_store.restore(state)
+    return state
+
+
+def test_a_running_stream_and_agent_are_saved_with_the_day():
+    session_store.save(_trading(_running_state()))
+    run = session_store.load()["run"]
+    assert run["agent"] == _RUN_SPEC
+    assert run["stream"] == {
+        "symbols": ["AAPL", "MSFT"], "timeframe": "1Min", "feed": "iex",
+        "data_source": "finnhub", "history_feed": "auto",
+    }
+
+
+def test_a_stopped_agent_and_stream_leave_nothing_to_resume():
+    state = _trading(_running_state())
+    state.agent_running = False               # ⏹ Stop Agent, a stop-out, the end of a run
+    session_store.save(state)
+    assert session_store.load()["run"]["agent"] is None
+
+    state.bars_fallback_stop_event.set()      # ⏹ Stop
+    session_store.save(state)
+    assert session_store.load()["run"] is None
+
+
+def test_stopping_changes_the_autosave_signature():
+    state = _trading(_running_state())
+    before = session_store._signature(state)
+    state.agent_running = False
+    assert session_store._signature(state) != before
+    stopped = session_store._signature(state)
+    state.bars_fallback_stop_event.set()
+    assert session_store._signature(state) != stopped
+
+
+def test_a_run_interrupted_by_a_restart_is_handed_out_once():
+    session_store.save(_trading(_running_state()))
+
+    first = _restart_and_restore()
+    second = AppState()
+    session_store.restore(second)             # another tab, same process
+
+    run = session_store.take_resume(first)
+    assert run["agent"] == _RUN_SPEC and run["stream"]["symbols"] == ["AAPL", "MSFT"]
+    assert session_store.take_resume(first) is None    # a later rerun
+    assert session_store.take_resume(second) is None   # not the owner
+
+
+def test_only_the_owner_of_the_day_resumes_it():
+    session_store.save(_trading(_running_state()))
+    session_store._owners.clear()
+    session_store._resumed.clear()
+    looking, owner = AppState(), AppState()
+    session_store.restore(looking)
+    session_store.claim(owner)                # pressed ▶ Start elsewhere first
+    assert session_store.take_resume(looking) is None
+
+
+def test_nothing_is_resumed_from_a_day_saved_while_stopped():
+    session_store.save(_running_state())      # a ledger, nothing running
+    assert session_store.take_resume(_restart_and_restore()) is None
+
+
+def test_a_stream_alone_is_kept_and_resumed_without_a_ledger():
+    state = _streaming(AppState())
+    path = session_store.save(state)
+    assert path is not None and session_store.load()["tracker"] is None
+
+    restored = _restart_and_restore()
+    assert restored.decision_tracker is None
+    assert restored.session_restored["decisions"] == restored.session_restored["log"] == 0
+    assert session_store.take_resume(restored)["stream"]["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_a_day_with_only_a_stream_is_not_archived_on_a_fresh_start():
+    session_store.save(_streaming(AppState()))
+    assert session_store.archive() is None
+    assert session_store.path_for("2026-09-28").exists()

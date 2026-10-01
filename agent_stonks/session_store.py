@@ -10,10 +10,16 @@ on a fresh `AppState`.
 - **What restore gives back.** The ledger, the log, the equity history, the
   venue the run was on and Apple Trader's recorded levels plus the trader's own
   memory of an open position (`DayRangeTrader.memory`: its fill, stop, ladder
-  and a session stand-down). Nothing is re-started: the agent stays stopped
-  until ▶ Start, which then *continues* the day (`continues`) rather than
-  opening a new ledger -- the user's choice, 2026-09-28. A new ET day, or a
-  different venue, starts fresh.
+  and a session stand-down). ▶ Start then *continues* the day (`continues`)
+  rather than opening a new ledger -- the user's choice, 2026-09-28. A new ET
+  day, or a different venue, starts fresh.
+- **What was running is started again.** While the live stream or the agent
+  runs, the file also holds how it was started (`run`: the stream's symbols
+  and connection, the agent's `AppState.run_spec`); a Stop, a stop-out or the
+  end of the run clears its part at once or within one autosave. So a file
+  that still has one was written by a process that went down mid-run, and the
+  first session after the restart starts it again (`take_resume`, once per
+  day per process; 2026-10-01). What was stopped stays stopped.
 - **The ledger is restored onto a simulated broker.** Only ▶ Start resolves a
   venue; until then an Alpaca run's numbers are the ledger as last saved, and
   the Start that continues it re-reads the account (`sync_from_broker`).
@@ -60,6 +66,9 @@ _owners: dict[str, str] = {}
 _owners_lock = threading.Lock()
 # Serialises writes, so two threads never interleave on the temp file.
 _write_lock = threading.Lock()
+# Days whose saved run this process has already handed out to be started
+# again -- a restart resumes a run once, in its first session, never per tab.
+_resumed: set[str] = set()
 
 _DECISION_FIELDS = {f.name for f in fields(Decision)}
 
@@ -159,6 +168,31 @@ def _levels_record(levels: "dict | None") -> "dict | None":
     }
 
 
+def is_streaming(state) -> bool:
+    """Whether `state`'s live stream is running: started, and not stopped."""
+    event = getattr(state, "bars_fallback_stop_event", None)
+    return event is not None and not event.is_set() and bool(state.symbols)
+
+
+def _run_record(state) -> "dict | None":
+    """What is running on `state` and how it was started, or None when nothing
+    is. Only ever written by a process that is up, so on disk it means "was
+    running when the app last saved" -- see `take_resume`."""
+    stream = None
+    if is_streaming(state):
+        stream = {
+            "symbols": list(state.symbols),
+            "timeframe": state.timeframe,
+            "feed": state.feed,
+            "data_source": state.data_source,
+            "history_feed": state.history_feed,
+        }
+    agent = dict(state.run_spec) if state.agent_running and state.run_spec else None
+    if stream is None and agent is None:
+        return None
+    return {"stream": stream, "agent": agent}
+
+
 def capture(state) -> dict:
     """The part of `state` a restart would lose, as one JSON-able record."""
     tracker = state.decision_tracker
@@ -189,11 +223,16 @@ def capture(state) -> dict:
         "agent_equity_history": equity,
         "tracker": ledger,
         "apple_trader_levels": _levels_record(getattr(state, "apple_trader_levels", None)),
+        "run": _run_record(state),
     }
 
 
-def _has_content(record: dict) -> bool:
+def _has_ledger(record: dict) -> bool:
     return bool(record.get("tracker") or record.get("agent_log"))
+
+
+def _has_content(record: dict) -> bool:
+    return _has_ledger(record) or bool(record.get("run"))
 
 
 def save(state, *, force: bool = False) -> "Path | None":
@@ -231,6 +270,9 @@ def archive(day: "str | None" = None) -> "Path | None":
     path = path_for(day or session_date())
     if not path.exists():
         return None
+    saved = load(day or session_date())
+    if saved is not None and not _has_ledger(saved):
+        return None  # only a stream was kept: nothing a fresh ledger replaces
     stamp = clock.now().astimezone(MARKET_TZ).strftime("%H%M%S")
     target = path.with_name(f"{path.stem}-replaced-{stamp}.json")
     with _write_lock:
@@ -331,6 +373,8 @@ def restore(state, record: "dict | None" = None) -> "dict | None":
         "fills": sum(1 for d in tracker.decisions if d.status == "filled") if tracker else 0,
         "positions": {s: q for s, q in tracker.positions.items() if q} if tracker else {},
         "cash": tracker.cash if tracker else None,
+        "log": len(state.agent_log),
+        "run": record.get("run") or None,
     }
     state.session_restored = summary
     logger.info(
@@ -338,6 +382,23 @@ def restore(state, record: "dict | None" = None) -> "dict | None":
         day, summary["path"], summary["decisions"], summary["positions"] or "flat",
     )
     return summary
+
+
+def take_resume(state) -> "dict | None":
+    """The run `state` should start again after a restart, or None.
+
+    Only a run the restored file says was going when the process went down,
+    only for the state that owns the day (the first to restore it), and only
+    once per day per process: a second tab, or a later reload, gets None."""
+    restored = getattr(state, "session_restored", None) or {}
+    spec, day = restored.get("run"), restored.get("date")
+    if not spec or not day:
+        return None
+    with _owners_lock:
+        if day in _resumed or _owners.get(day) != owner_token(state):
+            return None
+        _resumed.add(day)
+    return dict(spec)
 
 
 def continues(state, venue: str, day: "str | None" = None) -> bool:
@@ -380,6 +441,12 @@ def _signature(state) -> tuple:
         len(rows),
         rows[-1].get("t") if rows else None,
         repr(levels.get("memory")),
+        # A stop has to reach the file promptly, or a crash right after it
+        # would start the stopped run again.
+        bool(state.agent_running),
+        is_streaming(state),
+        tuple(state.symbols),
+        state.timeframe,
     )
 
 

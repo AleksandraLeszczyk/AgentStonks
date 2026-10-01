@@ -52,11 +52,12 @@ def _no_live_bar_tiers(monkeypatch):
 @pytest.fixture(autouse=True)
 def _session_files_in_tmp(monkeypatch, tmp_path):
     """Keep `session_store`'s day files out of the real data/sessions/, and
-    start every test with no state owning a day."""
+    start every test with no state owning a day and no run resumed."""
     from agent_stonks import session_store
 
     monkeypatch.setattr(session_store, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(session_store, "_owners", {})
+    monkeypatch.setattr(session_store, "_resumed", set())
 
 
 @pytest.fixture(autouse=True)

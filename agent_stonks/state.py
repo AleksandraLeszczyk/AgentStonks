@@ -268,6 +268,8 @@ _DEFAULTS: dict[str, object] = {
     "agent_equity_history": [],
     "session_date": "",
     "session_restored": None,
+    "run_spec": None,
+    "recovery": None,
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
@@ -406,6 +408,15 @@ class AppState:
         # today's and on the same venue instead of opening a new one.
         self.session_date: str = ""
         self.session_restored: "dict | None" = None
+        # How the running agent was started -- personality, model, symbols,
+        # connection, venue, Apple Trader's config -- so a restart of the app
+        # can start it again the same way (`session_store.take_resume`). Set by
+        # ▶ Start Agent; saved only while `agent_running`.
+        self.run_spec: "dict | None" = None
+        # What brought this state back, for the banner above the tabs: a
+        # browser session that took over a running one after a dropped
+        # connection, or a run resumed after a restart. None otherwise.
+        self.recovery: "dict | None" = None
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()
         self.agent_wake_reason: str | None = None

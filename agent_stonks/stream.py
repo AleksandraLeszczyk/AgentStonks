@@ -810,7 +810,14 @@ def register_live_session(session_id: str, app: AppState) -> None:
 
 def reap_dead_sessions(is_active, now: float | None = None) -> list[str]:
     """Stop the streams of every registered session that `is_active(session_id)`
-    has reported gone for SESSION_REAP_AFTER_SEC. Returns the reaped ids."""
+    has reported gone for SESSION_REAP_AFTER_SEC. Returns the reaped ids.
+
+    A session whose agent is still running is never reaped: the agent keeps
+    trading with no browser attached, and the streams are what it reads. Reaping
+    them used to leave it holding a position on a tape that had stopped moving,
+    with its stop never able to fire. It stays registered, so the next browser
+    session adopts it (`adopt_orphaned_session`), and is reaped once its agent
+    stops if no browser has come back by then."""
     now = time.monotonic() if now is None else now
     reaped: list[tuple[str, AppState]] = []
     with _live_sessions_lock:
@@ -819,7 +826,7 @@ def reap_dead_sessions(is_active, now: float | None = None) -> list[str]:
                 _gone_since.pop(session_id, None)
                 continue
             since = _gone_since.setdefault(session_id, now)
-            if now - since >= SESSION_REAP_AFTER_SEC:
+            if now - since >= SESSION_REAP_AFTER_SEC and not app.agent_running:
                 reaped.append((session_id, app))
                 del _live_sessions[session_id]
                 del _gone_since[session_id]
@@ -827,3 +834,45 @@ def reap_dead_sessions(is_active, now: float | None = None) -> list[str]:
         logger.info("Stopping the streams of closed session %s", session_id)
         stop_streams(app)
     return [session_id for session_id, _ in reaped]
+
+
+def adopt_orphaned_session(session_id: str, is_active) -> "AppState | None":
+    """Hand `session_id` -- a browser session just opened -- the AppState of a
+    session whose browser has gone, while its streams or agent still run.
+
+    A dropped connection (a laptop sleep, a frozen background tab, a network
+    change) that lasts past Streamlit's 2-minute grace, or a page reload,
+    comes back as a *new* session. Before this, that session built a fresh
+    AppState from the day's file -- agent shown stopped, no stream -- while the
+    old one went on trading out of sight, and a second ▶ Start ran two agents
+    on one day. The new session takes over the old state instead, so the page
+    opens on what is actually running.
+
+    Prefers a state whose agent is running, then the most recently registered.
+    Only states none of whose sessions is still connected are taken: a second
+    tab opened beside a live one keeps a state of its own."""
+    with _live_sessions_lock:
+        by_state: dict[int, list[str]] = {}
+        for sid, app in _live_sessions.items():
+            by_state.setdefault(id(app), []).append(sid)
+        candidates: list[tuple[str, AppState]] = []
+        for sid, app in _live_sessions.items():
+            if sid == session_id:
+                return app
+            if any(is_active(other) for other in by_state[id(app)]):
+                continue
+            candidates.append((sid, app))
+        if not candidates:
+            return None
+        # Insertion order is registration order: the last one is the newest.
+        running = [c for c in candidates if c[1].agent_running]
+        _, app = (running or candidates)[-1]
+        for sid in by_state[id(app)]:
+            del _live_sessions[sid]
+            _gone_since.pop(sid, None)
+        _live_sessions[session_id] = app
+    logger.info(
+        "Session %s took over a running session whose browser had gone (agent %s)",
+        session_id, "running" if app.agent_running else "stopped",
+    )
+    return app
