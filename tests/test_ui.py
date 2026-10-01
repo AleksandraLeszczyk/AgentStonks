@@ -78,6 +78,16 @@ class TestBuildNewsHtml:
         html = build_news_html(news, "AAPL")
         assert "No summary here" in html
 
+    def test_marks_yahoo_articles(self):
+        base = {"summary": "", "created_at": "2024-01-15T14:30:00Z", "url": "http://example.com"}
+        news = [
+            {**base, "id": "yf-1", "headline": "From Yahoo", "source": "Reuters", "feed": "yfinance"},
+            {**base, "id": 2, "headline": "From Alpaca", "source": "benzinga"},
+        ]
+        html = build_news_html(news, "AAPL")
+        assert html.count("via Yahoo") == 1
+        assert "Reuters" in html
+
 
 class TestMoneyLabelsNameTheAccount:
     """Paper and live are two separate Alpaca accounts with separate balances.

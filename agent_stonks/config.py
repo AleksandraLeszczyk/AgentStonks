@@ -138,6 +138,18 @@ PREMARKET_POLL_SEC = 3
 FALLBACK_POLL_SEC = 15
 NEWS_FALLBACK_POLL_SEC = 60
 
+# Yahoo Finance news, polled alongside the Alpaca news stream whether or not
+# that socket is up: Alpaca's news is Benzinga's wire only, Yahoo's carries
+# Reuters, Barron's, WSJ, IBD and the rest. Yahoo has no news socket, so a poll
+# is the only way in. Each poll asks for the newest YF_NEWS_COUNT articles.
+YF_NEWS_POLL_SEC = 60
+YF_NEWS_COUNT = 20
+# A polled article only wakes the agent when it was published this recently.
+# A poll can turn up an article that is new to the session but hours old (the
+# first poll after a failed initial fetch returns two days of articles); those
+# go into the list without waking anything.
+NEWS_WAKE_MAX_AGE_MIN = 60
+
 # Periodic REST backfill that repairs holes in the live bar series while the
 # WebSocket IS connected: the stream never re-delivers bars that closed during
 # a reconnect, and thin symbols get no bar at all for minutes without a trade

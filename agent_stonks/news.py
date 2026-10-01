@@ -1,15 +1,22 @@
 """
-News analysis pipeline using Alpaca, WorldNews API, and an LLM (Gemini,
-OpenAI, or Anthropic — see `agent_stonks.llm`).
+News analysis pipeline using Alpaca, Yahoo Finance (yfinance), WorldNews API,
+and an LLM (Gemini, OpenAI, or Anthropic — see `agent_stonks.llm`).
 
 This module is optional — only needed for LLM-based impact scoring.
 Required env vars: one of GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY,
 plus WORLD_NEWS_API_KEY.
+
+A live session's news comes from two feeds at once (`fetch_live_news`, then
+`agent_stonks.stream`): Alpaca, whose news is Benzinga's wire only, and Yahoo
+Finance, which carries Reuters, Barron's, WSJ, IBD and the rest. The two
+overlap -- Benzinga pieces are on Yahoo too, under Yahoo's own id -- so they
+are combined with `merge_news`, which drops a repeated headline.
 """
 from __future__ import annotations
 
+import html
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import pandas as pd
@@ -17,6 +24,7 @@ import requests
 from pydantic import BaseModel, field_validator
 
 from . import observability as obs
+from .config import YF_NEWS_COUNT
 from .datalog import log_fetch, log_fetch_failure
 from .llm import DEFAULT_NEWS_MODELS, parse_structured
 from .rest import fetch_news as _fetch_alpaca_news
@@ -196,6 +204,129 @@ def fetch_news_with_fallback(
         }
         for i, item in enumerate(fallback[:limit])
     ]
+
+
+YFINANCE_FEED = "yfinance"
+
+
+def fetch_yfinance_news(symbol: str, count: int = YF_NEWS_COUNT) -> list[dict]:
+    """Recent Yahoo Finance articles for `symbol`, in `rest.fetch_news`'s shape
+    (id/headline/summary/created_at/url/source), plus `feed: "yfinance"`.
+    `source` is the publisher (Reuters, Barrons.com, ...). Raises on failure.
+
+    Yahoo does not return its articles in time order (it pins some), so callers
+    sort -- `merge_news` does."""
+    import yfinance as yf
+
+    # A fresh Ticker on every call: Ticker.get_news caches its first answer on
+    # the instance, so a kept one would never see a new article.
+    items = yf.Ticker(symbol).get_news(count=count, tab="news")
+    articles = []
+    for item in items or []:
+        content = item.get("content") or {}
+        title = content.get("title")
+        published = content.get("pubDate") or content.get("displayTime")
+        article_id = content.get("id") or item.get("id")
+        if not (title and published and article_id):
+            continue
+        url = (
+            (content.get("canonicalUrl") or {}).get("url")
+            or (content.get("clickThroughUrl") or {}).get("url")
+            or content.get("previewUrl")
+            or ""
+        )
+        articles.append({
+            "id": f"yf-{article_id}",
+            "headline": title,
+            "summary": content.get("summary") or content.get("description") or "",
+            "created_at": published,
+            "url": url,
+            "source": (content.get("provider") or {}).get("displayName") or "Yahoo Finance",
+            "feed": YFINANCE_FEED,
+        })
+    return articles
+
+
+def headline_key(article: dict) -> str:
+    """`article`'s headline as lowercase words: what two feeds' copies of one
+    story share (Alpaca's headlines carry HTML entities, Yahoo's do not)."""
+    text = html.unescape(str(article.get("headline") or "")).lower()
+    return " ".join(re.findall(r"[a-z0-9]+", text))
+
+
+_NO_TIME = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def published_at(article: dict) -> datetime:
+    """`article`'s created_at as an aware UTC datetime; the earliest possible
+    time when it is missing or unreadable, so such an article sorts last."""
+    try:
+        ts = datetime.fromisoformat(str(article.get("created_at")))
+    except ValueError:
+        return _NO_TIME
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def merge_news(existing: list[dict], fresh: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Combine `existing` with the articles of `fresh` it does not have yet.
+
+    Returns (every article newest first, the ones `fresh` added). An article
+    is a repeat when its id or its headline (`headline_key`) is already there:
+    the same Benzinga story reaches a session through Alpaca and through Yahoo,
+    under a different id each time, and the first copy to arrive is kept.
+
+    A new list is returned rather than `existing` changed, so a caller can swap
+    it onto SymbolState.news whole and a reader never sees it half-sorted.
+    """
+    seen_ids = {str(a.get("id")) for a in existing if a.get("id") is not None}
+    seen_headlines = {headline_key(a) for a in existing} - {""}
+    added = []
+    for article in fresh:
+        article_id = article.get("id")
+        headline = headline_key(article)
+        if article_id is not None and str(article_id) in seen_ids:
+            continue
+        if headline and headline in seen_headlines:
+            continue
+        added.append(article)
+        if article_id is not None:
+            seen_ids.add(str(article_id))
+        if headline:
+            seen_headlines.add(headline)
+    # Sorted even when nothing was added: Alpaca's REST answer is not in
+    # publication order either. The sort is stable, so ties keep their order.
+    merged = sorted([*existing, *added], key=published_at, reverse=True)
+    return merged, added
+
+
+def fetch_live_news(
+    symbol: str,
+    alpaca_key: str,
+    alpaca_secret: str,
+    worldnews_api_key: str,
+    limit: int = 15,
+) -> list[dict]:
+    """A live session's opening news for `symbol`, newest first: Alpaca's
+    (WorldNews when Alpaca fails, see `fetch_news_with_fallback`) merged with
+    Yahoo Finance's. A Yahoo failure leaves Alpaca's articles alone; the
+    stream's Yahoo poll fills them in later."""
+    articles = fetch_news_with_fallback(
+        symbol, alpaca_key, alpaca_secret, worldnews_api_key, limit=limit
+    )
+    try:
+        yahoo = fetch_yfinance_news(symbol)
+    except Exception as exc:
+        log_fetch_failure(
+            "news (Yahoo Finance)",
+            [("yfinance", exc)],
+            symbol=symbol,
+            consequence="Alpaca's articles only until the next Yahoo poll",
+        )
+        yahoo = []
+    else:
+        log_fetch("news (Yahoo Finance)", "yfinance", symbol=symbol, detail=f"{len(yahoo)} articles")
+    merged, _ = merge_news(articles, yahoo)
+    return merged
 
 
 _IMPACT_SYSTEM = (

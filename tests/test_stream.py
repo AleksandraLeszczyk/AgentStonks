@@ -178,6 +178,82 @@ def test_fallback_news_loop_skips_polling_when_stream_connected(monkeypatch):
     assert called == []
 
 
+def _minutes_ago(minutes: float) -> str:
+    from datetime import datetime, timedelta, timezone
+    ts = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_yfinance_news_loop_polls_even_while_the_alpaca_stream_is_up(monkeypatch):
+    app, state = _app()
+    app.news_connected = True
+    state.news = [{"id": 1, "headline": "Benzinga story", "created_at": _minutes_ago(30)}]
+    fresh = [
+        {"id": "yf-a", "headline": "Benzinga Story", "created_at": _minutes_ago(30)},
+        {"id": "yf-b", "headline": "Reuters story", "created_at": _minutes_ago(5)},
+    ]
+    monkeypatch.setattr(stream, "fetch_yfinance_news", lambda symbol: fresh)
+
+    stream._yfinance_news_loop(["AAPL"], app, _StopAfter(1))
+
+    assert [a["id"] for a in state.news] == ["yf-b", 1]  # repeat dropped, newest first
+    assert app.agent_wake_event.is_set()
+    assert "Yahoo Finance" in app.agent_wake_reason
+    assert "Reuters story" in app.agent_wake_reason
+
+
+def test_yfinance_news_loop_adds_old_articles_without_waking_the_agent(monkeypatch):
+    app, state = _app()
+    monkeypatch.setattr(stream, "fetch_yfinance_news", lambda symbol: [
+        {"id": "yf-old", "headline": "Yesterday's story", "created_at": _minutes_ago(24 * 60)},
+    ])
+
+    stream._yfinance_news_loop(["AAPL"], app, _StopAfter(1))
+
+    assert [a["id"] for a in state.news] == ["yf-old"]
+    assert not app.agent_wake_event.is_set()
+
+
+def test_yfinance_news_loop_survives_a_failed_poll(monkeypatch):
+    app, state = _app("AAPL", "MSFT")
+    calls = []
+
+    def _fetch(symbol):
+        calls.append(symbol)
+        if symbol == "AAPL":
+            raise RuntimeError("Too Many Requests")
+        return [{"id": "yf-m", "headline": "MSFT story", "created_at": _minutes_ago(1)}]
+
+    monkeypatch.setattr(stream, "fetch_yfinance_news", _fetch)
+
+    stream._yfinance_news_loop(["AAPL", "MSFT"], app, _StopAfter(2))
+
+    assert calls == ["AAPL", "MSFT", "AAPL", "MSFT"]
+    assert state.news == []
+    assert [a["id"] for a in app.sym("MSFT").news] == ["yf-m"]
+
+
+def test_news_socket_drops_a_story_yahoo_already_delivered(monkeypatch):
+    import json
+    app, state = _app()
+    state.news = [{"id": "yf-a", "headline": "Apple Pay arrives in India", "created_at": _minutes_ago(3)}]
+    sock = stream._news_socket(["AAPL"], "k", "s", app)
+
+    sock.ws.on_message(None, json.dumps([
+        {"T": "n", "id": 9, "headline": "Apple Pay Arrives In India", "symbols": ["AAPL"],
+         "created_at": _minutes_ago(3)},
+    ]))
+    assert [a["id"] for a in state.news] == ["yf-a"]
+    assert not app.agent_wake_event.is_set()
+
+    sock.ws.on_message(None, json.dumps([
+        {"T": "n", "id": 10, "headline": "Something new", "symbols": ["AAPL"],
+         "created_at": _minutes_ago(0)},
+    ]))
+    assert [a["id"] for a in state.news] == [10, "yf-a"]  # newest first, not appended
+    assert app.agent_wake_event.is_set()
+
+
 def test_fire_due_alerts_wakes_on_price_field():
     import time
     app, state = _app()

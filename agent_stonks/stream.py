@@ -15,6 +15,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import websocket
@@ -27,6 +28,8 @@ from .config import (
     FALLBACK_POLL_SEC,
     NEWS_FALLBACK_POLL_SEC,
     NEWS_STREAM_URL,
+    NEWS_WAKE_MAX_AGE_MIN,
+    YF_NEWS_POLL_SEC,
 )
 from . import bar_history
 from . import finnhub_stream
@@ -34,7 +37,7 @@ from . import scoring
 from . import stream_common
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
-from .news import fetch_news_with_fallback
+from .news import fetch_news_with_fallback, fetch_yfinance_news, merge_news, published_at
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
 from .state import AppState, SymbolState
 from .stream_common import merge_missing_bars  # noqa: F401  (re-export)
@@ -576,6 +579,16 @@ def _news_message_states(app: AppState, msg: dict) -> list[SymbolState]:
     return states
 
 
+def _wake_agent_for_news(app: AppState, symbol: str, article: dict, via: str = "") -> None:
+    """Wake the agent early because `article` just reached `symbol`'s news."""
+    text = f"Fresh news arrived for {symbol}" + (f" (via {via})." if via else ".")
+    headline = article.get("headline", "")
+    if headline:
+        text += f" Latest: {headline}"
+    app.agent_wake_reason = text
+    app.agent_wake_event.set()
+
+
 def _news_socket(
     symbols: list[str], key: str, secret: str, app: AppState
 ) -> ReconnectingSocket:
@@ -601,7 +614,10 @@ def _news_socket(
                 app.news_status = "Authenticated – subscribing to news…"
                 ws.send(json.dumps({"action": "subscribe", "news": symbols}))
             elif t == "subscription":
-                app.news_status = f"✅ Streaming news ({symbols_label})"
+                app.news_status = (
+                    f"✅ Streaming news ({symbols_label}) · "
+                    f"Yahoo Finance polled every {YF_NEWS_POLL_SEC}s"
+                )
                 app.news_connected = True
             elif t == "n":
                 article = {
@@ -617,15 +633,9 @@ def _news_socket(
                         detail=f"headline: {article.get('headline', '')[:80]}",
                     )
                     with state.lock:
-                        if any(a.get("id") == article.get("id") for a in state.news):
-                            continue
-                        state.news.append(article)
-                    headline = article.get("headline", "")
-                    text = f"Fresh news arrived for {state.symbol}."
-                    if headline:
-                        text += f" Latest: {headline}"
-                    app.agent_wake_reason = text
-                    app.agent_wake_event.set()
+                        state.news, added = merge_news(state.news, [article])
+                    if added:
+                        _wake_agent_for_news(app, state.symbol, article)
             elif t == "error":
                 app.news_status = f"News stream error: {msg.get('msg')}"
                 app.news_connected = False
@@ -681,17 +691,50 @@ def _fallback_news_loop(
                 )
                 continue
             with state.lock:
-                seen = {a.get("id") for a in state.news}
-                new_articles = [a for a in fresh if a.get("id") not in seen]
-                state.news.extend(new_articles)
+                state.news, new_articles = merge_news(state.news, fresh)
             if new_articles:
                 app.news_status = f"⚠️ Fallback polling news for {symbol} (stream down)"
-                headline = new_articles[0].get("headline", "")
-                text = f"Fresh news arrived for {symbol} (via fallback poll)."
-                if headline:
-                    text += f" Latest: {headline}"
-                app.agent_wake_reason = text
-                app.agent_wake_event.set()
+                _wake_agent_for_news(app, symbol, new_articles[0], via="fallback poll")
+
+
+def _yfinance_news_loop(
+    symbols: list[str], app: AppState, stop_event: threading.Event
+) -> None:
+    """Poll Yahoo Finance's news for every symbol, whether or not the Alpaca
+    news socket is up -- Alpaca's news is Benzinga's wire only, and Yahoo has
+    no socket. `merge_news` drops the stories both feeds carry.
+
+    An added article wakes the agent only when it is under
+    NEWS_WAKE_MAX_AGE_MIN old: a poll can bring in articles that are new to
+    the session but hours old, e.g. the first good poll after the initial
+    Yahoo fetch failed returns two days of them.
+    """
+    while not stop_event.wait(YF_NEWS_POLL_SEC):
+        for symbol in symbols:
+            state = app.sym(symbol)
+            if state is None:
+                continue
+            try:
+                fresh = fetch_yfinance_news(symbol)
+            except Exception as exc:
+                log_fetch_failure(
+                    "news (Yahoo Finance)",
+                    [("yfinance", exc)],
+                    symbol=symbol,
+                    consequence="retrying next poll",
+                )
+                continue
+            log_fetch(
+                "news (Yahoo Finance)", "yfinance", symbol=symbol,
+                detail=f"{len(fresh)} articles",
+            )
+            with state.lock:
+                state.news, added = merge_news(state.news, fresh)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=NEWS_WAKE_MAX_AGE_MIN)
+            recent = [a for a in added if published_at(a) >= cutoff]
+            if recent:
+                newest = max(recent, key=published_at)
+                _wake_agent_for_news(app, symbol, newest, via="Yahoo Finance")
 
 
 def launch_stream_news(
@@ -699,7 +742,7 @@ def launch_stream_news(
 ) -> None:
     """Close any existing news stream and start a new background thread covering
     every symbol, plus a REST-polling fallback that activates whenever the WS
-    stream isn't connected."""
+    stream isn't connected, plus the Yahoo Finance poll that runs throughout."""
     if app.ws_news:
         try:
             app.ws_news.close()
@@ -721,11 +764,15 @@ def launch_stream_news(
         args=(symbols, key, secret, worldnews_key, app, stop_event),
         daemon=True,
     ).start()
+    threading.Thread(
+        target=_yfinance_news_loop, args=(symbols, app, stop_event), daemon=True,
+    ).start()
 
 
 def stop_streams(app: AppState) -> None:
     """Stop everything `launch_stream` and `launch_stream_news` started for
-    `app`: both sockets (or its Finnhub subscription) and both REST fallbacks."""
+    `app`: both sockets (or its Finnhub subscription), both REST fallbacks and
+    the Yahoo news poll (it shares the news fallback's stop event)."""
     for event in (app.bars_fallback_stop_event, app.news_fallback_stop_event):
         if event:
             event.set()

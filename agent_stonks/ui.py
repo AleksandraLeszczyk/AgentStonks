@@ -97,7 +97,7 @@ from .historical import (
     fetch_static_analysis,
 )
 from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS, models_for
-from .news import fetch_news_with_fallback, score_news_impacts
+from .news import YFINANCE_FEED, fetch_live_news, score_news_impacts
 from .premarket import (
     DEFAULT_PREMARKET_MODELS,
     PHASE_TITLES,
@@ -495,6 +495,8 @@ def _news_html(
     for item in news[:12]:
         ts = pd.to_datetime(item.get("created_at")).strftime("%b %d  %H:%M")
         src = html.escape(item.get("source", ""))
+        if item.get("feed") == YFINANCE_FEED:
+            src += f'<span style="color:{PALETTE["muted"]}"> via Yahoo</span>'
         headline = html.escape(_strip_html(item.get("headline", "")))
         summary = _strip_html(item.get("summary") or "")[:180].rstrip()
         summary = html.escape(summary)
@@ -3554,7 +3556,8 @@ def _start_live_session(
     streams were launched, False when loading any symbol failed.
 
     History, news and daily bars come from Alpaca REST whichever live source is
-    chosen; `data_source` only decides which WebSocket takes over from there.
+    chosen (news from Yahoo Finance too); `data_source` only decides which
+    WebSocket takes over from there.
 
     A symbol that already has bars at this timeframe and history feed (a Stop
     followed by a Start) keeps them: the fetched history is merged in, filling
@@ -3587,7 +3590,9 @@ def _start_live_session(
                     "trades (initial load)", "Alpaca REST", symbol=sym,
                     detail=f"{len(historical_trades)} trades",
                 )
-                news = fetch_news_with_fallback(
+                # Alpaca's and Yahoo Finance's, merged; the stream keeps
+                # both coming (see launch_stream_news).
+                news = fetch_live_news(
                     sym, key, secret, os.getenv("WORLD_NEWS_API_KEY", "")
                 )
                 # Same feed as the intraday bars: this series is the baseline
