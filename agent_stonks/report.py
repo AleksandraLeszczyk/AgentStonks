@@ -1,7 +1,7 @@
 """
 Builds a single self-contained HTML file documenting an agent run: starting
 conditions, the briefing and news the run started from, the Live/Put-Call
-walls/Historical/Agent charts as they looked at save time, and the full history
+walls/Agent charts as they looked at save time, and the full history
 of agent decisions and activity.
 """
 from __future__ import annotations
@@ -342,8 +342,6 @@ def build_report_html(
     llm_personality: str,
     agent_running: bool,
     live_figs: list[tuple[str, Optional[go.Figure]]],
-    historical_figs: list[tuple[str, Optional[go.Figure]]],
-    historical_period_label: Optional[str],
     performance_fig: Optional[go.Figure],
     performance_stats: Optional[dict],
     decisions: list[dict],
@@ -388,8 +386,6 @@ def build_report_html(
             }
         )
 
-    hist_title = f"Historical — {historical_period_label}" if historical_period_label else "Historical"
-
     option_walls = option_walls or []
 
     # plotly.js is loaded from the CDN by the first figure in the document, so
@@ -403,12 +399,6 @@ def build_report_html(
     walls_sections = _option_walls_sections(
         option_walls, first_includes_plotlyjs=not live_figs
     )
-    historical_sections = _fig_sections(
-        historical_figs,
-        title=hist_title,
-        first_includes_plotlyjs=not (live_figs or option_walls),
-        empty_msg="No historical chart data available.",
-    )
     briefing_section = _cards_section(
         briefing_title,
         briefing_cards or [],
@@ -420,7 +410,7 @@ def build_report_html(
     )
     performance_chart = _fig_html(
         performance_fig,
-        include_plotlyjs=not (live_figs or option_walls or historical_figs),
+        include_plotlyjs=not (live_figs or option_walls),
         empty_msg="No agent performance data available.",
     )
 
@@ -445,8 +435,6 @@ def build_report_html(
 {live_sections}
 
 {walls_sections}
-
-{historical_sections}
 
 <h2>Agent performance</h2>
 {perf_summary}

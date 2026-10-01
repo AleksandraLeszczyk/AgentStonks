@@ -41,17 +41,8 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 <img width="1005" height="698" alt="Screenshot 2026-09-30 at 11 05 51" src="https://github.com/user-attachments/assets/9f3b3f86-f70b-4835-99b8-bad9cd14e1ca" />
 
 
-### 🗂️ Historical tab
-- **Price history** — daily closes over 7 days to 5 years, plotted against SPY and VIX
-- **Expert price targets** — each analyst firm's dated price targets (from Yahoo's analyst actions feed) drawn as piecewise lines over the shown period, toggleable per symbol and per firm (via the chart legend)
-- **Dividend and earnings markers** — overlaid on the historical chart
-- **Static analysis** — trailing P/E, estimated annual return (growth + dividend), and estimated 10-year cumulative dividend return
-
 ### 🔬 Technical Analysis tab
 - Daily trend regime, intraday momentum, and broad-market risk environment (VIX level/trend/term structure, S&P 500 trend and drawdown), each summarized in plain language with a gauge chart, per symbol
-
-### 🏦 Smart Money tab
-- Higher-timeframe bullish **order blocks** and **fair value gaps** drawn as demand/supply zones over daily candles, with entry/stop/target geometry overlaid when a setup is active
 
 ### 🧱 Put/Call Walls tab
 - Call Wall / Put Wall (open-interest-based resistance/support) and net dealer gamma regime, computed from a yfinance options chain on its own independent poll loop
@@ -212,8 +203,8 @@ agent_stonks/
                   put/call wall + gamma exposure analysis, Smart Money order blocks / fair value
                   gaps / composite setup + geometry
   options.py    — yfinance options chain fetching (open interest, Black-Scholes gamma per strike)
-  charts.py     — Plotly chart builders (candlestick + volume profile, gamma, Smart Money zones,
-                  performance, historical), the model-overlay renderer, and the multi-day session
+  charts.py     — Plotly chart builders (candlestick + volume profile, gamma, analysis gauges,
+                  performance), the model-overlay renderer, and the multi-day session
                   helpers (rangebreaks collapsing off-session time, 09:30/16:00 boundary rules)
   profile_model.py — ML predicted price profile: loads the LevelsML density-model pack
                   (../Models/open_profile_lgbm.json.gz), rebuilds its at-open features from
@@ -282,8 +273,8 @@ agent_stonks/
                   aggregate scoring report
   performance.py— replays decisions against price bars to build the equity curve
   report.py     — self-contained HTML report of an agent run
-  ui.py         — Streamlit layout (Live / News / Pre-Market / Historical / Technical Analysis /
-                  Smart Money / Put-Call Walls / Agent tabs), event callbacks
+  ui.py         — Streamlit layout (Agent / Live / News / Pre-Market / Technical Analysis /
+                  Put-Call Walls / ML Models tabs), event callbacks
   clock.py      — swappable time source: wall clock live, pinned to the replayed
                   moment under SimLab (agent path reads time through here)
 simlab/

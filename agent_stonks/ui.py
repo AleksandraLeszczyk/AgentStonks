@@ -46,9 +46,7 @@ from .charts import (
     build_analysis_gauges,
     build_chart,
     build_gamma_chart,
-    build_historical_chart,
     build_performance_chart,
-    build_smart_money_chart,
     empty_chart,
 )
 from .config import (
@@ -82,21 +80,7 @@ from .config import (
 )
 from .datalog import log_fetch, log_fetch_failure
 from .decisions import DecisionTracker
-from .historical import (
-    HISTORICAL_PERIODS,
-    SPY_SYMBOL,
-    VIX_SYMBOL,
-    estimate_dividend_return_10y,
-    estimate_total_return,
-    fetch_close_series,
-    fetch_dividends,
-    fetch_earnings_dates,
-    fetch_intraday_history_bars,
-    fetch_market_indicators,
-    fetch_price_target_history,
-    fetch_smart_money_flow,
-    fetch_static_analysis,
-)
+from .historical import fetch_intraday_history_bars, fetch_market_indicators
 from .llm import DEFAULT_AGENT_MODELS, DEFAULT_NEWS_MODELS, ENV_KEYS, PROVIDERS, models_for
 from .news import YFINANCE_FEED, fetch_live_news, score_news_impacts
 from .premarket import (
@@ -143,11 +127,7 @@ from .stream import (
 )
 from .technical_analysis import (
     analyze_intraday,
-    analyze_liquidity,
     analyze_market,
-    analyze_order_blocks,
-    analyze_premium_discount,
-    analyze_smart_money_setup,
     analyze_trend,
     get_put_call_walls_and_gamma,
 )
@@ -301,35 +281,6 @@ def _session_is_active(session_id: str) -> bool:
     except Exception:
         # No runtime to ask: never stop a session on a guess.
         return True
-
-
-# The Historical tab is a daily-bar view, but Streamlit renders every tab on
-# every rerun, so uncached these Yahoo downloads ran on each click anywhere in
-# the app -- ~4 s of network per widget change, whatever tab was on screen.
-# Cached here rather than in `historical`, whose other callers (premarket, the
-# agent's tools) keep their own freshness. Exceptions are not cached, so a
-# failed download is retried on the next rerun.
-_HISTORICAL_TTL_SEC = 300
-
-
-@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
-def _cached_close_series(symbol: str, days: int) -> pd.Series:
-    return fetch_close_series(symbol, days)
-
-
-@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
-def _cached_dividends(symbol: str, days: int) -> pd.Series:
-    return fetch_dividends(symbol, days)
-
-
-@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
-def _cached_earnings_dates(symbol: str, days: int) -> pd.DataFrame:
-    return fetch_earnings_dates(symbol, days)
-
-
-@st.cache_data(ttl=_HISTORICAL_TTL_SEC, show_spinner=False)
-def _cached_static_analysis(symbol: str) -> dict:
-    return fetch_static_analysis(symbol)
 
 
 def _get_state() -> AppState:
@@ -1564,88 +1515,6 @@ def _live_panel() -> None:
     _chart_panel()
 
 
-def _historical_panel(symbols: list[str]) -> None:
-    period_label = st.selectbox("Period", list(HISTORICAL_PERIODS.keys()), index=3, key="hist_period")
-
-    if not symbols:
-        st.plotly_chart(empty_chart("Enter symbols in the sidebar"), width='stretch')
-        return
-
-    # Targets default to shown: select symbols the first time they appear in the
-    # basket (keeping the user's deselections for ones they've already seen), and
-    # drop selections for symbols no longer in the basket before the widget renders.
-    seen_syms = st.session_state.setdefault("hist_target_seen", set())
-    selected = st.session_state.get("hist_target_syms") or []
-    st.session_state["hist_target_syms"] = [s for s in selected if s in symbols] + [
-        s for s in symbols if s not in seen_syms and s not in selected
-    ]
-    seen_syms.update(symbols)
-    target_syms = st.pills(
-        "Expert price targets",
-        symbols,
-        selection_mode="multi",
-        key="hist_target_syms",
-        help=(
-            "Overlay each analyst firm's price targets as piecewise lines over the shown "
-            "period (Yahoo's analyst actions feed). Click a firm in a chart's legend to "
-            "hide that firm's line."
-        ),
-    ) or []
-
-    days = HISTORICAL_PERIODS[period_label]
-    # Shared context series fetched once for the whole basket.
-    try:
-        spy_close = _cached_close_series(SPY_SYMBOL, days)
-        vix_close = _cached_close_series(VIX_SYMBOL, days)
-    except Exception as exc:
-        st.error(f"Failed to load market context series: {exc}")
-        spy_close, vix_close = None, None
-
-    for sym in symbols:
-        with st.spinner(f"Loading historical data for {sym}…"):
-            try:
-                ticker_close = _cached_close_series(sym, days)
-                dividends = _cached_dividends(sym, days)
-                earnings = _cached_earnings_dates(sym, days)
-            except Exception as exc:
-                st.error(f"Failed to load historical data for {sym}: {exc}")
-                continue
-            price_targets = fetch_price_target_history(sym, days) if sym in target_syms else None
-
-        fig = build_historical_chart(
-            ticker_close,
-            spy_close if sym != SPY_SYMBOL else None,
-            vix_close,
-            sym,
-            period_label,
-            dividends,
-            earnings,
-            price_targets=price_targets,
-        )
-        st.plotly_chart(fig, width='stretch', key=f"hist_chart_{sym}")
-        _static_analysis_panel(sym)
-
-
-def _static_analysis_panel(symbol: str) -> None:
-    static = _cached_static_analysis(symbol)
-    pe_ratio = static["pe_ratio"]
-    dividend_yield = static["dividend_yield"]
-    growth_rate = static["growth_rate"]
-    total_return = estimate_total_return(dividend_yield, growth_rate)
-    dividend_return_10y = estimate_dividend_return_10y(dividend_yield, growth_rate)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("P/E (trailing)", f"{pe_ratio:.2f}" if pe_ratio is not None else "—")
-    col2.metric(
-        "Est. annual return (growth + div)",
-        f"{total_return * 100:.1f}%" if total_return is not None else "—",
-    )
-    col3.metric(
-        "Est. 10yr cumulative dividend return",
-        f"{dividend_return_10y * 100:.1f}%" if dividend_return_10y is not None else "—",
-    )
-
-
 @st.fragment(run_every=CHART_POLL_SEC)
 def _technical_analysis_panel(symbols: list[str]) -> None:
     """Visualizes the three human-readable reads from `technical_analysis` for
@@ -1712,109 +1581,6 @@ def _technical_analysis_panel(symbols: list[str]) -> None:
                 st.caption(market["summary"])
                 for insight in market.get("insights", []):
                     st.markdown(f"- {insight}")
-        st.divider()
-
-
-@st.fragment(run_every=CHART_POLL_SEC)
-def _smart_money_panel(symbols: list[str]) -> None:
-    """Visualizes the Smart Money Concepts setup per symbol: higher-timeframe daily
-    order blocks drawn as demand/supply zones over the candles, with the suggested
-    entry/stop/target geometry -- the same composite read the `smart_money` agent
-    personality trades from, with the intraday confirmation reported alongside."""
-    state = _get_state()
-
-    states = [s for s in state.iter_symbol_states() if s.symbol in symbols] or list(
-        state.iter_symbol_states()
-    )
-    states = [s for s in states if s.daily_bars]
-    if not states:
-        st.info("Start the Live stream for your symbols first so there's daily structure to analyze.")
-        return
-
-    for sym_state in states:
-        sym = sym_state.symbol
-        with sym_state.lock:
-            intraday = list(sym_state.bars)
-            spot = sym_state.last_price
-        daily = sym_state.daily_bars
-
-        st.subheader(sym)
-        setup = analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
-        blocks = analyze_order_blocks(daily, spot=spot).get("order_blocks", [])
-        pd_read = analyze_premium_discount(daily, spot=spot)
-        liquidity = analyze_liquidity(intraday, spot=spot) if intraday else {}
-
-        # The chart renders daily candles, so only the daily order blocks (whose indices
-        # map to that x-axis) are drawn as zones. Intraday FVGs drive the agent's
-        # confirmation read but have no position on a daily chart, so they're left off.
-        # Premium/discount (daily) and the nearest liquidity pools overlay as levels.
-        chart_analysis = {
-            **setup,
-            "order_blocks": blocks,
-            "fair_value_gaps": [],
-            "premium_discount": pd_read,
-            "liquidity": liquidity,
-        }
-        st.plotly_chart(
-            build_smart_money_chart(daily, chart_analysis, sym),
-            width="stretch",
-            key=f"smart_money_chart_{sym}",
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Signal", setup.get("signal", "n/a").replace("_", " "), setup.get("quality", ""))
-        rr = setup.get("reward_risk_to_target")
-        c2.metric("Reward : Risk", f"{rr:.1f}:1" if rr is not None else "n/a")
-        c3.metric("Range zone", (setup.get("premium_discount_zone") or "n/a").title())
-        confs = setup.get("intraday_confirmation") or []
-        c4.metric("Intraday confirmation", ", ".join(confs) if confs else "none")
-
-        st.caption(setup.get("summary", ""))
-
-        sweep = setup.get("recent_sweep")
-        if sweep is not None:
-            st.markdown(
-                f"- **Liquidity sweep:** {sweep['type']} stop-run of {sweep['level']:.2f} "
-                f"({sweep['bars_ago']} bars ago)"
-            )
-
-        ob = setup.get("order_block")
-        if ob is not None:
-            e, s, t = setup.get("suggested_entry"), setup.get("suggested_stop"), setup.get("structural_target")
-            st.markdown(
-                f"- **Demand order block:** {ob['bottom']:.2f}–{ob['top']:.2f} "
-                f"({'unmitigated' if not ob['mitigated'] else 'mitigated'}, {ob['bars_ago']} bars ago)"
-            )
-            if e is not None and s is not None and t is not None:
-                st.markdown(f"- **Geometry:** entry {e:.2f} · stop {s:.2f} · target {t:.2f}")
-        if "note" in setup and setup.get("order_block") is None:
-            st.caption(setup["note"])
-
-        with st.expander(f"🏦 Institutional footprint — {sym} (insiders · 13F)", expanded=False):
-            try:
-                flow = fetch_smart_money_flow(sym)
-            except Exception:
-                flow = None
-            if not flow:
-                st.caption("Institutional ownership data unavailable.")
-            else:
-                st.caption(flow.get("summary", ""))
-                f1, f2, f3 = st.columns(3)
-                inst_pct = flow.get("institutions_pct_held")
-                ins_pct = flow.get("insiders_pct_held")
-                f1.metric("Institutions", f"{inst_pct * 100:.1f}%" if inst_pct is not None else "n/a")
-                f2.metric("Insiders", f"{ins_pct * 100:.1f}%" if ins_pct is not None else "n/a")
-                insider = flow.get("insider_flow")
-                f3.metric(
-                    "Insider 6mo",
-                    insider["direction"].title() if insider else "n/a",
-                    f"{insider['net_shares_6mo']:+,}" if insider else None,
-                )
-                for h in (flow.get("top_institutional_holders") or [])[:5]:
-                    chg = h.get("pct_change")
-                    chg_str = f" ({chg * 100:+.1f}% q/q)" if chg is not None else ""
-                    held = f"{h['pct_held'] * 100:.2f}%" if h.get("pct_held") is not None else "n/a"
-                    st.markdown(f"- **{h['holder']}** — {held}{chg_str}")
         st.divider()
 
 
@@ -2524,40 +2290,6 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
             )
         )
 
-    historical_period_label = st.session_state.get("hist_period")
-    historical_figs: list[tuple[str, object]] = []
-    if historical_period_label:
-        days = HISTORICAL_PERIODS[historical_period_label]
-        target_syms = st.session_state.get("hist_target_syms") or []
-        try:
-            spy_close = _cached_close_series(SPY_SYMBOL, days)
-            vix_close = _cached_close_series(VIX_SYMBOL, days)
-        except Exception:
-            spy_close, vix_close = None, None
-        for sym in syms:
-            try:
-                ticker_close = _cached_close_series(sym, days)
-                dividends = _cached_dividends(sym, days)
-                earnings = _cached_earnings_dates(sym, days)
-                price_targets = fetch_price_target_history(sym, days) if sym in target_syms else None
-                historical_figs.append(
-                    (
-                        sym,
-                        build_historical_chart(
-                            ticker_close,
-                            spy_close if sym != SPY_SYMBOL else None,
-                            vix_close,
-                            sym,
-                            historical_period_label,
-                            dividends,
-                            earnings,
-                            price_targets=price_targets,
-                        ),
-                    )
-                )
-            except Exception:
-                continue
-
     performance_fig = None
     performance_stats = None
     agent_start = state.agent_start_time or SESSION_START
@@ -2583,8 +2315,6 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
         llm_personality=_personality_label(state.llm_personality),
         agent_running=state.agent_running,
         live_figs=live_figs,
-        historical_figs=historical_figs,
-        historical_period_label=historical_period_label,
         performance_fig=performance_fig,
         performance_stats=performance_stats,
         decisions=decisions,
@@ -3895,10 +3625,9 @@ def build_ui() -> None:
     symbols = _effective_symbols(state, symbols_input)
 
     (
-        tab_agent, tab_live, tab_news, tab_premarket, tab_historical, tab_analysis,
-        tab_smart_money, tab_walls, tab_models,
+        tab_agent, tab_live, tab_news, tab_premarket, tab_analysis, tab_walls, tab_models,
     ) = st.tabs(
-        ["🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🗂️ Historical", "🔬 Technical Analysis", "🏦 Smart Money", "🧱 Put/Call Walls", "🧠 ML Models"]
+        ["🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🔬 Technical Analysis", "🧱 Put/Call Walls", "🧠 ML Models"]
     )
 
     with tab_live:
@@ -3984,14 +3713,8 @@ def build_ui() -> None:
     with tab_premarket:
         _premarket_panel(symbols)
 
-    with tab_historical:
-        _historical_panel(symbols)
-
     with tab_analysis:
         _technical_analysis_panel(symbols)
-
-    with tab_smart_money:
-        _smart_money_panel(symbols)
 
     with tab_walls:
         _options_walls_panel(symbols)

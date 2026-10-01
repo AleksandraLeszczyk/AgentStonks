@@ -57,8 +57,6 @@ def _base_kwargs(**overrides) -> dict:
         llm_personality="Swing / Position Trader",
         agent_running=True,
         live_figs=[],
-        historical_figs=[],
-        historical_period_label=None,
         performance_fig=None,
         performance_stats=None,
         decisions=[],
@@ -106,10 +104,6 @@ class TestBuildReportHtml:
         result = build_report_html(**_base_kwargs(performance_stats=stats))
         assert "$105,000.00" in result
         assert "+5.00%" in result
-
-    def test_historical_period_label_in_heading(self):
-        result = build_report_html(**_base_kwargs(historical_period_label="1 Year"))
-        assert "Historical — 1 Year" in result
 
     def test_briefing_and_news_cards_are_included(self):
         result = build_report_html(

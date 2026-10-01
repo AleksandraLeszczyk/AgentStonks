@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import pytest
 
 from agent_stonks import charts
-from agent_stonks.charts import build_chart, build_historical_chart, build_performance_chart, empty_chart
+from agent_stonks.charts import build_chart, build_performance_chart, empty_chart
 
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
@@ -212,78 +212,6 @@ class TestBuildPerformanceChart:
         names = [t.name for t in fig.data]
         assert "Agent buy" in names
         assert "Agent sell" in names
-
-
-def _close_series(values: list[float], start: str = "2024-01-01") -> pd.Series:
-    idx = pd.date_range(start, periods=len(values), freq="D")
-    return pd.Series(values, index=idx)
-
-
-class TestBuildHistoricalChart:
-    def test_empty_ticker_returns_placeholder(self):
-        fig = build_historical_chart(pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year")
-        texts = [a["text"] for a in fig.layout.annotations]
-        assert any("No historical data" in t for t in texts)
-
-    def test_returns_figure_with_data(self):
-        ticker = _close_series([100, 102, 105])
-        spy = _close_series([400, 404, 410])
-        vix = _close_series([15, 16, 14])
-        fig = build_historical_chart(ticker, spy, vix, "AAPL", "1 Year")
-        assert isinstance(fig, go.Figure)
-        names = [t.name for t in fig.data]
-        assert "AAPL" in names
-        assert "SPY" in names
-        assert "VIX" in names
-
-    def test_ticker_normalized_to_percentage(self):
-        ticker = _close_series([100, 110, 90])
-        fig = build_historical_chart(ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year")
-        ticker_trace = next(t for t in fig.data if t.name == "AAPL")
-        assert list(ticker_trace.y) == pytest.approx([0.0, 10.0, -10.0])
-
-    def test_price_targets_add_per_firm_step_lines(self):
-        ticker = _close_series([100, 102, 105])
-        targets = pd.DataFrame(
-            {
-                "firm": ["Morgan Stanley", "Morgan Stanley", "Wedbush"],
-                "date": pd.to_datetime(["2023-12-30", "2024-01-02", "2024-01-01"]),
-                "target": [110.0, 120.0, 130.0],
-            }
-        )
-        fig = build_historical_chart(
-            ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year",
-            price_targets=targets,
-        )
-        names = [t.name for t in fig.data]
-        assert "🎯 Morgan Stanley" in names
-        assert "🎯 Wedbush" in names
-
-        ms = next(t for t in fig.data if t.name == "🎯 Morgan Stanley")
-        assert ms.line.shape == "hv"
-        # Targets are on the % change scale relative to the first close (100),
-        # the carry-in date is clipped to the plotted range, and the last
-        # target is extended to the final close date.
-        assert list(ms.y) == pytest.approx([10.0, 20.0, 20.0])
-        assert pd.Timestamp(ms.x[0]) == ticker.index[0]
-        assert pd.Timestamp(ms.x[-1]) == ticker.index[-1]
-
-    def test_no_price_targets_adds_no_target_traces(self):
-        ticker = _close_series([100, 102, 105])
-        fig = build_historical_chart(
-            ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year",
-        )
-        assert not any(t.name.startswith("🎯") for t in fig.data if t.name)
-
-    def test_earnings_and_dividends_add_vlines(self):
-        ticker = _close_series([100, 102, 105])
-        earnings = pd.DataFrame({"EPS Estimate": [1.5]}, index=pd.DatetimeIndex(["2024-01-02"]))
-        dividends = pd.Series([0.5], index=pd.DatetimeIndex(["2024-01-03"]))
-        fig = build_historical_chart(
-            ticker, pd.Series(dtype=float), pd.Series(dtype=float), "AAPL", "1 Year",
-            dividends=dividends, earnings=earnings,
-        )
-        assert len(fig.layout.shapes) == 2
 
 
 class TestFillIntradayGaps:

@@ -75,11 +75,10 @@ KEYS = frozenset({
     "candle_pattern_keys",
     "fvg_min_size",
     "fvg_hide_filled",
-    # News, Pre-Market and Historical tabs
+    # News and Pre-Market tabs
     "news_impact_method_select",
     "news_llm_provider_select",
     "premarket_provider",
-    "hist_period",
     # Agent tab
     "agent_llm_personality",
     "agent_llm_provider",
