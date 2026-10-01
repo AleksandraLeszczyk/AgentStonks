@@ -136,7 +136,7 @@ def _closes_before(symbol: str, feed: str, day: str) -> pd.Series:
     """Stored daily closes of the sessions before `day`, indexed by ET date.
 
     Daily bars are stamped at midnight ET in UTC, so the session is the bar's
-    ET date (see `app._tuning_session_moves`).
+    ET date (see `app._tuning_session_bars`).
     """
     rows = {}
     for bar in sim_data.load_daily_bars(symbol, feed):

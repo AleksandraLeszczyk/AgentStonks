@@ -3764,6 +3764,11 @@ def _tuning_summary_rows(job: dict) -> list[dict]:
             f"{pick['days_up']} up · {pick['days_traded']} traded / {pick['days']}"
             if scored else "—"
         )
+        out["pick_win_rate"] = sim_tuning.win_rate(pick) if scored else None
+        out["pick_round_trips"] = (
+            f"{pick['wins']} of {pick['round_trips']}"
+            if scored and pick.get("round_trips") is not None else "—"
+        )
         out["pick_worst"] = pick["worst_day"] if scored else None
         return out
 
@@ -3826,6 +3831,13 @@ def _tuning_verdict(job: dict) -> "str | None":
     return f"{head} {detail}."
 
 
+_TUNING_WIN_RATE_HELP = (
+    "Share of round trips that made money, fees included. A round trip runs from the "
+    "buy that opens a flat book to the sell that flattens it, however many rungs and "
+    "partial takes it had. Blank for a cell replayed before round trips were counted."
+)
+
+
 def _tuning_cell_rows(job: dict) -> list[dict]:
     """Every summed combination, best total first, with each dataset's share."""
     names = sim_tuning.dataset_names(job["spec"])
@@ -3843,6 +3855,7 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
         }
         row.update(
             profit=cell["profit"], return_pct=cell["return_pct"], trades=cell["trades"],
+            win_rate=sim_tuning.win_rate(cell),
             days_up=cell["days_up"], days_traded=cell["days_traded"],
             worst_day=cell["worst_day"],
         )
@@ -3858,20 +3871,20 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
     return rows
 
 
-def _tuning_session_moves(symbol: str, feed: str, days: list[str]) -> dict[str, dict]:
-    """Each session's close − open and high − low, from the stored daily bars.
+def _tuning_session_bars(symbol: str, feed: str, days: list[str]) -> dict[str, dict]:
+    """Each session's stored daily bar (o, h, l, c), keyed by ET date.
 
     Daily bars are stamped at midnight exchange time in UTC (04:00Z or 05:00Z),
     so the session a bar belongs to is its date in ET, not in UTC. A day with no
-    stored daily bar is left out rather than drawn as zero.
+    stored daily bar is left out rather than drawn as an empty candle.
     """
     wanted = set(days)
-    moves = {}
+    bars = {}
     for bar in sim_data.load_daily_bars(symbol, feed):
         day = pd.Timestamp(bar["t"]).tz_convert(MARKET_TZ).date().isoformat()
         if day in wanted:
-            moves[day] = {"close_open": bar["c"] - bar["o"], "high_low": bar["h"] - bar["l"]}
-    return moves
+            bars[day] = {k: bar[k] for k in ("o", "h", "l", "c")}
+    return bars
 
 
 _BIAS_MARK = {
@@ -3968,7 +3981,7 @@ def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
         row_heights=[0.6, 0.4],
     )
-    moves: dict[str, dict] = {}
+    bars: dict[str, dict] = {}
     for index, dataset in enumerate(spec["datasets"]):
         cell = sim_tuning.pick_cell(job, dataset["name"])
         if not sim_tuning.is_scored(cell):
@@ -3979,32 +3992,33 @@ def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
             name=f"Pick on {dataset['name']}", marker_color=_tuning_color(index),
             hovertext=[_tuning_day_hover(d, context) for d in days],
         ), row=1, col=1)
-        moves.update(_tuning_session_moves(symbol, dataset["feed"], days))
-    if moves:
-        days = sorted(moves)
-        fig.add_trace(go.Bar(
-            x=days, y=[moves[d]["high_low"] for d in days],
-            name=f"{symbol} high − low", marker_color=PALETTE["muted"],
+        bars.update(_tuning_session_bars(symbol, dataset["feed"], days))
+    if bars:
+        days = sorted(bars)
+        fig.add_trace(go.Candlestick(
+            x=days,
+            open=[bars[d]["o"] for d in days],
+            high=[bars[d]["h"] for d in days],
+            low=[bars[d]["l"] for d in days],
+            close=[bars[d]["c"] for d in days],
+            name=f"{symbol} daily",
+            increasing_line_color=PALETTE["up"],
+            decreasing_line_color=PALETTE["down"],
         ), row=2, col=1)
-        fig.add_trace(go.Bar(
-            x=days, y=[moves[d]["close_open"] for d in days],
-            name=f"{symbol} close − open",
-            marker_color=[
-                PALETTE["up"] if moves[d]["close_open"] >= 0 else PALETTE["down"]
-                for d in days
-            ],
-        ), row=2, col=1)
-    fig.update_xaxes(type="category", categoryorder="category ascending", gridcolor=PALETTE["grid"])
+    fig.update_xaxes(
+        type="category", categoryorder="category ascending", gridcolor=PALETTE["grid"],
+        rangeslider_visible=False,
+    )
     # Each session's label carries what the morning looked like: the pre-market
     # briefing's call and the VIX's opening print. Set on the bottom axis only,
     # the one a shared x shows.
-    all_days = sorted({d for ds in _tuning_pick_days(job).values() for d in ds} | set(moves))
+    all_days = sorted({d for ds in _tuning_pick_days(job).values() for d in ds} | set(bars))
     fig.update_xaxes(
         tickvals=all_days, ticktext=[_tuning_day_label(d, context) for d in all_days],
         row=2, col=1,
     )
     fig.update_yaxes(title="Profit ($)", row=1, col=1)
-    fig.update_yaxes(title=f"{symbol} ($/share)", row=2, col=1)
+    fig.update_yaxes(title=f"{symbol} ($)", row=2, col=1)
     fig.update_yaxes(gridcolor=PALETTE["grid"])
     fig.update_layout(title="The pick, session by session", barmode="group")
     _chart_layout(fig, height=520)
@@ -4314,6 +4328,10 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         "pick_profit": money("Pick profit ($)", format="%+.2f"),
         "pick_return": money("Pick return", format="%+.2f%%"),
         "pick_days": "Pick days",
+        "pick_win_rate": money("Pick win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP),
+        "pick_round_trips": st.column_config.TextColumn(
+            "Pick wins", help="Winning round trips of all the pick's round trips.",
+        ),
         "pick_worst": money("Pick worst day ($)", format="%+.2f"),
     })
 
@@ -4352,6 +4370,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
                 "profit": money("Total profit ($)", format="%+.2f"),
                 "return_pct": money("Total return", format="%+.2f%%"),
                 "trades": "Trades",
+                "win_rate": money("Win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP),
                 "days_up": "Days up",
                 "days_traded": "Days traded",
                 "worst_day": money("Worst day ($)", format="%+.2f"),

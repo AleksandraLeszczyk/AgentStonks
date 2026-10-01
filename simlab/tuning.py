@@ -550,6 +550,7 @@ def score(result, days: "list[date]") -> dict:
     }
     profits = list(daily.values())
     profit = float(result.final_value) - float(result.starting_cash)
+    round_trips, wins = _round_trips(fills, float(result.starting_cash))
     return {
         "profit": round(profit, 2),
         "return_pct": round(100.0 * profit / result.starting_cash, 4)
@@ -560,12 +561,56 @@ def score(result, days: "list[date]") -> dict:
         "days_traded": len(buys_by_day),
         "days_up": sum(1 for p in profits if p > _FLAT_DAY_USD),
         "days_down": sum(1 for p in profits if p < -_FLAT_DAY_USD),
+        "round_trips": round_trips,
+        "wins": wins,
         "worst_day": min(profits) if profits else 0.0,
         "best_day": max(profits) if profits else 0.0,
         "daily": daily,
         "no_forecast_days": sorted(no_forecast),
         "error": result.error,
     }
+
+
+def _round_trips(
+    fills: "list[dict]", starting_cash: float
+) -> "tuple[int | None, int | None]":
+    """(round trips, winning ones) over a replay's fills, in the order made.
+
+    A round trip runs from the buy that opens a flat book to the fill that
+    flattens it again, however many rungs were added or partial takes sold in
+    between; it won if the cash it ended on beats the cash it started from,
+    fees included. A position still open at the end of the replay is not a
+    round trip -- the trader flattens before every close, so that is a replay
+    cut short rather than a trade. Apple Trader holds one ticker, so the book
+    is flat when that ticker's position is. (None, None) when a fill does not
+    say what it left behind.
+    """
+    if any("cash_after" not in f or "position_after" not in f for f in fills):
+        return None, None
+    trips = wins = 0
+    cash = starting_cash
+    opened_with = None
+    for fill in fills:
+        if opened_with is None and fill.get("action") == "buy":
+            opened_with = cash
+        cash = float(fill["cash_after"])
+        if opened_with is not None and float(fill.get("position_after") or 0.0) <= 0.0:
+            trips += 1
+            if cash - opened_with > _FLAT_DAY_USD:
+                wins += 1
+            opened_with = None
+    return trips, wins
+
+
+def win_rate(cell: "dict | None") -> "float | None":
+    """Winning round trips as a percentage, or None with none to count.
+
+    None too for a cell scored before round trips were counted: its replay
+    kept no fills, so there is nothing to count them from.
+    """
+    if not cell or not cell.get("round_trips"):
+        return None
+    return round(100.0 * cell["wins"] / cell["round_trips"], 1)
 
 
 def is_scored(cell: "dict | None") -> bool:
@@ -1202,6 +1247,9 @@ def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
     if errored is not None:
         return {"overrides": dict(overrides), "error": errored["error"]}
     total = lambda field: sum(p.get(field) or 0 for p in parts)  # noqa: E731
+    # A dataset scored before round trips were counted leaves the sum without
+    # them, rather than a rate over the other datasets' trades only.
+    counted = all(p.get("round_trips") is not None for p in parts)
     return {
         "overrides": dict(overrides),
         "profit": round(total("profit"), 2),
@@ -1212,6 +1260,8 @@ def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
         "days_traded": total("days_traded"),
         "days_up": total("days_up"),
         "days_down": total("days_down"),
+        "round_trips": total("round_trips") if counted else None,
+        "wins": total("wins") if counted else None,
         "worst_day": min(p["worst_day"] for p in parts),
         "best_day": max(p["best_day"] for p in parts),
         "datasets": len(parts),

@@ -147,7 +147,7 @@ class TestSessionChart:
     def test_each_session_label_carries_its_bias_and_vix(self, monkeypatch):
         from simlab import app as sim_app
 
-        monkeypatch.setattr(sim_app, "_tuning_session_moves", lambda sym, feed, days: {})
+        monkeypatch.setattr(sim_app, "_tuning_session_bars", lambda sym, feed, days: {})
         cell = {"overrides": {}, "profit": 10.0,
                 "daily": {"2026-09-14": 12.0, "2026-09-15": -2.0}}
         job = {
@@ -168,3 +168,31 @@ class TestSessionChart:
         assert "▼ bearish" in ticks["2026-09-14"] and "VIX 17.5" in ticks["2026-09-14"]
         assert "no bias" in ticks["2026-09-15"] and "VIX –" in ticks["2026-09-15"]
         assert "bearish (high confidence)" in fig.data[0].hovertext[0]
+
+    def test_bottom_panel_is_one_daily_candle_per_session(self, monkeypatch):
+        from simlab import app as sim_app
+
+        stored = [
+            {"t": "2026-09-14T04:00:00Z", "o": 230.0, "h": 234.0, "l": 229.0, "c": 233.0},
+            {"t": "2026-09-15T04:00:00Z", "o": 233.0, "h": 233.5, "l": 228.0, "c": 229.0},
+            {"t": "2026-09-16T04:00:00Z", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0},
+        ]
+        monkeypatch.setattr(sim_app.sim_data, "load_daily_bars", lambda sym, feed: stored)
+        cell = {"overrides": {}, "profit": 10.0,
+                "daily": {"2026-09-14": 12.0, "2026-09-15": -2.0}}
+        job = {
+            "spec": {"base": {"ticker": "AAPL"}, "datasets": [{"name": "wk", "feed": "sip"}]},
+            "cells": {"wk": [cell]},
+            "best": cell,
+        }
+        monkeypatch.setattr(sim_app.sim_tuning, "is_scored", lambda c: bool(c))
+        fig = sim_app._tuning_daily_chart(job)
+        candles = [t for t in fig.data if t.type == "candlestick"]
+        assert len(candles) == 1 and candles[0].xaxis == "x2"
+        assert list(candles[0].x) == ["2026-09-14", "2026-09-15"]
+        assert list(candles[0].open) == [230.0, 233.0]
+        assert list(candles[0].high) == [234.0, 233.5]
+        assert list(candles[0].low) == [229.0, 228.0]
+        assert list(candles[0].close) == [233.0, 229.0]
+        assert not [t for t in fig.data if t.type == "bar" and t.xaxis == "x2"]
+        assert fig.layout.xaxis2.rangeslider.visible is False

@@ -457,6 +457,22 @@ class TestSum:
         assert (total["datasets"], total["datasets_up"], total["reused"]) == (2, 1, 1)
         assert tu.is_scored(total)
 
+    def test_round_trips_and_wins_add_into_one_win_rate(self):
+        total = tu.combine({"buy_k": 0.3}, [
+            {**scored({"buy_k": 0.3}, 300.0), "round_trips": 3, "wins": 2},
+            {**scored({"buy_k": 0.3}, -100.0), "round_trips": 1, "wins": 0},
+        ])
+        assert (total["round_trips"], total["wins"]) == (4, 2)
+        assert tu.win_rate(total) == 50.0
+
+    def test_a_dataset_scored_before_round_trips_leaves_the_sum_without_a_rate(self):
+        """Not a rate over the other datasets' trades only."""
+        total = tu.combine({"buy_k": 0.3}, [
+            {**scored({"buy_k": 0.3}, 300.0), "round_trips": 3, "wins": 2},
+            scored({"buy_k": 0.3}, -100.0),
+        ])
+        assert total["round_trips"] is None and tu.win_rate(total) is None
+
     def test_a_dataset_not_yet_swept_leaves_a_hole(self):
         """A partial total would read as a bad cell rather than an unfinished one."""
         assert tu.combine({"buy_k": 0.3}, [scored({"buy_k": 0.3}, 300.0), None]) is None
@@ -536,6 +552,52 @@ class TestScore:
         scored = tu.score(self.result(), [TUNE_DAY, TEST_DAY])
         assert scored["profit"] == 150.0 and scored["return_pct"] == pytest.approx(1.5)
         assert scored["no_forecast_days"] == ["2026-06-16"]
+
+    def test_fills_without_cash_or_position_leave_round_trips_uncounted(self):
+        scored = tu.score(self.result(), [TUNE_DAY, TEST_DAY])
+        assert scored["round_trips"] is None and tu.win_rate(scored) is None
+
+
+class TestRoundTrips:
+    """A round trip is flat to flat, fees included, however many fills it took."""
+
+    @staticmethod
+    def fill(action, cash_after, position_after):
+        return {"action": action, "status": "filled",
+                "cash_after": cash_after, "position_after": position_after}
+
+    def test_a_laddered_entry_and_a_partial_take_are_one_round_trip(self):
+        fills = [
+            self.fill("buy", 5_000.0, 50),     # opens from 10,000
+            self.fill("buy", 3_000.0, 70),     # a rung lower
+            self.fill("sell", 6_100.0, 40),    # partial take
+            self.fill("sell", 10_050.0, 0),    # flat: +50
+        ]
+        assert tu._round_trips(fills, 10_000.0) == (1, 1)
+
+    def test_each_trip_is_measured_from_the_cash_it_opened_with(self):
+        fills = [
+            self.fill("buy", 5_000.0, 50),
+            self.fill("sell", 9_900.0, 0),     # −100
+            self.fill("buy", 4_900.0, 50),
+            self.fill("sell", 9_920.0, 0),     # +20 on the 9,900 it opened with
+            self.fill("buy", 4_920.0, 50),
+            self.fill("sell", 9_919.0, 0),     # −1, fees ate it
+        ]
+        assert tu._round_trips(fills, 10_000.0) == (3, 1)
+
+    def test_a_position_still_open_at_the_end_is_not_a_round_trip(self):
+        fills = [
+            self.fill("buy", 5_000.0, 50),
+            self.fill("sell", 10_100.0, 0),
+            self.fill("buy", 5_100.0, 50),
+        ]
+        assert tu._round_trips(fills, 10_000.0) == (1, 1)
+
+    def test_no_round_trips_is_no_win_rate_not_zero(self):
+        assert tu._round_trips([], 10_000.0) == (0, 0)
+        assert tu.win_rate({"round_trips": 0, "wins": 0}) is None
+        assert tu.win_rate({"round_trips": 3, "wins": 2}) == pytest.approx(66.7)
 
 
 # --- the job store ----------------------------------------------------------
