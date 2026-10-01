@@ -233,6 +233,14 @@ def dayrange_params(
         disabled=float(position_pct) >= 100,
         help=copy.help.get("scale_in"),
     )
+    buy_step_k = st.number_input(
+        f"Next buy step (× {unit_label} lower per buy, 0 = half-way to the bottom)",
+        min_value=0.0, max_value=1.0, value=float(defaults.buy_step_k), step=0.05,
+        format="%.2f",
+        key=copy.key("dayrange_buy_step_k"),
+        disabled=not scale_in or float(position_pct) >= 100,
+        help=copy.help.get("buy_step_k"),
+    )
     # One look-back for both sides of the behaviour table: the buy at the buy
     # level, and the sells at and short of the sell level (the Exits below).
     momentum_confirmation_bars = col_b.number_input(
@@ -266,6 +274,7 @@ def dayrange_params(
         sell_k=float(sell_k),
         position_pct=float(position_pct),
         scale_in=bool(scale_in),
+        buy_step_k=float(buy_step_k),
         momentum_confirmation_bars=int(momentum_confirmation_bars),
         level_unit=level_unit,
         breach_update=breach_update,

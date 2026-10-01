@@ -52,6 +52,7 @@ from .config import (
     APPLE_TRADER_BREACH_EXIT,
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_CYCLE_SEC,
+    APPLE_TRADER_BUY_STEP_K,
     APPLE_TRADER_DAYRANGE_LEVELS,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_HOLD_MIN_GAIN_K,
@@ -259,9 +260,14 @@ class AppleTraderConfig:
     min_win_k: Optional[float] = None
     # Whether an open position is added to at a lower level when the cash left
     # after the first buy can pay for more -- see `DayRangeTrader._add` and
-    # `can_scale_in`. The next add rests half-way between the last buy and the
-    # bottom of the range, `reference - 1 x unit`.
+    # `can_scale_in`. Where the next add rests is `buy_step_k`.
     scale_in: bool = APPLE_TRADER_SCALE_IN
+    # How many level units further under the reference each buy moves the next
+    # one: after `n` fills the buy distance is `buy_k + n x buy_step_k`, back to
+    # `buy_k` once the position is sold out. 0 is the rule before 2026-10-01,
+    # each add half-way between the last buy and the bottom of the range
+    # (`reference - 1 x unit`), which a stored record replays. See `_rung_k`.
+    buy_step_k: float = APPLE_TRADER_BUY_STEP_K
     # Where the stop hangs while the ladder can still add. False (every new
     # config, since 2026-09-28): under the actual fill, like a position that
     # cannot be added to -- the price paid is what the forecast *and* the
@@ -302,7 +308,7 @@ class AppleTraderConfig:
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
-            "momentum_confirmation_bars", "take_min_gain_fraction",
+            "momentum_confirmation_bars", "take_min_gain_fraction", "buy_step_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -469,6 +475,15 @@ class AppleTraderConfig:
         cannot change a trade, so the signature leaves it out there too.
         """
         return bool(self.scale_in) and self.position_pct < 100
+
+    @property
+    def ladder_has_room(self) -> bool:
+        """Whether there is anywhere lower for an add to rest.
+
+        Always under a fixed step. Under the half-way rule only while `buy_k`
+        is above the bottom of the range, since every rung is half-way to it.
+        """
+        return bool(self.buy_step_k) or float(self.buy_k) < 1.0
 
     @property
     def fall_bars(self) -> int:
@@ -683,7 +698,14 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # Only where it can change a trade (`can_scale_in`), so a run at 100% signs
     # the same with the setting on or off -- and every record written before it
     # existed, which replays with it off, keeps the signature it was filed under.
-    adds = ",adds=half" if c.can_scale_in else ""
+    # The step is written as the step; the half-way rule it replaced keeps the
+    # token every record made before it was filed under.
+    if not c.can_scale_in:
+        adds = ""
+    elif c.buy_step_k:
+        adds = f",adds=+{c.buy_step_k:g}{unit}"
+    else:
+        adds = ",adds=half"
     # The stop under the fill rather than under the next rung. Only where the
     # two can differ -- a ladder and a stop -- and only in today's form, so a
     # record from before it keeps the `adds=half` it was filed under.
@@ -1131,9 +1153,10 @@ class DayRangeTrader(BaseTrader):
 
     Nor is the ladder (`scale_in`): under a position size below 100% the cash
     the first buy leaves can buy more on the way down, each add resting
-    half-way between the last buy and the bottom of the range (`_add`,
-    `_after_fill`). The stop stays under the last actual fill, so a rung is
-    only bought while it sits above that stop. Switched off it is the
+    `buy_step_k` units under the last buy's level and the whole ladder back at
+    `buy_k` once the position is sold out (`_add`, `_after_fill`, `_rung_k`).
+    The stop stays under the last actual fill, so a rung is only bought while
+    it sits above that stop. Switched off it is the
     notebook's one buy per position.
 
     Against the notebook
@@ -1937,17 +1960,26 @@ class DayRangeTrader(BaseTrader):
     def _rung_k(self, fills: int) -> float:
         """The distance of the buy that would follow `fills` buys, in units.
 
-        Each add rests half-way between the last buy and the bottom of the
+        Each buy moves the next `buy_step_k` units further down: 0.55, 0.65,
+        0.75 for AAPL's 0.55 at a 0.1 step. Counted from the position's fills,
+        which go with it, so selling it out is what puts the buy back at `buy_k`;
+        a partial sell keeps the count.
+
+        Under a step of 0, the rule a record from before 2026-10-01 replays,
+        each add rests half-way between the last buy and the bottom of the
         range, `reference - 1 x unit`: the predicted low under "pred_range",
         one ADR under the reference under "adr". So the gap left to the bottom
-        halves with every fill -- 0.40, 0.70, 0.85, 0.925 for AAPL's 0.40 --
-        and no add is ever placed under it.
+        halves with every fill -- 0.40, 0.70, 0.85, 0.925 for a 0.40 -- and no
+        add is ever placed under it.
 
         Counted from `buy_k` rather than stored per rung, so a sidebar edit to
         the buy distance moves the whole ladder with it, the same way it moves
         the first buy.
         """
         buy_k = float(self.config.buy_k)
+        step = float(self.config.buy_step_k)
+        if step:
+            return buy_k + step * fills
         return 1.0 - (1.0 - buy_k) / 2 ** fills
 
     def _above_last_fill(self, state: AppState, bar) -> bool:
@@ -1983,8 +2015,9 @@ class DayRangeTrader(BaseTrader):
 
         `can_add` is decided at each fill, from the cash that fill left
         (`_after_fill`). A runner is never added to -- the momentum take already
-        decided to take money off this position -- and a buy distance at or
-        under the bottom of the range leaves nowhere lower to go.
+        decided to take money off this position -- and under the half-way rule
+        a buy distance at or under the bottom of the range leaves nowhere lower
+        to go (`ladder_has_room`).
         """
         entry = self.entry or {}
         return bool(
@@ -1992,7 +2025,7 @@ class DayRangeTrader(BaseTrader):
             and entry.get("can_add")
             and entry.get("fills")
             and not entry.get("runner")
-            and float(self.config.buy_k) < 1.0
+            and self.config.ladder_has_room
         )
 
     def _momentum_read(self, frame) -> "dict | None":
@@ -2152,7 +2185,7 @@ class DayRangeTrader(BaseTrader):
         cash = float(tracker.snapshot()["cash"])
         shares = rule_agent.order_quantity(cash, rung, config.position_pct)
         affordable = bool(
-            config.can_scale_in and float(config.buy_k) < 1.0 and shares > 0
+            config.can_scale_in and config.ladder_has_room and shares > 0
         )
         if config.stop_under_next_buy:
             entry["can_add"] = affordable
@@ -2185,14 +2218,21 @@ class DayRangeTrader(BaseTrader):
                     f" The stop sits {stop_phrase(config)} (${risk:,.2f}) under the "
                     f"${fill:,.2f} fill, at ${entry['stop']:,.2f}, below the next buy."
                 )
+            if config.buy_step_k:
+                where = f"{config.buy_step_k:g} lower than the last buy's"
+            else:
+                where = (
+                    f"half-way to the "
+                    f"${float(plan['reference']) - level_unit(config, plan):,.2f} bottom "
+                    "of the range"
+                )
             text = (
                 f"{held} Next buy at ${plan['buy_level']:,.2f} ({rung_k:g} × "
-                f"{config.unit_phrase} under {self._ref_name}, half-way to the "
-                f"${float(plan['reference']) - level_unit(config, plan):,.2f} bottom of "
-                f"the range): ${cash:,.2f} cash pays for {shares:g} more share(s).{stop}"
+                f"{config.unit_phrase} under {self._ref_name}, {where}): ${cash:,.2f} "
+                f"cash pays for {shares:g} more share(s).{stop}"
             )
         else:
-            if float(config.buy_k) >= 1.0:
+            if not config.ladder_has_room:
                 why = "the buy distance leaves nowhere lower to go"
             elif not affordable:
                 why = f"${cash:,.2f} cash buys no share at the ${rung:,.2f} next rung"
@@ -2223,12 +2263,15 @@ class DayRangeTrader(BaseTrader):
         """
         before = dict(self.entry)
         rung_k = self._buy_k()
+        if self.config.buy_step_k:
+            where = f"{self.config.buy_step_k:g} lower than the last buy's"
+        else:
+            where = "half-way from the last buy to the bottom of the range"
         reasoning = (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
             f"${self.plan['buy_level']:,.2f} next buy level — {rung_k:g} × the "
-            f"{self.config.unit_phrase} below {self._ref_name}, half-way from the last "
-            f"buy to the bottom of the range. Adding to the {position:g} sh bought at an "
-            f"average ${float(before['price']):,.2f}."
+            f"{self.config.unit_phrase} below {self._ref_name}, {where}. Adding to the "
+            f"{position:g} sh bought at an average ${float(before['price']):,.2f}."
         )
         if not self.buy(
             state, tracker, float(bar["close"]), reasoning,

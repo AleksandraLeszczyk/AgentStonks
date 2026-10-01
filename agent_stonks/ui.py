@@ -2642,9 +2642,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Adds to an open position on the way down, while the cash left over can "
             "pay for at least one more share.\n\n"
             "- Each buy spends *Position size* of the cash that is left.\n"
-            "- After every buy the next one rests **half-way to the bottom of the "
-            "range** — the predicted low, or one ADR under H, depending on what the "
-            "distances are counted in. A buy at 0.40 becomes 0.70, then 0.85, 0.925…\n"
+            "- After every buy the next one rests **Next buy step** lower — 0.55, "
+            "0.65, 0.75… at a 0.1 step — and selling the whole position puts it back "
+            "at the buy distance.\n"
             "- The stop sits its usual distance under **the last actual fill**, so "
             "the next buy is placed only while it is above that stop.\n"
             "- An add fills only on a bar that closes **under the last fill**, so "
@@ -2652,6 +2652,17 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- The target, the momentum take and the breakeven measure from the "
             "average cost.\n"
             "- Needs a position size under 100%."
+        ),
+        "buy_step_k": (
+            "How much further below H each buy moves the next one, in the same units "
+            "as the distances.\n\n"
+            "- At 0.1 a buy distance of 0.55 becomes 0.65 after the first buy, 0.75 "
+            "after the second…\n"
+            "- Selling the whole position resets it to the buy distance; a partial "
+            "take does not.\n"
+            "- A step at or past the stop distance never adds: the stop is hit first.\n"
+            "- **0** — the old rule: each buy half-way to the bottom of the range "
+            "(the predicted low, or one ADR under H). 0.40 → 0.70 → 0.85…"
         ),
         "stop_gain_fraction": (
             "Sells everything when a bar's low reaches this share of the **predicted "

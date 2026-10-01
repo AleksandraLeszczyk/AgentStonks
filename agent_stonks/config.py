@@ -584,23 +584,32 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # Whether a day-range position may be added to on the way down
 # (`apple_trader.DayRangeTrader._add`). Only does anything under a position size
 # below 100%, since that is what leaves cash for a second buy. After every fill
-# the next buy rests half-way between the last one and the bottom of the range
-# (reference - 1 unit: the predicted low under "pred_range", H - ADR under
-# "adr"), so with AAPL's 0.40 the ladder is 0.40, 0.70, 0.85, 0.925... units
-# under the reference -- each add half as far below the last, never past the
-# bottom. The stop sits its usual distance under the last actual fill (since
+# the next buy rests APPLE_TRADER_BUY_STEP_K units further under the reference
+# (below). The stop sits its usual distance under the last actual fill (since
 # 2026-09-28; before that it sat under the next rung while an add was
 # affordable), so an add is placed only while its rung is above that stop -- a
 # bar that reaches a rung under the stop is stopped out first. At the default
 # stop (half the predicted gain) and a fill at the buy level the first rung is
 # above it on most model/ticker pairs, but not on Day Range x Intraday Volatility
-# for AAPL (stop 0.075, rung 0.30 units down) or INTC (0.225 vs 0.25), and a fill
-# under the level leaves less room. An add also has to close under the last
+# for AAPL (stop 0.075, rung 0.1 units down), and a fill under the level leaves
+# less room. An add also has to close under the last
 # fill (since 2026-09-28), so a first buy made under the next rung is not
 # added to at once at no better a price. Not swept.
 # A SimLab record written before the setting existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 APPLE_TRADER_SCALE_IN = True
+# How much further under the reference each buy moves the next one, in level
+# units (2026-10-01, the user's rule): after every fill the buy distance grows
+# by this much -- 0.55, 0.65, 0.75... for AAPL's day-range pair -- and selling
+# the whole position puts it back at the configured `buy_k`. A partial sell (a
+# take that keeps a runner) leaves it where it is, and a runner is never added
+# to anyway. Not capped at the bottom of the range; the stop under the last
+# fill and the cash are what end the ladder. 0 is the rule before it: each add
+# half-way between the last one and the bottom of the range (reference - 1
+# unit: the predicted low under "pred_range", H - ADR under "adr"), 0.40, 0.70,
+# 0.85, 0.925... for a 0.40 buy -- what every SimLab record made before it
+# replays as (`simlab.rule_agents._APPLE_LEGACY`). Not swept.
+APPLE_TRADER_BUY_STEP_K = 0.1
 # No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`), as it was
 # 2026-09-23 to -24 -- kept so the records made then replay. A new config
 # leaves it at 0: the momentum confirmation above decides entries now. An entry,

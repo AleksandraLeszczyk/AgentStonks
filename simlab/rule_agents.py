@@ -201,6 +201,10 @@ _APPLE_LEGACY = {
     # or above the last fill (before 2026-09-28). False is that rule, and it is
     # left out of the signature.
     "add_under_fill": False,
+    # And each add rested half-way between the last buy and the bottom of the
+    # range rather than a fixed step under it (before 2026-10-01). 0 is that
+    # rule, and such a record keeps the `adds=half` signature it was filed under.
+    "buy_step_k": 0.0,
     # And an entry was never refused for the speed of the fall that reached the
     # buy level. 0 is that rule, and it is left out of the signature.
     "max_fall_k": 0.0,

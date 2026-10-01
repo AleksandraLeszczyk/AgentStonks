@@ -197,7 +197,8 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     and `TestBreachExit` are where each of the three is switched on.
 
     `scale_in` is pinned off for the same reason: the notebook buys once and
-    waits. `TestScaleIn` is where the ladder is switched on. So is `max_fall_k`:
+    waits. `TestScaleIn` is where the ladder is switched on, on the half-way
+    rung `buy_step_k` is pinned to; `TestBuyStep` is where the step is set. So is `max_fall_k`:
     the notebook buys whatever the speed of the fall. `TestNoBuyIntoAFall` is
     where it is switched on.
 
@@ -230,6 +231,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("keep_width", False)
     kwargs.setdefault("breach_exit", False)
     kwargs.setdefault("scale_in", False)
+    kwargs.setdefault("buy_step_k", 0.0)
     kwargs.setdefault("max_fall_k", 0.0)
     return AppleTraderConfig(model_key="dayrange", **kwargs)
 
@@ -3199,20 +3201,10 @@ class TestReadsClosedBarsOnly:
             clock.clear()
 
 
-class TestScaleIn:
-    """Buying again lower while the cash left over allows it.
-
-    Notebook arithmetic (H $110, ADR $10, buy 0.75): the first buy rests at
-    $102.50 and the bottom of the range is $100.00, one ADR under H, so the
-    ladder is $102.50 → $101.25 → $100.625, each rung half-way down what is
-    left. The stop is half the $6.50 predicted gain, $3.25, under the last
-    actual fill -- so $99.25 under a fill at the buy level, and every rung here
-    is above it.
-    """
+class _Ladder:
+    """What both ladder classes drive a trader with: 50% of the cash a buy."""
 
     RISK = 0.5 * TARGET_GAIN  # 3.25
-    RUNG_2 = 101.25   # 110 - 0.875 x 10
-    RUNG_3 = 100.625  # 110 - 0.9375 x 10
 
     def _trader(self, **kwargs):
         kwargs.setdefault("scale_in", True)
@@ -3233,6 +3225,22 @@ class TestScaleIn:
         trader = self._trader(**kwargs)
         assert self._cycle(trader, state, tracker, tape, at_price) == "bought"
         return trader, tracker, tape
+
+
+class TestScaleIn(_Ladder):
+    """Buying again lower while the cash left over allows it, on the half-way
+    rung (`buy_step_k` 0, pinned by `dayrange_config`).
+
+    Notebook arithmetic (H $110, ADR $10, buy 0.75): the first buy rests at
+    $102.50 and the bottom of the range is $100.00, one ADR under H, so the
+    ladder is $102.50 → $101.25 → $100.625, each rung half-way down what is
+    left. The stop is half the $6.50 predicted gain, $3.25, under the last
+    actual fill -- so $99.25 under a fill at the buy level, and every rung here
+    is above it.
+    """
+
+    RUNG_2 = 101.25   # 110 - 0.875 x 10
+    RUNG_3 = 100.625  # 110 - 0.9375 x 10
 
     def test_after_a_buy_the_next_rests_half_way_to_the_bottom_of_the_range(
         self, state, market_open, monkeypatch
@@ -3403,11 +3411,16 @@ class TestScaleIn:
         assert f"buy ${row['buy']:,.2f}" in line and f"stop ${row['stop']:,.2f}" in line
 
     def test_signed_only_where_it_can_change_a_trade(self):
+        assert "adds=+0.1A,stop@fill" in config_signature(
+            AppleTraderConfig(model_key="dayrange", level_unit=UNIT_ADR)
+        )
         assert "adds=half,stop@fill" in config_signature(
-            AppleTraderConfig(model_key="dayrange")
+            AppleTraderConfig(model_key="dayrange", buy_step_k=0.0)
         )
         legacy = config_signature(
-            AppleTraderConfig(model_key="dayrange", stop_under_next_buy=True)
+            AppleTraderConfig(
+                model_key="dayrange", stop_under_next_buy=True, buy_step_k=0.0
+            )
         )
         assert "adds=half" in legacy and "stop@fill" not in legacy
         assert "stop@fill" not in config_signature(
@@ -3420,10 +3433,10 @@ class TestScaleIn:
         assert "add<fill" not in config_signature(
             AppleTraderConfig(model_key="dayrange", position_pct=100.0)
         )
-        assert "adds=half" not in config_signature(
+        assert "adds=" not in config_signature(
             AppleTraderConfig(model_key="dayrange", position_pct=100.0)
         )
-        assert "adds=half" not in config_signature(
+        assert "adds=" not in config_signature(
             AppleTraderConfig(model_key="dayrange", scale_in=False)
         )
 
@@ -3439,6 +3452,64 @@ class TestScaleIn:
         assert old.stop_under_next_buy is True
         assert "stop@fill" not in config_signature(old)
         assert old.add_under_fill is False and "add<fill" not in config_signature(old)
+
+
+class TestBuyStep(_Ladder):
+    """Each buy rests the next one `buy_step_k` units lower (2026-10-01).
+
+    Same arithmetic as `TestScaleIn` at a 0.1 step: the first buy at $102.50
+    (0.75), the next at $101.50 (0.85), then $100.50 (0.95) -- every rung above
+    the $99.25 stop under a fill at the level.
+    """
+
+    RUNG_2 = 101.50   # 110 - 0.85 x 10
+    RUNG_3 = 100.50   # 110 - 0.95 x 10
+
+    def _trader(self, **kwargs):
+        kwargs.setdefault("buy_step_k", 0.1)
+        return super()._trader(**kwargs)
+
+    def test_after_a_buy_the_next_rests_one_step_lower(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        assert trader.plan["buy_level"] == pytest.approx(self.RUNG_2)
+        line = self._analysis(state)[-1]
+        assert "Next buy at $101.50 (0.85 × ADR" in line and "0.1 lower" in line
+
+    def test_each_add_steps_another_notch_down(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        assert self._cycle(trader, state, tracker, tape, self.RUNG_2) == "bought"
+        assert trader.entry["fills"] == 2
+        assert trader.plan["buy_level"] == pytest.approx(self.RUNG_3)
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "0.85 × the ADR" in reasoning and "0.1 lower" in reasoning
+
+    def test_selling_everything_puts_the_buy_back_at_the_buy_distance(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._bought_once(state, monkeypatch)
+        self._cycle(trader, state, tracker, tape, self.RUNG_2)
+        assert self._cycle(trader, state, tracker, tape, 108.0, high=SELL_LEVEL) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        self._cycle(trader, state, tracker, tape, 107.0)
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+
+    def test_the_step_is_not_capped_at_the_bottom_of_the_range(
+        self, state, market_open, monkeypatch
+    ):
+        """Buy 0.95 at $100.50: the half-way rule would rest the next at
+        0.975, the step puts it at 1.05, $99.50 -- under the $100 bottom."""
+        trader, tracker, tape = self._bought_once(
+            state, monkeypatch, at_price=100.5, buy_k=0.95
+        )
+        assert trader.plan["buy_level"] == pytest.approx(99.5)
+
+    def test_a_record_from_before_the_step_replays_half_way(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({"position_pct": 50.0, "scale_in": True})
+        assert old.buy_step_k == 0.0 and "adds=half" in config_signature(old)
 
 
 class TestLimitEntry:

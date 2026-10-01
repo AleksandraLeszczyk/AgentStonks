@@ -1740,12 +1740,19 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
         "scale_in": (
             "Adds to an open position on the way down while the cash left can pay for "
-            "a share: each next buy rests half-way from the last one to the bottom of "
-            "the range (reference − 1 unit) — placed only while it is above the "
-            "stop, which sits under the last actual fill, and filled only under "
-            "the last fill.\n\n"
+            "a share: each next buy rests *Next buy step* units lower than the last "
+            "— placed only while it is above the stop, which sits under the last "
+            "actual fill, and filled only under the last fill. Selling the whole "
+            "position resets it to the buy distance.\n\n"
             "- Needs a position size under 100%.\n"
-            "- In the signature as `adds=half` while it can change a trade."
+            "- In the signature as `adds=+0.1A` (the step) while it can change a "
+            "trade; `adds=half` is the step of 0."
+        ),
+        "buy_step_k": (
+            "How many units lower each buy moves the next one; the whole ladder goes "
+            "back to the buy distance once the position is sold out.\n\n"
+            "- **0** — half-way to the bottom of the range (reference − 1 unit), the "
+            "rule every run before 2026-10-01 replays."
         ),
         "min_win_k": (
             "The session circuit breaker: after a trade closes for no more than this many "
