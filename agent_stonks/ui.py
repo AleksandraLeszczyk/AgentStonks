@@ -1337,18 +1337,19 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     st.markdown("**Model Predictions**")
     with _help_row(
         "Draws what the trained models predict for this session:\n"
-        "- **Price ranges** — horizontal lines, in the candles and in the "
-        "profile beside them.\n"
-        "- **Time-of-day ranges** — a shaded envelope, widest at the open and "
-        "narrowing through midday.\n"
-        "- **Apple Trader buy/sell levels** — not a forecast: the two orders the "
-        "agent configured below would rest, following whatever settings that "
-        "form is holding."
+        "- **TimeToChange3**, **HighLow**, **LevelsML** — price ranges: "
+        "horizontal lines, in the candles and in the profile beside them.\n"
+        "- **IntradayVolatility** (alone or × TimeToChange3) — time-of-day "
+        "ranges: a shaded envelope, widest at the open and narrowing through "
+        "midday.\n"
+        "- **Apple Trader** — buy/sell levels, not a forecast: the two orders "
+        "the agent configured below would rest, following whatever settings "
+        "that form is holding."
     ):
         selected = st.multiselect(
             "Model predictions",
             available,
-            format_func=model_overlays.label,
+            format_func=model_overlays.name,
             key="model_overlay_keys",
             placeholder="None",
             label_visibility="collapsed",
@@ -1356,7 +1357,7 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     for key in selected:
         overlay = model_overlays.get(key)
         if overlay:
-            st.caption(f"{overlay.label} — {overlay.summary}")
+            st.caption(f"{overlay.name} — {overlay.summary}")
     return selected
 
 
