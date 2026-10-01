@@ -120,7 +120,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
-from . import bar_history, minute_momentum, newsimpact_model, stream_common
+from . import bar_history, gamma_history, minute_momentum, newsimpact_model, stream_common
 from .trade_sound import next_trade_cue, play_trade_sound
 from .quote_card import quote_card
 from .trading_mode import (
@@ -591,19 +591,14 @@ def _live_net_gamma(sym_state: SymbolState, spot: float | None = None) -> float 
     return float(sum(data["calls_gamma_exposure"]) + sum(data["puts_gamma_exposure"]))
 
 
-def _live_gamma_series(sym_state: SymbolState, bars: list[dict]) -> dict:
-    """The chart's net gamma panel: the latest chain re-priced at each bar's
-    close (`options.net_gamma_exposure`), or a note saying why there is none."""
+def _live_gamma_series(sym_state: SymbolState, bars: list[dict], timeframe: str) -> dict:
+    """The chart's net gamma panel: each bar's value taken once, at its close,
+    with the chain the app had then (`gamma_history`), the forming bar's at its
+    current close -- or a note saying why there is none."""
     _refresh_option_chain(sym_state)
     with sym_state.lock:
         data = sym_state.options_chain
-    if not data or not data.get("strikes"):
-        return {"t": [], "value": [], "note": "Waiting for the options chain (yfinance)"}
-    values = net_gamma_exposure(data, [float(b["c"]) for b in bars])
-    if values is None:
-        return {"t": [], "value": [],
-                "note": "Waiting for the next options chain refresh (within a minute)"}
-    return {"t": [b["t"] for b in bars], "value": values.tolist(), "note": ""}
+    return gamma_history.series(sym_state.symbol, timeframe, bars, data)
 
 
 def _quote_html(
@@ -885,7 +880,10 @@ def _chart_panel() -> None:
         )
         option_walls = _live_option_walls(sym_state, state.option_walls)
         day_range_lines = _day_range_lines(sym, sym_state.daily_bars, bars)
-        net_gamma = _live_gamma_series(sym_state, bars) if state.show_net_gamma else None
+        net_gamma = (
+            _live_gamma_series(sym_state, bars, state.timeframe)
+            if state.show_net_gamma else None
+        )
 
         fig = build_chart(
             bars,
@@ -1106,9 +1104,13 @@ def _live_chart_controls() -> None:
                 "and their hedging amplifies them.\n\n"
                 "From the nearest expiry within 45 days (yfinance, refreshed every "
                 "minute — the same chain as the Put/Call Walls tab and the Net "
-                "Gamma card). Open interest only changes overnight, so the latest "
-                "chain is re-priced at every bar's close to fill the whole "
-                "session; implied volatility is held at the latest fetch's.",
+                "Gamma card). Each bar is priced once, at its close, with the "
+                "chain the app had then, and keeps that value — across a reload "
+                "or a restart too. Only the bar still forming moves. Bars that "
+                "closed before the first chain arrived (a start mid-day) are "
+                "priced with that first chain: open interest only changes "
+                "overnight, so it is re-priced at their closes, holding its "
+                "implied volatility.",
             )
 
         st.markdown("**Price Profile Fit**")

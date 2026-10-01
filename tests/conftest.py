@@ -57,3 +57,13 @@ def _session_files_in_tmp(monkeypatch, tmp_path):
 
     monkeypatch.setattr(session_store, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(session_store, "_owners", {})
+
+
+@pytest.fixture(autouse=True)
+def _net_gamma_in_tmp(monkeypatch, tmp_path):
+    """Keep the live chart's kept net gamma values out of the real
+    data/net_gamma/, and start every test with none kept in memory."""
+    from agent_stonks import gamma_history
+
+    monkeypatch.setattr(gamma_history, "CACHE_DIR", tmp_path / "net_gamma")
+    monkeypatch.setattr(gamma_history, "_kept", {})
