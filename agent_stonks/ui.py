@@ -17,6 +17,7 @@ import streamlit as st
 from . import (
     apple_models,
     candle_patterns,
+    last_setup,
     market_hours,
     model_overlays,
     session_store,
@@ -993,19 +994,21 @@ def _live_chart_controls() -> None:
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Candle**")
-            show_candle_body = st.checkbox("Open-Close", value=True)
-            show_percentile_body = st.checkbox("20%-80%", value=False)
-            show_whiskers = st.checkbox("Whiskers", value=True)
+            show_candle_body = st.checkbox("Open-Close", value=True, key="chart_candle_body")
+            show_percentile_body = st.checkbox("20%-80%", value=False, key="chart_percentile_body")
+            show_whiskers = st.checkbox("Whiskers", value=True, key="chart_whiskers")
             fill_gaps = st.checkbox(
                 "Fill no-trade gaps",
                 value=True,
+                key="chart_fill_gaps",
                 help="Draw flat zero-volume placeholder bars for feed minutes "
                 "without any trade (common on IEX for thin symbols).",
             )
-            show_vwap = st.checkbox("VWAP", value=False)
+            show_vwap = st.checkbox("VWAP", value=False, key="chart_vwap")
             show_pre_market = st.checkbox(
                 "Pre-market",
                 value=False,
+                key="chart_pre_market",
                 help=f"Show the whole day from its first bar. Off, the chart starts "
                 f"{CHART_LEAD_MIN} minutes before the 09:30 ET open, and every "
                 "panel under it — momentum, net gamma — starts there too.",
@@ -1021,6 +1024,7 @@ def _live_chart_controls() -> None:
                     "VWMA",
                     ["VWMA(5)", "VWMA(15)", "VWMA(60)"],
                     default=[],
+                    key="chart_vwma",
                     placeholder="VWMA",
                     label_visibility="collapsed",
                 )
@@ -1033,6 +1037,7 @@ def _live_chart_controls() -> None:
                     "Average Lines",
                     ["7d Avg", "28d Avg", "1y Avg"],
                     default=[],
+                    key="chart_avg_lines",
                     placeholder="Average lines",
                     label_visibility="collapsed",
                 )
@@ -1049,6 +1054,7 @@ def _live_chart_controls() -> None:
                     "Options walls",
                     list(_OPTION_WALL_OPTIONS),
                     default=[],
+                    key="chart_option_walls",
                     placeholder="Options walls",
                     label_visibility="collapsed",
                 )
@@ -1073,11 +1079,13 @@ def _live_chart_controls() -> None:
                     baseline_keys,
                     index=baseline_keys.index(DEFAULT_VOLUME_BASELINE),
                     format_func=lambda k: f"Usual volume: {VOLUME_BASELINE_WINDOWS[k]}",
+                    key="chart_volume_baseline",
                     label_visibility="collapsed",
                 )
             show_momentum = st.checkbox(
                 "Momentum panel",
                 value=True,
+                key="chart_momentum",
                 help="Two panels under the volume, one bar per chart bar, so "
                 "they follow the timeframe (a bar a minute on 1Min, one per five "
                 "minutes on 5Min):\n\n"
@@ -1099,6 +1107,7 @@ def _live_chart_controls() -> None:
             show_net_gamma = st.checkbox(
                 "Net gamma panel",
                 value=True,
+                key="chart_net_gamma",
                 help="A panel at the bottom, under Momentum Δ: the options "
                 "market's net dealer gamma, in $M per 1% move, at each bar's "
                 "close. Green where dealers are long gamma — their hedging sells "
@@ -1131,6 +1140,7 @@ def _live_chart_controls() -> None:
                 "Price profile fit",
                 list(_PROFILE_FIT_OPTIONS),
                 default=[],
+                key="chart_profile_fit",
                 placeholder="None",
                 label_visibility="collapsed",
             )
@@ -1143,12 +1153,16 @@ def _live_chart_controls() -> None:
         max_components = 0
         fit_target_choice = "Live volume"
         if mixture_dists:
-            max_components = st.slider("Components", min_value=1, max_value=5, value=1)
+            max_components = st.slider(
+                "Components", min_value=1, max_value=5, value=1,
+                key="chart_mixture_components",
+            )
             if show_predicted:
                 fit_target_choice = st.selectbox(
                     "Fit to",
                     ["Live volume", "Predicted profile"],
                     index=0,
+                    key="chart_mixture_fit_target",
                     help="Which profile the mixture is fitted to.",
                 )
 
@@ -1526,6 +1540,9 @@ def _news_panel(symbols: list[str]) -> None:
         st.caption(f"News: {state.news_status}")
     _refresh_model_impacts(state)
     _news_analysis_controls(symbols)
+    # The impact method and provider are drawn in this fragment, whose reruns
+    # skip the full run's save.
+    last_setup.remember()
     rendered = False
     for sym_state in state.iter_symbol_states():
         st.html(
@@ -2781,7 +2798,9 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     levels = getattr(state, "apple_trader_levels", None) or {}
     running = levels if state.agent_running else {}
     # After a restart the form reopens on the restored run's buy and sell, so
-    # the ▶ Start that continues it does not quietly move them.
+    # the ▶ Start that continues it does not quietly move them -- unless the
+    # pair was changed on screen, when last_setup has already put the last
+    # values in (which a running agent had adopted anyway).
     seed = running.get("config") or (
         levels.get("config") if getattr(state, "session_restored", None) else None
     )
@@ -2797,6 +2816,9 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     # configuration rather than from a model and should show the one on screen,
     # and for the running agent, which reads the two distances back from it.
     state.apple_trader_config = config
+    # A knob change reruns this fragment alone, so the end of the full run
+    # that would otherwise save it never comes.
+    last_setup.remember()
     return config
 
 
@@ -3699,6 +3721,10 @@ def build_ui() -> None:
         page_icon="📈",
         layout="wide",
     )
+    # The setup the last session left -- symbols, connection, chart settings,
+    # personality, Apple Trader's rules, venue -- before any widget is drawn,
+    # so a restart or a reconnect opens where it was (see last_setup).
+    last_setup.restore()
 
     with st.sidebar:
         st.header("Controls")
@@ -3708,6 +3734,7 @@ def build_ui() -> None:
         symbols_input = st.text_input(
             "Symbols",
             value="AAPL",
+            key="sidebar_symbols",
             placeholder="AAPL, TSLA, MSFT…",
             help="One or more tickers, comma- or space-separated. All live plots, "
             "analyses, and the trading agent cover every listed symbol.",
@@ -3718,6 +3745,7 @@ def build_ui() -> None:
                 list(LIVE_SOURCES),
                 index=list(LIVE_SOURCES).index(DEFAULT_LIVE_SOURCE),
                 format_func=lambda s: LIVE_SOURCE_LABELS.get(s, s),
+                key="sidebar_live_source",
                 help=(
                     "Which WebSocket fills the live bar series, and — for Alpaca — which "
                     "of its feeds. **Finnhub** streams the consolidated trade tape and the "
@@ -3738,6 +3766,7 @@ def build_ui() -> None:
                 "History / backfill source",
                 HISTORY_FEEDS,
                 index=0,
+                key="sidebar_history_feed",
                 help=(
                     "Where REST bars come from — the initial history load, the timeframe "
                     "reload, the periodic backfill and the stream-down fallback poll, which "
@@ -3895,3 +3924,5 @@ def build_ui() -> None:
 
     with tab_models:
         model_catalogue_panel()
+
+    last_setup.remember()

@@ -67,3 +67,12 @@ def _net_gamma_in_tmp(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gamma_history, "CACHE_DIR", tmp_path / "net_gamma")
     monkeypatch.setattr(gamma_history, "_kept", {})
+
+
+@pytest.fixture(autouse=True)
+def _last_setup_in_tmp(monkeypatch, tmp_path):
+    """Keep the dashboard's remembered setup out of the real
+    data/last_setup.json."""
+    from agent_stonks import last_setup
+
+    monkeypatch.setattr(last_setup, "SETUP_PATH", tmp_path / "last_setup.json")
