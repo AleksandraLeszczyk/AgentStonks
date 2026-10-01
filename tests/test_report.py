@@ -110,3 +110,55 @@ class TestBuildReportHtml:
     def test_historical_period_label_in_heading(self):
         result = build_report_html(**_base_kwargs(historical_period_label="1 Year"))
         assert "Historical — 1 Year" in result
+
+    def test_briefing_and_news_cards_are_included(self):
+        result = build_report_html(
+            **_base_kwargs(
+                briefing_title="Intraday Situation Briefing",
+                briefing_note="Generated 2024-01-15 10:05 ET",
+                briefing_cards=["<div>BRIEFING-CARD</div>"],
+                news_cards=["<div>NEWS-CARD</div>"],
+            )
+        )
+        assert "Intraday Situation Briefing" in result
+        assert "Generated 2024-01-15 10:05 ET" in result
+        assert "BRIEFING-CARD" in result and "NEWS-CARD" in result
+        # Context comes before the charts.
+        assert result.index("BRIEFING-CARD") < result.index("NEWS-CARD") < result.index("Live chart")
+
+    def test_missing_briefing_news_and_walls_show_placeholders(self):
+        result = build_report_html(**_base_kwargs())
+        assert "No briefing was generated for this run." in result
+        assert "No news was loaded for this run." in result
+        assert "No options chain data available." in result
+
+    def test_option_walls_section(self):
+        import plotly.graph_objects as go
+
+        analysis = {
+            "call_wall": 105.0,
+            "put_wall": 95.0,
+            "call_wall_trend": "rising",
+            "put_wall_trend": None,
+            "gamma_regime": "negative (amplifying)",
+            "summary": "Call wall 105.00 (resistance), put wall 95.00 (support).",
+            "insights": ["Spot inside the range.", "Net dealer gamma is negative."],
+        }
+        walls = [
+            {
+                "symbol": "AAPL",
+                "fig": go.Figure(),
+                "expiry": "2024-01-19",
+                "fetched_at": "2024-01-15T14:00:00+00:00",
+                "analysis": analysis,
+            }
+        ]
+        result = build_report_html(**_base_kwargs(option_walls=walls))
+        assert "Put/Call walls — AAPL" in result
+        assert "Expiry 2024-01-19" in result
+        assert "$105.00 (rising)" in result
+        assert "$95.00" in result
+        assert "Negative" in result
+        assert "Net dealer gamma is negative." in result
+        # With no live chart above it, the walls chart is the one that loads plotly.js.
+        assert result.count("cdn.plot.ly") == 1

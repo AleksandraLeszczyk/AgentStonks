@@ -1,7 +1,8 @@
 """
 Builds a single self-contained HTML file documenting an agent run: starting
-conditions, the Live/Historical/Agent charts as they looked at save time, and
-the full history of agent decisions and activity.
+conditions, the briefing and news the run started from, the Live/Put-Call
+walls/Historical/Agent charts as they looked at save time, and the full history
+of agent decisions and activity.
 """
 from __future__ import annotations
 
@@ -74,6 +75,10 @@ tr.action-sell td:nth-child(2) {{ color: {PALETTE['down']}; font-weight: 600; }}
 tr.action-alert td:nth-child(2) {{ color: {PALETTE['orange']}; font-weight: 600; }}
 tr.action-tactics td:nth-child(2) {{ color: {PALETTE['orange']}; font-weight: 600; }}
 .empty-note {{ color: {PALETTE['muted']}; font-style: italic; }}
+.section-note {{ color: {PALETTE['muted']}; font-size: 12px; margin: -6px 0 12px; }}
+.walls-summary {{ font-size: 13px; margin: 12px 0 6px; }}
+.walls-insights {{ font-size: 12px; color: {PALETTE['muted']}; margin: 0; padding-left: 18px; }}
+.walls-insights li {{ margin-bottom: 4px; }}
 .log-card {{
     background: {PALETTE['panel']};
     border-radius: 8px;
@@ -269,6 +274,61 @@ def _fig_sections(
     return "\n".join(sections)
 
 
+def _cards_section(title: str, cards: list[str], empty_msg: str, note: str = "") -> str:
+    """An <h2>-titled section of pre-rendered HTML cards (the dashboard's own
+    News / Briefing cards), or an empty-note when there are none."""
+    note_html = f'<p class="section-note">{html.escape(note)}</p>' if note else ""
+    body = "".join(cards) or f'<p class="empty-note">{html.escape(empty_msg)}</p>'
+    return f"<h2>{html.escape(title)}</h2>\n{note_html}{body}"
+
+
+def _wall_label(analysis: dict, key: str) -> str:
+    """"$185.00 (rising)" for the call_wall/put_wall `key`, trend when known."""
+    value = analysis.get(key)
+    if value is None:
+        return "—"
+    trend = analysis.get(f"{key}_trend")
+    return f"${value:,.2f}" + (f" ({trend})" if trend else "")
+
+
+def _option_walls_sections(walls: list[dict], first_includes_plotlyjs: bool) -> str:
+    """One section per symbol: the Put/Call Walls tab's chart, its three
+    headline numbers, and the read underneath. Each entry is {"symbol", "fig",
+    "expiry", "fetched_at", "analysis"}, `analysis` being
+    technical_analysis.get_put_call_walls_and_gamma's result."""
+    if not walls:
+        return (
+            "<h2>Put/Call walls</h2>\n"
+            '<p class="empty-note">No options chain data available.</p>'
+        )
+    sections = []
+    for i, entry in enumerate(walls):
+        analysis = entry.get("analysis") or {}
+        regime = str(analysis.get("gamma_regime") or "—")
+        tiles = _starting_conditions_html(
+            {
+                "Call wall (resistance)": _wall_label(analysis, "call_wall"),
+                "Put wall (support)": _wall_label(analysis, "put_wall"),
+                "Net gamma regime": regime.split(" ")[0].capitalize(),
+            }
+        )
+        insights = "".join(f"<li>{html.escape(str(t))}</li>" for t in analysis.get("insights") or [])
+        sections.append(
+            f"<h2>Put/Call walls — {html.escape(str(entry.get('symbol', '')))}</h2>\n"
+            f'<p class="section-note">Expiry {html.escape(str(entry.get("expiry", "")))} · '
+            f'fetched {html.escape(str(entry.get("fetched_at", "")))}</p>\n'
+            + _fig_html(
+                entry.get("fig"),
+                include_plotlyjs=first_includes_plotlyjs and i == 0,
+                empty_msg="No options chain data available.",
+            )
+            + tiles
+            + f'<p class="walls-summary">{html.escape(str(analysis.get("summary", "")))}</p>'
+            + (f'<ul class="walls-insights">{insights}</ul>' if insights else "")
+        )
+    return "\n".join(sections)
+
+
 def build_report_html(
     *,
     symbols: list[str],
@@ -289,7 +349,15 @@ def build_report_html(
     decisions: list[dict],
     agent_log: list[dict],
     trading_venue: str = "",
+    briefing_title: str = "Pre-Market Briefing",
+    briefing_note: str = "",
+    briefing_cards: Optional[list[str]] = None,
+    news_cards: Optional[list[str]] = None,
+    option_walls: Optional[list[dict]] = None,
 ) -> str:
+    """`briefing_cards` and `news_cards` are the dashboard's own rendered cards
+    (one per symbol) so the report shows them exactly as the Pre-Market and
+    News tabs did; `option_walls` is described in `_option_walls_sections`."""
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     symbols_label = ", ".join(symbols)
 
@@ -322,17 +390,38 @@ def build_report_html(
 
     hist_title = f"Historical — {historical_period_label}" if historical_period_label else "Historical"
 
+    option_walls = option_walls or []
+
+    # plotly.js is loaded from the CDN by the first figure in the document, so
+    # each section has to know whether one has been drawn above it.
     live_sections = _fig_sections(
         live_figs,
         title="Live chart",
         first_includes_plotlyjs=True,
         empty_msg="No live chart data available.",
     )
+    walls_sections = _option_walls_sections(
+        option_walls, first_includes_plotlyjs=not live_figs
+    )
     historical_sections = _fig_sections(
         historical_figs,
         title=hist_title,
-        first_includes_plotlyjs=not live_figs,
+        first_includes_plotlyjs=not (live_figs or option_walls),
         empty_msg="No historical chart data available.",
+    )
+    briefing_section = _cards_section(
+        briefing_title,
+        briefing_cards or [],
+        "No briefing was generated for this run.",
+        note=briefing_note,
+    )
+    news_section = _cards_section(
+        "News", news_cards or [], "No news was loaded for this run."
+    )
+    performance_chart = _fig_html(
+        performance_fig,
+        include_plotlyjs=not (live_figs or option_walls or historical_figs),
+        empty_msg="No agent performance data available.",
     )
 
     body = f"""<!DOCTYPE html>
@@ -349,13 +438,19 @@ def build_report_html(
 <h2>Starting conditions</h2>
 {_starting_conditions_html(conditions)}
 
+{briefing_section}
+
+{news_section}
+
 {live_sections}
+
+{walls_sections}
 
 {historical_sections}
 
 <h2>Agent performance</h2>
 {perf_summary}
-{_fig_html(performance_fig, include_plotlyjs=False, empty_msg="No agent performance data available.")}
+{performance_chart}
 
 <h2>Decision history</h2>
 {_decisions_table_html(decisions)}

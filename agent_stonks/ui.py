@@ -2383,6 +2383,84 @@ def _agent_performance_panel(symbols: list[str]) -> None:
     st.plotly_chart(fig, width='stretch')
 
 
+def _report_briefing(state: AppState, syms: list[str]) -> dict:
+    """The Pre-Market tab's briefing cards for the report: title, the
+    generated-at note (with any symbol that failed), and one card per symbol."""
+    briefings = dict(state.premarket_briefings or {})
+    errors = dict(state.premarket_errors or {})
+    phase = state.premarket_phase
+    notes = []
+    if state.premarket_generated_at is not None:
+        generated_et = state.premarket_generated_at.astimezone(market_hours.MARKET_TZ)
+        notes.append(f"Generated {generated_et.strftime('%Y-%m-%d %H:%M')} ET")
+    notes += [f"failed for {sym}: {errors[sym]}" for sym in syms if sym in errors]
+    return {
+        "briefing_title": PHASE_TITLES.get(phase, "Pre-Market Briefing"),
+        "briefing_note": " · ".join(notes),
+        "briefing_cards": [
+            _premarket_briefing_html(briefings[sym], sym, phase)
+            for sym in syms
+            if sym in briefings
+        ],
+    }
+
+
+def _report_news_cards(state: AppState, syms: list[str]) -> list[str]:
+    """The News tab's cards for the report, one per streamed symbol."""
+    cards = []
+    for sym in syms:
+        sym_state = state.sym(sym)
+        if sym_state is None:
+            continue
+        with sym_state.lock:
+            news = list(sym_state.news)
+            impacts = dict(sym_state.news_impacts)
+            details = dict(sym_state.news_impact_details)
+        cards.append(_news_html(news, sym, impacts, details))
+    return cards
+
+
+def _report_option_walls(state: AppState, syms: list[str]) -> list[dict]:
+    """The Put/Call Walls tab's chart and read per symbol, from the chain that
+    tab (or the live chart's wall overlay) last stored. A symbol with none yet
+    gets one fetch through the same 5-minute cache; one that fails is left out."""
+    walls = []
+    for sym in syms:
+        sym_state = state.sym(sym)
+        data, history, spot = None, [], None
+        if sym_state is not None:
+            with sym_state.lock:
+                data = sym_state.options_chain
+                history = list(sym_state.options_wall_history)
+                spot = sym_state.last_price
+        if not data:
+            try:
+                data = fetch_options_walls_data(sym, spot=spot)
+            except Exception:
+                continue
+        if not data or not data.get("strikes"):
+            continue
+        analysis = get_put_call_walls_and_gamma(
+            strikes=data["strikes"],
+            calls_oi=data["calls_oi"],
+            puts_oi=data["puts_oi"],
+            calls_gamma_exposure=data["calls_gamma_exposure"],
+            puts_gamma_exposure=data["puts_gamma_exposure"],
+            spot=data["spot"],
+            wall_history=history,
+        )
+        walls.append(
+            {
+                "symbol": sym,
+                "fig": build_gamma_chart(data, analysis, sym),
+                "expiry": data.get("expiry", ""),
+                "fetched_at": data.get("fetched_at", ""),
+                "analysis": analysis,
+            }
+        )
+    return walls
+
+
 def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
     syms = symbols or list(state.symbols)
 
@@ -2511,13 +2589,20 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
         performance_stats=performance_stats,
         decisions=decisions,
         agent_log=agent_log,
+        news_cards=_report_news_cards(state, syms),
+        option_walls=_report_option_walls(state, syms),
+        **_report_briefing(state, syms),
     )
 
 
 def _agent_report_section(symbols: list[str]) -> None:
     state = _get_state()
     st.divider()
-    st.caption("Save everything about this run — charts, starting conditions, and the full decision history — to a single HTML file.")
+    st.caption(
+        "Save everything about this run — starting conditions, the briefing and news, "
+        "the charts (put/call walls included), and the full decision history — to a "
+        "single HTML file."
+    )
     if st.button("📄 Generate Report", key="agent_generate_report"):
         with st.spinner("Building report…"):
             try:

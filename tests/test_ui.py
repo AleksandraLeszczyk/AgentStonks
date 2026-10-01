@@ -251,6 +251,75 @@ class TestLiveOptionWalls:
         assert calls == ["AAPL"]
 
 
+class TestReportSections:
+    CHAIN = TestLiveOptionWalls.CHAIN
+
+    def _app(self, chain=None):
+        from agent_stonks.state import SymbolState
+        app = AppState()
+        sym_state = SymbolState("AAPL", app)
+        sym_state.options_chain = chain
+        sym_state.news = [
+            {"id": "1", "created_at": "2024-01-15T13:00:00Z", "headline": "Apple headline",
+             "summary": "", "source": "benzinga", "url": "https://example.com"}
+        ]
+        app.symbol_states["AAPL"] = sym_state
+        return app
+
+    def test_briefing_cards_carry_the_phase_and_failures(self):
+        from datetime import datetime, timezone
+        from agent_stonks.premarket import PremarketBriefing
+        from agent_stonks.ui import _report_briefing
+        app = self._app()
+        app.premarket_phase = "open"
+        app.premarket_generated_at = datetime(2024, 1, 15, 15, 5, tzinfo=timezone.utc)
+        app.premarket_briefings = {
+            "AAPL": PremarketBriefing(
+                overall_bias="bullish", confidence="high", summary="Gap up on earnings.",
+                catalysts=[], technical_levels=[], risk_factors=[],
+                macro_context="Calm tape.", key_levels_to_watch=[],
+            )
+        }
+        app.premarket_errors = {"TSLA": "timeout"}
+        out = _report_briefing(app, ["AAPL", "TSLA"])
+        assert out["briefing_title"] == "Intraday Situation Briefing"
+        assert out["briefing_note"] == "Generated 2024-01-15 10:05 ET · failed for TSLA: timeout"
+        assert len(out["briefing_cards"]) == 1
+        assert "Gap up on earnings." in out["briefing_cards"][0]
+
+    def test_news_cards_per_streamed_symbol(self):
+        from agent_stonks.ui import _report_news_cards
+        cards = _report_news_cards(self._app(), ["AAPL", "MSFT"])
+        assert len(cards) == 1
+        assert "Apple headline" in cards[0]
+
+    def test_option_walls_from_the_stored_chain(self, monkeypatch):
+        from agent_stonks import ui
+        monkeypatch.setattr(
+            ui, "fetch_options_walls_data",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched")),
+        )
+        walls = ui._report_option_walls(self._app(self.CHAIN), ["AAPL"])
+        assert [w["symbol"] for w in walls] == ["AAPL"]
+        assert walls[0]["analysis"]["call_wall"] == 105.0
+        assert walls[0]["fig"] is not None
+
+    def test_option_walls_fetch_when_none_stored_and_skip_failures(self, monkeypatch):
+        from agent_stonks import ui
+        calls = []
+
+        def fetch(sym, spot=None):
+            calls.append(sym)
+            if sym == "MSFT":
+                raise RuntimeError("no chain")
+            return self.CHAIN
+
+        monkeypatch.setattr(ui, "fetch_options_walls_data", fetch)
+        walls = ui._report_option_walls(self._app(None), ["AAPL", "MSFT"])
+        assert calls == ["AAPL", "MSFT"]
+        assert [w["symbol"] for w in walls] == ["AAPL"]
+
+
 class TestAgentMomentum:
     """The look-back the momentum panels' agent lines are drawn over."""
 
