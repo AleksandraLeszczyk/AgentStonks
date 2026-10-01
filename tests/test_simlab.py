@@ -2300,7 +2300,30 @@ class TestPriceChartSessions:
         marks = [
             s for s in fig.layout.shapes if s.line.color == SESSION_MARKER_COLOR
         ]
-        assert len(marks) == 4  # open + close, two days
+        # One open per day. No 16:00 rule: the last drawn bar is 15:59, and
+        # with the night collapsed it would sit on the next day's open.
+        assert len(marks) == 2
+
+    def test_only_the_regular_session_is_drawn(self):
+        from simlab.app import _price_chart
+
+        fig = _price_chart("AAPL", self.bars(), [])
+        local = pd.to_datetime(list(fig.data[0].x), utc=True).tz_convert("America/New_York")
+        assert len(local) == 2 * 390
+        assert local.min().strftime("%H:%M") == "09:30"
+        assert local.max().strftime("%H:%M") == "15:59"
+        assert all("09:30" <= t.strftime("%H:%M") < "16:00" for t in local)
+
+    def test_a_fill_outside_the_session_does_not_widen_the_axis(self):
+        from simlab.app import _price_chart
+
+        pre_bell = pd.Timestamp("2024-01-15 09:00", tz="America/New_York")
+        fill = {"symbol": "AAPL", "action": "buy", "status": "filled",
+                "ts": pre_bell.tz_convert("UTC").isoformat(), "price": 100.0}
+        fig = _price_chart("AAPL", self.bars(), [fill])
+        lo, hi = (pd.Timestamp(x) for x in fig.layout.xaxis.range)
+        assert lo == pd.Timestamp("2024-01-15 09:30", tz="America/New_York")
+        assert hi == pd.Timestamp("2024-01-16 15:59", tz="America/New_York")
 
     def test_the_breaks_survive_the_shared_chart_layout(self):
         """`_chart_layout` sets `xaxis=dict(gridcolor=...)` afterwards, which

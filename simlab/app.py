@@ -51,7 +51,7 @@ from agent_stonks.charts import (
 from agent_stonks.config import PALETTE
 from agent_stonks.model_catalogue_ui import model_catalogue_panel
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
-from agent_stonks.market_hours import MARKET_TZ
+from agent_stonks.market_hours import MARKET_TZ, is_market_open
 
 from . import data as sim_data
 from . import drift as sim_drift
@@ -570,6 +570,18 @@ def _decision_hover(decision: dict) -> str:
     return "<br>".join(lines)
 
 
+def _regular_session_bars(bars: list[dict]) -> list[dict]:
+    """The bars stamped 09:30-15:59 ET on a weekday -- the session the
+    engine trades in (`market_hours.is_market_open`, as `_run_rule_day` asks
+    it). Pre-market, after-hours and overnight bars are dropped."""
+    out = []
+    for bar in bars:
+        ts = clock.parse_iso(bar.get("t"))
+        if ts is not None and is_market_open(ts):
+            out.append(bar)
+    return out
+
+
 def _price_chart(
     symbol: str,
     bars: list[dict],
@@ -588,12 +600,14 @@ def _price_chart(
     identical, which is the point of the items being data rather than plotly
     calls.
 
-    A run usually covers several days, and the exchange is shut for two thirds
-    of each one. Those stretches are removed from the time axis rather than
-    drawn as blank space (`charts.session_rangebreaks`), and the day boundary
-    they used to provide is put back as a rule at 09:30 and 16:00
-    (`charts.add_session_markers`).
+    Only the regular session is drawn (`_regular_session_bars`): the agents
+    trade 09:30-16:00, and the pre-, post- and overnight tape the store keeps
+    was never traded on. A run usually covers several days, so the time from
+    one day's close to the next day's open is removed from the axis rather
+    than drawn as blank space (`charts.session_rangebreaks`), and each day's
+    open is put back as a dated rule (`charts.add_session_markers`).
     """
+    bars = _regular_session_bars(bars)
     fig = go.Figure()
     fig.add_trace(
         go.Candlestick(
@@ -635,11 +649,17 @@ def _price_chart(
             )
     if bars:
         add_session_markers(fig, bars)
-        fig.update_xaxes(rangebreaks=session_rangebreaks(bars))
-    if overlays and bars:
         x0, x1 = pd.Timestamp(bars[0]["t"]), pd.Timestamp(bars[-1]["t"])
+        # Pinned to the session bars, so a fill outside the regular session
+        # (the pre-market agent can fill before the bell) cannot stretch the
+        # axis back over the hours this chart leaves out. It is still in the
+        # Decisions table.
+        fig.update_xaxes(
+            rangebreaks=session_rangebreaks(bars),
+            range=[x0, overlay_x_max(overlays, x1)],
+        )
+    if overlays and bars:
         add_model_overlays(overlays, fig, x0, x1, row=None, col=None)
-        fig.update_xaxes(range=[x0, overlay_x_max(overlays, x1)])
     if patterns and bars:
         add_candle_patterns(
             patterns, fig, pd.Timestamp(bars[0]["t"]), pd.Timestamp(bars[-1]["t"]),
