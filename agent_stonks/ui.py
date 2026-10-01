@@ -2127,6 +2127,33 @@ def _trade_sound_fragment() -> None:
 
 
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
+def _agent_status_line() -> None:
+    """The one-line run status: running or idle, the venue, the symbols, and
+    what the agent itself is doing. Polled, because the last of those changes
+    on the agent's thread -- the session opening, a buy, a stand-down -- and a
+    run that ends on its own (a stop-out) has to stop saying "running"."""
+    state = _get_state()
+    status = "🟢 running" if state.agent_running else "⚪ idle"
+    watching = (
+        f" — watching {', '.join(state.symbols)}"
+        if state.agent_running and state.symbols
+        else ""
+    )
+    # Where orders go belongs in the status line rather than in a banner of its
+    # own: this line is on screen whether the agent is running, idle or stopped,
+    # and "is this moving real money" is not a question that stops mattering the
+    # moment a run ends. Before the first Start nothing has been resolved yet,
+    # so the line says that instead of naming a venue it has not chosen.
+    if state.trading_mode_requested:
+        venue = f" · {_venue_badge(state.trading_mode)}"
+    else:
+        venue = " · no venue resolved yet — press ▶ Start"
+    activity = state.agent_activity if state.agent_running else None
+    doing = f" · {activity[0]} {activity[1]}" if activity else ""
+    st.caption(f"Status: {status}{venue}{watching}{doing}")
+
+
+@st.fragment(run_every=AGENT_LOG_POLL_SEC)
 def _agent_identity_panel() -> None:
     """Avatar card for the personality currently in charge. Under Automatic the
     face shown is the strategy Automatic activated, not Automatic itself; while
@@ -3207,22 +3234,7 @@ def _agent_panel(
         if not sold and not errors:
             st.info("Agent stopped. There were no open positions to sell.")
 
-    status = "🟢 running" if state.agent_running else "⚪ idle"
-    watching = (
-        f" — watching {', '.join(state.symbols)}"
-        if state.agent_running and state.symbols
-        else ""
-    )
-    # Where orders go belongs in the status line rather than in a banner of its
-    # own: this line is on screen whether the agent is running, idle or stopped,
-    # and "is this moving real money" is not a question that stops mattering the
-    # moment a run ends. Before the first Start nothing has been resolved yet,
-    # so the line says that instead of naming a venue it has not chosen.
-    if state.trading_mode_requested:
-        venue = f" · {_venue_badge(state.trading_mode)}"
-    else:
-        venue = " · no venue resolved yet — press ▶ Start"
-    st.caption(f"Status: {status}{venue}{watching}")
+    _agent_status_line()
     restored = getattr(state, "session_restored", None)
     if restored and not state.agent_running:
         held = restored.get("positions") or {}

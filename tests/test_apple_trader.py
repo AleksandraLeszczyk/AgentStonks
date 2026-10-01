@@ -2740,6 +2740,98 @@ def tracker_for_loop() -> DecisionTracker:
     return DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0))
 
 
+class TestStatusLineActivity:
+    """The agent's own segment of the Agent tab's status line: a dot and a
+    phrase, set from each cycle's outcome (`BaseTrader.activity`)."""
+
+    def _setup(self, monkeypatch, price=103.0, **tape):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(price))
+        return at.DayRangeTrader(dayrange_config()), tracker, Tape(monkeypatch, **tape)
+
+    def _activity(self, trader, state, tracker):
+        return trader.activity(trader.run_cycle(DAYRANGE_BUNDLE, state, tracker), tracker)
+
+    def test_before_the_open_it_waits_for_the_session(self, state, monkeypatch):
+        clock.set_simulated(datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc))  # 8:00 ET
+        try:
+            trader, tracker, _ = self._setup(monkeypatch)
+            assert self._activity(trader, state, tracker) == (
+                "🟠", "Agent waiting for session start"
+            )
+        finally:
+            clock.clear()
+
+    def test_inside_the_opening_window_it_waits_for_the_forecast(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._setup(monkeypatch, minutes=0)
+        tape.append(104.0)
+        assert self._activity(trader, state, tracker) == (
+            "🟠", "Agent waiting for the opening forecast"
+        )
+
+    def test_flat_then_holding(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+        tape.append(104.0)
+        assert self._activity(trader, state, tracker) == (
+            "🟢", "Agent watching for an entry"
+        )
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert self._activity(trader, state, tracker) == ("🟢", f"Agent holding {TICKER}")
+
+    def test_a_stand_down_says_so(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+        tape.append(104.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        trader.plan["stand_down"] = "min win"
+        tape.append(104.0)
+        assert self._activity(trader, state, tracker) == (
+            "🟠", "Agent stood down for the day"
+        )
+
+    def test_a_day_that_cannot_be_forecast_is_red(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+
+        def boom(*args, **kwargs):
+            raise ValueError("only 40 daily sessions of history")
+
+        monkeypatch.setattr(at._dayrange(), "forecast_session", boom)
+        tape.append(104.0)
+        dot, text = self._activity(trader, state, tracker)
+        assert dot == "🔴" and "cannot trade today" in text
+
+    def test_the_loop_publishes_it_and_clears_it_on_the_way_out(
+        self, state, monkeypatch
+    ):
+        seen: list = []
+
+        class OneCycle:
+            halt = None
+
+            def run_cycle(self, bundle, state, tracker):
+                self.halt = "stopped out"
+                return "hold"
+
+            def activity(self, outcome, tracker):
+                return ("🟢", f"after {outcome}")
+
+        def end(state, tracker, text):
+            seen.append(state.agent_activity)
+            original_end(state, tracker, text)
+
+        original_end = at.rule_agent.end_session
+        monkeypatch.setattr(at.rule_agent, "end_session", end)
+        monkeypatch.setattr(at.apple_models, "load", lambda key, ticker=None: DAYRANGE_BUNDLE)
+        monkeypatch.setattr(at, "config_error", lambda config, bundle=None: None)
+        monkeypatch.setattr(at, "build_trader", lambda config, bundle=None: OneCycle())
+        state.agent_running = True
+        at._apple_trader_loop(
+            state, tracker_for_loop(), AppleTraderConfig(), 60, threading.Event()
+        )
+        assert seen == [("🟢", "after hold")]
+        assert state.agent_activity is None
+
+
 class TestRecordedLevels:
     """What a live run publishes for the chart: one row per cycle, from the
     same plan the analysis line prints, so the two can never disagree."""

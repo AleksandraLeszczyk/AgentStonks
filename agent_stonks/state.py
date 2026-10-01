@@ -260,6 +260,7 @@ _DEFAULTS: dict[str, object] = {
     "fill_gaps": True,
     "agent_log": [],
     "agent_running": False,
+    "agent_activity": None,
     "agent_stop_event": None,
     "decision_tracker": None,
     "starting_budget": PAPER_STARTING_CASH,
@@ -389,6 +390,11 @@ class AppState:
         self.fill_gaps: bool = True
         self.agent_log: list[dict] = []
         self.agent_running: bool = False
+        # What the running agent is doing, as `(dot, phrase)` for the status
+        # line -- set by the rule agents' loop after every cycle
+        # (`rule_agent.BaseTrader.activity`); None while idle, and for the LLM
+        # agents, which do not report one.
+        self.agent_activity: "tuple[str, str] | None" = None
         self.agent_stop_event: "threading.Event | None" = None
         self.decision_tracker: "DecisionTracker | None" = None
         self.starting_budget: float = PAPER_STARTING_CASH

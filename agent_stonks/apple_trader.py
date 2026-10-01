@@ -1231,6 +1231,20 @@ class DayRangeTrader(BaseTrader):
         # ▶ Start, so there the stand-down simply lasts the session.
         self.halt: "str | None" = None
 
+    def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
+        """The base's phrases, plus the two this strategy's day has: before the
+        forecast, and after a stand-down."""
+        if outcome == rule_agent.WARMING_UP and self.plan is None and self.blocked is None:
+            return rule_agent.WAITING, "Agent waiting for the opening forecast"
+        if (
+            outcome != rule_agent.CLOSED
+            and self.plan is not None
+            and self.plan.get("stand_down")
+            and tracker.position_for(self.ticker) <= 0
+        ):
+            return rule_agent.WAITING, "Agent stood down for the day"
+        return super().activity(outcome, tracker)
+
     # --- one cycle --------------------------------------------------------
 
     def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
@@ -3242,6 +3256,9 @@ def _apple_trader_loop(
 
     def cycle() -> str:
         outcome = trader.run_cycle(bundle, state, tracker)
+        activity = getattr(trader, "activity", None)
+        if activity is not None:
+            state.agent_activity = activity(outcome, tracker)
         publish = getattr(trader, "publish_memory", None)
         if publish is not None:
             publish(state)

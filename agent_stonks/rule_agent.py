@@ -57,6 +57,14 @@ WARMING_UP = "warming_up"
 CLOSED = "closed"
 NO_DATA = "no_data"
 
+# The agent's segment of the Agent tab's status line (`state.agent_activity`):
+# a dot and a phrase, set after every cycle. Orange is waiting on the market --
+# the session, the opening window, the bars -- or stood down; green is trading;
+# red is something to read the log for.
+WAITING = "🟠"
+TRADING = "🟢"
+FAILED = "🔴"
+
 
 def order_quantity(cash: float, price: float, position_pct: float) -> float:
     """Whole shares that `position_pct` of `cash` buys at `price`, rounded down.
@@ -107,6 +115,23 @@ class BaseTrader:
         self.blocked: "dict | None" = None
         # The decision the last `buy` produced; see there.
         self.last_buy = None
+
+    # --- the status line -------------------------------------------------
+
+    def activity(self, outcome: str, tracker: "DecisionTracker") -> "tuple[str, str]":
+        """What the status line says this agent is doing, after a cycle that
+        returned `outcome`: `(dot, phrase)`."""
+        if outcome == CLOSED:
+            return WAITING, "Agent waiting for session start"
+        if self.blocked is not None:
+            return FAILED, "Agent cannot trade today — see the log"
+        if outcome == WARMING_UP:
+            return WAITING, "Agent warming up"
+        if outcome == NO_DATA:
+            return WAITING, f"Agent waiting for {self.ticker} bars"
+        if tracker.position_for(self.ticker) > 0:
+            return TRADING, f"Agent holding {self.ticker}"
+        return TRADING, "Agent watching for an entry"
 
     # --- pre-flight -------------------------------------------------------
 
@@ -267,6 +292,7 @@ def run_loop(
             run_cycle()
         except Exception as exc:
             _log(state, {"type": "error", "text": f"{agent_name} cycle failed: {exc}"})
+            state.agent_activity = (FAILED, "Agent cycle failed — see the log")
         scoring.maybe_score_day(state, tracker)
         stop_event.wait(seconds_to_next_bar(cycle_sec))
 
@@ -282,6 +308,7 @@ def end_session(state: "AppState", tracker: "DecisionTracker", text: "str | None
     """
     scoring.end_session(state, tracker)
     state.agent_running = False
+    state.agent_activity = None
     if text:
         _log(state, {"type": "status", "text": text})
     obs.flush()
@@ -306,6 +333,7 @@ def launch(
     stop_event = threading.Event()
     state.agent_stop_event = stop_event
     state.agent_running = True
+    state.agent_activity = (WAITING, "Agent starting")
     scoring.begin_session(state, agent_key, [ticker])
     threading.Thread(
         target=target, args=(*args, stop_event), daemon=True
