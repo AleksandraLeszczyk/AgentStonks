@@ -270,7 +270,7 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 #   dayrange  AAPL    0.55  0.05  +3757   +3.76%    3/3        14/14     20260923-181947-96f7cb
 #   dayrange  GOOGL   0.85  0.45  +1317   +1.32%    2/3         9/14     20260923-182822-178bfa
 #   dayrange  INTC    0.65  0.05  +7191   +7.19%    2/3         9/14     20260923-182628-bdbe37
-#   highlow   AAPL    0.75  0.35  +3775   +3.77%    3/3        12/14     20260923-191233-fd16ae
+#   highlow   AAPL    0.75  0.35  +3775   +3.77%    3/3        12/14     20260923-191233-fd16ae  (replaced 2026-10-01, below)
 #   highlow   INTC    0.85  0.35  +5971   +5.97%    3/3         7/14     20260923-191641-b7ded5
 #
 # How far to trust them. Every week is in sample -- the pick is read off the
@@ -285,12 +285,45 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # dayrange INTC the untuned 0.50/0.05 made +7262 on the same weeks, more than
 # the pick (0.50 sits between the grid's 0.10 steps). Re-read the Tuning tab's
 # jobs after adding a week before trusting any of these over the fallback.
+#
+# HighLow MU, BE and AAPL from jobs run 2026-09-30, installed 2026-10-01: the
+# same grid widened to buy 0.35..0.95, highest summed cell, yfinance tape at
+# $100,000 per week. MU and BE on two weeks (2026-09-14 and -09-21; 10
+# sessions; MU's job also required trading on at least half the days), AAPL on
+# the three tech weeks above:
+#
+#   model     ticker  buy   sell  total   return  weeks up  days traded  wins   job
+#   highlow   MU      0.55  0.35  +5739   +5.74%    2/2        9/10      11/15  20260930-113034-ec08db
+#   highlow   BE      0.55  0.45  +6561   +6.56%    2/2       10/10       9/12  20260930-164413-6e0c3c
+#   highlow   AAPL    0.75  0.05  +4939   +4.94%    3/3        9/14       8/9   20260930-184245-da9c77
+#
+# Their bases were the exit of 2026-09-30 (momentum confirmation, the minimum
+# gain before a take, scale-in at half-way rungs, brownian with keep_width) with
+# contain_range off, market entries and no buy_step_k -- again not today's
+# defaults. AAPL's base also had the stop at 1.0 of the predicted gain and a
+# 4-bar momentum confirmation (the pick of its stop x confirmation job
+# 20260930-171641-119bf9), where the defaults here are 0.5 and 5: replayed under
+# today's defaults the pick makes +1785 on the same weeks, the old 0.75/0.35
+# +887. 0.75/0.05 beat 0.75/0.35 under every setup tried.
+#
+# MU and BE picks sit in a buy-0.55 row that is profitable at every sell
+# distance (MU +3.2k..+5.7k, BE +3.1k..+6.6k). On MU every buy from 0.35 to 0.65
+# makes money and 0.75 and deeper do not; on BE the rows either side of 0.55 are
+# mixed, so the pick is a ridge rather than a plateau, and its sell is the
+# grid's edge. BE's target is only 0.10 units, so its circuit breaker is 0.01
+# (APPLE_TRADER_MIN_WIN), not the default 0.10 it was scored under, which stood
+# the session down after any trade that only reached the target. That costs on
+# these weeks: +5584 instead of +6561 under the job's base (19 buys instead of
+# 12), +2897 instead of +4084 under today's defaults. The stop sits 0.05 units
+# under the fill. The untuned 0.75/0.10 made -2 on MU and +2019 on BE.
 APPLE_TRADER_TUNED_LEVELS: "dict[tuple[str, str], tuple[float, float]]" = {
     ("dayrange", "AAPL"): (0.55, 0.05),
     ("dayrange", "GOOGL"): (0.85, 0.45),
     ("dayrange", "INTC"): (0.65, 0.05),
-    ("highlow", "AAPL"): (0.75, 0.35),
+    ("highlow", "AAPL"): (0.75, 0.05),
     ("highlow", "INTC"): (0.85, 0.35),
+    ("highlow", "MU"): (0.55, 0.35),
+    ("highlow", "BE"): (0.55, 0.45),
 }
 # The day-range managed exit, on top of the sell level and the closing flatten
 # (`DayRangeTrader._exit`). Unlike the levels these were never swept: they are
@@ -582,15 +615,18 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # completed trade ended the session. 0.10 leaves a target exit (and anything
 # better) alive and catches what the rule is for -- a breakeven runner, a
 # flatten at the fill, a take that gave out early. Since 2026-09-23 (the user's
-# call) 0.10 is every instrument's default, so the per-symbol table below is
-# empty; it stays for the same reason the levels are per instrument
-# (APPLE_TRADER_DAYRANGE_LEVELS): the number only means something against that
-# symbol's own buy/sell distances. Counted in the level unit, like every k.
+# call) 0.10 is every instrument's default; the per-symbol table below stays for
+# the same reason the levels are per instrument (APPLE_TRADER_DAYRANGE_LEVELS):
+# the number only means something against that symbol's own buy/sell
+# distances. Counted in the level unit, like every k.
 # With the tuned pairs of 2026-09-26 (APPLE_TRADER_TUNED_LEVELS) the target is
 # 0.40 to 0.60 units on every model and instrument, so 0.10 stands a run down
-# only on an exit well short of it.
+# only on an exit well short of it. The HighLow pairs of 2026-10-01 are
+# narrower: 0.20 on MU, and 0.10 on BE, where 0.10 made it one trade a day
+# unless it beat the target. BE gets 0.01 (the user's call, 2026-10-01), which
+# leaves its target exit alive -- at a cost on the tuning weeks, see the levels.
 APPLE_TRADER_MIN_WIN_K = 0.10
-APPLE_TRADER_MIN_WIN: "dict[str, float]" = {}
+APPLE_TRADER_MIN_WIN: "dict[str, float]" = {"BE": 0.01}
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Whether a day-range position may be added to on the way down

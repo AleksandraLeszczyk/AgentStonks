@@ -1636,10 +1636,11 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         "buy_k": (
             "Starts at **{buy_k}** on {ticker}, for this model.\n\n"
             "- The pick of this model and instrument's Tuning-tab job: the best total "
-            "profit of a buy × sell grid summed over three weeks of tape.\n"
+            "profit of a buy × sell grid summed over two or three weeks of tape.\n"
             "- A pair never tuned (the intraday-volatility model) starts from notebook 05's "
             "per-ticker sweep instead.\n"
-            "- In-sample, and swept under the exit rules of 2026-09-23 — "
+            "- In-sample, and swept under the exit rules of the day each job ran (2026-09-23, "
+            "or 09-30 for MU and BE) — "
             "`config.APPLE_TRADER_TUNED_LEVELS` records each pick's weeks and caveats."
         ),
         "sell_k": (

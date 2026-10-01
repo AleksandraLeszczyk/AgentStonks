@@ -2436,7 +2436,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "buy_k": (
             "How far under the predicted high the entry rests.\n\n"
             "- {ticker} starts at **{buy_k}** on this model — the most profitable cell of "
-            "a buy × sell grid replayed in SimLab over three weeks of {ticker} tape and "
+            "a buy × sell grid replayed in SimLab over two or three weeks of {ticker} tape and "
             "summed. A model never tuned on {ticker} starts from notebook 05's sweep.\n"
             "- Shallower entries fill on more days; deeper ones pay a better price on fewer.\n"
             "- It was picked on the sessions it was scored on: the best-evidenced starting "
