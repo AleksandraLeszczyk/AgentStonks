@@ -32,12 +32,16 @@ scan; in a tooltip it is there for whoever asks.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import streamlit as st
 
 from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
+
+if TYPE_CHECKING:
+    from .orchestra import OrchestraConfig
 from .config import (
     BREACH_LABELS,
     BREACH_OFFERED,
@@ -217,6 +221,32 @@ def dayrange_params(
         key=copy.key(f"sell_k_{model_key}_{ticker}"),
         help=copy.help.get("sell_k", "").format(**levels),
     )
+    sizing = position_params(defaults, unit_label, copy, col_a, col_b)
+    sell_k = repaired_sell(float(buy_k), float(sell_k))
+    rules = rule_params(
+        defaults, float(buy_k), float(sell_k), unit_label, copy,
+        take_on=bool(sizing["momentum_confirmation_bars"]),
+    )
+    min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
+    return AppleTraderConfig(
+        model_key=model_key,
+        ticker=ticker,
+        buy_k=float(buy_k),
+        sell_k=float(sell_k),
+        level_unit=level_unit,
+        min_win_k=min_win_k,
+        **sizing,
+        **rules,
+    )
+
+
+def position_params(
+    defaults: AppleTraderConfig, unit_label: str, copy: FormCopy, col_a, col_b,
+) -> dict:
+    """How much is bought and when a buy waits for momentum: the size, the
+    ladder and the confirmation period. Shared by every instrument (and every
+    racer), so none of it is keyed by ticker. `col_a` and `col_b` are the two
+    columns the levels sit in, which the size and the period continue."""
     position_pct = col_a.number_input(
         "Position size (% of cash)",
         min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
@@ -249,43 +279,53 @@ def dayrange_params(
         key=copy.key("momentum_confirmation_bars"),
         help=copy.help.get("momentum_confirmation_bars"),
     )
-    # A pair the wrong way round is not a strategy -- it would sell at a price
-    # below the one it bought at, on every bar. The config refuses it outright,
-    # which here would take the whole page down mid-render, so the pair is
-    # repaired and the repair is stated rather than applied quietly.
-    if sell_k >= buy_k:
-        sell_k = round(max(0.0, buy_k - 0.05), 2)
-        st.error(
-            f"The sell distance must be smaller than the buy distance — using "
-            f"{sell_k:g} until the buy distance is raised.",
-            icon=":material/error:",
-        )
+    return {
+        "position_pct": float(position_pct),
+        "scale_in": bool(scale_in),
+        "buy_step_k": float(buy_step_k),
+        "momentum_confirmation_bars": int(momentum_confirmation_bars),
+    }
+
+
+def repaired_sell(buy_k: float, sell_k: float, label: str = "") -> float:
+    """`sell_k`, or a repair of it when it is not under `buy_k`.
+
+    A pair the wrong way round is not a strategy -- it would sell at a price
+    below the one it bought at, on every bar. The config refuses it outright,
+    which here would take the whole page down mid-render, so the pair is
+    repaired and the repair is stated rather than applied quietly."""
+    if sell_k < buy_k:
+        return sell_k
+    repaired = round(max(0.0, buy_k - 0.05), 2)
+    st.error(
+        f"{label + ': ' if label else ''}The sell distance must be smaller than the buy "
+        f"distance — using {repaired:g} until the buy distance is raised.",
+        icon=":material/error:",
+    )
+    return repaired
+
+
+def rule_params(
+    defaults: AppleTraderConfig, buy_k: float, sell_k: float, unit_label: str,
+    copy: FormCopy, take_on: bool,
+) -> dict:
+    """The forecast-breach rules and the managed exit: shared by every
+    instrument. `buy_k` and `sell_k` only feed the stop's `?`, which says what
+    the stop fraction comes to against them."""
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     stop_gain_fraction, take_fraction, hold_min_gain_k, take_min_gain_fraction = exit_params(
-        defaults, float(buy_k), float(sell_k), unit_label, copy,
-        take_on=bool(momentum_confirmation_bars),
+        defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
     )
-    min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
-    return AppleTraderConfig(
-        model_key=model_key,
-        ticker=ticker,
-        buy_k=float(buy_k),
-        sell_k=float(sell_k),
-        position_pct=float(position_pct),
-        scale_in=bool(scale_in),
-        buy_step_k=float(buy_step_k),
-        momentum_confirmation_bars=int(momentum_confirmation_bars),
-        level_unit=level_unit,
-        breach_update=breach_update,
-        contain_range=contain_range,
-        breach_exit=breach_exit,
-        stop_gain_fraction=stop_gain_fraction,
-        take_fraction=take_fraction,
-        take_min_gain_fraction=take_min_gain_fraction,
-        hold_min_gain_k=hold_min_gain_k,
-        min_win_k=min_win_k,
-    )
+    return {
+        "breach_update": breach_update,
+        "contain_range": contain_range,
+        "breach_exit": breach_exit,
+        "stop_gain_fraction": stop_gain_fraction,
+        "take_fraction": take_fraction,
+        "take_min_gain_fraction": take_min_gain_fraction,
+        "hold_min_gain_k": hold_min_gain_k,
+    }
 
 
 def min_win_param(
@@ -543,3 +583,110 @@ def stop_warning(column, stop_gain_fraction: float) -> None:
 def section(title: str, help: "str | None") -> None:
     """A small heading for a group of knobs, with the group's explanation on its `?`."""
     st.markdown(f"**{title}**", help=help or None)
+
+
+# --- Orchestra: Apple Trader's rules over several pairs (agent_stonks.orchestra) --
+
+
+def orchestra_params(
+    symbols: "list[str] | None",
+    copy: FormCopy,
+    seed: "OrchestraConfig | None" = None,
+) -> "OrchestraConfig | None":
+    """Orchestra's setup: which (ticker, model) pairs, each pair's own numbers,
+    and the rules they all share. None while no pair is picked.
+
+    Its own agent with its own settings: `copy` carries Orchestra's widget-key
+    prefix, so nothing here is shared with Apple Trader's form. Every per-pair
+    widget is keyed by model and ticker, since two pairs can share a ticker.
+
+    `seed` is a running Orchestra's configuration, for the same reason as
+    `params`' -- a running racer adopts what its two widgets hold, so they
+    reopen on its numbers rather than the pair's shipped ones.
+    """
+    from .orchestra import (
+        build_orchestra_config, default_pairs, all_pairs, racer_key, racer_label,
+    )
+
+    available = {str(s).strip().upper() for s in (symbols or [])}
+
+    def label(key: str) -> str:
+        ticker = key.partition(":")[0]
+        text = racer_label(key)
+        return text if not available or ticker in available else f"{text} ({copy.unavailable_suffix})"
+
+    # The chips carry the plain label: Streamlit keeps a chip's text from when
+    # it was picked, so a "(not streamed)" there would outlive the fix. The
+    # rows below say it instead.
+    pairs = st.multiselect(
+        "Pairs",
+        all_pairs(),
+        default=default_pairs(),
+        format_func=racer_label,
+        key=copy.key("pairs"),
+        help=copy.help.get("pairs"),
+    )
+    if not pairs:
+        st.info("Pick at least one (ticker, model) pair.", icon=":material/info:")
+        return None
+
+    defaults = AppleTraderConfig()
+    section("Levels", copy.sections.get("pairs"))
+    level_unit = level_unit_param(defaults, copy)
+    unit_label = UNIT_FORM_LABELS[level_unit]
+    seeded = {
+        racer_key(r): r for r in (seed.racers if seed is not None else [])
+        if r.level_unit == level_unit
+    }
+    head = st.columns([2.2, 1, 1, 1])
+    head[0].caption("Pair")
+    head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
+    head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
+    head[3].caption("Min win", help=copy.help.get("pair_min_win_k"))
+    levels: dict = {}
+    for key in pairs:
+        ticker, _, model_key = key.partition(":")
+        default_buy, default_sell = dayrange_levels(ticker, model_key)
+        start_buy, start_sell = default_buy, default_sell
+        if key in seeded:
+            start_buy, start_sell = float(seeded[key].buy_k), float(seeded[key].sell_k)
+        row = st.columns([2.2, 1, 1, 1], vertical_alignment="center")
+        row[0].markdown(label(key))
+        buy_k = row[1].number_input(
+            f"{key} buy", min_value=0.05, max_value=3.0, value=start_buy, step=0.05,
+            format="%.2f", key=copy.key(f"buy_k_{model_key}_{ticker}"),
+            label_visibility="collapsed",
+        )
+        sell_k = row[2].number_input(
+            f"{key} sell", min_value=0.0, max_value=3.0, value=start_sell, step=0.05,
+            format="%.2f", key=copy.key(f"sell_k_{model_key}_{ticker}"),
+            label_visibility="collapsed",
+        )
+        min_win_k = row[3].number_input(
+            f"{key} min win", min_value=0.0, max_value=3.0, value=min_win_for(ticker),
+            step=0.05, format="%.2f", key=copy.key(f"min_win_k_{model_key}_{ticker}"),
+            label_visibility="collapsed",
+        )
+        sell_k = repaired_sell(float(buy_k), float(sell_k), racer_label(key))
+        if min_win_k and min_win_k >= float(buy_k) - sell_k:
+            st.warning(
+                f"{racer_label(key)}: the min win is at or above the "
+                f"{float(buy_k) - sell_k:.2f} its levels are apart, so every trade stands it "
+                "down — one trade a day for this pair.",
+                icon=":material/warning:",
+            )
+        levels[key] = (float(buy_k), float(sell_k), float(min_win_k))
+
+    col_a, col_b = st.columns(2)
+    sizing = position_params(defaults, unit_label, copy, col_a, col_b)
+    first_buy, first_sell, _ = levels[pairs[0]]
+    rules = rule_params(
+        defaults, first_buy, first_sell, unit_label, copy,
+        take_on=bool(sizing["momentum_confirmation_bars"]),
+    )
+    base = replace(defaults, level_unit=level_unit, **sizing, **rules)
+    try:
+        return build_orchestra_config(list(pairs), base, levels)
+    except ValueError as exc:
+        st.error(str(exc), icon=":material/error:")
+        return None

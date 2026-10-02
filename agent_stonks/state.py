@@ -1,3 +1,5 @@
+import contextlib
+import contextvars
 import json
 import threading
 import time
@@ -228,6 +230,9 @@ _DEFAULTS: dict[str, object] = {
     "history_feed": DEFAULT_HISTORY_FEED,
     "history_feed_resolved": "",
     "bar_tape_override": "",
+    "orchestra_configs": {},
+    "orchestra_levels": {},
+    "orchestra": None,
     "api_key": "",
     "api_secret": "",
     "status": "Idle",
@@ -340,6 +345,17 @@ class AppState:
         # `DayRangeTrader._record_levels`. The chart draws this in place of a
         # re-derived walk, so its levels are the ones the log quotes.
         self.apple_trader_levels = None
+        # The same two, once per racer, when Apple Trader races several
+        # (ticker, model) pairs (see agent_stonks.orchestra): the form's
+        # configuration for each and what each actually rested, keyed by the
+        # racer's key ("INTC:dayrange"). A race runs two traders on one symbol
+        # when it races both of its models, so a symbol is not a key.
+        self.orchestra_configs: dict = {}
+        self.orchestra_levels: dict = {}
+        # The running (or last) race as a whole: its racers in order, which one
+        # holds the position, and one board row per racer -- written by the
+        # coordinator every cycle, read by the Agent tab and the session file.
+        self.orchestra: "dict | None" = None
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"
@@ -596,6 +612,26 @@ def bar_tape(app: "AppState") -> str:
     return str(getattr(app, "feed", "") or "")
 
 
+# Fields merged into every agent-log entry written inside `agent_log_tag`. A
+# race runs several Apple Traders in one loop, two of them possibly on the same
+# symbol, and their lines say only the symbol; the tag says which racer wrote
+# each one without threading a name through every log call they make.
+_LOG_TAG: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar(
+    "agent_log_tag", default=None
+)
+
+
+@contextlib.contextmanager
+def agent_log_tag(**fields):
+    """Tag every entry `append_agent_log` writes in this block (this thread or
+    task only) with `fields`. An entry's own field of the same name wins."""
+    token = _LOG_TAG.set({**(_LOG_TAG.get() or {}), **fields})
+    try:
+        yield
+    finally:
+        _LOG_TAG.reset(token)
+
+
 def append_agent_log(state: "AppState", entry: dict) -> None:
     """Timestamp an agent-log entry and append it under the state's lock.
 
@@ -604,8 +640,9 @@ def append_agent_log(state: "AppState", entry: dict) -> None:
     orchestrator all do -- and the UI panel reads it back. It is a property of
     the state, not of whoever happens to be running.
     """
+    tag = _LOG_TAG.get()
     with state.lock:
-        state.agent_log.append({"ts": clock.now().isoformat(), **entry})
+        state.agent_log.append({"ts": clock.now().isoformat(), **(tag or {}), **entry})
 
 
 def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":

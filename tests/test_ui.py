@@ -533,3 +533,44 @@ class TestChartStart:
         # 23:30 ET on the 29th is 03:30 UTC on the 30th.
         start = self._et(_chart_start([{"t": "2026-09-30T03:30:00+00:00"}], pre_market=False))
         assert str(start.date()) == "2026-09-29"
+
+
+class TestOrchestraIsItsOwnAgent:
+    """Orchestra is a personality of its own, not a mode of Apple Trader."""
+
+    def test_listed_as_a_rule_agent_with_its_own_label_and_face(self):
+        from agent_stonks import ui
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+        from agent_stonks.orchestra import ORCHESTRA_KEY, ORCHESTRA_LABEL
+
+        assert ORCHESTRA_KEY in ui.RULE_AGENT_KEYS
+        assert ui._personality_label(ORCHESTRA_KEY) == ORCHESTRA_LABEL == "Orchestra (rule-based, no LLM)"
+        assert ui._avatar_data_uri(ORCHESTRA_KEY)
+        assert ui._avatar_data_uri(ORCHESTRA_KEY) != ui._avatar_data_uri(APPLE_TRADER_KEY)
+
+    def test_its_settings_are_its_own_and_remembered(self):
+        from agent_stonks import last_setup, ui
+
+        assert ui._ORCHESTRA_COPY.prefix == "orchestra"
+        assert ui._APPLE_TRADER_COPY.prefix == "apple_trader"
+        assert last_setup.is_kept("orchestra_buy_k_highlow_AAPL")
+        assert last_setup.is_kept("orchestra_pairs")
+        # A button's value cannot be restored into a session, so it is not kept.
+        assert not last_setup.is_kept("add_symbols_for_orchestra")
+
+    def test_the_momentum_window_is_the_pairs_on_this_symbol(self):
+        from types import SimpleNamespace
+
+        from agent_stonks.apple_trader import AppleTraderConfig
+        from agent_stonks.orchestra import ORCHESTRA_KEY
+
+        state = SimpleNamespace(
+            llm_personality=ORCHESTRA_KEY, timeframe="1Min", agent_running=False,
+            apple_trader_config=None, apple_trader_levels=None, orchestra=None,
+            orchestra_levels={},
+            orchestra_configs={
+                "INTC:dayrange": AppleTraderConfig(ticker="INTC", momentum_confirmation_bars=7),
+            },
+        )
+        sym = SimpleNamespace(symbol="INTC", tactics=None, alerts=[])
+        assert _agent_momentum(state, sym) == (7, "Orchestra")

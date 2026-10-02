@@ -1082,13 +1082,61 @@ class TestDayRangeEngine:
         assert fills[0]["action"] == "buy"
         assert fills[-1]["action"] == "sell"
 
+    # --- the race (`agent_stonks.orchestra`) on the same engine -------------
+
+    def _run_race(self, monkeypatch, racers: "list[dict]", symbols: "list[str]"):
+        from agent_stonks.orchestra import ORCHESTRA_KEY
+
+        self._stub_model(monkeypatch)
+        record = {"racers": [
+            {"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
+             "momentum_confirmation_bars": 0, **r}
+            for r in racers
+        ]}
+        agent = rule_agent(ORCHESTRA_KEY)
+        config = SimulationConfig(
+            personality=ORCHESTRA_KEY, provider=RULE_PROVIDER,
+            model=agent.signature(agent.from_record(record)), api_key="",
+            symbols=symbols, days=[DAY], starting_cash=10_000.0, rule_config=record,
+        )
+        return SimulationEngine(SimMarket(symbols, [DAY]), config).run()
+
+    def test_a_race_of_one_replays_exactly_as_apple_trader(self, dayrange_store, monkeypatch):
+        _, single = self._run(monkeypatch)
+        raced = self._run_race(monkeypatch, [{"ticker": "AAPL"}], ["AAPL"])
+        assert single.error is None and raced.error is None
+        strip = lambda ds: [  # noqa: E731
+            (d["ts"], d["symbol"], d["action"], d["status"], d["price"], d["filled_quantity"])
+            for d in ds
+        ]
+        assert strip(raced.decisions) == strip(single.decisions)
+        assert raced.final_value == pytest.approx(single.final_value)
+
+    def test_a_race_needs_every_racers_symbol_in_the_dataset(
+        self, dayrange_store, monkeypatch
+    ):
+        result = self._run_race(
+            monkeypatch, [{"ticker": "AAPL"}, {"ticker": "INTC"}], ["AAPL"],
+        )
+        assert "trades AAPL, INTC" in (result.error or "")
+
+    def test_a_orchestra_record_round_trips_and_signs_every_pair(self):
+        from agent_stonks.orchestra import ORCHESTRA_KEY, build_orchestra_config
+
+        agent = rule_agent(ORCHESTRA_KEY)
+        race = build_orchestra_config(["AAPL:dayrange", "INTC:highlow"], AppleTraderConfig())
+        back = agent.from_record(json.loads(json.dumps(agent.to_record(race))))
+        assert back == race
+        assert agent.symbols(back) == ["AAPL", "INTC"]
+        assert agent.signature(back).startswith("orchestra[dayrange_AAPL@")
+
 
 class TestRuleAgentRegistry:
     """What the engine, the runner and the UI rely on being true of *every*
     rule agent, so adding one cannot half-wire it."""
 
     def test_every_rule_agent_is_replayable(self):
-        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY}
+        assert set(RULE_AGENTS) == {APPLE_TRADER_KEY, "orchestra"}
         for key, agent in RULE_AGENTS.items():
             assert agent.key == key
             assert agent.default_ticker and agent.label

@@ -10,8 +10,8 @@ was the slow part of getting back to trading. This module keeps them in
 widgets are drawn.
 
 - **What is kept** is a widget's value, by its key: `KEYS`, and every key under
-  `PREFIXES` (the keys Apple Trader's form and the model pickers build from the
-  instrument or the provider). Never the credential fields -- those come from
+  `PREFIXES` (the keys Apple Trader's and Orchestra's forms and the model pickers
+  build from the instrument or the provider). Never the credential fields -- those come from
   the environment, and a plain file under data/ is no place for them -- nor
   buttons, nor the day's "Continue today's session" box, which is not a setting.
 - **Seeded, never forced.** A value goes into session state only where the key
@@ -90,7 +90,7 @@ KEYS = frozenset({
     "agent_auto_resume",
 })
 # Keys built from the instrument, the model or the provider on screen.
-PREFIXES = ("apple_trader_", "agent_llm_model_", "premarket_model_")
+PREFIXES = ("apple_trader_", "orchestra_", "agent_llm_model_", "premarket_model_")
 
 # Session-state key of the value this session last saw under each kept key.
 _SEEN = "_last_setup_seen"

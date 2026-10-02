@@ -115,6 +115,14 @@ class BaseTrader:
         self.blocked: "dict | None" = None
         # The decision the last `buy` produced; see there.
         self.last_buy = None
+        # Whether something outside this trader forbids opening a position now:
+        # a callable returning the reason, or None while entries are open. A
+        # trader running alone has none. A race (`orchestra`) sets one on
+        # every racer, closed while another racer holds the cash.
+        self.entry_gate = None
+        # The reason the gate last gave, so a level touched bar after bar while
+        # the gate is closed is reported once rather than every minute.
+        self._gate_note: "str | None" = None
 
     # --- the status line -------------------------------------------------
 
@@ -164,6 +172,25 @@ class BaseTrader:
             return None, CLOSED
 
         return sym_state, None
+
+    def entry_refused(self, state: "AppState", ts) -> bool:
+        """Whether the entry gate forbids a buy this trader's rules just called
+        for, saying so the first time in a stretch of refusals."""
+        reason = self.entry_gate() if self.entry_gate is not None else None
+        if reason is None:
+            self._gate_note = None
+            return False
+        if reason != self._gate_note:
+            self._gate_note = reason
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": f"{self.ticker} reached its buy level at {ts:%H:%M}, "
+                    f"but {reason}.",
+                },
+            )
+        return True
 
     def closing_soon(self) -> bool:
         """Whether the flatten-before-close rule is already in force."""
@@ -318,12 +345,15 @@ def launch(
     state: "AppState",
     tracker: "DecisionTracker",
     agent_key: str,
-    ticker: str,
+    ticker: "str | list[str]",
     target,
     args: tuple,
     stop_agent,
 ) -> None:
     """Stop whatever agent is running for this state, then start `target`.
+
+    `ticker` is the symbol the run trades, or every symbol it may trade (a
+    race, `orchestra`) -- what the session's scorecard is opened over.
 
     `stop_agent` is passed in rather than imported to keep this module off
     `agent.py`, which imports enough of the app that a rule agent should not
@@ -334,7 +364,7 @@ def launch(
     state.agent_stop_event = stop_event
     state.agent_running = True
     state.agent_activity = (WAITING, "Agent starting")
-    scoring.begin_session(state, agent_key, [ticker])
+    scoring.begin_session(state, agent_key, [ticker] if isinstance(ticker, str) else list(ticker))
     threading.Thread(
         target=target, args=(*args, stop_event), daemon=True
     ).start()

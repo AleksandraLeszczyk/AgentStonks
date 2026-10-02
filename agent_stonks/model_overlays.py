@@ -1229,11 +1229,10 @@ def live_overlays(
 
     # The agent's configuration is in the key because `trader_levels` is a
     # picture of it: moving a distance in the sidebar has to move the lines on
-    # the next rerun, not on the next bar.
-    config = getattr(getattr(sym_state, "app", None), "apple_trader_config", None)
-    # And the running agent's record, which grows once a cycle and changes the
-    # moment a sidebar edit is adopted -- which can be mid-bar.
-    history = getattr(getattr(sym_state, "app", None), "apple_trader_levels", None)
+    # the next rerun, not on the next bar. And the running agent's record,
+    # which grows once a cycle and changes the moment a sidebar edit is
+    # adopted -- which can be mid-bar.
+    config, history = live_trader_view(getattr(sym_state, "app", None), sym_state.symbol)
     rows = (history or {}).get("rows") or []
     key = (
         bars[-1].get("t"), tuple(wanted), len(bars),
@@ -1259,6 +1258,47 @@ def live_overlays(
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}
     return result
+
+
+def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
+    """`(trader_config, trader_history)` for the live chart of `symbol`.
+
+    Outside a race that is the single run's: the form's configuration and the
+    running agent's record (`AppState.apple_trader_config`/`apple_trader_levels`).
+
+    A race (`orchestra`) keeps one of each per racer, and races both models of
+    a symbol when it has two, so the chart of a symbol has to pick: the racer
+    holding the position when it trades this symbol, otherwise the first racer
+    on it in the race's order. Its own record when it has one, otherwise the
+    form's configuration for it, walked like any configuration without a record.
+    A symbol the race does not trade gets neither, and draws the instrument's
+    shipped configuration.
+    """
+    if app is None:
+        return None, None
+    race = getattr(app, "orchestra", None) or {}
+    configs = getattr(app, "orchestra_configs", None) or {}
+    if not configs and not race.get("running"):
+        return (
+            getattr(app, "apple_trader_config", None),
+            getattr(app, "apple_trader_levels", None),
+        )
+    symbol = (symbol or "").upper()
+    records = getattr(app, "orchestra_levels", None) or {}
+    order = list(race.get("order") or []) + [k for k in configs if k not in (race.get("order") or [])]
+    on_symbol = [
+        key for key in order
+        if str((records.get(key) or {}).get("ticker") or getattr(configs.get(key), "ticker", "")).upper()
+        == symbol
+    ]
+    if not on_symbol:
+        return None, None
+    holder = race.get("holder")
+    key = holder if holder in on_symbol else on_symbol[0]
+    record = records.get(key)
+    if record:
+        return record.get("config") or configs.get(key), record
+    return configs.get(key), None
 
 
 # The overlays that run TimeToChange3's forecast, and so need its inputs.

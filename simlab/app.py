@@ -41,6 +41,8 @@ from agent_stonks.apple_trader import (
     AppleTraderConfig,
 )
 from agent_stonks import apple_trader_ui
+from agent_stonks.orchestra import ORCHESTRA_KEY
+from agent_stonks.orchestra import default_pairs as default_orchestra_pairs
 from agent_stonks.charts import (
     add_candle_patterns,
     add_model_overlays,
@@ -214,6 +216,21 @@ def _render_rule_agent(personality: str) -> None:
         ":material/function: Rule-based — no LLM, no prompt, no tools. The same tape "
         "always produces the same trades."
     )
+    if personality == ORCHESTRA_KEY:
+        st.markdown(
+            "Apple Trader's rules on several **(ticker, model) pairs** at once, from one "
+            "cash balance. Every pair forecasts its own session at 9:35 and rests its own "
+            "levels; the first whose buy fills is the only one that trades until its "
+            "position is closed, and then the others may buy again. A stop-out stands "
+            "every pair down for the rest of that session. Each pair's own rules are "
+            "Apple Trader's, unchanged — Orchestra with one pair replays exactly as "
+            "Apple Trader."
+        )
+        st.caption(
+            ":material/database: A dataset must carry every pair's symbol, and the "
+            "oracle ceiling is the best round trip on any of them."
+        )
+        return
     _render_apple_rules()
 
 
@@ -740,12 +757,21 @@ def _apple_config_key(record: dict, symbol: str) -> tuple:
     which is what it does everywhere else it is not told otherwise.
     """
     summary = record.get("config_summary") or {}
-    if summary.get("personality") != APPLE_TRADER_KEY:
+    personality = summary.get("personality")
+    if personality not in (APPLE_TRADER_KEY, ORCHESTRA_KEY):
         return ()
     try:
-        config = rule_agent(APPLE_TRADER_KEY).from_record(summary.get("rule_config") or {})
+        config = rule_agent(personality).from_record(summary.get("rule_config") or {})
     except Exception:
         return ()
+    if personality == ORCHESTRA_KEY:
+        # Orchestra trades several symbols, two pairs possibly on one: this
+        # symbol's tab draws the first racer on it, as the live chart does.
+        config = next(
+            (r for r in config.racers if r.ticker == (symbol or "").upper()), None
+        )
+        if config is None:
+            return ()
     if config.ticker != (symbol or "").upper():
         return ()
     return tuple(sorted(asdict(config).items()))
@@ -1222,10 +1248,18 @@ def _configured_rule_tickers(personalities: list[str]) -> dict[str, list[str]]:
             continue
         found = []
         for slot in _rule_slots(personality):
-            stored = st.session_state.get(f"sim_rule_{personality}_{slot}_ticker")
-            symbol = str(stored or agent.default_ticker).strip().upper()
-            if symbol and symbol not in found:
-                found.append(symbol)
+            if personality == ORCHESTRA_KEY:
+                pairs = st.session_state.get(f"sim_rule_{personality}_{slot}_pairs")
+                symbols = [
+                    str(p).partition(":")[0].upper()
+                    for p in (default_orchestra_pairs() if pairs is None else pairs)
+                ]
+            else:
+                stored = st.session_state.get(f"sim_rule_{personality}_{slot}_ticker")
+                symbols = [str(stored or agent.default_ticker).strip().upper()]
+            for symbol in symbols:
+                if symbol and symbol not in found:
+                    found.append(symbol)
         tickers[personality] = found
     return tickers
 
@@ -1384,7 +1418,7 @@ def _experiment_symbols(
     this change**. Nothing rewrites those records; they are what they were.
     """
     if personality in RULE_AGENTS:
-        return [rule_agent(personality).ticker(rule_settings)]
+        return rule_agent(personality).symbols(rule_settings)
     return list(basket)
 
 
@@ -1408,7 +1442,8 @@ def _rule_agents_missing_ticker(
     missing: list[tuple[str, str, list[str]]] = []
     for personality, configs in rule_setups.items():
         agent = rule_agent(personality)
-        for ticker in dict.fromkeys(agent.ticker(config) for config in configs):
+        traded = [t for config in configs for t in agent.symbols(config)]
+        for ticker in dict.fromkeys(traded):
             names = [
                 name for name in selected_names
                 if ticker not in (datasets_by_name[name].symbols or [])
@@ -1465,6 +1500,7 @@ def _render_rule_params(
     """
     renderers = {
         APPLE_TRADER_KEY: _render_apple_setup,
+        ORCHESTRA_KEY: _render_orchestra_setup,
     }
     return {
         key: _render_agent_setups(key, symbols, renderers[key])
@@ -1975,6 +2011,27 @@ def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
 
 
 _apple_model_label = apple_trader_ui.model_label
+
+
+def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
+    """One Orchestra setup in the Simulate tab: its pairs, each pair's own
+    numbers and the rules they share -- the live form's, under SimLab's copy.
+    Not swept: an Orchestra is compared against its pairs' Apple Trader runs and
+    other Orchestras as whole configurations, each its own setup."""
+    fields = dict(_APPLE_TRADER_COPY_FIELDS)
+    fields["help"] = {
+        **fields.get("help", {}),
+        "pairs": (
+            "The (ticker, model) pairs Orchestra watches. Every pair's symbol must be "
+            "in the datasets. The order is the tie-break when two buys fill on one bar. "
+            "Each Orchestra setup is one row in Results; compare it with Apple Trader "
+            "setups on the same pairs."
+        ),
+    }
+    race = apple_trader_ui.orchestra_params(
+        symbols, apple_trader_ui.FormCopy(prefix=prefix, **fields),
+    )
+    return [race] if race is not None else []
 
 
 def render_simulate_tab() -> None:

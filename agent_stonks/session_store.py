@@ -168,6 +168,29 @@ def _levels_record(levels: "dict | None") -> "dict | None":
     }
 
 
+def _orchestra_levels_record(records: "dict | None") -> dict:
+    """A race's per-racer records (`AppState.orchestra_levels`), each as
+    `_levels_record` keeps a single run's."""
+    return {
+        str(key): kept
+        for key, levels in (records or {}).items()
+        if (kept := _levels_record(levels)) is not None
+    }
+
+
+def _orchestra_record(race: "dict | None") -> "dict | None":
+    """What a restart needs of the race itself: its racers in order and which
+    one held the position. The board is rebuilt by the next cycle."""
+    if not race:
+        return None
+    return {
+        "date": race.get("date"),
+        "order": list(race.get("order") or []),
+        "labels": dict(race.get("labels") or {}),
+        "holder": race.get("holder"),
+    }
+
+
 def is_streaming(state) -> bool:
     """Whether `state`'s live stream is running: started, and not stopped."""
     event = getattr(state, "bars_fallback_stop_event", None)
@@ -223,6 +246,8 @@ def capture(state) -> dict:
         "agent_equity_history": equity,
         "tracker": ledger,
         "apple_trader_levels": _levels_record(getattr(state, "apple_trader_levels", None)),
+        "orchestra_levels": _orchestra_levels_record(getattr(state, "orchestra_levels", None)),
+        "orchestra": _orchestra_record(getattr(state, "orchestra", None)),
         "run": _run_record(state),
     }
 
@@ -363,6 +388,16 @@ def restore(state, record: "dict | None" = None) -> "dict | None":
     levels = _levels_from(record.get("apple_trader_levels"))
     if levels is not None:
         state.apple_trader_levels = levels
+    race_levels = {
+        str(key): restored
+        for key, raw in (record.get("orchestra_levels") or {}).items()
+        if (restored := _levels_from(raw)) is not None
+    }
+    if race_levels:
+        state.orchestra_levels = race_levels
+    if record.get("orchestra"):
+        # Not running: only ▶ Start (or the restart resume) runs it again.
+        state.orchestra = {**record["orchestra"], "running": False}
     _claim_if_free(state, day)
     tracker = state.decision_tracker
     summary = {
@@ -431,6 +466,11 @@ def _signature(state) -> tuple:
         ledger = None
     levels = getattr(state, "apple_trader_levels", None) or {}
     rows = levels.get("rows") or []
+    race = getattr(state, "orchestra", None) or {}
+    racers = tuple(
+        (key, len(record.get("rows") or []), repr(record.get("memory")))
+        for key, record in sorted((getattr(state, "orchestra_levels", None) or {}).items())
+    )
     return (
         ledger,
         len(state.agent_log),
@@ -441,6 +481,8 @@ def _signature(state) -> tuple:
         len(rows),
         rows[-1].get("t") if rows else None,
         repr(levels.get("memory")),
+        racers,
+        race.get("holder"),
         # A stop has to reach the file promptly, or a crash right after it
         # would start the stopped run again.
         bool(state.agent_running),

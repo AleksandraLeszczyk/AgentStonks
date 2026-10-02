@@ -16,8 +16,9 @@ Results, and how to build a trader exposing a uniform
 
 The ticker is asked of the *config* rather than of the agent, because the agent
 picks its instrument -- Apple Trader from the symbols its chosen model was
-fitted on. It is still single-symbol per run, which is what the dataset check
-depends on.
+fitted on. Apple Trader is single-symbol per run; Orchestra
+(`agent_stonks.orchestra`) trades several, which is why the dataset check asks
+for `tickers` -- every symbol a config may trade -- rather than the one.
 """
 from __future__ import annotations
 
@@ -43,6 +44,18 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
+from agent_stonks.orchestra import (
+    ORCHESTRA_AVATAR,
+    ORCHESTRA_KEY,
+    ORCHESTRA_LABEL,
+    OrchestraConfig,
+    build_orchestra,
+    build_orchestra_config,
+    default_pairs,
+    load_racers,
+    orchestra_signature,
+    racer_label,
+)
 
 
 @dataclass(frozen=True)
@@ -52,10 +65,9 @@ class RuleAgent:
     key: str
     label: str
     avatar: str
-    # config -> the single symbol that config trades. A rule agent is
-    # single-symbol per run by design, and a dataset without that symbol is a
-    # configuration mistake worth catching before the run produces an empty
-    # ledger.
+    # config -> the symbol that config trades (the first, for Orchestra). A
+    # dataset without it is a configuration mistake worth catching before the
+    # run produces an empty ledger.
     ticker: Callable[[Any], str]
     # The symbol a config that has not been built yet would trade -- what a
     # description page names, and the fallback wherever there is no config in
@@ -70,6 +82,12 @@ class RuleAgent:
     # config <-> the JSON-ready dict stored on the experiment record.
     to_record: Callable[[Any], dict]
     from_record: Callable[[Optional[dict]], Any]
+    # config -> every symbol that config may trade, in order: what a dataset
+    # must carry and what the run is handed. One for a single-symbol agent.
+    tickers: Optional[Callable[[Any], "list[str]"]] = None
+
+    def symbols(self, config) -> "list[str]":
+        return list(self.tickers(config)) if self.tickers is not None else [self.ticker(config)]
 
 
 class _BundleBound:
@@ -235,6 +253,32 @@ def _apple_from_record(raw: "dict | None") -> AppleTraderConfig:
     return AppleTraderConfig(**{k: v for k, v in merged.items() if k in _APPLE_FIELDS})
 
 
+# ---------------------------------------------------------------- Orchestra
+
+
+def _build_orchestra(config: OrchestraConfig):
+    """Orchestra over the config's pairs, each with its model loaded and
+    checked as Apple Trader's is (`_build_apple`). Any pair that cannot run
+    fails the whole replay: an Orchestra quietly short of a pair is a different
+    configuration from the one its signature names."""
+    bundles, refusals = load_racers(config)
+    if refusals:
+        raise RuntimeError("; ".join(
+            f"{racer_label(key)}: {reason}" for key, reason in refusals.items()
+        ))
+    return build_orchestra(config, bundles)
+
+
+def _orchestra_from_record(raw: "dict | None") -> OrchestraConfig:
+    """Each racer decoded as a single Apple Trader record is -- the same
+    legacy defaults for a field a later version added. No record at all is
+    the default Orchestra: every tuned pair on today's rules."""
+    racers = (raw or {}).get("racers") or []
+    if not racers:
+        return build_orchestra_config(default_pairs(), AppleTraderConfig())
+    return OrchestraConfig([_apple_from_record(r) for r in racers])
+
+
 # ------------------------------------------------------------------ registry
 
 RULE_AGENTS: dict[str, RuleAgent] = {
@@ -251,6 +295,18 @@ RULE_AGENTS: dict[str, RuleAgent] = {
         signature=apple_config_signature,
         to_record=asdict,
         from_record=_apple_from_record,
+    ),
+    ORCHESTRA_KEY: RuleAgent(
+        key=ORCHESTRA_KEY,
+        label=ORCHESTRA_LABEL,
+        avatar=ORCHESTRA_AVATAR,
+        ticker=lambda config: config.racers[0].ticker,
+        tickers=lambda config: config.tickers,
+        default_ticker=APPLE_TRADER_TICKER,
+        build=_build_orchestra,
+        signature=orchestra_signature,
+        to_record=asdict,
+        from_record=_orchestra_from_record,
     ),
 }
 

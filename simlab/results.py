@@ -244,7 +244,13 @@ def ml_models(record: dict) -> "list[str] | None":
     named = str(rule_config.get("model_key") or "").strip()
     if named:
         return [named]
-    return None
+    # Orchestra (`agent_stonks.orchestra`): every model a pair ran on, in order.
+    raced = [
+        str(r.get("model_key") or "").strip()
+        for r in rule_config.get("racers") or [] if isinstance(r, dict)
+    ]
+    raced = list(dict.fromkeys(m for m in raced if m))
+    return raced or None
 
 
 def ml_model_key(record: dict) -> str:
@@ -277,7 +283,8 @@ def ml_model_key(record: dict) -> str:
     # the breakdown would be worse than filing it as unknown.
     if not models:
         return UNKNOWN_INSTRUMENT
-    return models[0]
+    # Orchestra over several models is its own group, named by all of them.
+    return "+".join(models)
 
 
 def agent_key(record: dict) -> str:

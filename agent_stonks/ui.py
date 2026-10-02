@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace as dc_replace
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +42,13 @@ from .apple_trader import (
     launch_apple_trader,
 )
 from .apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
+from .orchestra import (
+    ORCHESTRA_AVATAR,
+    ORCHESTRA_KEY,
+    ORCHESTRA_LABEL,
+    OrchestraConfig,
+    launch_orchestra,
+)
 from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
     build_analysis_gauges,
@@ -342,15 +349,16 @@ def _effective_symbols(state: AppState, symbols_input: str) -> list[str]:
 
 # Agents that aren't LLM personalities and so have no entry in
 # AGENT_PERSONALITIES: the Automatic orchestrator and the rule-based Apple
-# Trader. They still need a label and a face in the picker.
+# Trader and Orchestra. They still need a label and a face in the picker.
 _NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
     AUTOMATIC_KEY: (AUTOMATIC_LABEL, AUTOMATIC_AVATAR),
     APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
+    ORCHESTRA_KEY: (ORCHESTRA_LABEL, ORCHESTRA_AVATAR),
 }
 
 # The agents that place their own orders from a fixed loop: no LLM key needed,
-# one symbol only, and their own parameter panel instead of provider/model.
-RULE_AGENT_KEYS = (APPLE_TRADER_KEY,)
+# and their own parameter panel instead of provider/model.
+RULE_AGENT_KEYS = (APPLE_TRADER_KEY, ORCHESTRA_KEY)
 
 
 def _personality_label(key: str) -> str:
@@ -908,6 +916,8 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
       the behaviour table over (the running agent's config while one runs,
       since that setting takes ▶ Start; else the form's). A legacy config
       without it: the take / fall look-back, `fall_bars`.
+    * Orchestra -- the same, read off the pair this symbol's chart draws
+      (`model_overlays.live_trader_view`); every pair shares the setting.
     * LLM personalities and Automatic -- an armed tactic or pending alert on
       `momentum_pct` compares against the close `TACTICS_MOMENTUM_WINDOW_MIN`
       minutes back.
@@ -923,14 +933,19 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
         return max(1, round(minutes / bar_min))
 
     personality = getattr(state, "llm_personality", None)
-    if personality == APPLE_TRADER_KEY:
-        running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
-        config = running.get("config") or getattr(state, "apple_trader_config", None)
+    if personality in (APPLE_TRADER_KEY, ORCHESTRA_KEY):
+        if personality == ORCHESTRA_KEY:
+            # The racer this symbol's chart draws: they share these settings.
+            config, _ = model_overlays.live_trader_view(state, sym_state.symbol)
+        else:
+            running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
+            config = running.get("config") or getattr(state, "apple_trader_config", None)
+        name = _personality_label(personality).split(" (")[0]
         confirm = int(getattr(config, "momentum_confirmation_bars", 0) or 0)
         if confirm:
-            return confirm, "Apple Trader"
+            return confirm, name
         if config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
-            return int(config.fall_bars), "Apple Trader"
+            return int(config.fall_bars), name
     elif _reads_momentum_pct(sym_state):
         return minutes_to_bars(TACTICS_MOMENTUM_WINDOW_MIN), "armed tactic"
     return minutes_to_bars(FALLBACK_MOMENTUM_MIN), f"{FALLBACK_MOMENTUM_MIN} min"
@@ -1832,6 +1847,9 @@ def _agent_log_html(log: list[dict]) -> str:
     cards = []
     for entry in reversed(log):
         icon, color, label = _agent_entry_style(entry)
+        if entry.get("racer"):
+            # An Orchestra line: which (ticker, model) pair wrote it.
+            label = f"{label} · {entry['racer']}"
         try:
             ts_fmt = pd.to_datetime(entry.get("ts", "")).strftime("%H:%M:%S")
         except Exception:
@@ -2081,9 +2099,53 @@ def _agent_log_panel() -> None:
     tactics_html = _current_tactics_html(state)
     if tactics_html:
         st.html(tactics_html)
+    _orchestra_board(state)
     with state.lock:
         log = list(state.agent_log)
     st.html(_agent_log_html(log[-50:]))
+
+
+def _orchestra_board(state: AppState) -> None:
+    """Where every pair of today's Orchestra stands (`AppState.orchestra`):
+    its status and how far its last close is above its buy level, counted in
+    its own level unit so pairs at different prices compare."""
+    race = getattr(state, "orchestra", None) or {}
+    board = race.get("board") or []
+    if not board or state.llm_personality != ORCHESTRA_KEY:
+        return
+    holder = race.get("holder")
+    title = (
+        f"🎼 Orchestra — following **{(race.get('labels') or {}).get(holder, holder)}**"
+        if holder else "🎼 Orchestra — open, the first buy to fill takes it"
+    )
+    if not race.get("running"):
+        title += " (stopped)"
+    st.markdown(title)
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "Pair": row["label"],
+                "Status": row["status"],
+                "Above buy (units)": row["to_buy"],
+                "Last": row["close"],
+                "Buy": row["buy"],
+                "Sell": row["sell"],
+            }
+            for row in board
+        ]),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Last": st.column_config.NumberColumn(format="$%.2f"),
+            "Buy": st.column_config.NumberColumn(format="$%.2f"),
+            "Sell": st.column_config.NumberColumn(format="$%.2f"),
+            "Above buy (units)": st.column_config.NumberColumn(
+                format="%+.2f",
+                help="(last close − buy level) ÷ the pair's level unit. The pair "
+                "nearest 0 is the nearest to buying.",
+            ),
+        },
+    )
 
 
 def _record_live_equity_point(state: AppState) -> None:
@@ -2613,6 +2675,39 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
     },
 )
 
+# Orchestra's form: the same knobs (and the same wording for them) as Apple
+# Trader's under its own widget-key prefix, so its settings are its own, plus
+# the wording for its pairs.
+_ORCHESTRA_COPY = dc_replace(
+    _APPLE_TRADER_COPY,
+    prefix="orchestra",
+    sections={
+        **_APPLE_TRADER_COPY.sections,
+        "pairs": (
+            "Every pair forecasts its own **H** at 9:35 and rests its own buy and sell "
+            "below it, in the same unit.\n\n"
+            "- **Buy / Sell** — each pair's own distances, starting from its tuned pair.\n"
+            "- **Min win** — each pair's circuit breaker: a trade that closes for no more "
+            "than this stands *that pair* down for the day; the others keep racing.\n"
+            "- Everything below the table is shared by every pair."
+        ),
+    },
+    help={
+        **_APPLE_TRADER_COPY.help,
+        "pairs": (
+            "The (ticker, model) pairs Orchestra watches — AAPL on the day-range model "
+            "and AAPL on HighLow are two pairs. The defaults are the pairs SimLab's "
+            "tuning has picked levels for. The order is the tie-break: when two buys "
+            "would fill on the same bar, the pair listed first takes it. Every pair's "
+            "ticker must be streamed."
+        ),
+        "pair_min_win_k": (
+            "Per pair: a trade that closes for no more than this many units a share "
+            "stands that pair down for the rest of the day. 0 is off."
+        ),
+    },
+)
+
 
 # Both rule forms are fragments: a knob change reruns the form alone rather
 # than the whole page, every tab of which Streamlit would otherwise re-render
@@ -2649,6 +2744,76 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     # that would otherwise save it never comes.
     last_setup.remember()
     return config
+
+
+def _running_orchestra(state: AppState) -> "OrchestraConfig | None":
+    """The running Orchestra's configuration as its racers now hold it, or None."""
+    race = getattr(state, "orchestra", None) or {}
+    if not (state.agent_running and race.get("running")):
+        return None
+    records = getattr(state, "orchestra_levels", None) or {}
+    racers = [
+        records[key]["config"] for key in race.get("order") or []
+        if (records.get(key) or {}).get("config") is not None
+    ]
+    try:
+        return OrchestraConfig(racers) if racers else None
+    except ValueError:
+        return None
+
+
+@st.fragment
+def _orchestra_params(symbols: list[str]) -> "OrchestraConfig | None":
+    """Orchestra's pairs, each pair's numbers and the rules they share, inside
+    the dashboard's expander. A fragment for the same reason as Apple Trader's."""
+    state = _get_state()
+    seed = _running_orchestra(state)
+    with st.expander("Orchestra rules", expanded=True):
+        race = apple_trader_ui.orchestra_params(symbols, _ORCHESTRA_COPY, seed=seed)
+        if seed is not None:
+            st.caption(
+                "The running Orchestra picks up a change to a pair's buy or sell distance "
+                "at its next bar. Every other setting — and adding or removing a pair — "
+                "takes effect on ▶ Start."
+            )
+        if race is not None:
+            missing = [t for t in race.tickers if t not in symbols]
+            if missing:
+                st.warning(
+                    f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not in "
+                    "the sidebar symbols, so Orchestra cannot read "
+                    f"{'its' if len(missing) == 1 else 'their'} bars.",
+                    icon=":material/warning:",
+                )
+                if st.button(
+                    f"Add {', '.join(missing)} to the symbols",
+                    # Not under the "orchestra_" prefix: last_setup keeps
+                    # those, and a button's value cannot be restored.
+                    key="add_symbols_for_orchestra",
+                    on_click=_add_sidebar_symbols,
+                    args=(missing,),
+                    help="Adds them to the sidebar's symbol list. ▶ Start Agent then "
+                    "restarts the live stream with them in it.",
+                ):
+                    # This form is a fragment: only a full rerun redraws the
+                    # sidebar and hands the form the longer symbol list.
+                    st.rerun(scope="app")
+    # Published for the chart (each racer's levels) and for the running
+    # Orchestra, whose racers read their two distances back from here.
+    state.orchestra_configs = (
+        {f"{r.ticker}:{r.model_key}": r for r in race.racers} if race is not None else {}
+    )
+    last_setup.remember()
+    return race
+
+
+def _add_sidebar_symbols(symbols: "list[str]") -> None:
+    """Append `symbols` to the sidebar's symbol box (an on_click callback: a
+    widget's value can only be set before it renders)."""
+    current = _parse_symbols(st.session_state.get("sidebar_symbols", ""))
+    st.session_state["sidebar_symbols"] = ", ".join(
+        current + [s for s in symbols if s not in current]
+    )
 
 
 def _execution_controls() -> str:
@@ -2728,7 +2893,7 @@ def _start_agent(
     personality: str,
     provider: str,
     model: str,
-    apple_config: "AppleTraderConfig | None",
+    apple_config: "AppleTraderConfig | OrchestraConfig | None",
     trading_mode_choice: str,
     starting_budget: float,
     continue_today: bool,
@@ -2749,19 +2914,26 @@ def _start_agent(
     llm_key = os.getenv(env_var, "")
     is_apple_trader = personality == APPLE_TRADER_KEY
     is_rule_agent = personality in RULE_AGENT_KEYS
-    # The one symbol this run trades, as configured for Apple Trader. It has
-    # to be streamed, or there are no bars to read and the agent would idle
-    # all session.
-    rule_ticker = APPLE_TRADER_TICKER
-    if personality == APPLE_TRADER_KEY and apple_config is not None:
-        rule_ticker = apple_config.ticker
+    is_orchestra = personality == ORCHESTRA_KEY
+    # The symbols a rule agent trades: Apple Trader's one, or every pair's
+    # under Orchestra. They have to be streamed, or there are no bars to read
+    # and the agent would idle all session.
+    rule_tickers = [APPLE_TRADER_TICKER]
+    if is_orchestra and isinstance(apple_config, OrchestraConfig):
+        rule_tickers = apple_config.tickers
+    elif is_apple_trader and apple_config is not None:
+        rule_tickers = [apple_config.ticker]
+    unstreamed = [t for t in rule_tickers if t not in syms]
     stream_ready = False
     if not syms:
         st.error("Enter at least one symbol in the sidebar first.")
-    elif is_rule_agent and rule_ticker not in syms:
+    elif is_orchestra and not isinstance(apple_config, OrchestraConfig):
+        st.error("Pick at least one (ticker, model) pair for Orchestra.")
+    elif is_rule_agent and unstreamed:
         st.error(
             f"{_personality_label(personality)} is configured to trade "
-            f"{rule_ticker}; add {rule_ticker} to the symbols in the sidebar."
+            f"{', '.join(rule_tickers)}; add {', '.join(unstreamed)} to the symbols in "
+            "the sidebar."
         )
     elif not llm_key and not is_rule_agent:
         st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
@@ -2842,6 +3014,12 @@ def _start_agent(
                 # The rows stay on the chart; a fresh ledger has no position
                 # and no stand-down to resume.
                 state.apple_trader_levels = {**levels, "memory": None}
+            state.orchestra_levels = {
+                key: {**record, "memory": None}
+                for key, record in (getattr(state, "orchestra_levels", None) or {}).items()
+            }
+            if getattr(state, "orchestra", None):
+                state.orchestra = {**state.orchestra, "holder": None}
         state.decision_tracker = tracker
         state.session_date = session_store.session_date()
         state.session_restored = None
@@ -2912,7 +3090,14 @@ def _start_agent(
             "starting_budget": float(starting_budget),
             "apple_config": asdict(apple_config) if apple_config is not None else None,
         }
-        if is_apple_trader:
+        if is_orchestra:
+            launch_orchestra(
+                state,
+                state.decision_tracker,
+                apple_config,
+                cycle_sec=APPLE_TRADER_CYCLE_SEC,
+            )
+        elif is_apple_trader:
             launch_apple_trader(
                 state,
                 state.decision_tracker,
@@ -2969,9 +3154,10 @@ def _agent_panel(
         "always wakes up early when fresh news breaks for any of its tickers. No real "
         "orders are ever placed. "
         f"Each filled buy/sell costs a fixed ${TRADE_FIXED_COST:.2f}. "
-        "The exceptions are the two Apple Traders, which have no LLM at all: one is a "
-        "fixed loop over a saved day-range forecast, the other runs a list of "
-        "buy/sell rules written in this panel."
+        "The exceptions are Apple Trader and Orchestra, which have no LLM at all: "
+        "Apple Trader is a fixed loop over a saved day-range forecast on one "
+        "instrument, and Orchestra runs those rules on several (ticker, model) pairs "
+        "at once, following the first whose buy fills."
     )
     with st.expander("LLM", expanded=True):
         # Automatic first: it's the regime-adaptive orchestrator that picks and
@@ -3015,6 +3201,14 @@ def _agent_panel(
                 "the ones the model was fitted on — every rule here is a model's output, "
                 "so the instrument and the model constrain each other."
             )
+        if personality == ORCHESTRA_KEY:
+            st.caption(
+                "🎼 Orchestra runs no LLM. It plays Apple Trader's rules on several "
+                "**(ticker, model) pairs** at once — AAPL on the day-range model and AAPL "
+                "on HighLow are two pairs. Each forecasts its own day at 9:35; the first "
+                "whose buy fills is followed alone until its position is closed, then the "
+                "others may buy again. A stop-out stops the agent."
+            )
         if personality in RULE_AGENT_KEYS:
             # No LLM in the loop, so no LLM settings on screen. The stored
             # choice is left untouched for when an LLM personality is picked again.
@@ -3041,11 +3235,18 @@ def _agent_panel(
             if not os.getenv(env_var):
                 st.caption(f"⚠️ {env_var} is not set.")
 
+    # Each rule agent publishes its form for the chart; the other's is cleared,
+    # so the chart never draws the levels of an agent that is not selected.
     if personality == APPLE_TRADER_KEY:
         apple_config = _apple_trader_params(symbols)
+        state.orchestra_configs = {}
+    elif personality == ORCHESTRA_KEY:
+        apple_config = _orchestra_params(symbols)
+        state.apple_trader_config = None
     else:
         apple_config = None
         state.apple_trader_config = None
+        state.orchestra_configs = {}
 
     trading_mode_choice = _execution_controls()
 
@@ -3630,10 +3831,17 @@ RESUME_RETRY_SEC = 30
 RECOVERY_BANNER_SEC = 10 * 60
 
 
-def _apple_config_from(raw: "dict | None") -> "AppleTraderConfig | None":
+def _apple_config_from(raw: "dict | None") -> "AppleTraderConfig | OrchestraConfig | None":
+    """The rule agent's configuration a run was started with, back from its
+    saved `run_spec`: Apple Trader's, or Orchestra's (`{"racers": [...]}`)."""
     if not raw:
         return None
     known = {f.name for f in fields(AppleTraderConfig)}
+    if "racers" in raw:
+        return OrchestraConfig([
+            AppleTraderConfig(**{k: v for k, v in racer.items() if k in known})
+            for racer in raw["racers"]
+        ])
     return AppleTraderConfig(**{k: v for k, v in raw.items() if k in known})
 
 

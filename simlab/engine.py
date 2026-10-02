@@ -347,11 +347,13 @@ class SimulationEngine:
         """
         agent = rule_agent(self.config.personality)
         config = agent.from_record(self.config.rule_config)
-        ticker = agent.ticker(config)
-        if ticker not in self.app.symbols:
+        traded = agent.symbols(config)
+        missing = [t for t in traded if t not in self.app.symbols]
+        if missing:
             raise RuntimeError(
-                f"{agent.label} only trades {ticker}; this simulation's "
-                f"symbols are {', '.join(self.app.symbols) or 'none'}."
+                f"{agent.label} {'only trades' if len(traded) == 1 else 'trades'} "
+                f"{', '.join(traded)}; this simulation's symbols are "
+                f"{', '.join(self.app.symbols) or 'none'}."
             )
         return agent.build(config)
 

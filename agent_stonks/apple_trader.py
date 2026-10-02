@@ -106,6 +106,34 @@ RULE_PROVIDER = "rules"
 DEFAULT_TICKER = apple_models.DEFAULT_TICKER
 
 
+class TraderSlot:
+    """Where one trader keeps its published record and reads its sidebar form.
+
+    A run of one trader uses the two fields `AppState` has always had for it:
+    `apple_trader_config`, which the form writes, and `apple_trader_levels`,
+    which the trader writes once a cycle and the chart, the session file and a
+    restart read back. A race (`orchestra`) runs several traders over one
+    state -- two of them on the same symbol, under different models -- so each
+    gets its own slot there instead, and none overwrites another's levels, its
+    open position's memory or the form it adopts edits from.
+
+    This one is the single run's, and stateless: every trader shares it unless
+    a race hands it another.
+    """
+
+    def form(self, state: AppState) -> "AppleTraderConfig | None":
+        return getattr(state, "apple_trader_config", None)
+
+    def levels(self, state: AppState) -> "dict | None":
+        return getattr(state, "apple_trader_levels", None)
+
+    def publish(self, state: AppState, record: dict) -> None:
+        state.apple_trader_levels = record
+
+
+SINGLE_SLOT = TraderSlot()
+
+
 def dayrange_levels(ticker: str, model_key: "str | None" = None) -> "tuple[float, float]":
     """The `(buy_k, sell_k)` a run of this model on this symbol starts from.
 
@@ -1230,6 +1258,14 @@ class DayRangeTrader(BaseTrader):
         # fresh ▶ Start trades again. SimLab never reads it -- a replay has no
         # ▶ Start, so there the stand-down simply lasts the session.
         self.halt: "str | None" = None
+        # Where the published record and the sidebar form live (`TraderSlot`).
+        self.slot: TraderSlot = SINGLE_SLOT
+        # Whether the per-bar read line goes to the log. A race silences the
+        # racers that hold nothing and writes one line for all of them instead.
+        self.quiet_read = False
+        # The close and the time of the last bar this trader read, for whoever
+        # watches several traders at once (`orchestra`'s board).
+        self.last_close: "float | None" = None
 
     def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
         """The base's phrases, plus the two this strategy's day has: before the
@@ -1295,6 +1331,7 @@ class DayRangeTrader(BaseTrader):
 
         last = frame.iloc[-1]
         ts = frame.index[-1]
+        self.last_close = float(last["close"])
         fresh_bar = ts != self.last_bar_ts
         if fresh_bar:
             self.last_bar_ts = ts
@@ -1338,7 +1375,8 @@ class DayRangeTrader(BaseTrader):
         # Recorded from the same plan the line below prints, in the same cycle,
         # so the chart and the log cannot quote two different levels.
         self._record_levels(state, ts)
-        _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, frame)})
+        if not self.quiet_read:
+            _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, frame)})
 
         # Trading starts after the opening window, since the forecast does not
         # exist before it -- the notebook's `start_after`. The bar the plan was
@@ -1377,6 +1415,8 @@ class DayRangeTrader(BaseTrader):
             return "hold"
 
         if fresh_bar and float(last["low"]) <= self.plan["buy_level"]:
+            if self.entry_refused(state, ts):
+                return "hold"
             if self.closing_soon():
                 _log(
                     state,
@@ -1469,7 +1509,7 @@ class DayRangeTrader(BaseTrader):
             "open_price": self.plan["open_price"],
         }
         self._set_levels(opening.index[-1])
-        prior = getattr(state, "apple_trader_levels", None) or {}
+        prior = self.slot.levels(state) or {}
         if (
             prior.get("rows")
             and prior.get("ticker") == self.ticker
@@ -1605,7 +1645,7 @@ class DayRangeTrader(BaseTrader):
         it cannot read -- is refused and logged once, and the run carries on
         with the model it had.
         """
-        form = getattr(state, "apple_trader_config", None)
+        form = self.slot.form(state)
         config = self.config
         if (
             form is None
@@ -1699,7 +1739,7 @@ class DayRangeTrader(BaseTrader):
         predicted range are different orders, and adopting the number without
         the unit would rest them somewhere nobody asked for.
         """
-        form = getattr(state, "apple_trader_config", None)
+        form = self.slot.form(state)
         config = self.config
         if (
             form is None
@@ -1776,14 +1816,14 @@ class DayRangeTrader(BaseTrader):
             history[-1] = row
         else:
             history.append(row)
-        state.apple_trader_levels = {
+        self.slot.publish(state, {
             "ticker": self.ticker,
             "date": plan["date"],
             "config": self.config,
             "rows": history,
             "memory": self.memory(),
             "seed": plan.get("seed"),
-        }
+        })
 
     def memory(self) -> dict:
         """What this run knows about the day that the ledger does not: the open
@@ -1801,7 +1841,7 @@ class DayRangeTrader(BaseTrader):
         """Refresh `memory` on the published levels after a cycle -- an order
         placed after this cycle's levels were recorded would otherwise reach the
         session file only a cycle later."""
-        levels = getattr(state, "apple_trader_levels", None)
+        levels = self.slot.levels(state)
         if (
             not levels
             or self.plan is None
@@ -1809,7 +1849,7 @@ class DayRangeTrader(BaseTrader):
             or pd.Timestamp(levels.get("date")) != pd.Timestamp(self.plan["date"])
         ):
             return
-        state.apple_trader_levels = {**levels, "memory": self.memory()}
+        self.slot.publish(state, {**levels, "memory": self.memory()})
 
     def _resume(self, state: AppState, memory: "dict | None") -> None:
         """Take back what an earlier run today knew (`memory`), on a restart.
