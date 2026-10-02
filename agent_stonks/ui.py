@@ -7,7 +7,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, fields, replace as dc_replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -17,6 +17,7 @@ import streamlit as st
 
 from . import (
     apple_models,
+    candidates,
     candle_patterns,
     last_setup,
     market_hours,
@@ -48,6 +49,7 @@ from .orchestra import (
     ORCHESTRA_LABEL,
     OrchestraConfig,
     launch_orchestra,
+    racer_label,
 )
 from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
 from .charts import (
@@ -81,6 +83,7 @@ from .config import (
     PALETTE,
     POLL_SEC,
     PREMARKET_POLL_SEC,
+    ORCHESTRA_CANDIDATES_POLL_SEC,
     SESSION_START,
     TACTICS_MOMENTUM_WINDOW_MIN,
     TIMEFRAMES,
@@ -2683,6 +2686,17 @@ _ORCHESTRA_COPY = dc_replace(
     prefix="orchestra",
     sections={
         **_APPLE_TRADER_COPY.sections,
+        "selection": (
+            "Once a session, at **09:34 ET** — four opening minutes in, one bar before "
+            "the forecasts — Orchestra narrows its pairs to the day's candidates. The "
+            "rest sit the day out: they are not read and never forecast.\n\n"
+            "- Reads the pre-market briefing (bias, confidence), the earnings calendar, "
+            "and the opening gap on the daily ADR.\n"
+            "- Ranks what is left by what a target exit pays as a share of the price "
+            "(`buy − sell` ADRs over the price), best first.\n"
+            "- The Pre-Market tab shows the pick — provisional until 09:34, then the "
+            "one Orchestra made. A restart keeps it."
+        ),
         "pairs": (
             "Every pair forecasts its own **H** at 9:35 and rests its own buy and sell "
             "below it, in the same unit.\n\n"
@@ -2704,6 +2718,28 @@ _ORCHESTRA_COPY = dc_replace(
         "pair_min_win_k": (
             "Per pair: a trade that closes for no more than this many units a share "
             "stands that pair down for the rest of the day. 0 is off."
+        ),
+        "select_on": (
+            "Off, Orchestra races every pair all day. On, it picks the day's "
+            "candidates once at 09:34 and only those race."
+        ),
+        "select_max_pairs": (
+            "How many pairs race after the rules below have left out what they "
+            "leave out — the best by target as a share of the price. 0 keeps every "
+            "eligible pair."
+        ),
+        "select_max_gap_adr": (
+            "Leave out a symbol whose official open is further than this many average "
+            "daily ranges from yesterday's close, up or down. 0 is no limit."
+        ),
+        "select_bearish": (
+            "The strategy only buys dips and only goes long, so a confidently bearish "
+            "morning is the one most likely to walk through the buy level into the stop. "
+            "A symbol whose briefing is not ready by 09:34 is not left out for it."
+        ),
+        "select_earnings": (
+            "Leave out a symbol with an earnings report between yesterday's close and "
+            "today's — a day unlike the ones the levels were tuned on."
         ),
     },
 )
@@ -2803,6 +2839,8 @@ def _orchestra_params(symbols: list[str]) -> "OrchestraConfig | None":
     state.orchestra_configs = (
         {f"{r.ticker}:{r.model_key}": r for r in race.racers} if race is not None else {}
     )
+    # And whole, for the Pre-Market tab's provisional pick of candidates.
+    state.orchestra_form = race
     last_setup.remember()
     return race
 
@@ -3239,14 +3277,14 @@ def _agent_panel(
     # so the chart never draws the levels of an agent that is not selected.
     if personality == APPLE_TRADER_KEY:
         apple_config = _apple_trader_params(symbols)
-        state.orchestra_configs = {}
+        state.orchestra_configs, state.orchestra_form = {}, None
     elif personality == ORCHESTRA_KEY:
         apple_config = _orchestra_params(symbols)
         state.apple_trader_config = None
     else:
         apple_config = None
         state.apple_trader_config = None
-        state.orchestra_configs = {}
+        state.orchestra_configs, state.orchestra_form = {}, None
 
     trading_mode_choice = _execution_controls()
 
@@ -3626,8 +3664,89 @@ def _premarket_results(symbols: list[str], llm_key: str) -> None:
         )
 
 
+@st.fragment(run_every=ORCHESTRA_CANDIDATES_POLL_SEC)
+def _orchestra_candidates_panel() -> None:
+    """Orchestra's candidates for today: the pick it made at 09:34, or -- before
+    then, while Orchestra is the selected agent -- the pick as it would come
+    out now, from what is known so far."""
+    state = _get_state()
+    today = session_store.session_date()
+    decided = (getattr(state, "orchestra", None) or {}).get("selection") or {}
+    form = getattr(state, "orchestra_form", None)
+    rows: "list[dict]" = []
+    if decided.get("date") == today and decided.get("rows"):
+        rows = decided["rows"]
+        st.markdown("**🎼 Orchestra's candidates for today** — picked at 09:34 ET")
+    elif form is not None and form.selection is None:
+        st.markdown("**🎼 Orchestra's candidates for today**")
+        st.caption(
+            "The selection is off in Orchestra's rules, so it races every pair all day: "
+            + ", ".join(racer_label(r) for r in form.racers) + "."
+        )
+        return
+    elif form is not None:
+        st.markdown("**🎼 Orchestra's candidates for today** — provisional")
+        st.caption(
+            "Orchestra decides once, at 09:34 ET — four opening minutes in, one bar "
+            "before the forecasts. Until then this is the pick as it would come out now: "
+            "the open and the first minutes are not in before 09:30, and a briefing that "
+            "is still being written counts as none."
+        )
+        try:
+            today_date = date.fromisoformat(today)
+            facts = [
+                candidates.gather_facts(r, racer_label(r), state, today_date, candidates.LIVE_SOURCES)
+                for r in form.racers
+            ]
+            rows = candidates.to_rows(candidates.select_candidates(facts, form.selection))
+        except Exception as exc:  # a fetch that failed must not take the tab down
+            st.warning(f"Could not work out the candidates: {exc}")
+            return
+    else:
+        return
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "Pair": row["label"],
+                "Races": "✓" if row.get("selected") else "—",
+                "Why": row.get("reason"),
+                "Bias": (
+                    f"{row['bias']} ({row.get('confidence') or '?'})" if row.get("bias")
+                    else row.get("briefing_note") or "—"
+                ),
+                "Earnings": row.get("earnings") or ("—" if row.get("earnings_known", True) else "unknown"),
+                "Gap (ADR)": row.get("gap_adr"),
+                "First minutes (ADR)": row.get("move_adr"),
+                "Target (% of price)": row.get("target_pct"),
+                "ADR": row.get("adr"),
+            }
+            for row in rows
+        ]),
+        hide_index=True,
+        width="stretch",
+        # Every pair on screen at once: a pick is read as a whole.
+        height=36 * (len(rows) + 1) + 3,
+        column_config={
+            "Gap (ADR)": st.column_config.NumberColumn(
+                format="%+.2f", help="Official open minus yesterday's close, in 14-day ADRs."
+            ),
+            "First minutes (ADR)": st.column_config.NumberColumn(
+                format="%+.2f", help="09:30 to 09:33 close, from the open, in ADRs."
+            ),
+            "Target (% of price)": st.column_config.NumberColumn(
+                format="%.2f%%",
+                help="What a target exit pays — buy − sell distance, in ADRs — as a "
+                "share of the price. The ranking.",
+            ),
+            "ADR": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+    st.divider()
+
+
 def _premarket_panel(symbols: list[str]) -> None:
     state = _get_state()
+    _orchestra_candidates_panel()
 
     st.caption(
         "Synthesizes recent news, historical price action, macro indicators, and fundamentals "

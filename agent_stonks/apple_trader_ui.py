@@ -41,6 +41,7 @@ from . import apple_models
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
 
 if TYPE_CHECKING:
+    from .candidates import SelectionRules
     from .orchestra import OrchestraConfig
 from .config import (
     BREACH_LABELS,
@@ -592,6 +593,7 @@ def orchestra_params(
     symbols: "list[str] | None",
     copy: FormCopy,
     seed: "OrchestraConfig | None" = None,
+    briefing_choices: "list[tuple[str, str]] | None" = None,
 ) -> "OrchestraConfig | None":
     """Orchestra's setup: which (ticker, model) pairs, each pair's own numbers,
     and the rules they all share. None while no pair is picked.
@@ -603,6 +605,10 @@ def orchestra_params(
     `seed` is a running Orchestra's configuration, for the same reason as
     `params`' -- a running racer adopts what its two widgets hold, so they
     reopen on its numbers rather than the pair's shipped ones.
+
+    `briefing_choices` are the (provider, model) pairs whose briefings SimLab
+    has cached, for a replay to read; None live, where the app's own briefing
+    is the one read.
     """
     from .orchestra import (
         build_orchestra_config, default_pairs, all_pairs, racer_key, racer_label,
@@ -629,6 +635,7 @@ def orchestra_params(
     if not pairs:
         st.info("Pick at least one (ticker, model) pair.", icon=":material/info:")
         return None
+    selection = selection_params(copy, briefing_choices)
 
     defaults = AppleTraderConfig()
     section("Levels", copy.sections.get("pairs"))
@@ -686,7 +693,77 @@ def orchestra_params(
     )
     base = replace(defaults, level_unit=level_unit, **sizing, **rules)
     try:
-        return build_orchestra_config(list(pairs), base, levels)
+        return build_orchestra_config(list(pairs), base, levels, selection=selection)
     except ValueError as exc:
         st.error(str(exc), icon=":material/error:")
         return None
+
+
+def selection_params(
+    copy: FormCopy, briefing_choices: "list[tuple[str, str]] | None" = None,
+) -> "SelectionRules | None":
+    """How Orchestra picks the day's candidates at 09:34, or None to race every
+    pair all day. Disabled rather than hidden while off, so switching it back
+    on finds the numbers where they were."""
+    from .candidates import BEARISH_HIGH, BEARISH_LABELS, BEARISH_RULES, SelectionRules
+
+    defaults = SelectionRules()
+    section("Candidates at 09:34", copy.sections.get("selection"))
+    on = st.checkbox(
+        "Pick the day's candidates at 09:34",
+        value=True,
+        key=copy.key("select_on"),
+        help=copy.help.get("select_on"),
+    )
+    col_a, col_b = st.columns(2)
+    max_pairs = col_a.number_input(
+        "Keep at most (pairs; 0 = every eligible one)",
+        min_value=0, max_value=20, value=defaults.max_pairs, step=1,
+        key=copy.key("select_max_pairs"), disabled=not on,
+        help=copy.help.get("select_max_pairs"),
+    )
+    max_gap_adr = col_b.number_input(
+        "Leave out an open beyond (× ADR from the close; 0 = no limit)",
+        min_value=0.0, max_value=5.0, value=float(defaults.max_gap_adr), step=0.25,
+        format="%.2f", key=copy.key("select_max_gap_adr"), disabled=not on,
+        help=copy.help.get("select_max_gap_adr"),
+    )
+    exclude_bearish = col_a.selectbox(
+        "Leave out on a bearish briefing",
+        list(BEARISH_RULES),
+        index=list(BEARISH_RULES).index(BEARISH_HIGH),
+        format_func=lambda key: BEARISH_LABELS[key],
+        key=copy.key("select_bearish"), disabled=not on,
+        help=copy.help.get("select_bearish"),
+    )
+    exclude_earnings = col_b.checkbox(
+        "Leave out a symbol reporting earnings",
+        value=defaults.exclude_earnings,
+        key=copy.key("select_earnings"), disabled=not on,
+        help=copy.help.get("select_earnings"),
+    )
+    provider = model = ""
+    if briefing_choices is not None:
+        if briefing_choices:
+            provider, model = st.selectbox(
+                "Briefings replayed",
+                briefing_choices,
+                format_func=lambda pm: f"{pm[0]} / {pm[1]}",
+                key=copy.key("select_briefings"), disabled=not on,
+                help=copy.help.get("select_briefings"),
+            )
+        elif on:
+            st.caption(
+                ":material/info: No briefings are cached yet, so the bearish rule has "
+                "nothing to read."
+            )
+    if not on:
+        return None
+    return SelectionRules(
+        max_pairs=int(max_pairs),
+        exclude_earnings=bool(exclude_earnings),
+        exclude_bearish=str(exclude_bearish),
+        max_gap_adr=float(max_gap_adr),
+        briefing_provider=provider,
+        briefing_model=model,
+    )

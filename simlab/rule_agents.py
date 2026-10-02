@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any, Callable, Optional
 
 from agent_stonks import apple_models
+from simlab.session_context import ReplaySources
 from agent_stonks.config import (
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_SELL_K,
@@ -44,6 +45,7 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks.apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from agent_stonks.apple_trader import config_signature as apple_config_signature
+from agent_stonks.candidates import SelectionRules
 from agent_stonks.orchestra import (
     ORCHESTRA_AVATAR,
     ORCHESTRA_KEY,
@@ -266,7 +268,14 @@ def _build_orchestra(config: OrchestraConfig):
         raise RuntimeError("; ".join(
             f"{racer_label(key)}: {reason}" for key, reason in refusals.items()
         ))
-    return build_orchestra(config, bundles)
+    # The 09:34 selection reads the briefings cached for each replayed day and
+    # never asks for a new one (`session_context.ReplaySources`).
+    selection = config.selection
+    sources = (
+        None if selection is None
+        else ReplaySources(selection.briefing_provider, selection.briefing_model)
+    )
+    return build_orchestra(config, bundles, sources=sources)
 
 
 def _orchestra_from_record(raw: "dict | None") -> OrchestraConfig:
@@ -275,8 +284,14 @@ def _orchestra_from_record(raw: "dict | None") -> OrchestraConfig:
     the default Orchestra: every tuned pair on today's rules."""
     racers = (raw or {}).get("racers") or []
     if not racers:
-        return build_orchestra_config(default_pairs(), AppleTraderConfig())
-    return OrchestraConfig([_apple_from_record(r) for r in racers])
+        return build_orchestra_config(
+            default_pairs(), AppleTraderConfig(), selection=SelectionRules(),
+        )
+    # A record without `selection` was made before the 09:34 selection existed
+    # and raced every pair all day; None replays it -- and signs it -- so.
+    return OrchestraConfig(
+        [_apple_from_record(r) for r in racers], selection=(raw or {}).get("selection"),
+    )
 
 
 # ------------------------------------------------------------------ registry

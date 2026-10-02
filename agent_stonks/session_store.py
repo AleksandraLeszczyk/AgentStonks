@@ -179,8 +179,9 @@ def _orchestra_levels_record(records: "dict | None") -> dict:
 
 
 def _orchestra_record(race: "dict | None") -> "dict | None":
-    """What a restart needs of the race itself: its racers in order and which
-    one held the position. The board is rebuilt by the next cycle."""
+    """What a restart needs of Orchestra itself: its racers in order, which one
+    held the position and the day's candidate selection. The board is rebuilt
+    by the next cycle."""
     if not race:
         return None
     return {
@@ -188,6 +189,8 @@ def _orchestra_record(race: "dict | None") -> "dict | None":
         "order": list(race.get("order") or []),
         "labels": dict(race.get("labels") or {}),
         "holder": race.get("holder"),
+        # Today's 09:34 candidates: made once, so a restart keeps them.
+        "selection": race.get("selection"),
     }
 
 
@@ -483,6 +486,7 @@ def _signature(state) -> tuple:
         repr(levels.get("memory")),
         racers,
         race.get("holder"),
+        (race.get("selection") or {}).get("date"),
         # A stop has to reach the file promptly, or a crash right after it
         # would start the stopped run again.
         bool(state.agent_running),

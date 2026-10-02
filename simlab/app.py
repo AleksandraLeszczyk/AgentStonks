@@ -2028,10 +2028,93 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "setups on the same pairs."
         ),
     }
+    fields["sections"] = {
+        **fields.get("sections", {}),
+        "selection": (
+            "Replays Orchestra's 09:34 pick of the day's candidates from what the "
+            "morning knew: each symbol's **cached** pre-market briefing (written as of "
+            "09:25 that day), its earnings calendar and its opening gap. A replay never "
+            "writes a briefing — an LLM's answer is not reproducible — so a day without "
+            "one is picked without its bias. Brief the missing days below first."
+        ),
+    }
     race = apple_trader_ui.orchestra_params(
         symbols, apple_trader_ui.FormCopy(prefix=prefix, **fields),
+        # Always at least the default, so a setup made before anything is cached
+        # names the briefings it will read once they are written.
+        briefing_choices=sim_session.cached_briefing_models() or [sim_session.DEFAULT_BRIEFING],
     )
+    if race is not None and race.selection is not None:
+        _render_briefing_coverage(race, prefix)
     return [race] if race is not None else []
+
+
+def _selected_days() -> "dict[str, list[str]]":
+    """{feed: [day, ...]} over the datasets and days the Simulate tab has picked."""
+    days: "dict[str, list[str]]" = {}
+    for name in st.session_state.get("sim_datasets") or []:
+        ds = sim_data.get_dataset(name)
+        if ds is None:
+            continue
+        for day in st.session_state.get(f"sim_days_{name}") or (ds.days or [])[:1]:
+            bucket = days.setdefault(ds.feed, [])
+            if str(day) not in bucket:
+                bucket.append(str(day))
+    return days
+
+
+def _render_briefing_coverage(race, prefix: str) -> None:
+    """How many of the briefings this setup's replays will read are cached, and
+    a button to write the missing ones -- an LLM call per symbol and day, made
+    only when asked for."""
+    selection = race.selection
+    provider, model = selection.briefing_provider, selection.briefing_model
+    if not (provider and model):
+        return
+    days_by_feed = _selected_days()
+    days = sorted({d for ds in days_by_feed.values() for d in ds})
+    if not days:
+        return
+    cached, missing = sim_session.briefing_coverage(race.tickers, days, provider, model)
+    total = cached + len(missing)
+    if not missing:
+        st.caption(
+            f":material/check_circle: All {total} briefings these replays read are cached "
+            f"({provider} / {model})."
+        )
+        return
+    st.caption(
+        f":material/info: {cached} of {total} briefings these replays read are cached "
+        f"({provider} / {model}); the other {len(missing)} days are picked without a "
+        "bias: " + ", ".join(f"{sym} {day}" for sym, day in missing[:8])
+        + (" …" if len(missing) > 8 else "")
+    )
+    api_key = _env_key(provider)
+    if st.button(
+        f"Brief the {len(missing)} missing session(s) with {provider} / {model}",
+        key=f"{prefix}_brief_missing",
+        disabled=not api_key,
+        help=(
+            "One LLM call per symbol and day, as of 09:25 that day, cached and read by "
+            "every replay from then on."
+            if api_key else f"{ENV_KEYS.get(provider, provider)} is not set."
+        ),
+    ):
+        errors: "dict[str, str]" = {}
+        with st.spinner(f"Briefing {len(missing)} session(s)…"):
+            for symbol in sorted({sym for sym, _ in missing}):
+                want = {
+                    feed: [d for d in ds if (symbol, d) in set(missing)]
+                    for feed, ds in days_by_feed.items()
+                }
+                _, failed = sim_session.session_biases(
+                    symbol, {f: d for f, d in want.items() if d}, provider, model, api_key,
+                    os.getenv("ALPACA_API_KEY", ""), os.getenv("ALPACA_SECRET", ""),
+                )
+                errors.update({f"{symbol} {day}": err for day, err in failed.items()})
+        if errors:
+            st.warning("Not briefed: " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+        st.rerun()
 
 
 def render_simulate_tab() -> None:

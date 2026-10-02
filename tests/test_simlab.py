@@ -1084,7 +1084,10 @@ class TestDayRangeEngine:
 
     # --- the race (`agent_stonks.orchestra`) on the same engine -------------
 
-    def _run_race(self, monkeypatch, racers: "list[dict]", symbols: "list[str]"):
+    def _run_race(
+        self, monkeypatch, racers: "list[dict]", symbols: "list[str]",
+        selection: "dict | None" = None,
+    ):
         from agent_stonks.orchestra import ORCHESTRA_KEY
 
         self._stub_model(monkeypatch)
@@ -1092,7 +1095,7 @@ class TestDayRangeEngine:
             {"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
              "momentum_confirmation_bars": 0, **r}
             for r in racers
-        ]}
+        ], "selection": selection}
         agent = rule_agent(ORCHESTRA_KEY)
         config = SimulationConfig(
             personality=ORCHESTRA_KEY, provider=RULE_PROVIDER,
@@ -1111,6 +1114,30 @@ class TestDayRangeEngine:
         ]
         assert strip(raced.decisions) == strip(single.decisions)
         assert raced.final_value == pytest.approx(single.final_value)
+
+    @pytest.mark.parametrize("bias, trades", [("neutral", True), ("bearish", False)])
+    def test_the_0934_pick_replays_from_the_cached_briefing(
+        self, dayrange_store, monkeypatch, tmp_path, bias, trades
+    ):
+        """The selection reads the briefing cached for the replayed day -- here
+        a confidently bearish one keeps the only pair out -- and never writes one."""
+        from simlab import session_context
+
+        monkeypatch.setattr(session_context, "BRIEFING_DIR", tmp_path / "briefings")
+        monkeypatch.setattr(session_context, "earnings_dates", lambda symbol, fetch=None: [])
+        path = session_context.briefing_path("AAPL", DAY.isoformat(), "gemini", "m")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"bias": bias, "confidence": "high"}))
+        result = self._run_race(
+            monkeypatch, [{"ticker": "AAPL"}], ["AAPL"],
+            selection={"max_pairs": 1, "briefing_provider": "gemini", "briefing_model": "m"},
+        )
+        assert result.error is None
+        assert bool([d for d in result.decisions if d["status"] == "filled"]) == trades
+        line = next(e["text"] for e in result.agent_log if e["text"].startswith("Candidates at 09:34"))
+        assert ("Left out: AAPL · Day Range — bearish briefing, high confidence" in line) == (not trades)
+        assert ",brief=gemini/m)" in result.config_summary["model"]
+        assert len(list((tmp_path / "briefings").rglob("*.json"))) == 1
 
     def test_a_race_needs_every_racers_symbol_in_the_dataset(
         self, dayrange_store, monkeypatch

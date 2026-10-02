@@ -20,6 +20,13 @@ hold a position at a time. The pairs race for it:
   again, to every pair that is still armed. The holder's own rules decide
   whether *it* is: a breaker stand-down keeps that pair out for the day and
   leaves the rest racing. (The user's choice, 2026-10-02.)
+* **Picking.** With a selection (`OrchestraConfig.selection`, on by default),
+  Orchestra first narrows its pairs to the day's candidates, once, at 09:34 --
+  four opening minutes in, one bar before the forecasts -- from the
+  pre-market briefing, the earnings calendar and the opening gap
+  (`agent_stonks.candidates`). The pairs left out sit the day out: they are
+  not read and never forecast. The choice is published and saved with the
+  session, so a restart keeps it rather than picking again.
 * **Stopping.** A stop-out ends the whole run, as it ends an Apple Trader one:
   the live loop stops the agent and only ▶ Start re-arms it. A replay has no
   ▶ Start, so there every pair's entries stay closed for the rest of that
@@ -43,10 +50,10 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Optional
 
-from . import apple_models, market_hours, rule_agent
+from . import apple_models, candidates, market_hours, momentum_regime, rule_agent
 from . import apple_trader as at
 from .agent import stop_agent
 from .apple_trader import AppleTraderConfig, TraderSlot
@@ -126,12 +133,20 @@ class OrchestraConfig:
     same bar the earlier racer is read first and takes the position."""
 
     racers: "list[AppleTraderConfig]" = field(default_factory=list)
+    # How the day's candidates are picked at 09:34, or None to race every pair
+    # all day -- which is what every record made before the selection means.
+    selection: "candidates.SelectionRules | None" = None
 
     def __post_init__(self) -> None:
         self.racers = [
             r if isinstance(r, AppleTraderConfig) else AppleTraderConfig(**r)
             for r in self.racers
         ]
+        if isinstance(self.selection, dict):
+            known = {f.name for f in fields(candidates.SelectionRules)}
+            self.selection = candidates.SelectionRules(
+                **{k: v for k, v in self.selection.items() if k in known}
+            )
         if not self.racers:
             raise ValueError("Orchestra needs at least one (ticker, model) pair")
         keys = [racer_key(r) for r in self.racers]
@@ -160,10 +175,15 @@ def _shared(config: AppleTraderConfig) -> dict:
     return {k: v for k, v in asdict(config).items() if k not in PER_RACER_FIELDS}
 
 
-def build_orchestra_config(pairs: "list[str]", base: AppleTraderConfig, levels: "dict | None" = None) -> OrchestraConfig:
+def build_orchestra_config(
+    pairs: "list[str]",
+    base: AppleTraderConfig,
+    levels: "dict | None" = None,
+    selection: "candidates.SelectionRules | None" = None,
+) -> OrchestraConfig:
     """One racer per pair, each `base` with its own pair and the numbers tuned
     for it: `levels[key]` = `(buy_k, sell_k, min_win_k)` where given, the
-    pair's shipped defaults otherwise."""
+    pair's shipped defaults otherwise. `selection` as `OrchestraConfig`'s."""
     levels = levels or {}
     racers = []
     for key in pairs:
@@ -177,7 +197,7 @@ def build_orchestra_config(pairs: "list[str]", base: AppleTraderConfig, levels: 
             buy_k=float(buy_k), sell_k=float(sell_k), min_win_k=float(min_win_k),
             level_source=apple_models.get(model_key).level_source,
         ))
-    return OrchestraConfig(racers)
+    return OrchestraConfig(racers, selection=selection)
 
 
 def orchestra_signature(race: OrchestraConfig) -> str:
@@ -198,7 +218,7 @@ def orchestra_signature(race: OrchestraConfig) -> str:
     single = at.config_signature(first)
     rules = single[single.index("size="):-1]
     rules = re.sub(r",min_win=[^,)]*", "", rules)
-    return f"orchestra[{pairs}]({rules})"
+    return f"orchestra[{pairs}]({rules}{candidates.rules_signature(race.selection)})"
 
 
 # --- one racer's view of the shared state --------------------------------------
@@ -275,11 +295,25 @@ class Orchestra:
     it once a closed bar, SimLab's rule day loop once a replayed one.
     """
 
-    def __init__(self, racers: "list[Racer]") -> None:
+    def __init__(
+        self,
+        racers: "list[Racer]",
+        selection: "candidates.SelectionRules | None" = None,
+        sources=None,
+    ) -> None:
         if not racers:
             raise ValueError("Orchestra needs at least one racer")
         self.racers = racers
         self.by_key = {r.key: r for r in racers}
+        # The 09:34 candidate selection, and where its briefings and earnings
+        # calendar come from (`candidates.LiveSources`, or a replay's).
+        self.selection = selection
+        self.sources = sources or candidates.LIVE_SOURCES
+        # The day the selection was made for, its rows, and the pairs it left
+        # out -- each sits the day out, with the reason.
+        self._selected_day = None
+        self.selection_rows: "list[dict]" = []
+        self.benched: "dict[str, str]" = {}
         # The racer holding the position, or None while the race is open.
         self.holder: "str | None" = None
         self.holder_since = None
@@ -350,6 +384,8 @@ class Orchestra:
             self._day = today
             self.halt = None
             self._last_line = None
+            self.benched = {}
+            self.selection_rows = []
             # A trader keeps its stop-out flag across the night (nothing reads
             # it in a single replay); here it would stop the next session too.
             for racer in self.racers:
@@ -362,12 +398,27 @@ class Orchestra:
             return rule_agent.CLOSED
         if not self._adopted:
             self._adopt(state, tracker)
+        if self.selection is not None and self._selected_day != today:
+            if not self._restore_selection(state, today):
+                if not self._selection_due(state):
+                    # Before 09:34 there is nothing to read: no racer can
+                    # forecast before 09:35, and which ones will is not decided.
+                    self._publish(state)
+                    return rule_agent.WARMING_UP
+                self._select(state, today)
 
         alone = len(self.racers) == 1
         # The holder first: its exit decides whether the race is open on this
         # very bar, and a racer read before it would be refused for a
-        # position that is about to close.
-        order = sorted(self.racers, key=lambda r: r.key != self.holder)
+        # position that is about to close. A pair the selection left out is
+        # not read at all -- unless it holds a position from before it.
+        order = sorted(
+            (r for r in self.racers if r.key not in self.benched or r.key == self.holder),
+            key=lambda r: r.key != self.holder,
+        )
+        for racer in self.racers:
+            if racer.key in self.benched and racer.key != self.holder:
+                racer.outcome = rule_agent.HOLD
         for racer in order:
             racer.trader.quiet_read = not alone and racer.key != self.holder
             ledger = _RacerLedger(self, racer.key, tracker)
@@ -395,6 +446,49 @@ class Orchestra:
                 return tag
         return outcomes[0] or rule_agent.HOLD
 
+    # --- the 09:34 selection --------------------------------------------
+
+    def _selection_due(self, state: AppState) -> bool:
+        """Whether 09:30 to 09:33 have closed on any racer's symbol: the
+        selection's moment, one bar before the forecasts. A run started later
+        is past it on its first bar, and picks at once."""
+        for ticker in dict.fromkeys(r.trader.ticker for r in self.racers):
+            sym_state = state.sym(ticker)
+            if sym_state is None:
+                continue
+            if len(momentum_regime.minute_frame(sym_state)) >= candidates.SELECT_AFTER_BARS:
+                return True
+        return False
+
+    def _select(self, state: AppState, today) -> None:
+        facts = [
+            candidates.gather_facts(r.config, r.label, state, today.date(), self.sources)
+            for r in self.racers
+        ]
+        chosen = candidates.select_candidates(facts, self.selection)
+        self._apply_selection(today, candidates.to_rows(chosen))
+        _log(state, {"type": "analysis", "text": candidates.summary(chosen)})
+
+    def _restore_selection(self, state: AppState, today) -> bool:
+        """Take back today's selection from an earlier run (a restart, or ▶ Stop
+        and ▶ Start): it was made once, at 09:34, and is not made again."""
+        prior = (getattr(state, "orchestra", None) or {}).get("selection") or {}
+        rows = prior.get("rows") or []
+        if prior.get("date") != str(today.date()) or {r.get("key") for r in rows} != set(self.keys):
+            return False
+        self._apply_selection(today, rows)
+        chosen = [r["label"] for r in rows if r.get("selected")]
+        _log(state, {"type": "status", "text": (
+            "Keeping today's candidates, picked at 09:34 by the earlier run: "
+            + (", ".join(chosen) if chosen else "none") + "."
+        )})
+        return True
+
+    def _apply_selection(self, today, rows: "list[dict]") -> None:
+        self._selected_day = today
+        self.selection_rows = [dict(r) for r in rows]
+        self.benched = {r["key"]: r.get("reason") or "" for r in rows if not r.get("selected")}
+
     def _announce(self, state: AppState, tracker: DecisionTracker) -> None:
         kind, key = self._event
         self._event = None
@@ -408,7 +502,7 @@ class Orchestra:
                 f"position is closed. Waiting: {', '.join(others)}."
             )
         else:
-            armed = [r.label for r in self.racers if self._armed(r)]
+            armed = [r.label for r in self.racers if self._armed(r) and not self._benched(r)]
             text = (
                 f"{racer.label} is flat again, so the race is open: "
                 + (f"{', '.join(armed)} can buy." if armed else "no pair is still armed today.")
@@ -427,6 +521,9 @@ class Orchestra:
             and not plan.get("stand_down")
         )
 
+    def _benched(self, racer: Racer) -> bool:
+        return racer.key in self.benched and racer.key != self.holder
+
     def board(self) -> "list[dict]":
         """One row per racer: where it stands against its buy level, in its
         own level unit, which is what makes racers on different symbols and
@@ -440,6 +537,10 @@ class Orchestra:
             buy = plan.get("buy_level")
             if racer.key == self.holder:
                 status = "holding"
+            elif self._benched(racer):
+                status = f"sits out today ({self.benched[racer.key]})"
+            elif self.selection is not None and self._selected_day != self._day:
+                status = "waiting for 09:34"
             elif trader.blocked is not None:
                 status = "cannot forecast"
             elif not plan:
@@ -499,6 +600,14 @@ class Orchestra:
             "holder": self.holder,
             "board": self.board(),
             "running": True,
+            "selection": (
+                None if self.selection is None or self._selected_day is None
+                else {
+                    "date": str(self._selected_day.date()),
+                    "rows": self.selection_rows,
+                    "rules": asdict(self.selection),
+                }
+            ),
         }
 
     def publish_memory(self, state: AppState) -> None:
@@ -514,6 +623,8 @@ class Orchestra:
             dot, phrase = racer.trader.activity(racer.outcome or rule_agent.HOLD, _RacerLedger(self, racer.key, tracker))
             return dot, f"{phrase} ({racer.label})"
         board = self.board()
+        if self.selection is not None and self._selected_day != self._day:
+            return rule_agent.WAITING, "Agent waiting to pick its candidates at 09:34"
         racing = [row for row in board if row["status"] == "racing"]
         if racing:
             near = [row for row in racing if row["to_buy"] is not None]
@@ -528,12 +639,17 @@ class Orchestra:
             return rule_agent.WAITING, "Agent waiting for the opening forecasts"
         if all(row["status"] == "cannot forecast" for row in board):
             return rule_agent.FAILED, "Agent cannot trade today — see the log"
+        if all(row["status"].startswith("sits out") for row in board):
+            return rule_agent.WAITING, "Agent found no candidates today"
         return rule_agent.WAITING, "Agent stood down for the day"
 
 
-def build_orchestra(race: OrchestraConfig, bundles: "dict[str, dict]") -> Orchestra:
+def build_orchestra(
+    race: OrchestraConfig, bundles: "dict[str, dict]", sources=None,
+) -> Orchestra:
     """An `Orchestra` over `race`'s racers, each built the way an Apple Trader
-    run is (`apple_trader.build_trader`) on its loaded bundle."""
+    run is (`apple_trader.build_trader`) on its loaded bundle. `sources` serves
+    the selection its briefings and earnings calendar (live by default)."""
     return Orchestra([
         Racer(
             key=racer_key(config),
@@ -543,7 +659,7 @@ def build_orchestra(race: OrchestraConfig, bundles: "dict[str, dict]") -> Orches
             bundle=bundles[racer_key(config)],
         )
         for config in race.racers
-    ])
+    ], selection=race.selection, sources=sources)
 
 
 def load_racers(race: OrchestraConfig) -> "tuple[dict[str, dict], dict[str, str]]":
@@ -586,7 +702,7 @@ def _orchestra_loop(
         _log(state, {"type": "error", "text": "No pair can run, so Orchestra cannot start."})
         rule_agent.end_session(state, tracker, None)
         return
-    race_config = OrchestraConfig(kept)
+    race_config = OrchestraConfig(kept, selection=race_config.selection)
     race = build_orchestra(race_config, bundles)
     if len(kept) > 1:
         _log(state, {"type": "status", "text": (
@@ -599,6 +715,12 @@ def _orchestra_loop(
             "whose buy fills is the only one that trades until its position is closed, then "
             "the race is open again. Ties go to the earlier pair in this list. A stop-out "
             "stops the agent."
+            + (
+                " At 09:34 it first picks the day's candidates (keeping "
+                + (f"the best {race_config.selection.max_pairs}" if race_config.selection.max_pairs else "every eligible pair")
+                + "); the rest sit the day out."
+                if race_config.selection is not None else ""
+            )
         )})
     for config in kept:
         key = racer_key(config)
@@ -635,13 +757,16 @@ def launch_orchestra(
 ) -> None:
     """Stop any running agent for this state, then start Orchestra's loop.
     Every pair's symbol must already be streamed."""
+    prior = getattr(state, "orchestra", None) or {}
     state.orchestra = {
         "date": None,
         "order": race_config.keys,
         "labels": {racer_key(c): racer_label(c) for c in race_config.racers},
-        "holder": (getattr(state, "orchestra", None) or {}).get("holder"),
+        "holder": prior.get("holder"),
         "board": [],
         "running": True,
+        # Today's 09:34 selection, if an earlier run made it: kept, not re-made.
+        "selection": prior.get("selection"),
     }
     rule_agent.launch(
         state, tracker, ORCHESTRA_KEY, race_config.tickers,

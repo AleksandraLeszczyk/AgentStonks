@@ -231,6 +231,7 @@ _DEFAULTS: dict[str, object] = {
     "history_feed_resolved": "",
     "bar_tape_override": "",
     "orchestra_configs": {},
+    "orchestra_form": None,
     "orchestra_levels": {},
     "orchestra": None,
     "api_key": "",
@@ -351,6 +352,9 @@ class AppState:
         # racer's key ("INTC:dayrange"). A race runs two traders on one symbol
         # when it races both of its models, so a symbol is not a key.
         self.orchestra_configs: dict = {}
+        # The whole Orchestra setup the form holds -- pairs, rules and the 09:34
+        # candidate selection -- for the Pre-Market tab's provisional pick.
+        self.orchestra_form = None
         self.orchestra_levels: dict = {}
         # The running (or last) race as a whole: its racers in order, which one
         # holds the position, and one board row per racer -- written by the

@@ -129,6 +129,9 @@ CHART_POLL_SEC = 30
 # land one symbol at a time, so this only has to be fast enough that a finished
 # symbol appears promptly.
 PREMARKET_POLL_SEC = 3
+# How often the Pre-Market tab re-works Orchestra's provisional candidates. Slower
+# than the briefing poll: it reads daily bars, the open and the earnings calendar.
+ORCHESTRA_CANDIDATES_POLL_SEC = 20
 
 # REST-polling fallback for bars/trades and news, used only while the
 # corresponding WebSocket stream is not connected (e.g. Alpaca's

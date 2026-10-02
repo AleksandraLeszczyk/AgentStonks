@@ -50,22 +50,29 @@ class Tapes:
     forecast is built on; `bar` appends the next tradable minute to all of
     them at once, as the clock would."""
 
-    def __init__(self, monkeypatch, symbols, broker=None, open_=OPEN):
+    def __init__(self, monkeypatch, symbols, broker=None, open_=OPEN, opening=5):
         self.open = open_
         self.broker = broker
         self.rows = {s: [] for s in symbols}
         self.index: list[pd.Timestamp] = []
-        for i in range(5):
-            self._stamp(i)
-            for s in symbols:
-                self._row(s, 101.0 + i * 0.1, low=100.9, high=101.5)
+        self.forecasts: list[str] = []
+        for _ in range(opening):
+            self.opening_bar()
         monkeypatch.setattr(at.momentum_regime, "minute_frame", lambda ss: self.frame(ss.symbol))
         monkeypatch.setattr(at.momentum_regime, "compute_momentum", lambda frame, *a, **k: frame)
-        monkeypatch.setattr(
-            at, "session_forecast",
-            lambda bundle, ticker, opening, today, key=None, secret=None: (dict(FORECAST), None),
-        )
+        monkeypatch.setattr(at, "session_forecast", self._forecast)
         monkeypatch.setattr(at.historical, "fetch_intraday_bars", lambda *a, **k: [])
+
+    def _forecast(self, bundle, ticker, opening, today, key=None, secret=None):
+        self.forecasts.append(ticker)
+        return dict(FORECAST), None
+
+    def opening_bar(self):
+        """The next minute of the 09:30 opening window, on every symbol."""
+        i = len(self.index)
+        self._stamp(i)
+        for s in self.rows:
+            self._row(s, 101.0 + i * 0.1, low=100.9, high=101.5)
 
     def _stamp(self, offset):
         self.index.append(self.open + pd.Timedelta(minutes=offset))
@@ -115,9 +122,9 @@ def racer(ticker, model_key="dayrange", **kwargs):
     return replace(dayrange_config(**kwargs), ticker=ticker, model_key=model_key)
 
 
-def make_race(*configs) -> ar.Orchestra:
-    race = ar.OrchestraConfig(list(configs))
-    return ar.build_orchestra(race, {k: BUNDLE for k in race.keys})
+def make_race(*configs, selection=None, sources=None) -> ar.Orchestra:
+    race = ar.OrchestraConfig(list(configs), selection=selection)
+    return ar.build_orchestra(race, {k: BUNDLE for k in race.keys}, sources=sources)
 
 
 def fills(tracker):
@@ -490,3 +497,146 @@ class TestTheLiveLoop:
         errors = [e["text"] for e in state.agent_log if e["type"] == "error"]
         assert any(t.startswith("INTC · Day Range is left out of Orchestra") for t in errors)
         assert state.orchestra["order"] == ["AAPL:dayrange"]
+
+
+
+class _Sources:
+    """Briefings and earnings for the 09:34 selection, per ticker."""
+
+    def __init__(self, briefings=None, earnings=None):
+        self.briefings = briefings or {}
+        self.earnings_by = earnings or {}
+
+    def briefing(self, ticker, day, state):
+        b = self.briefings.get(ticker)
+        return (b, "") if b else (None, "no briefing")
+
+    def earnings(self, ticker, day):
+        return self.earnings_by.get(ticker, [])
+
+
+def _daily(monkeypatch, adr_by_ticker):
+    """Fourteen completed sessions per symbol at a $100 close and the given
+    daily range -- what the selection's ADR and gap are read from."""
+    from agent_stonks import candidates as cd
+
+    def bars(ticker, *a, **k):
+        adr = adr_by_ticker.get(ticker, 1.0)
+        return [
+            {"t": f"2026-07-{d:02d}", "o": 100.0, "h": 100.0 + adr / 2, "l": 100.0 - adr / 2, "c": 100.0}
+            for d in range(1, 15)
+        ]
+
+    monkeypatch.setattr(cd.historical, "fetch_daily_ohlc_bars", bars)
+    monkeypatch.setattr(cd.historical, "fetch_session_open", lambda *a, **k: None)
+
+
+class TestTheMorningPick:
+    """Orchestra's 09:34 candidate selection (`agent_stonks.candidates`)."""
+
+    def test_picks_once_at_0934_and_the_rest_never_forecast(self, market_open, monkeypatch):
+        from agent_stonks.candidates import SelectionRules
+
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "INTC", "MU"], broker, opening=3)
+        # The same levels on all three; INTC's wider day makes its target worth
+        # the most of its price.
+        _daily(monkeypatch, {"AAPL": 2.0, "INTC": 6.0, "MU": 4.0})
+        state = make_state(["AAPL", "INTC", "MU"])
+        race = make_race(
+            racer("AAPL"), racer("INTC"), racer("MU"),
+            selection=SelectionRules(max_pairs=1), sources=_Sources(),
+        )
+
+        # 09:33: three opening minutes in -- nothing is decided, nothing read.
+        assert race.run_cycle(state, tracker) == "warming_up"
+        assert state.orchestra["selection"] is None
+        assert tapes.forecasts == []
+        assert race.activity("warming_up", tracker)[1] == "Agent waiting to pick its candidates at 09:34"
+
+        # 09:34: the fourth is in, and the pick is made.
+        tapes.opening_bar()
+        race.run_cycle(state, tracker)
+        picked = state.orchestra["selection"]
+        assert [r["key"] for r in picked["rows"] if r["selected"]] == ["INTC:dayrange"]
+        assert set(race.benched) == {"AAPL:dayrange", "MU:dayrange"}
+        line = next(e["text"] for e in state.agent_log if e["text"].startswith("Candidates at 09:34"))
+        assert "INTC · Day Range" in line and "Left out: AAPL · Day Range" in line
+
+        # 09:35: only the candidate forecasts, and only it may buy.
+        tapes.opening_bar()
+        race.run_cycle(state, tracker)
+        assert tapes.forecasts == ["INTC"]
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=104.0)
+        assert race.run_cycle(state, tracker) == "hold"
+        tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "bought"
+        assert [f[:2] for f in fills(tracker)] == [("INTC", "buy")]
+        statuses = {row["key"]: row["status"] for row in state.orchestra["board"]}
+        assert statuses["AAPL:dayrange"].startswith("sits out today (ranked #")
+
+    def test_a_confidently_bearish_morning_keeps_a_pair_out(self, market_open, monkeypatch):
+        from agent_stonks.candidates import SelectionRules
+
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=Broker2())
+        Tapes(monkeypatch, ["AAPL", "INTC"], Broker2(), opening=4)
+        _daily(monkeypatch, {"AAPL": 6.0, "INTC": 2.0})
+        state = make_state(["AAPL", "INTC"])
+        race = make_race(
+            racer("AAPL"), racer("INTC"),
+            selection=SelectionRules(max_pairs=0),
+            sources=_Sources(briefings={"AAPL": {"bias": "bearish", "confidence": "high"}}),
+        )
+        race.run_cycle(state, tracker)
+        assert race.benched == {"AAPL:dayrange": "bearish briefing, high confidence"}
+
+    def test_earnings_since_the_last_close_keep_a_pair_out(self, market_open, monkeypatch):
+        from agent_stonks.candidates import SelectionRules
+
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=Broker2())
+        Tapes(monkeypatch, ["AAPL", "INTC"], Broker2(), opening=4)
+        _daily(monkeypatch, {})
+        state = make_state(["AAPL", "INTC"])
+        race = make_race(
+            racer("AAPL"), racer("INTC"),
+            selection=SelectionRules(max_pairs=0),
+            sources=_Sources(earnings={"INTC": [pd.Timestamp("2026-07-20 16:05-04:00")]}),
+        )
+        race.run_cycle(state, tracker)
+        assert list(race.benched) == ["INTC:dayrange"]
+        assert race.benched["INTC:dayrange"].startswith("earnings 2026-07-20 16:05")
+
+    def test_a_restart_keeps_the_mornings_pick(self, market_open, monkeypatch):
+        from agent_stonks.candidates import SelectionRules
+
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=Broker2())
+        Tapes(monkeypatch, ["AAPL", "INTC"], Broker2(), opening=4)
+        _daily(monkeypatch, {"AAPL": 2.0, "INTC": 6.0})
+        state = make_state(["AAPL", "INTC"])
+        rules = SelectionRules(max_pairs=1)
+        make_race(racer("AAPL"), racer("INTC"), selection=rules, sources=_Sources()).run_cycle(state, tracker)
+        assert [r["key"] for r in state.orchestra["selection"]["rows"] if r["selected"]] == ["INTC:dayrange"]
+
+        # Later the same morning the facts would say otherwise; the pick stands.
+        _daily(monkeypatch, {"AAPL": 9.0, "INTC": 1.0})
+        again = make_race(racer("AAPL"), racer("INTC"), selection=rules, sources=_Sources())
+        again.run_cycle(state, tracker)
+        assert list(again.benched) == ["AAPL:dayrange"]
+        assert any(e["text"].startswith("Keeping today's candidates") for e in state.agent_log)
+
+    def test_the_selection_is_in_the_signature_and_the_record(self):
+        from agent_stonks.candidates import SelectionRules
+        from simlab.rule_agents import rule_agent
+
+        agent = rule_agent(ar.ORCHESTRA_KEY)
+        race = ar.build_orchestra_config(
+            ["AAPL:dayrange", "INTC:dayrange"], at.AppleTraderConfig(),
+            selection=SelectionRules(max_pairs=1, briefing_provider="gemini", briefing_model="g"),
+        )
+        assert ",select=1,earn,bear=high,brief=gemini/g)" in ar.orchestra_signature(race)
+        assert agent.from_record(agent.to_record(race)) == race
+        # A record from before the selection existed raced every pair all day.
+        legacy = agent.to_record(race)
+        del legacy["selection"]
+        assert agent.from_record(legacy).selection is None

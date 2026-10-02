@@ -2,8 +2,11 @@
 open, and a pre-market briefing's bullish / neutral / bearish call.
 
 Read by the Tuning tab's "The pick, session by session" chart, so a day the
-pick lost money can be set against what the morning looked like. Neither is
-an input to any replay.
+pick lost money can be set against what the morning looked like. The cached
+briefings are also the one input a replay takes from here: Orchestra's 09:34
+candidate selection reads them (`ReplaySources`), together with each symbol's
+earnings calendar, kept here too. A replay only ever reads a cached briefing
+and never writes one, so the same morning makes the same choice every time.
 
 That is why both live under `data/simlab/session_context/` and not in the
 rolling store: `tuning.run_is_stale` compares the store's mtimes against every
@@ -269,3 +272,94 @@ def session_biases(
                 else:
                     errors[day] = error
     return records, errors
+
+
+# ---------------------------------------------------------------------------
+# Orchestra's 09:34 candidate selection, replayed
+# ---------------------------------------------------------------------------
+
+EARNINGS_DIR = CONTEXT_DIR / "earnings"
+# The briefings an Orchestra setup that names none is shown coverage for: the
+# pre-market default on the first provider.
+DEFAULT_BRIEFING = (PROVIDERS[0], premarket.DEFAULT_PREMARKET_MODELS[PROVIDERS[0]])
+
+
+def cached_briefing_models() -> list[tuple[str, str]]:
+    """Every (provider, model) with briefings in the cache, the most-cached
+    first: what a replayed selection can read."""
+    counts: dict[tuple[str, str], int] = {}
+    for path in BRIEFING_DIR.glob("*/*.json"):
+        parts = path.name[: -len(".json")].split(".", 2)
+        if len(parts) == 3:
+            key = (parts[1], parts[2])
+            counts[key] = counts.get(key, 0) + 1
+    return sorted(counts, key=lambda key: (-counts[key], key))
+
+
+def briefing_coverage(
+    symbols: list[str], days: list[str], provider: str, model: str
+) -> tuple[int, list[tuple[str, str]]]:
+    """(cached, [(symbol, day) missing]) over every symbol and day."""
+    missing = [
+        (symbol, day) for symbol in symbols for day in days
+        if not briefing_path(symbol, day, provider, model).exists()
+    ]
+    return len(symbols) * len(days) - len(missing), missing
+
+
+def earnings_dates(symbol: str, fetch: Optional[Callable[[str], list]] = None) -> Optional[list[str]]:
+    """`symbol`'s earnings report times (ISO), from the cache, fetched from
+    yfinance and kept the first time they are asked for. None when they cannot
+    be read.
+
+    Kept rather than re-fetched so a replay reads the same calendar every
+    time. Past reports stay on Yahoo's list and future ones are scheduled
+    weeks ahead, so the date after a replayed morning was known that morning.
+    """
+    path = EARNINGS_DIR / f"{symbol.upper()}.json"
+    try:
+        return json.loads(path.read_text())["dates"]
+    except (OSError, ValueError, KeyError):
+        pass
+    if fetch is None:
+        from agent_stonks import historical
+
+        def fetch(sym: str) -> list:
+            frame = historical.fetch_earnings_dates(sym, days=2000)
+            return [] if frame is None else [pd.Timestamp(t).isoformat() for t in frame.index]
+    try:
+        dates = fetch(symbol.upper())
+    except Exception:
+        return None
+    if not dates:
+        # Nothing on record is not the same as a failed read; neither is kept,
+        # so the next replay asks again.
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "symbol": symbol.upper(), "dates": list(dates),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }, indent=1))
+    return list(dates)
+
+
+class ReplaySources:
+    """The briefing and the earnings calendar for a replayed 09:34 selection
+    (`agent_stonks.candidates`): the briefing cached for the day by `provider`
+    and `model`, never a new one -- an LLM answer is not reproducible, and a
+    replay must make the same choice every time it is run."""
+
+    def __init__(self, provider: str = "", model: str = "") -> None:
+        self.provider = provider
+        self.model = model
+
+    def briefing(self, ticker: str, day: date, state) -> tuple[Optional[dict], str]:
+        if not (self.provider and self.model):
+            return None, "no briefing source chosen"
+        record = cached_briefing(ticker, day.isoformat(), self.provider, self.model)
+        if record is None:
+            return None, f"no cached {self.provider}/{self.model} briefing"
+        return {"bias": record.get("bias"), "confidence": record.get("confidence")}, ""
+
+    def earnings(self, ticker: str, day: date) -> Optional[list]:
+        return earnings_dates(ticker)
