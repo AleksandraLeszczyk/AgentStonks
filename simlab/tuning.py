@@ -193,7 +193,14 @@ TUNABLES: "dict[str, Tunable]" = {
         ),
         Tunable("take_fraction", "Share taken on negative momentum", 0.05, 1.0, 0.05, (0.30, 1.0, 0.10)),
         Tunable(
-            "take_min_gain_fraction", "Take only after gaining (× predicted gain)",
+            "take_after_minutes", "Take only after time (min)", 0, 390, 1,
+            (0, 30, 5), "%d", integer=True,
+        ),
+        # The gate the time above replaced (2026-09-29 to 10-02). Still a
+        # tunable so a stored sweep over it reads back as the grid it was; not
+        # offered for a new one (`LEGACY_AXES`).
+        Tunable(
+            "take_min_gain_fraction", "Take only after gaining, legacy (× predicted gain)",
             0.0, 1.0, 0.05, (0.0, 0.50, 0.10),
         ),
         Tunable(
@@ -289,7 +296,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "stop_gain_fraction",
     "momentum_confirmation_bars",
     "take_fraction",
-    "take_min_gain_fraction",
+    "take_after_minutes",
     "hold_min_gain_k",
     "min_win_k",
     "position_pct",
@@ -305,6 +312,7 @@ AXES: "tuple[str, ...]" = tuple(TUNABLES) + tuple(CHOICES)
 LEGACY_AXES: "tuple[str, ...]" = (
     "momentum_fade_bars", "momentum_drop",
     "negative_momentum_bars", "negative_for_bars", "max_fall_k",
+    "take_min_gain_fraction",
 )
 
 

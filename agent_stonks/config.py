@@ -129,7 +129,7 @@ CHART_POLL_SEC = 30
 # land one symbol at a time, so this only has to be fast enough that a finished
 # symbol appears promptly.
 PREMARKET_POLL_SEC = 3
-# How often the Pre-Market tab re-works Orchestra's provisional candidates. Slower
+# How often the Candidates tab re-works Orchestra's provisional pick. Slower
 # than the briefing poll: it reads daily bars, the open and the earnings calendar.
 ORCHESTRA_CANDIDATES_POLL_SEC = 20
 
@@ -389,14 +389,15 @@ APPLE_TRADER_NEGATIVE_FOR_BARS = 5
 APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS = 5
 MOMENTUM_NEUTRAL_FRACTION = 0.10
 APPLE_TRADER_TAKE_FRACTION = 0.70
-# The momentum take waits for the trade to have banked something first
-# (2026-09-29, at the user's request): it fires only once the close is at least
-# this share of the predicted gain -- `(buy_k - sell_k)` level units, the gap
-# the stop is written against too -- above the fill. Under it a negative read is
-# noise around the entry, and the stop is what covers the downside. Not swept.
-# 0 is the rule before it existed (any profit at all), which is what every
-# SimLab record written before then replays as (`simlab.rule_agents._APPLE_LEGACY`).
-APPLE_TRADER_TAKE_MIN_GAIN_FRACTION = 0.20
+# The momentum take waits for the trade to have had time first (2026-10-02, at
+# the user's request, replacing the 2026-09-29 wait for 0.2 of the predicted gain
+# to be banked, `take_min_gain_fraction`): it fires only once this many minutes
+# have passed since the last fill. Before that a negative read is noise around
+# the entry, and the stop is what covers the downside. 15 is the user's pick, not
+# swept. 0 is the rule before it existed (the take from the first bar), which is
+# what every SimLab record written before then replays as
+# (`simlab.rule_agents._APPLE_LEGACY`).
+APPLE_TRADER_TAKE_AFTER_MINUTES = 15
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What the agent does when the session trades through the forecast it was given
 # at 9:35 -- the vocabulary lives here rather than in `dayrange_model`, which

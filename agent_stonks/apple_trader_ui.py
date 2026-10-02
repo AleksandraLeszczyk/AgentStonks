@@ -315,7 +315,7 @@ def rule_params(
     the stop fraction comes to against them."""
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
-    stop_gain_fraction, take_fraction, hold_min_gain_k, take_min_gain_fraction = exit_params(
+    stop_gain_fraction, take_fraction, hold_min_gain_k, take_after_minutes = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
     )
     return {
@@ -324,7 +324,7 @@ def rule_params(
         "breach_exit": breach_exit,
         "stop_gain_fraction": stop_gain_fraction,
         "take_fraction": take_fraction,
-        "take_min_gain_fraction": take_min_gain_fraction,
+        "take_after_minutes": take_after_minutes,
         "hold_min_gain_k": hold_min_gain_k,
     }
 
@@ -524,17 +524,16 @@ def exit_params(
         help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
         disabled=not take_on,
     )
-    take_min_gain_fraction = col_b.number_input(
-        "Take only after gaining (× the predicted gain)",
-        min_value=0.0, max_value=1.0, value=defaults.take_min_gain_fraction, step=0.05,
-        format="%.2f",
-        key=copy.key("take_min_gain_fraction"),
-        help=copy.help.get("take_min_gain_fraction"),
+    take_after_minutes = col_b.number_input(
+        "Take only after time (min)",
+        min_value=0, max_value=390, value=int(defaults.take_after_minutes), step=1,
+        key=copy.key("take_after_minutes"),
+        help=copy.help.get("take_after_minutes"),
         disabled=not take_on,
     )
     return (
         float(stop_gain_fraction), float(take_pct) / 100.0, float(hold_min_gain_k),
-        float(take_min_gain_fraction),
+        int(take_after_minutes),
     )
 
 

@@ -207,9 +207,10 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     which stored records still replay. `TestMomentumConfirmation` is where the
     confirmation is switched on.
 
-    `take_min_gain_fraction` is pinned to 0, the take on any profit: what every
-    take test here was written against. `TestMomentumConfirmation` is where the
-    realised-gain gate is switched on.
+    `take_after_minutes` is pinned to 0, the take from the first bar after the
+    fill: what every take test here was written against.
+    `TestMomentumConfirmation` is where the wait is switched on, and the legacy
+    realised-gain gate (`take_min_gain_fraction`, 0 by default) with it.
 
     `limit_entry` is pinned off, the market buy: most tests here enter on a bar
     that dipped to the level and closed above it, filling at the close, which
@@ -217,7 +218,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     """
     kwargs.setdefault("limit_entry", False)
     kwargs.setdefault("momentum_confirmation_bars", 0)
-    kwargs.setdefault("take_min_gain_fraction", 0.0)
+    kwargs.setdefault("take_after_minutes", 0)
     if not kwargs["momentum_confirmation_bars"] and not (
         kwargs.get("momentum_fade_bars") or kwargs.get("momentum_drop")
     ):
@@ -3815,7 +3816,7 @@ class TestMomentumConfirmation:
         assert config.momentum_confirmation_bars == 5
         assert config.has_take
         signature = config_signature(config)
-        assert ",confirm=5b" in signature and "@conf>=0.2G," in signature
+        assert ",confirm=5b" in signature and "@conf>=15m," in signature
 
     def test_it_cannot_sit_beside_a_legacy_take(self):
         with pytest.raises(ValueError, match="only one may be set"):
@@ -3944,16 +3945,48 @@ class TestMomentumConfirmation:
         assert self._step(trader, tracker, tape, state, 103.0) == "sold"
         assert 0 < tracker.position_for(TICKER) < shares
 
-    # --- the take waits for a share of the predicted gain ------------------
+    # --- the take waits for time since the fill -----------------------------
 
-    def test_the_gain_gate_is_on_by_default_and_signed(self):
+    def test_the_time_gate_is_on_by_default_and_signed(self):
         config = AppleTraderConfig()
-        assert config.take_min_gain_fraction == 0.2
-        assert "@conf>=0.2G," in config_signature(config)
-        assert ">=0G" not in config_signature(replace(config, take_min_gain_fraction=0.0))
-        assert "G," not in config_signature(
+        assert config.take_after_minutes == 15
+        assert config.take_min_gain_fraction == 0.0
+        assert "@conf>=15m," in config_signature(config)
+        assert ">=0m" not in config_signature(replace(config, take_after_minutes=0))
+        assert ">=15m" not in config_signature(
             AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
         )
+        with pytest.raises(ValueError, match="take_after_minutes"):
+            AppleTraderConfig(take_after_minutes=-1)
+        with pytest.raises(ValueError, match="must be whole"):
+            AppleTraderConfig(take_after_minutes=2.5)
+
+    def test_no_take_before_the_time_is_up(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_after_minutes=3)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "negative")
+        # Bought on the bar before: 1 and then 2 minutes after the fill.
+        assert self._step(trader, tracker, tape, state, 105.0) == "hold"
+        assert self._step(trader, tracker, tape, state, 105.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+        # 3 minutes after it.
+        assert self._step(trader, tracker, tape, state, 105.0) == "sold"
+        assert 0 < tracker.position_for(TICKER) < shares
+        assert "Momentum take" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_the_wait_is_announced(self):
+        config = dayrange_config(momentum_confirmation_bars=self.N, take_after_minutes=15)
+        summary = at._armed_summary(
+            config, at.apple_models.get(config.model_key), DAYRANGE_BUNDLE
+        )
+        assert "take in profit (not before 15 min after the fill)" in summary
+
+    # --- the legacy gate: a share of the predicted gain ---------------------
+
+    def test_the_legacy_gain_gate_is_signed_when_set(self):
+        config = AppleTraderConfig(take_min_gain_fraction=0.2, take_after_minutes=0)
+        assert "@conf>=0.2G," in config_signature(config)
+        assert ">=0G" not in config_signature(AppleTraderConfig())
         with pytest.raises(ValueError, match="take_min_gain_fraction"):
             AppleTraderConfig(take_min_gain_fraction=-0.1)
 

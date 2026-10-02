@@ -2647,13 +2647,13 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "negative.\n"
             "- Whole shares, rounded down, and at least one."
         ),
-        "take_min_gain_fraction": (
-            "The momentum take fires only once the price is at least this share of the "
-            "predicted gain (`buy − sell`, the gap the stop is written against) above "
-            "the fill.\n\n"
-            "- Below it a negative momentum read is left alone; the stop covers the "
+        "take_after_minutes": (
+            "The momentum take fires only once this many minutes have passed since the "
+            "last buy.\n\n"
+            "- Before that a negative momentum read is left alone; the stop covers the "
             "downside.\n"
-            "- 0 takes on any profit at all."
+            "- A buy lower down (scale-in) starts the wait again.\n"
+            "- 0 takes from the first bar after the buy."
         ),
         "hold_min_gain_k": (
             "Keep a runner only if the sell level is still this many × {unit} above the fill; "
@@ -2694,7 +2694,7 @@ _ORCHESTRA_COPY = dc_replace(
             "and the opening gap on the daily ADR.\n"
             "- Ranks what is left by what a target exit pays as a share of the price "
             "(`buy − sell` ADRs over the price), best first.\n"
-            "- The Pre-Market tab shows the pick — provisional until 09:34, then the "
+            "- The Candidates tab shows the pick — provisional until 09:34, then the "
             "one Orchestra made. A restart keeps it."
         ),
         "pairs": (
@@ -2839,7 +2839,7 @@ def _orchestra_params(symbols: list[str]) -> "OrchestraConfig | None":
     state.orchestra_configs = (
         {f"{r.ticker}:{r.model_key}": r for r in race.racers} if race is not None else {}
     )
-    # And whole, for the Pre-Market tab's provisional pick of candidates.
+    # And whole, for the Candidates tab's provisional pick.
     state.orchestra_form = race
     last_setup.remember()
     return race
@@ -3703,6 +3703,11 @@ def _orchestra_candidates_panel() -> None:
             st.warning(f"Could not work out the candidates: {exc}")
             return
     else:
+        st.info(
+            "Nothing to show yet. Pick **Orchestra** as the agent in the 🤖 Agent tab to "
+            "see the pick as it would come out now; the one it makes at 09:34 ET stays "
+            "here for the rest of the day."
+        )
         return
     st.dataframe(
         pd.DataFrame([
@@ -3741,12 +3746,10 @@ def _orchestra_candidates_panel() -> None:
             "ADR": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
-    st.divider()
 
 
 def _premarket_panel(symbols: list[str]) -> None:
     state = _get_state()
-    _orchestra_candidates_panel()
 
     st.caption(
         "Synthesizes recent news, historical price action, macro indicators, and fundamentals "
@@ -4244,9 +4247,13 @@ def build_ui() -> None:
     symbols = _effective_symbols(state, symbols_input)
 
     (
-        tab_agent, tab_live, tab_news, tab_premarket, tab_analysis, tab_walls, tab_models,
+        tab_agent, tab_live, tab_news, tab_premarket, tab_candidates, tab_analysis,
+        tab_walls, tab_models,
     ) = st.tabs(
-        ["🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🔬 Technical Analysis", "🧱 Put/Call Walls", "🧠 ML Models"]
+        [
+            "🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🎼 Candidates",
+            "🔬 Technical Analysis", "🧱 Put/Call Walls", "🧠 ML Models",
+        ]
     )
 
     with tab_live, _panel_guard("The Live tab"):
@@ -4349,6 +4356,11 @@ def build_ui() -> None:
             finnhub_token=finnhub_token,
             history_feed=history_feed,
         )
+
+    # After the Agent tab: Orchestra's form there publishes the setup the
+    # provisional pick is worked out from.
+    with tab_candidates, _panel_guard("The Candidates tab"):
+        _orchestra_candidates_panel()
 
     with tab_models, _panel_guard("The ML Models tab"):
         model_catalogue_panel()

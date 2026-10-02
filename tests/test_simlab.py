@@ -978,8 +978,20 @@ class TestRuleAgentRecords:
         assert "@mom-1," in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert "@conf>=0.2G," in agent.signature(today)
+        assert "@conf>=15m," in agent.signature(today)
         assert ",confirm=5b" in agent.signature(today)
+
+    def test_a_record_from_the_gain_gate_keeps_it(self):
+        """From 2026-09-29 to 10-02 the take waited for 0.2 of the predicted gain
+        rather than for time. Such a record carries the 0.2 and no wait: it
+        replays the gate it was run under and signs as it was filed."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        record["take_min_gain_fraction"] = 0.2
+        record.pop("take_after_minutes")
+        old = agent.from_record(record)
+        assert (old.take_min_gain_fraction, old.take_after_minutes) == (0.2, 0)
+        assert "@conf>=0.2G," in agent.signature(old)
 
     def test_a_record_from_before_negative_momentum_keeps_its_turn(self):
         """From 2026-09-21 to -23 the take fired on the sigma score turning from

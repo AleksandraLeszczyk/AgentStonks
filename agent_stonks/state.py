@@ -353,7 +353,7 @@ class AppState:
         # when it races both of its models, so a symbol is not a key.
         self.orchestra_configs: dict = {}
         # The whole Orchestra setup the form holds -- pairs, rules and the 09:34
-        # candidate selection -- for the Pre-Market tab's provisional pick.
+        # candidate selection -- for the Candidates tab's provisional pick.
         self.orchestra_form = None
         self.orchestra_levels: dict = {}
         # The running (or last) race as a whole: its racers in order, which one

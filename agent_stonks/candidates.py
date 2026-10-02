@@ -227,7 +227,7 @@ def summary(candidates: "list[Candidate]") -> str:
 
 
 def to_rows(candidates: "list[Candidate]") -> "list[dict]":
-    """The selection as plain rows: what the board, the Pre-Market panel and
+    """The selection as plain rows: what the board, the Candidates tab and
     the session file keep."""
     rows = []
     for c in candidates:

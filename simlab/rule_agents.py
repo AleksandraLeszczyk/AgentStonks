@@ -234,8 +234,13 @@ _APPLE_LEGACY = {
     # the signature, so every stored run keeps the identity it was filed under.
     "momentum_confirmation_bars": 0,
     # And before 2026-09-29 the take fired on any profit at all, however small.
-    # 0 is that rule, and it is left out of the signature.
+    # 0 is that rule, and it is left out of the signature. No new config sets it
+    # either (the time below replaced it); a record from 09-29 to 10-02 carries
+    # its 0.2 and replays that.
     "take_min_gain_fraction": 0.0,
+    # And before 2026-10-02 the take fired from the first bar after the fill.
+    # 0 is that rule, and it is left out of the signature.
+    "take_after_minutes": 0,
     # And every buy was a market order, filling near the close of the bar that
     # reached the level even when that was above it (before 2026-09-30). False
     # is that rule, and it is left out of the signature.
