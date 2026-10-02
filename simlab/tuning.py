@@ -1758,6 +1758,20 @@ def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
         tasks += [(name, "cell", c) for c in cells if overrides_key(c) not in have]
         if record["baseline"][name] is None:
             tasks.append((name, BASELINE, {}))
+    # A session stored before it was over ends every replay of it early; fetch
+    # it whole first if it can be had now (once here, not in every worker).
+    from . import data as sim_data
+
+    try:
+        ticker = make_config(spec["base"], {}).ticker
+    except (TypeError, ValueError):
+        ticker = None  # every cell reports the invalid base itself
+    for dataset in spec["datasets"] if ticker else ():
+        if any(name == dataset["name"] for name, _, _ in tasks):
+            sim_data.repair_for_replay(
+                [ticker], [date.fromisoformat(d) for d in dataset["days"]], dataset["feed"],
+                progress=progress,
+            )
     _run_tasks(tasks, spec, workers, on_done)
 
     order = [overrides_key(c) for c in cells]

@@ -64,6 +64,9 @@ def run_experiment(experiment_id: str) -> dict:
         feed=cfg.get("feed") or sim_data.LEGACY_FEED,
     )
     rule_based = is_rule_based(config.personality)
+    # A session stored before it was over would end the replay early (no
+    # flatten); fetch it whole first if it can be had now.
+    sim_data.repair_for_replay(config.symbols, days, config.feed, progress=_progress)
     market = SimMarket(config.symbols, days, config.feed)
     engine = SimulationEngine(market, config, progress=_progress)
     result = engine.run()

@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 import textwrap
+import threading
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
@@ -25,6 +26,7 @@ from agent_stonks import (
     apple_models,
     candle_patterns,
     clock,
+    minute_momentum,
     model_overlays,
 )
 from agent_stonks import observability as obs
@@ -433,6 +435,15 @@ def render_agents_tab() -> None:
 # Tab 2 — datasets
 # ---------------------------------------------------------------------------
 
+def _incomplete_note(item: "sim_data.IncompleteFile") -> str:
+    """What happens next to a stored day that is not whole."""
+    if datetime.now(timezone.utc) < sim_data.day_final_at(item.day):
+        return "re-downloaded once the day is over"
+    if item.fixable:
+        return "re-download pending (retried automatically)"
+    return "no longer downloadable on this feed"
+
+
 def render_datasets_tab() -> None:
     st.caption(
         "Datasets are named bundles of symbols + a date range + a **feed**. Minute bars "
@@ -503,6 +514,9 @@ def render_datasets_tab() -> None:
         return
     size_mb = sim_data.store_size_bytes() / 1e6
     st.markdown(f"##### Stored datasets — shared store {size_mb:.1f} MB")
+    # What the automatic repair (`_repair_incomplete_store`) could not fix yet:
+    # a day still trading, or one Yahoo no longer serves.
+    incomplete = [f for f in sim_data.incomplete_files() if f.kind == "bars"]
     for ds in datasets:
         with st.container(border=True, horizontal=True, vertical_alignment="center"):
             st.markdown(
@@ -512,6 +526,30 @@ def render_datasets_tab() -> None:
             if st.button("Delete", key=f"del_ds_{ds.name}", icon=":material/delete:"):
                 sim_data.delete_dataset(ds.name)
                 st.rerun()
+        lo, hi = ds.date_range()
+        reach = set(sim_data.weekdays(lo, hi)) | set(minute_momentum.prior_week_days(lo))
+        partial = [
+            f for f in incomplete
+            if f.feed == ds.feed and f.symbol in ds.symbols and f.day in reach
+        ]
+        if partial:
+            groups: "dict[tuple[str, str], list[date]]" = {}
+            for item in partial:
+                groups.setdefault((item.symbol, _incomplete_note(item)), []).append(item.day)
+            week_before = sum(1 for item in partial if item.day < lo)
+            st.caption(
+                f":material/warning: {len(partial)} stored day(s) are not whole"
+                + (f" ({week_before} in the week before the first session, read only for "
+                   "`abs_mean_minute_momentum`)" if week_before else "")
+                + " — "
+                + "; ".join(
+                    f"{symbol} {days[0]}"
+                    + (f" → {days[-1]} ({len(days)} days)" if len(days) > 1 else "")
+                    + f": {note}"
+                    for (symbol, note), days in groups.items()
+                ),
+                help="\n\n".join(f"{item.symbol} {item.day}: {item.reason}" for item in partial),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -4595,6 +4633,47 @@ SIMLAB_TABS = [
 ]
 TAB_STATE_KEY = "simlab_tab"
 
+# How often the app re-downloads stored files that were fetched before their
+# day was over and can now be had whole (`sim_data.repair_incomplete`). Once per
+# process at start, then at most this often -- a day that finishes while the
+# app is open (today's, after 20:30 ET) is picked up on a later rerun.
+_REPAIR_EVERY = timedelta(minutes=10)
+_repair_lock = threading.Lock()
+_last_repair: "dict[str, datetime]" = {}
+
+
+def _repair_incomplete_store() -> None:
+    """Re-download what the store holds only part of, before anything reads it.
+
+    A day fetched mid-session (2026-09-09 stopped at 10:29) used to stay that
+    way: a replay ran out of tape before the flatten. The scan is a stat per
+    file; downloads happen only when something is both incomplete and now
+    whole at the source. Never lets a failure reach the page.
+    """
+    now = datetime.now(timezone.utc)
+    if now - _last_repair.get("at", datetime.min.replace(tzinfo=timezone.utc)) < _REPAIR_EVERY:
+        return
+    if not _repair_lock.acquire(blocking=False):
+        return  # another session's rerun is already at it
+    try:
+        _last_repair["at"] = now
+        pending = [f for f in sim_data.incomplete_files() if f.fixable]
+        if pending:
+            with st.status(
+                f"Re-downloading {len(pending)} stored file(s) fetched before their day was over…",
+                expanded=False,
+            ) as status:
+                repaired = sim_data.repair_incomplete(progress=st.write)
+                status.update(
+                    label=f"Re-downloaded {len(repaired)} of {len(pending)} incomplete stored file(s)",
+                    state="complete" if len(repaired) == len(pending) else "error",
+                )
+        sim_data.reconcile_dataset_days()
+    except Exception as exc:  # the store repair must never take the app down
+        st.warning(f"Checking the stored data for incomplete days failed: {exc}")
+    finally:
+        _repair_lock.release()
+
 
 def build_ui() -> None:
     st.set_page_config(page_title="AgentStonks SimLab", page_icon="🧪", layout="wide")
@@ -4609,6 +4688,7 @@ def build_ui() -> None:
     # ticks while Simulate is open -- so a batch would stall the moment anyone
     # went to read a result. It is also the honest place for it: experiments run
     # whatever is on screen.
+    _repair_incomplete_store()
     _render_pipeline()
     st.divider()
     (

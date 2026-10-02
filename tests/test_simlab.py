@@ -1,5 +1,6 @@
 """Tests for the SimLab simulation suite (clock, store, market, engine, scores)."""
 import json
+import os
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -543,6 +544,229 @@ class TestMinuteBarsComeFromYfinance:
         sim_data.create_dataset("yf", ["TEST"], day, day)
 
         assert sim_data.load_news("TEST", day) == []
+
+
+def _written(path, moment: datetime) -> None:
+    """Back-date a stored file to when it was (supposedly) downloaded."""
+    os.utime(path, (moment.timestamp(), moment.timestamp()))
+
+
+def _session(day: date, minutes: int, close: float = 100.0) -> list[dict]:
+    open_utc = OPEN_UTC + timedelta(days=(day - DAY).days)
+    return [_bar(open_utc + timedelta(minutes=i), close) for i in range(minutes)]
+
+
+class TestIncompleteDays:
+    """A day downloaded before it was over is a prefix of it, and used to stay
+    one: 2026-09-09 was fetched at 10:29 ET, every later dataset counted it as
+    stored, and a replay ran out of tape before the flatten."""
+
+    SESSION = date(2026, 6, 16)  # a Tuesday
+    MID_SESSION = datetime(2026, 6, 16, 14, 29, tzinfo=timezone.utc)  # 10:29 EDT
+    NEXT_MORNING = datetime(2026, 6, 17, 9, 0, tzinfo=timezone.utc)
+
+    def _fetchers(self, monkeypatch, calls, minutes=390, news=()):
+        def fake_minute(symbol, day, key="", secret="", feed=sim_data.DEFAULT_FEED):
+            calls.append((symbol, day, feed))
+            return _session(day, minutes)
+
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", fake_minute)
+        monkeypatch.setattr(sim_data, "fetch_news_day", lambda *a, **k: list(news))
+        monkeypatch.setattr(sim_data, "fetch_daily_bars_range", lambda *a, **k: [_bar(OPEN_UTC, 99.0)])
+        monkeypatch.setattr(
+            sim_data, "fetch_market_indicator_closes",
+            lambda *a, **k: {"spy": [], "vix": [], "vix3m": []},
+        )
+
+    def _store_partial(self, minutes=60, feed="iex"):
+        path = sim_data.bars_path("TEST", self.SESSION, feed)
+        sim_data._write_gz(path, _session(self.SESSION, minutes))
+        _written(path, self.MID_SESSION)
+        return path
+
+    def test_a_day_written_before_it_was_over_is_not_whole(self, store):
+        self._store_partial()
+        assert not sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+        assert "before the day was over" in sim_data.incomplete_reason("TEST", self.SESSION, "iex")
+
+        _written(sim_data.bars_path("TEST", self.SESSION, "iex"), self.NEXT_MORNING)
+        assert sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+
+    def test_the_post_market_counts_the_day_is_over_only_after_the_stored_window(self, store):
+        """The stored window runs to 20:00 ET; a 16:30 download misses the
+        after-hours tape the store promises."""
+        path = self._store_partial()
+        _written(path, datetime(2026, 6, 16, 20, 30, tzinfo=timezone.utc))  # 16:30 EDT
+        assert not sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+        _written(path, sim_data.day_final_at(self.SESSION))
+        assert sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+
+    def test_create_dataset_downloads_a_partial_day_again(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        self._store_partial(minutes=60)
+
+        ds = sim_data.create_dataset("d", ["TEST"], self.SESSION, self.SESSION, "k", "s", feed="iex")
+
+        assert ("TEST", self.SESSION, "iex") in calls
+        assert len(sim_data.load_day_bars("TEST", self.SESSION, "iex")) == 390
+        assert sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+        assert ds.days == [self.SESSION.isoformat()]
+
+    def test_a_whole_day_is_not_downloaded_again(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        sim_data._write_gz(sim_data.bars_path("TEST", self.SESSION, "iex"), _session(self.SESSION, 390))
+
+        sim_data.create_dataset("d", ["TEST"], self.SESSION, self.SESSION, "k", "s", feed="iex")
+
+        assert ("TEST", self.SESSION, "iex") not in calls
+
+    def test_a_download_never_replaces_more_bars_with_fewer(self, store, monkeypatch):
+        """Yahoo lets a day go after 30 days and answers [] -- the 60 stored
+        minutes are then worth more than none, and stay incomplete."""
+        calls = []
+        self._fetchers(monkeypatch, calls, minutes=0)
+        self._store_partial(minutes=60)
+        messages = []
+
+        sim_data.create_dataset(
+            "d", ["TEST"], self.SESSION, self.SESSION, "k", "s", feed="iex", progress=messages.append,
+        )
+
+        assert len(sim_data.load_day_bars("TEST", self.SESSION, "iex")) == 60
+        assert not sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+        assert any("kept the stored copy" in m for m in messages)
+
+    def test_a_day_stored_empty_although_it_traded_is_not_whole(self, store):
+        """A failed fetch reads as [] -- a holiday, unless the daily history
+        says the session happened."""
+        path = sim_data.bars_path("TEST", self.SESSION)
+        sim_data._write_gz(path, [])
+        assert sim_data.stored_day_complete("TEST", self.SESSION)  # no daily row: a holiday
+
+        stored = sim_data._read_gz(sim_data.daily_path("TEST"))
+        stored["bars"].append(_bar(datetime(2026, 6, 16, tzinfo=timezone.utc), 99.0))
+        sim_data._write_gz(sim_data.daily_path("TEST"), stored)
+        assert "daily history" in sim_data.incomplete_reason("TEST", self.SESSION)
+
+    def test_repair_downloads_what_is_now_whole_and_leaves_the_rest(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        self._store_partial()
+        # Still trading on the real clock: a download now is another prefix.
+        tomorrow = date.today() + timedelta(days=1)
+        future = sim_data.bars_path("TEST", tomorrow, "iex")
+        sim_data._write_gz(future, [])
+
+        repaired = sim_data.repair_incomplete("k", "s", feed="iex")
+
+        assert [(f.symbol, f.day) for f in repaired] == [("TEST", self.SESSION)]
+        assert calls == [("TEST", self.SESSION, "iex")]
+        assert sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+        assert not sim_data.stored_day_complete("TEST", tomorrow, "iex")
+
+    def test_repair_leaves_a_yfinance_day_yahoo_no_longer_serves(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        self._store_partial(feed="yfinance")
+        [item] = sim_data.incomplete_files(feed="yfinance")
+        assert not item.fixable
+
+        assert sim_data.repair_incomplete(feed="yfinance") == []
+        assert calls == []
+
+    def test_repair_needs_credentials_for_the_alpaca_tapes(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+        monkeypatch.delenv("ALPACA_SECRET", raising=False)
+        self._store_partial()
+        messages = []
+
+        assert sim_data.repair_incomplete(feed="iex", progress=messages.append) == []
+        assert calls == []
+        assert any("no Alpaca credentials" in m for m in messages)
+
+    def test_news_fetched_mid_session_is_fetched_again(self, store, monkeypatch):
+        self._fetchers(monkeypatch, [], news=[{"id": 1}, {"id": 2}])
+        npath = sim_data.news_path("TEST", self.SESSION)
+        sim_data._write_gz(npath, [{"id": 1}])
+        _written(npath, self.MID_SESSION)
+
+        sim_data.repair_incomplete("k", "s", symbols=["TEST"])
+
+        assert sim_data.load_news("TEST", self.SESSION) == [{"id": 1}, {"id": 2}]
+
+    def test_a_daily_history_fetched_mid_session_does_not_cover_that_day(self, store):
+        path = sim_data.daily_path("TEST")
+        meta = sim_data._read_gz(path)
+        meta.update(start="2025-01-01", end=self.SESSION.isoformat())
+        meta["bars"].append(_bar(datetime(2026, 6, 16, tzinfo=timezone.utc), 99.0))
+        sim_data._write_gz(path, meta)
+        _written(path, self.MID_SESSION)
+
+        assert not sim_data._daily_covers("TEST", date(2026, 3, 2), self.SESSION)
+        assert sim_data._daily_covers("TEST", date(2026, 3, 2), date(2026, 6, 15))
+        [item] = [f for f in sim_data.incomplete_files() if f.kind == "daily"]
+        assert item.day == self.SESSION
+
+        # Recorded since the fix, and preferred over the mtime.
+        meta["fetched_at"] = self.NEXT_MORNING.isoformat()
+        sim_data._write_gz(path, meta)
+        _written(path, self.MID_SESSION)
+        assert sim_data._daily_covers("TEST", date(2026, 3, 2), self.SESSION)
+
+    def test_a_weekend_end_is_covered_by_fridays_close(self, store):
+        path = sim_data.daily_path("TEST")
+        meta = sim_data._read_gz(path)
+        meta.update(start="2025-01-01", end="2026-06-20")  # a Saturday
+        sim_data._write_gz(path, meta)
+        _written(path, datetime(2026, 6, 20, 9, 0, tzinfo=timezone.utc))
+        assert sim_data._daily_covers("TEST", date(2026, 3, 2), date(2026, 6, 20))
+
+    def test_market_indicators_fetched_mid_session_are_fetched_again(self, store):
+        rows = [{"date": "2025-01-02", "close": 1.0}, {"date": "2026-06-16", "close": 2.0}]
+        sim_data._write_gz(sim_data.market_path(), {"spy": rows, "vix": rows, "vix3m": rows})
+        _written(sim_data.market_path(), self.MID_SESSION)
+        assert not sim_data._market_covers(date(2026, 3, 2), self.SESSION)
+        _written(sim_data.market_path(), self.NEXT_MORNING)
+        assert sim_data._market_covers(date(2026, 3, 2), self.SESSION)
+
+    def test_a_day_stored_before_it_began_joins_its_dataset_once_whole(self, store, monkeypatch):
+        """Fetched the day before, it stored empty and was left out as a
+        holiday (2026-08-21)."""
+        self._fetchers(monkeypatch, [])
+        path = sim_data.bars_path("TEST", self.SESSION, "iex")
+        sim_data._write_gz(path, [])
+        _written(path, datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc))
+        sim_data._write_gz(sim_data.bars_path("TEST", DAY, "iex"), _session(DAY, 390))
+        sim_data._save_manifest([sim_data.Dataset(
+            name="d", symbols=["TEST"], start=DAY.isoformat(), end=self.SESSION.isoformat(),
+            days=[DAY.isoformat()], feed="iex",
+        )])
+
+        sim_data.repair_incomplete("k", "s", feed="iex")
+
+        assert sim_data.reconcile_dataset_days() == ["d"]
+        assert sim_data.get_dataset("d").days == [DAY.isoformat(), self.SESSION.isoformat()]
+        assert sim_data.reconcile_dataset_days() == []
+
+    def test_a_replay_repairs_its_own_sessions_and_the_week_before(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        monkeypatch.setenv("ALPACA_API_KEY", "k")
+        monkeypatch.setenv("ALPACA_SECRET", "s")
+        self._store_partial()
+        replayed = date(2026, 6, 17)
+        assert minute_momentum.prior_week_days(replayed)[-1] == self.SESSION
+        other = sim_data.bars_path("OTHER", self.SESSION, "iex")
+        sim_data._write_gz(other, [])
+        _written(other, self.MID_SESSION)
+
+        sim_data.repair_for_replay(["TEST"], [replayed], "iex")
+
+        assert calls == [("TEST", self.SESSION, "iex")]
 
 
 def _tool_call(call_id, name, arguments):
