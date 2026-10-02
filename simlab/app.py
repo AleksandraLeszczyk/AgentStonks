@@ -3662,7 +3662,12 @@ def _render_tuning_form() -> None:
     if not carrying:
         st.warning(f"No stored dataset carries {base.ticker}. Download one in the Datasets tab.")
         return
-    by_name = {d.name: d for d in carrying}
+    # Oldest first, the order the results show them in.
+    stored = {d.name: d for d in carrying}
+    by_name = {
+        d["name"]: stored[d["name"]]
+        for d in sim_tuning.chronological([_tuning_dataset_spec(d) for d in carrying])
+    }
     newest = max(carrying, key=lambda d: str(d.end)).name
     chosen = st.multiselect(
         "Sweep on", list(by_name), default=[newest], format_func=lambda n: _tuning_describe_dataset(by_name[n]),
@@ -3952,7 +3957,7 @@ def _tuning_heatmap(
 def _tuning_summary_rows(job: dict) -> list[dict]:
     """The base configuration and the pick on each dataset, then summed."""
     spec = job["spec"]
-    datasets = spec["datasets"]
+    datasets = sim_tuning.chronological(spec["datasets"])
 
     def row(label: str, sessions: int, base: "dict | None", pick: "dict | None") -> dict:
         out = {"dataset": label, "sessions": sessions}
@@ -4041,7 +4046,7 @@ _TUNING_WIN_RATE_HELP = (
 
 def _tuning_cell_rows(job: dict) -> list[dict]:
     """Every summed combination, best total first, with each dataset's share."""
-    names = sim_tuning.dataset_names(job["spec"])
+    names = sim_tuning.dataset_names(job["spec"], by_date=True)
     per_dataset = [
         {sim_tuning.overrides_key(c["overrides"]): c for c in job["cells"].get(name) or ()}
         for name in names
@@ -4096,7 +4101,7 @@ _BIAS_MARK = {
 
 
 def _tuning_color(index: int) -> str:
-    """One dataset's colour, in the order the job lists them."""
+    """One dataset's colour, in the order the job shows them (oldest first)."""
     return _DRIFT_SERIES_COLORS[index % len(_DRIFT_SERIES_COLORS)]
 
 
@@ -4183,7 +4188,7 @@ def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
         row_heights=[0.6, 0.4],
     )
     bars: dict[str, dict] = {}
-    for index, dataset in enumerate(spec["datasets"]):
+    for index, dataset in enumerate(sim_tuning.chronological(spec["datasets"])):
         cell = sim_tuning.pick_cell(job, dataset["name"])
         if not sim_tuning.is_scored(cell):
             continue
@@ -4284,7 +4289,7 @@ def _render_tuning_session_context(job: dict, context: dict) -> None:
 
 
 def _render_tuning_notes(job: dict) -> None:
-    for dataset in job["spec"]["datasets"]:
+    for dataset in sim_tuning.chronological(job["spec"]["datasets"]):
         name = dataset["name"]
         cells = [*(job["cells"].get(name) or ()), job["baseline"].get(name)]
         errors = [c for c in cells if c and c.get("error")]
@@ -4398,7 +4403,7 @@ def _render_tuning_dataset_controls(job: dict) -> None:
     spec = job["spec"]
     job_id = job["job_id"]
     ticker = spec["base"]["ticker"]
-    names = sim_tuning.dataset_names(spec)
+    names = sim_tuning.dataset_names(spec, by_date=True)
     addable = sorted(
         (
             d for d in sim_data.list_datasets()
@@ -4457,7 +4462,7 @@ def _render_tuning_dataset_controls(job: dict) -> None:
                     st.rerun()
     if chosen is not None:
         added = _tuning_dataset_spec(chosen)
-        _render_tuning_overlaps([*spec["datasets"], added])
+        _render_tuning_overlaps(sim_tuning.chronological([*spec["datasets"], added]))
         prior = sim_tuning.prior_cells(spec, _runs(), [added])
         minutes = sim_tuning.estimated_seconds(spec, prior, [added]) / 60.0
         found = len(prior[added["name"]])
@@ -4486,7 +4491,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     job = next(j for j in jobs if j["job_id"] == job_id)
     spec = job["spec"]
     axes = spec["axes"]
-    names = sim_tuning.dataset_names(spec)
+    names = sim_tuning.dataset_names(spec, by_date=True)
 
     if job["status"] == sim_tuning.RUNNING:
         st.info("Still running — the heatmaps fill in as cells finish.",

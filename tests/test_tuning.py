@@ -417,6 +417,27 @@ class TestPick:
         assert tu.overlapping_days(["2026-06-15", "2026-06-16"], ["2026-06-16"]) == ["2026-06-16"]
 
 
+class TestChronological:
+    """Datasets are shown oldest first, whatever order they were added in."""
+
+    SPEC = {"datasets": [
+        {"name": "late", "days": ["2026-09-22", "2026-09-21"]},
+        {"name": "b_early", "days": ["2026-09-14", "2026-09-18"]},
+        {"name": "a_early", "days": ["2026-09-14", "2026-09-18"]},
+        {"name": "early_short", "days": ["2026-09-14", "2026-09-15"]},
+    ]}
+
+    def test_by_first_session_then_last_then_name(self):
+        assert tu.dataset_names(self.SPEC, by_date=True) == [
+            "early_short", "a_early", "b_early", "late",
+        ]
+
+    def test_the_record_keeps_the_order_they_were_added_in(self):
+        assert tu.dataset_names(self.SPEC) == ["late", "b_early", "a_early", "early_short"]
+        tu.chronological(self.SPEC["datasets"])
+        assert self.SPEC["datasets"][0]["name"] == "late"
+
+
 # --- the sum over datasets --------------------------------------------------
 
 

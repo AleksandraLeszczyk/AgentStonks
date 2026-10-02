@@ -1221,9 +1221,25 @@ def overlapping_days(first: "list[str]", second: "list[str]") -> "list[str]":
 # --- the sum over datasets --------------------------------------------------
 
 
-def dataset_names(spec: dict) -> "list[str]":
-    """A job's datasets by name, in the order they were added."""
-    return [d["name"] for d in spec.get("datasets") or ()]
+def chronological(datasets) -> "list[dict]":
+    """Datasets oldest first: by first session, then last session, then name.
+
+    The order everything is *shown* in. The record keeps the order they were
+    added in, which is the order they are replayed and summed in -- left alone
+    so a re-read sum or pick cannot move by a float's last bit.
+    """
+    def period(d: dict) -> tuple:
+        days = sorted(d.get("days") or ())
+        return (days[0], days[-1]) if days else ("", "")
+
+    return sorted(datasets or (), key=lambda d: (*period(d), d["name"]))
+
+
+def dataset_names(spec: dict, by_date: bool = False) -> "list[str]":
+    """A job's datasets by name, in the order they were added -- or, with
+    `by_date`, oldest first (`chronological`), the order they are shown in."""
+    datasets = spec.get("datasets") or ()
+    return [d["name"] for d in (chronological(datasets) if by_date else datasets)]
 
 
 def _cells_by_key(record: dict, name: str) -> "dict[str, dict]":
