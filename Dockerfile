@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent_stonks/ agent_stonks/
 COPY main.py run_app.py ./
+# Streamlit settings the app relies on (the message cache off; see README, "Recovery").
+COPY .streamlit/config.toml .streamlit/config.toml
 
 EXPOSE 8501
 

@@ -118,6 +118,7 @@ from .state import (
 from .tactics import tactic_price_levels, tactics_summaries
 from . import bar_history, gamma_history, minute_momentum, newsimpact_model, stream_common
 from .trade_sound import next_trade_cue, play_trade_sound
+from .page_watchdog import WATCHDOG_BEAT_SEC, describe_reload, page_watchdog
 from .quote_card import quote_card
 from .trading_mode import (
     ENV_KEYS as TRADING_ENV_KEYS,
@@ -4073,6 +4074,20 @@ def _resume_after_restart(
     state.recovery = {"kind": "restart", "at": time.time(), "run": run, "error": error}
 
 
+@st.fragment(run_every=WATCHDOG_BEAT_SEC)
+def _page_watchdog() -> None:
+    """The heartbeat of the page's own watchdog (see page_watchdog), which
+    reloads this tab when Streamlit's frontend has died under a healthy server.
+    The first page after such a reload says why; the full run draws that in
+    the recovery banner."""
+    report = page_watchdog()
+    if report:
+        state = _get_state()
+        recovery = state.recovery or {"kind": "reconnect", "at": time.time()}
+        state.recovery = {**recovery, "reload": report}
+        st.rerun(scope="app")
+
+
 @st.fragment(run_every=RESUME_RETRY_SEC)
 def _resume_retry_timer() -> None:
     """Rerun the whole app once a pending resume is due to be tried again --
@@ -4107,12 +4122,18 @@ def _recovery_banner(state: AppState) -> None:
                 (_personality_label(state.llm_personality), state.agent_running),
             ) if on
         ]
+        reload = recovery.get("reload")
+        what = (
+            f"This page reloaded itself because {describe_reload(reload)}"
+            if reload else "The connection to the app dropped and came back"
+        )
         if running:
             st.info(
-                "🔌 The connection to the app dropped and came back. This page took "
-                f"over the session that kept running meanwhile: {' and '.join(running)} "
-                "never stopped."
+                f"🔌 {what}. This page took over the session that kept running "
+                f"meanwhile: {' and '.join(running)} never stopped."
             )
+        elif reload:
+            st.info(f"🔌 {what}.")
     elif recovery.get("error"):
         st.error(
             f"♻️ The app restarted while {_run_label(run)} was running, and could not "
@@ -4239,6 +4260,9 @@ def build_ui() -> None:
                 type="password",
                 placeholder="From env ALPACA_SECRET if blank",
             )
+        # Invisible; ahead of the tabs, so nothing they draw can keep the page
+        # from watching itself.
+        _page_watchdog()
     finnhub_token = finnhub_token_input.strip() or os.getenv("FINNHUB_API_KEY", "")
     state = _get_state()
     with _panel_guard("Restart recovery"):

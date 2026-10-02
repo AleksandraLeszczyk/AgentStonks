@@ -144,11 +144,12 @@ Open http://localhost:8501. (`streamlit run main.py` still works; it just has no
 
 ## Recovery from crashes and dropped connections
 
-The live app used to need a manual restart after a "Connection error". Three layers now handle it without one:
+The live app used to need a manual restart after a "Connection error". Four layers now handle it without one:
 
 - **A dropped connection.** A browser that loses the app for more than Streamlit's 2-minute grace (laptop sleep, a frozen background tab, a network change), or a page reload, comes back as a *new* session. That session now **takes over** the session that kept running without it — same stream, same agent, nothing restarted — instead of opening a stopped copy beside it while the old agent traded out of sight. A banner says so. A second tab opened beside a live one still gets a state of its own.
 - **A crash or a hang.** `python run_app.py` (any `streamlit` option passes through, e.g. `--server.port 8533`; `python run_app.py sim_main.py` for SimLab) runs the app under a supervisor. It restarts the app when the process exits, and when it stops answering `/_stcore/health` for six checks in a row (about 1½ minutes). Before killing a hung app it asks it for every thread's stack (SIGUSR1), so the log shows where it was stuck. Restarts back off from 2 s to 60 s and stop after 5 within 15 minutes, with a macOS notification. Everything the app prints is also written to `data/logs/main.log` (rotated at 10 MB, 5 kept).
 - **What was running starts again.** While the live stream or the agent runs, today's `data/sessions/<date>.json` also records how they were started. After a restart, the open browser tab reconnects by itself, and the first session restores the day and **starts them again**: the stream on the same symbols and connection, and the agent on the same venue, continuing today's ledger. Apple Trader takes back its open position and stand-down. Anything stopped on purpose (⏹ Stop, ⏹ Stop Agent, a stop-out) stays stopped. If the stream can't start yet, it is retried every 30 s. Untick **Resume automatically after a restart** in the Agent tab to turn this off. Credentials come from the environment, since sidebar-typed keys are not kept.
+- **A page that dies under a healthy server.** Streamlit's frontend can stop for good on its own — on 2026-10-02 with *"Failed to process a Websocket message. Error: Cached ForwardMsg MISS"* — while the server, the stream and the agent all run on unseen. Nothing reconnects it, and the supervisor can't see it, since the server is still answering. The cause of that one is gone: `.streamlit/config.toml` turns off Streamlit's message cache (`global.minCachedMessageSize`). The browser drops cached elements whenever any run finishes, so with a dozen auto-refreshing panels the server would sometimes point at one it had just dropped. For anything else that kills the page, the page now watches itself (`agent_stonks/page_watchdog.py`). It **reloads the tab** when Streamlit's connection badge has shown *Connecting*/*Error* for 20 s, or when no heartbeat has come for 90 s (5 min while a run is in progress, 3 min in a background tab). It does this only once `/_stcore/health` has answered for 10 s, since a server that is down is the supervisor's job. Reloads back off from 1 to 10 minutes and never give up. The reloaded page takes over the running session like any reconnect, and the banner and `data/logs/main.log` say why it reloaded.
 
 Two smaller safety nets: the 5-minute reaper of abandoned sessions no longer stops the streams under an agent that is still trading (it used to leave a headless agent holding a position on a frozen tape, its stop unable to fire), and an error in one tab — a data source refusing a connection, say — is shown in that tab instead of ending the page there and leaving every tab after it, the Agent tab included, undrawn.
 
@@ -244,6 +245,9 @@ agent_stonks/
   trade_sound.py — optional audible cue on a fill: an inline Custom Component v2 that
                   synthesises a two-note chime with the Web Audio API (rising for a buy,
                   falling for a sell). No audio asset, no visible player. Off by default
+  page_watchdog.py — the page's own watchdog: an invisible Custom Component v2 that reloads
+                  the tab when Streamlit's frontend has died under a healthy server, and
+                  reports why to the server log and the recovery banner
   decisions.py  — independent decision ledger; fetches its own fill price per trade. On a
                   simulated broker it owns the cash balance; on a real one the Alpaca account
                   does, and the ledger is written from an account read after each order
