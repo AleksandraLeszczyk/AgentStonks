@@ -45,6 +45,7 @@ import gzip
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
@@ -248,7 +249,9 @@ def format_metric(value: "object | None") -> str:
     return f"{number:.2e}"
 
 
-def dayrange_error_pct_adr(meta: dict) -> "float | None":
+def dayrange_error_pct_adr(
+    meta: dict, sessions: "dict | None" = None, ticker: str = ""
+) -> "float | None":
     """A day-range bundle's held-out MAE as a percentage of a typical day's range.
 
     The sidecar grades the model in log units, which is a *fraction of the
@@ -259,20 +262,41 @@ def dayrange_error_pct_adr(meta: dict) -> "float | None":
     the unit the rules downstream are already written in, where the buy and
     sell levels and the stop are all multiples of ADR (`apple_trader`).
 
-    The denominator is the only ADR the saved file carries: `adr14_abs` on the
+    The denominator is the ADR the saved file carries: `adr14_abs` on the
     bundle's own simulation day, over that day's reference price. One day's
     reading standing in for the test window's, so this is an estimate to a few
     points rather than a measurement -- `simlab.drift` computes the same ratio
     per session against each session's own ADR, which is the exact version.
+
+    A refit sidecar can lack that simulation day (INTC's does). Then the ADR
+    is taken the way `highlow_error_pct_adr` takes it -- from the SIP rollups
+    in `data/highlow`, averaged over the sidecar's `test_window` -- or, with no
+    rollups covering the window, there is no percentage.
     """
     test = meta.get("test_metrics_ensemble") or {}
     sim = meta.get("sim_date_forecast") or {}
     try:
         mae = float(test["mae_mean"])
-        adr_rel = float(sim["adr14_abs"]) / float(sim["prev_avg"])
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+    except (KeyError, TypeError, ValueError):
         return None
-    if mae != mae or adr_rel != adr_rel or adr_rel <= 0:
+    if mae != mae:
+        return None
+    if sim:
+        try:
+            adr_rel = float(sim["adr14_abs"]) / float(sim["prev_avg"])
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+    else:
+        match = re.match(
+            r"\s*(\d{4}-\d{2}-\d{2})\s*\.\.\s*(\d{4}-\d{2}-\d{2})",
+            str(meta.get("test_window") or ""),
+        )
+        if match is None:
+            return None
+        if sessions is None:
+            sessions = _highlow_sessions(ticker or str(meta.get("ticker") or ""))
+        adr_rel, _ = _window_adr(sessions, match.group(1), match.group(2))
+    if adr_rel != adr_rel or adr_rel <= 0:
         return None
     return 100.0 * mae / adr_rel
 
@@ -287,6 +311,25 @@ def _highlow_sessions(ticker: str) -> dict:
     """The cached `{date: {high, low, ...}}` rollups for one ticker, or `{}`."""
     path = HIGHLOW_HISTORY_DIR / f"{ticker.upper()}_sip_sessions.json"
     return (_read_json(path).get("sessions") or {}) if path.exists() else {}
+
+
+def _window_adr(sessions: dict, start: str, end: str) -> "tuple[float, int]":
+    """The mean `adr14` -- mean `log(high / low)` of the previous 14 sessions --
+    over the cached sessions dated `start..end`, and how many that is.
+    (0.0, 0) when the cache holds none."""
+    ranges: "list[tuple[str, float]]" = []
+    for day in sorted(sessions):
+        try:
+            high, low = float(sessions[day]["high"]), float(sessions[day]["low"])
+            ranges.append((day, math.log(high / low)))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+    adrs = [
+        sum(r for _, r in ranges[i - 14:i]) / 14
+        for i in range(14, len(ranges))
+        if start <= ranges[i][0] <= end
+    ]
+    return (sum(adrs) / len(adrs) if adrs else 0.0), len(adrs)
 
 
 def highlow_error_pct_adr(
@@ -319,22 +362,10 @@ def highlow_error_pct_adr(
         return None
     if sessions is None:
         sessions = _highlow_sessions(ticker or str(meta.get("ticker") or ""))
-    ranges: "list[tuple[str, float]]" = []
-    for day in sorted(sessions):
-        try:
-            high, low = float(sessions[day]["high"]), float(sessions[day]["low"])
-            ranges.append((day, math.log(high / low)))
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
-            continue
-    adrs = [
-        sum(r for _, r in ranges[i - 14:i]) / 14
-        for i in range(14, len(ranges))
-        if start <= ranges[i][0] <= end
-    ]
-    adr = sum(adrs) / len(adrs) if adrs else 0.0
+    adr, n_sessions = _window_adr(sessions, start, end)
     if mae != mae or not adr > 0:
         return None
-    return 100.0 * mae / adr, len(adrs)
+    return 100.0 * mae / adr, n_sessions
 
 
 # --- one builder per model --------------------------------------------------
@@ -357,7 +388,7 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
         metrics["opening-stage LOO gain"] = meta["opening_correction_loo_gain"]
     if meta.get("opening_stage_loo_mae") is not None:
         metrics["opening-stage LOO MAE"] = meta["opening_stage_loo_mae"]
-    error_pct = dayrange_error_pct_adr(meta)
+    error_pct = dayrange_error_pct_adr(meta, ticker=ticker)
     if error_pct is not None:
         # First, not last: it is the row's headline, and the log-unit MAE it is
         # derived from is directly above it in `test_metrics_ensemble`.

@@ -153,6 +153,42 @@ class TestDayRangeErrorPctAdr:
         assert not spec.available
 
 
+# A refit sidecar with no simulation day (INTC's): the ADR comes from the SIP
+# rollups over the sidecar's test window, as for HighLow. 20 sessions of 2%.
+REFIT_SESSIONS = {
+    f"2026-01-{day:02d}": {"high": 100.0 * math.exp(0.02), "low": 100.0}
+    for day in range(1, 21)
+}
+REFIT_SIDECAR = {
+    "ticker": "INTC",
+    "test_metrics_ensemble": {"mae_mean": 0.005},
+    "test_window": "2026-01-15 .. 2026-01-20 (6 sessions)",
+}
+
+
+class TestDayRangeErrorPctAdrFromTheSessionCache:
+    def test_a_sidecar_without_a_simulation_day_uses_the_cached_window_adr(self):
+        assert mc.dayrange_error_pct_adr(REFIT_SIDECAR, REFIT_SESSIONS) == pytest.approx(25.0)
+
+    def test_the_simulation_day_still_wins_when_there_is_one(self):
+        meta = {**DAYRANGE_SIDECAR, "test_window": REFIT_SIDECAR["test_window"]}
+        assert mc.dayrange_error_pct_adr(meta, REFIT_SESSIONS) == pytest.approx(40.0)
+
+    @pytest.mark.parametrize("meta, sessions", [
+        (REFIT_SIDECAR, {}),
+        ({**REFIT_SIDECAR, "test_window": ""}, REFIT_SESSIONS),
+        ({**REFIT_SIDECAR, "test_window": "not a window"}, REFIT_SESSIONS),
+        ({**REFIT_SIDECAR, "test_metrics_ensemble": {}}, REFIT_SESSIONS),
+    ])
+    def test_nothing_to_measure_is_no_percentage(self, meta, sessions):
+        assert mc.dayrange_error_pct_adr(meta, sessions) is None
+
+    def test_the_spec_leads_with_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "_highlow_sessions", lambda ticker: REFIT_SESSIONS)
+        spec = _dayrange_spec_from(REFIT_SIDECAR, tmp_path, monkeypatch, ticker="INTC")
+        assert spec.headline == ("MAE (% of ADR)", "25.0%")
+
+
 def test_highlow_history_dir_mirrors_the_real_one():
     highlow = pytest.importorskip("agent_stonks.highlow_model")
     assert mc.HIGHLOW_HISTORY_DIR / "AAPL_sip_sessions.json" == highlow.history_path("AAPL")
