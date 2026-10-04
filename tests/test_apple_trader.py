@@ -2262,6 +2262,38 @@ class TestDayRangeLevelDefaults:
         )
 
 
+class TestStopDefaults:
+    """The stop starts from the one tuned with the pair's levels, since 2026-10-04."""
+
+    def test_each_tuned_pair_starts_from_its_own_stop(self):
+        for (model_key, ticker), stop in at.APPLE_TRADER_TUNED_STOP.items():
+            config = AppleTraderConfig(model_key=model_key, ticker=ticker.lower())
+            assert config.stop_gain_fraction == stop, (model_key, ticker)
+
+    def test_a_stop_is_tuned_only_with_the_levels_it_is_a_share_of(self):
+        assert set(at.APPLE_TRADER_TUNED_STOP) <= set(at.APPLE_TRADER_TUNED_LEVELS)
+
+    def test_a_pair_never_tuned_starts_from_the_shared_default(self):
+        assert ("dayrange", "AAPL") not in at.APPLE_TRADER_TUNED_STOP
+        assert AppleTraderConfig(model_key="dayrange", ticker="AAPL").stop_gain_fraction == (
+            at.APPLE_TRADER_STOP_GAIN_FRACTION
+        )
+        assert at.stop_for("ZZZZ", "highlow") == at.APPLE_TRADER_STOP_GAIN_FRACTION
+
+    def test_a_stop_given_explicitly_wins(self):
+        assert AppleTraderConfig(
+            model_key="highlow", ticker="AAPL", stop_gain_fraction=0.25
+        ).stop_gain_fraction == 0.25
+        # 0 is the stop switched off, not a missing value.
+        assert not AppleTraderConfig(
+            model_key="highlow", ticker="AAPL", stop_gain_fraction=0.0
+        ).has_stop
+
+    def test_the_tuned_stop_signs_the_run(self):
+        config = AppleTraderConfig(model_key="highlow", ticker="AAPL")
+        assert f",stop=E-{at.stop_for('AAPL', 'highlow'):g}G" in config_signature(config)
+
+
 class TestRangeContainment:
     """The forecast is never left arguing with the tape.
 

@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 import streamlit as st
 
 from . import apple_models, event_days
-from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
+from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for, stop_for
 
 if TYPE_CHECKING:
     from .candidates import SelectionRules
@@ -192,7 +192,8 @@ def dayrange_params(
 
     Both start from the model and instrument's own tuned pair, and the widget
     keys carry both so that switching either re-seeds them with that pair
-    rather than carrying the last one's numbers across.
+    rather than carrying the last one's numbers across. So does the stop, which
+    was tuned with them.
     """
     section("Levels", copy.sections.get("dayrange"))
     default_buy, default_sell = dayrange_levels(ticker, model_key)
@@ -202,13 +203,15 @@ def dayrange_params(
     level_unit = level_unit_param(defaults, copy)
     unit_label = UNIT_FORM_LABELS[level_unit]
     start_buy, start_sell = default_buy, default_sell
-    if (
+    same_pair = (
         seed is not None
         and (seed.ticker or "").upper() == ticker
         and seed.model_key == model_key
-        and seed.level_unit == level_unit
-    ):
+    )
+    if same_pair and seed.level_unit == level_unit:
         start_buy, start_sell = float(seed.buy_k), float(seed.sell_k)
+    # A share of the gap between the levels, so it does not depend on the unit.
+    stop_seed = float(seed.stop_gain_fraction) if same_pair else None
     col_a, col_b = st.columns(2)
     buy_k = col_a.number_input(
         f"Buy distance (× {unit_label} below H)",
@@ -225,8 +228,10 @@ def dayrange_params(
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
     sell_k = repaired_sell(float(buy_k), float(sell_k))
     rules = rule_params(
-        defaults, float(buy_k), float(sell_k), unit_label, copy,
+        replace(defaults, stop_gain_fraction=stop_for(ticker, model_key)),
+        float(buy_k), float(sell_k), unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
+        stop_scope=f"{model_key}_{ticker}", stop_seed=stop_seed,
     )
     min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
     return AppleTraderConfig(
@@ -308,15 +313,18 @@ def repaired_sell(buy_k: float, sell_k: float, label: str = "") -> float:
 
 def rule_params(
     defaults: AppleTraderConfig, buy_k: float, sell_k: float, unit_label: str,
-    copy: FormCopy, take_on: bool,
+    copy: FormCopy, take_on: bool, stop_scope: str = "",
+    stop_seed: "float | None" = None,
 ) -> dict:
     """The forecast-breach rules and the managed exit: shared by every
-    instrument. `buy_k` and `sell_k` only feed the stop's `?`, which says what
+    instrument, but for the stop -- see `exit_params` for `stop_scope` and
+    `stop_seed`. `buy_k` and `sell_k` only feed the stop's `?`, which says what
     the stop fraction comes to against them."""
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     stop_gain_fraction, take_fraction, hold_min_gain_k, take_after_minutes = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
+        stop_scope=stop_scope, stop_seed=stop_seed,
     )
     skip_events = skip_param(defaults, copy)
     return {
@@ -489,6 +497,8 @@ def exit_params(
     unit_label: str,
     copy: FormCopy,
     take_on: bool = True,
+    stop_scope: str = "",
+    stop_seed: "float | None" = None,
 ) -> "tuple[float, float, float]":
     """The managed exit: a stop under the fill, a momentum take, and a runner.
 
@@ -502,6 +512,13 @@ def exit_params(
     knobs that only mean something once the take is on are greyed out while
     it is off rather than hidden, so turning it back on finds them where they were.
 
+    The stop is the exception since 2026-10-04, when it was tuned per model and
+    instrument with the levels: `defaults.stop_gain_fraction` is then the
+    pair's own, `stop_scope` (model and ticker) goes into its widget key so a
+    switch re-seeds it, and `stop_seed` is a running agent's stop for the same
+    pair, which it opens on instead -- as the levels do. Orchestra's racers
+    share one stop and pass no scope.
+
     The stop is the one that takes the levels as an argument, because it is
     written as a share of what they are playing for rather than as a distance
     of its own. The number on screen therefore means a different stop on every
@@ -511,11 +528,12 @@ def exit_params(
     """
     section("Exits", copy.sections.get("dayrange_exits"))
     col_a, col_b = st.columns(2)
-    stop_key = copy.key("stop_gain_fraction")
-    shown = float(st.session_state.get(stop_key, defaults.stop_gain_fraction))
+    stop_key = copy.key(f"stop_gain_fraction_{stop_scope}" if stop_scope else "stop_gain_fraction")
+    start_stop = defaults.stop_gain_fraction if stop_seed is None else stop_seed
+    shown = float(st.session_state.get(stop_key, start_stop))
     stop_gain_fraction = col_a.number_input(
         "Stop loss (× the predicted gain, below the fill)",
-        min_value=0.0, max_value=3.0, value=defaults.stop_gain_fraction, step=0.05,
+        min_value=0.0, max_value=3.0, value=start_stop, step=0.05,
         format="%.2f",
         key=stop_key,
         help="\n\n".join(p for p in (

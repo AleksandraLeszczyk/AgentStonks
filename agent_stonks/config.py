@@ -319,14 +319,60 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # these weeks: +5584 instead of +6561 under the job's base (19 buys instead of
 # 12), +2897 instead of +4084 under today's defaults. The stop sits 0.05 units
 # under the fill. The untuned 0.75/0.10 made -2 on MU and +2019 on BE.
+#
+# Every pair below but dayrange AAPL and GOOGL re-tuned 2026-10-04 (installed the
+# same day, the user's request) with the stop as a third axis: buy 0.45..0.95 x
+# sell 0.05..0.45 x stop 0.4/0.6/0.8/1.0 of the predicted gain (0.3/0.5/0.7/0.9
+# on INTC, NVDA and AVGO HighLow), on two yfinance weeks (week_2026-09-14 and
+# week_2026-09-27; 10 sessions) at $100,000 per week, highest summed cell (INTC
+# HighLow's job also required trading on half the days). The stop is installed
+# with the levels, per pair (APPLE_TRADER_TUNED_STOP below). "Base" is each job's
+# own starting configuration on the same weeks; "today" replays the pick and the
+# pair's previous default (old levels, stop 0.5) under today's defaults:
+#
+#   model     ticker  buy   sell  stop  total   base    weeks up  traded  wins   today: pick / previous  job
+#   highlow   AAPL    0.65  0.10  1.0   +2185   -56       2/2      8/10   9/9           +357 / -158      20261004-122522-bb7ab1
+#   highlow2  AAPL    0.60  0.35  0.4    +814   +22       1/2      9/10   4/11          +863 / -589      20261004-123206-0d0ba0
+#   dayrange  INTC    0.45  0.05  0.8   +8257  +3879      2/2      9/10   11/12        +7423 / +697      20261004-123706-76751f
+#   highlow   BE      0.70  0.30  0.4   +2271   -95       1/2      8/10   12/16         -662 / +43       20261004-123758-37dc10
+#   highlow   MU      0.55  0.35  0.6   +6068  +5295      2/2      7/10   10/13        +4085 / +3201     20261004-123830-8cb4bd
+#   highlow   INTC    0.70  0.05  0.7   +1440  -227       2/2      5/10   6/6          +1440 / -227      20261004-162236-6d0e8e
+#   highlow   NVDA    0.65  0.05  0.5   +2389  +183       2/2      9/10   8/9          +1223 / +324      20261004-182658-b47693
+#   highlow   AVGO    0.45  0.40  0.3   +1030  -2742      2/2      9/10   7/9           -485 / -2184     20261004-183552-2593c3
+#
+# Every job's base but INTC HighLow's had a 3-bar momentum confirmation and
+# contain_range off, where the defaults here are 5 bars and on; that is the gap
+# between "total" and "today: pick". Under today's defaults the pick still beats
+# the pair's previous default everywhere but BE, and AVGO's loses either way.
+# Ties along the stop axis go to the smaller stop (grid order): dayrange INTC
+# scores the same at 0.8 and 1.0, NVDA at 0.5, 0.7 and 0.9 -- the stop never
+# fired between them. Weak picks: highlow2 AAPL and BE lost money on the
+# 09-27 week, 4 of 11 highlow2 round trips won, and AVGO's buy is the grid's
+# shallowest edge with a 0.05-unit target (only 114 of 392 cells made money).
 APPLE_TRADER_TUNED_LEVELS: "dict[tuple[str, str], tuple[float, float]]" = {
     ("dayrange", "AAPL"): (0.55, 0.05),
     ("dayrange", "GOOGL"): (0.85, 0.45),
-    ("dayrange", "INTC"): (0.65, 0.05),
-    ("highlow", "AAPL"): (0.75, 0.05),
-    ("highlow", "INTC"): (0.85, 0.35),
+    ("dayrange", "INTC"): (0.45, 0.05),
+    ("highlow", "AAPL"): (0.65, 0.10),
+    ("highlow", "INTC"): (0.70, 0.05),
     ("highlow", "MU"): (0.55, 0.35),
-    ("highlow", "BE"): (0.55, 0.45),
+    ("highlow", "BE"): (0.70, 0.30),
+    ("highlow", "NVDA"): (0.65, 0.05),
+    ("highlow", "AVGO"): (0.45, 0.40),
+    ("highlow2", "AAPL"): (0.60, 0.35),
+}
+# The stop (APPLE_TRADER_STOP_GAIN_FRACTION, a share of the predicted gain) per
+# (model, instrument): the third axis of the 2026-10-04 jobs above, read off the
+# same picked cell. A pair with no entry starts from the shared default.
+APPLE_TRADER_TUNED_STOP: "dict[tuple[str, str], float]" = {
+    ("dayrange", "INTC"): 0.8,
+    ("highlow", "AAPL"): 1.0,
+    ("highlow", "INTC"): 0.7,
+    ("highlow", "MU"): 0.6,
+    ("highlow", "BE"): 0.4,
+    ("highlow", "NVDA"): 0.5,
+    ("highlow", "AVGO"): 0.3,
+    ("highlow2", "AAPL"): 0.4,
 }
 # The day-range managed exit, on top of the sell level and the closing flatten
 # (`DayRangeTrader._exit`). Unlike the levels these were never swept: they are
@@ -360,6 +406,9 @@ APPLE_TRADER_TUNED_LEVELS: "dict[tuple[str, str], tuple[float, float]]" = {
 # default is a much tighter stop on AAPL than the 0.20 ADR it replaces and a
 # wider one on GOOGL. 0 switches the stop off, which is what every record
 # written before the managed exit existed replays as.
+# Since 2026-10-04 only the default of a pair with no tuned stop
+# (APPLE_TRADER_TUNED_STOP): today dayrange AAPL and GOOGL, and the intraday-
+# volatility model.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
 # The momentum take as it was 2026-09-23 to -24 (`DayRangeTrader._momentum_negative`),
 # kept so the records made then replay; a new config uses the momentum
@@ -629,8 +678,12 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # narrower: 0.20 on MU, and 0.10 on BE, where 0.10 made it one trade a day
 # unless it beat the target. BE gets 0.01 (the user's call, 2026-10-01), which
 # leaves its target exit alive -- at a cost on the tuning weeks, see the levels.
+# The 2026-10-04 picks widen BE to 0.40, but its job was scored at 0.01, so it
+# stays. AVGO's pick is 0.05 apart, under the 0.10 default, and gets 0.01 too:
+# its pick replays to the dollar the same at 0.01 as at the 0.10 it was scored
+# under, on both weeks and under today's defaults.
 APPLE_TRADER_MIN_WIN_K = 0.10
-APPLE_TRADER_MIN_WIN: "dict[str, float]" = {"BE": 0.01}
+APPLE_TRADER_MIN_WIN: "dict[str, float]" = {"BE": 0.01, "AVGO": 0.01}
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Whether a day-range position may be added to on the way down
@@ -640,11 +693,12 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # (below). The stop sits its usual distance under the last actual fill (since
 # 2026-09-28; before that it sat under the next rung while an add was
 # affordable), so an add is placed only while its rung is above that stop -- a
-# bar that reaches a rung under the stop is stopped out first. At the default
-# stop (half the predicted gain) and a fill at the buy level the first rung is
-# above it on most model/ticker pairs, but not on Day Range x Intraday Volatility
-# for AAPL (stop 0.075, rung 0.1 units down), and a fill under the level leaves
-# less room. An add also has to close under the last
+# bar that reaches a rung under the stop is stopped out first. At each pair's
+# default stop (APPLE_TRADER_TUNED_STOP) and a fill at the buy level the first
+# rung (0.1 units down) is above it on most model/ticker pairs, but not on
+# HighLow AVGO (stop 0.015 units under the fill), HighLow2 AAPL (0.10, level
+# with the rung) or Day Range x Intraday Volatility for AAPL (0.075) -- those
+# never add -- and a fill under the level leaves less room. An add also has to close under the last
 # fill (since 2026-09-28), so a first buy made under the next rung is not
 # added to at once at no better a price. Not swept.
 # A SimLab record written before the setting existed replays with it off

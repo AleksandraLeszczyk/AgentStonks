@@ -2645,8 +2645,11 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "gain** under the fill.\n\n"
             "- Predicted gain = `buy − sell`: the gap between the levels, and the most a "
             "target exit can pay.\n"
-            "- {stop_gain_fraction} risks \\$0.50 for every \\$1.00 the trade plays for — "
+            "- 0.5 risks \\$0.50 for every \\$1.00 the trade plays for — "
             "on any instrument, at any levels.\n"
+            "- Starts at **{stop_gain_fraction}**: the stop SimLab tuned with this model "
+            "and instrument's levels, or the shared default for a pair it did not "
+            "(Orchestra's pairs share one).\n"
             "- After a stop the agent stops; press ▶ Start Agent to trade again.\n"
             "- 0 switches the stop off."
         ),

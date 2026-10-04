@@ -264,6 +264,16 @@ class TestHighLowErrorPctAdr:
         assert spec.headline == ("MAE ($ per extreme)", "$1.37")
         assert "MAE (% of ADR)" not in spec.metrics
 
+    def test_the_notebooks_own_adr_score_wins_over_the_estimate(self, tmp_path, monkeypatch):
+        """AVGO's and NVDA's sidecars (2026-10-04) score the test window in ADR
+        units per session; that is the exact figure, so the cache is not read."""
+        meta = {**HIGHLOW_SIDECAR, "test_metrics": {**HIGHLOW_SIDECAR["test_metrics"], "mae_adr_mean": 27.13},
+                "weights": {"lgbm": 0.5, "nbeats": 0.0, "nhits": 0.5}}
+        spec = _highlow_spec_from(meta, HIGHLOW_SESSIONS, tmp_path, monkeypatch, ticker="NVDA")
+        assert spec.headline == ("MAE (% of ADR)", "27.1%")
+        assert "notebook's own score" in spec.caveat
+        assert [f.role for f in spec.files] == ["bundle", "N-HiTS weights", "metadata"]
+
 
 def test_highlow2_path_mirrors_the_real_one():
     highlow2 = pytest.importorskip("agent_stonks.highlow2_model")

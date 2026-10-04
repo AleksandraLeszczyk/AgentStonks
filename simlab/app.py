@@ -12,6 +12,7 @@ import os
 import textwrap
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 from html import escape
 from itertools import combinations
@@ -46,13 +47,14 @@ from agent_stonks import apple_trader_ui
 from agent_stonks.orchestra import ORCHESTRA_KEY
 from agent_stonks.orchestra import default_pairs as default_orchestra_pairs
 from agent_stonks.charts import (
+    _rgba,
     add_candle_patterns,
     add_model_overlays,
     add_session_markers,
     overlay_x_max,
     session_rangebreaks,
 )
-from agent_stonks.config import PALETTE
+from agent_stonks.config import MODEL_OVERLAY_COLORS, PALETTE
 from agent_stonks.model_catalogue_ui import model_catalogue_panel
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ, is_market_open
@@ -1737,8 +1739,9 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "profit of a buy × sell grid summed over two or three weeks of tape.\n"
             "- A pair never tuned (the intraday-volatility model) starts from notebook 05's "
             "per-ticker sweep instead.\n"
-            "- In-sample, and swept under the exit rules of the day each job ran (2026-09-23, "
-            "or 09-30 for MU and BE) — "
+            "- In-sample, and swept under the exit rules of the day each job ran (2026-09-23 "
+            "for the day-range forecast on AAPL and GOOGL, 2026-10-04 — with the stop — for "
+            "the rest) — "
             "`config.APPLE_TRADER_TUNED_LEVELS` records each pick's weeks and caveats."
         ),
         "sell_k": (
@@ -1797,7 +1800,9 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "on against a target that moved out of the bar's way."
         ),
         "stop_gain_fraction": (
-            "Starts at **{stop_gain_fraction}**. A share of the **predicted gain** "
+            "Starts at **{stop_gain_fraction}**: the stop tuned with this model and "
+            "instrument's levels, or the shared default for a pair never tuned "
+            "(Orchestra's pairs share one). A share of the **predicted gain** "
             "(`buy − sell`, what a target exit pays), not a distance of its own.\n\n"
             "- 0.5 risks \\$0.50 for every \\$1.00 the trade plays for, on every "
             "instrument. In ADRs it would not travel: 0.20 ADR was a third of AAPL's "
@@ -3857,15 +3862,77 @@ def _render_tuning_prior(
     )
 
 
-def _render_tuning_charts(charts: "list[tuple[str, go.Figure]]") -> None:
-    """Heatmaps two to a row; a lone one gets the whole width."""
+def _render_tuning_charts(
+    charts: "list[tuple[str, go.Figure]]", job_id: "str | None" = None
+) -> None:
+    """Heatmaps two to a row; a lone one gets the whole width.
+
+    With a `job_id`, a click on a square shows that configuration in the job's
+    results (`_tuning_on_click`).
+    """
+    def draw(target, key: str, fig: go.Figure) -> None:
+        if job_id is None:
+            target.plotly_chart(fig, key=key)
+            return
+        target.plotly_chart(
+            fig, key=key, selection_mode="points",
+            on_select=lambda: _tuning_on_click(job_id, key),
+        )
+
     if len(charts) == 1:
-        key, fig = charts[0]
-        st.plotly_chart(fig, key=key)
+        draw(st, *charts[0])
         return
     for start in range(0, len(charts), 2):
         for column, (key, fig) in zip(st.columns(2), charts[start:start + 2]):
-            column.plotly_chart(fig, key=key)
+            draw(column, key, fig)
+
+
+def _tuning_chosen_key(job_id: str) -> str:
+    return f"tune_chosen_{job_id}"
+
+
+def _tuning_on_click(job_id: str, chart_key: str) -> None:
+    """Remember the configuration of the square just clicked, for the results.
+
+    The configuration rides in the clicked point's customdata
+    (`_tuning_heatmap`'s `config_of`). It is kept under its own key rather than
+    read off the chart: the chart's selection is lost whenever its figure
+    changes, and the figure changes on the very next run -- it outlines the
+    square that was clicked. A click on a square with nothing to show (blank,
+    refused) or a double-click, which clears the chart's selection, keeps
+    whatever was shown before.
+    """
+    state = st.session_state.get(chart_key) or {}
+    for point in (state.get("selection") or {}).get("points") or ():
+        custom = point.get("customdata")
+        if isinstance(custom, (list, tuple)) and len(custom) > 3 and custom[3]:
+            st.session_state[_tuning_chosen_key(job_id)] = json.loads(custom[3])
+            return
+
+
+def _tuning_chosen(job: dict) -> "dict | None":
+    """The configuration clicked on one of the job's heatmaps; None shows the pick.
+
+    A click on the pick's own square is the pick, so it reads as one; a
+    configuration no longer on the job's grid is forgotten.
+    """
+    chosen = st.session_state.get(_tuning_chosen_key(job["job_id"]))
+    if not chosen:
+        return None
+    key = sim_tuning.overrides_key(chosen)
+    best = job.get("best")
+    if best and key == sim_tuning.overrides_key(best["overrides"]):
+        return None
+    if key not in {sim_tuning.overrides_key(o) for o in sim_tuning.grid(job["spec"]["axes"])}:
+        return None
+    return chosen
+
+
+def _tuning_shown_cell(job: dict, name: str, chosen: "dict | None") -> "dict | None":
+    """The shown configuration's cell on one dataset: the clicked one, else the pick's."""
+    if chosen is None:
+        return sim_tuning.pick_cell(job, name)
+    return sim_tuning.cell_at(job, name, chosen)
 
 
 # The two ways a three-axis grid's heatmap collapses its third parameter, as
@@ -3874,6 +3941,10 @@ _SLICE_LABELS = {
     sim_tuning.SLICE_BEST: "Best of all",
     sim_tuning.SLICE_MEAN: "Average",
 }
+
+# The clicked configuration's mark: a hue the heatmaps' red-yellow-green scale
+# never uses, so it shows on any square.
+_TUNING_SELECTED_COLOR = "#e040fb"
 
 
 def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> "int | str | None":
@@ -3907,31 +3978,40 @@ def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> "int | str |
 
 
 def _tuning_view_heatmap(
-    cells: list[dict], axes: list[dict], marks: dict, title: str, view
+    cells: list[dict], axes: list[dict], marks: dict, title: str, view,
+    clickable: bool = False,
 ) -> go.Figure:
     """`_tuning_heatmap` for a grid of any size, a third axis drawn as `view` says.
 
     On a slice, a mark is outlined only if it sits on that slice. Collapsed,
     every mark is outlined where it sits on the first two axes; its own value
     of the third is in the caption above the charts.
+
+    `clickable` lets a click name the square's configuration: on a slice, the
+    square at that value of the third; on Best of all, the value it won at.
+    An Average square is several configurations, so it names none.
     """
     if len(axes) < 3:
-        return _tuning_heatmap(cells, axes, marks, title)
+        config_of = (lambda cell: cell["overrides"]) if clickable else None
+        return _tuning_heatmap(cells, axes, marks, title, config_of=config_of)
     name, values = axes[2]["name"], axes[2]["values"]
     param = _tuning_param_label(name)
     metric_label = None
     if view == sim_tuning.SLICE_BEST:
         title, shown = f"{title} · best {param}", marks
+        config_of = lambda cell: {**cell["overrides"], name: cell["best_of"]["value"]}  # noqa: E731
     elif view == sim_tuning.SLICE_MEAN:
         title, shown = f"{title} · average over {param}", marks
         metric_label = f"Average {sim_tuning.METRICS[sim_tuning.PICK_METRIC].lower()}"
+        config_of = None
     else:
         value = values[int(view)]
         title = f"{title} · {param} {sim_tuning.axis_tick(name, value)}"
         shown = {label: o for label, o in marks.items() if (o or {}).get(name) == value}
+        config_of = lambda cell: {**cell["overrides"], name: value}  # noqa: E731
     return _tuning_heatmap(
         sim_tuning.slice_cells(cells, axes, view), axes[:2], shown, title,
-        metric_label=metric_label,
+        metric_label=metric_label, config_of=config_of if clickable else None,
     )
 
 
@@ -3977,19 +4057,35 @@ def _tuning_hover_data(cell: "dict | None") -> list:
 def _tuning_heatmap(
     cells: list[dict], axes: list[dict], marks: dict, title: str, metric: str = "profit",
     metric_label: "str | None" = None,
+    config_of: "Callable[[dict], dict] | None" = None,
 ) -> go.Figure:
-    """The grid coloured by `metric`; `marks` outlines named cells (the pick, the base).
+    """The grid coloured by `metric`; `marks` outlines named cells (the pick, the
+    base, the square clicked).
 
     The hover carries the return beside the dollar profit: the profit is what
     the cells are ranked on, the return is what it means against the cash.
     A three-axis grid comes here already sliced to its first two axes
     (`_tuning_view_heatmap`), and the hover then says what was done with the
     third.
+
+    With `config_of`, a square can be clicked: each scored one carries its
+    configuration (`config_of(cell)`, as JSON) as a fourth customdata entry,
+    which `_tuning_on_click` reads. Plotly selects points of scatter-like
+    traces only, never a heatmap's squares, so a clickable heatmap gets an
+    invisible marker at each square's centre, and the hover moves onto those
+    markers. With no limit on the hover distance the nearest centre answers,
+    and on a grid that is the square under the cursor.
     """
     by_key = {sim_tuning.overrides_key(c["overrides"]): c for c in cells}
 
     def cell_at(overrides: dict) -> "dict | None":
         return by_key.get(sim_tuning.overrides_key(overrides))
+
+    def custom_of(cell: "dict | None") -> list:
+        data = _tuning_hover_data(cell)
+        if config_of is not None and sim_tuning.is_scored(cell):
+            data.append(json.dumps(config_of(cell)))
+        return data
 
     metric_label = metric_label or sim_tuning.METRICS[metric]
     collapsed = any(c.get("best_of") or c.get("mean_of") for c in cells)
@@ -3997,7 +4093,25 @@ def _tuning_heatmap(
         f"{metric_label}: %{{text}}<br>Return: %{{customdata[0]}}<br>%{{customdata[1]}}"
         + ("<br>%{customdata[2]}" if collapsed else "") + "<extra></extra>"
     )
-    mark_colors = {"Pick": PALETTE["text"], "Base configuration": PALETTE["muted"]}
+    # A bar chart's stars: (colour, size).
+    star_styles = {
+        "Pick": (PALETTE["text"], 16),
+        "Base configuration": (PALETTE["muted"], 16),
+        "Selected": (_TUNING_SELECTED_COLOR, 12),
+    }
+    # A heatmap's outlines: (colour, size). The pick's and the base's are the
+    # colours they always showed, which Streamlit's colorway used to hand out
+    # by trace order. The clicked square's sits inside the others, so it still
+    # shows on the pick's or the base's square.
+    outline_styles = {
+        "Pick": ("#0068c9", 30),
+        "Base configuration": ("#ffabab", 30),
+        "Selected": (_TUNING_SELECTED_COLOR, 22),
+    }
+    # A click selects a point in plotly, which dims every other point of every
+    # selectable trace until the next run redraws the chart; the outlines and
+    # bars keep their look.
+    undimmed = dict(marker=dict(opacity=1))
     fig = go.Figure()
     if len(axes) == 1:
         axis = axes[0]
@@ -4008,18 +4122,18 @@ def _tuning_heatmap(
             x=xs, y=ys, name=metric_label,
             marker_color=[PALETTE["up"] if (y or 0) >= 0 else PALETTE["down"] for y in ys],
             text=[_tuning_metric_text(metric, y) for y in ys], textposition="outside",
-            customdata=[_tuning_hover_data(cell) for cell in found],
+            customdata=[custom_of(cell) for cell in found], unselected=undimmed,
             hovertemplate=f"{_tuning_param_label(axis['name'])} %{{x}}<br>" + hover_tail,
         ))
         for label, overrides in marks.items():
             value = (overrides or {}).get(axis["name"])
             if value in axis["values"]:
                 y = ys[axis["values"].index(value)]
+                color, size = star_styles.get(label, (PALETTE["text"], 16))
                 fig.add_trace(go.Scatter(
                     x=[sim_tuning.axis_tick(axis["name"], value)], y=[y or 0], mode="markers",
-                    name=label, hoverinfo="skip",
-                    marker=dict(symbol="star", size=16,
-                                color=mark_colors.get(label, PALETTE["text"])),
+                    name=label, hoverinfo="skip", unselected=undimmed,
+                    marker=dict(symbol="star", size=size, color=color),
                 ))
         fig.update_xaxes(title=_tuning_param_label(axis["name"]), type="category")
         fig.update_yaxes(title=metric_label)
@@ -4027,18 +4141,35 @@ def _tuning_heatmap(
         row_axis, col_axis = axes
         xs = [sim_tuning.axis_tick(col_axis["name"], v) for v in col_axis["values"]]
         ys = [sim_tuning.axis_tick(row_axis["name"], v) for v in row_axis["values"]]
+        position = (
+            f"{_tuning_param_label(row_axis['name'])} %{{y}}<br>"
+            f"{_tuning_param_label(col_axis['name'])} %{{x}}<br>"
+        )
         z, text, custom = [], [], []
-        for row_value in row_axis["values"]:
+        # The clickable overlay's markers, one per square, flat.
+        point_x, point_y, point_text, point_custom, point_hover = [], [], [], [], []
+        for row_value, y in zip(row_axis["values"], ys):
             z_row, text_row, custom_row = [], [], []
-            for col_value in col_axis["values"]:
+            for col_value, x in zip(col_axis["values"], xs):
                 cell = cell_at({row_axis["name"]: row_value, col_axis["name"]: col_value})
                 if sim_tuning.is_scored(cell):
                     z_row.append(cell[metric])
                     text_row.append(_tuning_metric_text(metric, cell[metric]))
+                    hover = hover_tail
                 else:
                     z_row.append(None)
                     text_row.append("×" if cell and "invalid" in cell else "")
-                custom_row.append(_tuning_hover_data(cell))
+                    hover = (
+                        "Not replayed yet" if cell is None
+                        else "Refused by the configuration" if "invalid" in cell
+                        else "The replay ended with an error"
+                    ) + "<extra></extra>"
+                custom_row.append(custom_of(cell))
+                point_x.append(x)
+                point_y.append(y)
+                point_text.append(text_row[-1])
+                point_custom.append(custom_row[-1])
+                point_hover.append(position + hover)
             z.append(z_row)
             text.append(text_row)
             custom.append(custom_row)
@@ -4047,21 +4178,29 @@ def _tuning_heatmap(
             z=z, x=xs, y=ys, text=text, texttemplate="%{text}", colorscale="RdYlGn",
             zmid=0 if centred else None, hoverongaps=False, customdata=custom,
             colorbar=dict(title=metric_label),
-            hovertemplate=(
-                f"{_tuning_param_label(row_axis['name'])} %{{y}}<br>"
-                f"{_tuning_param_label(col_axis['name'])} %{{x}}<br>" + hover_tail
-            ),
+            hovertemplate=position + hover_tail,
+            hoverinfo="skip" if config_of is not None else None,
         ))
+        if config_of is not None:
+            fig.add_trace(go.Scatter(
+                x=point_x, y=point_y, mode="markers", name="", showlegend=False,
+                marker=dict(size=1, opacity=0), unselected=dict(marker=dict(opacity=0)),
+                text=point_text, customdata=point_custom, hovertemplate=point_hover,
+            ))
+            fig.update_layout(hoverdistance=-1, dragmode="zoom")
         for label, overrides in marks.items():
             overrides = overrides or {}
             row_value, col_value = overrides.get(row_axis["name"]), overrides.get(col_axis["name"])
             if row_value in row_axis["values"] and col_value in col_axis["values"]:
+                # An open symbol is stroked in the marker's own colour; left
+                # unset, Streamlit's colorway gives it one by trace order.
+                color, size = outline_styles.get(label, (PALETTE["text"], 30))
                 fig.add_trace(go.Scatter(
                     x=[sim_tuning.axis_tick(col_axis["name"], col_value)],
                     y=[sim_tuning.axis_tick(row_axis["name"], row_value)],
-                    mode="markers", name=label, hoverinfo="skip",
-                    marker=dict(symbol="square-open", size=30, line=dict(
-                        width=3, color=mark_colors.get(label, PALETTE["text"]))),
+                    mode="markers", name=label, hoverinfo="skip", unselected=undimmed,
+                    marker=dict(symbol="square-open", size=size, color=color, line=dict(
+                        width=3, color=color)),
                 ))
         # The whole grid, in grid order, even while cells are still missing --
         # a category axis otherwise shows only the values something was drawn at.
@@ -4077,39 +4216,44 @@ def _tuning_heatmap(
     return _chart_layout(fig, height=440)
 
 
-def _tuning_summary_rows(job: dict) -> list[dict]:
-    """The base configuration and the pick on each dataset, then summed."""
+def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
+    """The base configuration and the shown one on each dataset, then summed.
+
+    The shown configuration is the pick, or the square clicked on a heatmap
+    (`chosen`); its columns are `shown_*` either way.
+    """
     spec = job["spec"]
     datasets = sim_tuning.chronological(spec["datasets"])
 
-    def row(label: str, sessions: int, base: "dict | None", pick: "dict | None") -> dict:
+    def row(label: str, sessions: int, base: "dict | None", shown: "dict | None") -> dict:
         out = {"dataset": label, "sessions": sessions}
-        for prefix, cell in (("base", base), ("pick", pick)):
+        for prefix, cell in (("base", base), ("shown", shown)):
             scored = sim_tuning.is_scored(cell)
             out[f"{prefix}_profit"] = cell["profit"] if scored else None
             out[f"{prefix}_return"] = cell["return_pct"] if scored else None
-        scored = sim_tuning.is_scored(pick)
-        out["pick_days"] = (
-            f"{pick['days_up']} up · {pick['days_traded']} traded / {pick['days']}"
+        scored = sim_tuning.is_scored(shown)
+        out["shown_days"] = (
+            f"{shown['days_up']} up · {shown['days_traded']} traded / {shown['days']}"
             if scored else "—"
         )
-        out["pick_win_rate"] = sim_tuning.win_rate(pick) if scored else None
-        out["pick_round_trips"] = (
-            f"{pick['wins']} of {pick['round_trips']}"
-            if scored and pick.get("round_trips") is not None else "—"
+        out["shown_win_rate"] = sim_tuning.win_rate(shown) if scored else None
+        out["shown_round_trips"] = (
+            f"{shown['wins']} of {shown['round_trips']}"
+            if scored and shown.get("round_trips") is not None else "—"
         )
-        out["pick_worst"] = pick["worst_day"] if scored else None
+        out["shown_worst"] = shown["worst_day"] if scored else None
         return out
 
     rows = [
         row(d["name"], len(d["days"]), job["baseline"].get(d["name"]),
-            sim_tuning.pick_cell(job, d["name"]))
+            _tuning_shown_cell(job, d["name"], chosen))
         for d in datasets
     ]
     if len(datasets) > 1:
         rows.append(row(
             f"Sum of {len(datasets)}", sum(len(d["days"]) for d in datasets),
-            sim_tuning.summed_baseline(job), job.get("best"),
+            sim_tuning.summed_baseline(job),
+            job.get("best") if chosen is None else sim_tuning.summed_cell(job, chosen),
         ))
     return rows
 
@@ -4228,31 +4372,33 @@ def _tuning_color(index: int) -> str:
     return _DRIFT_SERIES_COLORS[index % len(_DRIFT_SERIES_COLORS)]
 
 
-def _tuning_pick_days(job: dict) -> dict[str, list[str]]:
-    """{feed: sessions the pick was scored on} across every dataset of the job."""
+def _tuning_shown_days(job: dict, chosen: "dict | None" = None) -> dict[str, list[str]]:
+    """{feed: sessions the shown configuration was scored on} across every
+    dataset of the job -- the pick's, or `chosen`'s, the square clicked."""
     by_feed: dict[str, list[str]] = {}
     for dataset in job["spec"]["datasets"]:
-        cell = sim_tuning.pick_cell(job, dataset["name"])
+        cell = _tuning_shown_cell(job, dataset["name"], chosen)
         if sim_tuning.is_scored(cell):
             by_feed.setdefault(dataset["feed"], []).extend(cell["daily"])
     return by_feed
 
 
-def _tuning_session_context(job: dict) -> dict:
-    """The VIX open and the pre-market bias of every session the pick was scored on.
+def _tuning_session_context(job: dict, chosen: "dict | None" = None) -> dict:
+    """The VIX open and the pre-market bias of every session the shown
+    configuration was scored on (the pick's, or `chosen`'s).
 
     Briefings are LLM calls, made once per session and cached on disk
     (`session_context`); a day that failed is remembered for this browser
     session so a rerun does not ask again, and "Retry" clears that.
     """
     symbol = job["spec"]["base"]["ticker"]
-    by_feed = _tuning_pick_days(job)
+    by_feed = _tuning_shown_days(job, chosen)
     days = sorted({d for ds in by_feed.values() for d in ds})
     context = {"vix": sim_session.vix_opens(days), "biases": {}, "errors": {}, "provider": None}
-    chosen = sim_session.briefing_provider()
-    if chosen is None:
+    briefer = sim_session.briefing_provider()
+    if briefer is None:
         return context
-    provider, model, api_key = chosen
+    provider, model, api_key = briefer
     context["provider"] = f"{provider} · {model}"
     failed = st.session_state.setdefault("tune_briefing_failed", {})
     wanted = {
@@ -4282,6 +4428,64 @@ def _tuning_session_context(job: dict) -> dict:
     return context
 
 
+@st.cache_data(show_spinner="Forecasting each session's day range…")
+def _tuning_forecast(symbol: str, model_key: str, feed: str, day: str, signature: tuple) -> dict:
+    """One session's morning forecast of its high and low, as the replay made it.
+
+    The inputs `_overlay_day` hands the overlays -- the stored tape's opening
+    minutes, completed daily bars strictly before the day and the stored
+    opening print -- so the range is the one every cell's levels hung off at
+    09:35, whatever the configuration did with it afterwards. `signature`
+    (`drift.signature`) is the half of the key that moves when the store or
+    the model does; a day with no forecast is cached with its reason, as
+    `_overlay_day` caches its notes.
+    """
+    session = date.fromisoformat(day)
+    market = SimMarket([symbol], [session], feed)
+    t = market.session_open(session) + timedelta(minutes=1)
+    result = model_overlays.session_forecast(
+        model_key, symbol, market.series[symbol].minute_bars,
+        daily_bars=market.completed_daily_bars(symbol, t),
+        session_date=session,
+        open_price=market.session_open_price(symbol, t),
+    )
+    forecast = result["forecast"]
+    return {
+        "high": float(forecast["pred_high"]) if forecast else None,
+        "low": float(forecast["pred_low"]) if forecast else None,
+        "made_at": f"{pd.Timestamp(result['made_at']):%H:%M}" if forecast else None,
+        "problem": result["problem"],
+        "overlay": result["overlay"],
+    }
+
+
+def _tuning_forecasts(job: dict, chosen: "dict | None" = None) -> dict:
+    """{"days": {day: forecast}, "overlay", "notes"} for every session the
+    shown configuration was scored on (the pick's, or `chosen`'s), from the
+    model that configuration trades on."""
+    spec = job["spec"]
+    symbol = spec["base"]["ticker"]
+    shown = chosen if chosen is not None else (job.get("best") or {}).get("overrides") or {}
+    model_key = model_overlays.trader_model(sim_tuning.make_config(spec["base"], shown), symbol)
+    out = {"days": {}, "overlay": None, "notes": []}
+    missing: dict[str, str] = {}
+    for feed, days in _tuning_shown_days(job, chosen).items():
+        signature = sim_drift.signature(model_key, symbol, feed)
+        for day in days:
+            found = _tuning_forecast(symbol, model_key, feed, day, signature)
+            out["overlay"] = found["overlay"]
+            if found["high"] is None:
+                missing[day] = found["problem"]
+            else:
+                out["days"][day] = found
+    if missing:
+        first = min(missing)
+        out["notes"].append(
+            f"No predicted range for {len(missing)} session(s) — {first}: {missing[first]}"
+        )
+    return out
+
+
 def _tuning_day_label(day: str, context: dict) -> str:
     lines = [day]
     record = context["biases"].get(day)
@@ -4302,26 +4506,68 @@ def _tuning_day_hover(day: str, context: dict) -> str:
     return f"pre-market: {bias}<br>VIX open: " + (f"{vix:.2f}" if vix is not None else "–")
 
 
-def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
+def _tuning_forecast_hover(forecast: dict, bar: "dict | None") -> str:
+    lines = [
+        f"predicted {forecast['low']:.2f} – {forecast['high']:.2f} "
+        f"(forecast at {forecast['made_at']})"
+    ]
+    if bar is not None:
+        lines.append(f"actual {bar['l']:.2f} – {bar['h']:.2f}")
+        lines.append(
+            f"actual − predicted: high {bar['h'] - forecast['high']:+.2f}, "
+            f"low {bar['l'] - forecast['low']:+.2f}"
+        )
+    return "<br>".join(lines)
+
+
+def _tuning_daily_chart(
+    job: dict,
+    context: "dict | None" = None,
+    chosen: "dict | None" = None,
+    forecasts: "dict | None" = None,
+) -> go.Figure:
+    """The pick's profit per session over the daily candles -- or, with
+    `chosen`, the profit of the square clicked on a heatmap. `forecasts`
+    (`_tuning_forecasts`) boxes each session's predicted high and low behind
+    its candle."""
     spec = job["spec"]
     symbol = spec["base"]["ticker"]
     context = context or {"vix": {}, "biases": {}}
+    who = "Pick" if chosen is None else "Selected"
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
         row_heights=[0.6, 0.4],
     )
     bars: dict[str, dict] = {}
     for index, dataset in enumerate(sim_tuning.chronological(spec["datasets"])):
-        cell = sim_tuning.pick_cell(job, dataset["name"])
+        cell = _tuning_shown_cell(job, dataset["name"], chosen)
         if not sim_tuning.is_scored(cell):
             continue
         days = list(cell["daily"])
         fig.add_trace(go.Bar(
             x=days, y=[cell["daily"][d] for d in days],
-            name=f"Pick on {dataset['name']}", marker_color=_tuning_color(index),
+            name=f"{who} on {dataset['name']}", marker_color=_tuning_color(index),
             hovertext=[_tuning_day_hover(d, context) for d in days],
         ), row=1, col=1)
         bars.update(_tuning_session_bars(symbol, dataset["feed"], days))
+    predicted = (forecasts or {}).get("days") or {}
+    if predicted:
+        # A box from the predicted low to the predicted high, behind the candle:
+        # a wick through its lid or floor is the session trading outside the
+        # forecast. Added before the candles so they draw over it.
+        overlay = forecasts["overlay"]
+        color = MODEL_OVERLAY_COLORS[overlay]
+        days = sorted(predicted)
+        fig.add_trace(go.Bar(
+            x=days,
+            base=[predicted[d]["low"] for d in days],
+            y=[predicted[d]["high"] - predicted[d]["low"] for d in days],
+            width=0.7,
+            name=model_overlays.label(overlay),
+            marker=dict(color=_rgba(color, 0.18), line=dict(color=color, width=1.5)),
+            customdata=[_tuning_forecast_hover(predicted[d], bars.get(d)) for d in days],
+            hovertemplate="%{customdata}<extra></extra>",
+        ), row=2, col=1)
     if bars:
         days = sorted(bars)
         fig.add_trace(go.Candlestick(
@@ -4341,7 +4587,8 @@ def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
     # Each session's label carries what the morning looked like: the pre-market
     # briefing's call and the VIX's opening print. Set on the bottom axis only,
     # the one a shared x shows.
-    all_days = sorted({d for ds in _tuning_pick_days(job).values() for d in ds} | set(bars))
+    shown_days = _tuning_shown_days(job, chosen).values()
+    all_days = sorted({d for ds in shown_days for d in ds} | set(bars))
     fig.update_xaxes(
         tickvals=all_days, ticktext=[_tuning_day_label(d, context) for d in all_days],
         row=2, col=1,
@@ -4349,14 +4596,21 @@ def _tuning_daily_chart(job: dict, context: "dict | None" = None) -> go.Figure:
     fig.update_yaxes(title="Profit ($)", row=1, col=1)
     fig.update_yaxes(title=f"{symbol} ($)", row=2, col=1)
     fig.update_yaxes(gridcolor=PALETTE["grid"])
-    fig.update_layout(title="The pick, session by session", barmode="group")
+    title = (
+        "The pick, session by session" if chosen is None
+        else f"Selected — {_tuning_values_text(chosen)}, session by session"
+    )
+    fig.update_layout(title=title, barmode="group")
     _chart_layout(fig, height=520)
     fig.update_layout(margin=dict(b=80))
     return fig
 
 
-def _render_tuning_session_context(job: dict, context: dict) -> None:
-    """Under the chart: where the labels come from, and each morning's briefing."""
+def _render_tuning_session_context(
+    job: dict, context: dict, chosen: "dict | None" = None
+) -> None:
+    """Under the chart: where the labels come from, and each morning's briefing,
+    beside the shown configuration's profit that day (the pick's, or `chosen`'s)."""
     if context["provider"] is None:
         st.caption(
             ":material/info: No LLM key in the environment (GEMINI_API_KEY, OPENAI_API_KEY "
@@ -4376,7 +4630,7 @@ def _render_tuning_session_context(job: dict, context: dict) -> None:
         return
     profit = {}
     for name in sim_tuning.dataset_names(job["spec"]):
-        cell = sim_tuning.pick_cell(job, name)
+        cell = _tuning_shown_cell(job, name, chosen)
         if sim_tuning.is_scored(cell):
             profit.update(cell["daily"])
     rows = [
@@ -4406,7 +4660,9 @@ def _render_tuning_session_context(job: dict, context: dict) -> None:
             "bias": "Bias",
             "confidence": "Confidence",
             "vix_open": st.column_config.NumberColumn("VIX open", format="%.2f"),
-            "profit": st.column_config.NumberColumn("Pick profit ($)", format="%+.2f"),
+            "profit": st.column_config.NumberColumn(
+                f"{'Pick' if chosen is None else 'Selected'} profit ($)", format="%+.2f"
+            ),
             "summary": st.column_config.TextColumn("Summary", width="large"),
         })
 
@@ -4650,46 +4906,77 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         st.markdown(verdict)
 
     best = job.get("best")
+    # A square clicked on any of the heatmaps below replaces the pick in the
+    # table, the session-by-session chart and the configuration at the bottom;
+    # the verdict above stays about the pick.
+    chosen = _tuning_chosen(job)
+    who = "Pick" if chosen is None else "Selected"
     base_values = {a["name"]: spec["base"][a["name"]] for a in axes}
     st.caption(
         f"Base configuration: {_tuning_values_text(base_values)}"
         + (f" · Pick: {_tuning_values_text(best['overrides'])}" if best else "")
+        + (f" · **Selected: {_tuning_values_text(chosen)}**" if chosen else "")
     )
+    if chosen is not None:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption(
+                ":material/ads_click: Showing the square clicked on a heatmap rather than "
+                "the pick, here and in the session-by-session chart below."
+            )
+            st.button(
+                "Back to the pick", icon=":material/undo:", key=f"tune_unchoose_{job_id}",
+                on_click=st.session_state.pop, args=(_tuning_chosen_key(job_id), None),
+            )
     money = st.column_config.NumberColumn
-    st.dataframe(pd.DataFrame(_tuning_summary_rows(job)), hide_index=True, column_config={
-        "dataset": "Dataset",
-        "sessions": "Sessions",
-        "base_profit": money("Base profit ($)", format="%+.2f"),
-        "base_return": money("Base return", format="%+.2f%%"),
-        "pick_profit": money("Pick profit ($)", format="%+.2f"),
-        "pick_return": money("Pick return", format="%+.2f%%"),
-        "pick_days": "Pick days",
-        "pick_win_rate": money("Pick win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP),
-        "pick_round_trips": st.column_config.TextColumn(
-            "Pick wins", help="Winning round trips of all the pick's round trips.",
-        ),
-        "pick_worst": money("Pick worst day ($)", format="%+.2f"),
-    })
+    st.dataframe(
+        pd.DataFrame(_tuning_summary_rows(job, chosen)), hide_index=True, column_config={
+            "dataset": "Dataset",
+            "sessions": "Sessions",
+            "base_profit": money("Base profit ($)", format="%+.2f"),
+            "base_return": money("Base return", format="%+.2f%%"),
+            "shown_profit": money(f"{who} profit ($)", format="%+.2f"),
+            "shown_return": money(f"{who} return", format="%+.2f%%"),
+            "shown_days": f"{who} days",
+            "shown_win_rate": money(
+                f"{who} win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP
+            ),
+            "shown_round_trips": st.column_config.TextColumn(
+                f"{who} wins",
+                help=f"Winning round trips of all the {who.lower()}'s round trips.",
+            ),
+            "shown_worst": money(f"{who} worst day ($)", format="%+.2f"),
+        },
+    )
 
     marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
+    if chosen is not None:
+        marks["Selected"] = chosen
     prefix = "From stored runs · " if sim_tuning.is_derived(job) else ""
     view = _tuning_view_picker(axes, marks, key=f"tune_view_{job_id}")
+    # An Average square is several configurations at once, so it cannot be one.
+    clickable = view != sim_tuning.SLICE_MEAN
     _render_tuning_charts([
         (
             f"tune_heat_{job_id}_{index}",
             _tuning_view_heatmap(
-                job["cells"].get(name) or [], axes, marks, f"{prefix}{name}", view
+                job["cells"].get(name) or [], axes, marks, f"{prefix}{name}", view,
+                clickable=clickable,
             ),
         )
         for index, name in enumerate(names)
-    ])
+    ], job_id=job_id if clickable else None)
     if len(names) > 1:
-        st.plotly_chart(
+        _render_tuning_charts([(
+            f"tune_heat_sum_{job_id}",
             _tuning_view_heatmap(
                 sim_tuning.summed_cells(job), axes, marks,
-                f"Sum of all {len(names)} datasets", view,
+                f"Sum of all {len(names)} datasets", view, clickable=clickable,
             ),
-            key=f"tune_heat_sum_{job_id}",
+        )], job_id=job_id if clickable else None)
+        st.caption(
+            "A combination is summed once every dataset has replayed it. The pick is the "
+            "best cell of this sum, so every dataset above is in sample: a pick worth "
+            "keeping is in profit on most of them, not carried by one."
         )
     if len(axes) > 2:
         third = _tuning_param_label(axes[2]["name"])
@@ -4701,11 +4988,16 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             f"{third}. A collapsed square fills in once every {third} has been replayed "
             "there, and refused combinations are left out of its average."
         )
-        st.caption(
-            "A combination is summed once every dataset has replayed it. The pick is the "
-            "best cell of this sum, so every dataset above is in sample: a pick worth "
-            "keeping is in profit on most of them, not carried by one."
+    st.caption(
+        f":material/ads_click: Click a {'bar' if len(axes) == 1 else 'square'} to show "
+        "that configuration in the table above and the session-by-session chart below; "
+        "it is marked in magenta"
+        + (
+            f" — on Best of all, at the {_tuning_param_label(axes[2]['name'])} it won at. "
+            "An Average square is several configurations, so it cannot be clicked."
+            if len(axes) > 2 else "."
         )
+    )
     _render_tuning_notes(job)
 
     rows = _tuning_cell_rows(job)
@@ -4732,17 +5024,26 @@ def _render_tuning_results(jobs: list[dict]) -> None:
                 ),
             })
 
-    if sim_tuning.is_scored(best):
-        context = _tuning_session_context(job)
-        st.plotly_chart(_tuning_daily_chart(job, context), key=f"tune_daily_{job_id}")
-        _render_tuning_session_context(job, context)
-        picked = sim_tuning.make_config(spec["base"], best["overrides"])
-        st.markdown("**The pick as a configuration**")
+    shown = chosen if chosen is not None else (best or {}).get("overrides")
+    if _tuning_shown_days(job, chosen) and shown is not None:
+        context = _tuning_session_context(job, chosen)
+        forecasts = _tuning_forecasts(job, chosen)
+        st.plotly_chart(
+            _tuning_daily_chart(job, context, chosen, forecasts), key=f"tune_daily_{job_id}"
+        )
+        for note in forecasts["notes"]:
+            st.caption(f":material/info: {note}")
+        _render_tuning_session_context(job, context, chosen)
+        picked = sim_tuning.make_config(spec["base"], shown)
+        st.markdown(
+            "**The pick as a configuration**" if chosen is None
+            else "**The selected square as a configuration**"
+        )
         st.code(rule_agent(APPLE_TRADER_KEY).signature(picked), language=None)
         st.caption(
-            f"{_tuning_values_text(best['overrides'])}. Set these in an Apple Trader setup "
-            "on the Simulate tab to replay the pick with its full ledger, charts and "
-            "decisions."
+            f"{_tuning_values_text(shown)}. Set these in an Apple Trader setup on the "
+            f"Simulate tab to replay {'the pick' if chosen is None else 'it'} with its "
+            "full ledger, charts and decisions."
         )
 
     # A derived grid has no record to delete -- it is the runs themselves, and

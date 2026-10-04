@@ -986,6 +986,51 @@ class TestHighLowOverlay:
         assert mo.HIGHLOW_RANGE_KEY not in mo.keys_for("GOOGL")
 
 
+class TestSessionForecast:
+    """`session_forecast` hands back the numbers `trader_levels` hangs the levels
+    off -- the configured model's forecast -- and which overlay draws it."""
+
+    def test_a_day_range_agent_gets_time_to_change3s_forecast(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        TestHighLowOverlay().stub_both(monkeypatch)
+        result = mo.session_forecast(apple_models.DAYRANGE_KEY, "aapl", minute_bars(),
+                                     daily_bars=[], session_date=SESSION)
+        assert result["overlay"] == mo.DAY_RANGE_KEY
+        assert result["forecast"]["pred_high"] == 210.0
+        made = pd.Timestamp(result["made_at"]).tz_convert("America/New_York")
+        assert (made.hour, made.minute) == (9, 34)
+
+    def test_a_highlow_agent_gets_highlows_and_never_asks_time_to_change3(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        import agent_stonks.dayrange_model as dr
+
+        TestHighLowOverlay().stub_both(monkeypatch)
+        monkeypatch.setattr(dr, "forecast_session", lambda *a, **k: pytest.fail("ttc3"))
+        result = mo.session_forecast(apple_models.HIGHLOW_KEY, "AAPL", minute_bars(),
+                                     session_date=SESSION)
+        assert result["overlay"] == mo.HIGHLOW_RANGE_KEY
+        assert result["forecast"]["pred_high"] == 206.0
+
+    def test_the_official_open_reaches_time_to_change3(self, monkeypatch):
+        pytest.importorskip("agent_stonks.dayrange_model")
+        import agent_stonks.dayrange_model as dr
+
+        TestDayRangeOverlay().stub_forecast(monkeypatch)
+        seen = []
+        monkeypatch.setattr(dr, "forecast_session",
+                            lambda *a, open_price=None, **k: seen.append(open_price) or {
+                                "pred_high": 210.0, "pred_low": 198.0})
+        mo.session_forecast(apple_models.DAYRANGE_KEY, "AAPL", minute_bars(),
+                            daily_bars=[], session_date=SESSION, open_price=200.5)
+        assert seen == [200.5]
+
+    def test_a_day_with_no_bars_is_a_reason_not_a_forecast(self):
+        result = mo.session_forecast(apple_models.DAYRANGE_KEY, "AAPL", minute_bars(),
+                                     session_date="2026-08-10")
+        assert result["forecast"] is None
+        assert result["problem"] == "No bars for 2026-08-10."
+
+
 class TestHighLow2Overlay:
     """HighLow2's range is drawn like the other two, under its own key, and an
     agent configured on it has its levels drawn under HighLow2's high."""

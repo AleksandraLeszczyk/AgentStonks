@@ -73,6 +73,7 @@ from .config import (
     APPLE_TRADER_TAKE_FRACTION,
     APPLE_TRADER_TAKE_AFTER_MINUTES,
     APPLE_TRADER_TUNED_LEVELS,
+    APPLE_TRADER_TUNED_STOP,
     BREACH_BROWNIAN,
     BREACH_LABELS,
     BREACH_OFF,
@@ -153,6 +154,20 @@ def dayrange_levels(ticker: str, model_key: "str | None" = None) -> "tuple[float
     return APPLE_TRADER_DAYRANGE_LEVELS.get(symbol, (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K))
 
 
+def stop_for(ticker: str, model_key: "str | None" = None) -> float:
+    """The stop a run of this model on this symbol starts from, as a share of
+    the predicted gain.
+
+    Per model and instrument, like the levels it is a share of: SimLab's tuning
+    pick for the pair (`config.APPLE_TRADER_TUNED_STOP`), else the one shared
+    default.
+    """
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    return APPLE_TRADER_TUNED_STOP.get(
+        (str(model_key or APPLE_TRADER_MODEL), symbol), APPLE_TRADER_STOP_GAIN_FRACTION
+    )
+
+
 def min_win_for(ticker: str) -> float:
     """The circuit breaker a run on this symbol starts from, in ADRs a share.
 
@@ -198,8 +213,9 @@ class AppleTraderConfig:
     # have gone the wrong way, as a share of what the trade is playing for --
     # the predicted gain, `(buy_k - sell_k) x ADR`, which is the gap between the
     # two levels at every minute of the session. 0.5 risks one dollar for every
-    # two the target is worth. 0 switches the stop off.
-    stop_gain_fraction: float = APPLE_TRADER_STOP_GAIN_FRACTION
+    # two the target is worth. 0 switches the stop off. None -> the pair's own
+    # tuned stop (`stop_for`), filled in by `__post_init__`.
+    stop_gain_fraction: Optional[float] = None
     # The same stop in the units it used to be written in: ADRs under the fill,
     # with no reference to what the trade was playing for. Kept only so that a
     # stored record replays and signs exactly as the run it describes -- nothing
@@ -347,6 +363,8 @@ class AppleTraderConfig:
         self.ticker = (self.ticker or DEFAULT_TICKER).strip().upper()
         if self.min_win_k is None:
             self.min_win_k = min_win_for(self.ticker)
+        if self.stop_gain_fraction is None:
+            self.stop_gain_fraction = stop_for(self.ticker, self.model_key)
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",

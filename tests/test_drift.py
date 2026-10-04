@@ -677,8 +677,10 @@ class TestPairs:
 
     def test_a_per_ticker_model_only_takes_its_own_symbols(self, store, monkeypatch):
         monkeypatch.setattr(sim_data, "STORE_DIR", dr.sim_data.STORE_DIR)
-        sim_data._write_gz(sim_data.daily_path("NVDA", FEED), {"symbol": "NVDA", "bars": []})
-        keys = {k for k, t in dr.pairs(FEED, ["NVDA"])}
+        # IBM: no per-ticker model was fitted on it (NVDA was the example until
+        # its HighLow bundle, 2026-10-04)
+        sim_data._write_gz(sim_data.daily_path("IBM", FEED), {"symbol": "IBM", "bars": []})
+        keys = {k for k, t in dr.pairs(FEED, ["IBM"])}
         assert keys == {k for k, m in dr.MODELS.items() if m.tickers is None}
 
     def test_the_default_symbols_are_the_ones_a_model_was_fitted_for(self, store):

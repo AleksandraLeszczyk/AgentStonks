@@ -1424,12 +1424,24 @@ def summed_baseline(record: dict) -> "dict | None":
     return combine({}, [(record.get("baseline") or {}).get(name) for name in names])
 
 
+def summed_cell(record: dict, overrides: dict) -> "dict | None":
+    """One combination summed over every dataset of the job (`combine`)."""
+    return combine(
+        overrides, [cell_at(record, name, overrides) for name in dataset_names(record["spec"])]
+    )
+
+
+def cell_at(record: dict, name: str, overrides: dict) -> "dict | None":
+    """One combination's own cell on one dataset, or None if it has none yet."""
+    return _cells_by_key(record, name).get(overrides_key(overrides))
+
+
 def pick_cell(record: dict, name: str) -> "dict | None":
     """The pick's own cell on one dataset: its share of the summed total."""
     best = record.get("best")
     if not best:
         return None
-    return _cells_by_key(record, name).get(overrides_key(best["overrides"]))
+    return cell_at(record, name, best["overrides"])
 
 
 def refresh_pick(record: dict) -> dict:

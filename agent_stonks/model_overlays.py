@@ -558,16 +558,9 @@ def compute(
         return {"items": items, "notes": notes}
 
     symbol = (ticker or "").upper()
-    frame = momentum_regime.frame_from_bars(bars)
-    if not len(frame):
-        return {"items": items, "notes": ["No regular-session bars to draw on."]}
-
-    day = pd.Timestamp(session_date).normalize() if session_date is not None else None
-    if day is None:
-        day = pd.Timestamp(frame.index[-1]).normalize().tz_localize(None)
-    session = frame[frame.index.normalize().tz_localize(None) == day]
-    if not len(session):
-        return {"items": items, "notes": [f"No bars for {day.date()}."]}
+    day, session, problem = _session_of(bars, session_date)
+    if session is None:
+        return {"items": items, "notes": [problem]}
 
     # Asked for at most once per call, however many overlays draw it.
     memo: dict = {}
@@ -659,6 +652,62 @@ def compute(
             notes.append(why)
 
     return {"items": items, "notes": notes}
+
+
+def _session_of(
+    bars: "list[dict]", session_date=None
+) -> "tuple[pd.Timestamp | None, pd.DataFrame | None, str]":
+    """`(day, session frame, "")` for the regular session of `session_date` in
+    `bars` -- the last bar's day when None -- or `(day, None, why not)`."""
+    frame = momentum_regime.frame_from_bars(bars)
+    if not len(frame):
+        return None, None, "No regular-session bars to draw on."
+    day = pd.Timestamp(session_date).normalize() if session_date is not None else None
+    if day is None:
+        day = pd.Timestamp(frame.index[-1]).normalize().tz_localize(None)
+    session = frame[frame.index.normalize().tz_localize(None) == day]
+    if not len(session):
+        return day, None, f"No bars for {day.date()}."
+    return day, session, ""
+
+
+# The range overlay that draws each model's forecast; every other model (the
+# two TimeToChange3 ones) forecasts through TimeToChange3's.
+_RANGE_OVERLAYS = {
+    apple_models.HIGHLOW_KEY: HIGHLOW_RANGE_KEY,
+    apple_models.HIGHLOW2_KEY: HIGHLOW2_RANGE_KEY,
+}
+
+
+def session_forecast(
+    model_key: "str | None",
+    ticker: str,
+    bars: "list[dict]",
+    daily_bars: "list[dict] | None" = None,
+    session_date=None,
+    open_price: "float | None" = None,
+    credentials: "tuple[str, str] | None" = None,
+) -> dict:
+    """The morning forecast of the session's high and low that an Apple Trader
+    on `model_key` hangs its levels off, as numbers rather than drawing items.
+
+    The same forecast `trader_levels` draws under, off the same inputs as
+    `compute` (whose arguments these are), for a chart that wants the two
+    numbers themselves -- SimLab's Tuning tab draws one per session over daily
+    candles. Returns `{"forecast", "made_at", "problem", "overlay"}`: the first
+    three as `_day_range_forecast` returns them, `overlay` the key of the range
+    overlay that draws this model's forecast, for its label and colour.
+    """
+    symbol = (ticker or "").upper()
+    overlay = _RANGE_OVERLAYS.get(model_key or "", DAY_RANGE_KEY)
+    day, session, problem = _session_of(bars or [], session_date)
+    if session is None:
+        result = {"forecast": None, "made_at": None, "problem": problem}
+    elif overlay == DAY_RANGE_KEY:
+        result = _day_range_forecast(symbol, session, daily_bars or [], day, open_price)
+    else:
+        result = _highlow_forecast(symbol, session, day, credentials, model_key)
+    return {**result, "overlay": overlay}
 
 
 # --- day range (TimeToChange3) ----------------------------------------------

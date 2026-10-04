@@ -672,21 +672,31 @@ def _intraday_vol_spec(ticker: str) -> ModelSpec:
     )
 
 
+# The network checkpoints a HighLow bundle may ship beside its joblib.
+_HIGHLOW_NETS = {"nbeats": "N-BEATS", "nhits": "N-HiTS"}
+
+
 def _highlow_spec(ticker: str) -> ModelSpec:
     path = _saved_path("APPLE_HIGHLOW_MODEL", "highlow15m_{ticker}.joblib", ticker)
+    meta = _read_json(path.with_suffix(".json"))
+    # Only the networks the blend weights have to be on disk (INTC ships
+    # N-HiTS alone); a sidecar without weights predates the choice: N-BEATS.
+    shipped = [k for k, w in (meta.get("weights") or {"nbeats": 1}).items() if w and k in _HIGHLOW_NETS]
     files = (
         ModelFile("bundle", path),
-        ModelFile("N-BEATS weights", path.with_name(f"{path.stem}_nbeats.pt")),
+        *(ModelFile(f"{_HIGHLOW_NETS[k]} weights", path.with_name(f"{path.stem}_{k}.pt")) for k in shipped),
         ModelFile("metadata", path.with_suffix(".json")),
     )
     available, reason = _availability(files, "torch", "lightgbm", "sklearn", "joblib")
-    meta = _read_json(path.with_suffix(".json"))
     test = meta.get("test_metrics") or {}
     metrics = {k: v for k, v in test.items()}
     if meta.get("walk_forward_mae_mean") is not None:
         metrics["walk-forward MAE"] = meta["walk_forward_mae_mean"]
-    measured = highlow_error_pct_adr(meta, ticker=ticker)
-    error_pct = measured[0] if measured else None
+    # Sidecars from 2026-10-03 on (AVGO, NVDA) carry the notebook's own score in
+    # ADR units, per session; older ones only the log MAE, put over the cached ADR.
+    exact = test.get("mae_adr_mean")
+    measured = None if exact is not None else highlow_error_pct_adr(meta, ticker=ticker)
+    error_pct = float(exact) if exact is not None else measured[0] if measured else None
     if error_pct is not None:
         # First, as on TimeToChange3's row: it is the headline.
         metrics = {"MAE (% of ADR)": error_pct, **metrics}
@@ -730,6 +740,14 @@ def _highlow_spec(ticker: str) -> ModelSpec:
                 if meta.get("peers") and "lead_or_ret_adr" in (meta.get("custom_features_kept") or ())
                 else ""
             )
+            + (
+                # NVDA: the market, pre-market and after-hours groups
+                f"; {meta.get('market_proxy') or 'SPY'}'s first minutes and SIP history, this "
+                "morning's SIP pre-market to 09:19 and the previous evening's after-hours"
+                if {"mkt_or_ret_adr", "pm_gap_extend", "ah_ret_adr"}
+                & set(meta.get("custom_features_kept") or ())
+                else ""
+            )
         ),
         metrics=metrics,
         headline=(
@@ -760,13 +778,21 @@ def _highlow_spec(ticker: str) -> ModelSpec:
                 f"range — the ADR averaged over the {measured[1]} test-window sessions "
                 "in the local SIP cache, so an estimate. "
                 if measured
+                else f"Misses each extreme by {error_pct:.0f}% of that day's 14-day range "
+                "on average (the notebook's own score). "
+                if error_pct is not None
                 else ""
             )
             + f"MAE {format_metric(test.get('mae_mean'))} log units on the "
-            f"{', '.join((meta.get('splits') or {}).get('test') or []) or 'test'} window, "
-            "against TimeToChange3's published "
-            f"{format_metric(meta.get('ttc3_published_test_mae_mean'))}. The shipped "
-            "trading distances were swept on TimeToChange3's forecast, not this one."
+            f"{', '.join((meta.get('splits') or {}).get('test') or []) or 'test'} window"
+            + (
+                ", against TimeToChange3's published "
+                f"{format_metric(meta.get('ttc3_published_test_mae_mean'))}"
+                if meta.get("ttc3_published_test_mae_mean") is not None
+                else ""
+            )
+            + ". The shipped trading distances were swept on TimeToChange3's forecast, "
+            "not this one."
         ),
     )
 

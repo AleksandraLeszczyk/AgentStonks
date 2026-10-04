@@ -8,6 +8,7 @@ replay-backed minute frame -- are pinned against the scans they replaced,
 at every step of a stored session, because a faster replay that answered
 differently would make every tuned number wrong.
 """
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -659,6 +660,221 @@ class TestThirdAxis:
         assert best["overrides"] == {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 0.5}
         assert best["pick_score"] == pytest.approx((100 - 60 + 50 + 400 - 30 + 50 + 70) / 7)
         assert tu.pick_best(cells3(self.PROFITS), AXES3)["profit"] == 400
+
+
+# --- a square clicked on a heatmap ------------------------------------------
+
+
+AXES2 = [{"name": "buy_k", "values": [0.3, 0.5]}, {"name": "sell_k", "values": [0.1, 0.2]}]
+
+
+def square(buy: float, sell: float) -> tuple:
+    """A heatmap square as its (column tick, row tick)."""
+    return tu.axis_tick("sell_k", sell), tu.axis_tick("buy_k", buy)
+
+
+def clicked_configs(fig) -> dict:
+    """{square: the configuration a click on it names, or None}, read off the
+    invisible markers a clickable heatmap carries."""
+    [overlay] = [t for t in fig.data if t.type == "scatter" and t.showlegend is False]
+    return {
+        (x, y): json.loads(custom[3]) if len(custom) > 3 else None
+        for x, y, custom in zip(overlay.x, overlay.y, overlay.customdata)
+    }
+
+
+class TestClickedSquare:
+    """A square clicked on one of a job's heatmaps is shown in its results --
+    the table, the session-by-session chart -- in place of the pick
+    (simlab/app.py)."""
+
+    def cells2(self) -> "list[dict]":
+        """(0.3, 0.2) refused, (0.5, 0.2) not replayed yet."""
+        return [
+            scored({"buy_k": 0.3, "sell_k": 0.1}, 100.0),
+            {"overrides": {"buy_k": 0.3, "sell_k": 0.2}, "invalid": "refused"},
+            scored({"buy_k": 0.5, "sell_k": 0.1}, -40.0),
+        ]
+
+    def test_every_scored_square_names_its_configuration(self):
+        from simlab import app as sim_app
+
+        fig = sim_app._tuning_view_heatmap(self.cells2(), AXES2, {}, "t", None, clickable=True)
+        assert clicked_configs(fig) == {
+            square(0.3, 0.1): {"buy_k": 0.3, "sell_k": 0.1},
+            square(0.3, 0.2): None,
+            square(0.5, 0.1): {"buy_k": 0.5, "sell_k": 0.1},
+            square(0.5, 0.2): None,
+        }
+        # The markers answer the hover too, nearest centre first, so the
+        # heatmap's own hover is off.
+        [heatmap] = [t for t in fig.data if t.type == "heatmap"]
+        assert heatmap.hoverinfo == "skip" and fig.layout.hoverdistance == -1
+
+    def test_a_heatmap_that_is_not_clickable_keeps_its_own_hover(self):
+        from simlab import app as sim_app
+
+        fig = sim_app._tuning_view_heatmap(self.cells2(), AXES2, {}, "t", None)
+        assert [t.type for t in fig.data] == ["heatmap"]
+        assert fig.data[0].hoverinfo is None
+
+    def test_a_slice_names_its_value_of_the_third_and_best_the_value_it_won_at(self):
+        from simlab import app as sim_app
+
+        cells = cells3(TestThirdAxis.PROFITS)
+
+        def clicked(view) -> "dict | None":
+            fig = sim_app._tuning_view_heatmap(cells, AXES3, {}, "t", view, clickable=True)
+            return clicked_configs(fig)[square(0.3, 0.1)]
+
+        assert clicked(2) == {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0}
+        assert clicked(tu.SLICE_BEST) == {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 0.75}
+
+    def test_an_average_square_is_several_configurations_so_names_none(self):
+        from simlab import app as sim_app
+
+        fig = sim_app._tuning_view_heatmap(
+            cells3(TestThirdAxis.PROFITS), AXES3, {}, "t", tu.SLICE_MEAN, clickable=True
+        )
+        assert [t.type for t in fig.data] == ["heatmap"]
+
+    def test_a_bar_of_a_one_axis_grid_names_its_configuration(self):
+        from simlab import app as sim_app
+
+        axes = [{"name": "buy_k", "values": [0.3, 0.5]}]
+        cells = [scored({"buy_k": 0.3}, 100.0), {"overrides": {"buy_k": 0.5}, "invalid": "no"}]
+        fig = sim_app._tuning_view_heatmap(cells, axes, {}, "t", None, clickable=True)
+        [bar] = [t for t in fig.data if t.type == "bar"]
+        assert json.loads(bar.customdata[0][3]) == {"buy_k": 0.3}
+        assert len(bar.customdata[1]) == 3
+
+    def test_a_click_is_kept_and_a_square_with_nothing_to_show_changes_nothing(
+        self, monkeypatch
+    ):
+        from simlab import app as sim_app
+
+        state: dict = {}
+        monkeypatch.setattr(sim_app.st, "session_state", state)
+
+        def click(*custom) -> None:
+            state["chart"] = {"selection": {"points": [{"customdata": list(custom)}]}}
+            sim_app._tuning_on_click("j", "chart")
+
+        click("+1.00%", "5/5 days traded", "", json.dumps({"buy_k": 0.5}))
+        assert state["tune_chosen_j"] == {"buy_k": 0.5}
+        click("", "", "")  # a blank or refused square
+        state["chart"] = {"selection": {"points": []}}  # a double-click
+        sim_app._tuning_on_click("j", "chart")
+        assert state["tune_chosen_j"] == {"buy_k": 0.5}
+
+    def test_the_picks_own_square_or_one_off_the_grid_is_the_pick(self, monkeypatch):
+        from simlab import app as sim_app
+
+        record = job_record({
+            "w1": [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)],
+        })
+        tu.refresh_pick(record)
+        state: dict = {}
+        monkeypatch.setattr(sim_app.st, "session_state", state)
+        assert sim_app._tuning_chosen(record) is None
+        state["tune_chosen_j"] = {"buy_k": 0.5}
+        assert sim_app._tuning_chosen(record) == {"buy_k": 0.5}
+        state["tune_chosen_j"] = {"buy_k": 0.3}
+        assert sim_app._tuning_chosen(record) is None
+        state["tune_chosen_j"] = {"buy_k": 0.9}
+        assert sim_app._tuning_chosen(record) is None
+
+    def test_the_table_and_the_sessions_show_the_clicked_square(self, monkeypatch):
+        from simlab import app as sim_app
+
+        def cell(buy: float, profit: float, day: str) -> dict:
+            return {**scored({"buy_k": buy}, profit), "daily": {day: profit}}
+
+        record = job_record({
+            "w1": [cell(0.3, 900.0, "2026-06-15"), cell(0.5, 400.0, "2026-06-15")],
+            "w2": [cell(0.3, -700.0, "2026-06-22"), cell(0.5, 350.0, "2026-06-22")],
+        })
+        tu.refresh_pick(record)
+        assert record["best"]["overrides"] == {"buy_k": 0.5}
+        chosen = {"buy_k": 0.3}
+        assert tu.summed_cell(record, chosen)["profit"] == 200.0
+
+        shown = lambda rows: [r["shown_profit"] for r in rows]  # noqa: E731
+        assert shown(sim_app._tuning_summary_rows(record)) == [400.0, 350.0, 750.0]
+        assert shown(sim_app._tuning_summary_rows(record, chosen)) == [900.0, -700.0, 200.0]
+
+        monkeypatch.setattr(sim_app, "_tuning_session_bars", lambda sym, feed, days: {})
+        fig = sim_app._tuning_daily_chart(record, chosen=chosen)
+        assert {t.name: list(t.y) for t in fig.data if t.type == "bar"} == {
+            "Selected on w1": [900.0], "Selected on w2": [-700.0],
+        }
+        assert fig.layout.title.text.startswith("Selected")
+        assert sim_app._tuning_daily_chart(record).layout.title.text == (
+            "The pick, session by session"
+        )
+
+
+class TestPredictedRange:
+    """The session-by-session chart boxes each session's predicted high and low
+    behind its daily candle, from the model the shown configuration trades on."""
+
+    def record(self):
+        def cell(buy: float, profit: float, day: str) -> dict:
+            return {**scored({"buy_k": buy}, profit), "daily": {day: profit}}
+
+        record = job_record({
+            "w1": [cell(0.3, 900.0, "2026-06-15"), cell(0.5, 400.0, "2026-06-15")],
+            "w2": [cell(0.3, -700.0, "2026-06-22"), cell(0.5, 350.0, "2026-06-22")],
+        })
+        return tu.refresh_pick(record)
+
+    def test_each_session_is_forecast_once_and_a_missing_one_is_a_note(self, monkeypatch):
+        from simlab import app as sim_app
+
+        asked = []
+
+        def forecast(symbol, model_key, feed, day, signature):
+            asked.append((symbol, model_key, day))
+            if day == "2026-06-22":
+                return {"high": None, "low": None, "made_at": None,
+                        "problem": "no opening minutes", "overlay": "highlow_range"}
+            return {"high": 210.0, "low": 200.0, "made_at": "09:34", "problem": "",
+                    "overlay": "highlow_range"}
+
+        monkeypatch.setattr(sim_app, "_tuning_forecast", forecast)
+        monkeypatch.setattr(sim_app.sim_drift, "signature", lambda *a: ())
+        record = self.record()
+        record["spec"]["base"]["model_key"] = "highlow"
+        found = sim_app._tuning_forecasts(record, {"buy_k": 0.3})
+        assert sorted(asked) == [
+            ("AAPL", "highlow", "2026-06-15"), ("AAPL", "highlow", "2026-06-22"),
+        ]
+        assert list(found["days"]) == ["2026-06-15"]
+        assert found["overlay"] == "highlow_range"
+        assert found["notes"] == [
+            "No predicted range for 1 session(s) — 2026-06-22: no opening minutes"
+        ]
+
+    def test_the_box_runs_from_the_predicted_low_to_the_high(self, monkeypatch):
+        from simlab import app as sim_app
+
+        monkeypatch.setattr(
+            sim_app, "_tuning_session_bars",
+            lambda sym, feed, days: {d: {"o": 204.0, "h": 211.0, "l": 201.0, "c": 206.0}
+                                     for d in days},
+        )
+        forecasts = {
+            "days": {"2026-06-15": {"high": 210.0, "low": 200.0, "made_at": "09:34"}},
+            "overlay": "highlow_range", "notes": [],
+        }
+        fig = sim_app._tuning_daily_chart(self.record(), forecasts=forecasts)
+        [box] = [t for t in fig.data if t.name == "Predicted day range (HighLow)"]
+        assert (list(box.x), list(box.base), list(box.y)) == (["2026-06-15"], [200.0], [10.0])
+        assert box.yaxis == "y2"
+        assert "actual 201.00 – 211.00" in box.customdata[0]
+        # Under the candles, which are drawn over it.
+        names = [t.name for t in fig.data]
+        assert names.index(box.name) < names.index("AAPL daily")
 
 
 # --- scoring ----------------------------------------------------------------
