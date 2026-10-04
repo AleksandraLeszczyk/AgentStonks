@@ -269,12 +269,13 @@ class TestValidation:
     def test_a_sound_spec_passes(self):
         assert tu.validate(spec()) is None
 
-    def test_at_most_two_parameters(self):
+    def test_at_most_three_parameters(self):
         axes = [
-            {"name": n, "values": [1.0]}
-            for n in ("buy_k", "sell_k", "stop_gain_fraction")
+            {"name": n, "values": [0.5]}
+            for n in ("buy_k", "sell_k", "stop_gain_fraction", "take_fraction")
         ]
-        assert "one or two" in tu.validate(spec(axes=axes))
+        assert "one to 3" in tu.validate(spec(axes=axes))
+        assert tu.validate(spec(axes=axes[:3])) is None
 
     def test_the_same_parameter_twice_is_refused(self):
         axes = [{"name": "buy_k", "values": [0.5]}, {"name": "buy_k", "values": [0.7]}]
@@ -524,6 +525,140 @@ class TestSum:
         record = job_record({"w1": [scored({"buy_k": 0.3}, 1.0)], "w2": []})
         record["baseline"]["w2"] = None
         assert tu.missing_replays(record) == 1 + 3
+
+
+# --- a third axis -----------------------------------------------------------
+
+
+AXES3 = [{"name": "buy_k", "values": [0.3, 0.5]},
+         {"name": "sell_k", "values": [0.1, 0.2]},
+         {"name": "take_fraction", "values": [0.5, 0.75, 1.0]}]
+
+
+def cells3(profits: dict) -> "list[dict]":
+    """A 2x2x3 grid from {(buy, sell, take): profit}; None is a refused cell."""
+    out = []
+    for overrides in tu.grid(AXES3):
+        profit = profits[tuple(overrides.values())]
+        if profit is None:
+            out.append({"overrides": overrides, "invalid": "refused"})
+        else:
+            out.append(scored(overrides, profit, traded=profit % 5))
+    return out
+
+
+class TestThirdAxis:
+    """A three-axis grid drawn as a heatmap of its first two: one value of the
+    third at a time, or the third collapsed to each square's best or average."""
+
+    PROFITS = {
+        (0.3, 0.1, 0.5): 100, (0.3, 0.1, 0.75): 400, (0.3, 0.1, 1.0): 100,
+        (0.3, 0.2, 0.5): -60, (0.3, 0.2, 0.75): -30, (0.3, 0.2, 1.0): -90,
+        (0.5, 0.1, 0.5): 50, (0.5, 0.1, 0.75): 50, (0.5, 0.1, 1.0): 20,
+        (0.5, 0.2, 0.5): None, (0.5, 0.2, 0.75): 70, (0.5, 0.2, 1.0): 10,
+    }
+
+    def by_square(self, view, cells=None) -> dict:
+        out = tu.slice_cells(cells or cells3(self.PROFITS), AXES3, view)
+        return {(c["overrides"]["buy_k"], c["overrides"]["sell_k"]): c for c in out}
+
+    def test_a_slice_is_the_grid_at_one_value_of_the_third(self):
+        found = self.by_square(1)
+        assert {k: c["profit"] for k, c in found.items()} == {
+            (0.3, 0.1): 400, (0.3, 0.2): -30, (0.5, 0.1): 50, (0.5, 0.2): 70,
+        }
+        # Only the first two axes are left, so it draws as any two-axis grid.
+        assert all(set(c["overrides"]) == {"buy_k", "sell_k"} for c in found.values())
+
+    def test_a_refused_cell_stays_refused_on_its_slice(self):
+        assert "invalid" in self.by_square(0)[(0.5, 0.2)]
+
+    def test_best_takes_each_squares_best_value_and_names_it(self):
+        found = self.by_square(tu.SLICE_BEST)
+        assert {k: c["profit"] for k, c in found.items()} == {
+            (0.3, 0.1): 400, (0.3, 0.2): -30, (0.5, 0.1): 50, (0.5, 0.2): 70,
+        }
+        assert found[(0.3, 0.1)]["best_of"] == {
+            "name": "take_fraction", "value": 0.75, "count": 3,
+        }
+        # The winning cell as it is, not a re-scored one.
+        assert found[(0.3, 0.1)]["days_traded"] == 400 % 5
+
+    def test_best_ties_go_to_the_earlier_value(self):
+        assert self.by_square(tu.SLICE_BEST)[(0.5, 0.1)]["best_of"]["value"] == 0.5
+
+    def test_best_skips_a_refused_value(self):
+        assert self.by_square(tu.SLICE_BEST)[(0.5, 0.2)]["best_of"]["count"] == 2
+
+    def test_the_average_is_over_every_value_the_configuration_accepts(self):
+        found = self.by_square(tu.SLICE_MEAN)
+        assert found[(0.3, 0.1)]["profit"] == pytest.approx(200.0)
+        assert found[(0.3, 0.1)]["return_pct"] == pytest.approx(2.0)
+        assert found[(0.3, 0.1)]["mean_of"] == {
+            "name": "take_fraction", "count": 3, "of": 3, "low": 100.0, "high": 400.0,
+        }
+        # The refused value is left out, not counted as zero.
+        assert found[(0.5, 0.2)]["profit"] == pytest.approx(40.0)
+        assert (found[(0.5, 0.2)]["mean_of"]["count"], found[(0.5, 0.2)]["mean_of"]["of"]) == (2, 3)
+        assert all(tu.is_scored(c) for c in found.values())
+
+    def test_a_square_collapses_only_once_every_value_is_in(self):
+        """The best or the average of the values swept so far would read as a
+        finished square."""
+        cells = [c for c in cells3(self.PROFITS)
+                 if c["overrides"] != {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0}]
+        for view in (tu.SLICE_BEST, tu.SLICE_MEAN):
+            found = self.by_square(view, cells)
+            assert (0.3, 0.1) not in found and len(found) == 3
+        # A slice that does not need the missing cell is unaffected.
+        assert (0.3, 0.1) in self.by_square(0, cells)
+
+    def test_a_square_with_every_value_refused_is_refused(self):
+        profits = {**self.PROFITS, (0.5, 0.2, 0.75): None, (0.5, 0.2, 1.0): None}
+        for view in (tu.SLICE_BEST, tu.SLICE_MEAN):
+            found = self.by_square(view, cells3(profits))
+            assert found[(0.5, 0.2)] == {"overrides": {"buy_k": 0.5, "sell_k": 0.2},
+                                         "invalid": "refused"}
+
+    def test_an_errored_square_with_nothing_scored_is_errored(self):
+        cells = cells3({**self.PROFITS, (0.5, 0.2, 0.75): None, (0.5, 0.2, 1.0): 0})
+        for cell in cells:
+            if cell["overrides"] == {"buy_k": 0.5, "sell_k": 0.2, "take_fraction": 1.0}:
+                cell["error"] = "boom"
+        found = self.by_square(tu.SLICE_MEAN, cells)
+        assert found[(0.5, 0.2)]["error"] == "boom" and not tu.is_scored(found[(0.5, 0.2)])
+
+    def test_a_grid_of_two_axes_is_returned_as_it_is(self):
+        cells = cells_from(TestPick.PROFITS)
+        assert tu.slice_cells(cells, AXES, tu.SLICE_BEST) == cells
+
+    def test_the_sum_slices_like_any_grid(self):
+        """Best of all on the sum is each square's best *total*, which need not
+        be either dataset's own best."""
+        w1 = cells3(self.PROFITS)
+        w2 = [
+            {**c, "profit": -c["profit"] + (500 if c["overrides"]["take_fraction"] == 1.0 else 0)}
+            if tu.is_scored(c) else c
+            for c in cells3(self.PROFITS)
+        ]
+        record = job_record({"w1": w1, "w2": w2}, axes=AXES3)
+        found = {
+            (c["overrides"]["buy_k"], c["overrides"]["sell_k"]): c
+            for c in tu.slice_cells(tu.summed_cells(record), AXES3, tu.SLICE_BEST)
+        }
+        assert found[(0.3, 0.1)]["best_of"]["value"] == 1.0
+        assert found[(0.3, 0.1)]["profit"] == 500.0
+        assert found[(0.3, 0.1)]["datasets"] == 2
+
+    def test_the_pick_reads_a_plateau_along_all_three_axes(self):
+        """On a 2x2 every square neighbours every other, so the plateau is
+        decided along the third axis: take 0.5's neighbourhood (itself and
+        0.75, the refused cell left out) averages best, and the first of its
+        cells in grid order takes the tie -- not the 400 spike at 0.75."""
+        best = tu.pick_best(cells3(self.PROFITS), AXES3, rule=tu.PICK_PLATEAU)
+        assert best["overrides"] == {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 0.5}
+        assert best["pick_score"] == pytest.approx((100 - 60 + 50 + 400 - 30 + 50 + 70) / 7)
+        assert tu.pick_best(cells3(self.PROFITS), AXES3)["profit"] == 400
 
 
 # --- scoring ----------------------------------------------------------------

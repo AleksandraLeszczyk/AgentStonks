@@ -41,7 +41,9 @@ which is what the Tuning tab's progress bar reads. The worker replays whatever
 the record has no answer for yet, which is what makes adding a dataset or
 resuming a stopped job the same operation as running a new one.
 
-Up to two parameters are tuned at once -- two is what a heatmap can show. Every
+Up to three parameters are tuned at once. Two is what a heatmap can show, so a
+third is shown over the first two's heatmap one value at a time, or collapsed
+square by square to its best value or its average (`slice_cells`). Every
 other field comes from the base configuration. A combination the config refuses
 (a sell level at or under the buy level, a take fraction of 0) is recorded as
 an *invalid* cell rather than replayed or silently dropped, so the heatmap
@@ -100,8 +102,9 @@ BASELINE = "baseline"
 #: What the pick is chosen on: the total profit over every dataset of a job.
 PICK_METRIC = "profit"
 
-# How many parameters one job sweeps: two is what a heatmap can show.
-MAX_AXES = 2
+# How many parameters one job sweeps. A heatmap shows two; a third is shown a
+# slice at a time over them, or collapsed (`slice_cells`).
+MAX_AXES = 3
 # A guard against a slip of the step size queueing hours of replays.
 MAX_CELLS = 400
 # The same guard for the Simulate tab's per-setup sweep, and much lower for a
@@ -1187,7 +1190,8 @@ def pick_best(
 
     `PICK_MAX` takes the highest metric. `PICK_PLATEAU` takes the cell whose
     neighbourhood -- itself and every adjacent cell on the grid, diagonals
-    included -- scores best on average, which is how `sweep_levels.py` chose
+    included, along every axis (up to 27 cells on a three-axis grid) --
+    scores best on average, which is how `sweep_levels.py` chose
     the shipped defaults: the middle of a profitable region rather than its
     sharpest point, which on a few sessions is usually a fluke.
 
@@ -1232,6 +1236,92 @@ def pick_best(
 def overlapping_days(first: "list[str]", second: "list[str]") -> "list[str]":
     """Sessions two datasets share -- summed, those sessions count twice."""
     return sorted(set(first) & set(second))
+
+
+# --- a third axis -----------------------------------------------------------
+#
+# A heatmap shows two parameters. A job may sweep a third, and every view of
+# it is still a heatmap over the first two: the grid at one value of the third,
+# or the third collapsed square by square -- its best value there, or the
+# average over all of its values.
+
+#: Each square at whichever value of the third parameter scores best there.
+SLICE_BEST = "best"
+#: Each square averaged over every value of the third parameter.
+SLICE_MEAN = "mean"
+
+
+def slice_cells(
+    cells: "list[dict]", axes: "list[dict]", view, metric: str = PICK_METRIC
+) -> "list[dict]":
+    """A three-axis grid's cells as a grid over its first two axes.
+
+    `view` is an index into the third axis's values -- the grid at that value
+    -- or one of `SLICE_BEST` / `SLICE_MEAN`, which collapse the third axis:
+
+    * best: each square's cell with the highest `metric` over the third axis,
+      as it is, with `best_of` naming the value it won at. Ties go to the
+      earlier value. No minimum share of days traded applies: this is a
+      picture of the surface, not the pick.
+    * mean: `metric`, the return and the days traded averaged over the values
+      of the third the configuration accepts, with `mean_of` saying how many
+      that was out of how many, and the lowest and highest `metric` among them.
+
+    A square collapses only once every value of the third has an answer, for
+    the reason `combine` waits for every dataset: the best or the average of
+    three values out of five would read as a finished square. A square whose
+    every value is refused is refused; one with nothing scored and a replay
+    that errored is errored.
+
+    The cells come back with only the first two axes in their overrides, so
+    they draw as any two-axis grid. A grid of fewer than three axes is
+    returned as it is.
+    """
+    if len(axes) < 3:
+        return list(cells)
+    name, values = axes[2]["name"], axes[2]["values"]
+    by_key = {overrides_key(c["overrides"]): c for c in cells}
+    out: "list[dict]" = []
+    for overrides in grid(axes[:2]):
+        parts = [by_key.get(overrides_key({**overrides, name: v})) for v in values]
+        if view not in (SLICE_BEST, SLICE_MEAN):
+            cell = parts[int(view)]
+            if cell is not None:
+                out.append({**cell, "overrides": dict(overrides)})
+            continue
+        if any(p is None for p in parts):
+            continue
+        scored = [(v, p) for v, p in zip(values, parts) if is_scored(p)]
+        if not scored:
+            errored = next((p for p in parts if "invalid" not in p), None)
+            out.append(
+                {"overrides": dict(overrides), "invalid": parts[0]["invalid"]}
+                if errored is None
+                else {"overrides": dict(overrides), "error": errored.get("error") or "no score"}
+            )
+            continue
+        if view == SLICE_BEST:
+            value, winner = max(scored, key=lambda vp: float(vp[1][metric]))
+            out.append({
+                **winner, "overrides": dict(overrides),
+                "best_of": {"name": name, "value": value, "count": len(scored)},
+            })
+            continue
+        mean = lambda field: sum(float(p.get(field) or 0) for _, p in scored) / len(scored)  # noqa: E731
+        found = [float(p[metric]) for _, p in scored]
+        out.append({
+            "overrides": dict(overrides),
+            "return_pct": round(mean("return_pct"), 4),
+            metric: round(mean(metric), 2),
+            "days": scored[0][1].get("days") or 0,
+            "days_traded": round(mean("days_traded"), 1),
+            "error": None,
+            "mean_of": {
+                "name": name, "count": len(scored), "of": len(values),
+                "low": min(found), "high": max(found),
+            },
+        })
+    return out
 
 
 # --- the sum over datasets --------------------------------------------------
@@ -1489,7 +1579,7 @@ def validate(spec: dict) -> "str | None":
     """Why this job cannot run, or None."""
     axes = spec.get("axes") or []
     if not 1 <= len(axes) <= MAX_AXES:
-        return f"Pick one or two parameters to tune (got {len(axes)})."
+        return f"Pick one to {MAX_AXES} parameters to tune (got {len(axes)})."
     if len({a["name"] for a in axes}) != len(axes):
         return "The same parameter is tuned twice."
     for axis in axes:
