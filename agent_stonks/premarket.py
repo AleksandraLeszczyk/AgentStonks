@@ -12,9 +12,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from . import clock
+from . import event_days
 from . import finnhub_rest
 from . import market_hours
 from . import observability as obs
@@ -50,7 +51,18 @@ class TechnicalLevel(BaseModel):
     note: str
 
 
+def _schema_without_defaults(schema: dict, _model) -> None:
+    """Drop the `default`s from the schema the model is shown. The defaults are
+    for briefings parsed in Python (tests, ones written before a field
+    existed); the structured-output schema asks for every field anyway, and
+    a `default` in it is a keyword not every provider accepts."""
+    for prop in (schema.get("properties") or {}).values():
+        prop.pop("default", None)
+
+
 class PremarketBriefing(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_schema_without_defaults)
+
     overall_bias: Literal["bullish", "bearish", "neutral"]
     confidence: Literal["high", "medium", "low"]
     summary: str
@@ -59,6 +71,13 @@ class PremarketBriefing(BaseModel):
     risk_factors: list[str]
     macro_context: str
     key_levels_to_watch: list[str]
+    # Whether news known before today's open makes it a market-wide shock day,
+    # the kind whose range the news sets on its own: "geo" (war, strikes,
+    # tariffs, sanctions) or "market" (an unscheduled crash that is not
+    # geopolitical). Apple Trader sits those sessions out (`event_days`), and
+    # this is the only thing that says a morning from here on is one.
+    shock: Literal["none", "geo", "market"] = "none"
+    shock_reason: str = ""
 
 
 _SYSTEM_BASE = """\
@@ -119,6 +138,20 @@ Your job:
 5. List 2-4 tail risks that could invalidate the thesis.
 6. Provide 1-2 sentences of macro context (SPY trend + VIX regime).
 7. List 2-3 things to watch during the session as actionable cues.
+8. Say whether today is a SHOCK DAY (`shock`, with one sentence of why in
+   `shock_reason`): news that broke before today's open and is extraordinary and
+   market-wide enough to set the whole session's range by itself.
+   - "geo": a war, military strikes or an attack involving a major power or an oil
+     route, or tariffs, sanctions or export controls announced, escalated, paused
+     or taking effect -- e.g. strikes on Iran over the weekend, "Liberation Day"
+     tariffs announced after the close, a US-China tariff truce.
+   - "market": an unscheduled market-wide crash or scare that is not geopolitical
+     -- e.g. a yen carry-trade unwind with the Nikkei down double digits, a
+     sector-wide selloff like DeepSeek's, a US election result.
+   Everything else is "none" with an empty reason: company news and earnings,
+   scheduled data (CPI, jobs, the Fed), analyst moves, ordinary macro worries, and
+   ongoing stories with no fresh development since the last close. Most days are
+   "none"; when in doubt, "none".
 
 Be concise. If data is thin, lower confidence to "low" and say so in the summary.
 """
@@ -782,6 +815,8 @@ def briefing_to_prompt_text(briefing: PremarketBriefing, symbol: str) -> str:
         lines.append(f"  It said to watch: {'; '.join(briefing.key_levels_to_watch[:3])}")
     if briefing.macro_context:
         lines.append(f"  Macro read: {briefing.macro_context}")
+    if briefing.shock != "none":
+        lines.append(f"  Shock day ({briefing.shock}): {briefing.shock_reason}")
     return "\n".join(lines)
 
 
@@ -840,6 +875,7 @@ def generate_for_symbols(
         else:
             if briefing is not None:
                 app.premarket_briefings = {**app.premarket_briefings, sym: briefing}
+                _record_shock_verdict(sym, briefing, phase)
             else:
                 app.premarket_errors = {
                     **app.premarket_errors, sym: "the model returned no briefing"
@@ -853,6 +889,22 @@ def generate_for_symbols(
         if done
         else "Briefing failed"
     )
+
+
+def _record_shock_verdict(symbol: str, briefing: PremarketBriefing, phase: str) -> None:
+    """Keep the briefing's shock verdict for today's session (`event_days`),
+    which is what Apple Trader decides to sit a session out on. Only a briefing
+    about today's session counts -- one written after the close or over the
+    weekend is about the next one. Never raises: a verdict that cannot be kept
+    leaves the calendar to decide, and must not cost the briefing."""
+    if phase not in ("premarket", "open"):
+        return
+    try:
+        event_days.record_verdict(
+            symbol, briefing.shock, briefing.shock_reason, datetime.now(timezone.utc),
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def launch_premarket_analysis(

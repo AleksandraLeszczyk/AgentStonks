@@ -71,6 +71,18 @@ def _net_gamma_in_tmp(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _days_off_hermetic(monkeypatch, tmp_path):
+    """Keep the days-off check (`event_days`) off Yahoo's earnings dates and
+    out of the real data/event_days/: no report on record, no briefing
+    verdict kept. The calendar file is read as shipped. Tests of the check
+    patch these back in themselves."""
+    from agent_stonks import event_days
+
+    monkeypatch.setattr(event_days, "fetch_earnings_stamps", lambda *a, **k: [])
+    monkeypatch.setattr(event_days, "VERDICTS_DIR", tmp_path / "event_days" / "verdicts")
+
+
+@pytest.fixture(autouse=True)
 def _last_setup_in_tmp(monkeypatch, tmp_path):
     """Keep the dashboard's remembered setup out of the real
     data/last_setup.json."""

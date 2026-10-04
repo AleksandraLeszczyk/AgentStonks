@@ -272,13 +272,19 @@ def earnings_in_window(
     A report after yesterday's bell gaps today's open; one before today's is
     the same day seen from the other side; one after today's bell is a
     position nobody holds over it, since every pair flattens before the close.
+
+    The window is closed at the previous bell and open at today's: Yahoo stamps
+    an after-the-close report at 16:00 exactly (every AAPL, INTC, MU and BE
+    report on record is), and such a report is the *next* session's news.
+    Until 2026-10-04 it ran the other way, which sat out the report day and
+    traded the reaction day.
     """
     prev_day = prev_day or (day - timedelta(days=3 if day.weekday() == 0 else 1))
     start = datetime.combine(prev_day, time(16, 0), tzinfo=MARKET_TZ)
     end = datetime.combine(day, time(16, 0), tzinfo=MARKET_TZ)
     for stamp in sorted(pd.Timestamp(s) for s in stamps):
         stamp = stamp.tz_localize(MARKET_TZ) if stamp.tzinfo is None else stamp.tz_convert(MARKET_TZ)
-        if start < stamp.to_pydatetime() <= end:
+        if start <= stamp.to_pydatetime() < end:
             return stamp.strftime("%Y-%m-%d %H:%M ET")
     return None
 

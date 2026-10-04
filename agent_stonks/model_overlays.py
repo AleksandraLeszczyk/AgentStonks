@@ -93,7 +93,8 @@ import numpy as np
 import pandas as pd
 
 from . import (
-    apple_models, historical, intraday_vol_model, market_hours, momentum_regime, profile_model,
+    apple_models, event_days, historical, intraday_vol_model, market_hours, momentum_regime,
+    profile_model,
 )
 from .config import MODEL_OVERLAY_COLORS
 
@@ -616,6 +617,9 @@ def compute(
                 symbol, session, day, open_price, _recorded_result(rows), config,
                 levels=rows,
             )
+        sat_out = _sat_out(symbol, day, trader_config)
+        if sat_out:
+            return [], sat_out
         return _trader_levels_items(
             symbol, session, day, open_price, trader_forecast(), trader_config
         )
@@ -1081,6 +1085,30 @@ def trader_model(config, symbol: str) -> str:
     if apple_models.covers(apple_models.DEFAULT_MODEL, symbol):
         return apple_models.DEFAULT_MODEL
     return next(iter(apple_models.keys_for(symbol)), apple_models.DEFAULT_MODEL)
+
+
+def _sat_out(symbol: str, day: pd.Timestamp, config=None) -> "str | None":
+    """Why the configured agent rests nothing on this session, when its
+    days-off rule sits it out (`event_days`) -- the note drawn in place of
+    levels it would never have rested. Asked before the forecast, which such a
+    session never needs. None when it trades, or when the check cannot be read
+    (the walk is drawn then, as before the rule)."""
+    from .apple_trader import AppleTraderConfig  # heavy-ish, and only here
+
+    if config is None or (config.ticker or "").upper() != symbol:
+        config = AppleTraderConfig(ticker=symbol, model_key=trader_model(None, symbol))
+    if not config.skip_events:
+        return None
+    try:
+        found = event_days.check(symbol, pd.Timestamp(day).date(), config.skip_events)
+    except Exception:  # a decoration must never take the chart down
+        return None
+    if not found.events:
+        return None
+    return (
+        f"{OVERLAYS[TRADER_LEVELS_KEY].label}: the agent sits this session out — "
+        f"{event_days.sit_out_phrase(found.events)}."
+    )
 
 
 def _trader_levels_items(

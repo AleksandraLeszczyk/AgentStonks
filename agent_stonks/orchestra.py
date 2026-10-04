@@ -53,7 +53,7 @@ import threading
 from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Optional
 
-from . import apple_models, candidates, market_hours, momentum_regime, rule_agent
+from . import apple_models, candidates, event_days, market_hours, momentum_regime, rule_agent
 from . import apple_trader as at
 from .agent import stop_agent
 from .apple_trader import AppleTraderConfig, TraderSlot
@@ -542,6 +542,10 @@ class Orchestra:
                 status = f"sits out today ({self.benched[racer.key]})"
             elif self.selection is not None and self._selected_day != self._day:
                 status = "waiting for 09:34"
+            elif (trader.blocked or {}).get("sit_out"):
+                status = "sits out today (" + ", ".join(
+                    event_days.LABELS[c] for c in trader.blocked["sit_out"]
+                ) + ")"
             elif trader.blocked is not None:
                 status = "cannot forecast"
             elif not plan:

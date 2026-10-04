@@ -556,6 +556,13 @@ def score(result, days: "list[date]") -> dict:
         for e in result.agent_log
         if e.get("type") == "error" and "cannot forecast" in str(e.get("text", ""))
     }
+    # Sessions the days-off rule sat out (`DayRangeTrader._sit_out`): not
+    # traded by choice, which is not the same as not forecast.
+    sat_out = {
+        datetime.fromisoformat(str(e["ts"])).astimezone(MARKET_TZ).date().isoformat()
+        for e in result.agent_log
+        if e.get("type") == "analysis" and "sits out" in str(e.get("text", ""))
+    }
     profits = list(daily.values())
     profit = float(result.final_value) - float(result.starting_cash)
     round_trips, wins = _round_trips(fills, float(result.starting_cash))
@@ -575,6 +582,7 @@ def score(result, days: "list[date]") -> dict:
         "best_day": max(profits) if profits else 0.0,
         "daily": daily,
         "no_forecast_days": sorted(no_forecast),
+        "sat_out_days": sorted(sat_out),
         "error": result.error,
     }
 
@@ -688,9 +696,14 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
     dataset, and refreshing them changes what the day-range model forecasts for
     sessions that were downloaded months ago -- which moves both levels, and so
     every fill.
+
+    A run with days off (`skip_events`) also reads the days-off calendar, the
+    symbol's kept earnings dates and the briefing verdicts of its own sessions
+    (`event_days`): a row added to the calendar can take a session out of it.
     """
     from . import data as sim_data
-    from agent_stonks import apple_models
+    from .session_context import EARNINGS_DIR
+    from agent_stonks import apple_models, event_days
 
     symbol = config.ticker.upper()
     paths = [sim_data.market_path(), sim_data.stored_daily_path(symbol, feed)]
@@ -704,6 +717,9 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
             paths.append(sim_data.stored_bars_path(symbol, prior, feed))
     bundle = apple_models.get(config.model_key).path(symbol)
     paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
+    if config.skip_events:
+        paths += [event_days.CALENDAR_PATH, EARNINGS_DIR / f"{symbol}.json"]
+        paths += [event_days.verdicts_path(date.fromisoformat(str(d)[:10])) for d in days or ()]
     return paths
 
 

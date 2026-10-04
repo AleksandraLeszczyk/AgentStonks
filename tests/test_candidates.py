@@ -121,6 +121,10 @@ class TestTheFacts:
         ("2026-09-15 07:00-04:00", True),    # before today's open
         ("2026-09-15 16:30-04:00", False),   # after today's close: flat by then
         ("2026-09-14 08:00-04:00", False),   # yesterday's morning: already traded
+        # Yahoo's stamp for an after-the-close report is 16:00 sharp: the next
+        # session's news, not the report day's.
+        ("2026-09-14 16:00-04:00", True),
+        ("2026-09-15 16:00-04:00", False),
     ])
     def test_the_earnings_window(self, stamp, counts):
         found = cd.earnings_in_window([pd.Timestamp(stamp)], date(2026, 9, 15), date(2026, 9, 14))

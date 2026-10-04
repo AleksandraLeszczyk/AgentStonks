@@ -1678,6 +1678,10 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- 0 switches the stop or the take off. With both off a run files beside the "
             "records made before the exit existed, which replay that way."
         ),
+        "dayrange_skip": (
+            "Sessions the replay does not trade: no forecast, no order. In the signature as "
+            "`skip=...`; a record from before the rule replays with none."
+        ),
         "dayrange_breaker": (
             "When to stop for the day.\n\n"
             "- Its own axis on the Tuning tab, and worth one: it changes how many trades "
@@ -1695,6 +1699,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the Tuning tab.\n\n"
             "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY "
             "/ ALPACA_SECRET), cached under `data/highlow/` — the first replay fetches it."
+        ),
+        "skip_events": (
+            "What a replay can know of each, as of that morning:\n\n"
+            "- **Day after earnings** — Yahoo's earnings dates, kept under "
+            "`data/simlab/session_context/` like the Orchestra selection's.\n"
+            "- **CPI**, **jobs report** — the calendar (`agent_stonks/calendars/shock_days.csv`).\n"
+            "- **Market / geopolitical shock** — the calendar's hand-marked rows (to 25 Sep "
+            "2026, only those known before the open), then the shock flags the live app's "
+            "pre-market briefings recorded before 09:35. A day after the calendar that the "
+            "live app never briefed counts as an ordinary day."
         ),
         "model_highlow2": (
             "The day-range rules on HighLow2's predicted high and range. No distances were "
@@ -4316,6 +4330,13 @@ def _render_tuning_notes(job: dict) -> None:
                 f"{len(missing)} of {base['days']} sessions ({', '.join(missing)}), so no "
                 "configuration traded them. The usual cause is too little daily history "
                 "before the dataset's first day."
+            )
+        sat_out = (base or {}).get("sat_out_days") or []
+        if sat_out:
+            st.caption(
+                f":material/event_busy: On `{name}` the base configuration sat out "
+                f"{len(sat_out)} of {base['days']} sessions ({', '.join(sat_out)}) under its "
+                "days-off rule — the day after earnings, a CPI or jobs release, or a shock."
             )
     reused = 0 if sim_tuning.is_derived(job) else sim_tuning.reused_count(job)
     if reused:

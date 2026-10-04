@@ -245,6 +245,10 @@ _APPLE_LEGACY = {
     # reached the level even when that was above it (before 2026-09-30). False
     # is that rule, and it is left out of the signature.
     "limit_entry": False,
+    # And no session was sat out for an earnings report, a CPI or jobs release
+    # or a shock (before 2026-10-04). Empty is that rule, and it is left out of
+    # the signature.
+    "skip_events": (),
 }
 
 

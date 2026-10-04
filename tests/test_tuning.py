@@ -574,9 +574,33 @@ class TestScore:
         assert scored["profit"] == 150.0 and scored["return_pct"] == pytest.approx(1.5)
         assert scored["no_forecast_days"] == ["2026-06-16"]
 
+    def test_a_session_sat_out_is_named_apart_from_one_not_forecast(self):
+        result = self.result()
+        result.agent_log.append({
+            "type": "analysis", "ts": et(TUNE_DAY, "09:35"),
+            "text": "Apple Trader sits out AAPL's session today — CPI release (...).",
+        })
+        scored = tu.score(result, [TUNE_DAY, TEST_DAY])
+        assert scored["sat_out_days"] == ["2026-06-15"]
+        assert scored["no_forecast_days"] == ["2026-06-16"]
+
     def test_fills_without_cash_or_position_leave_round_trips_uncounted(self):
         scored = tu.score(self.result(), [TUNE_DAY, TEST_DAY])
         assert scored["round_trips"] is None and tu.win_rate(scored) is None
+
+
+class TestReplayInputs:
+    def test_days_off_make_a_run_read_the_calendar_and_its_own_days_verdicts(self):
+        from agent_stonks import event_days
+
+        days = [str(TUNE_DAY), str(TEST_DAY)]
+        with_days = tu._replay_inputs(AppleTraderConfig(ticker=TICKER), days, "yfinance")
+        without = tu._replay_inputs(AppleTraderConfig(ticker=TICKER, skip_events=()), days, "yfinance")
+        added = set(with_days) - set(without)
+        assert event_days.CALENDAR_PATH in added
+        assert {event_days.verdicts_path(TUNE_DAY), event_days.verdicts_path(TEST_DAY)} <= added
+        # Only its own sessions': a verdict written this morning stales no old run.
+        assert event_days.verdicts_path(date(2026, 10, 5)) not in added
 
 
 class TestRoundTrips:
@@ -790,10 +814,11 @@ class TestJob:
         # The managed exit and the momentum confirmation off, so the grid is
         # about the two levels alone (the tape dives straight to the deeper
         # level), and the ADR unit because the tape below and the numbers
-        # asserted on it are that arithmetic.
+        # asserted on it are that arithmetic. No days off: TUNE_DAY is a
+        # geopolitical-shock day in the calendar, which a default run sits out.
         base = AppleTraderConfig(ticker=TICKER, buy_k=0.75, sell_k=0.10,
                                  stop_gain_fraction=0.0, momentum_confirmation_bars=0,
-                                 level_unit=UNIT_ADR)
+                                 level_unit=UNIT_ADR, skip_events=())
         return spec(
             base=asdict(base),
             axes=[{"name": "buy_k", "values": [0.5, 0.75, 1.0]},

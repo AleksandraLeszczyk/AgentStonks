@@ -7,7 +7,7 @@ depending on the saved artifact or on live market data.
 
 import threading
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import pytest
@@ -215,7 +215,12 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     `limit_entry` is pinned off, the market buy: most tests here enter on a bar
     that dipped to the level and closed above it, filling at the close, which
     a limit at the level refuses. `TestLimitEntry` is where it is switched on.
+
+    `skip_events` is pinned empty: the notebook trades every session, and the
+    days-off calendar would otherwise decide which of these tests' dates trade.
+    `TestDaysOff` is where it is switched on.
     """
+    kwargs.setdefault("skip_events", ())
     kwargs.setdefault("limit_entry", False)
     kwargs.setdefault("momentum_confirmation_bars", 0)
     kwargs.setdefault("take_after_minutes", 0)
@@ -1314,6 +1319,99 @@ class TestHighLow2Model(TestHighLowModel):
 
         assert caveats("highlow", TestHighLowModel.BUNDLE)
         assert caveats(self.KEY, self.BUNDLE) == []
+
+
+class TestDaysOff:
+    """A session the run sits out (`skip_events`, `event_days`) is never
+    forecast: no model is asked, no order rests, and the log and the status
+    line say which day it is. MIDSESSION, 2026-07-21, is an ordinary Tuesday;
+    the calendar's own days are pinned in `tests/test_event_days.py`."""
+
+    DAY = date(2026, 7, 21)
+
+    def _run(self, state, monkeypatch, bars: int = 1, **kwargs):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config(skip_events=at.event_days.CATEGORIES, **kwargs))
+        outcomes = []
+        for _ in range(bars):
+            tape.append(104.0, low=90.0)  # through the buy level every bar
+            outcomes.append(trader.run_cycle(DAYRANGE_BUNDLE, state, tracker))
+        return trader, tape, tracker, outcomes
+
+    def _flag(self, shock="geo", reason="US strikes on Iran overnight", hhmm="08:30"):
+        made = pd.Timestamp(f"{self.DAY} {hhmm}").tz_localize("America/New_York").to_pydatetime()
+        at.event_days.record_verdict(TICKER, shock, reason, made)
+
+    def test_a_flagged_shock_day_is_never_forecast_or_traded(self, state, market_open, monkeypatch):
+        self._flag()
+        trader, tape, tracker, outcomes = self._run(state, monkeypatch, bars=3)
+        assert outcomes == ["no_data"] * 3
+        assert tape.forecast_calls == 0 and tracker.position_for(TICKER) == 0
+        assert trader.blocked["sit_out"] == ["geo"]
+        lines = [e["text"] for e in state.agent_log if "sits out" in e.get("text", "")]
+        assert len(lines) == 1 and "US strikes on Iran overnight" in lines[0]
+        assert trader.activity("no_data", tracker) == (
+            at.rule_agent.WAITING, "Agent sits today out (Geopolitical shock)"
+        )
+
+    def test_a_calendar_day_needs_no_briefing(self, state, market_open, monkeypatch):
+        monkeypatch.setattr(at.event_days, "load_calendar", lambda *a, **k: [{
+            "date": str(self.DAY), "category": "cpi", "scope": "ALL",
+            "event": "BLS Consumer Price Index release, 08:30 ET", "source": "",
+        }])
+        trader, tape, _, outcomes = self._run(state, monkeypatch)
+        assert outcomes == ["no_data"] and tape.forecast_calls == 0
+        assert trader.blocked["sit_out"] == ["cpi"]
+
+    def test_an_ordinary_day_trades_and_says_what_it_could_not_check(self, state, market_open, monkeypatch):
+        self._flag(shock="none", reason="")
+        trader, tape, tracker, outcomes = self._run(state, monkeypatch)
+        assert tape.forecast_calls == 1 and trader.plan is not None
+        assert tracker.position_for(TICKER) > 0
+        assert not [e for e in state.agent_log if "Days-off check" in e.get("text", "")]
+
+    def test_a_briefing_still_being_written_is_waited_for_then_read(self, state, market_open, monkeypatch):
+        state.premarket_pending = [TICKER]
+        trader, tape, tracker, outcomes = self._run(state, monkeypatch, bars=2)
+        assert outcomes == ["warming_up"] * 2 and tape.forecast_calls == 0
+        waits = [e for e in state.agent_log if "Waiting for" in e.get("text", "")]
+        assert len(waits) == 1  # once, not every minute
+        self._flag()
+        state.premarket_pending = []
+        tape.append(104.0, low=90.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "no_data"
+        assert trader.blocked["sit_out"] == ["geo"] and tape.forecast_calls == 0
+
+    def test_a_briefing_that_never_lands_is_not_waited_for_all_day(self, state, market_open, monkeypatch):
+        state.premarket_pending = [TICKER]
+        trader, tape, _, outcomes = self._run(
+            state, monkeypatch, bars=at.BRIEFING_WAIT_BARS + 1,
+        )
+        assert outcomes[:at.BRIEFING_WAIT_BARS - 1] == ["warming_up"] * (at.BRIEFING_WAIT_BARS - 1)
+        assert tape.forecast_calls == 1 and trader.plan is not None
+
+    def test_with_no_days_off_nothing_is_checked(self, state, market_open, monkeypatch):
+        monkeypatch.setattr(at.event_days, "check", lambda *a, **k: pytest.fail("checked"))
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config())
+        tape.append(104.0, low=104.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert tape.forecast_calls == 1
+
+    def test_the_days_sign_the_run_and_an_old_record_has_none(self):
+        from simlab.rule_agents import _apple_from_record
+
+        sig = config_signature(AppleTraderConfig(skip_events=["geo", "earnings"]))
+        assert sig.endswith(",skip=earn+geo)")
+        assert ",skip=" not in config_signature(AppleTraderConfig(skip_events=()))
+        assert _apple_from_record({"model_key": "dayrange"}).skip_events == ()
+        assert AppleTraderConfig().skip_events == at.event_days.CATEGORIES
+
+    def test_an_unknown_day_is_refused(self):
+        with pytest.raises(ValueError, match="skip_events"):
+            AppleTraderConfig(skip_events=("fomc",))
 
 
 class TestIntradayLevelSource:

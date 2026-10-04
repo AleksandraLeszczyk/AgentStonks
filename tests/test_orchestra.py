@@ -131,6 +131,29 @@ def fills(tracker):
     return [(d.symbol, d.action, d.filled_quantity) for d in tracker.decisions if d.status == "filled"]
 
 
+class TestDaysOff:
+    def test_a_pair_sitting_the_day_out_leaves_the_race_to_the_rest(self, market_open, monkeypatch):
+        """Each racer checks its own symbol: a geo shock flagged in AAPL's
+        briefing benches AAPL's pair, and INTC's still races."""
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
+        state = make_state(["AAPL", "INTC"])
+        made = pd.Timestamp("2026-07-21 08:30", tz="America/New_York").to_pydatetime()
+        at.event_days.record_verdict("AAPL", "geo", "strikes", made)
+        at.event_days.record_verdict("INTC", "none", "", made)
+        days = at.event_days.CATEGORIES
+        race = make_race(racer("AAPL", skip_events=days), racer("INTC", skip_events=days))
+
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+
+        board = {row["key"]: row["status"] for row in state.orchestra["board"]}
+        assert board["AAPL:dayrange"] == "sits out today (Geopolitical shock)"
+        assert [f[:2] for f in fills(tracker)] == [("INTC", "buy")]
+
+
 class TestFirstFillTakesTheRace:
     def test_the_first_racer_to_fill_holds_and_the_rest_wait(self, market_open, monkeypatch):
         broker = Broker2()

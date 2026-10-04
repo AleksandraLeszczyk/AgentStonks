@@ -2480,6 +2480,11 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "the sell level or back at the fill), or the closing flatten. None of this is "
             "in the notebook's results."
         ),
+        "dayrange_skip": (
+            "Sessions the agent does not trade at all: no forecast, no order. The forecast "
+            "is built for an ordinary day, and on these the news sets the range — "
+            "HighLow2 was fitted with most of them left out."
+        ),
         "dayrange_breaker": (
             "When to stop buying for the day. Two things end it:\n\n"
             "- **A stop** — the day has not gone the way the forecast said.\n"
@@ -2501,6 +2506,18 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "not this one.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP minute history: the first "
             "run fetches it (tens of seconds) and caches it under `data/highlow/`."
+        ),
+        "skip_events": (
+            "Checked when the opening window closes, before the forecast.\n\n"
+            "- **Day after earnings** — the first session after the symbol's report "
+            "(Yahoo's earnings dates).\n"
+            "- **CPI release**, **Jobs report (NFP)** — BLS days, 08:30 ET, from "
+            "`agent_stonks/calendars/shock_days.csv`. BLS's dates run to December 2026; "
+            "add 2027's when they are published (the log says when they run out).\n"
+            "- **Market shock**, **Geopolitical shock** — flagged by the pre-market "
+            "briefing for the symbol (shown in red on the Pre-Market tab). Without a "
+            "briefing only the calendar can say so, and its shock rows end on 25 Sep 2026. "
+            "A briefing still being written at 9:35 is waited for up to 10 minutes."
         ),
         "model_highlow2": (
             "The day-range rules, unchanged, on HighLow2's predicted high and predicted "
@@ -3497,8 +3514,19 @@ def _premarket_briefing_html(
         f'</div>'
     )
 
-    # Macro
+    # Macro, after the shock flag when there is one: Apple Trader sits the
+    # session out on it (`event_days`), so it is the line to read first.
+    shock = getattr(briefing, "shock", "none")
+    shock_label = {"geo": "Geopolitical shock day", "market": "Market shock day"}.get(shock)
     macro = (
+        (
+            f'<div style="background:{PALETTE["panel"]};border:1px solid #f87171;'
+            f'border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px;'
+            f'color:{PALETTE["text"]};font-family:Inter,sans-serif;">'
+            f'⚡ <b>{shock_label}</b> — {html.escape(briefing.shock_reason or "flagged")}. '
+            f'Apple Trader sits such sessions out by default.</div>'
+        ) if shock_label else ""
+    ) + (
         f'<div style="background:{PALETTE["panel"]};border:1px solid {PALETTE["grid"]};'
         f'border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:12px;'
         f'color:{PALETTE["muted"]};font-family:Inter,sans-serif;">'

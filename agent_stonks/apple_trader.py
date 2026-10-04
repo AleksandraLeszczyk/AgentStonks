@@ -39,7 +39,7 @@ import pandas as pd
 from . import agent as agent_mod
 from . import state as state_mod
 from . import (
-    apple_models, bar_history, clock, historical, intraday_vol_model, market_hours,
+    apple_models, bar_history, clock, event_days, historical, intraday_vol_model, market_hours,
     momentum_regime, rule_agent,
 )
 from .agent import stop_agent
@@ -47,6 +47,7 @@ from .rule_agent import BaseTrader
 from .state import append_agent_log as _log
 from .config import (
     APPLE_TRADER_BREACH_UPDATE,
+    APPLE_TRADER_BRIEFING_WAIT_BARS as BRIEFING_WAIT_BARS,
     APPLE_TRADER_CONTAIN_RANGE,
     APPLE_TRADER_KEEP_WIDTH,
     APPLE_TRADER_BREACH_EXIT,
@@ -67,6 +68,7 @@ from .config import (
     MOMENTUM_NEUTRAL_FRACTION,
     APPLE_TRADER_SCALE_IN,
     APPLE_TRADER_SELL_K,
+    APPLE_TRADER_SKIP_EVENTS,
     APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
     APPLE_TRADER_TAKE_AFTER_MINUTES,
@@ -332,6 +334,12 @@ class AppleTraderConfig:
     # every new config since 2026-09-30; False, what every record made before
     # then replays as, is the market order.
     limit_entry: bool = True
+    # The sessions this run sits out -- `event_days.CATEGORIES`: the day after
+    # earnings, CPI and jobs-report days, market and geopolitical shocks. On
+    # such a day the agent makes no forecast and rests no order
+    # (`DayRangeTrader._sit_out`). Empty, what every record made before
+    # 2026-10-04 replays as, trades every session.
+    skip_events: "tuple[str, ...]" = APPLE_TRADER_SKIP_EVENTS
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -377,6 +385,9 @@ class AppleTraderConfig:
                 "and must be whole"
             )
         self.take_after_minutes = int(self.take_after_minutes)
+        # A tuple in canonical order, whatever a form (a list) or a JSON record
+        # handed over, so the same days always sign the same way.
+        self.skip_events = event_days.normalise(self.skip_events)
         # A streak of no bars would fire on the first bar in profit, which is
         # not "negative for long enough" but no rule at all.
         if self.negative_momentum_bars and self.negative_for_bars < 1:
@@ -785,6 +796,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         breach += ",contain"
     if c.breach_exit:
         breach += ",breach_exit"
+    # Only while some day is sat out, so every record written before the rule
+    # existed (which replays with none) keeps the signature it was filed under.
+    if c.skip_events:
+        breach += ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events)
     # Written only when the reference is *not* the one this model implies. For
     # "Day Range × Intraday Volatility" the model key already says it, and a
     # second token would be the same fact twice; for a record written when the
@@ -1283,6 +1298,9 @@ class DayRangeTrader(BaseTrader):
         # Why this bar did not sell at the sell level, for `run_cycle` to log
         # (`_exit` only returns what to sell).
         self._held_note: "str | None" = None
+        # The session `_sit_out` last wrote about, so its notes and its wait for
+        # the briefing are each logged once a day rather than every minute.
+        self._sit_out_noted: "dict" = {}
         # Set by a stop-out: the live loop stops the agent on it, and only a
         # fresh ▶ Start trades again. SimLab never reads it -- a replay has no
         # ▶ Start, so there the stand-down simply lasts the session.
@@ -1297,8 +1315,11 @@ class DayRangeTrader(BaseTrader):
         self.last_close: "float | None" = None
 
     def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
-        """The base's phrases, plus the two this strategy's day has: before the
-        forecast, and after a stand-down."""
+        """The base's phrases, plus the three this strategy's day has: before the
+        forecast, a session sat out, and after a stand-down."""
+        if outcome != rule_agent.CLOSED and (self.blocked or {}).get("sit_out"):
+            labels = ", ".join(event_days.LABELS[c] for c in self.blocked["sit_out"])
+            return rule_agent.WAITING, f"Agent sits today out ({labels})"
         if outcome == rule_agent.WARMING_UP and self.plan is None and self.blocked is None:
             return rule_agent.WAITING, "Agent waiting for the opening forecast"
         if (
@@ -1342,6 +1363,8 @@ class DayRangeTrader(BaseTrader):
         if self.plan is None:
             if self.blocked is not None:
                 return "no_data"
+            if len(frame) >= want and self._sit_out(state, frame, today, want):
+                return "no_data" if self.blocked is not None else "warming_up"
             if len(frame) < want:
                 _log(
                     state,
@@ -1463,6 +1486,59 @@ class DayRangeTrader(BaseTrader):
                 return "hold"
             return "bought" if self._buy(state, tracker, last) else "hold"
         return "hold"
+
+    def _sit_out(self, state: AppState, frame, today, want: int) -> bool:
+        """Whether this session is one the configuration sits out
+        (`skip_events`, see `event_days`) -- or, while the morning's briefing is
+        still being written, cannot say yet. True means no forecast this cycle;
+        a session sat out for good is recorded in `self.blocked`, like a
+        forecast that failed, and lasts until the next session.
+
+        Asked when the opening window has closed, the moment the forecast would
+        be made: by then the 09:25 briefing has normally landed. A briefing
+        still being written is waited for up to BRIEFING_WAIT_BARS bars, after
+        which the session trades on the calendar's word alone.
+        """
+        if not self.config.skip_events:
+            return False
+        noted = self._sit_out_noted if self._sit_out_noted.get("date") == today else {}
+        self._sit_out_noted = noted
+        noted["date"] = today
+        pending = self.ticker in (getattr(state, "premarket_pending", None) or [])
+        try:
+            found = event_days.check(self.ticker, today, self.config.skip_events, pending)
+        except Exception as exc:  # noqa: BLE001 -- a calendar read must not stop the day
+            if not noted.get("failed"):
+                noted["failed"] = True
+                _log(state, {"type": "error", "text": (
+                    f"Could not check whether today is a day to sit out ({exc}); trading it."
+                )})
+            return False
+        if found.waiting and len(frame) - want < BRIEFING_WAIT_BARS:
+            if not noted.get("waiting"):
+                noted["waiting"] = True
+                _log(state, {"type": "status", "text": (
+                    f"Waiting for {self.ticker}'s pre-market briefing to say whether today is a "
+                    "market or geopolitical shock before forecasting."
+                )})
+            return True
+        if found.events:
+            self.blocked = {
+                "date": today, "sit_out": found.categories,
+                "reason": f"sits the session out: {event_days.sit_out_phrase(found.events)}",
+            }
+            _log(state, {"type": "analysis", "text": (
+                f"Apple Trader sits out {self.ticker}'s session today — "
+                f"{event_days.sit_out_phrase(found.events)}. No forecast, no orders; the "
+                "forecast is not built for a day set by that news."
+            )})
+            return True
+        if found.notes and not noted.get("notes"):
+            noted["notes"] = True
+            _log(state, {"type": "status", "text": (
+                "Days-off check: " + "; ".join(found.notes) + "."
+            )})
+        return False
 
     def _roll_session(self, today) -> None:
         """Forget yesterday's forecast at the start of a new session."""

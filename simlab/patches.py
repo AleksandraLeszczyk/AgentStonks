@@ -28,6 +28,11 @@ duration of a simulation:
   stored daily bars for days that finished before the simulated one, plus
   the simulated day's own auction open, which is fixed at 9:30 and therefore
   point-in-time honest
+- ``event_days.fetch_earnings_stamps`` / ``briefing_verdict`` (the days-off
+  check) -> the earnings dates SimLab keeps (``session_context.earnings_dates``,
+  the Orchestra selection's copy), and only the briefing verdicts the live app
+  recorded before 09:35 on the replayed day -- what a run that morning could
+  have read; the calendar itself is a file and needs no patch
 - ``momentum_regime.minute_frame`` (not a fetch: a faster route to the same
   answer) -> today's frame sliced out of one frame per replayed day, instead
   of rebuilt from the bar buffer on every cycle. Same rows; it is what makes a
@@ -59,7 +64,7 @@ from typing import Iterator
 import pandas as pd
 
 from agent_stonks import agent as agent_mod
-from agent_stonks import clock, historical, momentum_regime
+from agent_stonks import clock, event_days, historical, momentum_regime
 from agent_stonks.market_hours import MARKET_TZ
 
 from .market import BAR_SEC, SimMarket
@@ -178,8 +183,18 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
         cutoff = pd.Timestamp(now - timedelta(seconds=BAR_SEC))
         return frame.iloc[: frame.index.searchsorted(cutoff, side="right")].copy()
 
+    def kept_earnings_stamps(ticker, day):
+        from .session_context import earnings_dates
+
+        return earnings_dates(ticker)
+
+    def verdict_before_the_open(symbol, day):
+        return event_days.recorded_verdict(symbol, day, before_cutoff=True)
+
     patches = [
         (momentum_regime, "minute_frame", fast_minute_frame),
+        (event_days, "fetch_earnings_stamps", kept_earnings_stamps),
+        (event_days, "briefing_verdict", verdict_before_the_open),
         (agent_mod, "fetch_bars_window", fake_bars_window),
         (agent_mod, "fetch_corporate_actions", fake_corporate_actions),
         (historical, "fetch_market_indicators", fake_market_indicators),

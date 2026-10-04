@@ -662,6 +662,23 @@ APPLE_TRADER_SCALE_IN = True
 # 0.85, 0.925... for a 0.40 buy -- what every SimLab record made before it
 # replays as (`simlab.rule_agents._APPLE_LEGACY`). Not swept.
 APPLE_TRADER_BUY_STEP_K = 0.1
+# The sessions Apple Trader sits out, on every model (`event_days`, since
+# 2026-10-04 at the user's call): the first session after the symbol's
+# earnings, BLS CPI and jobs-report days, and market or geopolitical shocks
+# known before the open. HighLow2_5m was fitted without the day after
+# earnings, jobs reports and geo shocks, and its notebook's trading week sits
+# them out; CPI days and market shocks are the user's additions. Read from the
+# calendar `agent_stonks/calendars/shock_days.csv` (the notebook's, plus BLS's
+# later dates), Yahoo's earnings dates and, for shocks from here on, the
+# pre-market briefing's flag. Not swept: nothing here says it helps the
+# day-range rules, only that the forecast is not built for those days. Every
+# SimLab record made before it replays with none (`_APPLE_LEGACY`).
+APPLE_TRADER_SKIP_EVENTS = ("earnings", "cpi", "nfp", "market_shock", "geo")
+# How many bars past the opening window a run waits for its symbol's pre-market
+# briefing -- still being written when the stream started just before the open
+# -- to say whether today is a shock. After that it forecasts on the calendar's
+# word alone (and says so).
+APPLE_TRADER_BRIEFING_WAIT_BARS = 10
 # No buy into a sharp fall (`apple_trader.DayRangeTrader._falling`), as it was
 # 2026-09-23 to -24 -- kept so the records made then replay. A new config
 # leaves it at 0: the momentum confirmation above decides entries now. An entry,

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from . import apple_models
+from . import apple_models, event_days
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for
 
 if TYPE_CHECKING:
@@ -72,7 +72,7 @@ class FormCopy:
     instrument_help: str
     model_help: str
     #: The `?` on each section heading: "dayrange" (the levels),
-    #: "dayrange_breach", "dayrange_exits", "dayrange_breaker".
+    #: "dayrange_breach", "dayrange_exits", "dayrange_breaker", "dayrange_skip".
     sections: "dict[str, str]" = field(default_factory=dict)
     #: Help text per knob, and per model as `model_<key>` -- the latter is
     #: appended to the model picker's own help for the model selected.
@@ -318,6 +318,7 @@ def rule_params(
     stop_gain_fraction, take_fraction, hold_min_gain_k, take_after_minutes = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
     )
+    skip_events = skip_param(defaults, copy)
     return {
         "breach_update": breach_update,
         "contain_range": contain_range,
@@ -326,7 +327,23 @@ def rule_params(
         "take_fraction": take_fraction,
         "take_after_minutes": take_after_minutes,
         "hold_min_gain_k": hold_min_gain_k,
+        "skip_events": skip_events,
     }
+
+
+def skip_param(defaults: AppleTraderConfig, copy: FormCopy) -> "tuple[str, ...]":
+    """The sessions the run sits out (`event_days`): no forecast and no order
+    on the day after earnings, a CPI or jobs release, or a shock."""
+    section("Days off", copy.sections.get("dayrange_skip"))
+    picked = st.multiselect(
+        "Sit out these sessions",
+        list(event_days.CATEGORIES),
+        default=list(defaults.skip_events),
+        format_func=lambda c: event_days.LABELS[c],
+        key=copy.key("skip_events"),
+        help=copy.help.get("skip_events"),
+    )
+    return tuple(picked)
 
 
 def min_win_param(

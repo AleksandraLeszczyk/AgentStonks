@@ -27,6 +27,17 @@ SESSION = "2026-08-07"
 SESSION_START = datetime(2026, 8, 7, 13, 25, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _no_days_off(monkeypatch, request):
+    """SESSION -- TimeToChange3's held-out day, which the recorded forecasts
+    here are pinned to -- is a jobs-report day, which every default
+    configuration sits out. These tests are about how levels are drawn, so the
+    calendar is emptied for them; `TestTraderLevelsOnDaysOff` reads it."""
+    if request.node.cls is not None and request.node.cls.__name__ == "TestTraderLevelsOnDaysOff":
+        return
+    monkeypatch.setattr(mo.event_days, "load_calendar", lambda *a, **k: [])
+
+
 def minute_bars(n=180, seed=7, base=200.0):
     """A session of 1-minute bars starting at the 09:30 open.
 
@@ -725,6 +736,25 @@ class TestTraderLevelsOverlay:
         orders, not a forecast of the day."""
         for key in apple_models.keys():
             assert mo.TRADER_LEVELS_KEY not in mo.for_models([key], "AAPL")["keys"]
+
+
+class TestTraderLevelsOnDaysOff:
+    """A session the agent sits out draws no levels, and says why -- not a walk
+    of orders it would never rest."""
+
+    def test_a_jobs_report_day_rests_nothing_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        out = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[],
+                         session_date=SESSION)
+        assert out["items"] == []
+        assert "sits this session out" in out["notes"][0] and "Jobs report" in out["notes"][0]
+
+    def test_a_run_that_trades_every_day_still_draws_its_levels(self, monkeypatch):
+        from agent_stonks.apple_trader import AppleTraderConfig
+
+        sat_out = mo._sat_out("AAPL", pd.Timestamp(SESSION), AppleTraderConfig(skip_events=()))
+        assert sat_out is None
+        assert mo._sat_out("AAPL", pd.Timestamp(SESSION), AppleTraderConfig(skip_events=("cpi",))) is None
 
 
 class TestRecordedTraderLevels:
