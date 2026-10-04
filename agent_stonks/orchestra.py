@@ -93,6 +93,7 @@ SHORT_MODEL_NAMES = {
     "dayrange": "Day Range",
     "dayrange_intraday": "Day Range × IV",
     "highlow": "HighLow",
+    "highlow2": "HighLow2",
 }
 
 

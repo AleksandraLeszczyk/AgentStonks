@@ -1696,6 +1696,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY "
             "/ ALPACA_SECRET), cached under `data/highlow/` — the first replay fetches it."
         ),
+        "model_highlow2": (
+            "The day-range rules on HighLow2's predicted high and range. No distances were "
+            "ever swept on it, so sweep them on the Tuning tab.\n\n"
+            "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
+            "minute history before each replayed day, and that morning's IEX opening and "
+            "pre-market (ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow2/` — "
+            "the first replay fetches it.\n"
+            "- Fitted without shock days, so a replay through earnings scores a forecast "
+            "of an ordinary day."
+        ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band, so the whole ladder "
             "descends through the morning and rises into the close.\n\n"

@@ -956,6 +956,52 @@ class TestHighLowOverlay:
         assert mo.HIGHLOW_RANGE_KEY not in mo.keys_for("GOOGL")
 
 
+class TestHighLow2Overlay:
+    """HighLow2's range is drawn like the other two, under its own key, and an
+    agent configured on it has its levels drawn under HighLow2's high."""
+
+    @pytest.fixture()
+    def stubbed(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        hl2 = pytest.importorskip("agent_stonks.highlow2_model")
+        seen = TestHighLowOverlay().stub_both(monkeypatch, highlow_high=206.0)
+        base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0}
+
+        def highlow2(bundle, ticker, opening, day, key=None, secret=None):
+            seen.append(("highlow2", key, secret))
+            return {**base, "pred_high": 204.0, "pred_low": 192.0}
+
+        monkeypatch.setattr(hl2, "forecast_session", highlow2)
+        return seen
+
+    def test_the_highlow2_range_is_two_levels_under_its_own_key(self, stubbed):
+        items = mo.compute([mo.HIGHLOW2_RANGE_KEY], "AAPL", minute_bars(),
+                           daily_bars=[], session_date=SESSION, credentials=("k", "s"))["items"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Pred. high": 204.0, "Pred. low": 192.0}
+        assert {i["key"] for i in items} == {mo.HIGHLOW2_RANGE_KEY}
+        assert stubbed == [("highlow2", "k", "s")]  # HighLow was never asked
+
+    def test_the_agents_levels_follow_highlow2(self, stubbed):
+        items = mo.compute(
+            [mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[], session_date=SESSION,
+            trader_config=TestHighLowOverlay().config(model_key="highlow2"),
+        )["items"]
+        buy = next(i for i in items if i["label"] == "Buy level")
+        assert buy["value"] == pytest.approx(204.0 - 0.75 * 3.0)
+        assert "(HighLow2)" in buy["note"]
+
+    def test_both_highlow_ranges_draw_together_from_their_own_models(self, stubbed):
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY, mo.HIGHLOW2_RANGE_KEY], "AAPL", minute_bars(),
+                           daily_bars=[], session_date=SESSION)["items"]
+        highs = {i["key"]: i["value"] for i in items if i.get("label") == "Pred. high"}
+        assert highs == {mo.HIGHLOW_RANGE_KEY: 206.0, mo.HIGHLOW2_RANGE_KEY: 204.0}
+
+    def test_a_highlow2_run_opens_showing_its_range(self):
+        assert mo.for_models([apple_models.HIGHLOW2_KEY], "AAPL")["keys"] == [mo.HIGHLOW2_RANGE_KEY]
+        assert mo.HIGHLOW2_RANGE_KEY not in mo.keys_for("INTC")
+
+
 class TestLiveOverlays:
     LONG_HISTORY = [{"t": "2026-08-06", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}]
 

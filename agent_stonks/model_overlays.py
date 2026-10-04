@@ -8,8 +8,8 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Five overlays
--------------
+Seven overlays
+--------------
 `day_range`          TimeToChange3's forecast of where the session's high and
                      low will land, made once from the first five minutes -- the
                      model's claim about the *width* of the day. Two price levels
@@ -34,6 +34,7 @@ Five overlays
 `highlow_range`      HighLow's forecast of the same two numbers, drawn exactly
                      like `day_range` (flat, or stepped once the session
                      breaks it). See `highlow_model`.
+`highlow2_range`     HighLow2's, drawn the same way. See `highlow2_model`.
 `trader_levels`      where Apple Trader would rest its buy and its sell, from
                      the forecast of the model its configuration names. The odd one out: every other overlay
                      draws what a *model* said, this one draws what an *agent*
@@ -84,6 +85,7 @@ never an exception and never a fabricated line.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import astuple, dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -104,6 +106,7 @@ INTRADAY_RANGE_KEY = "intraday_range"
 INTRADAY_DAYRANGE_KEY = "intraday_dayrange"
 TRADER_LEVELS_KEY = "trader_levels"
 HIGHLOW_RANGE_KEY = "highlow_range"
+HIGHLOW2_RANGE_KEY = "highlow2_range"
 
 
 @dataclass(frozen=True)
@@ -210,6 +213,22 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         requires="PyTorch, LightGBM, the HighLow bundle and Alpaca SIP minute history",
         tickers=apple_models.HIGHLOW_TICKERS,
         models=(apple_models.HIGHLOW_KEY,),
+    ),
+    HIGHLOW2_RANGE_KEY: ModelOverlay(
+        key=HIGHLOW2_RANGE_KEY,
+        label="Predicted day range (HighLow2)",
+        name="HighLow2",
+        summary=(
+            "HighLow2's forecast of the session's high and low, made once at 9:35 from "
+            "IEX's first five minutes and the pre-market. Drawn like the other ranges: "
+            "flat while the session stays inside it, stepped once it trades outside."
+        ),
+        requires=(
+            "LightGBM, the HighLow2 bundle and Alpaca SIP and IEX minute history "
+            "(extended hours)"
+        ),
+        tickers=apple_models.HIGHLOW2_TICKERS,
+        models=(apple_models.HIGHLOW2_KEY,),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -562,14 +581,15 @@ def compute(
             )
         return memo["result"]
 
-    def highlow_forecast() -> dict:
-        if "highlow" not in memo:
-            memo["highlow"] = _highlow_forecast(symbol, session, day, credentials)
-        return memo["highlow"]
+    def highlow_forecast(model_key: str = apple_models.HIGHLOW_KEY) -> dict:
+        if model_key not in memo:
+            memo[model_key] = _highlow_forecast(symbol, session, day, credentials, model_key)
+        return memo[model_key]
 
     def trader_forecast() -> dict:
-        if trader_model(trader_config, symbol) == apple_models.HIGHLOW_KEY:
-            return highlow_forecast()
+        model_key = trader_model(trader_config, symbol)
+        if model_key in _HIGHLOW_MODULES:
+            return highlow_forecast(model_key)
         return day_range_forecast()
 
     recorded = _recorded_levels(trader_history, symbol, day)
@@ -612,6 +632,9 @@ def compute(
             symbol, session, day, open_price, day_range_forecast()
         ),
         HIGHLOW_RANGE_KEY: lambda: range_items(HIGHLOW_RANGE_KEY, highlow_forecast),
+        HIGHLOW2_RANGE_KEY: lambda: range_items(
+            HIGHLOW2_RANGE_KEY, lambda: highlow_forecast(apple_models.HIGHLOW2_KEY)
+        ),
         TRADER_LEVELS_KEY: trader_items,
     }
 
@@ -695,30 +718,49 @@ def _day_range_forecast(
     return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
 
 
+# The module behind each HighLow model, imported only once its forecast is
+# drawn (torch and LightGBM for HighLow, LightGBM for HighLow2). Both expose
+# the same `opening_minutes` / `forecast_session` pair.
+_HIGHLOW_MODULES = {
+    apple_models.HIGHLOW_KEY: "highlow_model",
+    apple_models.HIGHLOW2_KEY: "highlow2_model",
+}
+# What the trader-levels note calls the forecast its levels hang off, when it
+# is not TimeToChange3's.
+_HIGHLOW_NAMES = {
+    apple_models.HIGHLOW_KEY: OVERLAYS[HIGHLOW_RANGE_KEY].name,
+    apple_models.HIGHLOW2_KEY: OVERLAYS[HIGHLOW2_RANGE_KEY].name,
+}
+
+
 def _highlow_forecast(
     symbol: str,
     session: pd.DataFrame,
     day: pd.Timestamp,
     credentials: "tuple[str, str] | None",
+    model_key: str = apple_models.HIGHLOW_KEY,
 ) -> dict:
-    """HighLow's forecast for the session, or why there is none -- the same
-    `{"forecast", "made_at", "problem"}` shape `_day_range_forecast` returns.
+    """HighLow's (or HighLow2's, `model_key`) forecast for the session, or why
+    there is none -- the same `{"forecast", "made_at", "problem"}` shape
+    `_day_range_forecast` returns.
 
-    Its history is SIP minute bars strictly before `day`, read from the
-    model's own cache (`highlow_model.history_frame`), so a past session is
-    drawn with what the model could have said that morning.
+    Its history is minute bars strictly before `day`, read from the model's
+    own cache (`highlow_model.history_frame`, `highlow2_model.history_inputs`),
+    so a past session is drawn with what the model could have said that
+    morning.
     """
     def failed(problem: str) -> dict:
         return {"forecast": None, "made_at": None, "problem": problem}
 
     try:
-        bundle = apple_models.load(apple_models.HIGHLOW_KEY, symbol)
+        bundle = apple_models.load(model_key, symbol)
         if bundle is None:
-            return failed(apple_models.unavailable_reason(apple_models.HIGHLOW_KEY, symbol))
+            return failed(apple_models.unavailable_reason(model_key, symbol))
 
-        from . import highlow_model  # heavy (torch + LightGBM); only once it is needed
+        # heavy (LightGBM, and torch for HighLow); only once it is needed
+        module = importlib.import_module(f".{_HIGHLOW_MODULES[model_key]}", __package__)
 
-        want = highlow_model.opening_minutes(bundle)
+        want = module.opening_minutes(bundle)
         if len(session) < want:
             return failed(
                 f"the forecast is built on the first {want} minutes and only "
@@ -731,7 +773,7 @@ def _highlow_forecast(
                 "the first five minutes the forecast needs are not here."
             )
         key, secret = credentials or (None, None)
-        forecast = highlow_model.forecast_session(bundle, symbol, opening, day, key, secret)
+        forecast = module.forecast_session(bundle, symbol, opening, day, key, secret)
     except Exception as exc:  # a decoration must never take the chart down
         return failed(str(exc))
     return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
@@ -762,8 +804,9 @@ def _day_range_items(
     Falls back to the flat 9:35 forecast when there is no session to walk,
     which is what a caller with bars but no usable window has.
 
-    `key` is the overlay being drawn: `day_range` (TimeToChange3) or
-    `highlow_range`, which differ only in whose forecast `result` holds.
+    `key` is the overlay being drawn: `day_range` (TimeToChange3),
+    `highlow_range` or `highlow2_range`, which differ only in whose forecast
+    `result` holds.
 
     `walked` is a live run's own record (`_recorded_levels`), drawn as given in
     place of the walk.
@@ -1091,7 +1134,7 @@ def _trader_levels_items(
         f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
         + ("the predicted high" if config.level_source != "intraday"
            else "the intraday band's upper curve")
-        + (" (HighLow)" if config.model_key == apple_models.HIGHLOW_KEY else "")
+        + (f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else "")
     )
     # Only while a position is open: the stop hangs under the actual fill, so
     # before a buy there is none, and a walk (which fills nothing) never has one.

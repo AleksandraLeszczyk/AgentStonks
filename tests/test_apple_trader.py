@@ -1202,6 +1202,9 @@ class TestHighLowModel:
     KEY = "highlow"
     BUNDLE = {"opening_minutes": 5, "kind": "highlow"}
 
+    def _module(self):
+        return at._highlow()
+
     def _stub_highlow(self, monkeypatch, forecast):
         calls = []
 
@@ -1209,7 +1212,7 @@ class TestHighLowModel:
             calls.append({"ticker": ticker, "bars": len(opening), "key": key, "secret": secret})
             return dict(forecast)
 
-        monkeypatch.setattr(at._highlow(), "forecast_session", fake)
+        monkeypatch.setattr(self._module(), "forecast_session", fake)
         return calls
 
     def test_it_drives_the_day_range_trader(self):
@@ -1263,7 +1266,7 @@ class TestHighLowModel:
         def boom(*a, **k):
             raise ValueError("only 40 complete SIP sessions of history")
 
-        monkeypatch.setattr(at._highlow(), "forecast_session", boom)
+        monkeypatch.setattr(self._module(), "forecast_session", boom)
         trader = at.DayRangeTrader(replace(dayrange_config(), model_key=self.KEY))
         tape.append(104.0, low=90.0)
         assert trader.run_cycle(self.BUNDLE, state, tracker) == "no_data"
@@ -1276,7 +1279,41 @@ class TestHighLowModel:
 
     def test_it_signs_its_own_row_in_results(self):
         sig = config_signature(AppleTraderConfig(model_key=self.KEY))
-        assert sig.startswith("highlow_AAPL(")
+        assert sig.startswith(f"{self.KEY}_AAPL(")
+
+
+class TestHighLow2Model(TestHighLowModel):
+    """HighLow2 likewise: every HighLow test above, its bundle dispatched to
+    `highlow2_model` instead."""
+
+    KEY = "highlow2"
+    BUNDLE = {"opening_minutes": 5, "kind": "highlow2", "opening_feed": "iex"}
+
+    def _module(self):
+        return at._highlow2()
+
+    def test_the_iex_caveat_does_not_describe_it(self, state, market_open, monkeypatch):
+        """It reads its own IEX window, fitted on IEX volume, whatever tape the
+        run streams -- where a SIP-opening HighLow bundle on an IEX tape is warned."""
+        opening_window = at.DayRangeTrader._opening_window
+        monkeypatch.setattr(
+            at.DayRangeTrader, "_opening_window",
+            lambda trader, *a, **k: (opening_window(trader, *a, **k)[0], "iex"),
+        )
+        Tape(monkeypatch).append(104.0, low=104.0)
+        monkeypatch.setattr(at._highlow(), "forecast_session", lambda *a, **k: dict(FORECAST))
+        self._stub_highlow(monkeypatch, FORECAST)
+
+        def caveats(key, bundle):
+            state.agent_log.clear()
+            tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+            trader = at.DayRangeTrader(replace(dayrange_config(), model_key=key))
+            trader.run_cycle(bundle, state, tracker)
+            assert trader.plan is not None
+            return [e for e in state.agent_log if "caveat" in (e.get("text") or "")]
+
+        assert caveats("highlow", TestHighLowModel.BUNDLE)
+        assert caveats(self.KEY, self.BUNDLE) == []
 
 
 class TestIntradayLevelSource:
@@ -2592,11 +2629,14 @@ class TestPredictedRangeUnit:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        # HighLow_5m has been run on AAPL and INTC, not GOOGL.
-        for symbol in (TICKER, "INTC"):
-            assert apple_models.keys_for(symbol) == [
-                "dayrange", "dayrange_intraday", "highlow",
-            ]
+        # HighLow_5m has been run on AAPL and INTC, not GOOGL; HighLow2_5m on
+        # AAPL alone.
+        assert apple_models.keys_for(TICKER) == [
+            "dayrange", "dayrange_intraday", "highlow", "highlow2",
+        ]
+        assert apple_models.keys_for("INTC") == [
+            "dayrange", "dayrange_intraday", "highlow",
+        ]
         for symbol in (NON_AAPL,):
             assert apple_models.keys_for(symbol) == [
                 "dayrange", "dayrange_intraday",

@@ -41,6 +41,10 @@ cache (``data/highlow/``). Nothing about the dataset could supply it anyway:
 it needs ~150 sessions of minute bars and a dataset stores a handful. It reads
 with ALPACA_API_KEY / ALPACA_SECRET, since the engine's own keys are
 placeholders (``DayRangeTrader._plan_session`` withholds them in a replay).
+The same goes for ``highlow2_model.history_inputs`` and ``fetch_morning``: the
+HighLow2 forecast reads SIP and IEX minute history and that morning's
+pre-market and IEX opening, all cut at the session date it is handed, from its
+own cache (``data/highlow2/``) or Alpaca with the environment's keys.
 
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead

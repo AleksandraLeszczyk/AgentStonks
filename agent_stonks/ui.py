@@ -1335,7 +1335,7 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     st.markdown("**Model Predictions**")
     with _help_row(
         "Draws what the trained models predict for this session:\n"
-        "- **TimeToChange3**, **HighLow**, **LevelsML** — price ranges: "
+        "- **TimeToChange3**, **HighLow**, **HighLow2**, **LevelsML** — price ranges: "
         "horizontal lines, in the candles and in the profile beside them.\n"
         "- **IntradayVolatility** (alone or × TimeToChange3) — time-of-day "
         "ranges: a shaded envelope, widest at the open and narrowing through "
@@ -2501,6 +2501,21 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "not this one.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP minute history: the first "
             "run fetches it (tens of seconds) and caches it under `data/highlow/`."
+        ),
+        "model_highlow2": (
+            "The day-range rules, unchanged, on HighLow2's predicted high and predicted "
+            "range.\n\n"
+            "- It reads this morning from **IEX** — the first five minutes and the open "
+            "— plus the pre-market (SIP to 09:19, IEX to 09:29) and last evening's "
+            "after-hours, so the stream's feed does not change its forecast.\n"
+            "- It was fitted **without shock days** (the day after earnings, jobs-report "
+            "days): on those it forecasts an ordinary day's width.\n"
+            "- No buy/sell distances were ever swept on it: it starts from the pair "
+            "TimeToChange3's notebook 05 swept for the instrument. Sweep them on "
+            "SimLab's Tuning tab.\n"
+            "- At 9:35 it needs ~150 sessions of Alpaca SIP and IEX minute history, "
+            "extended hours included: the first run fetches it (tens of seconds) and "
+            "caches it under `data/highlow2/`."
         ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band.\n\n"

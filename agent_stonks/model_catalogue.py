@@ -771,9 +771,103 @@ def _highlow_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _highlow2_spec(ticker: str) -> ModelSpec:
+    path = _saved_path("APPLE_HIGHLOW2_MODEL", "highlow2_5m_{ticker}.joblib", ticker)
+    files = (
+        ModelFile("bundle", path),
+        ModelFile("metadata", path.with_suffix(".json")),
+    )
+    available, reason = _availability(files, "lightgbm", "joblib")
+    meta = _read_json(path.with_suffix(".json"))
+    # The notebook's sidecar carries no score; the copy in Code/Models has the
+    # notebook's own `models.score` of its test window added (`test_metrics_note`).
+    test = meta.get("test_metrics") or {}
+    metrics = {k: v for k, v in test.items()}
+    error_pct = test.get("mae_adr_mean")
+    if error_pct is not None:
+        # First, as on the other day-range rows: it is the headline. Exact here
+        # rather than estimated -- the notebook divides each session's dollar
+        # miss by that session's own 14-day range.
+        metrics = {"MAE (% of ADR)": error_pct, **metrics}
+    for window, change in (meta.get("walk_forward_vs_highlow5m") or {}).items():
+        metrics[f"walk-forward vs HighLow_5m · {window}"] = change
+    weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
+    data = meta.get("data") or {}
+    rows = meta.get("training_rows") or {}
+    test_window = " – ".join(meta.get("test_window") or []) or "?"
+    model = apple_models.get(apple_models.HIGHLOW2_KEY)
+    return ModelSpec(
+        key=apple_models.HIGHLOW2_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note=(
+            f"Trained on {ticker} with {', '.join(meta['training_pool'])} pooled in, each in its "
+            "own 14-day-range units"
+            if meta.get("training_pool") else ""
+        ),
+        project="HighLow2_5m, mirrors `highlow2`",
+        predicts=(
+            "Where the **whole session's** high and low will land, called once at 9:35 "
+            "from IEX's first five minutes, the pre-market and the SIP daily history, "
+            "measured from the 9:35 price in 14-day average ranges. Fitted with shock "
+            "days left out, so it forecasts an ordinary day's width — on the day after "
+            "earnings it has nothing to say about the news."
+        ),
+        target="up = log(high / close5) / adr14, down = log(close5 / low) / adr14",
+        algorithm=(
+            f"LightGBM, L1 loss, averaged over {len(weights) or '?'} seeds "
+            f"({', '.join(str(s) for s in meta.get('seeds') or []) or '?'}), clipped to "
+            "contain the observed 5-minute range"
+        ),
+        family="LightGBM (3 seeds)",
+        consumers=(
+            "Apple Trader — day-range strategy", "Chart overlay — predicted day range (HighLow2)",
+        ),
+        features=tuple(meta.get("features") or []),
+        inputs=(
+            "~127 sessions of SIP minute bars rolled up to daily, the IEX openings of the "
+            "last 28, and the pre-market of the last 20; today's first 5 minutes from IEX, "
+            "SIP's pre-market to 09:19, IEX's 09:20–09:29 and last evening's after-hours"
+        ),
+        metrics=metrics,
+        headline=(
+            ("MAE (% of ADR)", f"{float(error_pct):.1f}%")
+            if error_pct is not None
+            else ("MAE (log units)", format_metric(test.get("mae_mean")))
+        ),
+        files=files,
+        trained_at=str(meta.get("created") or ""),
+        data_note=(
+            f"Fitted through {data.get('fit_through', '?')} on {sum(rows.values()) or '?'} sessions "
+            f"({rows.get(ticker, '?')} {ticker}) from {data.get('first_row', '?')}, shock days "
+            f"out · tested {test_window} · traded {' – '.join(meta.get('traded_week') or []) or '?'}"
+            if meta
+            else ""
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            (
+                f"Misses each extreme by about {float(error_pct):.0f}% of a typical day's range "
+                f"on its {test.get('n', '?')}-session test window ({test_window}). "
+                if error_pct is not None
+                else ""
+            )
+            + "Level with HighLow_5m over the notebook's walk-forward and slightly ahead — "
+            "its README calls it parity with a small edge, not a clear win. The shipped "
+            "trading distances were never swept on this forecast."
+        ),
+    )
+
+
 _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.HIGHLOW_KEY: _highlow_spec,
+    apple_models.HIGHLOW2_KEY: _highlow2_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,
 }
 

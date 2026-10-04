@@ -265,6 +265,57 @@ class TestHighLowErrorPctAdr:
         assert "MAE (% of ADR)" not in spec.metrics
 
 
+def test_highlow2_path_mirrors_the_real_one():
+    highlow2 = pytest.importorskip("agent_stonks.highlow2_model")
+    spec = mc.spec(apple_models.HIGHLOW2_KEY, "AAPL")
+    by_role = {f.role: f.path for f in spec.files}
+    real = highlow2.model_path("AAPL")
+    assert by_role["bundle"] == real
+    assert by_role["metadata"] == highlow2.metadata_path(real)
+
+
+HIGHLOW2_SIDECAR = {
+    "ticker": "AAPL",
+    "created": "2026-10-04T10:30:14",
+    "weights": {"lgbm_7": 1 / 3, "lgbm_11": 1 / 3, "lgbm_23": 1 / 3},
+    "seeds": [7, 11, 23],
+    "training_pool": ["GOOGL", "MSFT"],
+    "training_rows": {"AAPL": 500, "GOOGL": 480, "MSFT": 470},
+    "data": {"fit_through": "2026-09-04", "first_row": "2024-04-04"},
+    "test_window": ["2026-09-07", "2026-09-20"],
+    "test_metrics": {"mae_mean": 0.0036, "mae_usd_mean": 1.17, "mae_adr_mean": 15.76, "n": 9},
+    "walk_forward_vs_highlow5m": {"2026": -0.0007},
+}
+
+
+def _highlow2_spec_from(meta, tmp_path, monkeypatch):
+    bundle = tmp_path / "highlow2_5m_AAPL.joblib"
+    bundle.with_suffix(".json").write_text(json.dumps(meta))
+    monkeypatch.setenv("APPLE_HIGHLOW2_MODEL_AAPL", str(bundle))
+    return mc.spec(apple_models.HIGHLOW2_KEY, "AAPL")
+
+
+class TestHighLow2Spec:
+    """Its score is the notebook's own per-session ratio, read as it is: no
+    cache to estimate an ADR from, and nothing to estimate."""
+
+    def test_the_headline_is_the_test_windows_share_of_adr(self, tmp_path, monkeypatch):
+        spec = _highlow2_spec_from(HIGHLOW2_SIDECAR, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE (% of ADR)", "15.8%")
+        assert next(iter(spec.metrics)) == "MAE (% of ADR)"
+        assert spec.metrics["walk-forward vs HighLow_5m · 2026"] == -0.0007
+        assert "9-session test window" in spec.caveat
+        assert "GOOGL, MSFT pooled in" in spec.ticker_note
+        assert "1450 sessions (500 AAPL)" in spec.data_note
+
+    def test_a_sidecar_without_a_score_falls_back_to_nothing_invented(self, tmp_path, monkeypatch):
+        """The notebook's own sidecar carries no metrics."""
+        meta = {k: v for k, v in HIGHLOW2_SIDECAR.items() if k != "test_metrics"}
+        spec = _highlow2_spec_from(meta, tmp_path, monkeypatch)
+        assert spec.headline == ("MAE (log units)", "—")
+        assert "MAE (% of ADR)" not in spec.metrics
+
+
 def test_missing_file_is_a_reason_not_an_exception(tmp_path, monkeypatch):
     monkeypatch.setenv("OPEN_PROFILE_MODEL", str(tmp_path / "nope.json.gz"))
     spec = mc.spec(mc.OPEN_PROFILE_KEY)

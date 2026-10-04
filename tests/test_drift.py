@@ -179,6 +179,33 @@ class TestHighLowTraining:
         assert dr.highlow_training_from_metadata({}) == {"cutoffs": [], "references": []}
 
 
+HIGHLOW2_META = {
+    "ticker": "AAPL",
+    "training_pool": ["GOOGL", "MSFT"],
+    "training_rows": {"AAPL": 529, "GOOGL": 526, "MSFT": 526},
+    "data": {"history_start": "2024-01-01", "fit_through": "2026-09-04", "first_row": "2024-04-04"},
+    "test_window": ["2026-09-07", "2026-09-20"],
+    "test_metrics": {"mae_mean": 0.0036, "mae_high": 0.0038, "mae_low": 0.0034,
+                     "mae_usd_mean": 1.17, "mae_adr_mean": 15.76},
+}
+
+
+class TestHighLow2Training:
+    def test_the_one_cutoff_is_the_final_fit(self):
+        [cutoff] = dr.highlow2_training_from_metadata(HIGHLOW2_META)["cutoffs"]
+        assert cutoff.date == "2026-09-04"
+        assert "1581 sessions" in cutoff.note and "GOOGL, MSFT pooled in" in cutoff.note
+
+    def test_the_headline_reference_is_the_notebooks_own_ratio(self):
+        """No cache to estimate the ADR from: the sidecar carries the exact ratio."""
+        refs = {r.metric: r.value for r in dr.highlow2_training_from_metadata(HIGHLOW2_META)["references"]}
+        assert refs["mae_pct_adr"] == 15.76
+        assert (refs["mae"], refs["abs_err_high"], refs["mae_usd"]) == (0.0036, 0.0038, 1.17)
+
+    def test_missing_metadata_is_no_cutoffs_rather_than_an_error(self):
+        assert dr.highlow2_training_from_metadata({}) == {"cutoffs": [], "references": []}
+
+
 # --- scoring on a synthetic store --------------------------------------------
 
 
@@ -350,6 +377,48 @@ class TestHighLow:
         monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
         result = dr.evaluate_highlow(TICKER, FEED)
         assert result["rows"] == [] and result["notes"]
+
+
+class TestHighLow2:
+    FORECAST = TestHighLow.FORECAST
+
+    @pytest.fixture()
+    def stubbed(self, monkeypatch):
+        hl2 = pytest.importorskip("agent_stonks.highlow2_model")
+        monkeypatch.setattr(
+            dr.apple_models, "load",
+            lambda key, *a, **k: {"opening_minutes": 5, "opening_feed": "iex", "kind": "highlow2"}
+            if key == dr.apple_models.HIGHLOW2_KEY else None,
+        )
+        warmed, seen = [], []
+        monkeypatch.setattr(hl2, "history_inputs", lambda symbol, before, *a, **k: warmed.append(before))
+
+        def forecast(bundle, ticker, opening, session_date, key=None, secret=None):
+            seen.append(session_date)
+            return dict(self.FORECAST)
+
+        monkeypatch.setattr(hl2, "forecast_session", forecast)
+        return warmed, seen
+
+    def test_scored_exactly_as_the_other_day_range_models(self, store, stubbed, monkeypatch):
+        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
+        monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: dict(self.FORECAST))
+        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: {"opening_minutes": 5,
+                                                                      "kind": "highlow2"})
+        result = dr.evaluate_highlow2(TICKER, FEED)
+        assert result["rows"] == dr.evaluate_dayrange(TICKER, FEED)["rows"]
+
+    def test_the_history_is_warmed_once_and_every_day_forecast(self, store, stubbed):
+        warmed, seen = stubbed
+        result = dr.evaluate_highlow2(TICKER, FEED)
+        assert warmed == [DAYS[0], DAYS[-1]] and seen == DAYS
+        # The stored tape only picks the sessions; every input is Alpaca's.
+        assert any("whatever the stored tape" in note for note in result["notes"])
+
+    def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
+        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
+        result = dr.evaluate_highlow2(TICKER, FEED)
+        assert result["rows"] == [] and "HighLow2" in result["notes"][0]
 
 
 INTRAVOL = {

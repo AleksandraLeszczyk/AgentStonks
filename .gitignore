@@ -228,6 +228,7 @@ graphify-out
 tests/__pycache__/*
 data/simlab/
 data/highlow/
+data/highlow2/
 data/minute_momentum/
 data/net_gamma/
 data/sessions/

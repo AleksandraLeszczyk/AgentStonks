@@ -2,7 +2,7 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are three, and they
+named X" and never branch on which one they got. Today there are four, and they
 share a rule set:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
@@ -21,6 +21,12 @@ share a rule set:
                      Only the forecast differs: its bundle carries
                      `kind="highlow"` and `apple_trader.DayRangeTrader` asks
                      `highlow_model` for today's range instead.
+`highlow2`           HighLow2_5m's forecast of the same two numbers under
+                     stricter rules: this morning read entirely from IEX, the
+                     pre-market as an input, shock days out of training, five
+                     mega-caps pooled in. Level with HighLow on its test window,
+                     slightly ahead. Its bundle carries `kind="highlow2"` and
+                     the forecast comes from `highlow2_model`.
 
 That second entry is why `AppleModel` carries `level_source`: what the levels
 are measured below used to be a separate setting beside the model picker, which
@@ -89,6 +95,13 @@ DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 # features and the "theme" group, the one custom group `highlow_model` mirrors
 # (`_build_bundle` refuses anything else).
 HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE")
+
+# Which symbols HighLow2_5m has saved a bundle for (`highlow2_5m_<TICKER>.*`):
+# AAPL (saved 2026-10-04). The notebook has processed GOOGL, MSFT, AMZN, META
+# and NVDA as AAPL's training pool, but fitted no model of their own. Adding one
+# is this tuple plus its two files in `Code/Models` -- `_build_bundle` refuses a
+# bundle whose shipped blend reads anything but the base and pre-market groups.
+HIGHLOW2_TICKERS = (DEFAULT_TICKER,)
 
 
 @dataclass(frozen=True)
@@ -217,9 +230,28 @@ def _highlow_path(ticker: str = DEFAULT_TICKER) -> Path:
     return highlow_model.model_path(ticker)
 
 
+def _load_highlow2(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The HighLow2 bundle for one ticker, imported late: LightGBM only, no
+    torch, but still not something listing the model names should load."""
+    try:
+        from . import highlow2_model
+    except ImportError:
+        return None
+    return highlow2_model.load_bundle(ticker)
+
+
+def _highlow2_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import highlow2_model
+    except ImportError:
+        return Path(f"highlow2_5m_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return highlow2_model.model_path(ticker)
+
+
 DAYRANGE_KEY = "dayrange"
 DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
 HIGHLOW_KEY = "highlow"
+HIGHLOW2_KEY = "highlow2"
 # Both saved models have to exist for the pairing, so the symbols it covers are
 # the symbols both were fitted on.
 DAYRANGE_INTRADAY_TICKERS = tuple(
@@ -301,6 +333,32 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=HIGHLOW_TICKERS,
         load=_load_highlow,
         path=_highlow_path,
+    ),
+    HIGHLOW2_KEY: AppleModel(
+        key=HIGHLOW2_KEY,
+        label="HighLow2 model",
+        summary=(
+            "FinNotebooks' HighLow2_5m forecast of where the session's high and low "
+            "will land, made once at 9:35 and measured like HighLow's -- from the 9:35 "
+            "price in 14-day average ranges -- under stricter rules: everything about "
+            "this morning (the first five minutes, the open, the opening volume) read "
+            "from IEX, the only live tape at 9:35 on a basic plan; the pre-market as an "
+            "input (SIP to 09:19, IEX to 09:29, last evening's after-hours); shock days "
+            "(the day after earnings, jobs reports, geopolitical shocks) left out of "
+            "training; and the other five mega-caps pooled in as training rows. LightGBM "
+            "alone, three seeds. On its 9-session test window it misses each extreme by "
+            "$1.17 (15.8% of the 14-day range), level with HighLow and slightly ahead. "
+            "Only the forecast changes: the levels, exits and breach rules are the "
+            "day-range strategy's."
+        ),
+        requires=(
+            "LightGBM and joblib, and Alpaca credentials for ~150 sessions of SIP and IEX "
+            "minute history, extended hours included"
+        ),
+        strategy=STRATEGY_DAYRANGE,
+        tickers=HIGHLOW2_TICKERS,
+        load=_load_highlow2,
+        path=_highlow2_path,
     ),
 }
 

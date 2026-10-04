@@ -18,6 +18,10 @@ What each model is scored on
                 same way against the same daily bar. Its history is SIP minute
                 bars rolled up per session (`highlow_model`'s cache), its opening
                 minutes the stored tape's.
+`highlow2`      HighLow2's, scored the same way again. It reads every input --
+                the history, IEX's opening and the pre-market -- from its own
+                cache of Alpaca's tapes (`highlow2_model`), so the stored tape
+                only decides which sessions are scored.
 `intraday_vol`  IntradayVolatility's daily-bar forecast of the log day range
                 against the day's ln(high/low) -- daily bars only, so the whole
                 stored daily history -- plus how well each session's 5-minute
@@ -797,6 +801,53 @@ def highlow_training_from_metadata(meta: dict, sessions: "dict | None" = None) -
     return {"cutoffs": cutoffs, "references": references}
 
 
+def highlow2_training_from_metadata(meta: dict) -> dict:
+    """Cutoffs and references out of a HighLow2 bundle's JSON sidecar.
+
+    One cutoff: the shipped model is fitted on every usable session through
+    `data.fit_through`, the session before its test window, so -- unlike
+    HighLow's -- the test window's score is the shipped model's own. The
+    references are that score (`test_metrics`, which the copy in `Code/Models`
+    carries; see `model_catalogue._highlow2_spec`), shock days left out.
+    """
+    cutoffs: "list[Cutoff]" = []
+    references: "list[Reference]" = []
+    if not meta:
+        return {"cutoffs": cutoffs, "references": references}
+    data = meta.get("data") or {}
+    rows = meta.get("training_rows") or {}
+    if data.get("fit_through"):
+        cutoffs.append(Cutoff(
+            str(data["fit_through"])[:10], "Trained through",
+            f"{sum(rows.values()) or '?'} sessions from {str(data.get('first_row') or '?')[:10]}, "
+            f"{', '.join(meta.get('training_pool') or []) or 'no other tickers'} pooled in, "
+            "shock days left out",
+        ))
+    test = meta.get("test_metrics") or {}
+    window = meta.get("test_window") or []
+    where = (
+        f"the {str(window[0])[:10]} – {str(window[-1])[:10]} test window, shock days left out"
+        if len(window) == 2 else "the held-out test window"
+    )
+    for metric, field in (
+        ("mae_pct_adr", "mae_adr_mean"), ("mae", "mae_mean"), ("mae_usd", "mae_usd_mean"),
+        ("abs_err_high", "mae_high"), ("abs_err_low", "mae_low"),
+        ("bias_high", "bias_high"), ("bias_low", "bias_low"),
+    ):
+        if test.get(field) is not None:
+            references.append(Reference(
+                metric, float(test[field]), "Held-out test window",
+                f"{where}, against the SIP minute bars' extremes",
+            ))
+    return {"cutoffs": cutoffs, "references": references}
+
+
+def highlow2_training(ticker: str) -> dict:
+    spec = model_catalogue.spec(apple_models.HIGHLOW2_KEY, ticker)
+    path = next((f.path for f in spec.files if f.role == "metadata"), None) if spec else None
+    return highlow2_training_from_metadata(_read_json(path))
+
+
 def highlow_training(ticker: str) -> dict:
     spec = model_catalogue.spec(apple_models.HIGHLOW_KEY, ticker)
     path = next((f.path for f in spec.files if f.role == "metadata"), None) if spec else None
@@ -817,18 +868,39 @@ def evaluate_highlow(ticker: str, feed: str) -> dict:
     tape would feed them. The outcome is the stored daily bar, as for
     TimeToChange3, so the two day-range models are graded against one truth.
     """
-    symbol = ticker.upper()
-    bundle = apple_models.load(apple_models.HIGHLOW_KEY, symbol)
-    if bundle is None:
-        return {"rows": [], "notes": [
-            apple_models.unavailable_reason(apple_models.HIGHLOW_KEY, symbol)
-        ]}
     from agent_stonks import highlow_model  # torch + LightGBM, only once needed
+
+    return _evaluate_highlow_family(apple_models.HIGHLOW_KEY, highlow_model, ticker, feed)
+
+
+def evaluate_highlow2(ticker: str, feed: str) -> dict:
+    """HighLow2's 9:35 forecast of every stored minute session, graded like
+    HighLow's. Every input comes from the model's own cache of Alpaca's SIP and
+    IEX tapes, or is fetched into it, exactly as a replay reads it."""
+    from agent_stonks import highlow2_model  # LightGBM, only once needed
+
+    return _evaluate_highlow_family(apple_models.HIGHLOW2_KEY, highlow2_model, ticker, feed)
+
+
+def _evaluate_highlow_family(model_key: str, module, ticker: str, feed: str) -> dict:
+    """`evaluate_highlow`'s body, for either HighLow model: `module` is the one
+    behind `model_key` (`highlow_model` or `highlow2_model`, which expose the
+    same `opening_feed` / `warm_history` / `forecast_session`)."""
+    symbol = ticker.upper()
+    bundle = apple_models.load(model_key, symbol)
+    if bundle is None:
+        return {"rows": [], "notes": [apple_models.unavailable_reason(model_key, symbol)]}
 
     days = stored_minute_days(symbol, feed)
     notes: "list[str]" = []
-    opening_feed = highlow_model.opening_feed(bundle)
-    if opening_feed != highlow_model.OPENING_FEED_SIP:
+    opening_feed = module.opening_feed(bundle)
+    if bundle.get("kind") == "highlow2":
+        notes.append(
+            "This model reads this morning -- the opening minutes, the open and the "
+            "pre-market -- from Alpaca's IEX and SIP tapes whatever the stored tape, so the "
+            "stored bars only decide which sessions are scored."
+        )
+    elif opening_feed != "sip":
         notes.append(
             f"This model reads the opening minutes from {opening_feed.upper()} whatever the "
             "tape, fetched for each session, so the stored opening bars only set the open."
@@ -844,14 +916,15 @@ def evaluate_highlow(ticker: str, feed: str) -> dict:
     # rather than one per session.
     try:
         for day in (days[:1] + days[-1:]):
-            highlow_model.warm_history(bundle, symbol, day)
+            module.warm_history(bundle, symbol, day)
     except Exception as exc:  # noqa: BLE001 -- a network error is a note here
         return {"rows": [], "notes": notes + [
-            f"No SIP history for the HighLow forecast — {str(exc).rstrip('.')}."
+            f"No minute history for the {apple_models.get(model_key).label} forecast — "
+            f"{str(exc).rstrip('.')}."
         ]}
     daily = _daily(symbol, feed)
     by_date = {str(b["t"])[:10]: b for b in daily}
-    want = highlow_model.opening_minutes(bundle)
+    want = module.opening_minutes(bundle)
     rows: "list[dict]" = []
     failures: "dict[str, list[str]]" = {}
     for day in days:
@@ -865,7 +938,7 @@ def evaluate_highlow(ticker: str, feed: str) -> dict:
             failures.setdefault("the opening minutes are not stored", []).append(iso)
             continue
         try:
-            forecast = highlow_model.forecast_session(bundle, symbol, session.iloc[:want], day)
+            forecast = module.forecast_session(bundle, symbol, session.iloc[:want], day)
         except ValueError as exc:
             failures.setdefault(str(exc).rstrip("."), []).append(iso)
             continue
@@ -1169,6 +1242,29 @@ MODELS: "dict[str, DriftModel]" = {
             "sessions instead of the test window, against the stored daily bar rather "
             "than the SIP minute extremes, and divided by each session's own average "
             "daily range rather than by the window's mean one"
+        ),
+    ),
+    apple_models.HIGHLOW2_KEY: DriftModel(
+        key=apple_models.HIGHLOW2_KEY,
+        label=apple_models.get(apple_models.HIGHLOW2_KEY).label,
+        summary=(
+            "The 9:35 forecast of the session high and low against the day's actual ones, on "
+            "every stored session with its opening minutes — scored like the two models above. "
+            "Fitted through the session before its test window, so every session from that "
+            "window on is one it never saw. Shock days are scored too, though it was fitted "
+            "without them: expect its worst sessions to be the day after earnings."
+        ),
+        tickers=apple_models.HIGHLOW2_TICKERS,
+        needs_minute_bars=True,
+        metrics=HIGHLOW_METRICS,
+        evaluate=evaluate_highlow2,
+        training=highlow2_training,
+        headline="mae_pct_adr",
+        catalogue_metric=(
+            "MAE (% of ADR) — the same quantity the ML Models tab reports, each session's "
+            "dollar miss over its own average daily range; on later sessions instead of the "
+            "test window, against the stored daily bar rather than the SIP minute extremes, "
+            "and with shock days in"
         ),
     ),
     "intraday_vol": DriftModel(

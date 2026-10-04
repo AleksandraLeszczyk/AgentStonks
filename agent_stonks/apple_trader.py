@@ -894,6 +894,13 @@ def _highlow():
     return highlow_model
 
 
+def _highlow2():
+    """`agent_stonks.highlow2_model`, imported on first use (LightGBM)."""
+    from . import highlow2_model
+
+    return highlow2_model
+
+
 def session_forecast(
     bundle: dict,
     ticker: str,
@@ -910,13 +917,19 @@ def session_forecast(
     breach rule downstream reads those and nothing else.
 
     `open_price` is the official opening print the day-range model is fed and
-    the intraday envelope is centred on. The HighLow model rolls its daily bars
-    up from minute bars, so it reads the first bar's open instead and needs no
-    print; None then makes the plan fall back to that same bar.
+    the intraday envelope is centred on. The HighLow models roll their daily
+    bars up from minute bars, so they read the first bar's open instead (IEX's,
+    for HighLow2) and need no print; None then makes the plan fall back to the
+    caller's first bar.
     """
     if bundle.get("kind") == "highlow":
         return (
             _highlow().forecast_session(bundle, ticker, opening, today, key, secret),
+            None,
+        )
+    if bundle.get("kind") == "highlow2":
+        return (
+            _highlow2().forecast_session(bundle, ticker, opening, today, key, secret),
             None,
         )
     dayrange = _dayrange()
@@ -1540,8 +1553,9 @@ class DayRangeTrader(BaseTrader):
         else:
             self._record_levels(state, opening.index[-1])
 
-        # A HighLow bundle fitted on IEX openings (MU) fetched its own IEX window
-        # and was fitted on IEX volume, so the IEX caveat does not describe it.
+        # A HighLow bundle fitted on IEX openings (MU, every HighLow2 one) fetched
+        # its own IEX window and was fitted on IEX volume, so the IEX caveat does
+        # not describe it.
         warning = (
             None if (bundle.get("opening_feed") or "sip") != "sip"
             else _dayrange().volume_scale_warning(tape)
@@ -3217,7 +3231,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     """The one line the log opens a run with: which model, and what it will do."""
     metadata = bundle.get("metadata") or {}
     # TimeToChange3 files its held-out score as `test_metrics_ensemble`, HighLow
-    # as `test_metrics`; the dollar error is `mae_usd_mean` in both.
+    # and HighLow2 as `test_metrics`; the dollar error is `mae_usd_mean` in all.
     scores = metadata.get("test_metrics_ensemble") or metadata.get("test_metrics") or {}
     mae = scores.get("mae_usd_mean")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
