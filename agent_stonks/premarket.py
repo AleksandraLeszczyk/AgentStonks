@@ -33,9 +33,9 @@ from .state import current_volume_ratio
 
 
 DEFAULT_PREMARKET_MODELS: dict[str, str] = {
-    "gemini": "gemini-3.5-flash",
-    "openai": "gpt-5.6-luna",
-    "anthropic": "claude-haiku-4-5-20251001",
+    "gemini": "gemini-3.8-flash",
+    "openai": "gpt-6-luna",
+    "anthropic": "claude-sonnet-5-5",
 }
 
 

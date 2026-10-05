@@ -979,7 +979,7 @@ class TestRuleAgentRecords:
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
         assert "@conf>=15m," in agent.signature(today)
-        assert ",confirm=5b" in agent.signature(today)
+        assert ",confirm=3b" in agent.signature(today)
 
     def test_a_record_from_the_gain_gate_keeps_it(self):
         """From 2026-09-29 to 10-02 the take waited for 0.2 of the predicted gain

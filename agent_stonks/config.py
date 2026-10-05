@@ -302,11 +302,11 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 #
 # Their bases were the exit of 2026-09-30 (momentum confirmation, the minimum
 # gain before a take, scale-in at half-way rungs, brownian with keep_width) with
-# contain_range off, market entries and no buy_step_k -- again not today's
-# defaults. AAPL's base also had the stop at 1.0 of the predicted gain and a
+# contain_range off, market entries and no buy_step_k -- again not the
+# defaults of 2026-10-01. AAPL's base also had the stop at 1.0 of the predicted gain and a
 # 4-bar momentum confirmation (the pick of its stop x confirmation job
-# 20260930-171641-119bf9), where the defaults here are 0.5 and 5: replayed under
-# today's defaults the pick makes +1785 on the same weeks, the old 0.75/0.35
+# 20260930-171641-119bf9), where the defaults were then 0.5 and 5: replayed under
+# those defaults the pick makes +1785 on the same weeks, the old 0.75/0.35
 # +887. 0.75/0.05 beat 0.75/0.35 under every setup tried.
 #
 # MU and BE picks sit in a buy-0.55 row that is profitable at every sell
@@ -317,7 +317,7 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # (APPLE_TRADER_MIN_WIN), not the default 0.10 it was scored under, which stood
 # the session down after any trade that only reached the target. That costs on
 # these weeks: +5584 instead of +6561 under the job's base (19 buys instead of
-# 12), +2897 instead of +4084 under today's defaults. The stop sits 0.05 units
+# 12), +2897 instead of +4084 under the 2026-10-01 defaults. The stop sits 0.05 units
 # under the fill. The untuned 0.75/0.10 made -2 on MU and +2019 on BE.
 #
 # Every pair below but dayrange AAPL and GOOGL re-tuned 2026-10-04 (installed the
@@ -326,24 +326,27 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # on INTC, NVDA and AVGO HighLow), on two yfinance weeks (week_2026-09-14 and
 # week_2026-09-27; 10 sessions) at $100,000 per week, highest summed cell (INTC
 # HighLow's job also required trading on half the days). The stop is installed
-# with the levels, per pair (APPLE_TRADER_TUNED_STOP below). "Base" is each job's
-# own starting configuration on the same weeks; "today" replays the pick and the
-# pair's previous default (old levels, stop 0.5) under today's defaults:
+# with the levels, per pair (APPLE_TRADER_TUNED_STOP below). "Base" is the
+# pair's previous default (old levels, stop 0.5) on the same weeks. Seven of the
+# eight jobs ran with a 3-bar momentum confirmation and contain_range off, which
+# became the defaults the same day (the user's call), so "total" is what the
+# shipped defaults replay to; "old rules" is pick / base under the defaults
+# before that switch (5 bars, contain_range on):
 #
-#   model     ticker  buy   sell  stop  total   base    weeks up  traded  wins   today: pick / previous  job
-#   highlow   AAPL    0.65  0.10  1.0   +2185   -56       2/2      8/10   9/9           +357 / -158      20261004-122522-bb7ab1
-#   highlow2  AAPL    0.60  0.35  0.4    +814   +22       1/2      9/10   4/11          +863 / -589      20261004-123206-0d0ba0
-#   dayrange  INTC    0.45  0.05  0.8   +8257  +3879      2/2      9/10   11/12        +7423 / +697      20261004-123706-76751f
-#   highlow   BE      0.70  0.30  0.4   +2271   -95       1/2      8/10   12/16         -662 / +43       20261004-123758-37dc10
-#   highlow   MU      0.55  0.35  0.6   +6068  +5295      2/2      7/10   10/13        +4085 / +3201     20261004-123830-8cb4bd
-#   highlow   INTC    0.70  0.05  0.7   +1440  -227       2/2      5/10   6/6          +1440 / -227      20261004-162236-6d0e8e
-#   highlow   NVDA    0.65  0.05  0.5   +2389  +183       2/2      9/10   8/9          +1223 / +324      20261004-182658-b47693
-#   highlow   AVGO    0.45  0.40  0.3   +1030  -2742      2/2      9/10   7/9           -485 / -2184     20261004-183552-2593c3
+#   model     ticker  buy   sell  stop  total   base    weeks up  traded  wins   old rules        job
+#   highlow   AAPL    0.65  0.10  1.0   +2185   -56       2/2      8/10   9/9    +357 / -158     20261004-122522-bb7ab1
+#   highlow2  AAPL    0.60  0.35  0.4    +814   +22       1/2      9/10   4/11   +863 / -589     20261004-123206-0d0ba0
+#   dayrange  INTC    0.45  0.05  0.8   +8257  +3879      2/2      9/10   11/12  +7423 / +697    20261004-123706-76751f
+#   highlow   BE      0.70  0.30  0.4   +2271   -95       1/2      8/10   12/16  -662 / +43      20261004-123758-37dc10
+#   highlow   MU      0.55  0.35  0.6   +6068  +5295      2/2      7/10   10/13  +4085 / +3201   20261004-123830-8cb4bd
+#   highlow   INTC    0.70  0.05  0.7   +1440  -227       2/2      5/10   6/6    (= total, base) 20261004-162236-6d0e8e
+#   highlow   NVDA    0.65  0.05  0.5   +2389  +183       2/2      9/10   8/9    +1223 / +324    20261004-182658-b47693
+#   highlow   AVGO    0.45  0.40  0.3   +1030  -2742      2/2      9/10   7/9    -485 / -2184    20261004-183552-2593c3
 #
-# Every job's base but INTC HighLow's had a 3-bar momentum confirmation and
-# contain_range off, where the defaults here are 5 bars and on; that is the gap
-# between "total" and "today: pick". Under today's defaults the pick still beats
-# the pair's previous default everywhere but BE, and AVGO's loses either way.
+# INTC HighLow is the exception: its job ran under the old rules, so its row is
+# those rules' numbers. Under the shipped 3 bars / contain_range off its pick
+# makes +540 (week 09-14 -1710, 09-27 +2250) against -398 for its previous
+# default -- still ahead, but re-run that job on the new base before trusting it.
 # Ties along the stop axis go to the smaller stop (grid order): dayrange INTC
 # scores the same at 0.8 and 1.0, NVDA at 0.5, 0.7 and 0.9 -- the stop never
 # fired between them. Weak picks: highlow2 AAPL and BE lost money on the
@@ -433,9 +436,12 @@ APPLE_TRADER_NEGATIVE_FOR_BARS = 5
 # buy at the buy level only on positive momentum, or neutral with a change
 # that is not negative; sell at the sell level unless momentum is positive; below it, take
 # gains (in profit) on negative momentum whose change is neutral or negative.
-# 5 bars is not swept; 0 switches it off, which is what every SimLab record
-# written before it existed replays as (`simlab.rule_agents._APPLE_LEGACY`).
-APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS = 5
+# 0 switches it off, which is what every SimLab record written before it
+# existed replays as (`simlab.rule_agents._APPLE_LEGACY`). 3 bars since
+# 2026-10-04 (was 5; the user's call): the setting the day's tuning jobs ran
+# under, so the tuned levels and stops (APPLE_TRADER_TUNED_LEVELS) are scored
+# under the defaults they ship with. Not swept itself.
+APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS = 3
 MOMENTUM_NEUTRAL_FRACTION = 0.10
 APPLE_TRADER_TAKE_FRACTION = 0.70
 # The momentum take waits for the trade to have had time first (2026-10-02, at
@@ -523,7 +529,11 @@ APPLE_TRADER_BREACH_UPDATE = BREACH_BROWNIAN
 #
 # A SimLab record written before this existed replays with it off
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
-APPLE_TRADER_CONTAIN_RANGE = True
+#
+# Off by default since 2026-10-04 (the user's call), for the same reason as the
+# 3-bar momentum confirmation: the day's tuning jobs ran with it off. Records
+# name it in full (`asdict`), so one made with it on still replays with it on.
+APPLE_TRADER_CONTAIN_RANGE = False
 
 # Whether a breach under "shift" or "brownian" keeps the range at the level
 # unit's width -- the 9:35 predicted range under "pred_range", the ADR under

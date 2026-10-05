@@ -2381,7 +2381,11 @@ class TestRangeContainment:
         old = _apple_from_record({"model_key": "dayrange", "buy_k": 0.75})
         assert old.contain_range is False
         assert "contain" not in config_signature(old)
-        assert "contain" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        # Off by default since 2026-10-04, so the one that signs it says so.
+        assert "contain" not in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "contain" in config_signature(
+            AppleTraderConfig(model_key="dayrange", contain_range=True)
+        )
 
 
 class TestKeepWidth:
@@ -3983,10 +3987,10 @@ class TestMomentumConfirmation:
 
     def test_on_by_default_and_signed(self):
         config = AppleTraderConfig()
-        assert config.momentum_confirmation_bars == 5
+        assert config.momentum_confirmation_bars == 3
         assert config.has_take
         signature = config_signature(config)
-        assert ",confirm=5b" in signature and "@conf>=15m," in signature
+        assert ",confirm=3b" in signature and "@conf>=15m," in signature
 
     def test_it_cannot_sit_beside_a_legacy_take(self):
         with pytest.raises(ValueError, match="only one may be set"):

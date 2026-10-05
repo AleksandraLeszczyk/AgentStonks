@@ -21,15 +21,15 @@ from . import observability as obs
 PROVIDERS: tuple[str, ...] = ("gemini", "openai", "anthropic")
 
 DEFAULT_AGENT_MODELS: dict[str, str] = {
-    "gemini": "gemini-3.5-flash",
-    "openai": "gpt-5.6-luna",
-    "anthropic": "claude-haiku-4-5-20251001",
+    "gemini": "gemini-3.8-flash",
+    "openai": "gpt-6-luna",
+    "anthropic": "claude-sonnet-5-5",
 }
 
 DEFAULT_NEWS_MODELS: dict[str, str] = {
-    "gemini": "gemini-3.5-flash",
-    "openai": "gpt-5.6-luna",
-    "anthropic": "claude-haiku-4-5-20251001",
+    "gemini": "gemini-3.8-flash",
+    "openai": "gpt-6-luna",
+    "anthropic": "claude-sonnet-5-5",
 }
 
 # Curated per-provider model menus for the UI's model pickers. Ordered roughly
@@ -37,12 +37,12 @@ DEFAULT_NEWS_MODELS: dict[str, str] = {
 # DEFAULT_*_MODELS entry. Keep every model referenced by a DEFAULT_* dict listed
 # here so those defaults are always selectable (see `models_for`).
 SUPPORTED_MODELS: dict[str, tuple[str, ...]] = {
-    "gemini": ("gemini-3.5-pro", "gemini-3.5-flash"),
-    "openai": ("gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"),
+    "gemini": ("gemini-3.1-pro-preview", "gemini-3.8-flash"),
+    "openai": ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"),
     "anthropic": (
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-haiku-4-5-20251001",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
     ),
 }
 
@@ -179,7 +179,7 @@ class AnthropicChatClient:
 class _OpenAIToolCompletions:
     """Wraps OpenAI `chat.completions` to make function tools work with reasoning models.
 
-    Newer OpenAI models (e.g. gpt-5.6) apply a server-side default reasoning
+    Newer OpenAI models (e.g. gpt-5.6, gpt-6) apply a server-side default reasoning
     effort, and `/v1/chat/completions` rejects function tools whenever reasoning
     is active with: "Function tools with reasoning_effort are not supported ...
     set reasoning_effort to 'none'." We forward that documented workaround by
