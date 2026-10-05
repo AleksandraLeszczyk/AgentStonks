@@ -101,6 +101,14 @@ def fetch_option_chain(
         expirations = list(ticker.options)
         chosen_expiry = expiry or _select_expiry(expirations, max_dte)
         chain = ticker.option_chain(chosen_expiry)
+        # Yahoo now and then answers a dated chain request with no contracts,
+        # which yfinance hands back as calls=None / puts=None rather than
+        # raising. It is transient (the same request a minute later is fine),
+        # so ask once more before giving up.
+        if chain.calls is None or chain.puts is None:
+            chain = ticker.option_chain(chosen_expiry)
+        if chain.calls is None or chain.puts is None:
+            raise ValueError(f"yfinance returned no contracts for expiry {chosen_expiry}")
     except Exception as exc:
         log_fetch_failure(
             "options chain",

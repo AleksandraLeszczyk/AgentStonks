@@ -96,6 +96,24 @@ class TestFetchOptionChain:
         data = fetch_option_chain("AAPL", spot=123.0)
         assert data["spot"] == 123.0
 
+    def test_retries_once_when_yahoo_returns_no_contracts(self, monkeypatch):
+        calls, puts = _chain_frames()
+        ticker = FakeTicker([_future_date(30)], calls, puts, spot=100.0)
+        answers = [SimpleNamespace(calls=None, puts=None), SimpleNamespace(calls=calls, puts=puts)]
+        ticker.option_chain = lambda expiry: answers.pop(0)
+        monkeypatch.setattr("agent_stonks.options.yf.Ticker", lambda symbol: ticker)
+
+        data = fetch_option_chain("AAPL")
+        assert data["strikes"] == [95.0, 100.0, 105.0]
+
+    def test_no_contracts_twice_raises_a_readable_error(self, monkeypatch):
+        expiry = _future_date(30)
+        ticker = FakeTicker([expiry], None, None, spot=100.0)
+        monkeypatch.setattr("agent_stonks.options.yf.Ticker", lambda symbol: ticker)
+
+        with pytest.raises(ValueError, match=f"no contracts for expiry {expiry}"):
+            fetch_option_chain("AAPL")
+
 
 class TestNetGammaExposure:
     def _chain(self, monkeypatch):
