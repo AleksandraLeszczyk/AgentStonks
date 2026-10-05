@@ -29,6 +29,7 @@ from . import observability as obs
 from . import scoring
 from . import technical_analysis as ta
 from .config import (
+    AGENT_FINALIZE_ITERS,
     AGENT_MAX_TOOL_ITERS,
     PREMARKET_LEAD_SEC,
     PREMARKET_WAIT_POLL_SEC,
@@ -893,6 +894,16 @@ def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
     )
 
 
+# What a cycle may still call once its research turns are spent.
+_FINALIZE_TOOL_NAMES = frozenset({"set_tactics", "submit_decision", "stand_down"})
+
+_FINALIZE_NOW = (
+    "Your analysis turns for this cycle are used up. Decide with what you have "
+    "now: arm tactics with set_tactics if your plan needs them, then call "
+    "submit_decision."
+)
+
+
 @obs.observe(name="agent-cycle")
 def run_agent_cycle(
     client: Any,
@@ -907,6 +918,10 @@ def run_agent_cycle(
 ) -> str:
     """Run one analyze-then-decide cycle over the whole symbol basket. Always
     ends with exactly one recorded decision.
+
+    `max_iters` is the number of research turns. Up to AGENT_FINALIZE_ITERS
+    turns follow that offer only set_tactics / submit_decision (/ stand_down);
+    a cycle that still hasn't decided after those is put to sleep.
 
     When Langfuse is configured, the whole cycle is one trace: every LLM turn
     nests under it as a generation, so per-cycle latency, token usage, and cost
@@ -964,12 +979,20 @@ def run_agent_cycle(
     ]
     _log(state, {"type": "cycle_start", "text": f"Starting analysis cycle for {symbols_label}"})
 
+    # After max_iters research turns, up to AGENT_FINALIZE_ITERS more that offer
+    # only the finalizing tools, so a model still researching is made to decide.
+    finalize_tools = [t for t in tools if t["function"]["name"] in _FINALIZE_TOOL_NAMES] or tools
     decision_made = False
     stood_down = False
-    for _ in range(max_iters):
+    for turn in range(max_iters + AGENT_FINALIZE_ITERS):
+        turn_tools = tools
+        if turn >= max_iters:
+            turn_tools = finalize_tools
+            if turn == max_iters:
+                messages.append({"role": "user", "content": _FINALIZE_NOW})
         try:
             response = client.chat.completions.create(
-                model=model, messages=messages, tools=tools, tool_choice="auto"
+                model=model, messages=messages, tools=turn_tools, tool_choice="auto"
             )
         except Exception as exc:
             _log(state, {"type": "error", "text": f"LLM call failed: {exc}"})

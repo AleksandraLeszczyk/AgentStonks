@@ -194,6 +194,12 @@ AGENT_LOG_POLL_SEC = 4
 AGENT_PERFORMANCE_POLL_SEC = 60
 AGENT_EQUITY_HISTORY_MAXLEN = 5000
 AGENT_MAX_TOOL_ITERS = 8
+# Turns a trading cycle gets after its AGENT_MAX_TOOL_ITERS research turns,
+# offering only the finalizing tools (set_tactics / submit_decision /
+# stand_down). Without them a model that researches every ticker before
+# deciding (gemini-3.8-flash on a 12-ticker basket) runs out of turns every
+# cycle and is put to sleep with nothing armed.
+AGENT_FINALIZE_ITERS = 2
 PAPER_STARTING_CASH = 100_000.0
 TRADE_FIXED_COST = 1.15
 

@@ -7,16 +7,23 @@ is a list of typed blocks instead of `tool_calls`), so `AnthropicChatClient`
 adapts it to expose the same `.chat.completions.create(...)` shape that
 `agent.py`'s tool-calling loop and the tests' `FakeClient` already use —
 callers don't need to know which provider they're talking to.
+
+Some OpenAI models (gpt-6-astra, gpt-6.1-sol) take function tools only on
+`/v1/responses`, so `_OpenAIResponsesCompletions` adapts that endpoint to the
+same shape and their tool calls are routed there.
 """
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any, Optional
 
 from pydantic import BaseModel
 
 from . import observability as obs
+
+logger = logging.getLogger(__name__)
 
 PROVIDERS: tuple[str, ...] = ("gemini", "openai", "anthropic")
 
@@ -176,24 +183,130 @@ class AnthropicChatClient:
         self.chat = SimpleNamespace(completions=_AnthropicCompletions(self._client))
 
 
+# Models that rejected function tools on /v1/chat/completions at every
+# reasoning_effort (gpt-6-astra and gpt-6.1-sol refuse "none", and any other
+# value disallows tools there). Filled in on the first rejection so later calls
+# go straight to /v1/responses.
+_RESPONSES_API_MODELS: set[str] = set()
+
+
+def _chat_tools_to_responses(tools: list[dict]) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "name": t["function"]["name"],
+            "description": t["function"].get("description", ""),
+            "parameters": t["function"].get("parameters") or {"type": "object", "properties": {}},
+            # Chat-completions function tools are non-strict; strict would
+            # demand every property be required, which ours aren't.
+            "strict": False,
+        }
+        for t in tools
+    ]
+
+
+def _chat_messages_to_responses(messages: list[dict]) -> tuple[Optional[str], list[dict]]:
+    instructions: Optional[str] = None
+    items: list[dict] = []
+    for m in messages:
+        role = m["role"]
+        if role == "system":
+            instructions = m["content"]
+        elif role == "user":
+            items.append({"role": "user", "content": m["content"]})
+        elif role == "assistant":
+            if m.get("content"):
+                items.append({"role": "assistant", "content": m["content"]})
+            # Replayed without the item id or the reasoning item that preceded
+            # it -- the endpoint accepts a bare call_id, and with store=False
+            # there is no server-side copy to point at anyway.
+            for tc in m.get("tool_calls") or []:
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    }
+                )
+        elif role == "tool":
+            items.append(
+                {"type": "function_call_output", "call_id": m["tool_call_id"], "output": m["content"]}
+            )
+    return instructions, items
+
+
+class _OpenAIResponsesCompletions:
+    """Serves a chat-completions tool call from `/v1/responses`, in the same shape."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def create(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: Optional[list[dict]] = None,
+        tool_choice: str = "auto",
+    ) -> SimpleNamespace:
+        instructions, items = _chat_messages_to_responses(messages)
+        request: dict[str, Any] = {"model": model, "input": items, "store": False}
+        if instructions:
+            request["instructions"] = instructions
+        if tools:
+            request["tools"] = _chat_tools_to_responses(tools)
+            request["tool_choice"] = tool_choice
+        response = self._client.responses.create(**request)
+
+        tool_calls = [
+            SimpleNamespace(
+                id=item.call_id,
+                function=SimpleNamespace(name=item.name, arguments=item.arguments),
+            )
+            for item in response.output
+            if item.type == "function_call"
+        ]
+        message = SimpleNamespace(content=response.output_text or None, tool_calls=tool_calls or None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _rejects_chat_tools(exc: Exception) -> bool:
+    """True for the 400 a model returns when chat-completions can't carry its tools."""
+    return getattr(exc, "status_code", None) == 400 and getattr(exc, "param", None) == "reasoning_effort"
+
+
 class _OpenAIToolCompletions:
     """Wraps OpenAI `chat.completions` to make function tools work with reasoning models.
 
-    Newer OpenAI models (e.g. gpt-5.6, gpt-6) apply a server-side default reasoning
-    effort, and `/v1/chat/completions` rejects function tools whenever reasoning
-    is active with: "Function tools with reasoning_effort are not supported ...
-    set reasoning_effort to 'none'." We forward that documented workaround by
-    defaulting `reasoning_effort="none"` on any tool-carrying call (unless the
-    caller set it explicitly). Tool-less calls are passed through untouched.
+    Newer OpenAI models (e.g. gpt-5.6, gpt-6-luna) apply a server-side default
+    reasoning effort, and `/v1/chat/completions` rejects function tools whenever
+    reasoning is active with: "Function tools with reasoning_effort are not
+    supported ... set reasoning_effort to 'none'." We forward that documented
+    workaround by defaulting `reasoning_effort="none"` on any tool-carrying call
+    (unless the caller set it explicitly). Models that refuse "none" as well
+    (gpt-6-astra, gpt-6.1-sol) are switched to `/v1/responses`, where their
+    tools work at the server's default effort. Tool-less calls are passed
+    through untouched.
     """
 
-    def __init__(self, completions: Any) -> None:
+    def __init__(self, completions: Any, responses: _OpenAIResponsesCompletions) -> None:
         self._completions = completions
+        self._responses = responses
 
     def create(self, *args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("tools") and "reasoning_effort" not in kwargs:
-            kwargs["reasoning_effort"] = "none"
-        return self._completions.create(*args, **kwargs)
+        if not kwargs.get("tools") or "reasoning_effort" in kwargs:
+            return self._completions.create(*args, **kwargs)
+        model = kwargs.get("model")
+        if model in _RESPONSES_API_MODELS:
+            return self._responses.create(**kwargs)
+        try:
+            return self._completions.create(*args, **kwargs, reasoning_effort="none")
+        except Exception as exc:
+            if not _rejects_chat_tools(exc):
+                raise
+        logger.info("%s takes function tools only on /v1/responses; routing its tool calls there", model)
+        _RESPONSES_API_MODELS.add(model)
+        return self._responses.create(**kwargs)
 
     def __getattr__(self, name: str) -> Any:  # e.g. `.parse`, delegated unchanged
         return getattr(self._completions, name)
@@ -204,7 +317,9 @@ class _OpenAIToolChatClient:
 
     def __init__(self, client: Any) -> None:
         self._client = client
-        self.chat = SimpleNamespace(completions=_OpenAIToolCompletions(client.chat.completions))
+        self.chat = SimpleNamespace(
+            completions=_OpenAIToolCompletions(client.chat.completions, _OpenAIResponsesCompletions(client))
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
@@ -247,29 +362,31 @@ def parse_structured(
         import anthropic
 
         client = anthropic.Anthropic(api_key=api_key)
-        tool_name = "emit_result"
         with obs.anthropic_generation(
             name="anthropic-structured", model=model, input=user
         ) as generation:
+            # Structured outputs, not a forced tool call: Sonnet 5.5, Opus 5.5
+            # and Fable 5.1 reject tool_choice "tool"/"any" with a 400.
+            # transform_schema drops what the API can't enforce (ge/le) into the
+            # descriptions; model_validate_json below still enforces it. The
+            # headroom in max_tokens is for thinking, which those models run.
             response = client.messages.create(
                 model=model,
-                max_tokens=4096,
+                max_tokens=16000,
                 system=system,
                 messages=[{"role": "user", "content": user}],
-                tools=[
-                    {
-                        "name": tool_name,
-                        "description": "Emit the structured result.",
-                        "input_schema": response_model.model_json_schema(),
-                    }
-                ],
-                tool_choice={"type": "tool", "name": tool_name},
+                output_config={
+                    "format": {"type": "json_schema", "schema": anthropic.transform_schema(response_model)}
+                },
             )
             result = None
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = response_model.model_validate(block.input)
-                    break
+            # A refusal or a cut-off answer is not schema-valid JSON; report it
+            # as no result, as callers already expect.
+            if response.stop_reason not in ("refusal", "max_tokens"):
+                for block in response.content:
+                    if block.type == "text":
+                        result = response_model.model_validate_json(block.text)
+                        break
             obs.record_anthropic_usage(
                 generation, response, result.model_dump() if result is not None else None
             )

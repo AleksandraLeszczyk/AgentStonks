@@ -14,6 +14,7 @@ from agent_stonks.agent import (
     SMART_MONEY_TOOLS,
     VOLUME_DETECTIVE_SYSTEM_PROMPT,
     VOLUME_DETECTIVE_TOOLS,
+    _FINALIZE_NOW,
     _dispatch_tool,
     _session_closed_addendum,
     _tool_analyze_consolidation,
@@ -30,6 +31,7 @@ from agent_stonks.agent import (
     sell_everything_and_stop,
 )
 from agent_stonks.broker import Broker
+from agent_stonks.config import AGENT_FINALIZE_ITERS
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState, alert_triggered
 
@@ -532,14 +534,55 @@ class TestRunAgentCycle:
         state.api_secret = "s"
         tracker = DecisionTracker(broker=FakeBroker())
 
-        responses = [_response(content="still thinking...") for _ in range(3)]
+        responses = [_response(content="still thinking...") for _ in range(3 + AGENT_FINALIZE_ITERS)]
         client = FakeClient(responses)
 
         run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3)
 
+        assert len(client.calls) == 3 + AGENT_FINALIZE_ITERS
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
+
+    def test_finalize_turns_offer_only_deciding_tools_after_research(self):
+        """A model that spends every research turn on analysis (gemini-3.8-flash on
+        a 12-ticker basket) gets finalize-only turns and a nudge, and its decision
+        there is recorded instead of a forced sleep."""
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        state.api_key = "k"
+        state.api_secret = "s"
+        tracker = DecisionTracker(broker=FakeBroker())
+
+        responses = [
+            _response(tool_calls=[_tool_call(f"p{i}", "get_position", {})]) for i in range(3)
+        ] + [
+            _response(
+                tool_calls=[
+                    _tool_call(
+                        "d1",
+                        "submit_decision",
+                        {
+                            "action": "alert",
+                            "reasoning": "no setup",
+                            "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                        },
+                    )
+                ]
+            )
+        ]
+        client = FakeClient(responses)
+
+        run_agent_cycle(client, "gemini-3.8-flash", ["AAPL"], state, tracker, max_iters=3)
+
+        assert all(tools is MOMENTUM_TOOLS for tools in client.tools_seen[:3])
+        assert {t["function"]["name"] for t in client.tools_seen[3]} == {"set_tactics", "submit_decision"}
+        # FakeClient records the live messages list, so look for the nudge in it.
+        nudges = [i for i, m in enumerate(client.calls[3]) if m == {"role": "user", "content": _FINALIZE_NOW}]
+        assert len(nudges) == 1
+        assert client.calls[3][nudges[0] - 1]["tool_call_id"] == "p2"
+        snap = tracker.snapshot()
+        assert [d.action for d in snap["decisions"]] == ["alert"]
 
     def test_removed_sleep_action_is_rejected_and_retried(self):
         """The agent can no longer choose to sleep. A model that still reaches for the
