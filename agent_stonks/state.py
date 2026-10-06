@@ -230,6 +230,7 @@ _DEFAULTS: dict[str, object] = {
     "history_feed": DEFAULT_HISTORY_FEED,
     "history_feed_resolved": "",
     "bar_tape_override": "",
+    "replay": None,
     "orchestra_configs": {},
     "orchestra_form": None,
     "orchestra_levels": {},
@@ -332,6 +333,11 @@ class AppState:
         # `data_source`/`feed` describe sockets nothing is connected to. Empty
         # live; see `bar_tape`.
         self.bar_tape_override: str = ""
+        # The `replay.ReplaySession` this state belongs to when it is the live
+        # app's replay of a past session (the sidebar's Dummy data), "idle" on
+        # the empty page before its first Start, None for a live state. A
+        # replay state never writes the live day's files (see `replay`).
+        self.replay: object = None
         # The Apple Trader configuration the sidebar currently holds, so the
         # chart can draw the levels *this* setup would rest rather than a
         # plausible set (`model_overlays.TRADER_LEVELS_KEY`). None whenever

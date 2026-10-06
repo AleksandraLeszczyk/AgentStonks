@@ -82,8 +82,17 @@ def _series(pairs: list[tuple[str, float]]) -> pd.Series:
     return pd.Series(closes, index=pd.to_datetime(dates))
 
 
-@contextmanager
-def simulation_context(market: SimMarket) -> Iterator[None]:
+def patch_table(market: SimMarket, original=getattr) -> "list[tuple[object, str, object]]":
+    """Every (module, attribute, replacement) `simulation_context` swaps in.
+
+    Also read by the live app's replay of a past session
+    (`agent_stonks.replay`), which routes the same call sites to the same
+    replacements -- but only for the threads it binds, since the live session
+    beside it must keep the real fetches. `original(module, name)` gives the
+    real function behind an attribute, for the one replacement that falls back
+    to it; the replay passes its own, because by then the attribute holds its
+    dispatcher.
+    """
     def fake_bars_window(symbol, timeframe, start, end, key, secret, feed="iex", limit=200):
         return market.bars_window(str(symbol).upper(), start, end)
 
@@ -168,7 +177,7 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
     # sliced to the bars completed by the pinned clock, which is exactly what
     # the engine's buffer holds (a stored day is ~960 bars, under SIM_MAX_BARS).
     # Pinned row for row against the original by `tests/test_tuning.py`.
-    original_minute_frame = momentum_regime.minute_frame
+    original_minute_frame = original(momentum_regime, "minute_frame")
     day_frames: "dict[str, dict]" = {}
 
     def fast_minute_frame(sym_state):
@@ -212,6 +221,12 @@ def simulation_context(market: SimMarket) -> Iterator[None]:
         (historical, "fetch_daily_ohlc_bars", fake_daily_ohlc_bars),
         (historical, "fetch_session_open", fake_session_open),
     ]
+    return patches
+
+
+@contextmanager
+def simulation_context(market: SimMarket) -> Iterator[None]:
+    patches = patch_table(market)
     saved = []
     for module, name, replacement in patches:
         saved.append((module, name, getattr(module, name)))  # raises if renamed upstream

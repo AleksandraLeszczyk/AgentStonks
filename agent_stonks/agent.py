@@ -1457,13 +1457,13 @@ def launch_agent(
         # One-shot pre-open specialist: holds for the opening window, arms the
         # opening tactics, and disables itself once they execute.
         threading.Thread(
-            target=_premarket_loop,
+            target=clock.inherit(_premarket_loop),
             args=(state, tracker, symbols, provider, api_key, model, stop_event),
             daemon=True,
         ).start()
         return
     threading.Thread(
-        target=_agent_loop,
+        target=clock.inherit(_agent_loop),
         args=(state, tracker, symbols, provider, api_key, model, cycle_sec, stop_event, personality),
         daemon=True,
     ).start()

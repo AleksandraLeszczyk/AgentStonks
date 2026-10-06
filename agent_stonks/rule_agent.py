@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 from . import market_hours
 from . import observability as obs
 from . import scoring
+from . import clock
 from .clock import now as _now
 from .config import APPLE_TRADER_BAR_LAG_SEC, APPLE_TRADER_CYCLE_SEC
 from .state import append_agent_log as _log
@@ -366,5 +367,5 @@ def launch(
     state.agent_activity = (WAITING, "Agent starting")
     scoring.begin_session(state, agent_key, [ticker] if isinstance(ticker, str) else list(ticker))
     threading.Thread(
-        target=target, args=(*args, stop_event), daemon=True
+        target=clock.inherit(target), args=(*args, stop_event), daemon=True
     ).start()

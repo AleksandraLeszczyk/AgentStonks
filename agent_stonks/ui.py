@@ -19,9 +19,11 @@ from . import (
     apple_models,
     candidates,
     candle_patterns,
+    clock,
     last_setup,
     market_hours,
     model_overlays,
+    replay,
     session_store,
 )
 from . import apple_trader_ui
@@ -296,10 +298,35 @@ def _session_is_active(session_id: str) -> bool:
         return True
 
 
+# The sidebar's Dummy data switch and the replay it starts (see agent_stonks.replay).
+DUMMY_DATA_KEY = "sidebar_dummy_data"
+REPLAY_DAY_KEY = "sidebar_replay_day"
+REPLAY_START_KEY = "sidebar_replay_start"
+
+
+def _replaying() -> bool:
+    """Whether this page has Dummy data on."""
+    return bool(st.session_state.get(DUMMY_DATA_KEY))
+
+
 def _get_state() -> AppState:
     # Any rerun, in any session, stops the streams of sessions whose browser
     # has gone for good (see stream.reap_dead_sessions).
     reap_dead_sessions(_session_is_active)
+    if _replaying():
+        # Dummy data: every panel shows the process's replay instead of this
+        # session's live state, which carries on untouched beside it. This
+        # script run reads the replayed clock from here on (agent_stonks.clock
+        # thread scopes), as do the threads it starts -- the agent above all.
+        state = replay.app_state()
+        session = replay.session_of(state)
+        if session is not None:
+            session.touch()
+            clock.bind(session)
+        else:
+            clock.unbind()
+        return state
+    clock.unbind()
     if "app_state" not in st.session_state:
         # A browser coming back from a dropped connection, or a reload, is a
         # new session: it takes over the state that kept running without it
@@ -531,7 +558,7 @@ def _today_range(
         except (KeyError, TypeError, ValueError):
             pass
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = clock.now().strftime("%Y-%m-%d")
     todays = [b for b in intraday_bars if str(b.get("t", "")).startswith(today)]
     if not todays:
         return None, None, None
@@ -1192,7 +1219,7 @@ def _live_chart_controls() -> None:
 
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
-            disabled=not (state.symbols and state.api_key),
+            disabled=not (state.symbols and state.api_key) or replay.is_replay(state),
             help="Re-fetch each symbol's session bars via REST and merge any that the "
             "stream missed, e.g. while it was stopped. Bars older than 15 minutes come "
             "from yfinance (regular session) or the history feed (pre/post-market); "
@@ -1309,6 +1336,10 @@ def _refresh_option_chain(sym_state: SymbolState) -> None:
     failure is logged by `fetch_option_chain` and simply retried on the next
     interval; the chart keeps drawing the last chain it had.
     """
+    if replay.is_replay(sym_state.app):
+        # Today's chain over a past session's tape would be a made-up read; a
+        # replay draws only the net gamma the live app kept that day.
+        return
     sym = sym_state.symbol
     now = time.monotonic()
     with _option_fetch_lock:
@@ -1710,6 +1741,13 @@ def _options_walls_panel(symbols: list[str]) -> None:
     Put Wall / gamma read. The agent's get_put_call_walls tool only reads whatever
     this last stored on the SymbolState."""
     state = _get_state()
+    if replay.is_replay(state):
+        st.info(
+            "🎬 Not available in a replay: the options chain has no point-in-time history, and "
+            "today's chain drawn over a past session would be a made-up read. The "
+            "replaying agent's walls tool says \"no data\", as in a SimLab run."
+        )
+        return
     if not symbols:
         st.plotly_chart(empty_chart("Enter symbols in the sidebar"), width='stretch')
         return
@@ -2231,7 +2269,7 @@ def _record_live_equity_point(state: AppState) -> None:
     with state.lock:
         state.agent_equity_history.append(
             {
-                "ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                "ts": pd.Timestamp(clock.now()).isoformat(),
                 "price": None,
                 "cash": snap["cash"],
                 "position": sum(snap["positions"].values()),
@@ -3024,7 +3062,25 @@ def _execution_controls() -> str:
     account an automated strategy is about to trade is the single most
     consequential setting on this page, and it should not be possible to press
     ▶ Start without having seen it.
+
+    A replay (Dummy data) has one venue whatever this says: `ReplayBroker`,
+    filling at the replayed price. The picker is drawn disabled so its choice
+    is still there when Dummy data goes off.
     """
+    if _replaying():
+        st.selectbox(
+            "Order execution",
+            TRADING_MODES,
+            index=TRADING_MODES.index(DEFAULT_TRADING_MODE),
+            format_func=lambda m: MODE_LABELS.get(m, m),
+            key="agent_trading_mode",
+            disabled=True,
+        )
+        st.caption(
+            "🎬 Dummy data: every order fills locally at the replayed price. No venue "
+            "is used, whatever is picked above."
+        )
+        return "local"
     mode = st.selectbox(
         "Order execution",
         TRADING_MODES,
@@ -3126,6 +3182,10 @@ def _start_agent(
         rule_tickers = [apple_config.ticker]
     unstreamed = [t for t in rule_tickers if t not in syms]
     stream_ready = False
+    # Dummy data: the replay is the stream, its broker the venue, and this
+    # click is what sets its clock running.
+    replaying = _replaying()
+    session = replay.session_of(state) if replaying else None
     if not syms:
         st.error("Enter at least one symbol in the sidebar first.")
     elif is_orchestra and not isinstance(apple_config, OrchestraConfig):
@@ -3138,6 +3198,28 @@ def _start_agent(
         )
     elif not llm_key and not is_rule_agent:
         st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
+    elif replaying:
+        # A replay not loaded yet, stopped, or for other symbols is loaded
+        # here, as the live branch below starts the stream.
+        stream_ready = (
+            session is not None
+            and not session.stop_event.is_set()
+            and all(session.app.sym(s) is not None for s in syms)
+        )
+        if not stream_ready:
+            key = alpaca_key.strip() or os.getenv("ALPACA_API_KEY", "")
+            secret = alpaca_secret.strip() or os.getenv("ALPACA_SECRET", "")
+            if not key or not secret:
+                st.error(
+                    "Alpaca API key and secret are required to download the replayed day "
+                    "(sidebar Connection expander, or the ALPACA_API_KEY / ALPACA_SECRET "
+                    "environment variables)."
+                )
+            elif _start_replay_session(syms, key, secret, history_feed):
+                state = replay.app_state()
+                session = replay.session_of(state)
+                clock.bind(session)
+                stream_ready = session is not None
     else:
         # The live stream feeds every tool the agent reads. If it isn't
         # running for these symbols yet, start it here rather than sending
@@ -3179,9 +3261,18 @@ def _start_agent(
         # resolve_broker degrades to local simulation and says so, so a
         # misconfigured or blocked account can never silently become a
         # different account than the one the user picked.
-        live_broker, effective_mode, broker_message = resolve_broker(
-            trading_mode_choice
-        )
+        if session is not None:
+            live_broker, effective_mode, broker_message = (
+                replay.ReplayBroker(session),
+                "local",
+                "Replay — dummy data: orders fill at the replayed price and nothing "
+                "leaves this app.",
+            )
+            trading_mode_choice = "local"
+        else:
+            live_broker, effective_mode, broker_message = resolve_broker(
+                trading_mode_choice
+            )
         # Read before `trading_mode` becomes the new venue: a ledger is only
         # continued on the venue it was kept on.
         continuing = continue_today and session_store.continues(state, effective_mode)
@@ -3207,8 +3298,10 @@ def _start_agent(
         if continuing:
             tracker.carry_over(prior)
         else:
-            # Starting over must not destroy what the day already did.
-            session_store.archive()
+            # Starting over must not destroy what the day already did. (A
+            # replay's day is not on disk; its date would name a real file.)
+            if session is None:
+                session_store.archive()
             state.starting_budget = starting_budget
             levels = getattr(state, "apple_trader_levels", None)
             if levels:
@@ -3275,10 +3368,10 @@ def _start_agent(
                 },
             )
             if state.agent_start_time is None:
-                state.agent_start_time = datetime.now(tz=timezone.utc)
+                state.agent_start_time = clock.now()
         else:
             state.agent_log = []
-            state.agent_start_time = datetime.now(tz=timezone.utc)
+            state.agent_start_time = clock.now()
             state.agent_equity_history = []
         # How this run was started, saved with the day while it runs, so a
         # restart of the app can start it again the same way.
@@ -3291,6 +3384,11 @@ def _start_agent(
             "starting_budget": float(starting_budget),
             "apple_config": asdict(apple_config) if apple_config is not None else None,
         }
+        if session is not None:
+            # The replay starts with its agent: from here the tape plays at
+            # the speed of a real session, and the agent's thread inherits
+            # this run's replayed clock.
+            session.run()
         if is_orchestra:
             launch_orchestra(
                 state,
@@ -3536,6 +3634,10 @@ def _agent_panel(
             finnhub_token=finnhub_token,
             history_feed=history_feed,
         )
+        if _get_state() is not state:
+            # ▶ Start Agent loaded a new replay (Dummy data): its state has not
+            # had this page's settings drawn onto it yet, so draw it again.
+            st.rerun()
 
     if stop_clicked:
         stop_agent(state)
@@ -3760,8 +3862,17 @@ def premarket_llm_settings(state: AppState) -> tuple[str, str, str]:
 
 
 def _launch_premarket(state: AppState, symbols: list[str]) -> None:
-    """Kick off the automatic briefing for `symbols` on a background thread."""
+    """Kick off the automatic briefing for `symbols` on a background thread.
+
+    A replay's ↻ Regenerate writes the replayed morning's briefing again, from
+    what was known before that open, and replaces the cached one."""
     provider, llm_key, model = premarket_llm_settings(state)
+    session = replay.session_of(state)
+    if session is not None:
+        session.launch_briefing(provider, model, llm_key, force=True)
+        return
+    if replay.is_replay(state):
+        return
     launch_premarket_analysis(
         state,
         symbols,
@@ -3961,6 +4072,44 @@ def _premarket_panel(symbols: list[str]) -> None:
             st.info("Enter symbols in the sidebar first.")
 
     _premarket_results(symbols, llm_key)
+
+
+def _start_replay_session(
+    syms: "list[str]", key: str, secret: str, history_feed: str = DEFAULT_HISTORY_FEED,
+) -> bool:
+    """What the sidebar's ▶ Start does with Dummy data on: download the
+    replayed day into SimLab's store, seed the page as it stood at the start
+    time (09:29 ET unless changed) and launch the pre-market briefing -- from
+    the replay's cache when it has one. The clock waits there for the Agent
+    tab's ▶ Start Agent. True when the replay is ready.
+
+    Shared by the sidebar and by ▶ Start Agent, which loads the replay itself
+    when it is not loaded yet, as the live branch starts the stream."""
+    day = st.session_state.get(REPLAY_DAY_KEY) or replay.previous_session()
+    start = st.session_state.get(REPLAY_START_KEY) or replay.DEFAULT_START
+    if st.session_state.get("live_timeframe", TIMEFRAMES[0]) != "1Min":
+        st.info("A replay plays 1-minute bars; the chart's timeframe setting does not apply to it.")
+    progress = st.empty()
+    with st.spinner(f"Loading the replay of {day:%a %Y-%m-%d}…"):
+        try:
+            session = replay.prepare(
+                syms, day, start, key, secret, history_feed,
+                progress=lambda msg: progress.caption(msg),
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).exception("The replay could not be loaded")
+            progress.empty()
+            st.error(f"Could not load the replay of {day:%Y-%m-%d}: {exc}")
+            return False
+    progress.empty()
+    clock.bind(session)
+    provider, llm_key, model = premarket_llm_settings(session.app)
+    session.launch_briefing(provider, model, llm_key)
+    news_provider = st.session_state.get("news_llm_provider_select") or session.app.news_llm_provider
+    if news_provider in ENV_KEYS:
+        session.app.news_llm_provider = news_provider
+        replay.score_initial_news(session, news_provider, os.getenv(ENV_KEYS[news_provider], ""))
+    return True
 
 
 def _start_live_session(
@@ -4321,6 +4470,20 @@ def _recovery_banner(state: AppState) -> None:
         )
 
 
+@st.fragment(run_every=POLL_SEC)
+def _replay_banner() -> None:
+    """Dummy data's one line above the tabs: which day, what time it is in
+    it, and whether it is playing -- the presenter's clock."""
+    state = _get_state()
+    if replay.session_of(state) is None:
+        st.caption(
+            "🎬 **Dummy data** — ▶ Start in the sidebar loads the replayed day; "
+            "▶ Start Agent in the Agent tab plays it, at the speed of a real session."
+        )
+        return
+    st.caption(state.status)
+
+
 @contextmanager
 def _panel_guard(label: str):
     """Keep one tab's failure from taking the whole page down.
@@ -4359,6 +4522,8 @@ def build_ui() -> None:
         c1, c2 = st.columns(2)
         start_clicked = c1.button("▶ Start", type="primary", width='stretch')
         stop_clicked = c2.button("⏹ Stop", width='stretch')
+        if _replaying():
+            st.caption("🎬 Dummy data is on (Connection): Start loads a replay.")
         symbols_input = st.text_input(
             "Symbols",
             value="AAPL",
@@ -4368,6 +4533,39 @@ def build_ui() -> None:
             "analyses, and the trading agent cover every listed symbol.",
         )
         with st.expander("Connection"):
+            dummy_data = st.checkbox(
+                "Dummy data — replay a past session",
+                key=DUMMY_DATA_KEY,
+                help=(
+                    "Plays a session that already happened through this app as though "
+                    "it were live, one second per second — for demos.\n\n"
+                    "**▶ Start** (above) downloads the day, shows the chart as it stood "
+                    "at the start time and prepares the pre-market briefing (or loads "
+                    "the one written for that day before). **▶ Start Agent** in the "
+                    "Agent tab sets the clock running and starts the agent, as on a "
+                    "real morning.\n\n"
+                    "Orders only ever fill locally at the replayed price. Your live "
+                    "session is left as it is and comes back when this is switched off."
+                ),
+            )
+            if dummy_data:
+                newest = replay.last_replayable_day()
+                st.date_input(
+                    "Replayed day",
+                    value=min(replay.previous_session(), newest),
+                    max_value=newest,
+                    key=REPLAY_DAY_KEY,
+                    help="The previous session by default. A day's whole tape can be "
+                    "downloaded from 20:30 ET.",
+                )
+                st.time_input(
+                    "Starts at (ET)",
+                    value=replay.DEFAULT_START,
+                    step=60,
+                    key=REPLAY_START_KEY,
+                    help="Where the clock stands until ▶ Start Agent. 09:29 shows the "
+                    "agent arming before the bell.",
+                )
             live_source = st.selectbox(
                 "Live data source",
                 list(LIVE_SOURCES),
@@ -4441,6 +4639,8 @@ def build_ui() -> None:
     with _panel_guard("Restart recovery"):
         _resume_after_restart(state, api_key, api_secret, finnhub_token)
         _recovery_banner(state)
+    if _replaying():
+        _replay_banner()
     symbols = _effective_symbols(state, symbols_input)
 
     (
@@ -4454,18 +4654,28 @@ def build_ui() -> None:
     )
 
     with tab_live, _panel_guard("The Live tab"):
-        st.caption(
-            "Live candles are built locally from the Finnhub trade tape by default, so the "
-            "newest candle is the minute in progress. Bid/ask, the bar backfill and the "
-            "stream-down fallback still come from Alpaca REST — and on a free Alpaca "
-            "account the IEX feed only serves US market hours (9:30–16:00 ET). "
-            "Switch sources in the sidebar's Connection expander."
-        )
+        if replay.is_replay(state):
+            st.caption(
+                "🎬 Dummy data: a stored session played back at the speed of a real one. "
+                "The newest candle is the minute in progress, walked from the stored "
+                "bar's open through its extremes to its close, and replaced by the "
+                "stored bar when the minute ends. There is no bid/ask and no options "
+                "chain to replay."
+            )
+        else:
+            st.caption(
+                "Live candles are built locally from the Finnhub trade tape by default, so the "
+                "newest candle is the minute in progress. Bid/ask, the bar backfill and the "
+                "stream-down fallback still come from Alpaca REST — and on a free Alpaca "
+                "account the IEX feed only serves US market hours (9:30–16:00 ET). "
+                "Switch sources in the sidebar's Connection expander."
+            )
         timeframe = st.session_state.get("live_timeframe", TIMEFRAMES[0])
 
         timeframe_changed = (
             state.symbols
             and state.api_key
+            and not replay.is_replay(state)
             and timeframe != state.timeframe
             and not start_clicked
             and not stop_clicked
@@ -4518,6 +4728,10 @@ def build_ui() -> None:
                 st.error("Please enter at least one symbol.")
             elif not key or not secret:
                 st.error("API key and secret are required.")
+            elif _replaying():
+                if _start_replay_session(syms, key, secret, history_feed):
+                    # Every panel reads the new replay from the top.
+                    st.rerun()
             else:
                 _start_live_session(
                     state, syms, key, secret, feed, timeframe,
@@ -4526,8 +4740,11 @@ def build_ui() -> None:
                 )
 
         if stop_clicked:
-            stop_streams(state)
-            session_store.save(state)
+            if _replaying():
+                replay.stop_current("stopped")
+            else:
+                stop_streams(state)
+                session_store.save(state)
 
         _live_panel()
 

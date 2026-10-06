@@ -96,8 +96,8 @@ import numpy as np
 import pandas as pd
 
 from . import (
-    apple_models, event_days, historical, intraday_vol_model, market_hours, momentum_regime,
-    profile_model,
+    apple_models, clock, event_days, historical, intraday_vol_model, market_hours,
+    momentum_regime, profile_model,
 )
 from .config import MODEL_OVERLAY_COLORS
 
@@ -1493,7 +1493,7 @@ def _live_dayrange_inputs(
     """
     if not any(k in _DAYRANGE_DRIVEN and OVERLAYS[k].covers(symbol) for k in wanted):
         return {}
-    today = datetime.now(timezone.utc).astimezone(market_hours.MARKET_TZ).date()
+    today = clock.now().astimezone(market_hours.MARKET_TZ).date()
     is_today = session_date is not None and session_date.date() == today
     return {
         "dayrange_daily_bars": historical.fetch_daily_ohlc_bars(symbol),

@@ -258,7 +258,13 @@ class Scorecard:
 @_never_raise
 def begin_session(state: "AppState", mode: str, symbols: list[str]) -> None:
     """Attach a fresh scorecard for a launching agent session. `mode` is the
-    personality key, or "automatic" for the orchestrator."""
+    personality key, or "automatic" for the orchestrator.
+
+    A replay of a past session (`agent_stonks.replay`) gets none: its trades
+    are dummy data and must not reach the journal or a day's report."""
+    if getattr(state, "replay", None) is not None:
+        state.scorecard = None
+        return
     start_value = state.mark_to_market()
     if start_value is None:
         start_value = state.starting_budget
@@ -794,7 +800,10 @@ def maybe_score_day(
     session, if `state` carries a live scorecard -- totals less than
     ``SCORING_MIN_TOTAL_RUNTIME_SEC``. Otherwise writes and returns the report.
     Cheap to call every cycle: the already-scored check is one stat() call.
+    Never from a replay's loop: the real day is not its business.
     """
+    if state is not None and getattr(state, "replay", None) is not None:
+        return None
     now = now or _utcnow()
     day = _day_key(now)
     with _score_lock:

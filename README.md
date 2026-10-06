@@ -93,6 +93,15 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 
 <img width="796" height="615" alt="Screenshot 2026-09-30 at 10 54 31" src="https://github.com/user-attachments/assets/f4cec5aa-53a9-4313-ac7d-7ded9d6c1467" />
 
+### 🎬 Dummy data — replay a past session
+
+For demos: **Connection → Dummy data** plays a session that already happened through the main app as though it were live, one second per second.
+
+- **▶ Start** (sidebar) downloads the day — the previous session by default — into SimLab's store, shows every tab as it stood at the start time (09:29 ET by default) and prepares the pre-market briefing as of 09:25 that morning, or loads the one written for that day before (`data/replay/briefings/`).
+- **▶ Start Agent** (Agent tab) sets the clock running and starts the agent, so the whole morning plays out as on a real day: the agent arms before the bell, the minute in progress forms on the chart, news arrives when it was published.
+- The agent sees what a SimLab run of that day would show it: every live fetch an agent cycle makes is answered from the stored day, for the replay's threads only — a live session in another tab keeps the real clock and the real data.
+- Orders only ever fill locally at the replayed price, whatever venue is picked; nothing of a replay is written to `data/sessions/`, the scoring journal or the days-off verdicts. No bid/ask or options chain is replayed. ⏹ Stop ends the replay; switching Dummy data off brings the live session back as it was.
+
 ### 🧪 SimLab — strategy testing suite (`sim_main.py`)
 A separate app that replays the trading agents against **stored historical sessions** instead of the live tape — same prompts, same tools, same execution path (`run_agent_cycle`, `DecisionTracker`, `TacticsExecutor`), so a strategy tested here is exactly the strategy that trades live. Hours of "wait for the condition" collapse into minutes: between LLM cycles the engine fast-forwards bar by bar, firing armed tactics, condition alerts, and news wake-ups deterministically from the stored data.
 
@@ -309,7 +318,11 @@ agent_stonks/
   ui.py         — Streamlit layout (Agent / Live / News / Pre-Market / Technical Analysis /
                   Put-Call Walls / ML Models tabs), event callbacks
   clock.py      — swappable time source: wall clock live, pinned to the replayed
-                  moment under SimLab (agent path reads time through here)
+                  moment under SimLab, or bound to a replay's own threads (agent path
+                  reads time through here)
+  replay.py     — the sidebar's Dummy data: a stored session played back through the
+                  live app at real speed (SimLab's store, market and patches, a
+                  thread-scoped clock, a forming-candle feed, a local-only broker)
 simlab/
   data.py       — dataset download + smart local store (minute bars from yfinance by
                   default, Alpaca iex/sip on request; gzip JSON, deduplicated per

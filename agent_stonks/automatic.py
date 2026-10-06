@@ -37,6 +37,7 @@ import threading
 from typing import Any
 
 from . import agent
+from . import clock
 from . import market_hours
 from . import observability as obs
 from . import scoring
@@ -657,7 +658,7 @@ def launch_automatic(
     state.automatic_reason = None
     state.automatic_assignments = {}
     threading.Thread(
-        target=_automatic_loop,
+        target=clock.inherit(_automatic_loop),
         args=(state, tracker, symbols, provider, api_key, model, cycle_sec, stop_event),
         daemon=True,
     ).start()

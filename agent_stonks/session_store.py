@@ -135,8 +135,16 @@ def owner_token(state) -> str:
     return token
 
 
+def _is_replay(state) -> bool:
+    """A replay of a past session (`agent_stonks.replay`) is dummy data: it
+    never owns a day, and nothing of it reaches a session file."""
+    return getattr(state, "replay", None) is not None
+
+
 def claim(state, day: "str | None" = None) -> None:
     """Make `state` the one that writes `day`'s file (today by default)."""
+    if _is_replay(state):
+        return
     with _owners_lock:
         _owners[day or session_date()] = owner_token(state)
 
@@ -267,7 +275,9 @@ def save(state, *, force: bool = False) -> "Path | None":
     """Write `state`'s session to its day's file, atomically.
 
     Skipped (None) when another state owns the day -- unless `force` -- or
-    when there is nothing to keep yet."""
+    when there is nothing to keep yet. Never for a replay, `force` or not."""
+    if _is_replay(state):
+        return None
     day = getattr(state, "session_date", "") or session_date()
     with _owners_lock:
         owner = _owners.get(day)
@@ -499,7 +509,10 @@ def _signature(state) -> tuple:
 def start_autosave(state, interval: float = AUTOSAVE_SEC) -> None:
     """Save `state` on a background thread whenever it changes. Idempotent.
 
-    Holds only a weak reference, so the thread ends with the session."""
+    Holds only a weak reference, so the thread ends with the session. A
+    replay has nothing to save."""
+    if _is_replay(state):
+        return
     thread = state.__dict__.get("_session_autosave")
     if thread is not None and thread.is_alive():
         return

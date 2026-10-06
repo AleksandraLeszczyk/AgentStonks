@@ -200,5 +200,5 @@ def levels(symbol: str, day: date, daily_bars: "list[dict] | None" = None) -> "d
             with _lock:
                 _running.discard(key)
 
-    threading.Thread(target=fetch, name=f"prior-profile-{symbol}", daemon=True).start()
+    threading.Thread(target=clock.inherit(fetch), name=f"prior-profile-{symbol}", daemon=True).start()
     return None

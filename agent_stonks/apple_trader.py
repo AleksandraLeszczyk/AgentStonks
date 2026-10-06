@@ -1886,7 +1886,7 @@ class DayRangeTrader(BaseTrader):
             except Exception:  # noqa: BLE001 -- the 9:33 forecast retries and reports
                 pass
 
-        threading.Thread(target=work, name=f"highlow3m-warm-{ticker}", daemon=True).start()
+        threading.Thread(target=clock.inherit(work), name=f"highlow3m-warm-{ticker}", daemon=True).start()
         _log(state, {"type": "status", "text": (
             f"Fetching {ticker}'s minute history and last night's option tables in the "
             "background for the 9:33 HighLow_3m forecast."

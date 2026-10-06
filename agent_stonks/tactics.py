@@ -315,7 +315,7 @@ class TacticsExecutor:
         self._thread: "threading.Thread | None" = None
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=clock.inherit(self._loop), daemon=True)
         self._thread.start()
 
     def stop(self) -> None:

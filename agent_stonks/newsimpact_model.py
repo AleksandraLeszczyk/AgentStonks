@@ -952,5 +952,5 @@ def launch_refresh(sym_state, key: str, secret: str, feed: str, force: bool = Fa
         finally:
             sym_state.news_impact_scoring = False
 
-    threading.Thread(target=run, name=f"news-impact-{sym_state.symbol}", daemon=True).start()
+    threading.Thread(target=clock.inherit(run), name=f"news-impact-{sym_state.symbol}", daemon=True).start()
     return True

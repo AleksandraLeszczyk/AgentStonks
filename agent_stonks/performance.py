@@ -14,6 +14,8 @@ from typing import Any
 
 import pandas as pd
 
+from . import clock
+
 
 def _decision_positions(decision: dict) -> dict[str, float]:
     """Positions snapshot after a decision. Falls back to the single-symbol
@@ -99,13 +101,14 @@ def compute_equity_curve(
         )
 
     if live_prices:
-        _apply_decisions_up_to(pd.Timestamp.now(tz="UTC"))
+        now = pd.Timestamp(clock.now())
+        _apply_decisions_up_to(now)
         for sym, price in live_prices.items():
             if price is not None:
                 prices[sym] = float(price)
         points.append(
             {
-                "ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                "ts": now.isoformat(),
                 "price": next(iter(live_prices.values()), None),
                 "cash": cash,
                 "position": sum(positions.values()),

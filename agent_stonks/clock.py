@@ -11,9 +11,21 @@ lands on the simulated session rather than the real one.
 Only the agent path is routed through here. UI rendering, stream plumbing,
 and report generation keep the real wall clock -- they describe the live app,
 not a simulated tape.
+
+Two ways to move it, for two different owners:
+
+- **the pin** (`set_simulated` / `clear`) is process-wide. SimLab owns its
+  whole process, so pinning every thread at once is exactly right there.
+- **a thread scope** (`bind` / `unbind` / `inherit`) moves only the threads
+  bound to it. The live app's replay of a past session (`agent_stonks.replay`)
+  runs inside the same process as a live session that must keep the real
+  time, so its clock is bound to the replay's own threads -- the page's script
+  run, its data feed, its agent and whatever those start through `inherit` --
+  and to nothing else.
 """
 from __future__ import annotations
 
+import threading
 import time as _time
 from datetime import datetime, timezone
 
@@ -26,9 +38,17 @@ _sim_now: "datetime | None" = None
 # now() while pinned (used by hold_sec timers and recent-price windows).
 _sim_monotonic: "float | None" = None
 
+# The scope this thread is bound to: anything with a `now()` returning an
+# aware datetime. Unset = not bound.
+_local = threading.local()
+
 
 def now() -> datetime:
-    """Current time (UTC): the pinned simulation time, else the wall clock."""
+    """Current time (UTC): this thread's scope, else the pinned simulation
+    time, else the wall clock."""
+    scope = getattr(_local, "scope", None)
+    if scope is not None:
+        return scope.now()
     return _sim_now or datetime.now(timezone.utc)
 
 
@@ -55,6 +75,50 @@ def clear() -> None:
     global _sim_now, _sim_monotonic
     _sim_now = None
     _sim_monotonic = None
+
+
+# --------------------------------------------------------------------------
+# Thread scopes
+#
+# `monotonic()` deliberately ignores the scope: the one scope there is, the
+# live replay, runs at the speed of the wall clock, so real monotonic seconds
+# already are its seconds -- and the stream stamps `recent_prices` with
+# `time.monotonic()` directly.
+# --------------------------------------------------------------------------
+
+def bind(scope: object) -> None:
+    """Bind this thread to `scope` (anything with `now()`), until `unbind`."""
+    _local.scope = scope
+
+
+def unbind() -> None:
+    """Return this thread to the pin / the wall clock."""
+    _local.scope = None
+
+
+def scope() -> "object | None":
+    """The scope this thread is bound to, or None."""
+    return getattr(_local, "scope", None)
+
+
+def inherit(target):
+    """`target` wrapped to run bound to the scope of the thread calling this.
+
+    For `threading.Thread(target=clock.inherit(fn))`: a thread starts unbound,
+    so a replay's agent would otherwise read the wall clock the moment it
+    left the thread that launched it. Unbound callers get a wrapper that runs
+    `target` unbound, i.e. the live behaviour unchanged.
+    """
+    bound = scope()
+
+    def run(*args, **kwargs):
+        _local.scope = bound
+        try:
+            return target(*args, **kwargs)
+        finally:
+            _local.scope = None
+
+    return run
 
 
 # --------------------------------------------------------------------------

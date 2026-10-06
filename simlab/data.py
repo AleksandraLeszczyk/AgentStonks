@@ -778,8 +778,7 @@ def _store_daily(
     return True
 
 
-def create_dataset(
-    name: str,
+def download_days(
     symbols: list[str],
     start: date,
     end: date,
@@ -787,36 +786,17 @@ def create_dataset(
     secret: str = "",
     feed: str = DEFAULT_FEED,
     progress: ProgressCb = _noop_progress,
-) -> Dataset:
-    """Create (or refresh) a named dataset, downloading only what the store
-    is missing. Returns the manifest entry with its resolved trading days.
+) -> list[str]:
+    """Fill the store with everything a replay of [start, end] reads -- the
+    daily history, the market indicators, the week before the first session
+    and every day's bars and news -- downloading only what is missing or not
+    whole. Returns the session days (ISO) that have bars.
 
-    `key`/`secret` are Alpaca credentials. On the default yfinance feed they
-    are only needed for news, which is skipped (stored empty) without them; the
-    Alpaca feeds require them for bars.
+    `create_dataset` without the manifest entry: the live app's replay of a
+    past session (`agent_stonks.replay`) reads the same store, and has no
+    business adding a dataset to SimLab's list every time it is started.
+    Arguments are taken as validated (`create_dataset` checks them).
     """
-    symbols = [s.strip().upper() for s in symbols if s.strip()]
-    if not symbols:
-        raise ValueError("dataset needs at least one symbol")
-    if end < start:
-        raise ValueError("dataset end date is before its start date")
-    if feed not in FEEDS:
-        raise ValueError(f"unknown feed {feed!r}; expected one of {', '.join(FEEDS)}")
-    if feed != "yfinance" and not (key and secret):
-        raise ValueError(f"the {feed!r} feed needs Alpaca credentials")
-
-    # Yahoo's 1-minute history stops ~30 days back. Say so up front rather than
-    # letting the run finish with a handful of silently empty days: those days
-    # are indistinguishable from holidays once stored.
-    if feed == "yfinance":
-        horizon = date.today() - timedelta(days=YF_MINUTE_WINDOW_DAYS)
-        if start < horizon:
-            progress(
-                f"warning: yfinance serves 1-minute bars only back to {horizon} "
-                f"({YF_MINUTE_WINDOW_DAYS} days); days before that will store empty. "
-                "Use the 'sip' feed (paid Alpaca data) for an older window."
-            )
-
     # Daily bars first: they double as the trading-day calendar for the range.
     daily_start = start - timedelta(days=DAILY_LOOKBACK_DAYS)
     for sym in symbols:
@@ -869,6 +849,50 @@ def create_dataset(
             day_has_bars = any(load_day_bars(sym, day, feed) for sym in symbols)
         if day_has_bars:
             session_days.append(day.isoformat())
+
+    return session_days
+
+
+def create_dataset(
+    name: str,
+    symbols: list[str],
+    start: date,
+    end: date,
+    key: str = "",
+    secret: str = "",
+    feed: str = DEFAULT_FEED,
+    progress: ProgressCb = _noop_progress,
+) -> Dataset:
+    """Create (or refresh) a named dataset, downloading only what the store
+    is missing. Returns the manifest entry with its resolved trading days.
+
+    `key`/`secret` are Alpaca credentials. On the default yfinance feed they
+    are only needed for news, which is skipped (stored empty) without them; the
+    Alpaca feeds require them for bars.
+    """
+    symbols = [s.strip().upper() for s in symbols if s.strip()]
+    if not symbols:
+        raise ValueError("dataset needs at least one symbol")
+    if end < start:
+        raise ValueError("dataset end date is before its start date")
+    if feed not in FEEDS:
+        raise ValueError(f"unknown feed {feed!r}; expected one of {', '.join(FEEDS)}")
+    if feed != "yfinance" and not (key and secret):
+        raise ValueError(f"the {feed!r} feed needs Alpaca credentials")
+
+    # Yahoo's 1-minute history stops ~30 days back. Say so up front rather than
+    # letting the run finish with a handful of silently empty days: those days
+    # are indistinguishable from holidays once stored.
+    if feed == "yfinance":
+        horizon = date.today() - timedelta(days=YF_MINUTE_WINDOW_DAYS)
+        if start < horizon:
+            progress(
+                f"warning: yfinance serves 1-minute bars only back to {horizon} "
+                f"({YF_MINUTE_WINDOW_DAYS} days); days before that will store empty. "
+                "Use the 'sip' feed (paid Alpaca data) for an older window."
+            )
+
+    session_days = download_days(symbols, start, end, key, secret, feed, progress)
 
     dataset = Dataset(
         name=name,
