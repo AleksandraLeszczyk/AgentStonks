@@ -21,6 +21,7 @@ from .config import (
     NEWS_IMPACT_COLORS,
     NEWS_MARKER_OFFSET_FRAC,
     PALETTE,
+    PRIOR_PROFILE_COLOR,
     SESSION_MARKER_COLOR,
 )
 
@@ -683,38 +684,63 @@ _OPTION_WALLS = (
 _EDGE_LABEL_STEP_PX = 14
 
 
-def _add_option_walls(
-    option_walls: dict, fig: go.Figure, x0: datetime, x1: datetime,
-    price_low: float, price_high: float,
-) -> None:
-    """Dashed horizontal lines at the options Call Wall, Put Wall and gamma flip.
+def _option_wall_levels(option_walls: dict) -> "list[tuple[str, float, dict]]":
+    """(label, price, line) for each options level in `option_walls`.
 
     Expects {"call_wall": float | None, "put_wall": float | None,
     "gamma_flip": float | None} (the walls from
     technical_analysis.get_put_call_walls_and_gamma, the flip from
     options.gamma_flip); a missing key or None skips that level.
+    """
+    return [
+        (label, float(option_walls[key]), dict(color=color, width=1.5, dash="dash"))
+        for key, label, color in _OPTION_WALLS
+        if option_walls.get(key) is not None
+    ]
 
-    The walls are strikes with the most open interest, and one can sit far
-    from where the stock trades today -- 20% away is not unusual. A line there
-    would stretch the price axis until the candles are a flat strip, so a level
-    outside the session's range, widened by one range (and at least 0.5% of
-    price) either side, is instead a label pinned to the top or bottom edge of
-    the chart's left corner, pointing the way to it. Labels sharing an edge
-    stack away from it, so a far call wall and a far flip don't overprint.
+
+def _prior_profile_levels(prior_profile: dict) -> "list[tuple[str, float, dict]]":
+    """(label, price, line) for the previous session's volume-profile levels.
+
+    Expects {"poc": float | None, "peaks": [float, ...]} (see
+    prior_profile.levels; the UI passes only the parts switched on). The POC
+    is the stronger line, the other peaks a dotted one in the same colour.
+    """
+    color = PRIOR_PROFILE_COLOR
+    levels = []
+    if prior_profile.get("poc") is not None:
+        levels.append(("Prev POC", float(prior_profile["poc"]), dict(color=color, width=1.5, dash="dashdot")))
+    for peak in prior_profile.get("peaks") or []:
+        levels.append(("Prev peak", float(peak), dict(color=color, width=1, dash="dot")))
+    return levels
+
+
+def _add_reference_levels(
+    levels: "list[tuple[str, float, dict]]", fig: go.Figure, x0: datetime, x1: datetime,
+    price_low: float, price_high: float,
+) -> None:
+    """Horizontal lines at fixed prices from outside the session -- the options
+    levels, the previous session's profile -- each `(label, price, line)`.
+
+    A wall is the strike with the most open interest, and one can sit far from
+    where the stock trades today -- 20% away is not unusual; a gap open leaves
+    yesterday's POC as far behind. A line there would stretch the price axis
+    until the candles are a flat strip, so a level outside the session's range,
+    widened by one range (and at least 0.5% of price) either side, is instead a
+    label pinned to the top or bottom edge of the chart's left corner, pointing
+    the way to it. Labels sharing an edge stack away from it, so a far call
+    wall and a far POC don't overprint.
     """
     pad = max(price_high - price_low, 0.005 * price_high)
     on_edge = {True: 0, False: 0}
-    for key, label, color in _OPTION_WALLS:
-        level = option_walls.get(key)
-        if level is None:
-            continue
-        font = dict(color=color, size=10, family="monospace")
+    for label, level, line in levels:
+        font = dict(color=line["color"], size=10, family="monospace")
         if price_low - pad <= level <= price_high + pad:
             fig.add_shape(
                 type="line",
                 x0=x0, x1=x1,
                 y0=level, y1=level,
-                line=dict(color=color, width=1.5, dash="dash"),
+                line=line,
                 row=1, col=1,
             )
             fig.add_annotation(
@@ -1959,6 +1985,7 @@ def build_chart(
     option_walls: Optional[dict] = None,
     day_range_lines: Optional[dict] = None,
     net_gamma: Optional[dict] = None,
+    prior_profile: Optional[dict] = None,
 ) -> go.Figure:
     """The live price chart: candles and volume, the optional momentum panels
     and overlays.
@@ -1968,6 +1995,10 @@ def build_chart(
     close: `{"t": [...], "value": [...], "note": str}`, values in $ per 1%
     move (`options.net_gamma_exposure`). Empty values draw the panel with
     `note` in it; None draws no panel.
+
+    `prior_profile` draws the previous session's volume-profile levels,
+    `{"poc": float | None, "peaks": [float, ...]}` (`prior_profile.levels`),
+    like the options walls: a line, or a corner label when far away.
     """
     if not bars:
         return empty_chart("Waiting for data…")
@@ -2276,9 +2307,12 @@ def build_chart(
         _add_price_alerts(price_alerts, fig, df["t"].iloc[0], df["t"].iloc[-1])
     if tactic_levels:
         _add_tactic_levels(tactic_levels, fig, df["t"].iloc[0], df["t"].iloc[-1])
-    if option_walls:
-        _add_option_walls(
-            option_walls, fig, df["t"].iloc[0], df["t"].iloc[-1],
+    reference_levels = (
+        _option_wall_levels(option_walls or {}) + _prior_profile_levels(prior_profile or {})
+    )
+    if reference_levels:
+        _add_reference_levels(
+            reference_levels, fig, df["t"].iloc[0], df["t"].iloc[-1],
             price_low=float(df["l"].min()), price_high=float(df["h"].max()),
         )
     if day_range_lines:

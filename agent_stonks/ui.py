@@ -116,7 +116,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
-from . import bar_history, gamma_history, minute_momentum, newsimpact_model, stream_common
+from . import bar_history, gamma_history, minute_momentum, newsimpact_model, prior_profile, stream_common
 from .trade_sound import next_trade_cue, play_trade_sound
 from .page_watchdog import WATCHDOG_BEAT_SEC, describe_reload, page_watchdog
 from .quote_card import quote_card
@@ -859,6 +859,7 @@ def _chart_panel() -> None:
             sym_state, bars, state.model_overlay_keys
         )
         option_walls = _live_option_walls(sym_state, state.option_walls)
+        prior_profile_levels = _live_prior_profile(sym_state, bars, state.prior_profile)
         day_range_lines = _day_range_lines(sym, sym_state.daily_bars, bars)
         net_gamma = (
             _live_gamma_series(sym_state, bars, state.timeframe)
@@ -900,6 +901,7 @@ def _chart_panel() -> None:
             option_walls=option_walls,
             day_range_lines=day_range_lines,
             net_gamma=net_gamma,
+            prior_profile=prior_profile_levels,
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
@@ -1049,6 +1051,30 @@ def _live_chart_controls() -> None:
                     default=[],
                     key="chart_option_walls",
                     placeholder="Options levels",
+                    label_visibility="collapsed",
+                )
+            with _help_row(
+                "Levels from the previous session's volume-by-price profile — "
+                "yesterday's, or Friday's on a Monday — built from yfinance's "
+                "1-minute bars of its regular hours, each minute's volume spread "
+                "over its low-high.\n\n"
+                "- **POC** (point of control) — the price that traded the most "
+                "volume: the profile's tallest peak. A dash-dot line.\n"
+                "- **Peaks** — the profile's other peaks: prices where volume "
+                "piled up again, standing at least "
+                f"{prior_profile.MIN_PROMINENCE:.0%} of the POC's height above "
+                "the thinner stretch separating them from it. Dotted lines; "
+                "often none or one, sometimes four.\n\n"
+                "Fetched once per symbol and day. A level far outside today's "
+                "range is a label in the chart's corner rather than a line.",
+                icon_ratio=_HALF_WIDTH_ICON,
+            ):
+                prior_profile_selection = st.multiselect(
+                    "Yesterday's profile",
+                    list(_PRIOR_PROFILE_OPTIONS),
+                    default=[],
+                    key="chart_prior_profile",
+                    placeholder="Yesterday's profile",
                     label_visibility="collapsed",
                 )
             baseline_keys = list(VOLUME_BASELINE_WINDOWS)
@@ -1206,6 +1232,7 @@ def _live_chart_controls() -> None:
     state.vwap_style = "dot" if show_vwap else "hide"
     state.show_fib = show_fib
     state.option_walls = [_OPTION_WALL_OPTIONS[o] for o in wall_selection]
+    state.prior_profile = [_PRIOR_PROFILE_OPTIONS[o] for o in prior_profile_selection]
     state.mixture_distribution = mixture_dists
     state.mixture_max_components = max_components
     state.show_predicted_profile = show_predicted
@@ -1244,6 +1271,27 @@ def _help_row(help_text: str, icon_ratio: float = 0.08):
 
 # Options levels multiselect: option label -> key in `_live_option_walls`.
 _OPTION_WALL_OPTIONS = {"Call wall": "call_wall", "Put wall": "put_wall", "Gamma flip": "gamma_flip"}
+
+# Yesterday's profile multiselect: option label -> part of `_live_prior_profile`.
+_PRIOR_PROFILE_OPTIONS = {"POC": "poc", "Peaks": "peaks"}
+
+
+def _live_prior_profile(sym_state: SymbolState, bars: "list[dict]", parts: "list[str]") -> "dict | None":
+    """The previous session's selected profile levels ({"poc": ..., "peaks":
+    [...]}) for the symbol's chart, or None when none are selected or the
+    profile hasn't been fetched yet (`prior_profile.levels` starts that)."""
+    if not parts:
+        return None
+    levels = prior_profile.levels(
+        sym_state.symbol, prior_profile.chart_day(bars), sym_state.daily_bars
+    )
+    if not levels:
+        return None
+    return {
+        "poc": levels["poc"] if "poc" in parts else None,
+        "peaks": levels["peaks"] if "peaks" in parts else [],
+    }
+
 
 # Symbols whose options chain is being fetched for the live chart right now,
 # and when each was last tried -- see `_live_option_walls`.

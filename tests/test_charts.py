@@ -1025,6 +1025,32 @@ class TestOptionWalls:
         assert edge and edge[0].yref == "y domain" and edge[0].y == 0
         assert "▼" in edge[0].text
 
+    def test_prior_profile_poc_and_peaks_drawn(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          prior_profile={"poc": 101.5, "peaks": [100.25, 102.75]})
+        texts = self._annotations(fig)
+        assert {"Prev POC 101.50", "Prev peak 100.25", "Prev peak 102.75"} <= set(texts)
+        lines = {s.y0: s.line for s in fig.layout.shapes if s.y0 == s.y1}
+        assert lines[101.5].dash == "dashdot" and lines[100.25].dash == "dot"
+        assert lines[101.5].color == lines[102.75].color == charts.PRIOR_PROFILE_COLOR
+
+    def test_prior_profile_peaks_only(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          prior_profile={"poc": None, "peaks": [100.25]})
+        texts = self._annotations(fig)
+        assert "Prev peak 100.25" in texts
+        assert not any(t.startswith("Prev POC") for t in texts)
+
+    def test_far_prior_poc_stacks_with_a_far_wall(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          option_walls={"put_wall": 70.0},
+                          prior_profile={"poc": 80.0, "peaks": []})
+        edge = {a.text: a for a in fig.layout.annotations
+                if a.text and a.yref == "y domain" and a.x == 0.005}
+        wall, poc = edge["▼ Put wall 70.00"], edge["▼ Prev POC 80.00"]
+        assert wall.y == poc.y == 0
+        assert (wall.yshift or 0) == 0 and poc.yshift > 0
+
     def test_gamma_flip_drawn(self):
         fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
                           option_walls={"gamma_flip": 101.25})

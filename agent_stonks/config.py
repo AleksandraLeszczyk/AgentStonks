@@ -874,6 +874,10 @@ MA_COLORS: dict[int, str] = {
     60: "#a78bfa",  # violet
 }
 
+# The previous session's volume-profile levels on the live chart (POC and
+# peaks, see prior_profile.py): fuchsia, which no other price-panel line uses.
+PRIOR_PROFILE_COLOR = "#e879f9"
+
 AVG_LINE_COLORS: dict[str, str] = {
     "7d":  "#34d399",  # green
     "28d": "#fbbf24",  # amber

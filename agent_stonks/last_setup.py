@@ -67,6 +67,7 @@ KEYS = frozenset({
     "chart_vwma",
     "chart_avg_lines",
     "chart_option_walls",
+    "chart_prior_profile",
     "chart_volume_baseline",
     "chart_momentum",
     "chart_net_gamma",

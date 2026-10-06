@@ -255,6 +255,7 @@ _DEFAULTS: dict[str, object] = {
     "mixture_fit_target": "live",
     "show_predicted_profile": False,
     "option_walls": [],
+    "prior_profile": [],
     "vwap_style": "hide",
     "show_candle_body": True,
     "show_percentile_body": False,
@@ -383,8 +384,12 @@ class AppState:
         self.mixture_max_components: int = 0
         self.mixture_fit_target: str = "live"
         self.show_predicted_profile: bool = False
-        # Options walls drawn on the candle chart: any of "call_wall", "put_wall".
+        # Options levels drawn on the candle chart: any of "call_wall",
+        # "put_wall", "gamma_flip".
         self.option_walls: list[str] = []
+        # The previous session's volume-profile levels drawn on the candle
+        # chart: any of "poc", "peaks" (prior_profile.py).
+        self.prior_profile: list[str] = []
         # Which model predictions the price chart draws (model_overlays keys).
         self.model_overlay_keys: list[str] = []
         # Which candle patterns the price chart draws (candle_patterns keys),

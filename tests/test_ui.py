@@ -280,6 +280,45 @@ class TestLiveOptionWalls:
         assert calls == ["AAPL"]
 
 
+class TestLivePriorProfile:
+    LEVELS = {"date": "2026-10-05", "poc": 100.0, "peaks": [98.0, 103.0]}
+    BARS = [{"t": "2026-10-06T14:00:00Z", "o": 1, "h": 1, "l": 1, "c": 1, "v": 1}]
+
+    def _sym_state(self):
+        from agent_stonks.state import SymbolState
+        return SymbolState("AAPL", AppState())
+
+    def test_nothing_selected_fetches_nothing(self, monkeypatch):
+        from agent_stonks import ui
+        calls = []
+        monkeypatch.setattr(ui.prior_profile, "levels", lambda *a: calls.append(a))
+        assert ui._live_prior_profile(self._sym_state(), self.BARS, []) is None
+        assert calls == []
+
+    def test_only_the_selected_parts_for_the_charts_day(self, monkeypatch):
+        from datetime import date
+        from agent_stonks import ui
+        asked = []
+
+        def levels(symbol, day, daily_bars):
+            asked.append((symbol, day))
+            return self.LEVELS
+
+        monkeypatch.setattr(ui.prior_profile, "levels", levels)
+        sym_state = self._sym_state()
+        assert ui._live_prior_profile(sym_state, self.BARS, ["poc"]) == {"poc": 100.0, "peaks": []}
+        assert ui._live_prior_profile(sym_state, self.BARS, ["peaks"]) == {"poc": None, "peaks": [98.0, 103.0]}
+        assert ui._live_prior_profile(sym_state, self.BARS, ["poc", "peaks"]) == {
+            "poc": 100.0, "peaks": [98.0, 103.0],
+        }
+        assert asked[0] == ("AAPL", date(2026, 10, 6))
+
+    def test_none_until_fetched(self, monkeypatch):
+        from agent_stonks import ui
+        monkeypatch.setattr(ui.prior_profile, "levels", lambda *a: None)
+        assert ui._live_prior_profile(self._sym_state(), self.BARS, ["poc"]) is None
+
+
 class TestReportSections:
     CHAIN = TestLiveOptionWalls.CHAIN
 
