@@ -54,6 +54,31 @@ AAPL_FORECASTS = {
     "2026-09-25": (337.29399002103725, 332.5079589178143, 6.917621428571432),
 }
 
+# The same for INTC's bundle (saved 2026-10-06), which also carries a rest-of-
+# session head: (pred_rest_high, pred_rest_low, pred_high, pred_low,
+# adr14_usd). `forecast_from` hands the trader the first pair as pred_high /
+# pred_low and keeps the second as day_high / day_low. The test window and the
+# traded week, the session after an earnings day (2025-01-31) and after half
+# days (2024-07-08, 2024-12-26, 2025-07-07, 2025-12-01), and 2026-09-21, whose
+# rest-of-session high sits below what the first five minutes printed.
+INTC_FORECASTS = {
+    "2024-07-08": (33.653399958665865, 32.979311586094695, 33.68899238171411, 32.81514112327082, 0.6352499999999998),
+    "2024-12-26": (20.415150544556337, 19.93796409728379, 20.419515197508705, 19.91577075817311, 0.783392857142857),
+    "2025-01-31": (20.468291343253107, 19.848999688892693, 20.51683366066669, 19.796686061413745, 0.6424999999999998),
+    "2025-07-07": (22.5188442286951, 22.013866565181853, 22.5188442286951, 22.007600310374087, 0.8258571428571427),
+    "2025-12-01": (40.29963069117448, 39.27663688107967, 40.36337938496258, 39.17036115186083, 1.5211785714285715),
+    "2026-03-02": (45.93118165988787, 44.311311349017885, 45.9664432171674, 43.98, 2.331371428571429),
+    "2026-09-08": (103.21130906791724, 99.58459740466576, 103.45734591368306, 99.53505095865792, 3.8296357142857156),
+    "2026-09-11": (104.59972602449962, 100.93032141277503, 104.79434094865248, 100.84018930760458, 3.8160571428571433),
+    "2026-09-17": (107.07370421725656, 103.40731044394668, 107.07370421725656, 103.40731044394668, 4.159364285714288),
+    "2026-09-18": (110.80260175746898, 107.26898194337983, 111.01163450626952, 107.26898194337983, 4.315078571428573),
+    "2026-09-21": (117.68644957913268, 113.6133809882278, 119.46, 113.17508647400595, 4.275078571428572),
+    "2026-09-22": (123.64901109614857, 119.32624813278916, 123.64901109614857, 119.15681708811482, 4.769150000000001),
+    "2026-09-23": (123.63759001022927, 120.072666126089, 124.15098076853747, 120.072666126089, 4.79272142857143),
+    "2026-09-24": (123.28991830894942, 119.06826119340272, 123.41388066334582, 119.06826119340272, 4.927007142857144),
+    "2026-09-25": (127.65654665412843, 123.42400029041261, 127.93335837109514, 123.42400029041261, 5.158792857142857),
+}
+
 
 # --- synthetic sessions -------------------------------------------------------
 
@@ -159,12 +184,13 @@ class Constant:
 
     feature_cols = H.FEATURE_COLS
 
-    def __init__(self):
+    def __init__(self, pair=(1.0, 0.5)):
         self.rows = []
+        self.pair = list(pair)
 
     def predict(self, X):
         self.rows.append(X)
-        return np.tile([1.0, 0.5], (len(X), 1))
+        return np.tile(self.pair, (len(X), 1))
 
 
 def _bundle(path="synthetic"):
@@ -178,7 +204,8 @@ def _bundle(path="synthetic"):
 class TestRegistry:
     def test_highlow2_is_offered_where_a_bundle_was_saved(self):
         assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("AAPL")
-        assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("INTC")
+        assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("INTC")
+        assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("MU")
 
     def test_it_drives_the_day_range_rules(self):
         assert apple_models.strategy(apple_models.HIGHLOW2_KEY) == apple_models.STRATEGY_DAYRANGE
@@ -388,12 +415,84 @@ class TestForecast:
             H.forecast_session(bundle, "AAPL", pd.DataFrame({"open": [1.0] * 3}), self.DAY)
 
 
+# --- the rest-of-session head ---------------------------------------------------
+
+def _rest_bundle(rest_pair, within=True, path="synthetic-rest"):
+    """A day head answering (1.0, 0.5) ADRs and a rest head answering `rest_pair`."""
+    day, rest = Constant(), Constant(rest_pair)
+    model = H.HighLowModel(
+        {"c": day}, {"c": 1.0}, list(H.FEATURE_COLS),
+        rest=H.HighLowModel({"r": rest}, {"r": 1.0}, list(H.FEATURE_COLS), target=H.Target(span="rest")),
+        rest_within_day=within,
+    )
+    bundle = {"kind": "highlow2", "model": model, "opening_minutes": 5, "path": path, "rest_head": True}
+    return bundle, day
+
+
+def _opening_row(close5=100.0, high5=101.0, low5=99.0, adr14=0.02) -> pd.DataFrame:
+    return pd.DataFrame({"close5": [close5], "high5": [high5], "low5": [low5], "adr14": [adr14]})
+
+
+class TestRestHead:
+    def test_the_rest_is_bounded_by_the_935_price_not_the_opening_range(self):
+        """The first five minutes' extremes are out of the rest's reach: a rest
+        high under the opening high stays where the model put it."""
+        row = _opening_row()
+        rest = H.Target(span="rest").decode(np.array([[0.1, 0.1]]), row).iloc[0]
+        day = H.Target().decode(np.array([[0.1, 0.1]]), row).iloc[0]
+        assert rest["pred_high"] == pytest.approx(100 * np.exp(0.002))
+        assert rest["pred_low"] == pytest.approx(100 * np.exp(-0.002))
+        assert (day["pred_high"], day["pred_low"]) == (101.0, 99.0)
+        # Never on the wrong side of the 9:35 price.
+        wrong = H.Target(span="rest").decode(np.array([[-1.0, -1.0]]), row).iloc[0]
+        assert (wrong["pred_high"], wrong["pred_low"]) == (100.0, 100.0)
+
+    def test_the_rest_is_measured_from_close5_only(self):
+        assert H.Target(span="rest").label == "close5/adr14/rest"
+        assert H.Target().label == "close5/adr14"
+        with pytest.raises(ValueError):
+            H.Target("extremes", "adr14", "rest")
+        with pytest.raises(ValueError):
+            H.Target(span="week")
+
+    def test_the_rest_forecast_is_held_inside_the_days(self):
+        row = _opening_row()
+        for within, inside in ((True, True), (False, False)):
+            bundle, _ = _rest_bundle((3.0, 3.0), within=within)
+            out = bundle["model"].predict_prices(row).iloc[0]
+            assert bool(out["pred_rest_high"] <= out["pred_high"]) is inside
+            assert bool(out["pred_rest_low"] >= out["pred_low"]) is inside
+        bundle, _ = _rest_bundle((3.0, 3.0))
+        out = bundle["model"].predict_prices(row).iloc[0]
+        assert (out["pred_rest_high"], out["pred_rest_low"]) == (out["pred_high"], out["pred_low"])
+
+    def test_the_trader_is_handed_the_rest_and_told_so(self, alpaca):
+        """pred_high / pred_low are what every level, breach and chart reads, so
+        with a rest head they carry the rest; the day's pair rides along."""
+        bundle, day = _rest_bundle((0.2, 0.1))
+        out = H.forecast_session(bundle, "AAPL", pd.DataFrame({"open": [1.0] * 5}), TestForecast.DAY, "k", "s")
+        row = day.rows[0]
+        adr, close5 = float(row["adr14"].iloc[0]), float(row["close5"].iloc[0])
+        high5, low5 = float(row["high5"].iloc[0]), float(row["low5"].iloc[0])
+        assert out["day_high"] == pytest.approx(max(close5 * np.exp(adr), high5))
+        assert out["day_low"] == pytest.approx(min(close5 * np.exp(-0.5 * adr), low5))
+        assert out["pred_high"] == pytest.approx(min(max(close5 * np.exp(0.2 * adr), close5), out["day_high"]))
+        assert out["pred_low"] == pytest.approx(max(min(close5 * np.exp(-0.1 * adr), close5), out["day_low"]))
+        assert out["range_after_opening"] is True
+        assert out["or_high"] == high5 and out["or_low"] == low5
+
+    def test_a_day_only_bundle_forecasts_the_day(self, alpaca):
+        bundle, _ = _bundle()
+        out = H.forecast_session(bundle, "AAPL", pd.DataFrame({"open": [1.0] * 5}), TestForecast.DAY, "k", "s")
+        assert not {"range_after_opening", "day_high", "day_low"} & set(out)
+
+
 # --- the bundle -------------------------------------------------------------------
 
-def _installed_bundle():
-    bundle = H.load_bundle("AAPL")
+def _installed_bundle(ticker="AAPL"):
+    bundle = H.load_bundle(ticker)
     if bundle is None:
-        pytest.skip("the HighLow2 AAPL bundle is not installed")
+        pytest.skip(f"the HighLow2 {ticker} bundle is not installed")
     return bundle
 
 
@@ -405,14 +504,24 @@ class TestBundle:
         assert bundle["daily_models"] == ["lgbm_11", "lgbm_23", "lgbm_7"]
         assert bundle["opening_feed"] == "iex" and bundle["target"] == "close5/adr14"
         assert set(bundle["model"].feature_cols) == set(H.FEATURE_COLS)
+        assert bundle["rest_head"] is False and bundle["model"].rest is None
 
-    def _resaved(self, tmp_path, **changes):
+    def test_intcs_bundle_carries_a_rest_head(self):
+        bundle = _installed_bundle("INTC")
+        assert bundle["ticker"] == "INTC" and bundle["rest_head"] is True
+        assert bundle["target"] == "close5/adr14"
+        rest = bundle["model"].rest
+        assert rest.target.label == "close5/adr14/rest" and bundle["model"].rest_within_day
+        assert sorted(rest.models) == ["lgbm_11", "lgbm_23", "lgbm_7"]
+        assert set(rest.feature_cols) == set(H.FEATURE_COLS)
+
+    def _resaved(self, tmp_path, ticker="AAPL", **changes):
         import joblib
 
         H._register_unpickle_alias()
-        src = H.model_path("AAPL")
+        src = H.model_path(ticker)
         if not src.exists():
-            pytest.skip("the HighLow2 AAPL bundle is not installed")
+            pytest.skip(f"the HighLow2 {ticker} bundle is not installed")
         blob = {**joblib.load(src), **changes}
         target = tmp_path / src.name
         joblib.dump(blob, target)
@@ -440,32 +549,49 @@ class TestBundle:
         _, target = self._resaved(tmp_path, target={"anchor": "close5", "scale": "geo"})
         assert H._build_bundle(target) is None
 
+    def test_a_rest_head_it_cannot_mirror_refuses_the_whole_bundle(self, tmp_path):
+        """Not the day head alone: the trader's levels hang off the rest head."""
+        import joblib
+
+        blob, target = self._resaved(tmp_path, ticker="INTC")
+        rest = blob["rest"]
+        for broken in (
+            {**rest, "feature_cols": rest["feature_cols"] + ["vix"]},
+            {**rest, "weights": {**rest["weights"], "nbeats": 0.5}},
+            {**rest, "target": {"anchor": "close5", "scale": "adr14", "span": "day"}},
+            {**rest, "target": {"anchor": "close5", "scale": "geo", "span": "rest"}},
+        ):
+            joblib.dump({**blob, "rest": broken}, target)
+            assert H._build_bundle(target) is None
+        joblib.dump(blob, target)
+        assert H._build_bundle(target)["rest_head"] is True
+
 
 # --- the mirror, against the notebook ------------------------------------------------
 
 _NOTEBOOK_INPUTS: dict = {}
 
 
-def notebook_inputs():
+def notebook_inputs(symbol="AAPL"):
     """The bundle, and the notebook's *raw* minute files -- SIP and IEX, the
     regular session and both extended windows -- summarised by the live path's
     code, so the session cleaning, the half days and the 9:35 cuts are all part
     of what is checked."""
-    if _NOTEBOOK_INPUTS:
-        return _NOTEBOOK_INPUTS["inputs"]
-    folder = NOTEBOOK / "data" / "AAPL" / "raw"
-    if not sorted(folder.glob("AAPL_20??_pre_sip.parquet")):
-        pytest.skip("the HighLow2_5m AAPL notebook data is not on this machine")
-    bundle = _installed_bundle()
+    if symbol in _NOTEBOOK_INPUTS:
+        return _NOTEBOOK_INPUTS[symbol]
+    folder = NOTEBOOK / "data" / symbol / "raw"
+    if not sorted(folder.glob(f"{symbol}_20??_pre_sip.parquet")):
+        pytest.skip(f"the HighLow2_5m {symbol} notebook data is not on this machine")
+    bundle = _installed_bundle(symbol)
 
     def tape(*patterns):
         raw = pd.concat(pd.read_parquet(f) for p in patterns for f in sorted(folder.glob(p)))
         return raw.sort_index()[H.OHLCV]
 
-    sip = tape("AAPL_20??.parquet", "AAPL_20??_pre_sip.parquet", "AAPL_20??_post_sip.parquet")
-    iex = tape("AAPL_20??_iex.parquet", "AAPL_20??_pre_iex.parquet", "AAPL_20??_post_iex.parquet")
-    _NOTEBOOK_INPUTS["inputs"] = (bundle, sip, iex, H.stretch_from(sip, iex))
-    return _NOTEBOOK_INPUTS["inputs"]
+    sip = tape(f"{symbol}_20??.parquet", f"{symbol}_20??_pre_sip.parquet", f"{symbol}_20??_post_sip.parquet")
+    iex = tape(f"{symbol}_20??_iex.parquet", f"{symbol}_20??_pre_iex.parquet", f"{symbol}_20??_post_iex.parquet")
+    _NOTEBOOK_INPUTS[symbol] = (bundle, sip, iex, H.stretch_from(sip, iex))
+    return _NOTEBOOK_INPUTS[symbol]
 
 
 def _one_day(frame, stamp):
@@ -487,6 +613,22 @@ class TestAgainstTheNotebook:
         assert out["pred_high"] == pytest.approx(high, abs=1e-8)
         assert out["pred_low"] == pytest.approx(low, abs=1e-8)
         assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)
+        assert "range_after_opening" not in out
+
+    @pytest.mark.parametrize("day", sorted(INTC_FORECASTS))
+    def test_reproduces_intcs_rest_and_day_forecasts(self, day):
+        """Both heads, and the rest's handed over as pred_high / pred_low."""
+        bundle, sip, iex, history = notebook_inputs("INTC")
+        stamp = pd.Timestamp(day)
+        morning = H.morning_from_bars(_one_day(sip, stamp), _one_day(iex, stamp), stamp)
+        out = H.forecast_from(bundle, history, morning, stamp)
+        rest_high, rest_low, high, low, adr = INTC_FORECASTS[day]
+        assert out["pred_high"] == pytest.approx(rest_high, abs=1e-8)
+        assert out["pred_low"] == pytest.approx(rest_low, abs=1e-8)
+        assert out["day_high"] == pytest.approx(high, abs=1e-8)
+        assert out["day_low"] == pytest.approx(low, abs=1e-8)
+        assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)
+        assert out["range_after_opening"] is True
 
     def test_the_cached_morning_is_the_fetched_one(self, cache_dir):
         """`_cached_morning` against `morning_from_bars` on real tape."""

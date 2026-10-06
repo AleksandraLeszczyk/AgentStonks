@@ -94,6 +94,7 @@ SHORT_MODEL_NAMES = {
     "dayrange_intraday": "Day Range × IV",
     "highlow": "HighLow",
     "highlow2": "HighLow2",
+    "highlow3m": "HighLow_3m",
 }
 
 
@@ -402,8 +403,9 @@ class Orchestra:
         if self.selection is not None and self._selected_day != today:
             if not self._restore_selection(state, today):
                 if not self._selection_due(state):
-                    # Before 09:34 there is nothing to read: no racer can
-                    # forecast before 09:35, and which ones will is not decided.
+                    # Before 09:34 there is nothing to read: which racers will
+                    # forecast is not decided (a HighLow_3m racer, whose window
+                    # closes at 9:33, forecasts from it once picked).
                     self._publish(state)
                     return rule_agent.WARMING_UP
                 self._select(state, today)

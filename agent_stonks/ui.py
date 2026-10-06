@@ -1336,7 +1336,8 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     with _help_row(
         "Draws what the trained models predict for this session:\n"
         "- **TimeToChange3**, **HighLow**, **HighLow2**, **LevelsML** — price ranges: "
-        "horizontal lines, in the candles and in the profile beside them.\n"
+        "horizontal lines, in the candles and in the profile beside them. "
+        "**HighLow_3m**'s is the range *after 9:33*, not the day's.\n"
         "- **IntradayVolatility** (alone or × TimeToChange3) — time-of-day "
         "ranges: a shaded envelope, widest at the open and narrowing through "
         "midday.\n"
@@ -2522,6 +2523,10 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "model_highlow2": (
             "The day-range rules, unchanged, on HighLow2's predicted high and predicted "
             "range.\n\n"
+            "- On **INTC** those are its forecast of the high and low **after 9:35** (the "
+            "9:35 bar to the close), not the whole day's: the first five minutes' extremes "
+            "are out of reach by then, so a breach is read on the bars after 9:35. AAPL's "
+            "bundle has no such head and forecasts the day.\n"
             "- It reads this morning from **IEX** — the first five minutes and the open "
             "— plus the pre-market (SIP to 09:19, IEX to 09:29) and last evening's "
             "after-hours, so the stream's feed does not change its forecast.\n"
@@ -2533,6 +2538,24 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- At 9:35 it needs ~150 sessions of Alpaca SIP and IEX minute history, "
             "extended hours included: the first run fetches it (tens of seconds) and "
             "caches it under `data/highlow2/`."
+        ),
+        "model_highlow3m": (
+            "The day-range rules, unchanged, on HighLow_3m's predicted high and predicted "
+            "range.\n\n"
+            "- Its range is the one **after 9:33**, not the whole day's: forecast at 9:33 "
+            "from IEX's first three minutes, so the first trade can come two minutes "
+            "earlier. A breach is read on the bars after 9:33 — the first three minutes "
+            "can sit outside the range without moving it.\n"
+            "- It reads last night's **option positioning** (walls, dealer gamma, the "
+            "implied move, put/call volume), rebuilt from Alpaca's daily option bars.\n"
+            "- No buy/sell distances were ever swept on it: it starts from the pair "
+            "TimeToChange3's notebook 05 swept for the instrument. Sweep them on "
+            "SimLab's Tuning tab. (The notebook's own X/Y, 0.30/0.15, hang off the "
+            "predicted *low* and do not transfer.)\n"
+            "- Its caches live under `data/highlow3m/`. The first run fetches ~150 "
+            "sessions of SIP and IEX minute history and ~4 months of daily option bars "
+            "(about a minute); later mornings fetch the last session, in the background "
+            "from ▶ Start if the agent is running before 9:33."
         ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band.\n\n"

@@ -41,9 +41,31 @@ On its held-out window (8-18 Sep 2026, 9 sessions) it misses each extreme by
 slightly ahead (the notebook's README: parity with a small edge, not a clear
 win).
 
+**The rest of the session** (INTC's bundle, saved 2026-10-06; AAPL's has no
+such head). A second LightGBM pair, same features, forecasts the high and low
+from the 9:35 bar to the close -- what is still there to trade once the
+forecast exists:
+
+    rest_up   = log(rest_high / close5) / adr14
+    rest_down = log(close5 / rest_low)  / adr14
+
+    pred_rest_high = min(max(close5 * exp(rest_up   * adr14), close5), pred_high)
+    pred_rest_low  = max(min(close5 * exp(-rest_down * adr14), close5), pred_low)
+
+It is not clipped to the opening range (on INTC the day's high was already in
+by 9:35 on 27% of sessions, the low on 27%), only held inside the day forecast.
+The notebook found it no better than reading the day forecast as the rest
+(0.3% less error over Jul 2025 - Sep 2026, worse on its test window) and ships
+it because a rest-of-session forecast was asked for.
+
 Apple Trader uses it only for the forecast, as it uses HighLow:
 `forecast_session` returns the keys `dayrange_model.forecast_session` returns
-and `apple_trader.DayRangeTrader` runs on them unchanged.
+and `apple_trader.DayRangeTrader` runs on them unchanged. With a rest head,
+those keys carry the rest forecast -- the trader's reference high and its
+predicted range are the rest of the session's -- and say so
+(`range_after_opening`, HighLow_3m's flag), so a breach is read on the bars
+after the opening window; the day head's pair rides along as `day_high` /
+`day_low`.
 
 The mirror contract
 -------------------
@@ -577,10 +599,30 @@ class Target:
     `scale` is what they are divided by: adr14, the 14-day average range. (The
     notebook's `geo` scale reads yesterday's implied move, from an option chain
     this module does not rebuild; `_build_bundle` refuses it.)
+    `span` is which high and low:
+      day       the whole session's. A forecast is never inside the opening
+                range, which has already printed.
+      rest      from the 9:35 bar to the close, what is still to trade. A
+                forecast is never on the wrong side of the 9:35 price, where the
+                rest of the session starts. Measured from close5 only.
     """
 
     anchor: str = "close5"
     scale: str = "adr14"
+    span: str = "day"
+
+    def __post_init__(self):
+        if self.span not in ("day", "rest"):
+            raise ValueError(f"unknown span {self.span!r}")
+        if self.span == "rest" and self.anchor != "close5":
+            raise ValueError("the rest of the session is measured from close5 only")
+
+    def _bounds(self, frame: pd.DataFrame) -> "tuple[np.ndarray, np.ndarray]":
+        """The high is at least the first, the low at most the second."""
+        if self.span == "day":
+            return frame["high5"].to_numpy(dtype=float), frame["low5"].to_numpy(dtype=float)
+        c5 = frame["close5"].to_numpy(dtype=float)
+        return c5, c5
 
     def scale_of(self, frame: pd.DataFrame) -> np.ndarray:
         adr = frame["adr14"].to_numpy(dtype=float)
@@ -597,17 +639,18 @@ class Target:
         raise ValueError(f"unknown anchor {self.anchor!r}")
 
     def decode(self, pred: np.ndarray, frame: pd.DataFrame) -> pd.DataFrame:
-        """(up, down) back to dollar highs and lows, never inside the opening range."""
+        """(up, down) back to dollar highs and lows, kept outside what is already known (`_bounds`)."""
         pred = np.asarray(pred, dtype=float)
         hb, lb = self._bases(frame)
         s = self.scale_of(frame)
-        high = np.maximum(np.exp(hb + pred[:, 0] * s), frame["high5"].to_numpy())
-        low = np.minimum(np.exp(lb - pred[:, 1] * s), frame["low5"].to_numpy())
+        floor_high, cap_low = self._bounds(frame)
+        high = np.maximum(np.exp(hb + pred[:, 0] * s), floor_high)
+        low = np.minimum(np.exp(lb - pred[:, 1] * s), cap_low)
         return pd.DataFrame({"pred_high": high, "pred_low": low}, index=frame.index)
 
     @property
     def label(self) -> str:
-        return f"{self.anchor}/{self.scale}"
+        return f"{self.anchor}/{self.scale}" + ("/rest" if self.span == "rest" else "")
 
 
 # The anchors and scales `Target` above can decode.
@@ -616,15 +659,24 @@ _SCALES = ("adr14",)
 
 
 class HighLowModel:
-    """A weighted blend of tabular candidates, from panel rows to dollar highs and lows."""
+    """A weighted blend of tabular candidates, from panel rows to dollar highs and lows.
+
+    With a `rest` head (itself a HighLowModel on a rest-of-session target) it
+    also gives `pred_rest_high` and `pred_rest_low`, the high and low still to
+    come after 9:35; with `rest_within_day` they are held inside the day
+    forecast so the two never contradict.
+    """
 
     def __init__(self, models: dict, weights: dict, feature_cols: "list[str]",
-                 metadata: "dict | None" = None, target: Target = Target()):
+                 metadata: "dict | None" = None, target: Target = Target(),
+                 rest: "HighLowModel | None" = None, rest_within_day: bool = True):
         self.models = models
         self.weights = weights
         self.feature_cols = feature_cols
         self.metadata = metadata or {}
         self.target = target
+        self.rest = rest
+        self.rest_within_day = rest_within_day
 
     def predict_excursions(self, panel: pd.DataFrame) -> np.ndarray:
         total, wsum = 0.0, 0.0
@@ -637,7 +689,19 @@ class HighLowModel:
         return total / wsum
 
     def predict_prices(self, panel: pd.DataFrame) -> pd.DataFrame:
-        return self.target.decode(self.predict_excursions(panel), panel)
+        out = self.target.decode(self.predict_excursions(panel), panel)
+        if self.rest is not None:
+            r = self.rest.predict_prices(panel)
+            if self.rest_within_day:
+                r = hold_within(r, out)
+            out["pred_rest_high"], out["pred_rest_low"] = r["pred_high"], r["pred_low"]
+        return out
+
+
+def hold_within(rest: pd.DataFrame, day: pd.DataFrame) -> pd.DataFrame:
+    """Rest-of-session forecasts held inside the day forecasts (both with pred_high, pred_low)."""
+    return pd.DataFrame({"pred_high": np.minimum(rest["pred_high"], day["pred_high"]),
+                         "pred_low": np.maximum(rest["pred_low"], day["pred_low"])}, index=rest.index)
 
 
 # --- the saved bundle --------------------------------------------------------
@@ -676,6 +740,32 @@ model_path = _STORE.path
 metadata_path = _STORE.metadata_path
 
 
+def _head(part: dict, span: str) -> "HighLowModel | None":
+    """One head of a saved blob -- the day's, or the rest head's -- or None when
+    it needs something this module does not mirror."""
+    if not isinstance(part, dict) or {"models", "weights", "feature_cols"} - set(part):
+        return None
+    weights = {k: float(w) for k, w in part["weights"].items()}
+    shipped = {k for k, w in weights.items() if w > 0}
+    models = {k: m for k, m in dict(part["models"]).items() if k in shipped}
+    if not models or shipped - set(models):
+        return None
+    try:
+        target = Target(**(part.get("target") or {}))
+    except (TypeError, ValueError):
+        return None
+    if target.anchor not in _ANCHORS or target.scale not in _SCALES or target.span != span:
+        return None
+    read = set(part["feature_cols"])
+    for m in models.values():
+        read |= set(getattr(m, "feature_cols", None) or ())
+    if read - set(FEATURE_COLS):
+        return None
+    return HighLowModel(
+        models=models, weights=weights, feature_cols=list(part["feature_cols"]), target=target,
+    )
+
+
 def _build_bundle(path: Path) -> "dict | None":
     """One ticker's saved model plus its metadata, or None when it cannot be
     assembled.
@@ -684,7 +774,10 @@ def _build_bundle(path: Path) -> "dict | None":
     module does not mirror: a weighted network (`models.save_bundle` writes
     those to a `.pt` beside the joblib, so the joblib does not hold them), a
     candidate reading a feature group other than base and pre-market, or a
-    target this module cannot decode.
+    target this module cannot decode. A rest-of-session head (`rest` in the
+    joblib, INTC's since 2026-10-06) is held to the same rules: a bundle whose
+    rest head cannot be mirrored is refused whole rather than run on its day
+    head, since the trader's levels hang off the rest head when there is one.
     """
     try:
         import joblib
@@ -697,44 +790,35 @@ def _build_bundle(path: Path) -> "dict | None":
             blob = joblib.load(path)
     except (OSError, ValueError, KeyError, ModuleNotFoundError, AttributeError, ImportError, EOFError):
         return None
-    if not isinstance(blob, dict) or {"models", "weights", "feature_cols"} - set(blob):
+    if not isinstance(blob, dict):
         return None
-
-    weights = {k: float(w) for k, w in blob["weights"].items()}
-    shipped = {k for k, w in weights.items() if w > 0}
-    models = {k: m for k, m in dict(blob["models"]).items() if k in shipped}
-    if not models or shipped - set(models):
+    model = _head(blob, "day")
+    if model is None:
         return None
-    try:
-        target = Target(**(blob.get("target") or {}))
-    except TypeError:
-        return None
-    if target.anchor not in _ANCHORS or target.scale not in _SCALES:
-        return None
-    read = set(blob["feature_cols"])
-    for m in models.values():
-        read |= set(getattr(m, "feature_cols", None) or ())
-    if read - set(FEATURE_COLS):
-        return None
+    if "rest" in blob:
+        model.rest = _head(blob["rest"], "rest")
+        if model.rest is None:
+            return None
+        model.rest_within_day = bool(blob.get("rest_within_day", True))
 
     meta_file = metadata_path(path)
     try:
         metadata = json.loads(meta_file.read_text()) if meta_file.exists() else {}
     except (OSError, ValueError):
         metadata = {}
-    model = HighLowModel(
-        models=models, weights=weights, feature_cols=list(blob["feature_cols"]),
-        metadata=metadata, target=target,
-    )
+    model.metadata = metadata
     return {
         "kind": "highlow2",
         "model": model,
         "metadata": metadata,
-        "daily_models": sorted(models),
+        "daily_models": sorted(model.models),
         "opening_minutes": OPENING_MINUTES,
         "opening_feed": OPENING_FEED,
         "min_bars": MIN_BARS_PER_SESSION,
-        "target": target.label,
+        "target": model.target.label,
+        # The forecast handed to the trader is the rest of the session's when
+        # the bundle carries that head (`forecast_from`).
+        "rest_head": model.rest is not None,
         "trained_at": metadata.get("created"),
         "path": str(path),
         "ticker": str(metadata.get("ticker") or "").upper() or None,
@@ -1172,12 +1256,21 @@ _FORECAST_CACHE_MAX = 512
 
 
 def forecast_from(bundle: dict, history: History, morning: Morning, session_date) -> dict:
-    """The day's predicted high and low from the history (`history_inputs`)
-    and this morning (`fetch_morning`).
+    """The predicted high and low from the history (`history_inputs`) and this
+    morning (`fetch_morning`).
 
     Returns the keys `dayrange_model.forecast_session` returns --
     `{"pred_high", "pred_low", "prev_avg", "adr14_abs", "or_high", "or_low"}`
     in dollars -- so `apple_trader.DayRangeTrader` runs on it unchanged.
+
+    With a rest-of-session head (`HighLowModel.rest`), `pred_high` and
+    `pred_low` are *its* forecast -- the high and low from the 9:35 bar to the
+    close, what a 9:35 order can still reach -- so the trader's reference high
+    and its predicted-range unit are measured on that. The day head's pair is
+    kept as `day_high` / `day_low`, and `range_after_opening` tells the trader
+    (and the chart, and Drift) that the opening window's own extremes are not
+    a breach of it: on about a quarter of sessions one of them printed in the
+    first five minutes and sits outside the rest forecast.
     Raises ValueError when the inputs cannot support a forecast.
     """
     day = pd.Timestamp(session_date).normalize()
@@ -1230,7 +1323,7 @@ def forecast_from(bundle: dict, history: History, morning: Morning, session_date
             "the SIP or IEX history is too short or has gaps."
         )
     pred = model.predict_prices(row).iloc[0]
-    return {
+    out = {
         "pred_high": float(pred["pred_high"]),
         "pred_low": float(pred["pred_low"]),
         "prev_avg": float(row["prev_avg"].iloc[0]),
@@ -1238,6 +1331,13 @@ def forecast_from(bundle: dict, history: History, morning: Morning, session_date
         "or_high": float(row["high5"].iloc[0]),
         "or_low": float(row["low5"].iloc[0]),
     }
+    if "pred_rest_high" in pred.index:
+        out.update(
+            day_high=out["pred_high"], day_low=out["pred_low"],
+            pred_high=float(pred["pred_rest_high"]), pred_low=float(pred["pred_rest_low"]),
+            range_after_opening=True,
+        )
+    return out
 
 
 def warm_history(

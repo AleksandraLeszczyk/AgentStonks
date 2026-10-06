@@ -190,6 +190,37 @@ HIGHLOW2_META = {
 }
 
 
+HIGHLOW3M_META = {
+    "ticker": "AAPL",
+    "data": {"history_start": "2024-01-01", "fit_through": "2026-09-04", "aapl_rows": 637,
+             "training_rows": 3822, "pool": ["GOOGL", "MSFT"]},
+    "scores": {
+        "holdout_2026": {"n": 170, "mae": 0.00636, "mae_high": 0.00642, "mae_low": 0.00630,
+                         "mae_usd": 1.81, "mae_pct_adr": 30.34},
+        "test": {"n": 9, "mae": 0.00596, "mae_usd": 1.95, "mae_pct_adr": 26.31},
+    },
+    "windows": {"holdout": ["2026-01-01", "2026-09-04"], "test": ["2026-09-07", "2026-09-20"]},
+}
+
+
+class TestHighLow3mTraining:
+    def test_the_one_cutoff_is_the_final_fit(self):
+        [cutoff] = dr.highlow3m_training_from_metadata(HIGHLOW3M_META)["cutoffs"]
+        assert cutoff.date == "2026-09-04"
+        assert "3822 sessions" in cutoff.note and "GOOGL, MSFT pooled in" in cutoff.note
+
+    def test_the_holdout_and_the_test_window_are_both_references(self):
+        refs = dr.highlow3m_training_from_metadata(HIGHLOW3M_META)["references"]
+        by = {(r.metric, r.label): r.value for r in refs}
+        assert by[("mae_pct_adr", "2026 holdout (walk-forward)")] == 30.34
+        assert by[("mae_pct_adr", "Held-out test window")] == 26.31
+        assert by[("abs_err_high", "2026 holdout (walk-forward)")] == 0.00642
+        assert all("after 9:33" in r.note for r in refs)
+
+    def test_missing_metadata_is_no_cutoffs_rather_than_an_error(self):
+        assert dr.highlow3m_training_from_metadata({}) == {"cutoffs": [], "references": []}
+
+
 class TestHighLow2Training:
     def test_the_one_cutoff_is_the_final_fit(self):
         [cutoff] = dr.highlow2_training_from_metadata(HIGHLOW2_META)["cutoffs"]
@@ -204,6 +235,13 @@ class TestHighLow2Training:
 
     def test_missing_metadata_is_no_cutoffs_rather_than_an_error(self):
         assert dr.highlow2_training_from_metadata({}) == {"cutoffs": [], "references": []}
+
+    def test_a_rest_heads_references_say_what_they_were_scored_against(self):
+        """INTC's `test_metrics` are its rest head's, against the extremes after 9:35."""
+        rest = dr.highlow2_training_from_metadata({**HIGHLOW2_META, "rest_head": {"models": []}})
+        assert all("from 9:35 on" in r.note for r in rest["references"])
+        day = dr.highlow2_training_from_metadata(HIGHLOW2_META)
+        assert not any("9:35" in r.note for r in day["references"])
 
 
 # --- scoring on a synthetic store --------------------------------------------
@@ -419,6 +457,67 @@ class TestHighLow2:
         monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
         result = dr.evaluate_highlow2(TICKER, FEED)
         assert result["rows"] == [] and "HighLow2" in result["notes"][0]
+
+    def test_a_rest_head_is_scored_against_the_session_after_935(self, store, stubbed, monkeypatch):
+        """INTC's forecast is the rest of the session's: the stored bars from
+        the 9:35 bar on (highs to 101.26, lows to 100.76), not the daily bar's."""
+        monkeypatch.setattr(
+            dr.apple_models, "load",
+            lambda key, *a, **k: {"opening_minutes": 5, "opening_feed": "iex", "kind": "highlow2",
+                                  "rest_head": True},
+        )
+        monkeypatch.setattr(self, "FORECAST", {**self.FORECAST, "range_after_opening": True})
+        result = dr.evaluate_highlow2(TICKER, FEED)
+        assert [r["date"] for r in result["rows"]] == [str(d) for d in DAYS]
+        for row in result["rows"]:
+            assert row["actual_high"] == pytest.approx(101.26)
+            assert row["actual_low"] == pytest.approx(100.76)
+        assert any("from 9:35 on" in note for note in result["notes"])
+
+
+class TestHighLow3m:
+    FORECAST = {**TestHighLow.FORECAST, "range_after_opening": True}
+
+    @pytest.fixture()
+    def stubbed(self, monkeypatch):
+        hl3 = pytest.importorskip("agent_stonks.highlow3m_model")
+        monkeypatch.setattr(
+            dr.apple_models, "load",
+            lambda key, *a, **k: {"opening_minutes": 3, "opening_feed": "iex", "kind": "highlow3m"}
+            if key == dr.apple_models.HIGHLOW3M_KEY else None,
+        )
+        spans, seen = [], []
+        monkeypatch.setattr(hl3, "warm_span", lambda bundle, symbol, first, last, *a, **k:
+                            spans.append((first, last)))
+
+        def forecast(bundle, ticker, opening, session_date, key=None, secret=None):
+            seen.append((session_date, len(opening)))
+            return dict(self.FORECAST)
+
+        monkeypatch.setattr(hl3, "forecast_session", forecast)
+        return spans, seen
+
+    def test_scored_against_the_session_after_the_window(self, store, stubbed):
+        """Its question is the range from 9:33 on: the stored bars after the
+        window (highs to 101.26, lows to 100.76), not the daily bar's 106/100."""
+        result = dr.evaluate_highlow3m(TICKER, FEED)
+        assert [r["date"] for r in result["rows"]] == [str(d) for d in DAYS]
+        for row in result["rows"]:
+            assert row["actual_high"] == pytest.approx(101.26)
+            assert row["actual_low"] == pytest.approx(100.76)
+            assert row["mae_usd"] == pytest.approx((abs(105.0 - 101.26) + abs(99.0 - 100.76)) / 2)
+        assert any("from 9:33 on" in note for note in result["notes"])
+
+    def test_the_forecast_reads_three_minutes_and_the_caches_are_warmed_once(self, store, stubbed):
+        spans, seen = stubbed
+        dr.evaluate_highlow3m(TICKER, FEED)
+        assert spans == [(DAYS[0], DAYS[-1])]
+        assert seen == [(d, 3) for d in DAYS]
+
+    def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
+        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
+        result = dr.evaluate_highlow3m(TICKER, FEED)
+        assert result["rows"] == [] and "HighLow_3m" in result["notes"][0]
 
 
 INTRAVOL = {

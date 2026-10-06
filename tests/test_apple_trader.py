@@ -1238,7 +1238,8 @@ class TestHighLowModel:
         assert trader.plan["sell_level"] == pytest.approx(119.0)
         # TimeToChange3 was never asked, and the SIP history got the run's keys.
         assert tape.forecast_calls == 0
-        assert calls == [{"ticker": TICKER, "bars": 5, "key": "k", "secret": "s"}]
+        assert calls == [{"ticker": TICKER, "bars": self.BUNDLE["opening_minutes"],
+                          "key": "k", "secret": "s"}]
 
     def test_a_replay_withholds_its_placeholder_keys(self, state, market_open, monkeypatch):
         """SimLab's state carries "simulated" keys; sending those to Alpaca is a
@@ -1319,6 +1320,156 @@ class TestHighLow2Model(TestHighLowModel):
 
         assert caveats("highlow", TestHighLowModel.BUNDLE)
         assert caveats(self.KEY, self.BUNDLE) == []
+
+
+class TestHighLow3mModel(TestHighLow2Model):
+    """HighLow_3m likewise -- every HighLow and HighLow2 test above, its bundle
+    dispatched to `highlow3m_model` and forecast after three minutes -- plus
+    what its range being the one *after* the window changes."""
+
+    KEY = "highlow3m"
+    BUNDLE = {"opening_minutes": 3, "kind": "highlow3m", "opening_feed": "iex"}
+
+    def _module(self):
+        return at._highlow3m()
+
+    def _breaches(self, monkeypatch, state, forecast, bundle, module):
+        """Range updates after one bar past the window, with a high above the
+        forecast in the window and nothing after it reaching it."""
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch, minutes=bundle["opening_minutes"])  # window highs 101.5
+        tape.append(101.0, high=101.1)
+        monkeypatch.setattr(module, "forecast_session", lambda *a, **k: dict(forecast))
+        trader = at.DayRangeTrader(
+            replace(dayrange_config(breach_update="extreme"), model_key=bundle["kind"])
+        )
+        trader.run_cycle(bundle, state, tracker)
+        return trader.plan.get("range_updates", 0), trader.plan["pred_high"]
+
+    def test_the_windows_own_high_is_not_a_breach_of_a_range_after_it(
+        self, state, market_open, monkeypatch
+    ):
+        forecast = {**FORECAST, "pred_high": 101.2, "pred_low": 99.0}
+        updates, high = self._breaches(
+            monkeypatch, state, {**forecast, "range_after_opening": True}, self.BUNDLE,
+            self._module(),
+        )
+        assert (updates, high) == (0, 101.2)
+
+    def test_a_whole_day_forecast_is_still_breached_by_the_window(
+        self, state, market_open, monkeypatch
+    ):
+        """The other models' ranges cover the whole session: a window high
+        above one has falsified it, as before."""
+        forecast = {**FORECAST, "pred_high": 101.2, "pred_low": 99.0}
+        updates, high = self._breaches(
+            monkeypatch, state, forecast, TestHighLowModel.BUNDLE, at._highlow(),
+        )
+        assert (updates, high) == (1, pytest.approx(101.5))
+
+    def test_a_breach_after_the_window_still_moves_it(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch, minutes=3)
+        tape.append(101.6, high=101.8)
+        monkeypatch.setattr(self._module(), "forecast_session", lambda *a, **k: {
+            **FORECAST, "pred_high": 101.2, "pred_low": 99.0, "range_after_opening": True,
+        })
+        trader = at.DayRangeTrader(
+            replace(dayrange_config(breach_update="extreme"), model_key=self.KEY)
+        )
+        trader.run_cycle(self.BUNDLE, state, tracker)
+        assert trader.plan["pred_high"] == pytest.approx(101.8)
+
+    def test_the_caches_are_warmed_while_the_window_is_open(self, state, market_open, monkeypatch):
+        """Once per session, in the background, with the run's keys; not once
+        the window has closed (the forecast fetches then), never in a replay."""
+        warmed, done = [], threading.Event()
+
+        def warm(bundle, ticker, before, key=None, secret=None):
+            warmed.append((ticker, before, key, secret))
+            done.set()
+
+        monkeypatch.setattr(self._module(), "warm_history", warm)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        Tape(monkeypatch, minutes=2)
+        trader = at.DayRangeTrader(replace(dayrange_config(), model_key=self.KEY))
+        assert trader.run_cycle(self.BUNDLE, state, tracker) == "warming_up"
+        assert done.wait(5)
+        trader.run_cycle(self.BUNDLE, state, tracker)
+        assert [(t, k, s) for t, _, k, s in warmed] == [(TICKER, "k", "s")]
+
+        warmed.clear()
+        state.bar_tape_override = "yfinance"
+        replay = at.DayRangeTrader(replace(dayrange_config(), model_key=self.KEY))
+        replay.run_cycle(self.BUNDLE, state, tracker)
+        assert warmed == []
+
+    def test_the_armed_line_says_933_and_the_rest_of_the_day(self):
+        bundle = {**self.BUNDLE, "trained_at": "2026-10-05",
+                  "metadata": {"scores": {"test": {"mae_usd": 1.95}}}}
+        line = at._armed_summary(AppleTraderConfig(model_key=self.KEY),
+                                 apple_models.get(self.KEY), bundle)
+        assert "at 9:33 it forecasts where the rest of today's AAPL high and low" in line
+        assert "held-out mean error $1.95" in line
+        other = at._armed_summary(AppleTraderConfig(model_key="highlow"),
+                                  apple_models.get("highlow"), TestHighLowModel.BUNDLE)
+        assert "at 9:35 it forecasts where today's AAPL high and low" in other
+
+    def test_other_models_are_not_warmed(self, state, market_open, monkeypatch):
+        monkeypatch.setattr(self._module(), "warm_history", lambda *a, **k: pytest.fail("warmed"))
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        Tape(monkeypatch, minutes=2)
+        trader = at.DayRangeTrader(replace(dayrange_config(), model_key="highlow"))
+        assert trader.run_cycle(TestHighLowModel.BUNDLE, state, tracker) == "warming_up"
+
+
+class TestHighLow2RestHead:
+    """A HighLow2 bundle with a rest-of-session head (INTC's) hands the trader
+    the range after 9:35 as `pred_high` / `pred_low`: the reference high and
+    the predicted-range unit are that range's, and the window's own extremes
+    are not a breach of it."""
+
+    BUNDLE = {**TestHighLow2Model.BUNDLE, "rest_head": True}
+    # The rest of the session's 110 / 106 inside the day's 112 / 104.
+    FORECAST = {**FORECAST, "pred_high": 110.0, "pred_low": 106.0, "day_high": 112.0,
+                "day_low": 104.0, "range_after_opening": True}
+
+    def _run(self, monkeypatch, state, forecast, **config):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
+        tape = Tape(monkeypatch)  # window highs 101.5
+        tape.append(101.0, high=101.1)
+        monkeypatch.setattr(at._highlow2(), "forecast_session", lambda *a, **k: dict(forecast))
+        trader = at.DayRangeTrader(
+            replace(dayrange_config(**config), model_key=TestHighLow2Model.KEY)
+        )
+        trader.run_cycle(self.BUNDLE, state, tracker)
+        return trader
+
+    def test_the_levels_hang_off_the_rest_of_the_session(self, state, market_open, monkeypatch):
+        trader = self._run(monkeypatch, state, self.FORECAST, level_unit=UNIT_PRED_RANGE)
+        assert trader.plan["buy_level"] == pytest.approx(110.0 - 0.75 * 4.0)
+        assert trader.plan["sell_level"] == pytest.approx(110.0 - 0.10 * 4.0)
+
+    def test_the_windows_own_high_is_not_a_breach_of_it(self, state, market_open, monkeypatch):
+        forecast = {**self.FORECAST, "pred_high": 101.2, "pred_low": 99.0}
+        trader = self._run(monkeypatch, state, forecast, breach_update="extreme")
+        assert (trader.plan.get("range_updates", 0), trader.plan["pred_high"]) == (0, 101.2)
+
+    def test_the_log_says_which_range_it_trades(self, state, market_open, monkeypatch):
+        self._run(monkeypatch, state, self.FORECAST)
+        plan = next(e["text"] for e in state.agent_log if "forecast for" in (e.get("text") or ""))
+        assert "forecast for the rest of the session after 09:34" in plan
+        assert "high $110.00, low $106.00; the whole day's: high $112.00, low $104.00" in plan
+        armed = at._armed_summary(AppleTraderConfig(ticker="INTC", model_key="highlow2"),
+                                  apple_models.get("highlow2"), self.BUNDLE)
+        assert "at 9:35 it forecasts where the rest of today's INTC high and low" in armed
+
+    def test_a_day_only_bundle_logs_the_session(self, state, market_open, monkeypatch):
+        day = {k: v for k, v in self.FORECAST.items()
+               if k not in ("day_high", "day_low", "range_after_opening")}
+        self._run(monkeypatch, state, day)
+        plan = next(e["text"] for e in state.agent_log if "forecast for" in (e.get("text") or ""))
+        assert "forecast for the session, from" in plan and "whole day" not in plan
 
 
 class TestDaysOff:
@@ -2763,13 +2914,13 @@ class TestPredictedRangeUnit:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        # HighLow_5m has been run on AAPL and INTC, not GOOGL; HighLow2_5m on
-        # AAPL alone.
+        # HighLow_5m and HighLow2_5m have been run on AAPL and INTC, not GOOGL;
+        # HighLow_3m on AAPL alone.
         assert apple_models.keys_for(TICKER) == [
-            "dayrange", "dayrange_intraday", "highlow", "highlow2",
+            "dayrange", "dayrange_intraday", "highlow", "highlow2", "highlow3m",
         ]
         assert apple_models.keys_for("INTC") == [
-            "dayrange", "dayrange_intraday", "highlow",
+            "dayrange", "dayrange_intraday", "highlow", "highlow2",
         ]
         for symbol in (NON_AAPL,):
             assert apple_models.keys_for(symbol) == [

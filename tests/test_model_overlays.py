@@ -1074,7 +1074,83 @@ class TestHighLow2Overlay:
 
     def test_a_highlow2_run_opens_showing_its_range(self):
         assert mo.for_models([apple_models.HIGHLOW2_KEY], "AAPL")["keys"] == [mo.HIGHLOW2_RANGE_KEY]
-        assert mo.HIGHLOW2_RANGE_KEY not in mo.keys_for("INTC")
+        assert mo.for_models([apple_models.HIGHLOW2_KEY], "INTC")["keys"] == [mo.HIGHLOW2_RANGE_KEY]
+        assert mo.HIGHLOW2_RANGE_KEY not in mo.keys_for("MU")
+
+    def test_a_rest_of_session_forecast_is_drawn_as_one(self, monkeypatch, stubbed):
+        """INTC's bundle hands over the range after 9:35: the same two levels,
+        labelled as what they are, and the agent's levels under its high."""
+        hl2 = pytest.importorskip("agent_stonks.highlow2_model")
+        base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 205.0, "or_low": 199.0}
+        monkeypatch.setattr(hl2, "forecast_session", lambda *a, **k: {
+            **base, "pred_high": 203.0, "pred_low": 196.0, "day_high": 205.0, "day_low": 195.0,
+            "range_after_opening": True,
+        })
+        from agent_stonks.apple_trader import AppleTraderConfig
+        from agent_stonks.config import UNIT_ADR
+
+        config = AppleTraderConfig(
+            ticker="INTC", model_key="highlow2", buy_k=0.75, sell_k=0.10, breach_update="off",
+            level_unit=UNIT_ADR, contain_range=False,
+        )
+        items = mo.compute([mo.HIGHLOW2_RANGE_KEY, mo.TRADER_LEVELS_KEY], "INTC", minute_bars(),
+                           daily_bars=[], session_date=SESSION, trader_config=config)["items"]
+        mine = [i for i in items if i["key"] == mo.HIGHLOW2_RANGE_KEY]
+        levels = {i["label"]: i for i in mine if i["kind"] == "level"}
+        assert {k: v["value"] for k, v in levels.items()} == {"Pred. high": 203.0, "Pred. low": 196.0}
+        assert levels["Pred. high"]["note"].startswith("predicted high after ")
+        assert "session" not in levels["Pred. low"]["note"]
+        buy = next(i for i in items if i["label"] == "Buy level")
+        assert buy["value"] == pytest.approx(203.0 - 0.75 * 3.0)
+
+
+class TestHighLow3mOverlay:
+    """HighLow_3m's range is drawn like the others, under its own key, and an
+    agent configured on it has its levels drawn under HighLow_3m's high."""
+
+    @pytest.fixture()
+    def stubbed(self, monkeypatch):
+        pytest.importorskip("agent_stonks.highlow_model")
+        hl3 = pytest.importorskip("agent_stonks.highlow3m_model")
+        seen = TestHighLowOverlay().stub_both(monkeypatch, highlow_high=206.0)
+        base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0,
+                "range_after_opening": True}
+
+        def highlow3m(bundle, ticker, opening, day, key=None, secret=None):
+            seen.append(("highlow3m", len(opening), key, secret))
+            return {**base, "pred_high": 203.0, "pred_low": 193.0}
+
+        monkeypatch.setattr(hl3, "forecast_session", highlow3m)
+        return seen
+
+    def test_the_highlow3m_range_is_two_levels_under_its_own_key(self, stubbed):
+        result = mo.compute([mo.HIGHLOW3M_RANGE_KEY], "AAPL", minute_bars(),
+                            daily_bars=[], session_date=SESSION, credentials=("k", "s"))
+        levels = {i["label"]: i["value"] for i in result["items"] if i["kind"] == "level"}
+        assert levels == {"Pred. high": 203.0, "Pred. low": 193.0}
+        assert {i["key"] for i in result["items"]} == {mo.HIGHLOW3M_RANGE_KEY}
+        # Three minutes, not five; HighLow was never asked.
+        assert stubbed == [("highlow3m", 3, "k", "s")]
+
+    def test_the_agents_levels_follow_highlow3m(self, stubbed):
+        items = mo.compute(
+            [mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[], session_date=SESSION,
+            trader_config=TestHighLowOverlay().config(model_key="highlow3m"),
+        )["items"]
+        buy = next(i for i in items if i["label"] == "Buy level")
+        assert buy["value"] == pytest.approx(203.0 - 0.75 * 3.0)
+        assert "(HighLow_3m)" in buy["note"]
+
+    def test_a_highlow3m_run_opens_showing_its_range(self):
+        assert mo.for_models([apple_models.HIGHLOW3M_KEY], "AAPL")["keys"] == [mo.HIGHLOW3M_RANGE_KEY]
+        assert mo.HIGHLOW3M_RANGE_KEY not in mo.keys_for("INTC")
+
+    def test_the_tuning_chart_names_its_overlay(self, stubbed):
+        result = mo.session_forecast(apple_models.HIGHLOW3M_KEY, "AAPL", minute_bars(),
+                                     session_date=SESSION)
+        assert result["overlay"] == mo.HIGHLOW3M_RANGE_KEY
+        assert result["forecast"]["pred_high"] == 203.0
+        assert f"{result['made_at']:%H:%M}" == "09:32"
 
 
 class TestLiveOverlays:

@@ -2,7 +2,7 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are four, and they
+named X" and never branch on which one they got. Today there are five, and they
 share a rule set:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
@@ -26,7 +26,19 @@ share a rule set:
                      pre-market as an input, shock days out of training, five
                      mega-caps pooled in. Level with HighLow on its test window,
                      slightly ahead. Its bundle carries `kind="highlow2"` and
-                     the forecast comes from `highlow2_model`.
+                     the forecast comes from `highlow2_model`. INTC's bundle
+                     also forecasts the high and low *after* 9:35, and that
+                     pair is the one the trader gets -- marked, like
+                     HighLow_3m's, as starting after the opening window.
+`highlow3m`          HighLow_3m's forecast of a different pair of numbers: the
+                     high and low of the rest of the session *after* 9:33,
+                     called at 9:33 from IEX's first three minutes, the daily
+                     history and last night's option positioning (walls,
+                     dealer gamma, the implied move). Its bundle carries
+                     `kind="highlow3m"` and the forecast comes from
+                     `highlow3m_model`; the range is marked as starting after
+                     the opening window, so the trader measures breaches on
+                     the bars after it.
 
 That second entry is why `AppleModel` carries `level_source`: what the levels
 are measured below used to be a separate setting beside the model picker, which
@@ -99,11 +111,23 @@ DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA")
 
 # Which symbols HighLow2_5m has saved a bundle for (`highlow2_5m_<TICKER>.*`):
-# AAPL (saved 2026-10-04). The notebook has processed GOOGL, MSFT, AMZN, META
-# and NVDA as AAPL's training pool, but fitted no model of their own. Adding one
+# AAPL (saved 2026-10-04) and INTC (2026-10-06, AAPL's recipe with ten stocks
+# pooled in, plus a rest-of-session head: the high and low from 9:35 to the
+# close, which `highlow2_model.forecast_from` hands the trader in place of the
+# day's). The notebook has processed GOOGL, MSFT, AMZN, META, NVDA, AMD, MU,
+# AVGO and QCOM as training pools, but fitted no model of their own. Adding one
 # is this tuple plus its two files in `Code/Models` -- `_build_bundle` refuses a
-# bundle whose shipped blend reads anything but the base and pre-market groups.
-HIGHLOW2_TICKERS = (DEFAULT_TICKER,)
+# bundle whose shipped blend (either head) reads anything but the base and
+# pre-market groups.
+HIGHLOW2_TICKERS = (DEFAULT_TICKER, "INTC")
+
+# Which symbols HighLow_3m has saved a bundle for (`highlow3m_<TICKER>.*`):
+# AAPL (saved 2026-10-05). GOOGL, MSFT, AMZN, META and NVDA are processed as its
+# training pool, with their own option tables, but have no model. Adding one is
+# this tuple plus its two files in `Code/Models` and, if its blend reads the
+# option group, the notebook's per-ticker option settings in
+# `highlow3m_model.NOTEBOOK_OPTIONS` (`_build_bundle` refuses it without them).
+HIGHLOW3M_TICKERS = (DEFAULT_TICKER,)
 
 
 @dataclass(frozen=True)
@@ -250,10 +274,29 @@ def _highlow2_path(ticker: str = DEFAULT_TICKER) -> Path:
     return highlow2_model.model_path(ticker)
 
 
+def _load_highlow3m(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The HighLow_3m bundle for one ticker, imported late (LightGBM, and
+    SciPy for the option pricing)."""
+    try:
+        from . import highlow3m_model
+    except ImportError:
+        return None
+    return highlow3m_model.load_bundle(ticker)
+
+
+def _highlow3m_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import highlow3m_model
+    except ImportError:
+        return Path(f"highlow3m_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return highlow3m_model.model_path(ticker)
+
+
 DAYRANGE_KEY = "dayrange"
 DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
+HIGHLOW3M_KEY = "highlow3m"
 # Both saved models have to exist for the pairing, so the symbols it covers are
 # the symbols both were fitted on.
 DAYRANGE_INTRADAY_TICKERS = tuple(
@@ -350,11 +393,16 @@ MODELS: "dict[str, AppleModel]" = {
             "from IEX, the only live tape at 9:35 on a basic plan; the pre-market as an "
             "input (SIP to 09:19, IEX to 09:29, last evening's after-hours); shock days "
             "(the day after earnings, jobs reports, geopolitical shocks) left out of "
-            "training; and the other five mega-caps pooled in as training rows. LightGBM "
-            "alone, three seeds. On its 9-session test window it misses each extreme by "
-            "$1.17 (15.8% of the 14-day range), level with HighLow and slightly ahead. "
-            "Only the forecast changes: the levels, exits and breach rules are the "
-            "day-range strategy's."
+            "training; and similar stocks pooled in as training rows (five mega-caps for "
+            "AAPL, those plus AAPL and four chip stocks for INTC). LightGBM alone, three "
+            "seeds. On AAPL's 9-session test window it misses each extreme by $1.17 "
+            "(15.8% of the 14-day range), level with HighLow and slightly ahead. INTC's "
+            "bundle also forecasts the high and low still to come from 9:35 to the close "
+            "(on about a quarter of INTC's sessions one of the day's extremes is already "
+            "in by then), and on INTC that is the pair the levels are built on: the "
+            "reference high and the predicted range are the rest of the session's, and a "
+            "breach is read on the bars after 9:35. Only the forecast changes: the "
+            "levels, exits and breach rules are the day-range strategy's."
         ),
         requires=(
             "LightGBM and joblib, and Alpaca credentials for ~150 sessions of SIP and IEX "
@@ -364,6 +412,34 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=HIGHLOW2_TICKERS,
         load=_load_highlow2,
         path=_highlow2_path,
+    ),
+    HIGHLOW3M_KEY: AppleModel(
+        key=HIGHLOW3M_KEY,
+        label="HighLow_3m model",
+        summary=(
+            "FinNotebooks' HighLow_3m forecast of how high and how low the price will "
+            "trade from 9:33 to the close -- the part of the day a 9:33 order can still "
+            "reach, not the whole session's extremes (on about half of AAPL's sessions "
+            "one of those prints in the first three minutes). Called once at 9:33 from "
+            "IEX's first three minutes, the SIP daily history and last night's option "
+            "positioning: the near-term call and put walls, the call gamma wall, dealer "
+            "gamma re-read at the 9:33 price, the options market's implied move and "
+            "put/call volume, with open interest rebuilt from Alpaca's daily option bars. "
+            "LightGBM (three seeds) 0.8 + a linear median regression 0.2, the five other "
+            "mega-caps pooled in. On its 2026 holdout it misses each extreme by 30% of a "
+            "typical day's range, 8.7% less than a 14-day baseline in every month. Only "
+            "the forecast changes: the levels, exits and breach rules are the day-range "
+            "strategy's, and a breach is measured on the bars after 9:33."
+        ),
+        requires=(
+            "LightGBM, SciPy and joblib, and Alpaca credentials for ~150 sessions of SIP "
+            "and IEX minute history, the option contract list and ~4 months of daily "
+            "option bars, plus Yahoo's 13-week T-bill yield"
+        ),
+        strategy=STRATEGY_DAYRANGE,
+        tickers=HIGHLOW3M_TICKERS,
+        load=_load_highlow3m,
+        path=_highlow3m_path,
     ),
 }
 

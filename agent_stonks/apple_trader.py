@@ -934,6 +934,13 @@ def _highlow2():
     return highlow2_model
 
 
+def _highlow3m():
+    """`agent_stonks.highlow3m_model`, imported on first use (LightGBM)."""
+    from . import highlow3m_model
+
+    return highlow3m_model
+
+
 def session_forecast(
     bundle: dict,
     ticker: str,
@@ -952,8 +959,8 @@ def session_forecast(
     `open_price` is the official opening print the day-range model is fed and
     the intraday envelope is centred on. The HighLow models roll their daily
     bars up from minute bars, so they read the first bar's open instead (IEX's,
-    for HighLow2) and need no print; None then makes the plan fall back to the
-    caller's first bar.
+    for HighLow2 and HighLow_3m) and need no print; None then makes the plan
+    fall back to the caller's first bar.
     """
     if bundle.get("kind") == "highlow":
         return (
@@ -963,6 +970,11 @@ def session_forecast(
     if bundle.get("kind") == "highlow2":
         return (
             _highlow2().forecast_session(bundle, ticker, opening, today, key, secret),
+            None,
+        )
+    if bundle.get("kind") == "highlow3m":
+        return (
+            _highlow3m().forecast_session(bundle, ticker, opening, today, key, secret),
             None,
         )
     dayrange = _dayrange()
@@ -1362,6 +1374,8 @@ class DayRangeTrader(BaseTrader):
         self._roll_session(today)
 
         frame = momentum_regime.minute_frame(sym_state)
+        if self.plan is None and self.blocked is None:
+            self._prewarm(self._bundle or bundle, state, today, len(frame))
         if not len(frame):
             _log(
                 state,
@@ -1647,9 +1661,9 @@ class DayRangeTrader(BaseTrader):
         else:
             self._record_levels(state, opening.index[-1])
 
-        # A HighLow bundle fitted on IEX openings (MU, every HighLow2 one) fetched
-        # its own IEX window and was fitted on IEX volume, so the IEX caveat does
-        # not describe it.
+        # A HighLow bundle fitted on IEX openings (MU, every HighLow2 and
+        # HighLow_3m one) fetched its own IEX window and was fitted on IEX
+        # volume, so the IEX caveat does not describe it.
         warning = (
             None if (bundle.get("opening_feed") or "sip") != "sip"
             else _dayrange().volume_scale_warning(tape)
@@ -1713,6 +1727,40 @@ class DayRangeTrader(BaseTrader):
                     ),
                 },
             )
+
+    def _prewarm(self, bundle: dict, state: AppState, today, bars_in: int) -> None:
+        """Start filling the forecast's caches while the opening window is
+        still open, once per session.
+
+        HighLow_3m's 9:33 forecast reads last night's option tables, built from
+        a few months of daily bars per listed expiration: tens of seconds each
+        morning, over a minute the first time. Fetched in the background from
+        the first cycle before the forecast, so 9:33 reads a warm cache rather
+        than holding the first trade for it. Live only: a replay forecasts on
+        the spot, from caches its own clock decides. A failure here is not
+        reported -- the forecast makes the same fetches and reports its own.
+        """
+        if (bundle or {}).get("kind") != "highlow3m":
+            return
+        if bars_in >= _dayrange().opening_minutes(bundle):
+            return  # the forecast is due now, and fetches what it needs itself
+        if getattr(state, "bar_tape_override", "") or getattr(self, "_prewarmed", None) == today:
+            return
+        self._prewarmed = today
+        module, ticker = _highlow3m(), self.ticker
+        key, secret = state.api_key, state.api_secret
+
+        def work() -> None:
+            try:
+                module.warm_history(bundle, ticker, today, key, secret)
+            except Exception:  # noqa: BLE001 -- the 9:33 forecast retries and reports
+                pass
+
+        threading.Thread(target=work, name=f"highlow3m-warm-{ticker}", daemon=True).start()
+        _log(state, {"type": "status", "text": (
+            f"Fetching {ticker}'s minute history and last night's option tables in the "
+            "background for the 9:33 HighLow_3m forecast."
+        )})
 
     def _opening_window(self, state: AppState, frame, want: int):
         return fetch_opening_window(state, frame, want, ticker=self.ticker)
@@ -2544,8 +2592,17 @@ class DayRangeTrader(BaseTrader):
         )
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
-        session_high = float(frame["high"].max())
-        session_low = float(frame["low"].min())
+        # A forecast of the range *after* the opening window (HighLow_3m's)
+        # says nothing about the window itself, so its own extremes are not a
+        # breach of it: the tape is read from the first bar after the window.
+        # Every other forecast covers the whole session, and is already clipped
+        # to contain the window.
+        traded = (
+            frame[frame.index > plan["opening_end"]]
+            if plan.get("range_after_opening") else frame
+        )
+        session_high = float(traded["high"].max())
+        session_low = float(traded["low"].min())
         high, low = dayrange.updated_range(
             plan,
             session_high=session_high,
@@ -3149,10 +3206,21 @@ class DayRangeTrader(BaseTrader):
             )
         else:
             rests = "The levels rest under the predicted high, which is flat all session."
+        # A forecast of the range after the opening window (HighLow_3m's, or
+        # HighLow2's rest head) is not the session's, and says so; HighLow2's
+        # also carries the whole day's pair, which nothing here trades on.
+        span = "the session"
+        if plan.get("range_after_opening"):
+            span = f"the rest of the session after {plan['opening_end']:%H:%M}"
+        day = (
+            f"; the whole day's: high ${float(plan['day_high']):,.2f}, low "
+            f"${float(plan['day_low']):,.2f}"
+            if plan.get("day_high") is not None and plan.get("day_low") is not None else ""
+        )
         return (
-            f"{self.ticker} forecast for the session, from the first "
+            f"{self.ticker} forecast for {span}, from the first "
             f"{plan['opening_end']:%H:%M} minutes: high ${plan['pred_high']:,.2f}, low "
-            f"${plan['pred_low']:,.2f} (yesterday's average ${plan['prev_avg']:,.2f}, "
+            f"${plan['pred_low']:,.2f}{day} (yesterday's average ${plan['prev_avg']:,.2f}, "
             f"14-day average range ${plan['adr14_abs']:,.2f}). {rests} Buy at "
             f"${plan['buy_level']:,.2f} (ref − {self.config.buy_k:g} × {self.config.unit_phrase}), sell at "
             f"${plan['sell_level']:,.2f} (ref − {self.config.sell_k:g} × {self.config.unit_phrase}). {held}"
@@ -3326,8 +3394,9 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     metadata = bundle.get("metadata") or {}
     # TimeToChange3 files its held-out score as `test_metrics_ensemble`, HighLow
     # and HighLow2 as `test_metrics`; the dollar error is `mae_usd_mean` in all.
+    # HighLow_3m files it as `scores.test.mae_usd`.
     scores = metadata.get("test_metrics_ensemble") or metadata.get("test_metrics") or {}
-    mae = scores.get("mae_usd_mean")
+    mae = scores.get("mae_usd_mean") or ((metadata.get("scores") or {}).get("test") or {}).get("mae_usd")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
     exits = []
     if config.has_stop:
@@ -3390,10 +3459,19 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             "shape, so both levels move with the clock"
         )
     )
+    # When the forecast is made, and of what: the window the bundle reads, and
+    # the whole day's extremes or (HighLow_3m, a HighLow2 bundle with a rest
+    # head) those still to come after it.
+    made = 30 + _dayrange().opening_minutes(bundle)
+    extremes = (
+        f"the rest of today's {config.ticker} high and low"
+        if bundle.get("kind") == "highlow3m" or bundle.get("rest_head")
+        else f"today's {config.ticker} high and low"
+    )
     return (
         f"Apple Trader armed on {model.label} (fitted "
-        f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:35 it forecasts where "
-        f"today's {config.ticker} high and low will land, then rests a buy "
+        f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:{made:02d} it forecasts where "
+        f"{extremes} will land, then rests a buy "
         f"{config.buy_k:g} × the {config.unit_phrase} below {reference} and a sell "
         f"{config.sell_k:g} below it, until the closing flatten.{breach}{no_fall}{managed}{breaker}"
     )

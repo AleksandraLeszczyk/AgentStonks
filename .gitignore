@@ -229,6 +229,7 @@ tests/__pycache__/*
 data/simlab/
 data/highlow/
 data/highlow2/
+data/highlow3m/
 data/event_days/
 data/minute_momentum/
 data/net_gamma/

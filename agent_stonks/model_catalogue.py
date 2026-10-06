@@ -817,6 +817,15 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         metrics = {"MAE (% of ADR)": error_pct, **metrics}
     for window, change in (meta.get("walk_forward_vs_highlow5m") or {}).items():
         metrics[f"walk-forward vs HighLow_5m · {window}"] = change
+    # A bundle with a rest-of-session head (INTC's) hands the trader that head's
+    # forecast, so its `test_metrics` are the rest head's, against the extremes
+    # after 9:35; the day head's sit beside them.
+    rest = bool(meta.get("rest_head"))
+    day_pct = (meta.get("test_metrics_day") or {}).get("mae_adr_mean")
+    for k, v in (meta.get("test_metrics_day") or {}).items():
+        metrics[f"day head · {k}"] = v
+    for window, change in ((meta.get("rest_head") or {}).get("walk_forward_vs_day_head_as_rest") or {}).items():
+        metrics[f"rest head vs day head read as the rest · {window}"] = change
     weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
     data = meta.get("data") or {}
     rows = meta.get("training_rows") or {}
@@ -834,21 +843,38 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         ),
         project="HighLow2_5m, mirrors `highlow2`",
         predicts=(
-            "Where the **whole session's** high and low will land, called once at 9:35 "
-            "from IEX's first five minutes, the pre-market and the SIP daily history, "
-            "measured from the 9:35 price in 14-day average ranges. Fitted with shock "
-            "days left out, so it forecasts an ordinary day's width — on the day after "
-            "earnings it has nothing to say about the news."
+            (
+                "Where the high and low **after 9:35** will land — from the 9:35 bar to the "
+                "close, what a 9:35 order can still reach — and, from a second head, the "
+                "whole session's. Apple Trader's levels hang off the first pair. "
+                if rest else "Where the **whole session's** high and low will land. "
+            )
+            + "Called once at 9:35 from IEX's first five minutes, the pre-market and the "
+            "SIP daily history, measured from the 9:35 price in 14-day average ranges. "
+            "Fitted with shock days left out, so it forecasts an ordinary day's width — on "
+            "the day after earnings it has nothing to say about the news."
         ),
-        target="up = log(high / close5) / adr14, down = log(close5 / low) / adr14",
+        target=(
+            "rest_up = log(rest_high / close5) / adr14, rest_down = log(close5 / rest_low) / adr14 "
+            "(rest = 9:35 bar to the close); day head: up = log(high / close5) / adr14, "
+            "down = log(close5 / low) / adr14"
+            if rest else "up = log(high / close5) / adr14, down = log(close5 / low) / adr14"
+        ),
         algorithm=(
             f"LightGBM, L1 loss, averaged over {len(weights) or '?'} seeds "
-            f"({', '.join(str(s) for s in meta.get('seeds') or []) or '?'}), clipped to "
-            "contain the observed 5-minute range"
+            f"({', '.join(str(s) for s in meta.get('seeds') or []) or '?'}), "
+            + (
+                "one pair per head; the rest head kept on the right side of the 9:35 price "
+                "and inside the day forecast, the day head clipped to contain the observed "
+                "5-minute range"
+                if rest else "clipped to contain the observed 5-minute range"
+            )
         ),
         family="LightGBM (3 seeds)",
         consumers=(
-            "Apple Trader — day-range strategy", "Chart overlay — predicted day range (HighLow2)",
+            "Apple Trader — day-range strategy",
+            "Chart overlay — predicted range after 9:35 (HighLow2)" if rest
+            else "Chart overlay — predicted day range (HighLow2)",
         ),
         features=tuple(meta.get("features") or []),
         inputs=(
@@ -883,9 +909,143 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
                 if error_pct is not None
                 else ""
             )
+            + (
+                "That is the rest of the session's forecast against the extremes after 9:35, "
+                "a harder question than the day's (the opening's extremes are not given to "
+                "it), so it does not compare with the day-range rows"
+                + (
+                    f"; the day head misses by {float(day_pct):.0f}%. "
+                    if day_pct is not None else ". "
+                )
+                + "The notebook found the rest head no better than reading the day forecast as "
+                "the rest, and ships it because a rest-of-session forecast was asked for. "
+                if rest else ""
+            )
             + "Level with HighLow_5m over the notebook's walk-forward and slightly ahead — "
             "its README calls it parity with a small edge, not a clear win. The shipped "
             "trading distances were never swept on this forecast."
+        ),
+    )
+
+
+# HighLow_3m's sidecar scores four windows (`scores`); what each is called here.
+_HIGHLOW3M_WINDOWS = (
+    ("holdout_2026", "2026 holdout"),
+    ("test", "test window"),
+    ("baseline_test", "14-day baseline, test window"),
+    ("selection_2025", "2025 selection"),
+)
+_HIGHLOW3M_SCORES = ("mae_pct_adr", "mae_usd", "mae", "range_corr", "high_inside", "low_inside", "n")
+
+
+def _highlow3m_spec(ticker: str) -> ModelSpec:
+    path = _saved_path("APPLE_HIGHLOW3M_MODEL", "highlow3m_{ticker}.joblib", ticker)
+    files = (
+        ModelFile("bundle", path),
+        ModelFile("metadata", path.with_suffix(".json")),
+    )
+    available, reason = _availability(files, "lightgbm", "scipy", "joblib")
+    meta = _read_json(path.with_suffix(".json"))
+    scores = meta.get("scores") or {}
+    # The headline is the 2026 holdout, not the 9-session test window: walk-forward
+    # months refitted on everything before them, every one out of sample -- the
+    # notebook README's "honest number". The test window is the shipped model's own
+    # score, on nine sessions.
+    holdout = scores.get("holdout_2026") or {}
+    test = scores.get("test") or {}
+    error_pct = holdout.get("mae_pct_adr")
+    metrics: "dict[str, object]" = {}
+    if error_pct is not None:
+        metrics["MAE (% of ADR)"] = error_pct
+    for window, label in _HIGHLOW3M_WINDOWS:
+        for name in _HIGHLOW3M_SCORES:
+            value = (scores.get(window) or {}).get(name)
+            if value is not None:
+                metrics[f"{label} · {name}"] = value
+    weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
+    data = meta.get("data") or {}
+    recipe = meta.get("recipe") or {}
+    windows = meta.get("windows") or {}
+    test_window = " – ".join(windows.get("test") or []) or "?"
+    model = apple_models.get(apple_models.HIGHLOW3M_KEY)
+    blend = " + ".join(f"{k} {w:g}" for k, w in weights.items()) or "?"
+    return ModelSpec(
+        key=apple_models.HIGHLOW3M_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note=(
+            f"Trained on {ticker} with {', '.join(data['pool'])} pooled in, each in its "
+            "own 14-day-range units"
+            if data.get("pool") else ""
+        ),
+        project="HighLow_3m, mirrors `highlow3m`",
+        predicts=(
+            "How high and how low the price trades **from 9:33 to the close** — not the whole "
+            "session's extremes, which print in the first three minutes on about half of "
+            "AAPL's sessions — called once at 9:33 from IEX's first three minutes, the SIP "
+            "daily history and last night's option positioning, measured from the 9:33 "
+            "price (IEX's 9:32 close) in 14-day average ranges. Not clipped to the opening "
+            "range."
+        ),
+        target="up = log(rest_high / close3) / adr14, down = log(close3 / rest_low) / adr14",
+        algorithm=(
+            f"Blend {blend}: LightGBM, L1 loss, {recipe.get('lgbm_params', {}).get('num_leaves', '?')} "
+            f"leaves, averaged over seeds {', '.join(str(x) for x in recipe.get('seeds') or []) or '?'}; "
+            f"linear median (quantile) regression on standardised features, alpha "
+            f"{recipe.get('linear_alpha', '?')}"
+        ),
+        family="LightGBM (3 seeds) + linear median",
+        consumers=(
+            "Apple Trader — day-range strategy",
+            "Chart overlay — predicted rest-of-day range (HighLow_3m)",
+        ),
+        features=tuple(meta.get("feature_cols") or []),
+        inputs=(
+            "~127 sessions of SIP minute bars rolled up to daily, the SIP extremes after 9:33 "
+            "of the last 14 and the IEX openings of the last 14; today's first 3 minutes from "
+            "IEX; last night's option positioning, rebuilt from the contract list and every "
+            "expiration's daily bars over its last 120 days (open interest as the running sum "
+            "of size-weighted volume), priced with Yahoo's 13-week T-bill yield"
+        ),
+        metrics=metrics,
+        headline=(
+            ("MAE (% of ADR)", f"{float(error_pct):.1f}%")
+            if error_pct is not None
+            else ("MAE (log units)", format_metric(test.get("mae")))
+        ),
+        files=files,
+        trained_at=str(meta.get("created") or ""),
+        data_note=(
+            f"Fitted through {data.get('fit_through', '?')} on {data.get('training_rows', '?')} "
+            f"sessions ({data.get('aapl_rows', '?')} {ticker}) from {data.get('history_start', '?')} · "
+            f"tested {test_window} · traded {' – '.join(windows.get('traded_week') or []) or '?'}"
+            if meta
+            else ""
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            (
+                f"Misses each extreme by about {float(error_pct):.0f}% of a typical day's range "
+                f"over the {holdout.get('n', '?')}-session 2026 holdout"
+                + (
+                    f" ({float(test['mae_pct_adr']):.0f}% on the {test.get('n', '?')}-session "
+                    f"test window, {test_window})"
+                    if test.get("mae_pct_adr") is not None
+                    else ""
+                )
+                + ". "
+                if error_pct is not None
+                else ""
+            )
+            + "Not comparable with the other day-range rows: its target is the range after "
+            "9:33, which no opening-range clip can help. 8.7% better than a 14-day baseline "
+            "in every 2026 month — a forecast of width, not direction. The shipped trading "
+            "distances were never swept on it."
         ),
     )
 
@@ -894,6 +1054,7 @@ _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.HIGHLOW_KEY: _highlow_spec,
     apple_models.HIGHLOW2_KEY: _highlow2_spec,
+    apple_models.HIGHLOW3M_KEY: _highlow3m_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,
 }
 

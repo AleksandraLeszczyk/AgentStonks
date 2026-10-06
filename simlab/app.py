@@ -1713,14 +1713,25 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "live app never briefed counts as an ordinary day."
         ),
         "model_highlow2": (
-            "The day-range rules on HighLow2's predicted high and range. No distances were "
-            "ever swept on it, so sweep them on the Tuning tab.\n\n"
+            "The day-range rules on HighLow2's predicted high and range — on INTC the range "
+            "*after 9:35* (its rest-of-session head), so breaches are read on the bars after "
+            "it. No distances were ever swept on it, so sweep them on the Tuning tab.\n\n"
             "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
             "minute history before each replayed day, and that morning's IEX opening and "
             "pre-market (ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow2/` — "
             "the first replay fetches it.\n"
             "- Fitted without shock days, so a replay through earnings scores a forecast "
             "of an ordinary day."
+        ),
+        "model_highlow3m": (
+            "The day-range rules on HighLow_3m's predicted high and range — the range "
+            "*after 9:33*, forecast at 9:33, so breaches are read on the bars after it. "
+            "No distances were ever swept on it, so sweep them on the Tuning tab.\n\n"
+            "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
+            "minute history before each replayed day, that morning's IEX opening, and the "
+            "option chain's daily bars up to the previous close, plus Yahoo's ^IRX "
+            "(ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow3m/` — the first "
+            "replay fetches it (about a minute)."
         ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band, so the whole ladder "

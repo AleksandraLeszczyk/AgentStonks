@@ -50,6 +50,11 @@ The same goes for ``highlow2_model.history_inputs`` and ``fetch_morning``: the
 HighLow2 forecast reads SIP and IEX minute history and that morning's
 pre-market and IEX opening, all cut at the session date it is handed, from its
 own cache (``data/highlow2/``) or Alpaca with the environment's keys.
+And for ``highlow3m_model``: its minute history, its IEX opening and its option
+tables (``positioning_rows`` -- the contract list, the daily option bars and
+^IRX) are all cut at the previous close of the session date it is handed, never
+the wall clock, and cached under ``data/highlow3m/``. A positioning row is only
+ever built for a close that is over on the real clock.
 
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead

@@ -840,6 +840,9 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     "highlow_range": "#60a5fa",
     # HighLow2's: the same family, a step further toward indigo.
     "highlow2_range": "#818cf8",
+    # HighLow_3m's: the family's violet end. A different claim (the range after
+    # 9:33, not the day's), so the furthest of the three from the cyan.
+    "highlow3m_range": "#a5b4fc",
     # Apple Trader's two resting levels. Deliberately not a sibling of the cyan
     # above: these are an *agent's* orders, not a model's forecast, and reading
     # the chart means telling the two apart at a glance.
