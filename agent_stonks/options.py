@@ -199,6 +199,49 @@ def net_gamma_exposure(data: dict, spots) -> "np.ndarray | None":
     return (calls - puts) * scale
 
 
+# `gamma_flip` scans log price this far either side of the price, in steps of
+# 0.05% -- fine against a next-day expiry's gamma, ~1.5% of price wide. Each
+# scan is a few milliseconds, so the live chart can afford one per redraw.
+FLIP_WINDOW = 0.25
+_FLIP_STEP = 0.0005
+
+
+def gamma_flip(data: dict, near: "float | None" = None) -> "float | None":
+    """The price nearest `near` (default: the chain's own spot) at which the
+    chain's net dealer gamma (`net_gamma_exposure`) changes sign, or None when
+    it keeps one sign within FLIP_WINDOW (log) of that price, or the chain has
+    no IVs.
+
+    The price where the live chart's net gamma panel changes colour, and how
+    HighLow_3m's `gamma_flip` feature reads its own chains. Not the Put/Call
+    Walls tab's Gamma Flip (`technical_analysis.get_put_call_walls_and_gamma`):
+    that is the strike where per-strike gamma at today's spot, summed from the
+    lowest strike up, turns positive, which on a near expiry can sit on the
+    other side of the price from this one, or not exist.
+    """
+    if not data or not data.get("strikes"):
+        return None
+    near = float(near if near is not None else data.get("spot") or 0.0)
+    if not near > 0:
+        return None
+    n = int(round(2 * FLIP_WINDOW / _FLIP_STEP)) + 1
+    x = math.log(near) + np.linspace(-FLIP_WINDOW, FLIP_WINDOW, n)
+    values = net_gamma_exposure(data, np.exp(x))
+    if values is None:
+        return None
+    # A spot far from every strike can price to exactly zero; a change of sign
+    # across such a stretch is still a crossing, between the samples either side.
+    keep = values != 0
+    x, values = x[keep], values[keep]
+    left, right = values[:-1], values[1:]
+    at = np.nonzero(np.sign(left) != np.sign(right))[0]
+    if not at.size:
+        return None
+    # Linear in log price between the two samples either side of the change.
+    cross = x[at] - left[at] * (x[at + 1] - x[at]) / (right[at] - left[at])
+    return float(np.exp(cross[np.argmin(np.abs(cross - math.log(near)))]))
+
+
 def fetch_options_walls_data(symbol: str, spot: "float | None" = None, ttl_sec: int = 300) -> dict:
     """Cached wrapper around `fetch_option_chain` -- options open interest moves slowly
     relative to a poll loop, so avoid re-hitting yfinance on every refresh."""

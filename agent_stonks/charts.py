@@ -673,31 +673,37 @@ def _add_tactic_levels(tactic_levels: list[dict], fig: go.Figure, x0: datetime, 
         )
 
 
-# Colours match the gamma chart's Call Wall / Put Wall markers.
+# Colours match the gamma chart's Call Wall / Put Wall / Gamma Flip markers.
 _OPTION_WALLS = (
     ("call_wall", "Call wall", PALETTE["up"]),
     ("put_wall", "Put wall", PALETTE["down"]),
+    ("gamma_flip", "Gamma flip", PALETTE["orange"]),
 )
+# Pixels between edge labels stacked in the same corner.
+_EDGE_LABEL_STEP_PX = 14
 
 
 def _add_option_walls(
     option_walls: dict, fig: go.Figure, x0: datetime, x1: datetime,
     price_low: float, price_high: float,
 ) -> None:
-    """Dashed horizontal lines at the options Call Wall and Put Wall.
+    """Dashed horizontal lines at the options Call Wall, Put Wall and gamma flip.
 
-    Expects {"call_wall": float | None, "put_wall": float | None} (see
-    technical_analysis.get_put_call_walls_and_gamma); a missing key or None
-    skips that wall.
+    Expects {"call_wall": float | None, "put_wall": float | None,
+    "gamma_flip": float | None} (the walls from
+    technical_analysis.get_put_call_walls_and_gamma, the flip from
+    options.gamma_flip); a missing key or None skips that level.
 
     The walls are strikes with the most open interest, and one can sit far
     from where the stock trades today -- 20% away is not unusual. A line there
-    would stretch the price axis until the candles are a flat strip, so a wall
+    would stretch the price axis until the candles are a flat strip, so a level
     outside the session's range, widened by one range (and at least 0.5% of
     price) either side, is instead a label pinned to the top or bottom edge of
-    the chart's left corner, pointing the way to it.
+    the chart's left corner, pointing the way to it. Labels sharing an edge
+    stack away from it, so a far call wall and a far flip don't overprint.
     """
     pad = max(price_high - price_low, 0.005 * price_high)
+    on_edge = {True: 0, False: 0}
     for key, label, color in _OPTION_WALLS:
         level = option_walls.get(key)
         if level is None:
@@ -721,11 +727,14 @@ def _add_option_walls(
             )
         else:
             above = level > price_high
+            stacked = on_edge[above] * _EDGE_LABEL_STEP_PX
+            on_edge[above] += 1
             # The left corner, clear of the right-hand labels every in-range
             # level (a near wall, the averages, the model levels) carries.
             fig.add_annotation(
                 xref="x domain", yref="y domain",
                 x=0.005, y=1 if above else 0,
+                yshift=-stacked if above else stacked,
                 text=f"{'▲' if above else '▼'} {label} {level:.2f}",
                 font=font,
                 # Opaque, so a line running along the edge doesn't strike it through.

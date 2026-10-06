@@ -233,6 +233,35 @@ class TestLiveOptionWalls:
         walls = _live_option_walls(self._sym_state(self.CHAIN), ["put_wall"])
         assert walls == {"put_wall": 95.0}
 
+    def test_gamma_flip_is_where_net_gamma_changes_sign_nearest_the_last_trade(self, monkeypatch):
+        from agent_stonks.options import gamma_flip, net_gamma_exposure
+        from agent_stonks import ui
+        from agent_stonks.ui import _live_option_walls
+        self._stub_fetch(monkeypatch, [])
+        # Puts at 90 and 110, calls at 100: net gamma flips near 95 and 105.
+        chain = {
+            "strikes": [90.0, 100.0, 110.0],
+            "calls_oi": [0, 800, 0], "puts_oi": [800, 0, 800],
+            "calls_gamma_exposure": [0.0, 1.0, 0.0], "puts_gamma_exposure": [-1.0, 0.0, -1.0],
+            "calls_iv": [0.3] * 3, "puts_iv": [0.3] * 3, "t_years": 5 / 365, "spot": 100.0,
+        }
+        # The background refresh hands back this chain, not the class's.
+        monkeypatch.setattr(ui, "fetch_options_walls_data", lambda sym, spot=None: chain)
+        sym_state = self._sym_state(chain)
+        sym_state.last_price = 106.0
+        levels = _live_option_walls(sym_state, ["gamma_flip"])
+        assert set(levels) == {"gamma_flip"}
+        assert levels["gamma_flip"] == gamma_flip(chain, near=106.0)
+        assert 103.0 < levels["gamma_flip"] < 107.0
+        below, above = net_gamma_exposure(chain, [levels["gamma_flip"] - 0.01, levels["gamma_flip"] + 0.01])
+        assert below * above < 0
+
+    def test_gamma_flip_none_for_a_chain_without_ivs(self, monkeypatch):
+        from agent_stonks.ui import _live_option_walls
+        self._stub_fetch(monkeypatch, [])
+        walls = _live_option_walls(self._sym_state(self.CHAIN), ["call_wall", "gamma_flip"])
+        assert walls == {"call_wall": 105.0, "gamma_flip": None}
+
     def test_no_chain_yet_draws_nothing_and_fetches_once(self, monkeypatch):
         import threading
         import time as _time

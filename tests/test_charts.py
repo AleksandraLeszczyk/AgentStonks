@@ -1024,3 +1024,21 @@ class TestOptionWalls:
         edge = [a for a in fig.layout.annotations if a.text and "Put wall" in a.text]
         assert edge and edge[0].yref == "y domain" and edge[0].y == 0
         assert "▼" in edge[0].text
+
+    def test_gamma_flip_drawn(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          option_walls={"gamma_flip": 101.25})
+        assert "Gamma flip 101.25" in self._annotations(fig)
+        lines = [s for s in fig.layout.shapes if s.y0 == s.y1 == 101.25]
+        assert lines and lines[0].line.color == charts.PALETTE["orange"]
+
+    def test_far_levels_on_the_same_edge_stack(self):
+        fig = build_chart(BARS, [], TRADES, "AAPL", SESSION_START,
+                          option_walls={"call_wall": 130.0, "gamma_flip": 125.0, "put_wall": 70.0})
+        edge = {a.text: a for a in fig.layout.annotations
+                if a.text and a.yref == "y domain" and a.x == 0.005}
+        call, flip, put = edge["▲ Call wall 130.00"], edge["▲ Gamma flip 125.00"], edge["▼ Put wall 70.00"]
+        assert call.y == flip.y == 1
+        # Down from the top edge, one under the other; the bottom edge's own first.
+        assert (call.yshift or 0) == 0 and flip.yshift < 0
+        assert put.y == 0 and (put.yshift or 0) == 0

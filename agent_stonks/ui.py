@@ -100,7 +100,7 @@ from .premarket import (
     PremarketBriefing,
     launch_premarket_analysis,
 )
-from .options import fetch_options_walls_data, net_gamma_exposure
+from .options import FLIP_WINDOW, fetch_options_walls_data, gamma_flip, net_gamma_exposure
 from .performance import compute_equity_curve, decision_markers, summarize
 from .profile_model import predicted_open_profile
 from .report import build_report_html
@@ -1026,20 +1026,29 @@ def _live_chart_controls() -> None:
                     label_visibility="collapsed",
                 )
             with _help_row(
-                "The strikes with the most call open interest (Call wall, likely "
-                "resistance) and put open interest (Put wall, likely support) in "
-                "the nearest expiry within 45 days, from yfinance and refreshed "
-                "every minute: the same walls as the Put/Call Walls tab. A wall "
-                "far outside today's range is a label in the chart's corner "
-                "rather than a line, so it doesn't flatten the candles.",
+                "Levels from the options chain — the nearest expiry within 45 "
+                "days, from yfinance and refreshed every minute.\n\n"
+                "- **Call wall** / **Put wall** — the strikes with the most call "
+                "open interest (likely resistance) and put open interest (likely "
+                "support): the same walls as the Put/Call Walls tab.\n"
+                "- **Gamma flip** — the price nearest the last trade at which "
+                "net dealer gamma changes sign: where the Net gamma panel's bars "
+                "change colour. The chain is re-priced at every price "
+                f"within {FLIP_WINDOW:.0%} of the last trade, holding its open "
+                "interest and implied volatility; no line when the sign never "
+                "changes there. Not the Put/Call Walls tab's Gamma Flip, which "
+                "sums each strike's gamma at today's spot from the lowest strike "
+                "up and can sit on the other side of the price, or be missing.\n\n"
+                "A level far outside today's range is a label in the chart's "
+                "corner rather than a line, so it doesn't flatten the candles.",
                 icon_ratio=_HALF_WIDTH_ICON,
             ):
                 wall_selection = st.multiselect(
-                    "Options walls",
+                    "Options levels",
                     list(_OPTION_WALL_OPTIONS),
                     default=[],
                     key="chart_option_walls",
-                    placeholder="Options walls",
+                    placeholder="Options levels",
                     label_visibility="collapsed",
                 )
             baseline_keys = list(VOLUME_BASELINE_WINDOWS)
@@ -1105,7 +1114,9 @@ def _live_chart_controls() -> None:
                 "closed before the first chain arrived (a start mid-day) are "
                 "priced with that first chain: open interest only changes "
                 "overnight, so it is re-priced at their closes, holding its "
-                "implied volatility.",
+                "implied volatility.\n\n"
+                "Options levels → Gamma flip draws the price where the colour "
+                "changes.",
             )
 
         st.markdown("**Price Profile Fit**")
@@ -1231,8 +1242,8 @@ def _help_row(help_text: str, icon_ratio: float = 0.08):
     return field
 
 
-# Options walls multiselect: option label -> key in the walls analysis.
-_OPTION_WALL_OPTIONS = {"Call wall": "call_wall", "Put wall": "put_wall"}
+# Options levels multiselect: option label -> key in `_live_option_walls`.
+_OPTION_WALL_OPTIONS = {"Call wall": "call_wall", "Put wall": "put_wall", "Gamma flip": "gamma_flip"}
 
 # Symbols whose options chain is being fetched for the live chart right now,
 # and when each was last tried -- see `_live_option_walls`.
@@ -1276,14 +1287,18 @@ def _refresh_option_chain(sym_state: SymbolState) -> None:
 
 
 def _live_option_walls(sym_state: SymbolState, keys: "list[str]") -> "dict | None":
-    """The selected walls ({"call_wall": ..., "put_wall": ...}) from the symbol's
-    latest options chain, or None when none are selected or no chain has
-    arrived yet. Also kicks off a refresh of that chain."""
+    """The selected levels ({"call_wall": ..., "put_wall": ..., "gamma_flip":
+    ...}) from the symbol's latest options chain, or None when none are
+    selected or no chain has arrived yet. Also kicks off a refresh of that chain.
+
+    The flip is `options.gamma_flip` nearest the last trade -- where the net
+    gamma panel changes colour -- not the walls analysis' own `gamma_flip`."""
     if not keys:
         return None
     _refresh_option_chain(sym_state)
     with sym_state.lock:
         data = sym_state.options_chain
+        last_price = sym_state.last_price
     if not data or not data.get("strikes"):
         return None
     analysis = get_put_call_walls_and_gamma(
@@ -1294,7 +1309,10 @@ def _live_option_walls(sym_state: SymbolState, keys: "list[str]") -> "dict | Non
         puts_gamma_exposure=data["puts_gamma_exposure"],
         spot=data["spot"],
     )
-    return {k: analysis.get(k) for k in keys}
+    levels = {k: analysis.get(k) for k in keys}
+    if "gamma_flip" in levels:
+        levels["gamma_flip"] = gamma_flip(data, near=last_price)
+    return levels
 
 
 # Price Profile Fit multiselect: option label -> mixture distribution, or

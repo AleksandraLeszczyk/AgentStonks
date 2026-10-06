@@ -8,6 +8,7 @@ from agent_stonks.options import (
     _bs_gamma,
     _select_expiry,
     fetch_option_chain,
+    gamma_flip,
     net_gamma_exposure,
 )
 
@@ -140,3 +141,46 @@ class TestNetGammaExposure:
         data = self._chain(monkeypatch)
         del data["calls_iv"]
         assert net_gamma_exposure(data, [100.0]) is None
+
+
+def _flip_chain(strikes, calls_oi, puts_oi, spot=100.0):
+    """A chain as `fetch_option_chain` shapes it, five days from expiry."""
+    n = len(strikes)
+    return {
+        "strikes": strikes, "calls_oi": calls_oi, "puts_oi": puts_oi,
+        "calls_iv": [0.3] * n, "puts_iv": [0.3] * n, "t_years": 5 / 365, "spot": spot,
+    }
+
+
+class TestGammaFlip:
+    # Puts under the price, calls over it: dealers short gamma below, long above.
+    ONE_FLIP = _flip_chain([95.0, 100.0, 105.0], [0, 0, 800], [800, 0, 0])
+
+    def test_where_net_gamma_changes_sign(self):
+        flip = gamma_flip(self.ONE_FLIP)
+        assert 99.0 < flip < 101.0
+        below, above = net_gamma_exposure(self.ONE_FLIP, [flip - 0.01, flip + 0.01])
+        assert below < 0 < above
+
+    def test_nearest_the_given_price_when_there_are_two(self):
+        chain = _flip_chain([90.0, 100.0, 110.0], [0, 800, 0], [800, 0, 800])
+        low, high = gamma_flip(chain, near=93.0), gamma_flip(chain, near=108.0)
+        assert 93.0 < low < 97.0
+        assert 103.0 < high < 107.0
+        # The chain's own spot when no price is given.
+        assert gamma_flip(chain) == pytest.approx(high, abs=0.01)
+
+    def test_none_when_the_sign_never_changes(self):
+        calls_only = _flip_chain([95.0, 100.0, 105.0], [100, 100, 100], [0, 0, 0])
+        assert gamma_flip(calls_only) is None
+
+    def test_none_when_the_flip_is_outside_the_window(self):
+        # The flip near 100 is more than 25% (log) below 200.
+        assert gamma_flip(self.ONE_FLIP, near=200.0) is None
+
+    def test_none_without_ivs_or_strikes(self):
+        no_ivs = dict(self.ONE_FLIP)
+        del no_ivs["calls_iv"]
+        assert gamma_flip(no_ivs) is None
+        assert gamma_flip({}) is None
+        assert gamma_flip(None) is None
