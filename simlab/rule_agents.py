@@ -249,6 +249,11 @@ _APPLE_LEGACY = {
     # or a shock (before 2026-10-04). Empty is that rule, and it is left out of
     # the signature.
     "skip_events": (),
+    # And nothing was traded before the run's own forecast: HighLow_3m's 9:33
+    # window (2026-10-06) did not exist. False is that rule -- also today's
+    # default, so this entry is here to keep meaning the same if it moves --
+    # and it is left out of the signature.
+    "use_3m": False,
 }
 
 

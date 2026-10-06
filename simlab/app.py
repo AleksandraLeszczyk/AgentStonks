@@ -1684,6 +1684,15 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Sessions the replay does not trade: no forecast, no order. In the signature as "
             "`skip=...`; a record from before the rule replays with none."
         ),
+        "dayrange_3m": (
+            "The 09:33 and 09:34 bars, traded on HighLow_3m's 9:33 forecast before "
+            "HighLow's 9:35 one exists.\n\n"
+            "- Its own buy and sell under HighLow_3m's predicted high, in the run's unit; "
+            "no stop, no momentum confirmation, no take.\n"
+            "- A position still open at 9:35 is handed to HighLow's levels and exits.\n"
+            "- In the signature as `3m=H-0.4R/H-0.25R` while on; both distances are "
+            "Tuning-tab axes. A record from before it replays with it off."
+        ),
         "dayrange_breaker": (
             "When to stop for the day.\n\n"
             "- Its own axis on the Tuning tab, and worth one: it changes how many trades "
@@ -1694,6 +1703,22 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         "model_dayrange": (
             "The predicted high, flat for the session — what the shipped buy/sell "
             "distances were swept against, and what every stored record replays as."
+        ),
+        "use_3m": (
+            "Trade 09:33–09:35 on HighLow_3m's 9:33 forecast, then hand any open "
+            "position to HighLow at 9:35.\n\n"
+            "- Reads HighLow_3m's inputs from Alpaca as a HighLow_3m run does "
+            "(ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow3m/` — a cold "
+            "week takes about two minutes.\n"
+            "- A trade the window closes does not trip the circuit breaker."
+        ),
+        "buy_3m_k": (
+            "Starts at **{buy_3m_k}** on {ticker} — HighLow_3m's own starting pair, never "
+            "swept for this window. Sweepable."
+        ),
+        "sell_3m_k": (
+            "Starts at **{sell_3m_k}** on {ticker}. Only two bars to reach it; a "
+            "position that does not is handed to HighLow at 9:35. Sweepable."
         ),
         "model_highlow": (
             "The day-range rules on HighLow's predicted high and range. The shipped "

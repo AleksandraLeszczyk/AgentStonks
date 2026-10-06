@@ -227,6 +227,7 @@ def dayrange_params(
     )
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
     sell_k = repaired_sell(float(buy_k), float(sell_k))
+    early = early_params(model_key, ticker, unit_label, copy, seed)
     rules = rule_params(
         replace(defaults, stop_gain_fraction=stop_for(ticker, model_key)),
         float(buy_k), float(sell_k), unit_label, copy,
@@ -242,8 +243,69 @@ def dayrange_params(
         level_unit=level_unit,
         min_win_k=min_win_k,
         **sizing,
+        **early,
         **rules,
     )
+
+
+def early_params(
+    model_key: str, ticker: str, unit_label: str, copy: FormCopy,
+    seed: "AppleTraderConfig | None" = None,
+) -> dict:
+    """HighLow_3m's 9:33 window (`use_3m`): the switch and its two distances.
+
+    Offered on the HighLow model, and only on an instrument HighLow_3m was
+    fitted on; elsewhere nothing is drawn and the config keeps the window off.
+    The distances are keyed by ticker like the levels, since their default is
+    HighLow_3m's own pair on that instrument. They are passed on only while the
+    window is on, so a run with it off is the same configuration whatever the
+    greyed-out boxes hold. `seed` -- a running agent's configuration for the
+    same instrument and model -- reopens all three on its values: the run reads
+    them once, at ▶ Start.
+    """
+    if model_key != apple_models.HIGHLOW_KEY or not apple_models.covers(
+        apple_models.HIGHLOW3M_KEY, ticker
+    ):
+        return {}
+    section("HighLow_3m window (9:33–9:35)", copy.sections.get("dayrange_3m"))
+    default_buy, default_sell = dayrange_levels(ticker, apple_models.HIGHLOW3M_KEY)
+    same_pair = (
+        seed is not None
+        and (seed.ticker or "").upper() == ticker
+        and seed.model_key == model_key
+    )
+    start_on = bool(seed.use_3m) if same_pair else False
+    start_buy = float(seed.buy_3m_k) if same_pair else default_buy
+    start_sell = float(seed.sell_3m_k) if same_pair else default_sell
+    levels = dict(ticker=ticker, buy_3m_k=f"{default_buy:g}", sell_3m_k=f"{default_sell:g}")
+    use_3m = st.checkbox(
+        "Use HighLow_3m",
+        value=start_on,
+        key=copy.key(f"use_3m_{ticker}"),
+        help=copy.help.get("use_3m", "").format(**levels) or None,
+    )
+    col_a, col_b = st.columns(2)
+    buy_3m_k = col_a.number_input(
+        f"HighLow_3m buy distance (× {unit_label} below its H)",
+        min_value=0.05, max_value=3.0, value=start_buy, step=0.05, format="%.2f",
+        key=copy.key(f"buy_3m_k_{ticker}"),
+        disabled=not use_3m,
+        help=copy.help.get("buy_3m_k", "").format(**levels) or None,
+    )
+    sell_3m_k = col_b.number_input(
+        f"HighLow_3m sell distance (× {unit_label} below its H)",
+        min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
+        key=copy.key(f"sell_3m_k_{ticker}"),
+        disabled=not use_3m,
+        help=copy.help.get("sell_3m_k", "").format(**levels) or None,
+    )
+    if not use_3m:
+        return {"use_3m": False}
+    return {
+        "use_3m": True,
+        "buy_3m_k": float(buy_3m_k),
+        "sell_3m_k": repaired_sell(float(buy_3m_k), float(sell_3m_k), "HighLow_3m window"),
+    }
 
 
 def position_params(

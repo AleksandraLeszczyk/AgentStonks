@@ -161,6 +161,16 @@ TUNABLES: "dict[str, Tunable]" = {
         # header has no room to and must not name the wrong one.
         Tunable("buy_k", "Buy distance (× unit below H)", 0.05, 3.0, 0.05, (0.30, 0.90, 0.10)),
         Tunable("sell_k", "Sell distance (× unit below H)", 0.0, 3.0, 0.05, (0.05, 0.45, 0.10)),
+        # HighLow_3m's 9:33 window (`use_3m`): its own pair, under its own
+        # predicted high. Only changes a trade with the window on.
+        Tunable(
+            "buy_3m_k", "HighLow_3m buy distance (× unit below its H)", 0.05, 3.0, 0.05,
+            (0.10, 0.70, 0.10),
+        ),
+        Tunable(
+            "sell_3m_k", "HighLow_3m sell distance (× unit below its H)", 0.0, 3.0, 0.05,
+            (0.0, 0.50, 0.10),
+        ),
         Tunable(
             "stop_gain_fraction", "Stop loss (× the predicted gain)", 0.0, 3.0, 0.05,
             (0.0, 1.0, 0.25),
@@ -294,6 +304,8 @@ CHOICES: "dict[str, Choice]" = {
 SWEEPABLE: "tuple[str, ...]" = (
     "buy_k",
     "sell_k",
+    "buy_3m_k",
+    "sell_3m_k",
     "level_source",
     "breach_update",
     "stop_gain_fraction",
@@ -720,6 +732,10 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
             paths.append(sim_data.stored_bars_path(symbol, prior, feed))
     bundle = apple_models.get(config.model_key).path(symbol)
     paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
+    # HighLow_3m's 9:33 window forecasts from a second saved model.
+    if config.use_3m:
+        early = apple_models.get(apple_models.HIGHLOW3M_KEY).path(symbol)
+        paths.extend(sorted(early.parent.glob(f"{early.stem}*")))
     if config.skip_events:
         paths += [event_days.CALENDAR_PATH, EARNINGS_DIR / f"{symbol}.json"]
         paths += [event_days.verdicts_path(date.fromisoformat(str(d)[:10])) for d in days or ()]

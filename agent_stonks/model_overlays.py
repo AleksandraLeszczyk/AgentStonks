@@ -1251,6 +1251,17 @@ def _trader_levels_items(
            else "the intraday band's upper curve")
         + (f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else "")
     )
+    # A run that traded HighLow_3m's 9:33 window (`use_3m`) recorded those two
+    # bars on that model's levels before its own: never one flat pair.
+    early = config.model_key != apple_models.HIGHLOW3M_KEY and any(
+        row.get("model_key") == apple_models.HIGHLOW3M_KEY for row in levels
+    )
+    if early:
+        how += (
+            f"; before its forecast, HighLow_3m's 9:33 window: buy "
+            f"{getattr(config, 'buy_3m_k', 0.0):g} × and sell "
+            f"{getattr(config, 'sell_3m_k', 0.0):g} × under that model's predicted high"
+        )
     # Only while a position is open: the stop hangs under the actual fill, so
     # before a buy there is none, and a walk (which fills nothing) never has one.
     stops = [row.get("stop") for row in levels]
@@ -1261,7 +1272,7 @@ def _trader_levels_items(
                     "while a position is open")]
         if recorded and any(v is not None for v in stops) else []
     )
-    moves = min(buys) != max(buys) or min(sells) != max(sells)
+    moves = min(buys) != max(buys) or min(sells) != max(sells) or early
     if not moves:
         x0, x1 = made_at, _session_close(day)
         items = [

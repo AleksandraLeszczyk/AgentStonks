@@ -72,7 +72,13 @@ ORCHESTRA_AVATAR = "Multiavatar-2d21d8b739482562eb.png"
 # instruments, not several rule sets: the pair (ticker, model) and the numbers
 # tuned per pair -- the two distances and the circuit breaker -- are the racer's
 # own, and everything else is Orchestra's. `level_source` follows the model.
-PER_RACER_FIELDS = ("ticker", "model_key", "buy_k", "sell_k", "min_win_k", "level_source")
+# HighLow_3m's window distances default per instrument like the levels, so a
+# racer decoded from a record carries its own; Orchestra never trades the
+# window (`OrchestraConfig` refuses `use_3m`), so they change nothing.
+PER_RACER_FIELDS = (
+    "ticker", "model_key", "buy_k", "sell_k", "min_win_k", "level_source",
+    "buy_3m_k", "sell_3m_k",
+)
 
 
 def racer_key(config: AppleTraderConfig) -> str:
@@ -151,6 +157,13 @@ class OrchestraConfig:
             )
         if not self.racers:
             raise ValueError("Orchestra needs at least one (ticker, model) pair")
+        # Its candidates are picked at 09:34, after the window's first trade
+        # could have been made, and its signature has no place for it.
+        if any(r.use_3m for r in self.racers):
+            raise ValueError(
+                "Orchestra does not trade HighLow_3m's 9:33 window (use_3m): its pairs "
+                "are picked at 09:34 and race from their own forecasts"
+            )
         keys = [racer_key(r) for r in self.racers]
         twice = sorted({k for k in keys if keys.count(k) > 1})
         if twice:

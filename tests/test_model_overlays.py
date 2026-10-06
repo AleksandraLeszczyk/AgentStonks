@@ -856,6 +856,22 @@ class TestRecordedTraderLevels:
         stamp = pd.Timestamp(high["x0"]).tz_convert("America/New_York")
         assert (stamp.hour, stamp.minute) == (9, 36)
 
+    def test_highlow3ms_window_opens_the_band_before_the_runs_own_levels(self, monkeypatch):
+        """A HighLow run that traded HighLow_3m's 9:33 window recorded those
+        bars on that model's levels: a step into its own, never one flat pair,
+        and the note says what the first step was."""
+        from dataclasses import replace
+
+        history = self.history([207.0] * 4, model_key="highlow")
+        history["config"] = replace(history["config"], use_3m=True, buy_3m_k=0.4,
+                                    sell_3m_k=0.25)
+        for row in history["rows"][:2]:
+            row["model_key"] = "highlow3m"
+        items = self.compute([mo.TRADER_LEVELS_KEY], history, monkeypatch)
+        band = next(i for i in items if i["kind"] == "band")
+        assert band["lower"] == [207.0] * 4
+        assert "HighLow_3m's 9:33 window: buy 0.4 × and sell 0.25 ×" in band["note"]
+
     def test_levels_that_never_moved_are_still_two_flat_lines(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY], self.history([207.0] * 3), monkeypatch)
         levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
