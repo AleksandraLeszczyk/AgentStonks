@@ -392,10 +392,12 @@ APPLE_TRADER_TUNED_STOP: "dict[tuple[str, str], float]" = {
 #   take       once the momentum over the last NEGATIVE_MOMENTUM_BARS bars
 #              (close - close N bars earlier) has been negative for
 #              NEGATIVE_FOR_BARS bars in a row while holding, with the position
-#              in profit, sell TAKE_FRACTION of it ...
+#              in profit (or, since 2026-10-06, TAKE_IN_LOSS, at a loss too),
+#              sell TAKE_FRACTION of it ...
 #   runner     ... and keep the rest for the sell level only if that is still
 #              HOLD_MIN_GAIN_K x ADR above the fill (otherwise sell it all);
-#              a runner is sold if the price comes back to the fill
+#              a runner kept in profit is sold if the price comes back to the
+#              fill, one kept at a loss is left to the stop
 #
 # The stop is written against the *predicted gain* rather than against the ADR:
 # the trade is playing for the distance between the two levels, which is
@@ -441,7 +443,8 @@ APPLE_TRADER_NEGATIVE_FOR_BARS = 5
 # week's mean absolute one-minute move. The user's behaviour table then decides:
 # buy at the buy level only on positive momentum, or neutral with a change
 # that is not negative; sell at the sell level unless momentum is positive; below it, take
-# gains (in profit) on negative momentum whose change is neutral or negative.
+# (in profit or, with APPLE_TRADER_TAKE_IN_LOSS, at a loss) on negative momentum
+# whose change is neutral or negative.
 # 0 switches it off, which is what every SimLab record written before it
 # existed replays as (`simlab.rule_agents._APPLE_LEGACY`). 3 bars since
 # 2026-10-04 (was 5; the user's call): the setting the day's tuning jobs ran
@@ -459,6 +462,16 @@ APPLE_TRADER_TAKE_FRACTION = 0.70
 # what every SimLab record written before then replays as
 # (`simlab.rule_agents._APPLE_LEGACY`).
 APPLE_TRADER_TAKE_AFTER_MINUTES = 15
+# Whether the momentum take also fires on a position under its fill (2026-10-06,
+# at the user's request: "remove only in profit -- it should trigger on momentum
+# once the timer has passed"). Before then it banked gains only and left a
+# losing position to the stop. A runner kept from a take at or under the fill
+# (the user's choice: the same `take_fraction` split as in profit) has no
+# breakeven -- it is already under the fill -- and rides on the stop, the sell
+# level and the closing flatten. False is the rule before, which is what every
+# SimLab record written until then replays as (`simlab.rule_agents._APPLE_LEGACY`).
+# Not swept.
+APPLE_TRADER_TAKE_IN_LOSS = True
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What the agent does when the session trades through the forecast it was given
 # at 9:35 -- the vocabulary lives here rather than in `dayrange_model`, which

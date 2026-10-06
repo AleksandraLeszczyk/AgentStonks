@@ -978,7 +978,7 @@ class TestRuleAgentRecords:
         assert "@mom-1," in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
-        assert "@conf>=15m," in agent.signature(today)
+        assert "@conf>=15m+loss," in agent.signature(today)
         assert ",confirm=3b" in agent.signature(today)
 
     def test_a_record_from_the_gain_gate_keeps_it(self):
@@ -989,9 +989,20 @@ class TestRuleAgentRecords:
         record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
         record["take_min_gain_fraction"] = 0.2
         record.pop("take_after_minutes")
+        record.pop("take_in_loss")
         old = agent.from_record(record)
         assert (old.take_min_gain_fraction, old.take_after_minutes) == (0.2, 0)
         assert "@conf>=0.2G," in agent.signature(old)
+
+    def test_a_record_from_before_the_take_at_a_loss_takes_in_profit_only(self):
+        """Until 2026-10-06 the take fired in profit only. A record without
+        `take_in_loss` replays that and signs as it was filed, with no `+loss`."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        record.pop("take_in_loss")
+        old = agent.from_record(record)
+        assert not old.take_in_loss
+        assert "@conf>=15m," in agent.signature(old)
 
     def test_a_record_from_before_negative_momentum_keeps_its_turn(self):
         """From 2026-09-21 to -23 the take fired on the sigma score turning from

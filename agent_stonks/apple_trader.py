@@ -72,6 +72,7 @@ from .config import (
     APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
     APPLE_TRADER_TAKE_AFTER_MINUTES,
+    APPLE_TRADER_TAKE_IN_LOSS,
     APPLE_TRADER_TUNED_LEVELS,
     APPLE_TRADER_TUNED_STOP,
     BREACH_BROWNIAN,
@@ -229,7 +230,7 @@ class AppleTraderConfig:
     # positive, neutral (under MOMENTUM_NEUTRAL_FRACTION of the ticker's
     # `abs_mean_minute_momentum`) or negative. It gates the buy at the buy
     # level, the sell at the sell level and the breach exit, and is the
-    # momentum take below the sell level (`take_fraction`, in profit only).
+    # momentum take below the sell level (`take_fraction`, `take_in_loss`).
     # Never the stop, the breakeven or the flatten. See `_momentum_read`. 0
     # switches it off, and with it the take, the runner and its breakeven.
     momentum_confirmation_bars: int = APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS
@@ -264,6 +265,11 @@ class AppleTraderConfig:
     # level units, like the stop) above the fill. A new config leaves it at 0,
     # any profit.
     take_min_gain_fraction: float = 0.0
+    # Whether the take also fires on a position at or under its fill, once the
+    # time above has passed. False is the rule before 2026-10-06 -- gains only,
+    # a loss left to the stop -- which a stored record replays as. A runner kept
+    # from a take at a loss has no breakeven (`_exit`).
+    take_in_loss: bool = APPLE_TRADER_TAKE_IN_LOSS
     # The gain still left to the sell level, in ADRs above the fill, that is
     # worth keeping a runner for. Short of it the take sells everything.
     hold_min_gain_k: float = APPLE_TRADER_HOLD_MIN_GAIN_K
@@ -803,6 +809,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
             exits += f">={c.take_min_gain_fraction:g}G"
         if c.take_after_minutes:
             exits += f">={c.take_after_minutes}m"
+        # Only while on, so every record written before it existed (which
+        # replays gains-only) keeps its filed signature.
+        if c.take_in_loss:
+            exits += "+loss"
         exits += f",runner>={c.hold_min_gain_k:g}{unit}"
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
@@ -1201,7 +1211,8 @@ def fetch_opening_window(state: AppState, frame, want: int, ticker: str = DEFAUL
 # side may do on that bar:
 #
 #   buy          -- a buy at the buy level (first entry or an add) is allowed;
-#   take         -- below the sell level, in profit: sell `take_fraction`;
+#   take         -- below the sell level (in profit, or at a loss with
+#                   `take_in_loss`): sell `take_fraction`;
 #   sell_target  -- at or above the sell level: the target (and the breach
 #                   exit) may sell.
 #
@@ -2419,7 +2430,7 @@ class DayRangeTrader(BaseTrader):
         plan = self.plan
         row = _levels_row(self.config, plan, ts)
         if self.entry is not None:
-            if self.entry.get("runner"):
+            if self.entry.get("runner") and not self.entry.get("loss_runner"):
                 row["stop"] = float(self.entry["price"])
             else:
                 row["stop"] = self._stop_price()
@@ -3154,7 +3165,9 @@ class DayRangeTrader(BaseTrader):
 
         1. **breakeven** -- a runner (what a momentum take left behind) is sold
            once a bar's low comes back to the fill. It was kept to wait for the
-           sell level, not to hand back the gain the take already banked.
+           sell level, not to hand back the gain the take already banked. Not
+           a runner kept from a take at or under the fill (`take_in_loss`):
+           it is under the fill already, so it is left to the stop.
         2. **stop** -- a bar's low at `fill - stop_distance`, which is a share
            of what the trade is playing for (`stop_gain_fraction`): the day went
            the other way from the forecast. Everything is sold, and `run_cycle`
@@ -3182,7 +3195,7 @@ class DayRangeTrader(BaseTrader):
         pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
         self._held_note = None
 
-        if entry.get("runner") and low <= entry_price:
+        if entry.get("runner") and not entry.get("loss_runner") and low <= entry_price:
             return position, (
                 f"Breakeven: the runner the momentum take left traded back down to "
                 f"${low:,.2f}, at or under the ${entry_price:,.2f} fill. It was kept for the "
@@ -3268,7 +3281,8 @@ class DayRangeTrader(BaseTrader):
     ) -> "tuple[float, str, str] | None":
         """Bank gains short of the target once momentum has been negative for long enough.
 
-        Fires when the position is in profit, `take_after_minutes` or more have
+        Fires when the position is in profit (or at all, with `take_in_loss`),
+        `take_after_minutes` or more have
         passed since the last fill (`entry["ts"]`, which an add moves) -- and,
         on a legacy record, the close is `take_min_gain_fraction` of the
         predicted gain over the fill -- and the momentum confirmation's
@@ -3287,11 +3301,12 @@ class DayRangeTrader(BaseTrader):
         `take_fraction` of the shares go and the rest is kept as a runner --
         left to the sell level, the flatten, or the breakeven. Short of that the
         target is too close to be worth the wait and everything goes. Once per
-        position: a runner is never trimmed again.
+        position: a runner is never trimmed again. The split is the same at a
+        loss (the user's choice); that runner just has no breakeven (`_sell`
+        marks it `loss_runner`), so it rides on the stop.
 
         The momentum is recomputed over the session on each call rather than
         tracked bar by bar, so a cycle that missed a bar still sees the turn.
-        Only reached with a profitable, untrimmed position and the rule on.
         """
         config, plan = self.config, self.plan
         entry = self.entry or {}
@@ -3299,7 +3314,7 @@ class DayRangeTrader(BaseTrader):
             not config.has_take
             or entry.get("runner")
             or not entry_price
-            or price <= entry_price
+            or (price <= entry_price and not config.take_in_loss)
         ):
             return None
         # Not before the trade has had its time: until then a negative read is
@@ -3313,7 +3328,10 @@ class DayRangeTrader(BaseTrader):
         # The legacy gate: not before the trade has banked its share of what
         # it is playing for. Read at the current unit, like the runner test.
         unit = level_unit(config, plan)
-        if price - entry_price < config.take_min_gain_fraction * config.target_gain_k * unit:
+        if (
+            config.take_min_gain_fraction
+            and price - entry_price < config.take_min_gain_fraction * config.target_gain_k * unit
+        ):
             return None
 
         if config.momentum_confirmation_bars:
@@ -3330,10 +3348,16 @@ class DayRangeTrader(BaseTrader):
 
         left = plan["sell_level"] - entry_price
         pnl_pct = (price / entry_price - 1) * 100
+        in_loss = price <= entry_price
         fade = (
             f"Momentum take: {why}, with the "
-            f"price at ${price:,.2f} — above the ${entry_price:,.2f} fill but short of the "
-            f"${plan['sell_level']:,.2f} sell level"
+            f"price at ${price:,.2f} — "
+            + (
+                f"at or under the ${entry_price:,.2f} fill"
+                if in_loss
+                else f"above the ${entry_price:,.2f} fill but short of the "
+                f"${plan['sell_level']:,.2f} sell level"
+            )
         )
         to_target = f"${left:,.2f} ({left / unit:.2f} × {config.unit_phrase})"
 
@@ -3351,12 +3375,22 @@ class DayRangeTrader(BaseTrader):
                 f"{config.take_fraction:.0%} of {position:g} shares leaves no whole share to "
                 f"keep, so the whole position is sold at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_TAKE
+        stop = self._stop_price()
         return quantity, (
-            f"{fade}. Banking {quantity:g} of {position:g} shares at market "
-            f"({pnl_pct:+.2f}%). The sell level is still {to_target} above the fill — at "
-            f"least the {config.hold_min_gain_k:g} × {config.unit_phrase} worth waiting for — so the other "
-            f"{position - quantity:g} ride on to it or the closing flatten, and are sold if "
-            "the price comes back to the fill."
+            f"{fade}. {'Selling' if in_loss else 'Banking'} {quantity:g} of {position:g} "
+            f"shares at market ({pnl_pct:+.2f}%). The sell level is still {to_target} above "
+            f"the fill — at least the {config.hold_min_gain_k:g} × {config.unit_phrase} worth "
+            f"waiting for — so the other {position - quantity:g} ride on to it or the "
+            "closing flatten, and "
+            + (
+                (
+                    f"are sold at the ${stop:,.2f} stop."
+                    if stop is not None
+                    else "have no stop under them."
+                )
+                if in_loss
+                else "are sold if the price comes back to the fill."
+            )
         ), self.EXIT_TAKE
 
     def _momentum_negative(self, frame, since) -> "str | None":
@@ -3564,6 +3598,14 @@ class DayRangeTrader(BaseTrader):
             self.entry = {
                 **entry,
                 "runner": entry.get("runner") or kind == self.EXIT_TAKE,
+                # A take at or under the fill (`take_in_loss`): the runner is
+                # under the fill already, so no breakeven -- the stop is its
+                # floor. The close the take judged, not the fill, so the rule
+                # and the message it logged agree.
+                "loss_runner": entry.get("loss_runner") or (
+                    kind == self.EXIT_TAKE
+                    and float(bar["close"]) <= float(entry.get("price") or 0.0)
+                ),
                 "banked": banked,
                 "banked_shares": shares,
             }
@@ -3703,10 +3745,13 @@ class DayRangeTrader(BaseTrader):
                 f"long {position:g} sh @ ${entry_price:,.2f}{average} ({pnl:+.2f}%), "
                 f"{self.entry['bars']} bars"
             )
-            if self.entry.get("runner"):
+            if self.entry.get("runner") and not self.entry.get("loss_runner"):
                 parts.append(f"runner, out at ${entry_price:,.2f}")
-            elif self._stop_price() is not None:
-                parts.append(f"stop ${self._stop_price():,.2f}")
+            else:
+                if self.entry.get("runner"):
+                    parts.append("runner")
+                if self._stop_price() is not None:
+                    parts.append(f"stop ${self._stop_price():,.2f}")
         elif plan.get("stand_down"):
             parts.append(f"{plan['stand_down']}, no new entries today")
         return " · ".join(parts)
@@ -3848,7 +3893,8 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         )
     if config.has_take:
         exits.append(
-            f"a {config.take_fraction:.0%} take in profit"
+            f"a {config.take_fraction:.0%} take "
+            + ("in profit or at a loss" if config.take_in_loss else "in profit")
             + (
                 f" (at least {config.take_min_gain_fraction:g} × the predicted gain)"
                 if config.take_min_gain_fraction else ""
@@ -3861,6 +3907,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             f"({fade_phrase(config)}), the rest kept for the sell level only if "
             f"it is {config.hold_min_gain_k:g} × {config.unit_phrase} or more above the fill and sold if the "
             "price comes back to it"
+            + (" (a take at a loss leaves that to the stop)" if config.take_in_loss else "")
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
     if config.momentum_confirmation_bars:

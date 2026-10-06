@@ -212,6 +212,10 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     `TestMomentumConfirmation` is where the wait is switched on, and the legacy
     realised-gain gate (`take_min_gain_fraction`, 0 by default) with it.
 
+    `take_in_loss` is pinned off, the take in profit only: what every take test
+    here was written against. `TestMomentumConfirmation` is where it is
+    switched on.
+
     `limit_entry` is pinned off, the market buy: most tests here enter on a bar
     that dipped to the level and closed above it, filling at the close, which
     a limit at the level refuses. `TestLimitEntry` is where it is switched on.
@@ -224,6 +228,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("limit_entry", False)
     kwargs.setdefault("momentum_confirmation_bars", 0)
     kwargs.setdefault("take_after_minutes", 0)
+    kwargs.setdefault("take_in_loss", False)
     if not kwargs["momentum_confirmation_bars"] and not (
         kwargs.get("momentum_fade_bars") or kwargs.get("momentum_drop")
     ):
@@ -4141,7 +4146,7 @@ class TestMomentumConfirmation:
         assert config.momentum_confirmation_bars == 3
         assert config.has_take
         signature = config_signature(config)
-        assert ",confirm=3b" in signature and "@conf>=15m," in signature
+        assert ",confirm=3b" in signature and "@conf>=15m+loss," in signature
 
     def test_it_cannot_sit_beside_a_legacy_take(self):
         with pytest.raises(ValueError, match="only one may be set"):
@@ -4270,13 +4275,88 @@ class TestMomentumConfirmation:
         assert self._step(trader, tracker, tape, state, 103.0) == "sold"
         assert 0 < tracker.position_for(TICKER) < shares
 
+    # --- the take at a loss -----------------------------------------------
+
+    def test_the_take_at_a_loss_is_on_by_default_and_signed(self):
+        config = AppleTraderConfig()
+        assert config.take_in_loss
+        assert "@conf>=15m+loss," in config_signature(config)
+        assert "+loss" not in config_signature(replace(config, take_in_loss=False))
+        assert "+loss" not in config_signature(
+            AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
+        )
+
+    def test_the_take_at_a_loss_is_announced(self):
+        config = dayrange_config(momentum_confirmation_bars=self.N, take_in_loss=True)
+        summary = at._armed_summary(
+            config, at.apple_models.get(config.model_key), DAYRANGE_BUNDLE
+        )
+        assert "take in profit or at a loss" in summary
+        assert "a take at a loss leaves that to the stop" in summary
+
+    def test_a_loss_is_taken_and_its_runner_left_to_the_stop(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_in_loss=True)
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "negative")
+        # Under the $101.80 fill, above the stop: the same share as in profit.
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        left = tracker.position_for(TICKER)
+        assert 0 < left < shares
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "Momentum take" in reasoning and "at or under the $101.80 fill" in reasoning
+        stop = 101.8 - 0.5 * TARGET_GAIN
+        assert f"sold at the ${stop:,.2f} stop" in reasoning
+        assert trader.entry["runner"] and trader.entry["loss_runner"]
+        # Under the fill again: no breakeven for this runner, and no second take.
+        assert self._step(trader, tracker, tape, state, 100.8, low=100.7) == "hold"
+        assert tracker.position_for(TICKER) == left
+        assert trader.plan["history"][-1]["stop"] == pytest.approx(stop)
+        # The stop is its floor.
+        assert self._step(trader, tracker, tape, state, 99.0, low=stop - 0.01) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Stop loss" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_loss_runner_rides_to_the_sell_level(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_in_loss=True)
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        self._force(monkeypatch, "neutral", "neutral")
+        assert self._step(trader, tracker, tape, state, 109.5, high=109.6) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_runner_kept_in_profit_still_has_its_breakeven(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_in_loss=True)
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 105.0) == "sold"
+        assert not trader.entry["loss_runner"]
+        assert self._step(trader, tracker, tape, state, 102.0, low=101.7) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Breakeven" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_loss_waits_for_the_time_too(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_in_loss=True, take_after_minutes=3
+        )
+        shares = tracker.position_for(TICKER)
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 101.0) == "hold"
+        assert self._step(trader, tracker, tape, state, 101.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        assert 0 < tracker.position_for(TICKER) < shares
+
     # --- the take waits for time since the fill -----------------------------
 
     def test_the_time_gate_is_on_by_default_and_signed(self):
         config = AppleTraderConfig()
         assert config.take_after_minutes == 15
         assert config.take_min_gain_fraction == 0.0
-        assert "@conf>=15m," in config_signature(config)
+        assert "@conf>=15m+loss," in config_signature(config)
         assert ">=0m" not in config_signature(replace(config, take_after_minutes=0))
         assert ">=15m" not in config_signature(
             AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
@@ -4309,7 +4389,9 @@ class TestMomentumConfirmation:
     # --- the legacy gate: a share of the predicted gain ---------------------
 
     def test_the_legacy_gain_gate_is_signed_when_set(self):
-        config = AppleTraderConfig(take_min_gain_fraction=0.2, take_after_minutes=0)
+        config = AppleTraderConfig(
+            take_min_gain_fraction=0.2, take_after_minutes=0, take_in_loss=False
+        )
         assert "@conf>=0.2G," in config_signature(config)
         assert ">=0G" not in config_signature(AppleTraderConfig())
         with pytest.raises(ValueError, match="take_min_gain_fraction"):
