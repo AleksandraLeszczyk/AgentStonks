@@ -38,6 +38,11 @@ DEFAULT_PREMARKET_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-5-5",
 }
 
+# The provider briefings are written with when nothing names one (SimLab's
+# Tuning bias and Orchestra replays); the live tab's picker defaults to the
+# app's news provider, which starts on the same one.
+DEFAULT_PREMARKET_PROVIDER = "openai"
+
 
 class Catalyst(BaseModel):
     headline: str

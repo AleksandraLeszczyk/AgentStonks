@@ -111,9 +111,11 @@ def vix_opens(
 # ---------------------------------------------------------------------------
 
 def briefing_provider() -> Optional[tuple[str, str, str]]:
-    """(provider, model, api key) for the briefings: the first provider with a
-    key in the environment, on its pre-market default model. None without any."""
-    for provider in PROVIDERS:
+    """(provider, model, api key) for the briefings: the pre-market default
+    provider when its key is in the environment, else the first provider with
+    one, on its pre-market default model. None without any."""
+    default = premarket.DEFAULT_PREMARKET_PROVIDER
+    for provider in (default, *(p for p in PROVIDERS if p != default)):
         key = os.getenv(ENV_KEYS[provider], "")
         if key:
             return provider, premarket.DEFAULT_PREMARKET_MODELS[provider], key
@@ -280,8 +282,11 @@ def session_biases(
 
 EARNINGS_DIR = CONTEXT_DIR / "earnings"
 # The briefings an Orchestra setup that names none is shown coverage for: the
-# pre-market default on the first provider.
-DEFAULT_BRIEFING = (PROVIDERS[0], premarket.DEFAULT_PREMARKET_MODELS[PROVIDERS[0]])
+# pre-market default provider on its default model.
+DEFAULT_BRIEFING = (
+    premarket.DEFAULT_PREMARKET_PROVIDER,
+    premarket.DEFAULT_PREMARKET_MODELS[premarket.DEFAULT_PREMARKET_PROVIDER],
+)
 
 
 def cached_briefing_models() -> list[tuple[str, str]]:

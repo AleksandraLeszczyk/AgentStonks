@@ -2145,9 +2145,11 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
     }
     race = apple_trader_ui.orchestra_params(
         symbols, apple_trader_ui.FormCopy(prefix=prefix, **fields),
-        # Always at least the default, so a setup made before anything is cached
-        # names the briefings it will read once they are written.
-        briefing_choices=sim_session.cached_briefing_models() or [sim_session.DEFAULT_BRIEFING],
+        # The default first, cached or not, so a setup names the briefings it
+        # will read once they are written; then whatever else is cached.
+        briefing_choices=[sim_session.DEFAULT_BRIEFING] + [
+            pm for pm in sim_session.cached_briefing_models() if pm != sim_session.DEFAULT_BRIEFING
+        ],
     )
     if race is not None and race.selection is not None:
         _render_briefing_coverage(race, prefix)
