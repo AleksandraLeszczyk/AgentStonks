@@ -106,10 +106,12 @@ SHORT_MODEL_NAMES = {
 
 def racer_label(config_or_key) -> str:
     """"INTC · Day Range": what the log, the board and the form call a racer."""
-    if isinstance(config_or_key, AppleTraderConfig):
-        ticker, model_key = config_or_key.ticker, config_or_key.model_key
-    else:
+    # A key is the string; anything else is a config, of whichever class --
+    # see `apple_trader.as_config`.
+    if isinstance(config_or_key, str):
         ticker, model_key = split_key(config_or_key)
+    else:
+        ticker, model_key = config_or_key.ticker, config_or_key.model_key
     name = SHORT_MODEL_NAMES.get(model_key) or apple_models.get(model_key).label
     return f"{ticker} · {name}"
 
@@ -146,10 +148,7 @@ class OrchestraConfig:
     selection: "candidates.SelectionRules | None" = None
 
     def __post_init__(self) -> None:
-        self.racers = [
-            r if isinstance(r, AppleTraderConfig) else AppleTraderConfig(**r)
-            for r in self.racers
-        ]
+        self.racers = [at.as_config(r) for r in self.racers]
         if isinstance(self.selection, dict):
             known = {f.name for f in fields(candidates.SelectionRules)}
             self.selection = candidates.SelectionRules(

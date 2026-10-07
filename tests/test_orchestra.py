@@ -5,7 +5,7 @@ the race adds -- who may buy, who holds, when the race reopens -- and that it
 changes nothing about any one racer's own rules: a race of one trades exactly
 as a single run does.
 """
-from dataclasses import replace
+from dataclasses import field, fields, make_dataclass, replace
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -376,6 +376,27 @@ class TestOrchestraConfig:
     def test_refuses_racers_whose_shared_rules_differ(self):
         with pytest.raises(ValueError, match="position_pct"):
             ar.OrchestraConfig([racer("AAPL"), racer("INTC", position_pct=50.0)])
+
+    def test_takes_racers_of_the_class_before_a_module_reload(self):
+        # Saving a file makes Streamlit unload the app's modules, so a race
+        # started before the save keeps publishing configs of the old class --
+        # here one that has not gained `use_3m` yet and still has a field since
+        # removed. Rebuilding the running race from them raised TypeError.
+        aapl, intc = racer("AAPL"), racer("INTC")
+        old_class = make_dataclass(
+            "AppleTraderConfig",
+            [(f.name, object, field(default=None))
+             for f in fields(at.AppleTraderConfig) if f.name != "use_3m"]
+            + [("removed_since", object, field(default=None))],
+        )
+        stale = [
+            old_class(**{f.name: getattr(c, f.name) for f in fields(old_class) if hasattr(c, f.name)})
+            for c in (aapl, intc)
+        ]
+        assert not isinstance(stale[0], at.AppleTraderConfig)
+        race = ar.OrchestraConfig(stale)
+        assert race.racers == [aapl, intc]
+        assert ar.racer_label(stale[1]) == ar.racer_label("INTC:dayrange")
 
     def test_build_takes_each_pairs_own_tuned_numbers(self):
         race = ar.build_orchestra_config(["INTC:dayrange", "AAPL:highlow"], at.AppleTraderConfig())

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import timedelta, timezone
 from typing import Optional
 
@@ -623,6 +623,25 @@ class AppleTraderConfig:
             or self.momentum_fade_bars
             or self.momentum_drop
         )
+
+
+def as_config(value) -> AppleTraderConfig:
+    """An `AppleTraderConfig` from one, from a record's dict, or from an
+    instance of the class as it was before Streamlit reloaded this module.
+
+    Saving any of the app's files makes Streamlit unload every one of its
+    modules, so the next rerun builds a new `AppleTraderConfig` class while an
+    agent started before the save keeps publishing configs of the old one into
+    the state -- which `isinstance` refuses and `**` cannot unpack. Rebuilt by
+    field name; a field the class no longer has is dropped and one it gained
+    takes its default.
+    """
+    if isinstance(value, AppleTraderConfig):
+        return value
+    if is_dataclass(value) and not isinstance(value, type):
+        known = {f.name for f in fields(AppleTraderConfig)}
+        value = {f.name: getattr(value, f.name) for f in fields(value) if f.name in known}
+    return AppleTraderConfig(**value)
 
 
 def level_unit(config: AppleTraderConfig, plan: "dict") -> float:
