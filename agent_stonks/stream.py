@@ -68,8 +68,9 @@ def backfill_bars(
 
     The WS stream never re-delivers bars that closed while the socket was down,
     and a minute without a trade on the streamed venue produces no bar at all --
-    both leave permanent gaps in state.bars. Only missing timestamps are
-    inserted, so streamed bars are never overwritten.
+    both leave permanent gaps in state.bars. Missing timestamps are filled, and
+    bars older than SETTLED_BAR_AGE_MIN are swapped for the settled
+    consolidated bar; streamed bars younger than that are never overwritten.
 
     `history_feed` is the session's resolved REST bar source, NOT the stream's
     feed -- the two are deliberately separate. Repairing a consolidated live
@@ -78,10 +79,11 @@ def backfill_bars(
     is visible, a 26x-understated bar is not. See `agent_stonks.bar_history`.
 
     Each bar comes from the source its age calls for (`bar_history.fetch_live_bars`):
-    settled bars from yfinance / the resolved feed, the last
-    SETTLED_BAR_AGE_MIN minutes from IEX as provisional bars, and never the
-    minute in progress. Settled bars also replace provisional ones -- IEX
-    backfill and the partial minutes either side of a stop/start.
+    settled bars from the resolved feed (SIP; yfinance only without it), the
+    last SETTLED_BAR_AGE_MIN minutes from IEX as provisional bars, and never
+    the minute in progress. Settled bars replace provisional ones -- IEX
+    backfill and the partial minutes either side of a stop/start -- and any
+    older bar from a lesser source, streamed candles included.
 
     Returns (bars_added_or_replaced, source_name), counting only what is in the
     buffer now -- see `merge_missing_bars` for why that can be fewer than the
@@ -91,12 +93,14 @@ def backfill_bars(
     live = bar_history.fetch_live_bars(
         symbol, timeframe, key, secret, history_feed, what="bar backfill"
     )
-    added, replaced = stream_common.merge_live_bars(state, live.bars, live.provisional)
+    added, replaced = stream_common.merge_live_bars(
+        state, live.bars, live.provisional, live.settled
+    )
     log_fetch(
         "bar backfill",
         live.source,
         symbol=symbol,
-        detail=f"{added} missing {timeframe} bar(s) added, {replaced} provisional replaced",
+        detail=f"{added} missing {timeframe} bar(s) added, {replaced} replaced by settled bars",
         failures=live.failures,
     )
     return added + replaced, live.source
@@ -323,7 +327,7 @@ def _poll_symbol_via_rest(
         "bars", source, symbol=symbol, detail=f"{len(bars)} bars", failures=bar_failures
     )
     stream_common.mark_newest_bar_provisional(state)
-    stream_common.merge_live_bars(state, bars, live.provisional)
+    stream_common.merge_live_bars(state, bars, live.provisional, live.settled)
 
     last_price = bars[-1].get("c")
     price_source = f"{source} (last bar close)"

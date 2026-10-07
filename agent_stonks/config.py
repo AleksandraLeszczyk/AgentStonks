@@ -159,10 +159,11 @@ NEWS_WAKE_MAX_AGE_MIN = 60
 # on the subscribed feed.
 BACKFILL_POLL_SEC = 60
 
-# The age at which a backfilled bar counts as settled. Older bars come from a
-# consolidated source (yfinance for regular-session minutes, the resolved
-# history feed for the rest). Younger bars, other than the minute in progress,
-# come from Alpaca IEX and are kept as provisional: IEX carries ~3-4% of the
+# The age at which a bar counts as settled. Older bars come from the resolved
+# history feed (SIP; yfinance stands in for regular-session minutes without it)
+# and replace whatever the buffer held for them, streamed candles included.
+# Younger bars, other than the minute in progress, are the live stream's, with
+# Alpaca IEX filling any it missed as provisional: IEX carries ~3-4% of the
 # consolidated volume, so they are replaced once they are old enough for a
 # consolidated source to serve them. The minute in progress is never backfilled;
 # the live socket owns it. See `bar_history.fetch_live_bars`.

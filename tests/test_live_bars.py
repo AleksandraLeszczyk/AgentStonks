@@ -26,11 +26,11 @@ def _key(ts: str) -> str:
 
 
 class TestFetchLiveBars:
-    def _patch(self, monkeypatch, base, yf, recent, calls=None):
+    def _patch(self, monkeypatch, base, yf, recent, calls=None, base_feed="sip_delayed"):
         calls = calls if calls is not None else {}
 
         def _history(symbol, timeframe, key, secret, feed, **kw):
-            return base, bar_history.SOURCE_LABELS["sip_delayed"], []
+            return base, bar_history.SOURCE_LABELS[base_feed], []
 
         def _yf(symbol, interval, start, end):
             calls["yf_end"] = end
@@ -48,32 +48,66 @@ class TestFetchLiveBars:
     def test_each_age_comes_from_its_own_source(self, monkeypatch):
         premarket = _bar("2026-09-25T12:00:00Z", v=437)       # 08:00 ET, SIP
         regular_sip = _bar("2026-09-25T17:00:00Z", v=59805)   # 13:00 ET, SIP
-        regular_yf = _bar("2026-09-25T17:00:00Z", v=59813)    # same minute, yfinance
         young_iex = _bar("2026-09-25T17:55:00Z", v=160)       # 5 min old, IEX
         calls = self._patch(
             monkeypatch,
             base=[premarket, regular_sip],
-            yf=[regular_yf, _bar("2026-09-25T12:00:00Z", v=0)],  # yfinance's zero pre-market
+            yf=[_bar("2026-09-25T17:00:00Z", v=59813)],
             recent=[young_iex],
         )
 
         live = bar_history.fetch_live_bars("AAPL", "1Min", "k", "s", "sip_delayed", now=NOW)
 
         by_t = {_key(b["t"]): b for b in live.bars}
-        assert by_t[_key(premarket["t"])]["v"] == 437       # yfinance's 0 never used
-        assert by_t[_key(regular_yf["t"])]["v"] == 59813    # yfinance wins in session
+        assert by_t[_key(premarket["t"])]["v"] == 437
+        assert by_t[_key(regular_sip["t"])]["v"] == 59805    # SIP, not yfinance
         assert by_t[_key(young_iex["t"])]["v"] == 160
         assert live.provisional == {_key(young_iex["t"])}
+        # The SIP bars are settled: they may replace a streamed candle.
+        assert live.settled == {_key(premarket["t"]), _key(regular_sip["t"])}
         # Each bar records the tape it came off.
         assert by_t[_key(premarket["t"])]["src"] == "sip"
-        assert by_t[_key(regular_yf["t"])]["src"] == "yfinance"
+        assert by_t[_key(regular_sip["t"])]["src"] == "sip"
         assert by_t[_key(young_iex["t"])]["src"] == "iex"
         assert "src" not in young_iex  # the fetchers' own (cached) bars are untouched
+        # With SIP in hand yfinance is not asked.
+        assert "yf_end" not in calls
         # The young window stops short of the minute in progress, on IEX.
         start, end, feed = calls["recent"]
         assert end == datetime(2026, 9, 25, 18, 0, tzinfo=timezone.utc)
         assert feed == "iex"
+
+    def test_without_sip_yfinance_serves_the_settled_regular_session(self, monkeypatch):
+        premarket_iex = _bar("2026-09-25T12:00:00Z", v=20)
+        regular_iex = _bar("2026-09-25T17:00:00Z", v=2200)
+        calls = self._patch(
+            monkeypatch,
+            base=[premarket_iex, regular_iex],
+            yf=[_bar("2026-09-25T17:00:00Z", v=59813), _bar("2026-09-25T12:00:00Z", v=0)],
+            recent=[],
+            base_feed="iex",
+        )
+
+        live = bar_history.fetch_live_bars("AAPL", "1Min", "k", "s", "iex", now=NOW)
+
+        by_t = {_key(b["t"]): b for b in live.bars}
+        assert by_t[_key(regular_iex["t"])]["v"] == 59813
+        assert by_t[_key(regular_iex["t"])]["src"] == "yfinance"
+        assert by_t[_key(premarket_iex["t"])]["v"] == 20     # yfinance's 0 never used
+        assert live.provisional == {_key(premarket_iex["t"])}
+        assert live.settled == {_key(regular_iex["t"])}
         assert calls["yf_end"] == datetime(2026, 9, 25, 17, 45, 30, tzinfo=timezone.utc)
+
+    def test_a_bar_still_in_progress_is_not_settled(self, monkeypatch):
+        # 15Min at 14:00:30 ET: the 13:30 ET bar ended 13:45, before the
+        # 13:45:30 cut; the 13:45 bar started before the cut but runs to 14:00.
+        done = _bar("2026-09-25T17:30:00Z", v=900000)
+        running = _bar("2026-09-25T17:45:00Z", v=400000)
+        self._patch(monkeypatch, base=[done, running], yf=[], recent=[])
+
+        live = bar_history.fetch_live_bars("AAPL", "15Min", "k", "s", "sip_delayed", now=NOW)
+
+        assert live.settled == {_key(done["t"])}
 
     def test_the_resolved_feed_never_supplies_young_bars(self, monkeypatch):
         young = _bar("2026-09-25T17:58:00Z", v=99999)
@@ -120,16 +154,49 @@ class TestMergeLiveBars:
         assert state.bars[0]["v"] == 30000
         assert state.provisional_bar_keys == set()
 
-    def test_streamed_bars_are_never_replaced(self):
+    def test_young_streamed_bars_are_never_replaced(self):
         state = _state()
-        state.bars.append(_bar("2026-09-25T17:40:00Z", v=25000))
+        state.bars.append({**_bar("2026-09-25T17:55:00Z", v=25000), "src": "finnhub"})
 
         added, replaced = stream_common.merge_live_bars(
-            state, [_bar("2026-09-25T17:40:00Z", v=30000)], set()
+            state, [{**_bar("2026-09-25T17:55:00Z", v=30000), "src": "sip"}], set()
         )
 
         assert (added, replaced) == (0, 0)
         assert state.bars[0]["v"] == 25000
+
+    def test_a_settled_sip_bar_replaces_an_older_streamed_one(self):
+        state = _state()
+        state.bars.append({**_bar("2026-09-25T17:40:00Z", v=2500), "src": "finnhub"})
+        state.bars.append(_bar("2026-09-25T17:41:00Z", v=2600))  # untagged, also replaced
+
+        added, replaced = stream_common.merge_live_bars(
+            state,
+            [{**_bar("2026-09-25T17:40:00Z", v=30000), "src": "sip"},
+             {**_bar("2026-09-25T17:41:00Z", v=31000), "src": "sip"}],
+            set(),
+            {_key("2026-09-25T17:40:00Z"), _key("2026-09-25T17:41:00Z")},
+        )
+
+        assert (added, replaced) == (0, 2)
+        assert [(b["v"], b["src"]) for b in state.bars] == [(30000, "sip"), (31000, "sip")]
+
+    def test_sip_replaces_yfinance_and_never_the_other_way(self):
+        state = _state()
+        state.bars.append({**_bar("2026-09-25T17:00:00Z", v=59813), "src": "yfinance"})
+        state.bars.append({**_bar("2026-09-25T17:01:00Z", v=50000), "src": "sip"})
+        settled = {_key("2026-09-25T17:00:00Z"), _key("2026-09-25T17:01:00Z")}
+
+        added, replaced = stream_common.merge_live_bars(
+            state,
+            [{**_bar("2026-09-25T17:00:00Z", v=59805), "src": "sip"},
+             {**_bar("2026-09-25T17:01:00Z", v=50500), "src": "yfinance"}],
+            set(),
+            settled,
+        )
+
+        assert (added, replaced) == (0, 1)
+        assert [(b["v"], b["src"]) for b in state.bars] == [(59805, "sip"), (50000, "sip")]
 
     def test_iex_never_replaces_anything(self):
         state = _state()
@@ -178,16 +245,17 @@ class TestStopStartEdges:
 
         assert state.provisional_bar_keys == {_key("2026-09-25T17:50:00Z")}
 
-    def test_backfill_after_restart_keeps_streamed_bars_and_fills_the_gap(self, monkeypatch):
+    def test_backfill_after_restart_settles_old_bars_and_fills_the_gap(self, monkeypatch):
         state = _state()
-        streamed = _bar("2026-09-25T17:00:00Z", v=59000)
-        cut_short = _bar("2026-09-25T17:01:00Z", v=5000)
-        state.bars.extend([streamed, cut_short])
-        stream_common.reset_symbol_for_new_stream(state)
+        streamed = {**_bar("2026-09-25T17:00:00Z", v=2000), "src": "finnhub"}
+        cut_short = {**_bar("2026-09-25T17:01:00Z", v=500), "src": "finnhub"}
+        young = {**_bar("2026-09-25T17:55:00Z", v=1800), "src": "finnhub"}
+        state.bars.extend([streamed, cut_short, young])
+        stream_common.reset_symbol_for_new_stream(state)  # flags `young`, the newest
 
         def _history(*a, **k):
             return (
-                [_bar("2026-09-25T17:00:00Z", v=1), _bar("2026-09-25T17:01:00Z", v=44000),
+                [_bar("2026-09-25T17:00:00Z", v=59000), _bar("2026-09-25T17:01:00Z", v=44000),
                  _bar("2026-09-25T17:02:00Z", v=53000)],
                 bar_history.SOURCE_LABELS["sip_delayed"],
                 [],
@@ -196,11 +264,15 @@ class TestStopStartEdges:
         monkeypatch.setattr(bar_history, "fetch_history_bars", _history)
         monkeypatch.setattr(bar_history, "datetime", _FrozenDatetime)
 
-        added, _source = stream.backfill_bars("AAPL", "k", "s", "sip_delayed", state, "1Min")
+        changed, _source = stream.backfill_bars("AAPL", "k", "s", "sip_delayed", state, "1Min")
 
-        assert added == 2
-        assert [b["v"] for b in state.bars] == [59000, 44000, 53000]
-        assert state.provisional_bar_keys == set()
+        # 17:00 and 17:01 settled to SIP, 17:02 added; the young candle stays,
+        # still provisional until IEX or SIP serves its minute.
+        assert changed == 3
+        assert [(b["v"], b["src"]) for b in state.bars] == [
+            (59000, "sip"), (44000, "sip"), (53000, "sip"), (1800, "finnhub"),
+        ]
+        assert state.provisional_bar_keys == {_key("2026-09-25T17:55:00Z")}
 
 
 class _FrozenDatetime(datetime):

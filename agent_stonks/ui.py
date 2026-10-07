@@ -4135,7 +4135,8 @@ def _start_live_session(
 
     A symbol that already has bars at this timeframe and history feed (a Stop
     followed by a Start) keeps them: the fetched history is merged in, filling
-    the gap the stop left, and replacing only provisional bars."""
+    the gap the stop left, and replacing provisional bars and, once settled,
+    bars from a lesser source than SIP."""
     prior_timeframe = state.timeframe
     prior_history_feed = state.history_feed_resolved
     state.set_symbols(syms)
@@ -4194,11 +4195,11 @@ def _start_live_session(
             )
             if reuse:
                 added, replaced = stream_common.merge_live_bars(
-                    sym_state, historical.bars, historical.provisional
+                    sym_state, historical.bars, historical.provisional, historical.settled
                 )
                 detail = (
                     f"cached buffer kept; {added} {timeframe} bar(s) added, "
-                    f"{replaced} provisional replaced"
+                    f"{replaced} replaced by settled bars"
                 )
             else:
                 stream_common.load_live_bars(

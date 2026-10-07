@@ -119,7 +119,7 @@ def test_fallback_bars_loop_keeps_last_quote_when_quote_fetch_fails(monkeypatch)
 
 def test_fallback_bars_loop_backfills_instead_of_polling_when_stream_connected(monkeypatch):
     """While the WS is healthy the loop must not snapshot-replace state, but it
-    does run a periodic backfill that merges only-missing bars."""
+    does run a periodic backfill that fills holes and settles old bars."""
     app, state = _app()
     app.bars_connected = True
     app.status = "✅ Streaming AAPL (IEX)"
@@ -130,7 +130,8 @@ def test_fallback_bars_loop_backfills_instead_of_polling_when_stream_connected(m
 
     stream._fallback_bars_loop(["AAPL"], "k", "s", "iex", app, "1Min", _StopAfter(2))
 
-    assert list(state.bars) == [live_bar, {**missed_bar, "src": "sip"}]  # hole filled, live bar untouched
+    # Hole filled; the streamed bar, long past SETTLED_BAR_AGE_MIN, is now SIP's.
+    assert list(state.bars) == [{**live_bar, "c": 9.9, "src": "sip"}, {**missed_bar, "src": "sip"}]
     assert app.status == "✅ Streaming AAPL (IEX)"  # no fallback warning
     assert state.last_price is None  # snapshot-replace path did not run
 

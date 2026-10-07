@@ -176,21 +176,41 @@ def merge_missing_bars(state: SymbolState, fetched: list[dict]) -> int:
         return sum(1 for b in missing if bar_ts_key(b["t"]) in kept_keys)
 
 
+# How near a bar's volume is to the consolidated tape, by its `bar["src"]`. A
+# settled fetched bar replaces a buffered one only from a higher rank: SIP is
+# the tape itself, yfinance tracks it within ~0.5% a minute (it stands in when
+# SIP is unavailable), and everything else -- IEX, the candles a live socket
+# built, bars with no tag -- ranks below both. So a SIP outage that falls back
+# to yfinance never swaps SIP bars out, and SIP takes the minutes back after.
+SETTLED_SOURCE_RANK: dict[str, int] = {"sip": 2, "yfinance": 1}
+
+
+def _source_rank(bar: dict) -> int:
+    return SETTLED_SOURCE_RANK.get(bar.get("src") or "", 0)
+
+
 def merge_live_bars(
-    state: SymbolState, fetched: list[dict], provisional: "set[str] | None" = None
+    state: SymbolState,
+    fetched: list[dict],
+    provisional: "set[str] | None" = None,
+    settled: "set[str] | None" = None,
 ) -> "tuple[int, int]":
     """Merge a `bar_history.fetch_live_bars` result into the live buffer.
 
-    A fetched bar goes in where its timestamp is missing, and replaces an
-    existing bar only when that bar is provisional and the fetched one is not
-    -- a settled consolidated bar over an IEX bar or a partial live minute.
-    Everything else already in the buffer wins, so a streamed bar is never
-    overwritten by REST and IEX never overwrites anything.
+    A fetched bar goes in where its timestamp is missing. It replaces an
+    existing bar when that bar is provisional and the fetched one is not -- a
+    consolidated bar over an IEX bar or a partial live minute -- or when the
+    fetched bar is `settled` (finished, older than SETTLED_BAR_AGE_MIN) and
+    from a better source than the buffered one (`SETTLED_SOURCE_RANK`): that is
+    how a streamed candle becomes the SIP bar once SIP has the minute.
+    Everything else already in the buffer wins, so a streamed bar in the young
+    window is never overwritten by REST and IEX never overwrites anything.
 
     Returns (added, replaced), counting only bars still in the buffer after
     the ring's truncation (see `merge_missing_bars`).
     """
     provisional = provisional or set()
+    settled = settled or set()
     if not fetched:
         return 0, 0
     with state.lock:
@@ -206,7 +226,9 @@ def merge_live_bars(
                 added.add(k)
                 if k in provisional:
                     state.provisional_bar_keys.add(k)
-            elif k in state.provisional_bar_keys and k not in provisional:
+            elif (k in state.provisional_bar_keys and k not in provisional) or (
+                k in settled and _source_rank(bar) > _source_rank(by_key[k])
+            ):
                 by_key[k] = bar
                 replaced.add(k)
                 state.provisional_bar_keys.discard(k)

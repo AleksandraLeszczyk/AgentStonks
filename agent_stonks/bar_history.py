@@ -365,15 +365,21 @@ def fetch_and_log(
 # The buffer the live socket fills gets its REST bars by age, because no single
 # source is right for all of them (measured on AAPL, 2026-09-25):
 #
-#   older than SETTLED_BAR_AGE_MIN, regular session   yfinance
-#       within 0.5% of SIP minute by minute, and the source asked for.
-#   older than SETTLED_BAR_AGE_MIN, pre/post-market   the resolved feed
-#       yfinance reports these minutes with volume 0 (and 3,565 shares for the
-#       16:00 ET minute that carries SIP's 5.1M-share closing auction), so it
-#       cannot stand in for them. Delayed SIP can.
+#   older than SETTLED_BAR_AGE_MIN                     the resolved feed (SIP)
+#       the consolidated tape, settled: it replaces whatever the buffer holds
+#       for that minute -- an IEX bar, a streamed candle, a yfinance bar -- so
+#       everything older than the young window reads as SIP (the user's rule,
+#       2026-10-07; until then streamed candles were kept for good).
+#   older, regular session, when the feed is not SIP   yfinance
+#       within 0.5% of SIP minute by minute (not on its 09:30 bar, which
+#       attributes the opening cross differently), so it stands in when this
+#       key has no SIP or the SIP fetch failed. Never for pre/post-market:
+#       yfinance reports those minutes with volume 0 (and 3,565 shares for the
+#       16:00 ET minute that carries SIP's 5.1M-share closing auction).
 #   younger, up to the minute in progress             Alpaca IEX, provisional
 #       nothing consolidated is free that recently, and IEX is ~3-4% of the
 #       volume -- so these bars are flagged and replaced once they settle.
+#       Streamed candles in this window are kept.
 #   the minute in progress                            never fetched
 #       the live socket owns it. A REST snapshot of a half-finished minute
 #       would sit in the buffer and make the socket refuse that minute's trades.
@@ -387,11 +393,13 @@ _yf_window_cache: "dict[tuple[str, str], tuple[float, datetime, list[dict]]]" = 
 @dataclass
 class LiveBars:
     """What `fetch_live_bars` found: the bars, which of them are provisional
-    (by `bar_key`), a label naming every source that contributed, and the
-    (source, error) pairs that failed along the way."""
+    (by `bar_key`), which are settled consolidated bars that may replace a
+    buffered bar from a lesser source, a label naming every source that
+    contributed, and the (source, error) pairs that failed along the way."""
 
     bars: list[dict]
     provisional: "set[str]" = field(default_factory=set)
+    settled: "set[str]" = field(default_factory=set)
     source: str = ""
     failures: "list[tuple[str, object]]" = field(default_factory=list)
 
@@ -406,6 +414,20 @@ def bar_key(ts: object) -> str:
 def _in_regular_session(ts: object) -> bool:
     et = clock.parse_iso_strict(ts).astimezone(MARKET_TZ)
     return et.weekday() < 5 and MARKET_OPEN <= et.time() < MARKET_CLOSE
+
+
+# Minutes per bar, for telling a finished bar from one still in progress.
+_BAR_MINUTES: dict[str, int] = {
+    "1Min": 1, "5Min": 5, "15Min": 15, "30Min": 30, "1Hour": 60, "1Day": 1440,
+}
+
+
+def _over_by(ts: object, timeframe: str, cut: datetime) -> bool:
+    """Whether the `timeframe` bar starting at `ts` had ended by `cut`. A bar
+    that started before the settled cut can still be in progress on a 15Min or
+    1Hour chart, and a partial bar must not replace the streamed one."""
+    end = clock.parse_iso_strict(ts) + timedelta(minutes=_BAR_MINUTES.get(timeframe, 1))
+    return end <= cut
 
 
 def _bucket_start(now: datetime, timeframe: str) -> datetime:
@@ -451,11 +473,14 @@ def fetch_live_bars(
 ) -> LiveBars:
     """REST bars for the live buffer, each from the source its age calls for.
 
-    `feed` is the session's resolved history feed; it serves the settled bars
-    yfinance cannot (pre/post-market, the 1Day timeframe, a yfinance outage).
-    Bars that came off IEX are listed in `provisional` so the buffer knows to
-    replace them. A real-time SIP key serves the young tier too, and then
-    nothing is provisional.
+    `feed` is the session's resolved history feed; it serves every settled bar,
+    with yfinance standing in for regular-session minutes only when that feed
+    is not SIP (no SIP on this key, or the SIP fetch failed). Bars that came
+    off IEX are listed in `provisional` so the buffer knows to replace them.
+    Finished consolidated bars older than SETTLED_BAR_AGE_MIN are listed in
+    `settled`: they replace a buffered bar from a lesser source, streamed
+    candles included (`stream_common.merge_live_bars`). A real-time SIP key
+    serves the young tier too, and then nothing is provisional.
 
     Raises only when no tier returned anything and something failed.
     """
@@ -465,6 +490,7 @@ def fetch_live_bars(
     failures: list[tuple[str, object]] = []
     by_key: dict[str, dict] = {}
     provisional: set[str] = set()
+    settled: set[str] = set()
     sources: list[str] = []
 
     # Settled, from the resolved feed. Anything it returns from the young window
@@ -487,17 +513,22 @@ def fetch_live_bars(
     kept = 0
     for bar in base:
         if "t" in bar and clock.parse_iso_strict(bar["t"]) < settled_cut:
-            by_key[bar_key(bar["t"])] = bar
+            k = bar_key(bar["t"])
+            by_key[k] = bar
             kept += 1
             if base_is_iex:
-                provisional.add(bar_key(bar["t"]))
+                provisional.add(k)
+            elif _over_by(bar["t"], timeframe, settled_cut) and (
+                base_src == "sip" or (base_src == "yfinance" and _in_regular_session(bar["t"]))
+            ):
+                settled.add(k)
     if kept:
         sources.append(base_label)
 
-    # Settled regular-session minutes from yfinance, over whatever the resolved
-    # feed said for them.
+    # Settled regular-session minutes from yfinance, where the resolved feed
+    # was not SIP: over its IEX bars, or in place of a SIP fetch that failed.
     yf_interval = YF_INTERVALS.get(timeframe)
-    if yf_interval is not None and base_label != SOURCE_LABELS["yfinance"]:
+    if yf_interval is not None and base_src not in ("sip", "yfinance"):
         start = now - timedelta(hours=lookback_hours)
         try:
             yf_bars = _yfinance_window(symbol, yf_interval, start, settled_cut)
@@ -510,6 +541,8 @@ def fetch_live_bars(
                 k = bar_key(bar["t"])
                 by_key[k] = bar
                 provisional.discard(k)
+                if _over_by(bar["t"], timeframe, settled_cut):
+                    settled.add(k)
                 replaced += 1
         if replaced:
             sources.append(f"{SOURCE_LABELS['yfinance']} regular session")
@@ -552,6 +585,7 @@ def fetch_live_bars(
     return LiveBars(
         bars=bars,
         provisional=provisional & present,
+        settled=settled & present,
         source=" + ".join(sources) or "no bars",
         failures=failures,
     )

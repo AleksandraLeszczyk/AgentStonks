@@ -34,11 +34,11 @@ Three things follow from building bars locally rather than receiving them:
   `stream._refresh_quotes_via_rest`). Bars are likewise still backfilled from
   Alpaca REST, which repairs anything missed while the socket was down.
 
-Volume is Finnhub's consolidated tape rather than a single venue's, so it runs
-far *higher* than the IEX feed's volume for the same minute. The backfill only
-puts IEX bars in the buffer for the last few minutes, flagged provisional, and
-replaces them with consolidated bars once those exist (see
-`bar_history.fetch_live_bars`).
+Streamed candles stand only for the last SETTLED_BAR_AGE_MIN minutes. The
+backfill puts IEX bars in that window where the socket missed a minute, flagged
+provisional, and once a minute is older it swaps whatever the buffer holds --
+IEX bar or streamed candle -- for the settled SIP bar (see
+`bar_history.fetch_live_bars`, `stream_common.merge_live_bars`).
 """
 import json
 import logging
