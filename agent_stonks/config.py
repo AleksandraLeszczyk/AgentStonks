@@ -189,8 +189,15 @@ VOLUME_ADV_MIN_DAYS = 5
 QUOTE_WIDE_SPREAD_PCT = 1.0
 QUOTE_STALE_SEC = 120.0
 
-# Trading agent
-AGENT_CYCLE_SEC = 60
+# Trading agent. There is no cycle timer: the agent runs again only when
+# something it left behind wakes it -- an alert condition, an armed tactic
+# executing, fresh news, or the check-in time it chose itself
+# (`wake_in_minutes` on submit_decision). AGENT_RETRY_SEC is the one wake the
+# app schedules for it: after a cycle that ended without a decision (an LLM
+# error, or turns spent without finalizing), so a failure cannot leave the
+# agent asleep with nothing to wake it.
+AGENT_RETRY_SEC = 300
+AGENT_WAKE_MAX_MINUTES = 390
 AGENT_LOG_POLL_SEC = 4
 AGENT_PERFORMANCE_POLL_SEC = 60
 AGENT_EQUITY_HISTORY_MAXLEN = 5000

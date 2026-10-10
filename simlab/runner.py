@@ -55,7 +55,6 @@ def run_experiment(experiment_id: str) -> dict:
         symbols=cfg["symbols"],
         days=days,
         starting_cash=float(cfg["starting_cash"]),
-        cycle_minutes=int(cfg["cycle_minutes"]),
         max_cycles_per_day=int(cfg["max_cycles_per_day"]),
         system_prompt_override=cfg.get("system_prompt_override"),
         rule_config=cfg.get("rule_config"),

@@ -127,7 +127,10 @@ class TestStandDown:
         responses = [
             _response(
                 tool_calls=[
-                    _tool_call("c1", "submit_decision", {"action": "buy", "quantity": 1, "reasoning": "go"})
+                    _tool_call(
+                        "c1", "submit_decision",
+                        {"action": "buy", "quantity": 1, "reasoning": "go", "wake_in_minutes": 5},
+                    )
                 ]
             )
         ]
@@ -467,3 +470,125 @@ class TestPublishAssignments:
         assert state.automatic_assignments == {}
         assert state.automatic_active_strategy is None
         assert state.automatic_regime is None
+
+
+def _assignment(strategy: str) -> dict:
+    return {"strategy": strategy, "regime": "ranging", "market_regime": "quiet", "reasoning": "r"}
+
+
+class TestAutomaticLoopWakes:
+    """No cycle timer: a round runs after a wake, or straight after a
+    stand-down to re-assess the freed tickers."""
+
+    def test_stand_down_reassesses_now_and_leaves_other_groups_asleep(self, monkeypatch):
+        import threading
+
+        from agent_stonks import automatic, market_hours
+
+        state = AppState()
+        state.set_symbols(["AAPL", "KO"])
+        tracker = DecisionTracker(broker=FakeBroker())
+        stop = threading.Event()
+        regime_rounds = iter([
+            {"AAPL": _assignment("momentum"), "KO": _assignment("reversal")},
+            {"AAPL": _assignment("breakout")},
+        ])
+        regime_calls: list = []
+        cycles: list = []
+        waits: list = []
+
+        def fake_regime(client, model, symbols, st, tr):
+            regime_calls.append(list(symbols))
+            return next(regime_rounds)
+
+        def fake_cycle(client, model, symbols, st, tr, personality, under_automatic):
+            cycles.append((personality, list(symbols)))
+            return "stand_down" if personality == "momentum" else "decided"
+
+        def fake_wait(st, stop_event):
+            waits.append(True)
+            stop_event.set()
+
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
+        monkeypatch.setattr(automatic, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(automatic, "run_regime_cycle", fake_regime)
+        monkeypatch.setattr(automatic, "run_agent_cycle", fake_cycle)
+        monkeypatch.setattr(automatic, "_wait_for_next_cycle", fake_wait)
+
+        automatic._automatic_loop(state, tracker, ["AAPL", "KO"], "openai", "key", "model", stop)
+
+        assert regime_calls == [["AAPL", "KO"], ["AAPL"]]
+        # KO's reversal agent decided in round one and nothing has woken it,
+        # so the round after AAPL's stand-down runs only AAPL's new strategy.
+        assert cycles == [
+            ("momentum", ["AAPL"]),
+            ("reversal", ["KO"]),
+            ("breakout", ["AAPL"]),
+        ]
+        assert len(waits) == 1
+
+    def test_unassigned_tickers_get_a_retry(self, monkeypatch):
+        import threading
+
+        from agent_stonks import automatic, market_hours
+
+        state = AppState()
+        state.set_symbols(["AAPL", "KO"])
+        tracker = DecisionTracker(broker=FakeBroker())
+        stop = threading.Event()
+        seen: dict = {}
+
+        def fake_wait(st, stop_event):
+            seen["wake_at"] = st.agent_wake_at
+            stop_event.set()
+
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
+        monkeypatch.setattr(automatic, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(
+            automatic, "run_regime_cycle",
+            lambda client, model, symbols, st, tr: {"AAPL": _assignment("momentum")},
+        )
+        monkeypatch.setattr(
+            automatic, "run_agent_cycle",
+            lambda client, model, symbols, st, tr, personality, under_automatic: "decided",
+        )
+        monkeypatch.setattr(automatic, "_wait_for_next_cycle", fake_wait)
+
+        automatic._automatic_loop(state, tracker, ["AAPL", "KO"], "openai", "key", "model", stop)
+
+        assert seen["wake_at"] is not None
+
+
+class TestBasketScopedCleanup:
+    """Under the orchestrator several strategies share one AppState: a cycle
+    or a stand-down on one basket must not disarm another's."""
+
+    def test_a_cycle_clears_only_its_own_tickers_alerts(self):
+        state = AppState()
+        state.set_symbols(["AAPL", "KO"])
+        ko_alert = {"symbol": "KO", "field": "last_price", "condition": "above", "value": 70.0}
+        state.sym("KO").alerts = [ko_alert]
+        tracker = DecisionTracker(broker=FakeBroker())
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "stand_down", {"reasoning": "no edge"})]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, under_automatic=True)
+
+        assert state.sym("KO").alerts == [ko_alert]
+
+    def test_stand_down_disarms_only_its_own_tickers_tactics(self):
+        state = AppState()
+        state.set_symbols(["AAPL", "KO"])
+        state.sym("AAPL").tactics = object()
+        ko_plan = object()
+        state.sym("KO").tactics = ko_plan
+        tracker = DecisionTracker(broker=FakeBroker())
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "stand_down", {"reasoning": "no edge"})]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, under_automatic=True)
+
+        assert state.sym("AAPL").tactics is None
+        assert state.sym("KO").tactics is ko_plan

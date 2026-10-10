@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 
+from .config import AGENT_WAKE_MAX_MINUTES
 from .state import ALERTABLE_FIELDS
 from .tactics import TACTIC_CONDITION_FIELDS
 
@@ -409,7 +410,12 @@ _TOOL_SUBMIT_DECISION = {
         "description": (
             "Finalize this trading cycle with exactly one decision: buy, sell, or "
             "alert. Must be called exactly once, after analysis is complete. When you "
-            "don't want to trade, use 'alert' -- there is no do-nothing action."
+            "don't want to trade, use 'alert' -- there is no do-nothing action. "
+            "Nothing runs you again on a timer: after this call you sleep until an "
+            "alert condition is met, an armed tactic executes, fresh news arrives, or "
+            "the check-in you set with wake_in_minutes comes due. A decision that "
+            "leaves none of those (no alerts, no armed tactics, no wake_in_minutes) "
+            "is rejected."
         ),
         "parameters": {
             "type": "object",
@@ -443,8 +449,8 @@ _TOOL_SUBMIT_DECISION = {
                     "type": "array",
                     "description": (
                         "When action is 'alert': one or more conditions on continuously-updated "
-                        "live data that should wake you early -- the instant any one is met -- "
-                        "instead of sleeping out the full cycle. Each condition watches one "
+                        "live data that should wake you -- the instant any one is met. Each "
+                        "condition watches one "
                         "field, with 'above' meaning the field reaches or exceeds the value and "
                         "'below' meaning it reaches or falls to the value. Provide several to "
                         "watch a range or multiple signals at once; the first to trigger wakes "
@@ -474,6 +480,18 @@ _TOOL_SUBMIT_DECISION = {
                         },
                         "required": ["symbol", "field", "condition", "value"],
                     },
+                },
+                "wake_in_minutes": {
+                    "type": "integer",
+                    "description": (
+                        "Optional, any action: run your analysis again after this many "
+                        f"minutes (1-{AGENT_WAKE_MAX_MINUTES}) even if no alert or tactic "
+                        "has fired -- for when the next useful look depends on time "
+                        "passing rather than on a level (a setup still forming, a session "
+                        "window opening, a position you want to re-check). Whichever comes "
+                        "first wakes you: this check-in, an alert, a tactic fill, or news. "
+                        "Omit it to sleep until one of those."
+                    ),
                 },
             },
             "required": ["action", "reasoning"],

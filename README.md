@@ -50,7 +50,7 @@ Enter any number of tickers in the sidebar; every panel and the agent operate ac
 - Call Wall / Put Wall (open-interest-based resistance/support) and net dealer gamma regime, computed from a yfinance options chain on its own independent poll loop
 
 ### 🤖 Agent tab
-- **LLM paper-trading agent** — runs on a fixed cycle, reads already-fetched data for every symbol in the basket (bars, quotes, volume stats, news, options walls, positions) via tool calls, and reasons about a trading regime and strategy, trading from one shared cash balance across the whole basket
+- **LLM paper-trading agent** — runs when something it set up wakes it (an alert condition, an armed tactic executing, fresh news, or a check-in it chose with `wake_in_minutes`; there is no cycle timer), reads already-fetched data for every symbol in the basket (bars, quotes, volume stats, news, options walls, positions) via tool calls, and reasons about a trading regime and strategy, trading from one shared cash balance across the whole basket
 - **Agent personalities** — Momentum, Breakout, VWAP Mean-Reversion, and Premarket Analyst, each with its own system prompt, decision playbook, and tool set (default: Momentum). Two more stay wired but switched off, listed below:
   - *Momentum* — screens for gap + relative-volume + news catalyst, trades bull flags and VWAP reclaims
   - *Breakout* — waits for a volume-confirmed opening-range break, sizes via ATR-based `breakout_trade_geometry` targets requiring a minimum 2:1 reward/risk

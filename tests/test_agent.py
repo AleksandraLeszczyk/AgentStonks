@@ -3,6 +3,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from agent_stonks import clock
 from agent_stonks import historical as agent_historical
 from agent_stonks import market_hours
 from agent_stonks.agent import (
@@ -31,7 +32,7 @@ from agent_stonks.agent import (
     sell_everything_and_stop,
 )
 from agent_stonks.broker import Broker
-from agent_stonks.config import AGENT_FINALIZE_ITERS
+from agent_stonks.config import AGENT_FINALIZE_ITERS, AGENT_RETRY_SEC, AGENT_WAKE_MAX_MINUTES
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState, alert_triggered
 
@@ -479,13 +480,17 @@ class TestRunAgentCycle:
                     _tool_call(
                         "c2",
                         "submit_decision",
-                        {"action": "buy", "quantity": 2, "regime": "bullish", "reasoning": "uptrend confirmed"},
+                        {
+                            "action": "buy", "quantity": 2, "regime": "bullish",
+                            "reasoning": "uptrend confirmed", "wake_in_minutes": 15,
+                        },
                     )
                 ]
             ),
         ]
         client = FakeClient(responses)
 
+        before = clock.now()
         run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=5)
 
         snap = tracker.snapshot()
@@ -493,11 +498,88 @@ class TestRunAgentCycle:
         assert snap["cash"] == 800.0
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "buy"
+        # The check-in it asked for is what runs it next.
+        assert before + timedelta(minutes=15) <= state.agent_wake_at <= clock.now() + timedelta(minutes=15)
 
         with state.lock:
             log_types = [e["type"] for e in state.agent_log]
         assert "tool_call" in log_types
         assert "decision" in log_types
+
+    def test_trade_that_leaves_nothing_to_wake_on_is_rejected_and_retried(self):
+        """With no cycle timer, a buy that arms nothing and sets no check-in
+        would leave the position unmanaged until news happened to arrive."""
+        state, _ = _app()
+        tracker = DecisionTracker(starting_cash=1000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        buy = {"action": "buy", "symbol": "AAPL", "quantity": 2, "reasoning": "go"}
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", buy)]),
+            _response(tool_calls=[_tool_call("c2", "submit_decision", {**buy, "wake_in_minutes": 5})]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        rejection = next(m for m in client.calls[1] if m.get("tool_call_id") == "c1")
+        assert "nothing would wake you" in rejection["content"]
+        snap = tracker.snapshot()
+        assert [d.action for d in snap["decisions"]] == ["buy"]  # bought once, not twice
+        assert snap["positions"] == {"AAPL": 2.0}
+        assert state.agent_wake_at is not None
+
+    def test_trade_with_tactics_armed_needs_no_check_in(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(starting_cash=1000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        client = FakeClient([
+            _response(tool_calls=[
+                _tool_call("t1", "set_tactics", {
+                    "symbol": "AAPL",
+                    "actions": [{
+                        "action": "sell", "quantity_pct": 100,
+                        "conditions": [{"field": "last_price", "condition": "below", "value": 95.0}],
+                    }],
+                    "reasoning": "stop under the base",
+                }),
+                _tool_call("c1", "submit_decision", {
+                    "action": "buy", "symbol": "AAPL", "quantity": 2, "reasoning": "go",
+                }),
+            ]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        assert [d.action for d in tracker.snapshot()["decisions"]] == ["tactics", "buy"]
+        assert sym_state.tactics is not None
+        assert state.agent_wake_at is None
+
+    def test_alert_with_only_a_check_in_is_accepted(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(broker=FakeBroker())
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", {
+                "action": "alert", "reasoning": "base still forming", "wake_in_minutes": 20,
+            })]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        assert [d.action for d in tracker.snapshot()["decisions"]] == ["alert"]
+        assert sym_state.alerts == []
+        assert state.agent_wake_at is not None
+
+    def test_check_in_is_capped_at_a_session(self):
+        state, _ = _app()
+        tracker = DecisionTracker(broker=FakeBroker())
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", {
+                "action": "alert", "reasoning": "see you tomorrow", "wake_in_minutes": 5000,
+            })]),
+        ])
+
+        before = clock.now()
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        assert state.agent_wake_at <= clock.now() + timedelta(minutes=AGENT_WAKE_MAX_MINUTES)
+        assert state.agent_wake_at >= before + timedelta(minutes=AGENT_WAKE_MAX_MINUTES)
 
     def test_breakout_personality_passes_breakout_tools_to_client(self):
         state = AppState()
@@ -537,12 +619,15 @@ class TestRunAgentCycle:
         responses = [_response(content="still thinking...") for _ in range(3 + AGENT_FINALIZE_ITERS)]
         client = FakeClient(responses)
 
+        before = clock.now()
         run_agent_cycle(client, "gemini-3.5-flash", ["AAPL"], state, tracker, max_iters=3)
 
         assert len(client.calls) == 3 + AGENT_FINALIZE_ITERS
         snap = tracker.snapshot()
         assert len(snap["decisions"]) == 1
         assert snap["decisions"][0].action == "sleep"
+        # Nothing was armed, so without a retry nothing would ever run it again.
+        assert state.agent_wake_at >= before + timedelta(seconds=AGENT_RETRY_SEC)
 
     def test_finalize_turns_offer_only_deciding_tools_after_research(self):
         """A model that spends every research turn on analysis (gemini-3.8-flash on
@@ -923,7 +1008,7 @@ class TestAlertTrigger:
 
         def run():
             start.set()
-            _wait_for_next_cycle(state, stop_event, cycle_sec=60)
+            _wait_for_next_cycle(state, stop_event)
             finished.set()
 
         thread = threading.Thread(target=run)
@@ -952,7 +1037,7 @@ class TestAlertTrigger:
 
         def run():
             start.set()
-            _wait_for_next_cycle(state, stop_event, cycle_sec=60)
+            _wait_for_next_cycle(state, stop_event)
             finished.set()
 
         thread = threading.Thread(target=run)
@@ -983,7 +1068,7 @@ class TestAlertTrigger:
 
         def run():
             start.set()
-            _wait_for_next_cycle(state, stop_event, cycle_sec=60)
+            _wait_for_next_cycle(state, stop_event)
             finished.set()
 
         signaler = threading.Thread(target=signal_after_start)
@@ -1003,7 +1088,49 @@ class TestAlertTrigger:
         stop_event = threading.Event()
         stop_event.set()  # already stopped, should return immediately
 
-        _wait_for_next_cycle(state, stop_event, cycle_sec=60)  # should not hang
+        _wait_for_next_cycle(state, stop_event)  # should not hang
+
+    def test_wait_with_nothing_scheduled_has_no_timer(self):
+        """Nothing armed and no check-in: the agent is not re-run on a clock,
+        it sleeps until something wakes it (here, the stop)."""
+        state, _ = _app()
+        stop_event = threading.Event()
+        finished = threading.Event()
+
+        def run():
+            _wait_for_next_cycle(state, stop_event)
+            finished.set()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        assert not finished.wait(timeout=0.3)
+        stop_event.set()
+        state.agent_wake_event.set()  # what stop_agent does
+        thread.join(timeout=5)
+        assert finished.is_set()
+
+    def test_wait_returns_when_the_check_in_is_due_and_consumes_it(self):
+        state, _ = _app()
+        state.schedule_wake(clock.now() + timedelta(seconds=0.2))
+        stop_event = threading.Event()
+
+        thread = threading.Thread(target=_wait_for_next_cycle, args=(state, stop_event))
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert state.agent_wake_at is None
+        with state.lock:
+            texts = [e.get("text", "") for e in state.agent_log]
+        assert any("check-in" in t for t in texts)
+
+    def test_schedule_wake_keeps_the_earliest(self):
+        state = AppState()
+        now = clock.now()
+        state.schedule_wake(now + timedelta(minutes=30))
+        state.schedule_wake(now + timedelta(minutes=10))
+        state.schedule_wake(now + timedelta(minutes=20))
+        assert state.agent_wake_at == now + timedelta(minutes=10)
 
 
 class TestOpeningRangeTool:

@@ -31,6 +31,8 @@ from . import technical_analysis as ta
 from .config import (
     AGENT_FINALIZE_ITERS,
     AGENT_MAX_TOOL_ITERS,
+    AGENT_RETRY_SEC,
+    AGENT_WAKE_MAX_MINUTES,
     PREMARKET_LEAD_SEC,
     PREMARKET_WAIT_POLL_SEC,
     QUOTE_STALE_SEC,
@@ -894,6 +896,26 @@ def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
     )
 
 
+def _wake_minutes(raw: object) -> "int | None":
+    """submit_decision's `wake_in_minutes` as whole minutes, or None when it
+    was left out (or is not a positive number). Capped at a session's length:
+    a check-in further out than that is not a check-in on this session."""
+    try:
+        minutes = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if minutes < 1:
+        return None
+    return min(minutes, AGENT_WAKE_MAX_MINUTES)
+
+
+def schedule_retry(state: "AppState") -> None:
+    """Wake the agent again after AGENT_RETRY_SEC: for a cycle that ended
+    without a decision, which armed nothing and asked for no check-in, so with
+    no cycle timer nothing else would ever run it again."""
+    state.schedule_wake(clock.now() + timedelta(seconds=AGENT_RETRY_SEC))
+
+
 # What a cycle may still call once its research turns are spent.
 _FINALIZE_TOOL_NAMES = frozenset({"set_tactics", "submit_decision", "stand_down"})
 
@@ -969,7 +991,9 @@ def run_agent_cycle(
     if under_automatic:
         system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM
         tools = [*tools, _TOOL_STAND_DOWN]
-    state.clear_alerts()
+    # Only this basket's: under the Automatic orchestrator another strategy's
+    # tickers are still asleep on the alerts their own cycle set.
+    state.clear_alerts(symbols)
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
         {
@@ -1049,9 +1073,11 @@ def run_agent_cycle(
                 )
                 obs.update_trace(output={"action": "stand_down", "reasoning": reasoning})
                 # The relinquishing strategy's conditional orders must not keep
-                # trading under whatever regime/strategy comes next.
-                for ss in state.iter_symbol_states():
-                    ss.tactics = None
+                # trading under whatever regime/strategy comes next. Only its
+                # own tickers': the other strategies keep theirs armed.
+                for ss in map(state.sym, symbols):
+                    if ss is not None:
+                        ss.tactics = None
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"status": "relinquished"})}
                 )
@@ -1077,6 +1103,7 @@ def run_agent_cycle(
                 quantity = whole_shares(float(args.get("quantity") or 0))
                 reasoning = args.get("reasoning", "")
                 regime = args.get("regime", "unknown")
+                wake_minutes = _wake_minutes(args.get("wake_in_minutes"))
                 default_symbol = symbols[0] if len(symbols) == 1 else None
                 # Validate each requested condition against the watchable-field
                 # and streamed-symbol registries; silently drop malformed specs
@@ -1090,7 +1117,12 @@ def run_agent_cycle(
                     if a is not None
                 ]
 
-                if action == "alert" and not alerts and not state.any_tactics():
+                if (
+                    action == "alert"
+                    and not alerts
+                    and not state.any_tactics()
+                    and wake_minutes is None
+                ):
                     # Some models (small/cheap ones especially) pick action="alert" but
                     # forget the conditions, or name a field that isn't watchable. Reject
                     # and let the model retry instead of silently recording a no-op -- it
@@ -1103,9 +1135,10 @@ def run_agent_cycle(
                         f"(one of: {', '.join(ALERTABLE_FIELDS)}), condition ('above' or "
                         "'below'), and a numeric value. Call submit_decision again "
                         "with at least one valid condition (or arm a plan with "
-                        "set_tactics first -- an empty alerts array is only allowed "
-                        "while tactics are armed). Standing aside always means "
-                        "setting an alert -- there is no do-nothing action.",
+                        "set_tactics first, or pass wake_in_minutes -- an empty alerts "
+                        "array is only allowed while tactics are armed or a check-in "
+                        "is set). Nothing runs you again on a timer, so a decision "
+                        "that leaves nothing to wake you on would leave you asleep.",
                     )
                     continue
 
@@ -1121,6 +1154,26 @@ def run_agent_cycle(
                         "submit_decision again with a positive integer quantity, or use action "
                         "'alert' with one or more conditions to watch if you don't want "
                         "to trade right now.",
+                    )
+                    continue
+
+                if (
+                    action in ("buy", "sell")
+                    and not state.any_tactics()
+                    and wake_minutes is None
+                ):
+                    # A trade is a decision that it is time to act, not that it
+                    # is time to stop looking -- and with no cycle timer, a
+                    # trade that arms nothing and sets no check-in would sit
+                    # unmanaged until news happened to wake the agent.
+                    _reject(
+                        messages,
+                        tc.id,
+                        f"after this {action} nothing would wake you again: no tactics "
+                        "are armed and no wake_in_minutes is set, and nothing runs you "
+                        "on a timer. Arm the plan that manages it with set_tactics "
+                        "first, or call submit_decision again with wake_in_minutes set "
+                        "to when you want to look again.",
                     )
                     continue
 
@@ -1159,6 +1212,8 @@ def run_agent_cycle(
                         "submit_decision again.",
                     )
                     continue
+                if wake_minutes is not None:
+                    state.schedule_wake(clock.now() + timedelta(minutes=wake_minutes))
                 _log(
                     state,
                     {
@@ -1171,6 +1226,7 @@ def run_agent_cycle(
                         "reasoning": reasoning,
                         "regime": regime,
                         "alerts": decision.alerts,
+                        "wake_in_minutes": wake_minutes,
                     },
                 )
                 result_content = json.dumps(
@@ -1180,6 +1236,7 @@ def run_agent_cycle(
                         "price": decision.price,
                         "cash_after": decision.cash_after,
                         "position_after": decision.position_after,
+                        "wake_in_minutes": wake_minutes,
                     }
                 )
                 decision_made = True
@@ -1204,8 +1261,11 @@ def run_agent_cycle(
         return "stand_down"
 
     if not decision_made:
+        schedule_retry(state)
         forced = tracker.record_sleep(
-            symbols_label, "Max reasoning iterations reached without a finalized decision; defaulting to sleep."
+            symbols_label,
+            "Max reasoning iterations reached without a finalized decision; sleeping, "
+            f"retrying in {AGENT_RETRY_SEC // 60} min.",
         )
         obs.update_trace(output={"action": forced.action, "regime": "unknown", "reasoning": forced.reasoning})
         _log(
@@ -1224,51 +1284,57 @@ def run_agent_cycle(
     return "decided"
 
 
-def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
-    """Block until the next cycle is actually due.
+def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event) -> None:
+    """Block until something the agent left behind wakes it.
 
-    With no active alert or armed tactics, this is a plain `cycle_sec` timer
-    (woken early only by fresh news). With an active alert or armed tactics,
-    the fixed timer is disabled -- the agent committed to "nothing changes
-    until a watched condition fires, a tactic executes, or news arrives", so it
-    should wait indefinitely for `state.agent_wake_event` rather than also
-    waking on the next scheduled tick. The price/news stream threads and the
-    TacticsExecutor set that event directly the moment a condition is met, a
-    conditional trade fills, or fresh news arrives -- never on a timer just to
-    check state.
+    There is no cycle timer: running the whole analysis again every minute
+    while nothing has changed only repeats the same tool calls. The agent runs
+    again when one of its alert conditions is met, an armed tactic executes (or
+    they all expire), or fresh news arrives -- the price/news stream threads
+    and the TacticsExecutor set `state.agent_wake_event` the moment that
+    happens -- or when the check-in it scheduled comes due
+    (`state.agent_wake_at`: its own `wake_in_minutes`, or the retry after a
+    cycle that ended without a decision). With none of those pending the wait
+    is indefinite; `stop_agent` sets the event to end it.
+
+    The check-in is consumed here, whatever ends the wait: the round that
+    follows decides afresh what to wait for next.
     """
     state.agent_wake_event.clear()
     state.agent_wake_reason = None
-    if stop_event.is_set():
-        return
-
-    # The stream only signals on the *next* tick, so an alert condition that's
-    # already satisfied the instant it's set would otherwise wait for a tick
-    # that may not come. Catch that once, up front.
-    alert_pairs = state.iter_alerts()
-    if alert_pairs:
-        hit = next((a for ss, a in alert_pairs if alert_triggered(ss, a)), None)
-        if hit is not None:
-            state.clear_alerts()
-            _log(
-                state,
-                {"type": "status", "text": f"Alert already met: {format_alert(hit)}; waking early."},
-            )
+    try:
+        if stop_event.is_set():
             return
 
-    # An active alert or armed tactics (on any symbol) mean the agent should
-    # sleep until a condition fires, a tactic executes, or news arrives -- not
-    # get woken by the regular cycle timer too. (Armed tactics are watched
-    # independently by the per-symbol TacticsExecutors, which wake this thread
-    # on execution.)
-    timeout = None if (alert_pairs or state.any_tactics()) else cycle_sec
-    woke_early = state.agent_wake_event.wait(timeout=timeout)
-    if stop_event.is_set():
-        return
-    if woke_early and state.agent_wake_reason:
-        _log(state, {"type": "status", "text": f"{state.agent_wake_reason} Waking early."})
-    state.agent_wake_event.clear()
-    state.agent_wake_reason = None
+        # The stream only signals on the *next* tick, so an alert condition that's
+        # already satisfied the instant it's set would otherwise wait for a tick
+        # that may not come. Catch that once, up front.
+        alert_pairs = state.iter_alerts()
+        if alert_pairs:
+            hit = next((a for ss, a in alert_pairs if alert_triggered(ss, a)), None)
+            if hit is not None:
+                state.clear_alerts()
+                _log(
+                    state,
+                    {"type": "status", "text": f"Alert already met: {format_alert(hit)}; waking."},
+                )
+                return
+
+        wake_at = state.agent_wake_at
+        timeout = None
+        if wake_at is not None:
+            timeout = max(0.0, (wake_at - clock.now()).total_seconds())
+        woken = state.agent_wake_event.wait(timeout=timeout)
+        if stop_event.is_set():
+            return
+        if woken and state.agent_wake_reason:
+            _log(state, {"type": "status", "text": f"{state.agent_wake_reason} Waking."})
+        elif not woken:
+            _log(state, {"type": "status", "text": "Scheduled check-in is due; waking."})
+    finally:
+        state.agent_wake_at = None
+        state.agent_wake_event.clear()
+        state.agent_wake_reason = None
 
 
 def _wait_for_premarket_window(state: "AppState", stop_event: threading.Event) -> bool:
@@ -1326,6 +1392,10 @@ def run_premarket_session(
             )
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Premarket cycle failed: {exc}"})
+        # The analyst's schedule is the bell, not a check-in: it sleeps on its
+        # tactics below, so a wake_in_minutes (or a retry) is dropped here
+        # rather than left to wake whatever runs after it.
+        state.agent_wake_at = None
 
         if not state.any_tactics():
             # No opening plan -- hold through the bell (so a caller that
@@ -1405,7 +1475,6 @@ def _agent_loop(
     provider: str,
     api_key: str,
     model: str,
-    cycle_sec: int,
     stop_event: threading.Event,
     personality: str = DEFAULT_PERSONALITY,
 ) -> None:
@@ -1415,10 +1484,11 @@ def _agent_loop(
             run_agent_cycle(client, model, symbols, state, tracker, personality=personality)
         except Exception as exc:
             _log(state, {"type": "error", "text": f"Agent cycle failed: {exc}"})
+            schedule_retry(state)
         # Daily scoring may come due mid-session on a long-running agent; the
         # check is one stat() call once the day is scored.
         scoring.maybe_score_day(state, tracker)
-        _wait_for_next_cycle(state, stop_event, cycle_sec)
+        _wait_for_next_cycle(state, stop_event)
     scoring.end_session(state, tracker)
     state.agent_running = False
     _log(state, {"type": "status", "text": "Agent stopped"})
@@ -1441,11 +1511,10 @@ def launch_agent(
     api_key: str,
     provider: str = "openai",
     model: "str | None" = None,
-    cycle_sec: int = 60,
     personality: str = DEFAULT_PERSONALITY,
 ) -> None:
-    """Stop any running agent for this state, then start a new background cycle
-    loop trading the whole symbol basket."""
+    """Stop any running agent for this state, then start a new background loop
+    trading the whole symbol basket: one cycle now, then one per wake."""
     model = model or DEFAULT_AGENT_MODELS[provider]
     stop_agent(state)
     stop_event = threading.Event()
@@ -1464,7 +1533,7 @@ def launch_agent(
         return
     threading.Thread(
         target=clock.inherit(_agent_loop),
-        args=(state, tracker, symbols, provider, api_key, model, cycle_sec, stop_event, personality),
+        args=(state, tracker, symbols, provider, api_key, model, stop_event, personality),
         daemon=True,
     ).start()
 
@@ -1480,8 +1549,8 @@ def stop_agent(state: "AppState") -> None:
             sym_state.tactics_executor.stop()
             sym_state.tactics_executor = None
         sym_state.tactics = None
-    # Interrupt a blocked _wait_for_next_cycle immediately instead of letting
-    # it sit until the timeout expires.
+    # Interrupt a blocked _wait_for_next_cycle immediately -- with no check-in
+    # scheduled it would otherwise wait forever.
     state.agent_wake_event.set()
     # Push any buffered traces from the cycle(s) that just ran to Langfuse
     # before the background flusher would otherwise get to them.

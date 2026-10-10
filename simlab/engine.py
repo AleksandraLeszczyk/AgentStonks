@@ -15,9 +15,11 @@ that possible:
 Between agent cycles the engine fast-forwards deterministically, bar by bar:
 armed tactics are evaluated by the real ``TacticsExecutor`` matching logic
 (called synchronously instead of from a thread), condition alerts by the real
-``alert_triggered``, and stored news timestamps produce the same
-wake-the-agent interrupt the live stream would. Hours of waiting collapse
-into however many LLM cycles the session actually needed.
+``alert_triggered``, stored news timestamps produce the same
+wake-the-agent interrupt the live stream would, and the check-in the agent
+asked for (``wake_in_minutes``) comes due on the simulated clock. As live,
+nothing else runs a cycle -- there is no cycle timer. Hours of waiting
+collapse into however many LLM cycles the session actually needed.
 
 The rule-based agents (``simlab.rule_agents``) replay through the same engine
 on a different day loop: they have no prompt, no tools and no LLM, and they
@@ -71,16 +73,13 @@ class SimulationConfig:
     symbols: list[str]
     days: list[date]
     starting_cash: float = 100_000.0
-    # Re-cycle cadence while the agent has nothing armed (live default is 60s;
-    # simulation defaults coarser to keep LLM cost per session sane).
-    cycle_minutes: int = 5
     # Hard cap on LLM cycles per simulated day -- a runaway agent (e.g. alerts
     # armed a hair from the price) stops burning tokens and fast-forwards.
     max_cycles_per_day: int = 40
     system_prompt_override: Optional[str] = None
     # The selected rule agent's rule set, as a JSON-ready dict (so it survives
     # the experiment record). Ignored by every LLM personality; `provider`,
-    # `model`, `api_key`, `cycle_minutes` and `max_cycles_per_day` are ignored
+    # `model`, `api_key` and `max_cycles_per_day` are ignored
     # in return, since a rule agent scores every bar and calls no LLM.
     rule_config: Optional[dict] = None
     # The tape this run reads, carried from the dataset so the run record says
@@ -203,7 +202,6 @@ class SimulationEngine:
                 "days": [d.isoformat() for d in self.market.days],
                 "feed": self.market.feed,
                 "starting_cash": self.config.starting_cash,
-                "cycle_minutes": self.config.cycle_minutes,
                 "prompt_overridden": self.config.system_prompt_override is not None,
                 "rule_based": self.rule_based,
                 "rule_config": self.config.rule_config if self.rule_based else None,
@@ -316,6 +314,11 @@ class SimulationEngine:
             if fresh:
                 headline = str(fresh[0].get("headline") or "")[:120]
                 return f"Fresh news for {ss.symbol}: {headline}"
+
+        wake_at = self.app.agent_wake_at
+        if wake_at is not None and t >= wake_at:
+            self.app.agent_wake_at = None
+            return "Scheduled check-in is due."
         return None
 
     def _log(self, entry_type: str, text: str) -> None:
@@ -401,7 +404,6 @@ class SimulationEngine:
         premarket_retired = False
         cycles_today = 0
         run_cycle_now = True
-        last_cycle_at = first_cycle
 
         while idx <= len(steps):
             if self._stop_requested:
@@ -423,6 +425,9 @@ class SimulationEngine:
                     )
                     self.app.agent_wake_event.clear()
                     self.app.agent_wake_reason = None
+                    # What woke this cycle is consumed; the cycle decides what
+                    # it waits for next, exactly as the live wait does.
+                    self.app.agent_wake_at = None
                     run_agent_cycle(
                         client,
                         self.config.model,
@@ -432,10 +437,11 @@ class SimulationEngine:
                         personality=self.config.personality,
                         system_prompt_override=self.config.system_prompt_override,
                     )
-                    last_cycle_at = clock.now()
                     if premarket:
                         # One-shot pre-open specialist: no re-cycling once the
                         # session is live; a pre-bell news wake revises the plan.
+                        # It never takes a check-in, live or here.
+                        self.app.agent_wake_at = None
                         premarket_retired = clock.now() >= self.market.session_open(day)
                 run_cycle_now = False
 
@@ -461,16 +467,6 @@ class SimulationEngine:
                         self._log("status", f"{reason} Revising the opening plan.")
                         run_cycle_now = True
                     continue
-                self._log("status", f"{reason} Waking early.")
+                self._log("status", f"{reason} Waking.")
                 run_cycle_now = True
                 continue
-
-            # No alerts and no tactics armed: the plain cycle timer applies.
-            if (
-                not premarket
-                and not premarket_retired
-                and not self.app.any_tactics()
-                and not self.app.iter_alerts()
-                and (t - last_cycle_at) >= timedelta(minutes=self.config.cycle_minutes)
-            ):
-                run_cycle_now = True

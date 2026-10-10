@@ -276,7 +276,7 @@ class TestAutomaticPremarketRouting:
         monkeypatch.setattr(automatic, "get_agent_client", lambda provider, api_key: object())
 
         automatic._automatic_loop(
-            state, tracker, ["AAPL"], "openai", "key", "model", 1, threading.Event()
+            state, tracker, ["AAPL"], "openai", "key", "model", threading.Event()
         )
         assert seen["active_strategy"] == PREMARKET_PERSONALITY
         assert seen["regime"] == "premarket"

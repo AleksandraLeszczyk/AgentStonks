@@ -796,8 +796,9 @@ class FakeClient:
 
 def _scripted_client():
     """Cycle 1: arm a buy-the-breakout tactic at 103 and finalize with alert.
-    Cycle 2 (woken by the fill): sell everything. Cycle 3 (cycle timer): stand
-    aside on a far-away alert for the rest of the day."""
+    Cycle 2 (woken by the fill): sell everything and check in after 5 minutes.
+    Cycle 3 (that check-in): stand aside on a far-away alert for the rest of
+    the day."""
     cycle1 = _response([
         _tool_call("c1a", "set_tactics", {
             "symbol": "TEST",
@@ -816,6 +817,7 @@ def _scripted_client():
         _tool_call("c2a", "submit_decision", {
             "action": "sell", "symbol": "TEST", "quantity": 10,
             "regime": "bullish", "reasoning": "taking the breakout profit",
+            "wake_in_minutes": 5,
         }),
     ])
     cycle3 = _response([
@@ -827,11 +829,11 @@ def _scripted_client():
     return FakeClient([cycle1, cycle2, cycle3])
 
 
-def _run_sim(store, cycle_minutes=5):
+def _run_sim(store):
     market = SimMarket(["TEST"], [DAY])
     config = SimulationConfig(
         personality="momentum", provider="openai", model="fake", api_key="",
-        symbols=["TEST"], days=[DAY], starting_cash=10_000.0, cycle_minutes=cycle_minutes,
+        symbols=["TEST"], days=[DAY], starting_cash=10_000.0,
     )
     engine = SimulationEngine(market, config)
     result = engine.run(client=_scripted_client())
@@ -850,7 +852,7 @@ class TestEngine:
             ("alert", "noop"),  # cycle 1: finalize (empty alerts, tactics armed)
             ("buy", "filled"),  # tactic fires mid-fast-forward
             ("sell", "filled"),  # cycle 2, woken by the fill
-            ("alert", "noop"),  # cycle 3, cycle timer
+            ("alert", "noop"),  # cycle 3, the check-in cycle 2 asked for
         ]
         buy, sell = result.decisions[2], result.decisions[3]
         # The tactic fired on the first bar closing >= 103 (bar 30, completes
@@ -883,7 +885,7 @@ class TestEngine:
         market = SimMarket(["TEST"], [DAY])
         config = SimulationConfig(
             personality="momentum", provider="openai", model="fake", api_key="",
-            symbols=["TEST"], days=[DAY], starting_cash=10_000.0, cycle_minutes=5,
+            symbols=["TEST"], days=[DAY], starting_cash=10_000.0,
             system_prompt_override="custom plan",
         )
         result = SimulationEngine(market, config).run(client=_scripted_client())
@@ -1554,7 +1556,7 @@ class TestExperiments:
         config = {
             "personality": "momentum", "provider": "openai", "model": "gpt-test",
             "api_key": "sk-secret", "symbols": ["TEST"], "days": [DAY.isoformat()],
-            "starting_cash": 100_000.0, "cycle_minutes": 5,
+            "starting_cash": 100_000.0,
             "max_cycles_per_day": 40, "system_prompt_override": None,
             "run_judge": False,
         }
@@ -2505,7 +2507,7 @@ class TestRunnerJudgeSelection:
         config = {
             "personality": "momentum", "provider": "openai", "model": "gpt-test",
             "api_key": "sk-agent", "symbols": ["TEST"], "days": [DAY.isoformat()],
-            "starting_cash": 100_000.0, "cycle_minutes": 5,
+            "starting_cash": 100_000.0,
             "max_cycles_per_day": 40, "system_prompt_override": None,
             "run_judge": True,
         }

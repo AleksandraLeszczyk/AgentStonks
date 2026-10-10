@@ -69,9 +69,9 @@ JOURNAL_NAME = "journal.jsonl"
 _DECISION_TOOLS = frozenset({"submit_decision", "set_tactics", "select_strategy", "stand_down"})
 
 # Argument keys whose numbers are the agent's own free choices (share counts,
-# self-declared quiet windows), not restatements of market data -- exempt from
-# grounding.
-_GROUNDING_EXEMPT_KEYS = frozenset({"quantity", "expected_quiet_minutes"})
+# self-declared quiet windows, when to check in again), not restatements of
+# market data -- exempt from grounding.
+_GROUNDING_EXEMPT_KEYS = frozenset({"quantity", "expected_quiet_minutes", "wake_in_minutes"})
 
 # Small integers (counts, bar limits, "3 attempts") are overwhelmingly the
 # agent's own bookkeeping, not market data; auditing them would only add noise.

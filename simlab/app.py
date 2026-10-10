@@ -2285,14 +2285,14 @@ def render_simulate_tab() -> None:
     )
 
     with st.expander("Simulation settings"):
-        col_cash, col_cycle, col_max = st.columns(3)
+        col_cash, col_max = st.columns(2)
         starting_cash = col_cash.number_input("Starting cash", value=100_000.0, step=10_000.0)
-        cycle_minutes = col_cycle.number_input(
-            "Cycle interval (min)", value=5, min_value=1, max_value=60,
-            help="Re-cycle cadence while nothing is armed. With alerts/tactics armed the "
-                 "agent sleeps until a condition fires, exactly as live.",
+        max_cycles = col_max.number_input(
+            "Max LLM cycles per day", value=40, min_value=1, max_value=200,
+            help="There is no cycle timer: as live, the agent runs again only when an "
+                 "alert, a tactic, news or its own check-in (wake_in_minutes) wakes it. "
+                 "This caps how many such wakes one simulated day may spend on the LLM.",
         )
-        max_cycles = col_max.number_input("Max LLM cycles per day", value=40, min_value=1, max_value=200)
         run_judge = st.checkbox(
             "Judge the run with an LLM after the simulation", value=True,
             help="Grades every entry on the information available at entry time, plus an "
@@ -2441,7 +2441,6 @@ def render_simulate_tab() -> None:
                     ),
                     "days": scope["days"],
                     "starting_cash": float(starting_cash),
-                    "cycle_minutes": int(cycle_minutes),
                     "max_cycles_per_day": int(max_cycles),
                     "feed": by_name[name].feed,
                     "system_prompt_override": sim_prompts.get_override(personality),

@@ -731,9 +731,9 @@ the same action that demands the TURN, not merely a slow fall -- \
 'momentum_pct above 0', or 'previous_minute_close above' the VWAP/last-swing \
 value the advance is riding. A guard at a small NEGATIVE momentum threshold \
 only filters a crash from a drift, and a drift through a demand line is still \
-a breakdown -- it is how bids fill at the top of a rollover. Give the bid an \
-`expires_at` a couple of cycles out and re-arm it each wake so the guard's \
-reference values track the tape instead of going stale. Never arm a bare \
+a breakdown -- it is how bids fill at the top of a rollover. Give the bid a \
+short `expires_at` (its expiry wakes you) and re-arm it each wake so the \
+guard's reference values track the tape instead of going stale. Never arm a bare \
 price-only bid at a demand line.
    - Reclaim buy: BOTH 'previous_minute_close above the supply line' AND \
 'rvol_pace above' the step-5 threshold -- set from `rvol_pace_armable`, NOT \
@@ -1137,6 +1137,18 @@ tactics themselves wake you: the instant one action executes, the remaining \
 armed actions are disarmed and you are woken with the fill in hand to \
 reevaluate and re-arm whatever still applies. Add extra alert conditions only \
 for situations your tactics don't cover.
+
+WHEN YOU RUN AGAIN IS YOUR CALL: nothing re-runs you on a clock. After \
+submit_decision you sleep until one of your alert conditions is met, an armed \
+tactic executes (or they all expire), fresh news arrives for one of your \
+tickers, or the check-in you asked for comes due. Ask for a check-in with \
+wake_in_minutes on submit_decision when your next useful look depends on time \
+passing rather than on a level -- a setup still forming, a session window \
+about to open, a fresh fill whose bracket you want to arm with the price in \
+hand. Every wake is a full analysis, so pick the interval the tape actually \
+needs rather than the shortest one. Every decision must leave at least one of \
+these behind -- alerts, armed tactics, or a check-in -- and one that leaves \
+nothing to wake you on is rejected.
 """.format(fields="; ".join(f"'{name}' ({desc})" for name, desc in TACTIC_CONDITION_FIELDS.items()))
 
 AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
@@ -1224,6 +1236,7 @@ and activate a strategy better suited to it.
 Judgement: a single slow cycle is NOT a reason to stand down -- that is what a \
 normal alert-and-wait is for. Stand down only when the regime itself no longer fits \
 your strategy. Standing down does NOT close any open position; if you want to be \
-flat before relinquishing, sell first on this cycle and stand down on a later one.
+flat before relinquishing, sell first on this cycle (with a short wake_in_minutes \
+so you are woken again) and stand down on that later one.
 """
 

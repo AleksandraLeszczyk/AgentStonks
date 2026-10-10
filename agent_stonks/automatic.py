@@ -51,6 +51,7 @@ from .agent import (
     breakout_preconditions,
     run_agent_cycle,
     run_premarket_session,
+    schedule_retry,
     selectable_personalities,
 )
 # The orchestrator's own regime-detection cycle is a personality in everything
@@ -70,7 +71,7 @@ from .agent_tools import (
     _TOOL_GET_QUOTE,
     _TOOL_GET_SESSION_CLOCK,
 )
-from .config import AGENT_CYCLE_SEC, AGENT_MAX_TOOL_ITERS
+from .config import AGENT_MAX_TOOL_ITERS
 from .decisions import DecisionTracker
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 from .state import AppState
@@ -492,13 +493,18 @@ def _automatic_loop(
     provider: str,
     api_key: str,
     model: str,
-    cycle_sec: int,
     stop_event: threading.Event,
 ) -> None:
     client = get_agent_client(provider, api_key)
     # symbol -> {strategy, regime, market_regime, reasoning}. Survives rounds:
     # only tickers whose strategy stood down are removed and re-assessed.
     assignments: dict[str, dict] = {}
+    # Whether this round follows a wake. A wake is not routed to the ticker it
+    # was about (one shared wake event), so after one every group runs. The
+    # round straight after a stand-down follows no wake: only the groups that
+    # took a freshly assigned ticker run, the rest are still waiting on what
+    # they armed.
+    woken = True
     while not stop_event.is_set():
         # 0. Before the session starts there is no intraday regime to read --
         #    the Premarket Analyst runs instead. It holds until ~2 minutes
@@ -549,6 +555,7 @@ def _automatic_loop(
         #    being re-picked because a different ticker's edge faded.
         scoring.maybe_score_day(state, tracker)
         pending = [s for s in symbols if s.upper() not in assignments]
+        fresh: dict[str, dict] = {}
         if pending:
             try:
                 fresh = run_regime_cycle(client, model, pending, state, tracker)
@@ -576,6 +583,11 @@ def _automatic_loop(
                     },
                 )
             _publish_assignments(state, assignments)
+            if len(fresh) < len(pending):
+                # The unassigned are re-assessed on the next wake; if every
+                # other ticker is asleep on far-away alerts that could be
+                # hours, so a retry is scheduled for them.
+                schedule_retry(state)
 
         if stop_event.is_set():
             break
@@ -585,7 +597,8 @@ def _automatic_loop(
                 state,
                 {"type": "status", "text": "Automatic: no strategy selected this round; retrying."},
             )
-            _wait_for_next_cycle(state, stop_event, cycle_sec)
+            _wait_for_next_cycle(state, stop_event)
+            woken = True
             continue
 
         # 2. One cycle per distinct strategy, over the tickers assigned to it.
@@ -593,9 +606,12 @@ def _automatic_loop(
         #    balance, and two agents deciding how to spend it at the same
         #    moment would each size against money the other is already
         #    committing. Sequential cycles see each other's fills.
+        stood_down = False
         for strategy, group_symbols in group_by_strategy(assignments):
             if stop_event.is_set():
                 break
+            if not woken and not any(s in fresh for s in group_symbols):
+                continue
             try:
                 status = run_agent_cycle(
                     client, model, group_symbols, state, tracker,
@@ -603,6 +619,7 @@ def _automatic_loop(
                 )
             except Exception as exc:
                 _log(state, {"type": "error", "text": f"Strategy cycle failed: {exc}"})
+                schedule_retry(state)
                 status = "decided"
 
             if status == "stand_down":
@@ -621,10 +638,17 @@ def _automatic_loop(
                     assignments.pop(symbol, None)
                     scoring.record_activation_end(state, symbols=[symbol])
                 _publish_assignments(state, assignments)
+                stood_down = True
 
         if stop_event.is_set():
             break
-        _wait_for_next_cycle(state, stop_event, cycle_sec)
+        if stood_down:
+            # Control over those tickers is back with the orchestrator: re-assess
+            # them now rather than after whatever the other groups armed.
+            woken = False
+            continue
+        _wait_for_next_cycle(state, stop_event)
+        woken = True
 
     scoring.end_session(state, tracker)
     state.agent_running = False
@@ -641,7 +665,6 @@ def launch_automatic(
     api_key: str,
     provider: str = "openai",
     model: "str | None" = None,
-    cycle_sec: int = AGENT_CYCLE_SEC,
 ) -> None:
     """Stop any running agent for this state, then start the Automatic orchestrator
     loop (over the whole symbol basket) in the background. Uses the same stop/wake
@@ -659,6 +682,6 @@ def launch_automatic(
     state.automatic_assignments = {}
     threading.Thread(
         target=clock.inherit(_automatic_loop),
-        args=(state, tracker, symbols, provider, api_key, model, cycle_sec, stop_event),
+        args=(state, tracker, symbols, provider, api_key, model, stop_event),
         daemon=True,
     ).start()

@@ -63,7 +63,6 @@ from .charts import (
     empty_chart,
 )
 from .config import (
-    AGENT_CYCLE_SEC,
     AGENT_EQUITY_HISTORY_MAXLEN,
     AGENT_LOG_POLL_SEC,
     AGENT_PERFORMANCE_POLL_SEC,
@@ -1876,6 +1875,9 @@ def _agent_entry_body(entry: dict) -> str:
                 f"<b>{html.escape(format_alert(a))}</b>" for a in entry["alerts"]
             )
             extra = f" · Wake when {levels}"
+        wake = entry.get("wake_in_minutes")
+        if isinstance(wake, int):
+            extra += f" · Check in after <b>{wake} min</b>"
         return (
             f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b>{extra}</div>"
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
@@ -3414,7 +3416,6 @@ def _start_agent(
                 llm_key,
                 provider=provider,
                 model=model or None,
-                cycle_sec=AGENT_CYCLE_SEC,
             )
         else:
             launch_agent(
@@ -3424,7 +3425,6 @@ def _start_agent(
                 llm_key,
                 provider=provider,
                 model=model or None,
-                cycle_sec=AGENT_CYCLE_SEC,
                 personality=personality,
             )
         # On disk now rather than at the next autosave: a crash in the next

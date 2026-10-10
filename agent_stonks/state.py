@@ -281,6 +281,7 @@ _DEFAULTS: dict[str, object] = {
     "portfolio_value": None,
     "agent_wake_event": None,  # handled specially
     "agent_wake_reason": None,
+    "agent_wake_at": None,
     "llm_provider": "openai",
     "llm_model": "",
     "llm_personality": "automatic",
@@ -451,6 +452,10 @@ class AppState:
         self.portfolio_value: float | None = None
         self.agent_wake_event: threading.Event = threading.Event()
         self.agent_wake_reason: str | None = None
+        # When the agent asked to be woken even if nothing it armed fires (its
+        # `wake_in_minutes` check-in, or the retry after a failed cycle), on
+        # the app clock. None means it sleeps until an alert, a tactic or news.
+        self.agent_wake_at: "datetime | None" = None
         self.llm_provider: str = "openai"
         self.llm_model: str = ""
         self.llm_personality: str = "automatic"
@@ -553,9 +558,21 @@ class AppState:
     def iter_alerts(self) -> "list[tuple[SymbolState, dict]]":
         return [(ss, a) for ss in self.iter_symbol_states() for a in list(ss.alerts)]
 
-    def clear_alerts(self) -> None:
-        for ss in self.iter_symbol_states():
+    def clear_alerts(self, symbols: "Iterable[str] | None" = None) -> None:
+        """Drop the alert conditions of `symbols` (default: every ticker)."""
+        if symbols is None:
+            states = list(self.iter_symbol_states())
+        else:
+            states = [ss for ss in map(self.sym, symbols) if ss is not None]
+        for ss in states:
             ss.alerts = []
+
+    def schedule_wake(self, at: datetime) -> None:
+        """Wake the agent at `at` unless something wakes it sooner. Several
+        requests in one round (the Automatic orchestrator's strategy groups)
+        keep the earliest."""
+        if self.agent_wake_at is None or at < self.agent_wake_at:
+            self.agent_wake_at = at
 
     def mark_price(self, symbol: str) -> "float | None":
         """Best available marking price for a symbol: live trade price, else the
