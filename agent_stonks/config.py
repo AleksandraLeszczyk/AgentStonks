@@ -216,11 +216,15 @@ TRADE_FIXED_COST = 1.15
 # least this much total agent runtime -- short experiments alone never score.
 SCORING_MIN_TOTAL_RUNTIME_SEC = 3600
 
-# Premarket analyst: it may start its single opening-tactics cycle no earlier
-# than PREMARKET_LEAD_SEC before the opening bell; while holding for that
-# window it re-checks the clock every PREMARKET_WAIT_POLL_SEC.
-PREMARKET_LEAD_SEC = 120
-PREMARKET_WAIT_POLL_SEC = 30.0
+# Strategist (see agent_stonks.strategist): before the bell there is no
+# intraday regime to read, so it holds for the open, re-checking the clock every
+# STRATEGIST_OPEN_POLL_SEC. A round whose tickers' briefing is still being
+# written waits up to STRATEGIST_BRIEFING_WAIT_SEC for it (looking every
+# STRATEGIST_BRIEFING_POLL_SEC), then assigns without it -- a briefing that
+# never lands must not keep the whole basket out of the market.
+STRATEGIST_OPEN_POLL_SEC = 30.0
+STRATEGIST_BRIEFING_WAIT_SEC = 300.0
+STRATEGIST_BRIEFING_POLL_SEC = 2.0
 
 # Apple Trader: the rule-based (non-LLM) loop that trades its configured symbol
 # off a saved model's forecast (see agent_stonks.apple_trader).

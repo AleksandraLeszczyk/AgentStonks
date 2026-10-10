@@ -32,7 +32,6 @@ from .model_catalogue_ui import model_catalogue_panel
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
-    PREMARKET_PERSONALITY,
     launch_agent,
     selectable_personalities,
     sell_everything_and_stop,
@@ -54,7 +53,7 @@ from .orchestra import (
     launch_orchestra,
     racer_label,
 )
-from .automatic import AUTOMATIC_AVATAR, AUTOMATIC_KEY, AUTOMATIC_LABEL, launch_automatic
+from .strategist import STRATEGIST_AVATAR, STRATEGIST_KEY, STRATEGIST_LABEL, launch_strategist
 from .charts import (
     build_analysis_gauges,
     build_chart,
@@ -379,10 +378,10 @@ def _effective_symbols(state: AppState, symbols_input: str) -> list[str]:
 
 
 # Agents that aren't LLM personalities and so have no entry in
-# AGENT_PERSONALITIES: the Automatic orchestrator and the rule-based Apple
-# Trader and Orchestra. They still need a label and a face in the picker.
+# AGENT_PERSONALITIES: the Strategist and the rule-based Apple Trader and
+# Orchestra. They still need a label and a face in the picker.
 _NON_LLM_AGENTS: dict[str, tuple[str, str]] = {
-    AUTOMATIC_KEY: (AUTOMATIC_LABEL, AUTOMATIC_AVATAR),
+    STRATEGIST_KEY: (STRATEGIST_LABEL, STRATEGIST_AVATAR),
     APPLE_TRADER_KEY: (APPLE_TRADER_LABEL, APPLE_TRADER_AVATAR),
     ORCHESTRA_KEY: (ORCHESTRA_LABEL, ORCHESTRA_AVATAR),
 }
@@ -951,7 +950,7 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
       without it: the take / fall look-back, `fall_bars`.
     * Orchestra -- the same, read off the pair this symbol's chart draws
       (`model_overlays.live_trader_view`); every pair shares the setting.
-    * LLM personalities and Automatic -- an armed tactic or pending alert on
+    * LLM personalities and the Strategist -- an armed tactic or pending alert on
       `momentum_pct` compares against the close `TACTICS_MOMENTUM_WINDOW_MIN`
       minutes back.
 
@@ -2088,32 +2087,35 @@ def _agent_status_line() -> None:
 
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
 def _agent_identity_panel() -> None:
-    """Avatar card for the personality currently in charge. Under Automatic the
-    face shown is the strategy Automatic activated, not Automatic itself; while
-    it is still classifying the regime (or idle) the orchestrator's own avatar
-    shows. Polled so the card follows Automatic's strategy switches live."""
+    """Avatar card for the personality currently in charge. Under the
+    Strategist the face shown is the strategy it activated, not the Strategist
+    itself; while it is still classifying the regime, waiting for the bell or
+    the briefing (or idle) its own avatar shows. Polled so the card follows the
+    Strategist's strategy switches live."""
     state = _get_state()
     selected = state.llm_personality
     display_key = selected
     note = ""
     assignments: dict = {}
-    if selected == AUTOMATIC_KEY and state.agent_running:
-        assignments = state.automatic_assignments or {}
-        active = state.automatic_active_strategy
+    if selected == STRATEGIST_KEY and state.agent_running:
+        assignments = state.strategist_assignments or {}
+        active = state.strategist_active_strategy
         if active:
             display_key = active
-            regime = f" — {state.automatic_regime} market" if state.automatic_regime else ""
+            regime = f" — {state.strategist_regime} market" if state.strategist_regime else ""
             distinct = {a.get("strategy") for a in assignments.values()}
             note = (
-                # The card can only wear one face; when the orchestrator is
+                # The card can only wear one face; when the Strategist is
                 # running several strategies at once, say so rather than
                 # letting the dominant one stand for the whole basket.
                 f"🤖 most of the basket — {len(distinct)} strategies running{regime}"
                 if len(distinct) > 1
-                else f"🤖 picked by Automatic{regime}"
+                else f"🤖 picked by the Strategist{regime}"
             )
+        elif state.strategist_waiting:
+            note = f"🤖 The Strategist is waiting for {state.strategist_waiting}…"
         else:
-            note = "🤖 Automatic is assessing each ticker…"
+            note = "🤖 The Strategist is assessing each ticker…"
     avatar = _avatar_data_uri(display_key)
     img = (
         f"<img src='{avatar}' alt='' style='width:56px;height:56px;border-radius:50%;flex:none'/>"
@@ -2135,7 +2137,7 @@ def _agent_identity_panel() -> None:
         f"{note_html}"
         f"</div></div>"
     )
-    # Per-ticker assignments, when the orchestrator split the basket. One line
+    # Per-ticker assignments, when the Strategist split the basket. One line
     # each, because "which strategy is trading my TSLA" has no answer in the
     # single-avatar card above once the strategies differ.
     if len(assignments) > 1:
@@ -3251,15 +3253,18 @@ def _start_agent(
             open_et = market_hours.next_market_open().astimezone(market_hours.MARKET_TZ)
             st.info(
                 f"The trading session hasn't started yet (next open: "
-                f"{open_et.strftime('%a %Y-%m-%d %H:%M')} ET). The agent is told the "
-                "market is closed and adapts: the Premarket Analyst prepares opening "
-                "tactics, other strategies study structure and arm plans for the "
-                "open instead of trading the stale tape."
+                f"{open_et.strftime('%a %Y-%m-%d %H:%M')} ET). "
                 + (
-                    " The Apple Traders simply idle until the bell — they score "
+                    "The Apple Traders simply idle until the bell — they score "
                     "closed minute bars and there are none."
                     if is_rule_agent
-                    else ""
+                    else "The Strategist waits for the bell and makes its first "
+                    "assignments at the open, from the pre-market briefing and the "
+                    "live tape."
+                    if personality == STRATEGIST_KEY
+                    else "The agent is told the market is closed and adapts: it "
+                    "studies structure and arms plans for the open instead of "
+                    "trading the stale tape."
                 )
             )
         # Resolve the venue before anything starts. Every refusal inside
@@ -3408,8 +3413,8 @@ def _start_agent(
                 config=apple_config or AppleTraderConfig(),
                 cycle_sec=APPLE_TRADER_CYCLE_SEC,
             )
-        elif personality == AUTOMATIC_KEY:
-            launch_automatic(
+        elif personality == STRATEGIST_KEY:
+            launch_strategist(
                 state,
                 state.decision_tracker,
                 syms,
@@ -3462,11 +3467,11 @@ def _agent_panel(
         "at once, following the first whose buy fills."
     )
     with st.expander("LLM", expanded=True):
-        # Automatic first: it's the regime-adaptive orchestrator that picks and
-        # switches between the individual strategies on its own; the rule-based
-        # Apple Trader last, since it is the odd one out (no model reasoning).
+        # The Strategist first: it picks and switches between the individual
+        # strategies on its own; the rule-based agents last, since they are the
+        # odd ones out (no model reasoning).
         personality_keys = [
-            AUTOMATIC_KEY, *selectable_personalities(), *RULE_AGENT_KEYS
+            STRATEGIST_KEY, *selectable_personalities(), *RULE_AGENT_KEYS
         ]
         personality = st.selectbox(
             "Personality",
@@ -3478,21 +3483,13 @@ def _agent_panel(
             key="agent_llm_personality",
         )
         state.llm_personality = personality
-        if personality == AUTOMATIC_KEY:
+        if personality == STRATEGIST_KEY:
             st.caption(
-                "🤖 Automatic detects the market regime and activates the best-fitting "
-                "strategy. That strategy trades until it sees no opportunities in the near "
-                "term and stands down, waking Automatic to re-assess and switch. Before "
-                "the session starts it activates the Premarket Analyst instead."
-            )
-        elif personality == PREMARKET_PERSONALITY:
-            st.caption(
-                "🌅 The Premarket Analyst doesn't analyze on start: it holds until "
-                "~2 minutes before the opening bell, then runs one pre-market read and "
-                "arms opening tactics — how much of each ticker to buy/sell and at what "
-                "price for the later trades to be profitable. Once a tactic executes "
-                "(simulated at the opening prints), the analyst retires and the agent "
-                "disables itself."
+                "🤖 The Strategist reads the day's pre-market briefing (Pre-Market tab) "
+                "and the live tape, then hands each ticker to the strategy agent that "
+                "fits it. That agent trades until it sees no opportunities in the near "
+                "term and stands down, waking the Strategist to re-assess and switch. "
+                "Before the bell it waits: the first assignments are made at the open."
             )
         if personality == APPLE_TRADER_KEY:
             st.caption(

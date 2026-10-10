@@ -306,7 +306,7 @@ class TestToolHandlers:
         half-right.
 
         *Off* means nothing can newly select it: not the live picker, not
-        SimLab's, not the Automatic orchestrator, and not the `select_strategy`
+        SimLab's, not the Strategist, and not the `select_strategy`
         tool enum the model is handed. *Still wired* means the registry entry
         survives -- because a personality key is also the identity of every run
         that used it, `data/simlab/experiments` holds records naming this one,
@@ -322,7 +322,7 @@ class TestToolHandlers:
             DISABLED_PERSONALITIES,
             selectable_personalities,
         )
-        from agent_stonks.automatic import SELECTABLE_STRATEGIES, _TOOL_SELECT_STRATEGY
+        from agent_stonks.strategist import SELECTABLE_STRATEGIES, _TOOL_SELECT_STRATEGY
 
         assert "volume_detective" in DISABLED_PERSONALITIES
         assert "volume_detective" not in selectable_personalities()
@@ -330,12 +330,12 @@ class TestToolHandlers:
         enum = _TOOL_SELECT_STRATEGY["function"]["parameters"]["properties"]["strategy"]
         assert "volume_detective" not in enum["enum"]
 
-        # ...and the orchestrator's prompt no longer offers it either. The enum
+        # ...and the Strategist's prompt no longer offers it either. The enum
         # would reject the pick anyway, but describing a strategy the tool
         # forbids costs a wasted round trip and a forced re-pick.
-        from agent_stonks.automatic import AUTOMATIC_SYSTEM_PROMPT
+        from agent_stonks.strategist import STRATEGIST_SYSTEM_PROMPT
 
-        assert "volume_detective" not in AUTOMATIC_SYSTEM_PROMPT
+        assert "volume_detective" not in STRATEGIST_SYSTEM_PROMPT
 
         # Still wired: label, prompt, tools and avatar all resolve, which is
         # what keeps a finished run's identity intact in Results.
@@ -948,12 +948,6 @@ class TestSessionAwareness:
     def test_cycle_prompt_clean_while_market_open(self, monkeypatch):
         monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
         client = self._run_cycle()
-        system_prompt = client.calls[0][0]["content"]
-        assert "MARKET CLOSED" not in system_prompt
-
-    def test_premarket_personality_is_exempt(self, monkeypatch):
-        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: False)
-        client = self._run_cycle(personality="premarket")
         system_prompt = client.calls[0][0]["content"]
         assert "MARKET CLOSED" not in system_prompt
 

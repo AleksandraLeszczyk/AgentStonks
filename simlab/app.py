@@ -35,7 +35,6 @@ from agent_stonks import observability as obs
 from agent_stonks.agent import (
     AGENT_PERSONALITIES,
     PERSONALITY_TOOLS,
-    PREMARKET_PERSONALITY,
     _dispatch_tool,
     selectable_personalities,
 )
@@ -82,16 +81,8 @@ _UNTESTABLE_TOOLS = {"submit_decision", "set_tactics", "stand_down"}
 
 def _testable_agents() -> list[str]:
     """Every agent SimLab can replay, in picker order: the LLM personalities
-    first, the rule-based ones last.
-
-    The Premarket Analyst is hidden from SimLab only -- it stays wired
-    everywhere else (the app, the Automatic pre-open handoff, and the engine's
-    own premarket day loop), and past premarket runs still resolve their label,
-    avatar and prompt. Re-offering it is a one-line change here."""
-    return [
-        *(p for p in selectable_personalities() if p != PREMARKET_PERSONALITY),
-        *RULE_AGENTS,
-    ]
+    first, the rule-based ones last."""
+    return [*selectable_personalities(), *RULE_AGENTS]
 
 
 def _agent_label(key: "str | None") -> str:

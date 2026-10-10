@@ -33,8 +33,6 @@ from .config import (
     AGENT_MAX_TOOL_ITERS,
     AGENT_RETRY_SEC,
     AGENT_WAKE_MAX_MINUTES,
-    PREMARKET_LEAD_SEC,
-    PREMARKET_WAIT_POLL_SEC,
     QUOTE_STALE_SEC,
     QUOTE_WIDE_SPREAD_PCT,
 )
@@ -66,18 +64,16 @@ if TYPE_CHECKING:
 # record where the text now lives.
 from .agent_prompts import (  # noqa: F401
     AGENT_PERSONALITIES,
-    AUTOMATIC_MODE_ADDENDUM,
     BREAKOUT_SYSTEM_PROMPT,
     DEFAULT_PERSONALITY,
     DISABLED_PERSONALITIES,
     MOMENTUM_ADVANCED_LEVELS_ADDENDUM,
     MOMENTUM_SYSTEM_PROMPT,
     MULTI_SYMBOL_ADDENDUM,
-    PREMARKET_PERSONALITY,
-    PREMARKET_SYSTEM_PROMPT,
     REVERSAL_SYSTEM_PROMPT,
     SESSION_CLOSED_ADDENDUM,
     SMART_MONEY_SYSTEM_PROMPT,
+    STRATEGIST_MODE_ADDENDUM,
     TACTICS_ADDENDUM,
     VOLUME_DETECTIVE_SYSTEM_PROMPT,
     _session_closed_addendum,
@@ -89,7 +85,6 @@ from .agent_tools import (  # noqa: F401
     BREAKOUT_TOOLS,
     MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
-    PREMARKET_TOOLS,
     REVERSAL_TOOLS,
     SMART_MONEY_TOOLS,
     VOLUME_DETECTIVE_TOOLS,
@@ -100,7 +95,7 @@ from .agent_tools import (  # noqa: F401
 
 # The agent log belongs to the state, not to this module -- see
 # `state.append_agent_log`. Kept as a name here because `apple_trader` and
-# `automatic` have imported `_log` from `agent` since before that was true.
+# `strategist` have imported `_log` from `agent` since before that was true.
 _log = append_agent_log
 
 
@@ -768,54 +763,6 @@ def _tool_get_corporate_actions(state: "SymbolState", days_ahead: object = None)
     return {"window_days": days, "upcoming_corporate_actions": actions}
 
 
-def _tool_analyze_premarket(state: "SymbolState") -> dict:
-    now = clock.now()
-    # The session the read is about: the one in progress (edge case: the bell
-    # already rang while the analyst was reasoning) or the upcoming one.
-    open_dt = market_hours.session_open(now) or market_hours.next_market_open(now)
-    with state.lock:
-        bars = list(state.bars)
-        last_price = state.last_price
-        prev_close = state.prev_close
-
-    result: dict = {
-        "market_is_open": market_hours.is_market_open(now),
-        "market_open_at": open_dt.isoformat(),
-        "minutes_until_open": round(max(0.0, (open_dt - now).total_seconds()) / 60.0, 1),
-        "prev_close": prev_close,
-        "last_price": last_price,
-    }
-    if last_price is not None and prev_close:
-        result["implied_gap_pct"] = round((last_price / prev_close - 1.0) * 100.0, 2)
-
-    # Pre-market bars: same trading day as the open, printed before the bell.
-    session_date = open_dt.astimezone(market_hours.MARKET_TZ).date()
-    pre_bars = []
-    for bar in bars:
-        ts = clock.bar_dt(bar)
-        if ts is None:
-            continue
-        if ts < open_dt and ts.astimezone(market_hours.MARKET_TZ).date() == session_date:
-            pre_bars.append(bar)
-    try:
-        if pre_bars:
-            result["premarket_session"] = {
-                "bars": len(pre_bars),
-                "high": max(float(b["h"]) for b in pre_bars),
-                "low": min(float(b["l"]) for b in pre_bars),
-                "volume": sum(float(b.get("v") or 0.0) for b in pre_bars),
-                "last_bar_close": float(pre_bars[-1]["c"]),
-                "last_bar_time": pre_bars[-1].get("t"),
-            }
-        else:
-            result["premarket_session"] = {
-                "note": "no pre-market bars for the upcoming session yet"
-            }
-    except (KeyError, TypeError, ValueError):
-        result["premarket_session"] = {"note": "pre-market bars are malformed"}
-    return result
-
-
 def _per_symbol(handler: "Callable[..., dict]", *arg_names: str) -> "Callable[[dict, AppState, DecisionTracker], dict]":
     """Wrap a SymbolState-reading tool helper: resolve the call's `symbol` to
     its SymbolState (erroring on unknown tickers), then forward the named args."""
@@ -862,7 +809,6 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "get_smart_money_flow": _per_symbol(_tool_get_smart_money_flow),
     "get_analyst_targets": _per_symbol(_tool_get_analyst_targets),
     "get_corporate_actions": _per_symbol(_tool_get_corporate_actions, "days_ahead"),
-    "analyze_premarket": _per_symbol(_tool_analyze_premarket),
     "smart_money_trade_geometry": lambda args, app, tracker: _tool_smart_money_trade_geometry(
         args.get("entry"), args.get("stop"), args.get("target")
     ),
@@ -935,7 +881,7 @@ def run_agent_cycle(
     tracker: "DecisionTracker",
     max_iters: int = AGENT_MAX_TOOL_ITERS,
     personality: str = DEFAULT_PERSONALITY,
-    under_automatic: bool = False,
+    under_strategist: bool = False,
     system_prompt_override: "str | None" = None,
 ) -> str:
     """Run one analyze-then-decide cycle over the whole symbol basket. Always
@@ -949,10 +895,10 @@ def run_agent_cycle(
     nests under it as a generation, so per-cycle latency, token usage, and cost
     roll up automatically (see `agent_stonks.observability`).
 
-    When `under_automatic` is True the strategy is running under the Automatic
-    orchestrator: it also gets a `stand_down` tool to relinquish control when the
+    When `under_strategist` is True the strategy is running under the
+    Strategist: it also gets a `stand_down` tool to relinquish control when the
     regime no longer fits it. Returns "stand_down" in that case (so the
-    orchestrator can re-assess and pick another strategy), or "decided" when the
+    Strategist can re-assess and pick another strategy), or "decided" when the
     cycle finalized with a normal buy/sell/alert (or the forced-sleep fallback).
     """
     symbols_label = ", ".join(symbols)
@@ -984,14 +930,13 @@ def run_agent_cycle(
             generated_at=state.premarket_generated_at,
             phase=state.premarket_phase,
         )
+        + _session_closed_addendum()
     )
-    if personality != PREMARKET_PERSONALITY:
-        system_prompt = system_prompt + _session_closed_addendum()
     tools = PERSONALITY_TOOLS.get(personality, MOMENTUM_TOOLS)
-    if under_automatic:
-        system_prompt = system_prompt + AUTOMATIC_MODE_ADDENDUM
+    if under_strategist:
+        system_prompt = system_prompt + STRATEGIST_MODE_ADDENDUM
         tools = [*tools, _TOOL_STAND_DOWN]
-    # Only this basket's: under the Automatic orchestrator another strategy's
+    # Only this basket's: under the Strategist another strategy's
     # tickers are still asleep on the alerts their own cycle set.
     state.clear_alerts(symbols)
     messages: list[dict] = [
@@ -1059,7 +1004,7 @@ def run_agent_cycle(
             except json.JSONDecodeError:
                 args = {}
 
-            if name == "stand_down" and under_automatic:
+            if name == "stand_down" and under_strategist:
                 reasoning = args.get("reasoning", "")
                 quiet = args.get("expected_quiet_minutes")
                 _log(
@@ -1337,137 +1282,6 @@ def _wait_for_next_cycle(state: "AppState", stop_event: threading.Event) -> None
         state.agent_wake_reason = None
 
 
-def _wait_for_premarket_window(state: "AppState", stop_event: threading.Event) -> bool:
-    """Block until PREMARKET_LEAD_SEC before the next opening bell -- the
-    earliest moment the Premarket Analyst is allowed to start its analysis.
-    Returns False when the agent was stopped while holding."""
-    logged = False
-    while not stop_event.is_set():
-        remaining = market_hours.seconds_until_next_open() - PREMARKET_LEAD_SEC
-        if remaining <= 0:
-            return True
-        if not logged:
-            open_at = market_hours.next_market_open()
-            _log(
-                state,
-                {
-                    "type": "status",
-                    "text": (
-                        f"Premarket analyst holding until {PREMARKET_LEAD_SEC // 60} min "
-                        f"before the bell (opens {open_at.strftime('%Y-%m-%d %H:%M UTC')})."
-                    ),
-                },
-            )
-            logged = True
-        stop_event.wait(min(remaining, PREMARKET_WAIT_POLL_SEC))
-    return False
-
-
-def run_premarket_session(
-    client: Any,
-    model: str,
-    symbols: list[str],
-    state: "AppState",
-    tracker: "DecisionTracker",
-    stop_event: threading.Event,
-) -> str:
-    """Run the Premarket Analyst end to end: hold until PREMARKET_LEAD_SEC
-    before the opening bell, run one opening-tactics cycle, then sleep until an
-    armed tactic executes (the opening trade is simulated by the
-    TacticsExecutor). Fresh news before the bell wakes it to revise the plan;
-    any wake after the open just keeps it sleeping until a tactic fires.
-
-    Returns "executed" once an opening tactic filled, "done" when the bell rang
-    with nothing armed (nothing to perform), or "stopped".
-    """
-    while not stop_event.is_set():
-        if not _wait_for_premarket_window(state, stop_event):
-            return "stopped"
-
-        state.agent_wake_event.clear()
-        state.agent_wake_reason = None
-        try:
-            run_agent_cycle(
-                client, model, symbols, state, tracker, personality=PREMARKET_PERSONALITY
-            )
-        except Exception as exc:
-            _log(state, {"type": "error", "text": f"Premarket cycle failed: {exc}"})
-        # The analyst's schedule is the bell, not a check-in: it sleeps on its
-        # tactics below, so a wake_in_minutes (or a retry) is dropped here
-        # rather than left to wake whatever runs after it.
-        state.agent_wake_at = None
-
-        if not state.any_tactics():
-            # No opening plan -- hold through the bell (so a caller that
-            # re-assesses on return doesn't spin pre-open) and retire.
-            _log(
-                state,
-                {
-                    "type": "status",
-                    "text": "Premarket analyst armed no opening tactics; retiring at the bell.",
-                },
-            )
-            while not stop_event.is_set() and not market_hours.is_market_open():
-                stop_event.wait(PREMARKET_WAIT_POLL_SEC)
-            return "stopped" if stop_event.is_set() else "done"
-
-        # Opening tactics armed: sleep until the executor performs one.
-        while not stop_event.is_set():
-            state.agent_wake_event.wait()
-            if stop_event.is_set():
-                return "stopped"
-            reason = state.agent_wake_reason or ""
-            state.agent_wake_event.clear()
-            state.agent_wake_reason = None
-            if reason.startswith("Tactics executed"):
-                _log(
-                    state,
-                    {
-                        "type": "status",
-                        "text": "Opening tactic executed; premarket analyst retiring.",
-                    },
-                )
-                return "executed"
-            if not state.any_tactics():
-                # Tactics were cleared without an execution (external cancel).
-                return "done"
-            if not market_hours.is_market_open():
-                # Pre-bell wake (fresh news / alert): revise the opening plan.
-                _log(
-                    state,
-                    {
-                        "type": "status",
-                        "text": f"{reason} Premarket analyst revising the opening plan.",
-                    },
-                )
-                break
-            # Post-open wake that wasn't an execution: the bracket is still
-            # armed and watched -- keep sleeping until a tactic fires.
-    return "stopped"
-
-
-def _premarket_loop(
-    state: "AppState",
-    tracker: "DecisionTracker",
-    symbols: list[str],
-    provider: str,
-    api_key: str,
-    model: str,
-    stop_event: threading.Event,
-) -> None:
-    """Standalone Premarket Analyst run: one premarket session, then the agent
-    disables itself -- the opening tactics were performed (or there was nothing
-    to perform) and this personality never trades the session that follows."""
-    client = get_agent_client(provider, api_key)
-    outcome = run_premarket_session(client, model, symbols, state, tracker, stop_event)
-    if outcome != "stopped" and state.agent_stop_event is stop_event:
-        stop_agent(state)
-    scoring.end_session(state, tracker)
-    state.agent_running = False
-    _log(state, {"type": "status", "text": "Premarket analyst disabled."})
-    obs.flush()
-
-
 def _agent_loop(
     state: "AppState",
     tracker: "DecisionTracker",
@@ -1496,8 +1310,7 @@ def _agent_loop(
 
 def start_tactics_executor(state: "AppState", tracker: "DecisionTracker") -> None:
     """Start one background matcher per streamed symbol for its armed tactics;
-    stopped by `stop_agent`. Shared by `launch_agent` and the Automatic
-    orchestrator."""
+    stopped by `stop_agent`. Shared by `launch_agent` and the Strategist."""
     for sym_state in state.iter_symbol_states():
         executor = TacticsExecutor(sym_state, tracker)
         sym_state.tactics_executor = executor
@@ -1522,15 +1335,6 @@ def launch_agent(
     state.agent_running = True
     scoring.begin_session(state, personality, symbols)
     start_tactics_executor(state, tracker)
-    if personality == PREMARKET_PERSONALITY:
-        # One-shot pre-open specialist: holds for the opening window, arms the
-        # opening tactics, and disables itself once they execute.
-        threading.Thread(
-            target=clock.inherit(_premarket_loop),
-            args=(state, tracker, symbols, provider, api_key, model, stop_event),
-            daemon=True,
-        ).start()
-        return
     threading.Thread(
         target=clock.inherit(_agent_loop),
         args=(state, tracker, symbols, provider, api_key, model, stop_event, personality),

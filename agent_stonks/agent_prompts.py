@@ -794,83 +794,6 @@ it wakes you AND it invalidates old levels, so re-map before trusting any \
 previously armed plan.
 """
 
-PREMARKET_SYSTEM_PROMPT = """\
-You are the Premarket Analyst for a basket of equity tickers, operating in a \
-system whose execution venue is stated below -- reason as if real capital \
-is on the line, because depending on that venue it may be.
-
-You are a one-shot specialist: you run ONCE, in the final minutes before the \
-opening bell, and you do not manage the session afterwards. Your entire job is \
-to convert pre-market evidence into OPENING TACTICS -- standing conditional \
-orders (set_tactics) that state exactly how much to buy or sell and at what \
-price. Estimate the prices at which a buy (or sell) leaves the book profitable \
-as the session unfolds, and encode them; the executor simulates the fills the \
-moment the opening tape crosses your levels. Once one of your tactics \
-executes you are retired for the day, so the plan must stand entirely on its \
-own -- entry, take-profit, and stop all armed up front.
-
-Work through this process, citing the actual numbers the tools return:
-
-1. READ THE PRE-MARKET TAPE. Call analyze_premarket for the previous close, \
-the latest pre-market price and the implied opening gap, the pre-market \
-high/low/volume, and the minutes remaining to the bell. Call get_quote for the \
-freshest print -- mind the warning field: pre-open bid/ask from the thin IEX \
-book are placeholder-wide, trust last_price.
-
-2. FIND THE CATALYST BEHIND THE GAP. Call get_news. A gap backed by a real \
-catalyst (earnings, guidance, upgrade/downgrade, M&A, macro) tends to FOLLOW \
-THROUGH after the open; a gap on no news tends to FADE back toward the prior \
-close. This distinction shapes your plan more than any other input. Also call \
-get_corporate_actions -- an imminent ex-dividend date, split, merger, or \
-spin-off is a scheduled MECHANICAL catalyst: an ex-dividend gap-down is not a \
-fade signal, and a split resets every level your plan is anchored to.
-
-3. ANCHOR TO STRUCTURE. Call analyze_daily_trend for the medium-term regime \
-and the support/resistance the open will trade against, and analyze_market for \
-the broad backdrop (VIX regime, SPY trend). A gap-up into overhead resistance \
-deserves a lower entry and smaller size than one breaking into clear air; a \
-risk-off tape argues for smaller size everywhere. Call get_analyst_targets for \
-the Street's price targets -- the consensus mean (and the UBS / Morgan Stanley \
-/ Barclays targets) act as objectives/resistance: a gap-up into or above the \
-consensus mean has little Street upside left (cap the take-profit below it, \
-size down), while a wide gap remaining to the mean leaves room for a \
-follow-through target.
-
-4. ESTIMATE THE OPENING PRICE AND YOUR EDGE PRICES. From the pre-market \
-indication, the catalyst quality, and the structure, estimate where the stock \
-will actually open, then derive the prices that make the later trades \
-profitable:
-   - BUY price: the level at/below which getting long is worth it -- for a \
-catalyst-backed gap-up, a modest opening pullback that follow-through should \
-recover; for a no-news gap-up, much lower, near where a fade would land. \
-Opening prints overshoot in both directions, so place the entry where the \
-first minutes' volatility can plausibly reach it, not at the indication itself.
-   - TAKE-PROFIT price: above the entry, below the nearest resistance, at a \
-level the expected post-open drift can plausibly reach.
-   - STOP price: the level below which the read is simply wrong (under the \
-pre-market low / prior support), placed so the take-profit reward is at least \
-~2x the stop risk.
-Call get_position first -- if you already hold shares, plan the sell side the \
-same way: at/above what opening price is selling into strength better than \
-letting the position ride?
-
-5. ARM THE OPENING TACTICS. Call set_tactics once with the full bracket -- the \
-entry (quantity or quantity_pct) plus its take-profit and stop, each condition \
-on last_price at the levels you derived. This is your only lever: you never \
-buy or sell directly at the pre-open price, and nobody will be awake to adjust \
-the plan, so size prudently -- risk only a small, fixed slice of the account.
-
-6. FINALIZE. Call submit_decision exactly once with action 'alert' (an empty \
-alerts array is fine while tactics are armed), the regime, and reasoning that \
-names your estimated opening price, the buy/sell levels, and why fills at \
-those prices should end up profitable. If the evidence is genuinely too thin \
-to trade the open -- no gap, no catalyst, no clean level -- arming nothing and \
-saying so is correct; you then simply retire when the bell rings.
-
-If fresh news lands before the bell you are woken to REVISE: re-run the read \
-and call set_tactics again (it replaces the previous plan).
-"""
-
 # Appended to every personality's system prompt, formatted with the streamed
 # symbol list: one agent trades the whole basket from one shared cash balance.
 MULTI_SYMBOL_ADDENDUM = """
@@ -891,8 +814,7 @@ tickers wakes you early.
 
 # Appended to a trading personality's system prompt when the cycle starts
 # outside regular session hours, so the agent knows the tape is stale and can
-# adjust instead of trading it blind. The Premarket Analyst is exempt: it has
-# its own pre-open protocol (and holds for the opening window deterministically).
+# adjust instead of trading it blind.
 SESSION_CLOSED_ADDENDUM = """
 
 --- SESSION STATUS: MARKET CLOSED (PRE/POST-SESSION) ---
@@ -1006,12 +928,17 @@ def premarket_briefing_addendum(
     generated_at: "datetime | None" = None,
     phase: str = "",
     now: "datetime | None" = None,
+    template: str = PREMARKET_BRIEFING_ADDENDUM,
 ) -> str:
     """The briefing addendum for `symbols`, or '' when there is nothing to say.
 
     `briefings` maps symbol -> PremarketBriefing (AppState.premarket_briefings).
     Only the tickers this agent actually trades are included; a basket of two
     should not carry a third symbol's thesis.
+
+    `template` frames the briefing for its reader: a trading agent by default,
+    the Strategist with its own (`strategist.STRATEGIST_BRIEFING_ADDENDUM`).
+    Either is formatted with `{age}`, `{phase_note}` and `{briefings}`.
 
     The age is computed here, at cycle time rather than at briefing time, so a
     long-running agent sees the gap grow instead of reading "generated at 09:12"
@@ -1044,9 +971,7 @@ def premarket_briefing_addendum(
     rendered = "\n\n".join(
         briefing_to_prompt_text(briefings[symbol], symbol) for symbol in wanted
     )
-    return PREMARKET_BRIEFING_ADDENDUM.format(
-        age=age, phase_note=phase_note, briefings=rendered
-    )
+    return template.format(age=age, phase_note=phase_note, briefings=rendered)
 
 
 # Appended to every personality's system prompt: tactics apply to all supported
@@ -1177,22 +1102,12 @@ AGENT_PERSONALITIES: dict[str, dict[str, str]] = {
         "system_prompt": VOLUME_DETECTIVE_SYSTEM_PROMPT,
         "avatar": "Multiavatar-VolumeDetective.png",
     },
-    "premarket": {
-        "label": "Premarket Analyst (opening tactics)",
-        "system_prompt": PREMARKET_SYSTEM_PROMPT,
-        "avatar": "Multiavatar-10c320b2196d1cec32.png",
-    },
 }
 DEFAULT_PERSONALITY = "momentum"
-# One-shot pre-open specialist: gated to a window just before the bell, retired
-# once its opening tactics execute. Not selectable by the Automatic regime
-# cycle (see agent_stonks.automatic) -- the orchestrator activates it
-# deterministically whenever the session hasn't started.
-PREMARKET_PERSONALITY = "premarket"
 
 # Personalities that stay wired (prompt, tools, avatar, past run labels) but are
 # switched off: not offered in the app or SimLab, and never picked by the
-# Automatic orchestrator. Re-enabling one is a one-line change here.
+# Strategist. Re-enabling one is a one-line change here.
 #
 # They stay wired rather than being deleted because a personality key is also
 # the identity of every run that used it. `data/simlab/experiments` holds
@@ -1207,20 +1122,20 @@ DISABLED_PERSONALITIES: frozenset[str] = frozenset(
 
 
 def selectable_personalities() -> list[str]:
-    """Personality keys a user (or the orchestrator) may choose, in registry order."""
+    """Personality keys a user (or the Strategist) may choose, in registry order."""
     return [key for key in AGENT_PERSONALITIES if key not in DISABLED_PERSONALITIES]
 
 
 
 
-# Only exposed to a strategy agent while it runs UNDER the Automatic orchestrator.
-# It lets the strategy relinquish control instead of idling on alerts when the
-# regime that suits it has faded -- the orchestrator then re-assesses and may
-# activate a better-fitting strategy.
-AUTOMATIC_MODE_ADDENDUM = """
+# Only exposed to a strategy agent while it runs UNDER the Strategist (see
+# agent_stonks.strategist). It lets the strategy relinquish control instead of
+# idling on alerts when the regime that suits it has faded -- the Strategist
+# then re-assesses and may activate a better-fitting strategy.
+STRATEGIST_MODE_ADDENDUM = """
 
---- AUTOMATIC MODE ---
-You are running under an Automatic orchestrator that activated you because current \
+--- STRATEGIST MODE ---
+You are running under a Strategist that activated you because current \
 market conditions favor your strategy. Keep control and trade normally -- exactly \
 as described above -- for as long as your edge is plausibly present, including \
 standing aside with an alert through ordinary quiet stretches.
@@ -1230,7 +1145,7 @@ when you judge that the conditions your strategy depends on have genuinely faded
 and your setup is unlikely to appear in the near future -- e.g. a breakout agent in \
 a dead, rangebound tape, a mean-reversion agent once a strong trend has taken hold, \
 or a momentum agent after the move and its volume have died. Standing down hands \
-control back to the orchestrator with your reasoning, so it can re-assess the regime \
+control back to the Strategist with your reasoning, so it can re-assess the regime \
 and activate a strategy better suited to it.
 
 Judgement: a single slow cycle is NOT a reason to stand down -- that is what a \

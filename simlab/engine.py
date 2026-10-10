@@ -40,11 +40,9 @@ from agent_stonks.agent import (
     DEFAULT_PERSONALITY,
     MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
-    PREMARKET_PERSONALITY,
     run_agent_cycle,
 )
 from agent_stonks.broker import Broker
-from agent_stonks.config import PREMARKET_LEAD_SEC
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.market_hours import MARKET_TZ
 from agent_stonks.state import AppState, alert_triggered, format_alert
@@ -328,10 +326,7 @@ class SimulationEngine:
     # ------------------------------------------------------------ day loops
 
     def _first_cycle_time(self, day: date, steps: list[datetime]) -> Optional[datetime]:
-        if self.config.personality == PREMARKET_PERSONALITY:
-            target = self.market.session_open(day) - timedelta(seconds=PREMARKET_LEAD_SEC)
-        else:
-            target = self.market.session_open(day) + timedelta(seconds=BAR_SEC)
+        target = self.market.session_open(day) + timedelta(seconds=BAR_SEC)
         return next((t for t in steps if t >= target), None)
 
     # --------------------------------------------------- rule-based day loop
@@ -400,22 +395,21 @@ class SimulationEngine:
             self._apply_step(steps[idx])
             idx += 1
 
-        premarket = self.config.personality == PREMARKET_PERSONALITY
-        premarket_retired = False
+        cycles_capped = False
         cycles_today = 0
         run_cycle_now = True
 
         while idx <= len(steps):
             if self._stop_requested:
                 return
-            if run_cycle_now and not premarket_retired:
+            if run_cycle_now and not cycles_capped:
                 if cycles_today >= self.config.max_cycles_per_day:
                     self._log(
                         "status",
                         f"Reached max cycles for {day.isoformat()} "
                         f"({self.config.max_cycles_per_day}); fast-forwarding to the close.",
                     )
-                    premarket_retired = True  # no more cycles today; tactics stay live
+                    cycles_capped = True  # no more cycles today; tactics stay live
                 else:
                     cycles_today += 1
                     self.cycles_run += 1
@@ -437,12 +431,6 @@ class SimulationEngine:
                         personality=self.config.personality,
                         system_prompt_override=self.config.system_prompt_override,
                     )
-                    if premarket:
-                        # One-shot pre-open specialist: no re-cycling once the
-                        # session is live; a pre-bell news wake revises the plan.
-                        # It never takes a check-in, live or here.
-                        self.app.agent_wake_at = None
-                        premarket_retired = clock.now() >= self.market.session_open(day)
                 run_cycle_now = False
 
             if idx >= len(steps):
@@ -457,16 +445,6 @@ class SimulationEngine:
 
             reason = self._check_wake(prev_t, t)
             if reason is not None:
-                if premarket:
-                    executed = reason.startswith("Tactics executed")
-                    pre_bell = t < self.market.session_open(day)
-                    if executed:
-                        self._log("status", f"{reason} Premarket analyst retiring.")
-                        premarket_retired = True
-                    elif pre_bell and reason.startswith("Fresh news"):
-                        self._log("status", f"{reason} Revising the opening plan.")
-                        run_cycle_now = True
-                    continue
                 self._log("status", f"{reason} Waking.")
                 run_cycle_now = True
                 continue

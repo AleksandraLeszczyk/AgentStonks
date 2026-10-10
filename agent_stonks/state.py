@@ -285,10 +285,11 @@ _DEFAULTS: dict[str, object] = {
     "llm_provider": "openai",
     "llm_model": "",
     "llm_personality": "automatic",
-    "automatic_active_strategy": None,
-    "automatic_regime": None,
-    "automatic_reason": None,
-    "automatic_assignments": {},
+    "strategist_active_strategy": None,
+    "strategist_regime": None,
+    "strategist_reason": None,
+    "strategist_assignments": {},
+    "strategist_waiting": None,
     "news_llm_provider": "openai",
     "news_impact_method": "auto",
     "scorecard": None,
@@ -458,28 +459,32 @@ class AppState:
         self.agent_wake_at: "datetime | None" = None
         self.llm_provider: str = "openai"
         self.llm_model: str = ""
+        # The Strategist's key, which predates its name (strategist.STRATEGIST_KEY).
         self.llm_personality: str = "automatic"
-        # Automatic orchestrator: which strategy it has currently activated (None
-        # when idle or assessing the regime), plus the regime read and reasoning
-        # behind that choice. Surfaced in the UI/report.
-        self.automatic_active_strategy: str | None = None
-        self.automatic_regime: str | None = None
-        self.automatic_reason: str | None = None
-        # Per-ticker strategy assignments under the Automatic orchestrator:
+        # Strategist: which strategy it has currently activated (None when idle
+        # or assessing the regime), plus the regime read and reasoning behind
+        # that choice. Surfaced in the UI/report.
+        self.strategist_active_strategy: str | None = None
+        self.strategist_regime: str | None = None
+        self.strategist_reason: str | None = None
+        # Per-ticker strategy assignments under the Strategist:
         # {symbol: {strategy, regime, market_regime, reasoning}}. Different
-        # tickers can be in genuinely different states, so the orchestrator
+        # tickers can be in genuinely different states, so the Strategist
         # assigns each one separately; the three fields above hold the dominant
         # assignment as a summary for consumers that need a single value.
-        self.automatic_assignments: dict[str, dict] = {}
+        self.strategist_assignments: dict[str, dict] = {}
+        # What the Strategist is holding for before it can assess -- "the
+        # opening bell" or "the pre-market briefing" -- else None.
+        self.strategist_waiting: str | None = None
         self.news_llm_provider: str = "openai"
         # How news impact is estimated (newsimpact_model.IMPACT_METHODS):
         # "auto" scores a symbol with its own news-impact model when one is
         # fitted and with the LLM otherwise; "llm" uses the LLM for all.
         self.news_impact_method: str = "auto"
         # Per-session scoring collector (see agent_stonks.scoring); attached by
-        # launch_agent/launch_automatic, flushed to the journal at session end.
+        # launch_agent/launch_strategist, flushed to the journal at session end.
         self.scorecard = None  # "scoring.Scorecard | None"
-        # Automatic briefing (see agent_stonks.premarket), generated on a
+        # The pre-market briefing (see agent_stonks.premarket), generated on a
         # background thread when the data stream starts. It is a snapshot of one
         # moment, so `premarket_phase` and `premarket_generated_at` record which
         # moment -- a briefing written before the bell and one written at 11:00
@@ -569,7 +574,7 @@ class AppState:
 
     def schedule_wake(self, at: datetime) -> None:
         """Wake the agent at `at` unless something wakes it sooner. Several
-        requests in one round (the Automatic orchestrator's strategy groups)
+        requests in one round (the Strategist's strategy groups)
         keep the earliest."""
         if self.agent_wake_at is None or at < self.agent_wake_at:
             self.agent_wake_at = at
@@ -668,8 +673,8 @@ def append_agent_log(state: "AppState", entry: dict) -> None:
     """Timestamp an agent-log entry and append it under the state's lock.
 
     Lives here rather than with any one agent because every agent writes to the
-    same log -- the LLM personalities, the rule-based traders and the Automatic
-    orchestrator all do -- and the UI panel reads it back. It is a property of
+    same log -- the LLM personalities, the rule-based traders and the Strategist
+    all do -- and the UI panel reads it back. It is a property of
     the state, not of whoever happens to be running.
     """
     tag = _LOG_TAG.get()

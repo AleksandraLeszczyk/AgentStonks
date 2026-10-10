@@ -420,7 +420,7 @@ class TestDailyScoring:
         assert report["tools"]["error_rate"] == pytest.approx(0.1)
         assert report["tools"]["quote_warning_rate"] == pytest.approx(0.2)
         assert report["decision_quality"]["active_rate"] == pytest.approx(0.4)
-        momentum = report["automatic"]["strategies"]["momentum"]
+        momentum = report["strategist"]["strategies"]["momentum"]
         assert momentum["activations"] == 2
         assert momentum["alert_only"] == 1
         assert momentum["effectiveness"] == pytest.approx(0.5)

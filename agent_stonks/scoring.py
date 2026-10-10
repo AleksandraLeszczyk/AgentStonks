@@ -7,7 +7,7 @@ Collection vs. scoring are deliberately split:
   grounding results per cycle, set_tactics validation rejections, tool
   errors / unreliable-quote warnings, per-symbol price extremes (fed tick by
   tick from the market-data stream, see :func:`record_price`), and (under
-  Automatic) the strategy activation windows. When the session ends the
+  the Strategist) the strategy activation windows. When the session ends the
   scorecard is flattened into one journal record
   (``data/scoring/journal.jsonl``).
 
@@ -224,9 +224,9 @@ class Scorecard:
         # round trips can be reconstructed at session end (see record_price):
         # {min, max, max_after_min, min_before_max}.
         self.price_extremes: dict[str, dict] = {}
-        # Closed Automatic activation windows: {strategy, regime, started_at, ended_at}.
+        # Closed Strategist activation windows: {strategy, regime, started_at, ended_at}.
         self.activations: list[dict] = []
-        # Under the Automatic orchestrator each ticker gets its own strategy,
+        # Under the Strategist each ticker gets its own strategy,
         # so several activation windows are open at once. Keyed by the frozen
         # set of symbols the window covers, which is what makes them distinct.
         self._open_activations: "dict[frozenset, dict]" = {}
@@ -258,7 +258,8 @@ class Scorecard:
 @_never_raise
 def begin_session(state: "AppState", mode: str, symbols: list[str]) -> None:
     """Attach a fresh scorecard for a launching agent session. `mode` is the
-    personality key, or "automatic" for the orchestrator.
+    personality key, or "automatic" for the Strategist (its key predates
+    the name, see `strategist.STRATEGIST_KEY`).
 
     A replay of a past session (`agent_stonks.replay`) gets none: its trades
     are dummy data and must not reach the journal or a day's report."""
@@ -360,12 +361,12 @@ def record_activation_start(
     regime: "str | None",
     symbols: "list[str] | None" = None,
 ) -> None:
-    """Automatic activated `strategy` for `symbols`; a window opens until that
-    strategy stands down on them (or the orchestrator stops). The portfolio
+    """The Strategist activated `strategy` for `symbols`; a window opens until
+    that strategy stands down on them (or the Strategist stops). The portfolio
     value at activation is captured so the window can be judged on its REALIZED
     return, not merely on whether it armed anything.
 
-    `symbols` scopes the window. Since the orchestrator assigns per ticker,
+    `symbols` scopes the window. Since the Strategist assigns per ticker,
     several windows run at once and overlap in time -- without a symbol scope
     each would claim every decision made while it happened to be open,
     including other tickers' trades.
@@ -442,7 +443,7 @@ def _activation_outcomes(
     decisions: list[dict],
     session_symbols: "list[str] | None" = None,
 ) -> list[dict]:
-    """Attribute the session's decisions to each Automatic activation window
+    """Attribute the session's decisions to each Strategist activation window
     and judge it on what it actually MADE: `return_pct` is the portfolio change
     over the window, and `effective` means a positive realized return. Merely
     arming tactics or filling trades no longer counts as effective -- a window
@@ -745,7 +746,7 @@ def _build_day_report(day: str, records: list[dict]) -> dict:
             ),
             "mean_session_return_pct": (sum(returns) / len(returns)) if returns else None,
         },
-        "automatic": {"strategies": _merge_strategy_stats(records)},
+        "strategist": {"strategies": _merge_strategy_stats(records)},
         "session_index": [
             {"started_at": r["started_at"], "mode": r["mode"],
              "runtime_sec": r.get("runtime_sec"),

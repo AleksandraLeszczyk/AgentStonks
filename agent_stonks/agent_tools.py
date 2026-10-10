@@ -629,9 +629,9 @@ _TOOL_STAND_DOWN = {
     "function": {
         "name": "stand_down",
         "description": (
-            "Relinquish control back to the Automatic orchestrator because the market "
+            "Relinquish control back to the Strategist because the market "
             "regime no longer fits your strategy and your setup is unlikely to appear "
-            "soon. Available only in Automatic mode. Use this INSTEAD of submit_decision "
+            "soon. Available only in Strategist mode. Use this INSTEAD of submit_decision "
             "to end the cycle when standing aside on an alert would just be idling in the "
             "wrong regime. Does not close open positions."
         ),
@@ -935,21 +935,6 @@ _TOOL_GET_CORPORATE_ACTIONS = {
     },
 }
 
-_TOOL_ANALYZE_PREMARKET = {
-    "type": "function",
-    "function": {
-        "name": "analyze_premarket",
-        "description": (
-            "Pre-market read for the upcoming session: the previous close, the latest "
-            "pre-market price and the implied opening gap percentage, the pre-market "
-            "high/low/volume printed so far from the early bars, and how many minutes "
-            "remain until the opening bell. Use it to estimate where the stock will "
-            "open before deriving your buy/sell levels."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
 _SYMBOL_PARAM: dict = {
     "type": "string",
     "description": "Ticker symbol this call applies to -- one of your streamed tickers.",
@@ -993,7 +978,6 @@ for _tool in (
     _TOOL_GET_SMART_MONEY_FLOW,
     _TOOL_GET_ANALYST_TARGETS,
     _TOOL_GET_CORPORATE_ACTIONS,
-    _TOOL_ANALYZE_PREMARKET,
     _TOOL_SET_TACTICS,
 ):
     _add_symbol_param(_tool)
@@ -1102,30 +1086,12 @@ VOLUME_DETECTIVE_TOOLS: list[dict] = [
     _TOOL_SUBMIT_DECISION,
 ]
 
-# Premarket analyst: the pre-open read (gap, pre-market range, time to bell) +
-# the catalyst + the daily structure and broad backdrop the open will trade
-# against. No intraday tools -- there is no session yet; the whole output is a
-# set_tactics bracket for the opening prints.
-PREMARKET_TOOLS: list[dict] = [
-    _TOOL_GET_QUOTE,
-    _TOOL_ANALYZE_PREMARKET,
-    _TOOL_GET_NEWS,
-    _TOOL_GET_CORPORATE_ACTIONS,
-    _TOOL_ANALYZE_DAILY_TREND,
-    _TOOL_GET_ANALYST_TARGETS,
-    _TOOL_ANALYZE_MARKET,
-    _TOOL_GET_POSITION,
-    _TOOL_SET_TACTICS,
-    _TOOL_SUBMIT_DECISION,
-]
-
 PERSONALITY_TOOLS: dict[str, list[dict]] = {
     "momentum": MOMENTUM_TOOLS,
     "breakout": BREAKOUT_TOOLS,
     "reversal": REVERSAL_TOOLS,
     "smart_money": SMART_MONEY_TOOLS,
     "volume_detective": VOLUME_DETECTIVE_TOOLS,
-    "premarket": PREMARKET_TOOLS,
 }
 
 

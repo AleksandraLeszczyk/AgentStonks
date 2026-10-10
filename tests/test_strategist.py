@@ -1,13 +1,18 @@
 import json
+import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+from agent_stonks import clock, strategist
+from agent_stonks.premarket import Catalyst, PremarketBriefing
 
 from agent_stonks.agent import (
     DISABLED_PERSONALITIES,
     _TOOL_STAND_DOWN,
     run_agent_cycle,
 )
-from agent_stonks.automatic import (
-    AUTOMATIC_KEY,
+from agent_stonks.strategist import (
+    STRATEGIST_KEY,
     REGIME_TOOLS,
     SELECTABLE_STRATEGIES,
     run_regime_cycle,
@@ -67,7 +72,7 @@ def _base_state() -> AppState:
 
 
 class TestStandDown:
-    def test_stand_down_tool_only_added_under_automatic(self):
+    def test_stand_down_tool_only_added_under_strategist(self):
         state = _base_state()
         tracker = DecisionTracker(broker=FakeBroker())
         # Normal mode: model finalizes with a regular alert.
@@ -107,7 +112,7 @@ class TestStandDown:
         ]
         client = FakeClient(responses)
         result = run_agent_cycle(
-            client, "m", "AAPL", state, tracker, max_iters=3, personality="reversal", under_automatic=True
+            client, "m", "AAPL", state, tracker, max_iters=3, personality="reversal", under_strategist=True
         )
         assert result == "stand_down"
         # stand_down tool was exposed to the model
@@ -136,7 +141,7 @@ class TestStandDown:
         ]
         client = FakeClient(responses)
         result = run_agent_cycle(
-            client, "m", "AAPL", state, tracker, max_iters=3, personality="momentum", under_automatic=True
+            client, "m", "AAPL", state, tracker, max_iters=3, personality="momentum", under_strategist=True
         )
         assert result == "decided"
         assert tracker.snapshot()["positions"] == {"AAPL": 1.0}
@@ -208,14 +213,11 @@ class TestRunRegimeCycle:
         assert "set_tactics" not in names
 
     def test_selectable_strategies_match_personalities(self):
-        # Orchestrator can pick any tradeable personality, and automatic is not
-        # itself selectable.
-        assert AUTOMATIC_KEY not in SELECTABLE_STRATEGIES
+        # The Strategist can pick any tradeable personality, and is not itself
+        # selectable.
+        assert STRATEGIST_KEY not in SELECTABLE_STRATEGIES
         assert "momentum" in SELECTABLE_STRATEGIES
         assert "breakout" in SELECTABLE_STRATEGIES
-        # Premarket is activated deterministically before the open, never by
-        # the regime cycle.
-        assert "premarket" not in SELECTABLE_STRATEGIES
         # Switched-off personalities are never activated either.
         assert not DISABLED_PERSONALITIES & set(SELECTABLE_STRATEGIES)
         enum = _TOOL_STAND_DOWN["function"]["parameters"]["properties"]["reasoning"]
@@ -228,10 +230,10 @@ class TestBreakoutActivationGate:
     measurable opening range for today."""
 
     def test_gated_breakout_pick_is_rejected_then_corrected(self, monkeypatch):
-        import agent_stonks.automatic as automatic_mod
+        import agent_stonks.strategist as strategist_mod
 
         monkeypatch.setattr(
-            automatic_mod,
+            strategist_mod,
             "breakout_preconditions",
             lambda app, symbols, minutes=15: "breakout is not selectable right now: midday dead zone",
         )
@@ -382,7 +384,7 @@ class TestPerSymbolAssignment:
     def test_breakout_gate_is_checked_per_ticker(self, monkeypatch):
         # One ticker lacking a measurable opening range says nothing about
         # another's, so the gate must be evaluated for the named symbol only.
-        import agent_stonks.automatic as automatic_mod
+        import agent_stonks.strategist as strategist_mod
 
         seen = []
 
@@ -390,7 +392,7 @@ class TestPerSymbolAssignment:
             seen.append(list(symbols))
             return "no opening range" if symbols == ["TSLA"] else None
 
-        monkeypatch.setattr(automatic_mod, "breakout_preconditions", _gate)
+        monkeypatch.setattr(strategist_mod, "breakout_preconditions", _gate)
         state = self._state("AAPL", "TSLA")
         tracker = DecisionTracker(broker=FakeBroker())
         responses = [
@@ -413,7 +415,7 @@ class TestPerSymbolAssignment:
 
 class TestGroupByStrategy:
     def test_tickers_sharing_a_strategy_are_traded_together(self):
-        from agent_stonks.automatic import group_by_strategy
+        from agent_stonks.strategist import group_by_strategy
 
         groups = group_by_strategy({
             "AAPL": {"strategy": "momentum"},
@@ -427,26 +429,26 @@ class TestGroupByStrategy:
         assert len(groups) == 2
 
     def test_empty_assignments_produce_no_groups(self):
-        from agent_stonks.automatic import group_by_strategy
+        from agent_stonks.strategist import group_by_strategy
 
         assert group_by_strategy({}) == []
 
 
 class TestPublishAssignments:
     def test_single_strategy_keeps_the_legacy_summary_fields(self):
-        from agent_stonks.automatic import _publish_assignments
+        from agent_stonks.strategist import _publish_assignments
 
         state = AppState()
         _publish_assignments(state, {
             "AAPL": {"strategy": "momentum", "regime": "bullish_trend",
                      "market_regime": "quiet", "reasoning": "gap on volume"},
         })
-        assert state.automatic_active_strategy == "momentum"
-        assert state.automatic_regime == "quiet"       # the market's, not the ticker's
-        assert state.automatic_reason == "gap on volume"
+        assert state.strategist_active_strategy == "momentum"
+        assert state.strategist_regime == "quiet"       # the market's, not the ticker's
+        assert state.strategist_reason == "gap on volume"
 
     def test_mixed_strategies_summarise_as_the_dominant_one(self):
-        from agent_stonks.automatic import _publish_assignments
+        from agent_stonks.strategist import _publish_assignments
 
         state = AppState()
         _publish_assignments(state, {
@@ -457,33 +459,33 @@ class TestPublishAssignments:
             "TSLA": {"strategy": "reversal", "regime": "ranging",
                      "market_regime": "quiet", "reasoning": "c"},
         })
-        assert state.automatic_active_strategy == "momentum"  # covers 2 of 3
-        assert "TSLA" in state.automatic_reason               # per-ticker map instead
-        assert len(state.automatic_assignments) == 3
+        assert state.strategist_active_strategy == "momentum"  # covers 2 of 3
+        assert "TSLA" in state.strategist_reason               # per-ticker map instead
+        assert len(state.strategist_assignments) == 3
 
     def test_clearing_resets_every_field(self):
-        from agent_stonks.automatic import _publish_assignments
+        from agent_stonks.strategist import _publish_assignments
 
         state = AppState()
         _publish_assignments(state, {"AAPL": {"strategy": "momentum", "reasoning": "a"}})
         _publish_assignments(state, {})
-        assert state.automatic_assignments == {}
-        assert state.automatic_active_strategy is None
-        assert state.automatic_regime is None
+        assert state.strategist_assignments == {}
+        assert state.strategist_active_strategy is None
+        assert state.strategist_regime is None
 
 
 def _assignment(strategy: str) -> dict:
     return {"strategy": strategy, "regime": "ranging", "market_regime": "quiet", "reasoning": "r"}
 
 
-class TestAutomaticLoopWakes:
+class TestStrategistLoopWakes:
     """No cycle timer: a round runs after a wake, or straight after a
     stand-down to re-assess the freed tickers."""
 
     def test_stand_down_reassesses_now_and_leaves_other_groups_asleep(self, monkeypatch):
         import threading
 
-        from agent_stonks import automatic, market_hours
+        from agent_stonks import market_hours, strategist
 
         state = AppState()
         state.set_symbols(["AAPL", "KO"])
@@ -501,7 +503,7 @@ class TestAutomaticLoopWakes:
             regime_calls.append(list(symbols))
             return next(regime_rounds)
 
-        def fake_cycle(client, model, symbols, st, tr, personality, under_automatic):
+        def fake_cycle(client, model, symbols, st, tr, personality, under_strategist):
             cycles.append((personality, list(symbols)))
             return "stand_down" if personality == "momentum" else "decided"
 
@@ -510,12 +512,12 @@ class TestAutomaticLoopWakes:
             stop_event.set()
 
         monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
-        monkeypatch.setattr(automatic, "get_agent_client", lambda provider, api_key: object())
-        monkeypatch.setattr(automatic, "run_regime_cycle", fake_regime)
-        monkeypatch.setattr(automatic, "run_agent_cycle", fake_cycle)
-        monkeypatch.setattr(automatic, "_wait_for_next_cycle", fake_wait)
+        monkeypatch.setattr(strategist, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(strategist, "run_regime_cycle", fake_regime)
+        monkeypatch.setattr(strategist, "run_agent_cycle", fake_cycle)
+        monkeypatch.setattr(strategist, "_wait_for_next_cycle", fake_wait)
 
-        automatic._automatic_loop(state, tracker, ["AAPL", "KO"], "openai", "key", "model", stop)
+        strategist._strategist_loop(state, tracker, ["AAPL", "KO"], "openai", "key", "model", stop)
 
         assert regime_calls == [["AAPL", "KO"], ["AAPL"]]
         # KO's reversal agent decided in round one and nothing has woken it,
@@ -530,7 +532,7 @@ class TestAutomaticLoopWakes:
     def test_unassigned_tickers_get_a_retry(self, monkeypatch):
         import threading
 
-        from agent_stonks import automatic, market_hours
+        from agent_stonks import market_hours, strategist
 
         state = AppState()
         state.set_symbols(["AAPL", "KO"])
@@ -543,18 +545,18 @@ class TestAutomaticLoopWakes:
             stop_event.set()
 
         monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
-        monkeypatch.setattr(automatic, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(strategist, "get_agent_client", lambda provider, api_key: object())
         monkeypatch.setattr(
-            automatic, "run_regime_cycle",
+            strategist, "run_regime_cycle",
             lambda client, model, symbols, st, tr: {"AAPL": _assignment("momentum")},
         )
         monkeypatch.setattr(
-            automatic, "run_agent_cycle",
-            lambda client, model, symbols, st, tr, personality, under_automatic: "decided",
+            strategist, "run_agent_cycle",
+            lambda client, model, symbols, st, tr, personality, under_strategist: "decided",
         )
-        monkeypatch.setattr(automatic, "_wait_for_next_cycle", fake_wait)
+        monkeypatch.setattr(strategist, "_wait_for_next_cycle", fake_wait)
 
-        automatic._automatic_loop(state, tracker, ["AAPL", "KO"], "openai", "key", "model", stop)
+        strategist._strategist_loop(state, tracker, ["AAPL", "KO"], "openai", "key", "model", stop)
 
         assert seen["wake_at"] is not None
 
@@ -573,7 +575,7 @@ class TestBasketScopedCleanup:
             _response(tool_calls=[_tool_call("c1", "stand_down", {"reasoning": "no edge"})]),
         ])
 
-        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, under_automatic=True)
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, under_strategist=True)
 
         assert state.sym("KO").alerts == [ko_alert]
 
@@ -588,7 +590,266 @@ class TestBasketScopedCleanup:
             _response(tool_calls=[_tool_call("c1", "stand_down", {"reasoning": "no edge"})]),
         ])
 
-        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, under_automatic=True)
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3, under_strategist=True)
 
         assert state.sym("AAPL").tactics is None
         assert state.sym("KO").tactics is ko_plan
+
+
+def _briefing(**overrides) -> PremarketBriefing:
+    fields = dict(
+        overall_bias="bullish",
+        confidence="high",
+        summary="Beat-and-raise overnight; gapping up 4% on 3x pre-market volume.",
+        catalysts=[Catalyst(headline="Q3 beat and raised guidance", impact="positive",
+                            relevance="the gap's cause")],
+        technical_levels=[],
+        risk_factors=["guidance already priced in"],
+        macro_context="SPY above its 50-day, VIX 14.",
+        key_levels_to_watch=["the 231.40 pre-market high"],
+    )
+    fields.update(overrides)
+    return PremarketBriefing(**fields)
+
+
+class TestBriefingFeed:
+    """The day's pre-market briefing is the Strategist's starting point: it is
+    in the regime cycle's prompt, framed for picking a strategy."""
+
+    def _select(self, symbol="AAPL") -> SimpleNamespace:
+        return _response(tool_calls=[_tool_call("c1", "select_strategy", {
+            "symbol": symbol, "strategy": "momentum", "reasoning": "gap confirmed"})])
+
+    def test_briefing_reaches_the_regime_prompt(self):
+        state = _base_state()
+        state.premarket_briefings = {"AAPL": _briefing()}
+        state.premarket_phase = "premarket"
+        state.premarket_generated_at = clock.now() - timedelta(minutes=40)
+        client = FakeClient([self._select()])
+
+        run_regime_cycle(client, "m", ["AAPL"], state, DecisionTracker(broker=FakeBroker()), max_iters=2)
+
+        system, user = client.calls[0][0]["content"], client.calls[0][1]["content"]
+        assert "RESEARCH BRIEFING FOR TODAY (40 minutes ago)" in system
+        assert "Beat-and-raise overnight" in system
+        assert "THE LIVE TOOLS WIN" in system
+        assert "Start from the research briefing" in user
+
+    def test_only_the_assessed_tickers_briefings(self):
+        state = AppState()
+        state.set_symbols(["AAPL", "KO"])
+        state.premarket_briefings = {
+            "AAPL": _briefing(),
+            "KO": _briefing(summary="KO drifts on no news."),
+        }
+        state.premarket_generated_at = clock.now()
+        client = FakeClient([self._select("AAPL")])
+
+        run_regime_cycle(client, "m", ["AAPL"], state, DecisionTracker(broker=FakeBroker()), max_iters=2)
+
+        system = client.calls[0][0]["content"]
+        assert "Beat-and-raise overnight" in system
+        assert "KO drifts on no news" not in system
+
+    def test_no_briefing_leaves_the_prompt_alone(self):
+        state = _base_state()
+        client = FakeClient([self._select()])
+
+        run_regime_cycle(client, "m", ["AAPL"], state, DecisionTracker(broker=FakeBroker()), max_iters=2)
+
+        assert client.calls[0][0]["content"] == strategist.STRATEGIST_SYSTEM_PROMPT
+        assert "research briefing" not in client.calls[0][1]["content"]
+
+    def test_a_briefing_from_an_earlier_day_is_not_read(self):
+        state = _base_state()
+        state.premarket_briefings = {"AAPL": _briefing()}
+        state.premarket_generated_at = clock.now() - timedelta(days=1)
+        assert strategist.briefing_addendum(state, ["AAPL"]) == ""
+
+    def test_a_briefing_still_without_a_timestamp_is_read(self):
+        # Symbols land one at a time; the timestamp is written after the last.
+        state = _base_state()
+        state.premarket_briefings = {"AAPL": _briefing()}
+        assert "Beat-and-raise" in strategist.briefing_addendum(state, ["AAPL"])
+
+
+class TestBeforeTheBell:
+    def test_holds_until_the_open_then_assesses(self, monkeypatch):
+        from agent_stonks import market_hours, strategist
+
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        tracker = DecisionTracker(broker=FakeBroker())
+        stop = threading.Event()
+        opened = iter([False, False, True])
+        seen: dict = {}
+
+        def fake_open(now=None):
+            return next(opened, True)
+
+        def fake_regime(client, model, symbols, st, tr):
+            seen["regime"] = list(symbols)
+            stop.set()
+            return {}
+
+        monkeypatch.setattr(market_hours, "is_market_open", fake_open)
+        monkeypatch.setattr(market_hours, "seconds_until_next_open", lambda now=None: 60.0)
+        monkeypatch.setattr(strategist, "STRATEGIST_OPEN_POLL_SEC", 0.01)
+        monkeypatch.setattr(strategist, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(strategist, "run_regime_cycle", fake_regime)
+
+        strategist._strategist_loop(state, tracker, ["AAPL"], "openai", "key", "model", stop)
+
+        assert seen["regime"] == ["AAPL"]
+        assert state.strategist_waiting is None
+        with state.lock:
+            texts = [e.get("text", "") for e in state.agent_log]
+        assert any("holding until the bell" in t for t in texts)
+
+    def test_shows_what_it_is_waiting_for_and_stops_cleanly(self, monkeypatch):
+        from agent_stonks import market_hours, strategist
+
+        state = AppState()
+        stop = threading.Event()
+        seen: dict = {}
+
+        def fake_wait(timeout=None):
+            seen["waiting"] = state.strategist_waiting
+            stop.set()
+            return True
+
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: False)
+        monkeypatch.setattr(stop, "wait", fake_wait)
+
+        assert strategist._wait_for_open(state, stop) is False
+        assert seen["waiting"] == "the opening bell"
+        assert state.strategist_waiting is None
+
+    def test_the_close_ends_the_assignments(self, monkeypatch):
+        from agent_stonks import market_hours, scoring, strategist
+
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        tracker = DecisionTracker(broker=FakeBroker())
+        stop = threading.Event()
+        opened = iter([True, False])
+        ended: list = []
+
+        def fake_cycle(client, model, symbols, st, tr, personality, under_strategist):
+            return "decided"
+
+        def fake_hold(st, stop_event):
+            ended.append(dict(st.strategist_assignments))
+            stop_event.set()
+            return False
+
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: next(opened, False))
+        monkeypatch.setattr(strategist, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(
+            strategist, "run_regime_cycle",
+            lambda client, model, symbols, st, tr: {"AAPL": _assignment("momentum")},
+        )
+        monkeypatch.setattr(strategist, "run_agent_cycle", fake_cycle)
+        monkeypatch.setattr(strategist, "_wait_for_next_cycle", lambda st, stop_event: None)
+        monkeypatch.setattr(strategist, "_wait_for_open", fake_hold)
+        closed: list = []
+        monkeypatch.setattr(scoring, "record_activation_end",
+                            lambda st, symbols=None: closed.append(symbols))
+
+        strategist._strategist_loop(state, tracker, ["AAPL"], "openai", "key", "model", stop)
+
+        assert ended == [{}]          # the hold starts with nothing assigned
+        assert closed == [None]       # and every open window closed with it
+
+
+class TestAwaitBriefing:
+    def test_waits_for_a_briefing_in_progress(self, monkeypatch):
+        from agent_stonks import strategist
+
+        state = AppState()
+        state.premarket_pending = ["AAPL"]
+        stop = threading.Event()
+        polls: list = []
+
+        def fake_wait(timeout=None):
+            polls.append(state.strategist_waiting)
+            state.premarket_pending = []      # the briefing landed
+            return False
+
+        monkeypatch.setattr(stop, "wait", fake_wait)
+        strategist._await_briefing(state, ["AAPL"], stop)
+
+        assert polls == ["the pre-market briefing"]
+        assert state.strategist_waiting is None
+        with state.lock:
+            texts = [e.get("text", "") for e in state.agent_log]
+        assert any("waiting for the pre-market briefing on AAPL" in t for t in texts)
+
+    def test_gives_up_after_the_bound(self, monkeypatch):
+        from agent_stonks import strategist
+
+        state = AppState()
+        state.premarket_pending = ["AAPL"]
+        monkeypatch.setattr(strategist, "STRATEGIST_BRIEFING_WAIT_SEC", 0.05)
+        monkeypatch.setattr(strategist, "STRATEGIST_BRIEFING_POLL_SEC", 0.01)
+
+        strategist._await_briefing(state, ["AAPL"], threading.Event())
+
+        with state.lock:
+            texts = [e.get("text", "") for e in state.agent_log]
+        assert any("assessing without it" in t for t in texts)
+
+    def test_no_wait_for_other_tickers_briefings(self):
+        from agent_stonks import strategist
+
+        state = AppState()
+        state.premarket_pending = ["KO"]
+        strategist._await_briefing(state, ["AAPL"], threading.Event())
+        with state.lock:
+            assert state.agent_log == []
+
+    def test_a_round_holds_for_the_briefing_before_assessing(self, monkeypatch):
+        from agent_stonks import market_hours, strategist
+
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        stop = threading.Event()
+        order: list = []
+
+        def fake_await(st, symbols, stop_event):
+            order.append(("briefing", list(symbols)))
+
+        def fake_regime(client, model, symbols, st, tr):
+            order.append(("regime", list(symbols)))
+            stop.set()
+            return {}
+
+        monkeypatch.setattr(market_hours, "is_market_open", lambda now=None: True)
+        monkeypatch.setattr(strategist, "get_agent_client", lambda provider, api_key: object())
+        monkeypatch.setattr(strategist, "_await_briefing", fake_await)
+        monkeypatch.setattr(strategist, "run_regime_cycle", fake_regime)
+
+        strategist._strategist_loop(
+            state, DecisionTracker(broker=FakeBroker()), ["AAPL"], "openai", "key", "model", stop
+        )
+        assert order == [("briefing", ["AAPL"]), ("regime", ["AAPL"])]
+
+
+class TestBriefingLaunchMarksPending:
+    def test_pending_is_set_before_the_thread_runs(self, monkeypatch):
+        from agent_stonks import premarket
+
+        started: list = []
+
+        class FakeThread:
+            def __init__(self, target, args, daemon):
+                started.append(list(args[1]))
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(premarket.threading, "Thread", FakeThread)
+        state = AppState()
+        assert premarket.launch_premarket_analysis(state, ["AAPL", "KO"], "openai", "key")
+        assert state.premarket_pending == ["AAPL", "KO"]
+        assert started == [["AAPL", "KO"]]

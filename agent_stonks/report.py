@@ -214,7 +214,7 @@ def _agent_log_html(log: list[dict]) -> str:
             reasoning = html.escape(entry.get("reasoning", ""))
             strat = html.escape(str(entry.get("personality", "")))
             body = (
-                f"<div><b>{strat}</b> relinquished control to Automatic</div>"
+                f"<div><b>{strat}</b> relinquished control to the Strategist</div>"
                 f"<div style='color:{PALETTE['muted']}'>{reasoning}</div>"
             )
         elif etype == "tactics_set":

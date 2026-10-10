@@ -941,6 +941,10 @@ def launch_premarket_analysis(
         app.premarket_errors = {}
         app.premarket_pending = []
         return False
+    # Marked pending before the thread starts, not by it: the agent launched by
+    # the same ▶ Start may reach its first round first, and the Strategist holds
+    # that round for the briefing only if it can see one is on its way.
+    app.premarket_pending = list(symbols)
     threading.Thread(
         target=generate_for_symbols,
         args=(app, list(symbols), provider, api_key,
