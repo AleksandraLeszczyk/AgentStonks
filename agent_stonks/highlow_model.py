@@ -199,7 +199,7 @@ import torch.nn as nn  # noqa: E402
 
 torch.set_num_threads(1)
 
-from . import market_hours, model_store  # noqa: E402
+from . import codenames, market_hours, model_store  # noqa: E402
 from .model_store import ModelStore  # noqa: E402
 from .newsimpact_model import early_close  # noqa: E402
 
@@ -1244,7 +1244,7 @@ def _credentials(key: "str | None", secret: "str | None") -> "tuple[str, str]":
     secret = secret or os.getenv("ALPACA_SECRET", "")
     if not (key and secret):
         raise ValueError(
-            "the HighLow forecast needs Alpaca SIP minute history and no Alpaca "
+            f"the {codenames.HIGHLOW} forecast needs Alpaca SIP minute history and no Alpaca "
             "credentials are available (sidebar connection, or ALPACA_API_KEY / "
             "ALPACA_SECRET in the environment)."
         )
@@ -1550,7 +1550,7 @@ def forecast_from(
     if len(history) < MIN_PRIOR_SESSIONS:
         raise ValueError(
             f"only {len(history)} complete SIP sessions of history before {day.date()}; "
-            f"the HighLow forecast needs {MIN_PRIOR_SESSIONS} for its 126-day windows."
+            f"the {codenames.HIGHLOW} forecast needs {MIN_PRIOR_SESSIONS} for its 126-day windows."
         )
 
     # Today, as the notebook's minute frame would hold it at 9:35: the first

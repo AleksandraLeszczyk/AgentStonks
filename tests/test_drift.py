@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from agent_stonks import codenames
 from simlab import data as sim_data
 from simlab import drift as dr
 
@@ -456,7 +457,7 @@ class TestHighLow2:
     def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
         monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
         result = dr.evaluate_highlow2(TICKER, FEED)
-        assert result["rows"] == [] and "HighLow2" in result["notes"][0]
+        assert result["rows"] == [] and codenames.HIGHLOW2 in result["notes"][0]
 
     def test_a_rest_head_is_scored_against_the_session_after_935(self, store, stubbed, monkeypatch):
         """INTC's forecast is the rest of the session's: the stored bars from
@@ -517,7 +518,7 @@ class TestHighLow3m:
     def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
         monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
         result = dr.evaluate_highlow3m(TICKER, FEED)
-        assert result["rows"] == [] and "HighLow_3m" in result["notes"][0]
+        assert result["rows"] == [] and codenames.HIGHLOW3M in result["notes"][0]
 
 
 INTRAVOL = {

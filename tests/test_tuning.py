@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from agent_stonks import momentum_regime
+from agent_stonks import codenames, momentum_regime
 from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTraderConfig
 from agent_stonks.config import UNIT_ADR
 from agent_stonks.market_hours import MARKET_TZ
@@ -868,7 +868,7 @@ class TestPredictedRange:
             "overlay": "highlow_range", "notes": [],
         }
         fig = sim_app._tuning_daily_chart(self.record(), forecasts=forecasts)
-        [box] = [t for t in fig.data if t.name == "Predicted day range (HighLow)"]
+        [box] = [t for t in fig.data if t.name == codenames.HIGHLOW]
         assert (list(box.x), list(box.base), list(box.y)) == (["2026-06-15"], [200.0], [10.0])
         assert box.yaxis == "y2"
         assert "actual 201.00 – 211.00" in box.customdata[0]

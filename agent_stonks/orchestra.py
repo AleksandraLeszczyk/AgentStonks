@@ -53,7 +53,7 @@ import threading
 from dataclasses import asdict, dataclass, field, fields, replace
 from typing import Optional
 
-from . import apple_models, candidates, event_days, market_hours, momentum_regime, rule_agent
+from . import apple_models, candidates, codenames, event_days, market_hours, momentum_regime, rule_agent
 from . import apple_trader as at
 from .agent import stop_agent
 from .apple_trader import AppleTraderConfig, TraderSlot
@@ -92,28 +92,15 @@ def split_key(key: str) -> "tuple[str, str]":
     return ticker.upper(), model_key
 
 
-# What a racer's model is called beside its symbol. The registry's labels are
-# written for a picker ("Day-range forecast (TimeToChange3)") and are too long
-# to repeat on every log line and board row.
-SHORT_MODEL_NAMES = {
-    "dayrange": "Day Range",
-    "dayrange_intraday": "Day Range × IV",
-    "highlow": "HighLow",
-    "highlow2": "HighLow2",
-    "highlow3m": "HighLow_3m",
-}
-
-
 def racer_label(config_or_key) -> str:
-    """"INTC · Day Range": what the log, the board and the form call a racer."""
+    """"INTC · Polaris": what the log, the board and the form call a racer."""
     # A key is the string; anything else is a config, of whichever class --
     # see `apple_trader.as_config`.
     if isinstance(config_or_key, str):
         ticker, model_key = split_key(config_or_key)
     else:
         ticker, model_key = config_or_key.ticker, config_or_key.model_key
-    name = SHORT_MODEL_NAMES.get(model_key) or apple_models.get(model_key).label
-    return f"{ticker} · {name}"
+    return f"{ticker} · {apple_models.get(model_key).label}"
 
 
 def all_pairs() -> "list[str]":
@@ -160,7 +147,7 @@ class OrchestraConfig:
         # could have been made, and its signature has no place for it.
         if any(r.use_3m for r in self.racers):
             raise ValueError(
-                "Orchestra does not trade HighLow_3m's 9:33 window (use_3m): its pairs "
+                f"Orchestra does not trade {codenames.HIGHLOW3M}'s 9:33 window (use_3m): its pairs "
                 "are picked at 09:34 and race from their own forecasts"
             )
         keys = [racer_key(r) for r in self.racers]

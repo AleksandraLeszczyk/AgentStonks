@@ -13,7 +13,7 @@ import pytest
 
 from agent_stonks import orchestra as ar
 from agent_stonks import apple_trader as at
-from agent_stonks import clock, model_overlays, session_store
+from agent_stonks import clock, codenames, model_overlays, session_store
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
@@ -190,7 +190,7 @@ class TestFirstFillTakesTheRace:
             race.run_cycle(state, tracker)
         refusals = [e for e in state.agent_log if "Orchestra is following" in e.get("text", "")]
         assert len(refusals) == 1
-        assert refusals[0]["racer"] == "INTC · Day Range"
+        assert refusals[0]["racer"] == f"INTC · {codenames.DAYRANGE}"
 
 
 class TestTheRaceReopens:
@@ -303,7 +303,7 @@ class TestStopOut:
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(99.0, 98.0, 99.5))
         assert race.run_cycle(state, tracker) == "sold"
-        assert race.halt and race.halt.startswith("AAPL · Day Range")
+        assert race.halt and race.halt.startswith(f"AAPL · {codenames.DAYRANGE}")
 
         # A replay keeps going bar by bar: the race stays down all session.
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
@@ -539,7 +539,7 @@ class TestTheLiveLoop:
         loop.join(timeout=10)
 
         errors = [e["text"] for e in state.agent_log if e["type"] == "error"]
-        assert any(t.startswith("INTC · Day Range is left out of Orchestra") for t in errors)
+        assert any(t.startswith(f"INTC · {codenames.DAYRANGE} is left out of Orchestra") for t in errors)
         assert state.orchestra["order"] == ["AAPL:dayrange"]
 
 
@@ -606,7 +606,7 @@ class TestTheMorningPick:
         assert [r["key"] for r in picked["rows"] if r["selected"]] == ["INTC:dayrange"]
         assert set(race.benched) == {"AAPL:dayrange", "MU:dayrange"}
         line = next(e["text"] for e in state.agent_log if e["text"].startswith("Candidates at 09:34"))
-        assert "INTC · Day Range" in line and "Left out: AAPL · Day Range" in line
+        assert f"INTC · {codenames.DAYRANGE}" in line and f"Left out: AAPL · {codenames.DAYRANGE}" in line
 
         # 09:35: only the candidate forecasts, and only it may buy.
         tapes.opening_bar()

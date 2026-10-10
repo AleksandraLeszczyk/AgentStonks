@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_stonks import apple_models, model_catalogue as mc
+from agent_stonks import apple_models, codenames, model_catalogue as mc
 
 
 # --- the mirrored paths -----------------------------------------------------
@@ -313,7 +313,7 @@ class TestHighLow2Spec:
         spec = _highlow2_spec_from(HIGHLOW2_SIDECAR, tmp_path, monkeypatch)
         assert spec.headline == ("MAE (% of ADR)", "15.8%")
         assert next(iter(spec.metrics)) == "MAE (% of ADR)"
-        assert spec.metrics["walk-forward vs HighLow_5m · 2026"] == -0.0007
+        assert spec.metrics[f"walk-forward vs {codenames.HIGHLOW} · 2026"] == -0.0007
         assert "9-session test window" in spec.caveat
         assert "GOOGL, MSFT pooled in" in spec.ticker_note
         assert "1450 sessions (500 AAPL)" in spec.data_note
@@ -340,7 +340,7 @@ class TestHighLow2Spec:
         assert spec.metrics["rest head vs day head read as the rest · 2025"] == -0.0081
         assert "after 9:35" in spec.predicts and "rest_up" in spec.target
         assert "does not compare with the day-range rows; the day head misses by 30%" in spec.caveat
-        assert "Chart overlay — predicted range after 9:35 (HighLow2)" in spec.consumers
+        assert f"Chart overlay — {codenames.HIGHLOW2}" in spec.consumers
         day = _highlow2_spec_from(HIGHLOW2_SIDECAR, tmp_path, monkeypatch)
         assert "whole session" in day.predicts and "rest" not in day.target
 

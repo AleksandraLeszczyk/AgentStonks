@@ -1,5 +1,5 @@
 """
-News analysis pipeline using Alpaca, Yahoo Finance (yfinance), WorldNews API,
+News analysis pipeline using Alpaca, Yahoo Finance (its search API), WorldNews API,
 and an LLM (Gemini, OpenAI, or Anthropic — see `agent_stonks.llm`).
 
 This module is optional — only needed for LLM-based impact scoring.
@@ -207,41 +207,71 @@ def fetch_news_with_fallback(
 
 
 YFINANCE_FEED = "yfinance"
+# What the data log names as the Yahoo articles' source.
+YF_NEWS_SOURCE = "Yahoo search API"
+
+# Yahoo's quote-search API, whose answer carries the symbol's newest articles.
+# Not yfinance's Ticker.get_news: the endpoint behind it (/xhr/ncp) has
+# answered 404 since early October 2026, which yfinance turns into an empty
+# list, so the feed went silent with no error logged. Nor yfinance's Search,
+# which goes through an LRU-cached GET: a poll would get its first answer back
+# forever.
+YF_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
+# Yahoo answers python-requests' own User-Agent with 429s.
+_YF_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+
+
+def _yahoo_ticker(symbol: str) -> str:
+    """`symbol` the way Yahoo writes it: BRK.B is BRK-B there."""
+    return symbol.upper().replace(".", "-")
 
 
 def fetch_yfinance_news(symbol: str, count: int = YF_NEWS_COUNT) -> list[dict]:
     """Recent Yahoo Finance articles for `symbol`, in `rest.fetch_news`'s shape
     (id/headline/summary/created_at/url/source), plus `feed: "yfinance"`.
-    `source` is the publisher (Reuters, Barrons.com, ...). Raises on failure.
+    `source` is the publisher (Reuters, Barrons.com, ...). Yahoo's search
+    answer has no summary, so `summary` is empty. Raises on failure, and on an
+    answer without a news list -- an API change should not look like a quiet
+    day.
 
-    Yahoo does not return its articles in time order (it pins some), so callers
-    sort -- `merge_news` does."""
-    import yfinance as yf
-
-    # A fresh Ticker on every call: Ticker.get_news caches its first answer on
-    # the instance, so a kept one would never see a new article.
-    items = yf.Ticker(symbol).get_news(count=count, tab="news")
+    An article Yahoo tags with other tickers only is left out. Yahoo does not
+    promise time order, so callers sort -- `merge_news` does."""
+    ticker = _yahoo_ticker(symbol)
+    r = requests.get(
+        YF_SEARCH_URL,
+        params={
+            "q": ticker,
+            "quotesCount": 0,
+            "newsCount": count,
+            "listsCount": 0,
+            "enableFuzzyQuery": False,
+        },
+        headers=_YF_HEADERS,
+        timeout=10,
+    )
+    r.raise_for_status()
+    items = r.json().get("news")
+    if not isinstance(items, list):
+        raise ValueError("Yahoo's search answer has no news list")
     articles = []
-    for item in items or []:
-        content = item.get("content") or {}
-        title = content.get("title")
-        published = content.get("pubDate") or content.get("displayTime")
-        article_id = content.get("id") or item.get("id")
+    for item in items:
+        title = item.get("title")
+        published = item.get("providerPublishTime")
+        article_id = item.get("uuid")
         if not (title and published and article_id):
             continue
-        url = (
-            (content.get("canonicalUrl") or {}).get("url")
-            or (content.get("clickThroughUrl") or {}).get("url")
-            or content.get("previewUrl")
-            or ""
-        )
+        related = item.get("relatedTickers")
+        if related and ticker not in related:
+            continue
         articles.append({
             "id": f"yf-{article_id}",
             "headline": title,
-            "summary": content.get("summary") or content.get("description") or "",
-            "created_at": published,
-            "url": url,
-            "source": (content.get("provider") or {}).get("displayName") or "Yahoo Finance",
+            "summary": "",
+            "created_at": datetime.fromtimestamp(int(published), timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "url": item.get("link") or "",
+            "source": item.get("publisher") or "Yahoo Finance",
             "feed": YFINANCE_FEED,
         })
     return articles
@@ -318,13 +348,13 @@ def fetch_live_news(
     except Exception as exc:
         log_fetch_failure(
             "news (Yahoo Finance)",
-            [("yfinance", exc)],
+            [(YF_NEWS_SOURCE, exc)],
             symbol=symbol,
             consequence="Alpaca's articles only until the next Yahoo poll",
         )
         yahoo = []
     else:
-        log_fetch("news (Yahoo Finance)", "yfinance", symbol=symbol, detail=f"{len(yahoo)} articles")
+        log_fetch("news (Yahoo Finance)", YF_NEWS_SOURCE, symbol=symbol, detail=f"{len(yahoo)} articles")
     merged, _ = merge_news(articles, yahoo)
     return merged
 

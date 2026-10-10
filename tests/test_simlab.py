@@ -11,7 +11,7 @@ import pytest
 
 from agent_stonks import minute_momentum
 
-from agent_stonks import apple_models, apple_trader, clock
+from agent_stonks import apple_models, apple_trader, clock, codenames
 from agent_stonks.agent import MOMENTUM_SYSTEM_PROMPT
 from agent_stonks.apple_trader import (
     APPLE_TRADER_KEY,
@@ -1382,7 +1382,9 @@ class TestDayRangeEngine:
         assert result.error is None
         assert bool([d for d in result.decisions if d["status"] == "filled"]) == trades
         line = next(e["text"] for e in result.agent_log if e["text"].startswith("Candidates at 09:34"))
-        assert ("Left out: AAPL · Day Range — bearish briefing, high confidence" in line) == (not trades)
+        assert (
+            f"Left out: AAPL · {codenames.DAYRANGE} — bearish briefing, high confidence" in line
+        ) == (not trades)
         assert ",brief=gemini/m)" in result.config_summary["model"]
         assert len(list((tmp_path / "briefings").rglob("*.json"))) == 1
 
@@ -2111,7 +2113,11 @@ class TestMLModelLabels:
     in `apple_models` moves its row without touching stored runs."""
 
     def test_a_model_key_becomes_its_registry_name(self):
-        assert sim_app._ml_model_label("dayrange") == "Day-range forecast"
+        assert sim_app._ml_model_label("dayrange") == codenames.DAYRANGE
+        # An Orchestra names every model it raced.
+        assert sim_app._ml_model_label("dayrange+highlow") == (
+            f"{codenames.DAYRANGE}+{codenames.HIGHLOW}"
+        )
         # A removed model is not in the registry any more, so a stored run on
         # it shows its key rather than borrowing a real model's name.
         assert sim_app._ml_model_label("nbeats") == "nbeats"

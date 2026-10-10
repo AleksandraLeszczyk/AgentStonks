@@ -1,71 +1,118 @@
 """The live session's two news feeds -- Alpaca and Yahoo Finance -- and how
 they are combined into one list (`agent_stonks.news`)."""
-import yfinance
+import pytest
 
 from agent_stonks import news
 
 
-def _yahoo_item(uid, title, pub, provider="Reuters", **content):
+def _yahoo_item(uid, title, published, publisher="Reuters", **fields):
+    """One article of Yahoo's search answer."""
     return {
-        "id": uid,
-        "content": {
-            "id": uid,
-            "contentType": "STORY",
-            "title": title,
-            "summary": f"{title} summary",
-            "pubDate": pub,
-            "provider": {"displayName": provider},
-            "canonicalUrl": {"url": f"https://example.com/{uid}"},
-            **content,
-        },
+        "uuid": uid,
+        "title": title,
+        "publisher": publisher,
+        "link": f"https://example.com/{uid}",
+        "providerPublishTime": published,
+        "type": "STORY",
+        "relatedTickers": ["AAPL"],
+        **fields,
     }
 
 
-class _FakeTicker:
-    items: list = []
-    calls: list = []
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
 
-    def __init__(self, symbol):
-        self.symbol = symbol
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"{self.status} Client Error")
 
-    def get_news(self, count=10, tab="news"):
-        _FakeTicker.calls.append((self.symbol, count, tab))
-        return _FakeTicker.items
+    def json(self):
+        return self.payload
+
+
+@pytest.fixture
+def yahoo(monkeypatch):
+    """Answers `requests.get` with `yahoo.payload`, recording each call."""
+    class _Yahoo:
+        payload: dict = {"news": []}
+        status = 200
+        calls: list = []
+
+    def _get(url, params=None, **kwargs):
+        _Yahoo.calls.append((url, params))
+        return _FakeResponse(_Yahoo.payload, _Yahoo.status)
+
+    monkeypatch.setattr(news.requests, "get", _get)
+    return _Yahoo
 
 
 class TestFetchYfinanceNews:
-    def test_maps_yahoo_items_to_the_alpaca_article_shape(self, monkeypatch):
-        _FakeTicker.items = [_yahoo_item("u1", "Apple rallies", "2026-10-01T14:23:58Z")]
-        _FakeTicker.calls = []
-        monkeypatch.setattr(yfinance, "Ticker", _FakeTicker)
+    def test_maps_yahoo_items_to_the_alpaca_article_shape(self, yahoo):
+        # 1790864638 = 2026-10-01T14:23:58Z
+        yahoo.payload = {"news": [_yahoo_item("u1", "Apple rallies", 1790864638)]}
 
         articles = news.fetch_yfinance_news("AAPL", count=5)
 
         assert articles == [{
             "id": "yf-u1",
             "headline": "Apple rallies",
-            "summary": "Apple rallies summary",
+            "summary": "",
             "created_at": "2026-10-01T14:23:58Z",
             "url": "https://example.com/u1",
             "source": "Reuters",
             "feed": "yfinance",
         }]
-        assert _FakeTicker.calls == [("AAPL", 5, "news")]
+        [(url, params)] = yahoo.calls
+        assert url == news.YF_SEARCH_URL
+        assert params["q"] == "AAPL" and params["newsCount"] == 5
 
-    def test_skips_items_without_a_title_or_time_and_falls_back_on_url(self, monkeypatch):
-        no_title = _yahoo_item("u1", "", "2026-10-01T14:00:00Z")
-        no_time = _yahoo_item("u2", "Headline", None)
-        click_through = _yahoo_item(
-            "u3", "Kept", "2026-10-01T14:00:00Z",
-            canonicalUrl=None, clickThroughUrl={"url": "https://click/u3"},
-        )
-        _FakeTicker.items = [no_title, no_time, click_through]
-        monkeypatch.setattr(yfinance, "Ticker", _FakeTicker)
+    def test_skips_items_without_a_title_time_or_id(self, yahoo):
+        yahoo.payload = {"news": [
+            _yahoo_item("u1", "", 1790864638),
+            _yahoo_item("u2", "Headline", None),
+            _yahoo_item(None, "Headline", 1790864638),
+            _yahoo_item("u4", "Kept", 1790864638),
+        ]}
 
-        articles = news.fetch_yfinance_news("AAPL")
+        assert [a["id"] for a in news.fetch_yfinance_news("AAPL")] == ["yf-u4"]
 
-        assert [a["id"] for a in articles] == ["yf-u3"]
-        assert articles[0]["url"] == "https://click/u3"
+    def test_leaves_out_articles_tagged_with_other_tickers_only(self, yahoo):
+        yahoo.payload = {"news": [
+            _yahoo_item("u1", "About Apple", 1790864638, relatedTickers=["MSFT", "AAPL"]),
+            _yahoo_item("u2", "About Netflix", 1790864638, relatedTickers=["NFLX"]),
+            _yahoo_item("u3", "Untagged", 1790864638, relatedTickers=None),
+        ]}
+
+        assert [a["id"] for a in news.fetch_yfinance_news("AAPL")] == ["yf-u1", "yf-u3"]
+
+    def test_asks_for_the_symbol_as_yahoo_writes_it(self, yahoo):
+        yahoo.payload = {"news": [
+            _yahoo_item("u1", "Berkshire", 1790864638, relatedTickers=["BRK-B"]),
+        ]}
+
+        assert len(news.fetch_yfinance_news("BRK.B")) == 1
+        assert yahoo.calls[-1][1]["q"] == "BRK-B"
+
+    def test_an_http_error_raises(self, yahoo):
+        """yfinance's get_news turned its endpoint's 404 into an empty list,
+        and the feed went quiet for a week with nothing in the log."""
+        yahoo.status = 404
+
+        with pytest.raises(RuntimeError, match="404"):
+            news.fetch_yfinance_news("AAPL")
+
+    def test_an_answer_without_a_news_list_raises(self, yahoo):
+        yahoo.payload = {"quotes": []}
+
+        with pytest.raises(ValueError):
+            news.fetch_yfinance_news("AAPL")
+
+    def test_an_empty_news_list_is_a_quiet_day(self, yahoo):
+        yahoo.payload = {"news": []}
+
+        assert news.fetch_yfinance_news("AAPL") == []
 
 
 class TestMergeNews:

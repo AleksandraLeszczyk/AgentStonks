@@ -39,8 +39,8 @@ import pandas as pd
 from . import agent as agent_mod
 from . import state as state_mod
 from . import (
-    apple_models, bar_history, clock, event_days, historical, intraday_vol_model, market_hours,
-    momentum_regime, rule_agent,
+    apple_models, bar_history, clock, codenames, event_days, historical, intraday_vol_model,
+    market_hours, momentum_regime, rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -527,14 +527,14 @@ class AppleTraderConfig:
             setattr(self, name, float(getattr(self, name)))
             if getattr(self, name) < 0:
                 raise ValueError(
-                    f"{name} {getattr(self, name)!r} is a distance below HighLow_3m's "
+                    f"{name} {getattr(self, name)!r} is a distance below {codenames.HIGHLOW3M}'s "
                     "predicted high and cannot be negative"
                 )
         if self.sell_3m_k >= self.buy_3m_k:
             raise ValueError(
-                f"sell_3m_k {self.sell_3m_k!r} must sit above the HighLow_3m buy level, "
+                f"sell_3m_k {self.sell_3m_k!r} must sit above the {codenames.HIGHLOW3M} buy level, "
                 f"i.e. strictly below buy_3m_k {self.buy_3m_k!r} — both are distances "
-                "*below* HighLow_3m's predicted high, so the smaller number is the higher "
+                f"*below* {codenames.HIGHLOW3M}'s predicted high, so the smaller number is the higher "
                 "price"
             )
 
@@ -968,11 +968,11 @@ def early_window_error(config: AppleTraderConfig) -> "str | None":
         return (
             f"'Use {model.label}' trades the minutes between its 9:33 forecast and a "
             f"9:35 one, and this run is on {model.label} itself, which forecasts at "
-            "9:33. Switch it off, or run HighLow."
+            f"9:33. Switch it off, or run {codenames.HIGHLOW}."
         )
     if not model.covers(config.ticker):
         return (
-            f"'Use {model.label}' needs HighLow_3m's forecast, which was fitted on "
+            f"'Use {model.label}' needs {model.label}'s forecast, which was fitted on "
             f"{', '.join(model.tickers)} only, so it cannot be used on {config.ticker}. "
             "Switch it off, or pick another instrument."
         )
@@ -999,16 +999,16 @@ def level_source_error(config: AppleTraderConfig) -> "str | None":
     label = LEVEL_SOURCE_LABELS[LEVELS_INTRADAY]
     if not intraday_vol_model.covers(config.ticker):
         return (
-            f"'{label}' reads IntradayVolatility's time-of-day shape, which was fitted on "
+            f"'{label}' reads {codenames.INTRADAY_VOL}'s time-of-day shape, which was fitted on "
             f"{', '.join(intraday_vol_model.TICKERS)} only, so it cannot be used on "
-            f"{config.ticker}. Run the flat day-range model, or pick another instrument."
+            f"{config.ticker}. Run {codenames.DAYRANGE} alone, or pick another instrument."
         )
     if intraday_vol_model.load(config.ticker) is None:
         return (
-            f"'{label}' needs the IntradayVolatility export for {config.ticker} at "
+            f"'{label}' needs the {codenames.INTRADAY_VOL} export for {config.ticker} at "
             f"{intraday_vol_model.model_path(config.ticker)}, which is missing or "
             "unreadable. Write it with FinNotebooks/IntradayVolatility/scripts/"
-            "export_app_model.py, or run the flat day-range model."
+            f"export_app_model.py, or run {codenames.DAYRANGE} alone."
         )
     return None
 
@@ -1908,7 +1908,7 @@ class DayRangeTrader(BaseTrader):
         threading.Thread(target=clock.inherit(work), name=f"highlow3m-warm-{ticker}", daemon=True).start()
         _log(state, {"type": "status", "text": (
             f"Fetching {ticker}'s minute history and last night's option tables in the "
-            "background for the 9:33 HighLow_3m forecast."
+            f"background for the 9:33 {codenames.HIGHLOW3M} forecast."
         )})
 
     # --- HighLow_3m's early window (`use_3m`) -------------------------------
@@ -2059,9 +2059,9 @@ class DayRangeTrader(BaseTrader):
         early, config = self.early, self.config
         run_on = apple_models.get(config.model_key).label
         reasoning = (
-            f"HighLow_3m window: the bar traded down to ${float(bar['low']):,.2f}, at or "
+            f"{codenames.HIGHLOW3M} window: the bar traded down to ${float(bar['low']):,.2f}, at or "
             f"through the ${early['buy_level']:,.2f} buy level — {config.buy_3m_k:g} × the "
-            f"{config.unit_phrase} (${early['level_unit']:,.2f}) below HighLow_3m's 9:33 "
+            f"{config.unit_phrase} (${early['level_unit']:,.2f}) below {codenames.HIGHLOW3M}'s 9:33 "
             f"predicted high of ${early['reference']:,.2f}. Buying before {run_on}'s "
             f"9:{30 + int(early['until']):02d} forecast; until then the only exit is a "
             f"resting sell at ${early['sell_level']:,.2f} — no stop, no momentum "
@@ -2073,7 +2073,7 @@ class DayRangeTrader(BaseTrader):
             limit_price=float(early["buy_level"]) if config.limit_entry else None,
         )
         if not bought:
-            self._note_limit_miss(state, "HighLow_3m buy level")
+            self._note_limit_miss(state, f"{codenames.HIGHLOW3M} buy level")
             return False
         self.entry.update({
             "ts": bar.name, "early": True, "fills": 1,
@@ -2093,9 +2093,9 @@ class DayRangeTrader(BaseTrader):
         price = float(bar["close"])
         pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
         reasoning = (
-            f"Target (HighLow_3m window): the bar traded up to ${float(bar['high']):,.2f}, at "
+            f"Target ({codenames.HIGHLOW3M} window): the bar traded up to ${float(bar['high']):,.2f}, at "
             f"or through the ${early['sell_level']:,.2f} sell level ({config.sell_3m_k:g} × "
-            f"{config.unit_phrase} under HighLow_3m's ${early['reference']:,.2f} predicted "
+            f"{config.unit_phrase} under {codenames.HIGHLOW3M}'s ${early['reference']:,.2f} predicted "
             f"high). Selling at market ({pnl_pct:+.2f}%)."
         )
         decision = self.sell(
@@ -2143,7 +2143,7 @@ class DayRangeTrader(BaseTrader):
             exits.append("the momentum take")
         _log(state, {"type": "analysis", "text": (
             f"{self.ticker}: the {position:g} sh bought at "
-            f"{pd.Timestamp(entry['ts']):%H:%M} in HighLow_3m's window are now managed by "
+            f"{pd.Timestamp(entry['ts']):%H:%M} in {codenames.HIGHLOW3M}'s window are now managed by "
             f"{apple_models.get(config.model_key).label}'s forecast: "
             f"{', '.join(exits)} and the closing flatten, as for any position."
         )})
@@ -2170,7 +2170,7 @@ class DayRangeTrader(BaseTrader):
         self.sell(
             state, tracker, position,
             (
-                "The position bought in HighLow_3m's window was waiting for the 9:35 "
+                f"The position bought in {codenames.HIGHLOW3M}'s window was waiting for the 9:35 "
                 f"forecast to manage it, and there is none today ({why}). Without its "
                 f"levels or a stop it is not held: sold at market ({pnl_pct:+.2f}%)."
             ),
@@ -2220,7 +2220,7 @@ class DayRangeTrader(BaseTrader):
         price = float(bar["close"])
         parts = [
             f"{self.ticker} {ts:%H:%M} ${price:,.2f}",
-            f"HighLow_3m buy ${early['buy_level']:,.2f} ({price - early['buy_level']:+.2f})",
+            f"{codenames.HIGHLOW3M} buy ${early['buy_level']:,.2f} ({price - early['buy_level']:+.2f})",
             f"sell ${early['sell_level']:,.2f} ({price - early['sell_level']:+.2f})",
         ]
         if position > 0 and self.entry:
@@ -2253,7 +2253,7 @@ class DayRangeTrader(BaseTrader):
                 {
                     "type": "error",
                     "text": (
-                        f"The IntradayVolatility shape for {self.ticker} could not be "
+                        f"The {codenames.INTRADAY_VOL} shape for {self.ticker} could not be "
                         "loaded, so today's levels rest on the flat predicted high "
                         "instead of following the time of day."
                     ),
@@ -3702,7 +3702,7 @@ class DayRangeTrader(BaseTrader):
         if self.config.level_source == LEVELS_INTRADAY:
             rests = (
                 f"The levels rest under the intraday range's upper curve — that forecast "
-                f"stretched by IntradayVolatility's time-of-day shape around the "
+                f"stretched by {codenames.INTRADAY_VOL}'s time-of-day shape around the "
                 f"${plan['open_price']:,.2f} open — so they follow the clock: "
                 f"${plan['reference']:,.2f} now, pulling in towards the open through the "
                 "morning and widening again into the close."
@@ -3963,7 +3963,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         "the predicted high"
         if config.level_source != LEVELS_INTRADAY
         else (
-            "the upper curve of that range stretched by IntradayVolatility's time-of-day "
+            f"the upper curve of that range stretched by {codenames.INTRADAY_VOL}'s time-of-day "
             "shape, so both levels move with the clock"
         )
     )
@@ -3977,7 +3977,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         else f"today's {config.ticker} high and low"
     )
     early = (
-        f" Before that, from 9:33 it trades HighLow_3m's 9:33 forecast of the rest of the "
+        f" Before that, from 9:33 it trades {codenames.HIGHLOW3M}'s 9:33 forecast of the rest of the "
         f"session: a buy {config.buy_3m_k:g} × and a sell {config.sell_3m_k:g} × the "
         f"{config.unit_phrase} below its predicted high, with no stop, no momentum "
         f"confirmation and no take; a position still open at 9:{made:02d} is handed to "

@@ -79,10 +79,12 @@ trades.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import codenames
 from .config import APPLE_TRADER_MODEL, LEVELS_DAYRANGE, LEVELS_INTRADAY
 
 
@@ -226,15 +228,15 @@ def _dayrange_intraday_unavailable(ticker: str = DEFAULT_TICKER) -> str:
     symbol = (ticker or DEFAULT_TICKER).upper()
     if _load_dayrange(symbol) is None:
         return (
-            f"No day-range bundle at {_dayrange_path(symbol)} (or PyTorch, LightGBM, "
+            f"No {codenames.DAYRANGE} bundle at {_dayrange_path(symbol)} (or PyTorch, LightGBM, "
             "scikit-learn and joblib are not installed). This model reads that "
             "forecast before it reads the intraday shape."
         )
     return (
-        f"The day-range bundle for {symbol} loaded, but the IntradayVolatility export "
+        f"The {codenames.DAYRANGE} bundle for {symbol} loaded, but the {codenames.INTRADAY_VOL} export "
         f"at {_intraday_path(symbol)} is missing or unreadable — write it with "
-        "FinNotebooks/IntradayVolatility/scripts/export_app_model.py, or run the "
-        "flat day-range model instead."
+        "FinNotebooks/IntradayVolatility/scripts/export_app_model.py, or run "
+        f"{codenames.DAYRANGE} alone instead."
     )
 
 
@@ -306,7 +308,7 @@ DAYRANGE_INTRADAY_TICKERS = tuple(
 MODELS: "dict[str, AppleModel]" = {
     DAYRANGE_KEY: AppleModel(
         key=DAYRANGE_KEY,
-        label="Day-range forecast (TimeToChange3)",
+        label=codenames.DAYRANGE,
         summary=(
             "Forecasts where the whole session's high and low will land, once, at 9:35 "
             "— an equal blend of LightGBM, N-BEATS and N-HiTS over a year of daily "
@@ -324,9 +326,9 @@ MODELS: "dict[str, AppleModel]" = {
     ),
     DAYRANGE_INTRADAY_KEY: AppleModel(
         key=DAYRANGE_INTRADAY_KEY,
-        label="Day Range × Intraday Volatility",
+        label=codenames.DAYRANGE_INTRADAY,
         summary=(
-            "The same 9:35 day-range forecast, read through IntradayVolatility's "
+            f"{codenames.DAYRANGE}'s 9:35 forecast, read through {codenames.INTRADAY_VOL}'s "
             "time-of-day shape instead of flat. The predicted high and low are "
             "stretched by a curve that peaks at the open, decays to a flat midday and "
             "opens back up into the close, and the levels are measured below that "
@@ -338,7 +340,7 @@ MODELS: "dict[str, AppleModel]" = {
         ),
         requires=(
             "PyTorch, LightGBM, scikit-learn and joblib, plus both .pt checkpoints "
-            "and the IntradayVolatility export"
+            f"and the {codenames.INTRADAY_VOL} export"
         ),
         strategy=STRATEGY_DAYRANGE,
         # Both files have to exist, so this is the intersection rather than
@@ -352,9 +354,9 @@ MODELS: "dict[str, AppleModel]" = {
     ),
     HIGHLOW_KEY: AppleModel(
         key=HIGHLOW_KEY,
-        label="HighLow model",
+        label=codenames.HIGHLOW,
         summary=(
-            "FinNotebooks' HighLow_5m forecast of where the session's high and low "
+            f"{codenames.HIGHLOW}'s forecast of where the session's high and low "
             "will land, made once at 9:35 -- measured from the 9:35 price in units "
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL and AVGO: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + "
@@ -364,8 +366,8 @@ MODELS: "dict[str, AppleModel]" = {
             "VST's opening move, its lead AI-power peer; NVDA's with SPY's opening, the "
             "pre-market to 9:19 and the previous evening's after-hours). On the "
             "129-session test window its error is 35% below "
-            "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
-            "INTC; MU, BE and AVGO have no TimeToChange3 bundle, and beat that approach "
+            f"{codenames.DAYRANGE}'s on AAPL ($1.37 per extreme against $2.11) and 31% below on "
+            f"INTC; MU, BE and AVGO have no {codenames.DAYRANGE} bundle, and beat that approach "
             "retrained on them by 25%, 33% and 34%. "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
@@ -384,10 +386,10 @@ MODELS: "dict[str, AppleModel]" = {
     ),
     HIGHLOW2_KEY: AppleModel(
         key=HIGHLOW2_KEY,
-        label="HighLow2 model",
+        label=codenames.HIGHLOW2,
         summary=(
-            "FinNotebooks' HighLow2_5m forecast of where the session's high and low "
-            "will land, made once at 9:35 and measured like HighLow's -- from the 9:35 "
+            f"{codenames.HIGHLOW2}'s forecast of where the session's high and low "
+            f"will land, made once at 9:35 and measured like {codenames.HIGHLOW}'s -- from the 9:35 "
             "price in 14-day average ranges -- under stricter rules: everything about "
             "this morning (the first five minutes, the open, the opening volume) read "
             "from IEX, the only live tape at 9:35 on a basic plan; the pre-market as an "
@@ -396,7 +398,7 @@ MODELS: "dict[str, AppleModel]" = {
             "training; and similar stocks pooled in as training rows (five mega-caps for "
             "AAPL, those plus AAPL and four chip stocks for INTC). LightGBM alone, three "
             "seeds. On AAPL's 9-session test window it misses each extreme by $1.17 "
-            "(15.8% of the 14-day range), level with HighLow and slightly ahead. INTC's "
+            f"(15.8% of the 14-day range), level with {codenames.HIGHLOW} and slightly ahead. INTC's "
             "bundle also forecasts the high and low still to come from 9:35 to the close "
             "(on about a quarter of INTC's sessions one of the day's extremes is already "
             "in by then), and on INTC that is the pair the levels are built on: the "
@@ -415,9 +417,9 @@ MODELS: "dict[str, AppleModel]" = {
     ),
     HIGHLOW3M_KEY: AppleModel(
         key=HIGHLOW3M_KEY,
-        label="HighLow_3m model",
+        label=codenames.HIGHLOW3M,
         summary=(
-            "FinNotebooks' HighLow_3m forecast of how high and how low the price will "
+            f"{codenames.HIGHLOW3M}'s forecast of how high and how low the price will "
             "trade from 9:33 to the close -- the part of the day a 9:33 order can still "
             "reach, not the whole session's extremes (on about half of AAPL's sessions "
             "one of those prints in the first three minutes). Called once at 9:33 from "
@@ -523,6 +525,26 @@ def unavailable_reason(key: "str | None", ticker: "str | None" = None) -> str:
         f"No {model.label} model at {model.path(symbol)} "
         f"(or {model.requires} are not installed)."
     )
+
+
+# A model key where a run signature names it: `highlow_MU(buy=...)` for an Apple
+# Trader run, `orchestra[dayrange_AAPL@0.4/0.25R,...]` for an Orchestra. The
+# lookahead is the ticker, so `dayrange` never matches inside
+# `dayrange_intraday_AAPL`.
+_SIGNATURE_KEY = re.compile(
+    r"\b(" + "|".join(sorted(map(re.escape, MODELS), key=len, reverse=True)) + r")_(?=[A-Z])"
+)
+
+
+def display_signature(text: "str | None") -> str:
+    """A stored run signature as the screen shows it, each model key swapped for
+    the model's label: `highlow_MU(buy=...)` reads `Orion · MU(buy=...)`.
+
+    Display only. A signature is a record's identity, matched character for
+    character, so what is stored -- and what filters and lookups compare --
+    keeps the key.
+    """
+    return _SIGNATURE_KEY.sub(lambda m: f"{MODELS[m.group(1)].label} · ", text or "")
 
 
 def strategy(key: "str | None") -> str:

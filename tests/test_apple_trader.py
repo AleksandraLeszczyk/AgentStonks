@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 import pandas as pd
 import pytest
 
-from agent_stonks import apple_models, intraday_vol_model
+from agent_stonks import apple_models, codenames, intraday_vol_model
 from agent_stonks import apple_trader as at
 from agent_stonks import clock
 from agent_stonks import rule_agent
@@ -1189,14 +1189,14 @@ class TestDayRangeIntradayModel:
         )
         assert apple_models.load(self.KEY, TICKER) is None
         why = apple_models.unavailable_reason(self.KEY, TICKER)
-        assert "IntradayVolatility" in why and "missing" in why
+        assert codenames.INTRADAY_VOL in why and "missing" in why
 
     def test_a_missing_day_range_bundle_says_so_instead(self, monkeypatch):
         monkeypatch.setattr(
             apple_models, "_load_dayrange", lambda ticker=TICKER: None
         )
         why = apple_models.unavailable_reason(self.KEY, TICKER)
-        assert "day-range bundle" in why
+        assert f"{codenames.DAYRANGE} bundle" in why
 
     def test_both_models_drive_the_same_rule_set(self):
         assert (
@@ -1286,7 +1286,7 @@ class TestHighLowModel:
 
     def test_it_is_refused_on_a_symbol_it_was_not_fitted_on(self):
         config = AppleTraderConfig(ticker="GOOGL", model_key=self.KEY)
-        assert "HighLow" in at.model_ticker_error(config)
+        assert apple_models.get(self.KEY).label in at.model_ticker_error(config)
 
     def test_it_signs_its_own_row_in_results(self):
         sig = config_signature(AppleTraderConfig(model_key=self.KEY))
@@ -1725,7 +1725,7 @@ class TestIntradayLevelSource:
         assert trader.plan["reference"] == FORECAST["pred_high"]
         assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
         assert any(
-            "IntradayVolatility shape" in e.get("text", "")
+            f"{codenames.INTRADAY_VOL} shape" in e.get("text", "")
             for e in state.agent_log if e.get("type") == "error"
         )
 
@@ -1751,7 +1751,7 @@ class TestIntradayLevelSourceAvailability:
         monkeypatch.setattr(at.apple_models, "covers", lambda *a, **k: True)
         config = dayrange_config(ticker="MSFT", level_source="intraday")
         error = at.config_error(config)
-        assert error is not None and "MSFT" in error and "IntradayVolatility" in error
+        assert error is not None and "MSFT" in error and codenames.INTRADAY_VOL in error
 
     def test_a_missing_export_is_refused_with_the_path_it_looked_for(self, monkeypatch):
         monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
@@ -3035,6 +3035,38 @@ class TestInstrument:
             ), 60, threading.Event(),
         )
         assert asked == [("dayrange", NON_AAPL)]
+
+
+class TestDisplaySignature:
+    """A run signature is shown with each model's codename in place of its key,
+    and the stored string -- a record's identity -- is left alone."""
+
+    def test_an_apple_trader_signature_reads_the_codename(self):
+        assert apple_models.display_signature("highlow3m_AAPL(buy=H-0.4R,size=95%)") == (
+            f"{codenames.HIGHLOW3M} · AAPL(buy=H-0.4R,size=95%)"
+        )
+
+    def test_a_key_is_not_matched_inside_a_longer_one(self):
+        assert apple_models.display_signature("dayrange_intraday_AAPL(buy=H-0.4A)") == (
+            f"{codenames.DAYRANGE_INTRADAY} · AAPL(buy=H-0.4A)"
+        )
+        assert apple_models.display_signature("highlow2_INTC(buy=H-0.6R)").startswith(
+            f"{codenames.HIGHLOW2} · INTC("
+        )
+
+    def test_every_pair_of_an_orchestra_is_renamed(self):
+        shown = apple_models.display_signature(
+            "orchestra[dayrange_AAPL@0.4/0.25R,highlow_MU@0.55/0.35R](size=95%)"
+        )
+        assert shown == (
+            f"orchestra[{codenames.DAYRANGE} · AAPL@0.4/0.25R,"
+            f"{codenames.HIGHLOW} · MU@0.55/0.35R](size=95%)"
+        )
+
+    def test_anything_else_is_shown_as_it_is(self):
+        assert apple_models.display_signature("nbeats_AAPL(anticipate)") == "nbeats_AAPL(anticipate)"
+        assert apple_models.display_signature("openai/gpt-5") == "openai/gpt-5"
+        assert apple_models.display_signature(None) == ""
 
 
 class TestStopOutEndsTheRun:
@@ -4652,7 +4684,7 @@ class TestHighLow3mWindow:
         assert trader.entry["early"] and trader.entry["price"] == pytest.approx(self.FILL)
         assert trader._stop_price() is None
         reasoning = tracker.snapshot()["decisions"][-1].reasoning
-        assert "HighLow_3m window" in reasoning and "$102.00" in reasoning
+        assert f"{codenames.HIGHLOW3M} window" in reasoning and "$102.00" in reasoning
 
     def test_a_position_open_at_935_is_handed_to_the_935_rules(
         self, state, market_open, monkeypatch
@@ -4816,7 +4848,7 @@ class TestHighLow3mWindowConfig:
     def test_the_armed_line_says_so(self):
         config = dayrange_config(use_3m=True)
         line = at._armed_summary(config, apple_models.get("dayrange"), DAYRANGE_BUNDLE)
-        assert "from 9:33 it trades HighLow_3m's 9:33 forecast" in line
+        assert f"from 9:33 it trades {codenames.HIGHLOW3M}'s 9:33 forecast" in line
         assert "9:33" not in at._armed_summary(
             dayrange_config(), apple_models.get("dayrange"), DAYRANGE_BUNDLE
         )

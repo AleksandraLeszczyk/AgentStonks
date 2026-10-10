@@ -20,6 +20,7 @@ from . import (
     candidates,
     candle_patterns,
     clock,
+    codenames,
     last_setup,
     market_hours,
     model_overlays,
@@ -1178,7 +1179,7 @@ def _live_chart_controls() -> None:
             "volume-at-price profile. Both can be drawn at once; **Components** "
             "sets how many.\n"
             "- **ML predicted profile** — where today's volume is predicted to "
-            "trade (LevelsML density model: per-quantile LightGBM at the open, "
+            f"trade ({codenames.OPEN_PROFILE} density model: per-quantile LightGBM at the open, "
             "from daily-bar features). Needs the trained pack in ../Models and "
             "daily bars.\n"
             "- **Fibonacci levels** — retracement lines across the session's "
@@ -1432,10 +1433,11 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     st.markdown("**Model Predictions**")
     with _help_row(
         "Draws what the trained models predict for this session:\n"
-        "- **TimeToChange3**, **HighLow**, **HighLow2**, **LevelsML** — price ranges: "
+        f"- **{codenames.DAYRANGE}**, **{codenames.HIGHLOW}**, **{codenames.HIGHLOW2}**, "
+        f"**{codenames.OPEN_PROFILE}** — price ranges: "
         "horizontal lines, in the candles and in the profile beside them. "
-        "**HighLow_3m**'s is the range *after 9:33*, not the day's.\n"
-        "- **IntradayVolatility** (alone or × TimeToChange3) — time-of-day "
+        f"**{codenames.HIGHLOW3M}**'s is the range *after 9:33*, not the day's.\n"
+        f"- **{codenames.INTRADAY_VOL}** (alone or × {codenames.DAYRANGE}) — time-of-day "
         "ranges: a shaded envelope, widest at the open and narrowing through "
         "midday.\n"
         "- **Apple Trader** — buy/sell levels, not a forecast: the two orders "
@@ -1549,7 +1551,7 @@ def _news_analysis_controls(symbols: list[str]) -> None:
         format_func=newsimpact_model.IMPACT_METHODS.get,
         key="news_impact_method_select",
         help=(
-            "The news-impact model reads the price's momentum over the 15 minutes before an "
+            f"{codenames.NEWS_IMPACT} reads the price's momentum over the 15 minutes before an "
             "intraday release and estimates the momentum state over the 15 minutes after it; "
             "it does not read the article's text. Releases outside regular hours (or in the "
             "first 15 minutes) stay unknown. It is used for symbols that have their own model "
@@ -1569,7 +1571,7 @@ def _news_analysis_controls(symbols: list[str]) -> None:
         st.caption(caption)
         for sym_state in model_states:
             if sym_state.news_impact_error:
-                st.caption(f"⚠️ News-impact model for {sym_state.symbol}: {sym_state.news_impact_error}")
+                st.caption(f"⚠️ {codenames.NEWS_IMPACT} for {sym_state.symbol}: {sym_state.news_impact_error}")
 
     provider = state.news_llm_provider
     llm_key = ""
@@ -2589,17 +2591,17 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "dayrange_skip": (
             "Sessions the agent does not trade at all: no forecast, no order. The forecast "
             "is built for an ordinary day, and on these the news sets the range — "
-            "HighLow2 was fitted with most of them left out."
+            f"{codenames.HIGHLOW2} was fitted with most of them left out."
         ),
         "dayrange_3m": (
-            "HighLow forecasts at 9:35. HighLow_3m forecasts the rest of the session two "
+            f"{codenames.HIGHLOW} forecasts at 9:35. {codenames.HIGHLOW3M} forecasts the rest of the session two "
             "minutes earlier, at 9:33, so the **09:33 and 09:34 bars** can be traded on "
-            "its levels before HighLow's exist.\n\n"
-            "- **Buy / sell** — rest under HighLow_3m's own predicted high, in the same "
+            f"its levels before {codenames.HIGHLOW}'s exist.\n\n"
+            f"- **Buy / sell** — rest under {codenames.HIGHLOW3M}'s own predicted high, in the same "
             "unit as the levels above (under *Predicted Range*, its own predicted range).\n"
             "- **No stop, no momentum confirmation, no take** — two bars is too short for "
             "any of them.\n"
-            "- **At 9:35** a position still open is handed to HighLow: its sell level, a "
+            f"- **At 9:35** a position still open is handed to {codenames.HIGHLOW}: its sell level, a "
             "stop under the actual fill, the momentum take, the ladder and the flatten "
             "manage it as if it had been bought then.\n"
             "- A trade the window closes does not trip the circuit breaker."
@@ -2617,34 +2619,35 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "The notebook's rule, and what the buy and sell distances were swept against."
         ),
         "use_3m": (
-            "Trade the two minutes before HighLow's 9:35 forecast on HighLow_3m's 9:33 "
+            f"Trade the two minutes before {codenames.HIGHLOW}'s 9:35 forecast on {codenames.HIGHLOW3M}'s 9:33 "
             "one.\n\n"
-            "- A bar whose low reaches the HighLow_3m buy level buys (a limit at the "
+            f"- A bar whose low reaches the {codenames.HIGHLOW3M} buy level buys (a limit at the "
             "level); a bar whose high reaches its sell level sells everything.\n"
-            "- No stop, no momentum confirmation, no take until 9:35; then HighLow's "
+            f"- No stop, no momentum confirmation, no take until 9:35; then {codenames.HIGHLOW}'s "
             "rules take over the position.\n"
-            "- Needs HighLow_3m's model and caches (`data/highlow3m/`); with the agent "
+            f"- Needs {codenames.HIGHLOW3M}'s model and caches (`data/highlow3m/`); with the agent "
             "running before 9:33 they are fetched in the background.\n"
             "- Off: nothing is bought before 9:35, as before."
         ),
         "buy_3m_k": (
-            "Where the window's buy rests below HighLow_3m's predicted high.\n\n"
-            "- Starts at **{buy_3m_k}** on {ticker}: the pair a HighLow_3m run starts "
+            f"Where the window's buy rests below {codenames.HIGHLOW3M}'s predicted high.\n\n"
+            "- Starts at **{buy_3m_k}** on {ticker}: the pair a "
+            f"{codenames.HIGHLOW3M} run starts "
             "from. Never swept for this window — measure it on SimLab's Tuning tab."
         ),
         "sell_3m_k": (
             "Where the window's sell rests below the same high — the smaller number, "
             "the higher price.\n\n"
             "- Starts at **{sell_3m_k}** on {ticker}.\n"
-            "- Only two bars to reach it: a position that does not is handed to HighLow "
+            f"- Only two bars to reach it: a position that does not is handed to {codenames.HIGHLOW} "
             "at 9:35 rather than sold."
         ),
         "model_highlow": (
-            "The day-range rules, unchanged, on HighLow's predicted high and predicted "
-            "range instead of TimeToChange3's.\n\n"
+            f"The day-range rules, unchanged, on {codenames.HIGHLOW}'s predicted high and predicted "
+            f"range instead of {codenames.DAYRANGE}'s.\n\n"
             "- Its range is usually **narrower** (it anchors on the 9:35 price), so "
             "distances counted in the predicted range sit closer together.\n"
-            "- The shipped buy/sell distances were swept on TimeToChange3's forecast, "
+            f"- The shipped buy/sell distances were swept on {codenames.DAYRANGE}'s forecast, "
             "not this one.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP minute history: the first "
             "run fetches it (tens of seconds) and caches it under `data/highlow/`."
@@ -2662,7 +2665,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "A briefing still being written at 9:35 is waited for up to 10 minutes."
         ),
         "model_highlow2": (
-            "The day-range rules, unchanged, on HighLow2's predicted high and predicted "
+            f"The day-range rules, unchanged, on {codenames.HIGHLOW2}'s predicted high and predicted "
             "range.\n\n"
             "- On **INTC** those are its forecast of the high and low **after 9:35** (the "
             "9:35 bar to the close), not the whole day's: the first five minutes' extremes "
@@ -2674,14 +2677,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- It was fitted **without shock days** (the day after earnings, jobs-report "
             "days): on those it forecasts an ordinary day's width.\n"
             "- No buy/sell distances were ever swept on it: it starts from the pair "
-            "TimeToChange3's notebook 05 swept for the instrument. Sweep them on "
+            f"{codenames.DAYRANGE}'s notebook 05 swept for the instrument. Sweep them on "
             "SimLab's Tuning tab.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP and IEX minute history, "
             "extended hours included: the first run fetches it (tens of seconds) and "
             "caches it under `data/highlow2/`."
         ),
         "model_highlow3m": (
-            "The day-range rules, unchanged, on HighLow_3m's predicted high and predicted "
+            f"The day-range rules, unchanged, on {codenames.HIGHLOW3M}'s predicted high and predicted "
             "range.\n\n"
             "- Its range is the one **after 9:33**, not the whole day's: forecast at 9:33 "
             "from IEX's first three minutes, so the first trade can come two minutes "
@@ -2690,7 +2693,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- It reads last night's **option positioning** (walls, dealer gamma, the "
             "implied move, put/call volume), rebuilt from Alpaca's daily option bars.\n"
             "- No buy/sell distances were ever swept on it: it starts from the pair "
-            "TimeToChange3's notebook 05 swept for the instrument. Sweep them on "
+            f"{codenames.DAYRANGE}'s notebook 05 swept for the instrument. Sweep them on "
             "SimLab's Tuning tab. (The notebook's own X/Y, 0.30/0.15, hang off the "
             "predicted *low* and do not transfer.)\n"
             "- Its caches live under `data/highlow3m/`. The first run fetches ~150 "
@@ -2910,8 +2913,8 @@ _ORCHESTRA_COPY = dc_replace(
     help={
         **_APPLE_TRADER_COPY.help,
         "pairs": (
-            "The (ticker, model) pairs Orchestra watches — AAPL on the day-range model "
-            "and AAPL on HighLow are two pairs. The defaults are the pairs SimLab's "
+            f"The (ticker, model) pairs Orchestra watches — AAPL on {codenames.DAYRANGE} "
+            f"and AAPL on {codenames.HIGHLOW} are two pairs. The defaults are the pairs SimLab's "
             "tuning has picked levels for. The order is the tie-break: when two buys "
             "would fill on the same bar, the pair listed first takes it. Every pair's "
             "ticker must be streamed."
@@ -3503,8 +3506,8 @@ def _agent_panel(
         if personality == ORCHESTRA_KEY:
             st.caption(
                 "🎼 Orchestra runs no LLM. It plays Apple Trader's rules on several "
-                "**(ticker, model) pairs** at once — AAPL on the day-range model and AAPL "
-                "on HighLow are two pairs. Each forecasts its own day at 9:35; the first "
+                f"**(ticker, model) pairs** at once — AAPL on {codenames.DAYRANGE} and AAPL "
+                f"on {codenames.HIGHLOW} are two pairs. Each forecasts its own day at 9:35; the first "
                 "whose buy fills is followed alone until its position is closed, then the "
                 "others may buy again. A stop-out stops the agent."
             )

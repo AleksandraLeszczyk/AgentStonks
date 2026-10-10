@@ -37,7 +37,9 @@ from . import scoring
 from . import stream_common
 from .datalog import log_fetch, log_fetch_failure
 from .historical import fetch_intraday_bars
-from .news import fetch_news_with_fallback, fetch_yfinance_news, merge_news, published_at
+from .news import (
+    YF_NEWS_SOURCE, fetch_news_with_fallback, fetch_yfinance_news, merge_news, published_at,
+)
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
 from .state import AppState, SymbolState
 from .stream_common import merge_missing_bars  # noqa: F401  (re-export)
@@ -723,13 +725,13 @@ def _yfinance_news_loop(
             except Exception as exc:
                 log_fetch_failure(
                     "news (Yahoo Finance)",
-                    [("yfinance", exc)],
+                    [(YF_NEWS_SOURCE, exc)],
                     symbol=symbol,
                     consequence="retrying next poll",
                 )
                 continue
             log_fetch(
-                "news (Yahoo Finance)", "yfinance", symbol=symbol,
+                "news (Yahoo Finance)", YF_NEWS_SOURCE, symbol=symbol,
                 detail=f"{len(fresh)} articles",
             )
             with state.lock:

@@ -82,7 +82,7 @@ from agent_stonks.config import (
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
 )
-from agent_stonks import minute_momentum
+from agent_stonks import codenames, minute_momentum
 from agent_stonks.market_hours import MARKET_TZ
 
 TUNING_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "tuning"
@@ -164,11 +164,11 @@ TUNABLES: "dict[str, Tunable]" = {
         # HighLow_3m's 9:33 window (`use_3m`): its own pair, under its own
         # predicted high. Only changes a trade with the window on.
         Tunable(
-            "buy_3m_k", "HighLow_3m buy distance (× unit below its H)", 0.05, 3.0, 0.05,
+            "buy_3m_k", f"{codenames.HIGHLOW3M} buy distance (× unit below its H)", 0.05, 3.0, 0.05,
             (0.10, 0.70, 0.10),
         ),
         Tunable(
-            "sell_3m_k", "HighLow_3m sell distance (× unit below its H)", 0.0, 3.0, 0.05,
+            "sell_3m_k", f"{codenames.HIGHLOW3M} sell distance (× unit below its H)", 0.0, 3.0, 0.05,
             (0.0, 0.50, 0.10),
         ),
         Tunable(

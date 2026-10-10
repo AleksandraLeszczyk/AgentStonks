@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from . import apple_models, event_days
+from . import apple_models, codenames, event_days
 from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for, stop_for
 
 if TYPE_CHECKING:
@@ -267,7 +267,7 @@ def early_params(
         apple_models.HIGHLOW3M_KEY, ticker
     ):
         return {}
-    section("HighLow_3m window (9:33–9:35)", copy.sections.get("dayrange_3m"))
+    section(f"{codenames.HIGHLOW3M} window (9:33–9:35)", copy.sections.get("dayrange_3m"))
     default_buy, default_sell = dayrange_levels(ticker, apple_models.HIGHLOW3M_KEY)
     same_pair = (
         seed is not None
@@ -279,21 +279,21 @@ def early_params(
     start_sell = float(seed.sell_3m_k) if same_pair else default_sell
     levels = dict(ticker=ticker, buy_3m_k=f"{default_buy:g}", sell_3m_k=f"{default_sell:g}")
     use_3m = st.checkbox(
-        "Use HighLow_3m",
+        f"Use {codenames.HIGHLOW3M}",
         value=start_on,
         key=copy.key(f"use_3m_{ticker}"),
         help=copy.help.get("use_3m", "").format(**levels) or None,
     )
     col_a, col_b = st.columns(2)
     buy_3m_k = col_a.number_input(
-        f"HighLow_3m buy distance (× {unit_label} below its H)",
+        f"{codenames.HIGHLOW3M} buy distance (× {unit_label} below its H)",
         min_value=0.05, max_value=3.0, value=start_buy, step=0.05, format="%.2f",
         key=copy.key(f"buy_3m_k_{ticker}"),
         disabled=not use_3m,
         help=copy.help.get("buy_3m_k", "").format(**levels) or None,
     )
     sell_3m_k = col_b.number_input(
-        f"HighLow_3m sell distance (× {unit_label} below its H)",
+        f"{codenames.HIGHLOW3M} sell distance (× {unit_label} below its H)",
         min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
         key=copy.key(f"sell_3m_k_{ticker}"),
         disabled=not use_3m,
@@ -304,7 +304,7 @@ def early_params(
     return {
         "use_3m": True,
         "buy_3m_k": float(buy_3m_k),
-        "sell_3m_k": repaired_sell(float(buy_3m_k), float(sell_3m_k), "HighLow_3m window"),
+        "sell_3m_k": repaired_sell(float(buy_3m_k), float(sell_3m_k), f"{codenames.HIGHLOW3M} window"),
     }
 
 

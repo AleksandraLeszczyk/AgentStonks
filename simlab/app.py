@@ -27,6 +27,7 @@ from agent_stonks import (
     apple_models,
     candle_patterns,
     clock,
+    codenames,
     minute_momentum,
     model_overlays,
 )
@@ -256,7 +257,7 @@ def _render_apple_rules() -> None:
             + ", ".join(apple_models.get(k).label for k in apple_models.keys_for(symbol))
             for symbol in apple_models.tickers()
         )
-        + ". TimeToChange3 was run per ticker."
+        + f". {codenames.DAYRANGE} was run per ticker."
     )
 
     st.markdown("##### The day-range rules — `dayrange`")
@@ -264,7 +265,7 @@ def _render_apple_rules() -> None:
         "One question, asked once. At **9:35** the model forecasts where the session's "
         "high **H** and low will land, from a year of daily history plus the first five "
         "minutes, and the rest of the day is two levels derived from it "
-        "(TimeToChange3 notebook 05), with **A** the trailing 14-day average daily range "
+        f"({codenames.DAYRANGE} notebook 05), with **A** the trailing 14-day average daily range "
         "in dollars:\n"
         "- **Buy** when a bar's low reaches `H − buy × A`, well under where the day is "
         "expected to top out.\n"
@@ -287,8 +288,8 @@ def _render_apple_rules() -> None:
         "there today. Note that the most a target exit can net is `(buy − sell) × A`, so a "
         "threshold at or above that stands the session down after every completed trade.\n"
         "- **H** need not be the predicted high. The *levels measured below* setting can "
-        "point the two distances at the upper curve of the **predicted intraday range × "
-        "day range** band instead — the same forecast stretched by IntradayVolatility's "
+        f"point the two distances at the upper curve of the **{codenames.DAYRANGE_INTRADAY}** "
+        f"band instead — the same forecast stretched by {codenames.INTRADAY_VOL}'s "
         "time-of-day shape around the session's open — so the reference is the predicted "
         "high at 09:30, a fifth of that distance by midday, and wider again into the "
         "close. The whole ladder moves with it, targets included. It needs that symbol's "
@@ -987,7 +988,7 @@ def _render_run(record: dict) -> None:
     if rule_based:
         st.caption(
             f":material/function: Rule-based run — {_agent_label(config.get('personality'))}, "
-            f"no LLM and no judge. Rules: `{config.get('model')}`"
+            f"no LLM and no judge. Rules: `{apple_models.display_signature(config.get('model'))}`"
         )
     # The tape is part of what produced these numbers: identical rules on
     # `yfinance`, `iex` and `sip` are different bars and can be different
@@ -1063,7 +1064,7 @@ def _experiment_label(exp: dict) -> str:
     personality = config.get("personality") or "?"
     agent = _agent_label(personality)
     return (
-        f"**{agent}** · {config.get('provider')}/{config.get('model')} · "
+        f"**{agent}** · {config.get('provider')}/{apple_models.display_signature(config.get('model'))} · "
         f"{exp.get('dataset')} · {len(config.get('days') or [])} day(s)"
     )
 
@@ -1077,7 +1078,7 @@ def _past_experiment_rows(past: list[dict]) -> list[dict]:
         rows.append({
             "queued": (exp.get("created_at") or "")[:16].replace("T", " "),
             "agent": _agent_label(personality),
-            "model": f"{config.get('provider')}/{config.get('model')}",
+            "model": f"{config.get('provider')}/{apple_models.display_signature(config.get('model'))}",
             "dataset": exp.get("dataset"),
             "days": len(config.get("days") or []),
             "status": exp.get("status"),
@@ -1200,7 +1201,7 @@ def _combo_label(combo: tuple[str, str, str, str]) -> str:
     personality, provider, model, dataset = combo
     return (
         f"**{_agent_label(personality)}** · "
-        f"{provider}/{model} · {dataset}"
+        f"{provider}/{apple_models.display_signature(model)} · {dataset}"
     )
 
 
@@ -1686,11 +1687,11 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "`skip=...`; a record from before the rule replays with none."
         ),
         "dayrange_3m": (
-            "The 09:33 and 09:34 bars, traded on HighLow_3m's 9:33 forecast before "
-            "HighLow's 9:35 one exists.\n\n"
-            "- Its own buy and sell under HighLow_3m's predicted high, in the run's unit; "
+            f"The 09:33 and 09:34 bars, traded on {codenames.HIGHLOW3M}'s 9:33 forecast before "
+            f"{codenames.HIGHLOW}'s 9:35 one exists.\n\n"
+            f"- Its own buy and sell under {codenames.HIGHLOW3M}'s predicted high, in the run's unit; "
             "no stop, no momentum confirmation, no take.\n"
-            "- A position still open at 9:35 is handed to HighLow's levels and exits.\n"
+            f"- A position still open at 9:35 is handed to {codenames.HIGHLOW}'s levels and exits.\n"
             "- In the signature as `3m=H-0.4R/H-0.25R` while on; both distances are "
             "Tuning-tab axes. A record from before it replays with it off."
         ),
@@ -1706,24 +1707,25 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "distances were swept against, and what every stored record replays as."
         ),
         "use_3m": (
-            "Trade 09:33–09:35 on HighLow_3m's 9:33 forecast, then hand any open "
-            "position to HighLow at 9:35.\n\n"
-            "- Reads HighLow_3m's inputs from Alpaca as a HighLow_3m run does "
+            f"Trade 09:33–09:35 on {codenames.HIGHLOW3M}'s 9:33 forecast, then hand any open "
+            f"position to {codenames.HIGHLOW} at 9:35.\n\n"
+            f"- Reads {codenames.HIGHLOW3M}'s inputs from Alpaca as a {codenames.HIGHLOW3M} run does "
             "(ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow3m/` — a cold "
             "week takes about two minutes.\n"
             "- A trade the window closes does not trip the circuit breaker."
         ),
         "buy_3m_k": (
-            "Starts at **{buy_3m_k}** on {ticker} — HighLow_3m's own starting pair, never "
+            "Starts at **{buy_3m_k}** on {ticker} — "
+            f"{codenames.HIGHLOW3M}'s own starting pair, never "
             "swept for this window. Sweepable."
         ),
         "sell_3m_k": (
             "Starts at **{sell_3m_k}** on {ticker}. Only two bars to reach it; a "
-            "position that does not is handed to HighLow at 9:35. Sweepable."
+            f"position that does not is handed to {codenames.HIGHLOW} at 9:35. Sweepable."
         ),
         "model_highlow": (
-            "The day-range rules on HighLow's predicted high and range. The shipped "
-            "distances were swept on TimeToChange3's forecast, so sweep them again on "
+            f"The day-range rules on {codenames.HIGHLOW}'s predicted high and range. The shipped "
+            f"distances were swept on {codenames.DAYRANGE}'s forecast, so sweep them again on "
             "the Tuning tab.\n\n"
             "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY "
             "/ ALPACA_SECRET), cached under `data/highlow/` — the first replay fetches it."
@@ -1739,7 +1741,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "live app never briefed counts as an ordinary day."
         ),
         "model_highlow2": (
-            "The day-range rules on HighLow2's predicted high and range — on INTC the range "
+            f"The day-range rules on {codenames.HIGHLOW2}'s predicted high and range — on INTC the range "
             "*after 9:35* (its rest-of-session head), so breaches are read on the bars after "
             "it. No distances were ever swept on it, so sweep them on the Tuning tab.\n\n"
             "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
@@ -1750,7 +1752,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "of an ordinary day."
         ),
         "model_highlow3m": (
-            "The day-range rules on HighLow_3m's predicted high and range — the range "
+            f"The day-range rules on {codenames.HIGHLOW3M}'s predicted high and range — the range "
             "*after 9:33*, forecast at 9:33, so breaches are read on the bars after it. "
             "No distances were ever swept on it, so sweep them on the Tuning tab.\n\n"
             "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
@@ -2484,10 +2486,11 @@ _BREAKDOWN_DIMENSIONS = {
 def _ml_model_label(key: str) -> str:
     """One ML-model breakdown row, named for a reader rather than for the store.
 
-    Three shapes, because `results.ml_model_key` produces three: a provider for
-    an LLM run, an `apple_models` key for a rule run, and the sentinel for a
-    rule run that names none. Model names come from the registry, so renaming a
-    model there moves the row label with it.
+    Four shapes, because `results.ml_model_key` produces four: a provider for
+    an LLM run, an `apple_models` key for an Apple Trader run, `+`-joined keys
+    for an Orchestra, and the sentinel for a rule run that names none. Model
+    names come from the registry, so renaming a model there moves the row label
+    with it.
 
     The names are shortened to what identifies the model -- the breakdown table
     does not wrap.
@@ -2496,6 +2499,8 @@ def _ml_model_label(key: str) -> str:
         return f"{key[len(sim_results.LLM_MODEL_PREFIX):]} (LLM)"
     if not key or key == sim_results.UNKNOWN_INSTRUMENT:
         return key or sim_results.UNKNOWN_INSTRUMENT
+    if "+" in key:
+        return "+".join(_ml_model_label(part) for part in key.split("+"))
     # Membership, not `apple_models.get`: that deliberately falls back to the
     # default model for an unknown key so a stored run still replays, which
     # here would print a real model's name over a key that is not one. A key
@@ -2543,7 +2548,7 @@ def _best_run_tooltip(best: "dict | None") -> str:
     """Which model / agent / dataset produced a group's best return."""
     if not best:
         return ""
-    provider, model = best.get("provider"), best.get("model")
+    provider, model = best.get("provider"), apple_models.display_signature(best.get("model"))
     lines = [
         f"Model: {'/'.join(p for p in (provider, model) if p) or '?'}",
         "Agent: " + _agent_label(best.get("personality")),
@@ -2644,7 +2649,7 @@ _RUN_FILTERS: "tuple[tuple[str, str, str, object], ...]" = (
     # set is its model string, and two sets can agree for a hundred characters
     # before they differ. An abbreviated option list would offer the reader two
     # identical-looking choices that are not the same runs.
-    ("models", "LLM / rules", "All models", None),
+    ("models", "LLM / rules", "All models", apple_models.display_signature),
 )
 
 
@@ -2682,6 +2687,7 @@ def _short_model(key: str, limit: int = 46) -> str:
     """Rule agents encode their entire rule set in the model string, which would
     otherwise stretch one card far past the others. The full string is still in
     the breakdown table and on the run itself."""
+    key = apple_models.display_signature(key)
     return key if len(key) <= limit else key[: limit - 1].rstrip() + "…"
 
 
@@ -2818,9 +2824,12 @@ def render_summary_tab() -> None:
     ) or "Agent"
     dimension = _BREAKDOWN_DIMENSIONS[dim_label]
     rows = sim_results.breakdown(runs, dimension)
-    # Both of these group on a stable key and render a human label, so a
+    # Each of these groups on a stable key and renders a human label, so a
     # renamed agent or model moves the row without rewriting stored runs.
-    relabel = {"agent": _agent_label, "ml_model": _ml_model_label}.get(dimension)
+    relabel = {
+        "agent": _agent_label, "ml_model": _ml_model_label,
+        "model": apple_models.display_signature,
+    }.get(dimension)
     if relabel:
         for row in rows:
             row["group"] = relabel(row["group"])
@@ -2863,7 +2872,7 @@ def render_results_tab() -> None:
     labels = {
         r["run_id"]: (
             f"{r['run_id']} · {r.get('config_summary', {}).get('personality')} · "
-            f"{r.get('config_summary', {}).get('model')} · {r.get('dataset')} · "
+            f"{apple_models.display_signature(r.get('config_summary', {}).get('model'))} · {r.get('dataset')} · "
             f"{r.get('summary', {}).get('return_pct', 0):+.2f}%"
         )
         for r in runs

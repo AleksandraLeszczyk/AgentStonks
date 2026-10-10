@@ -115,7 +115,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import bar_history, clock
+from . import bar_history, clock, codenames
 from .datalog import log_fetch, log_fetch_failure
 from .model_store import RTH_END, RTH_START, ModelStore
 from .rest import fetch_bars_range
@@ -156,7 +156,7 @@ RETRY_AFTER_FAILURE_SEC = 120
 IMPACT_METHOD_AUTO = "auto"
 IMPACT_METHOD_LLM = "llm"
 IMPACT_METHODS: dict[str, str] = {
-    IMPACT_METHOD_AUTO: "News-impact model where fitted, LLM otherwise",
+    IMPACT_METHOD_AUTO: f"{codenames.NEWS_IMPACT} where fitted, LLM otherwise",
     IMPACT_METHOD_LLM: "LLM for every symbol",
 }
 
@@ -859,7 +859,7 @@ def score_symbol_news(
     """Fetch what the articles need and score them with `symbol`'s model."""
     bundle = load_bundle(symbol)
     if bundle is None:
-        raise LookupError(f"no news-impact model for {symbol}")
+        raise LookupError(f"no {codenames.NEWS_IMPACT} model for {symbol}")
     now = pd.Timestamp(now or clock.now()).tz_convert(MARKET_TZ)
     today = now.date()
     days = [ts.date() for ts in map(release_ts, articles) if ts is not None and ts <= now]

@@ -20,7 +20,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pytest
 
-from agent_stonks import apple_models, model_overlays as mo
+from agent_stonks import apple_models, codenames, model_overlays as mo
 from agent_stonks.charts import add_model_overlays, build_chart, overlay_x_max
 
 SESSION = "2026-08-07"
@@ -142,7 +142,7 @@ class TestCompute:
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)
         result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars())
         assert result["items"] == []
-        assert result["notes"] and "Predicted day range" in result["notes"][0]
+        assert result["notes"] and result["notes"][0].startswith(f"{codenames.DAYRANGE}:")
 
     def test_a_model_that_raises_is_a_note_not_an_exception(self, monkeypatch):
         def boom(*_a, **_k):
@@ -213,7 +213,7 @@ class TestProfileRangeOverlay:
         monkeypatch.setattr(mo.profile_model, "load_pack", lambda: None)
         result = mo.compute([mo.PROFILE_RANGE_KEY], "MSFT", minute_bars())
         assert result["items"] == []
-        assert "Predicted price profile range" in result["notes"][0]
+        assert result["notes"][0].startswith(f"{codenames.OPEN_PROFILE}:")
 
     def test_too_little_daily_history_is_a_note(self, monkeypatch):
         monkeypatch.setattr(mo.profile_model, "load_pack", lambda: {"p_levels": [5, 95]})
@@ -447,7 +447,7 @@ class TestIntradayRangeOverlay:
         stub_intravol(monkeypatch, model=None)
         result = self.compute()
         assert result["items"] == []
-        assert "Predicted intraday range" in result["notes"][0]
+        assert result["notes"][0].startswith(f"{codenames.INTRADAY_VOL}:")
         assert "export_app_model.py" in result["notes"][0]
 
     def test_bars_that_miss_the_open_with_no_opening_print_are_a_note(self, monkeypatch):
@@ -499,9 +499,7 @@ class TestIntradayDayRangeOverlay:
         result = mo.compute([mo.INTRADAY_DAYRANGE_KEY], "AAPL", minute_bars(),
                             daily_bars=[], session_date=SESSION)
         assert result["items"] == []
-        assert result["notes"][0].startswith(
-            "Predicted intraday range × day range (IntradayVolatility × TimeToChange3):"
-        )
+        assert result["notes"][0].startswith(f"{codenames.DAYRANGE_INTRADAY}:")
 
 
 class TestTraderLevelsOverlay:
@@ -870,7 +868,7 @@ class TestRecordedTraderLevels:
         items = self.compute([mo.TRADER_LEVELS_KEY], history, monkeypatch)
         band = next(i for i in items if i["kind"] == "band")
         assert band["lower"] == [207.0] * 4
-        assert "HighLow_3m's 9:33 window: buy 0.4 × and sell 0.25 ×" in band["note"]
+        assert f"{codenames.HIGHLOW3M}'s 9:33 window: buy 0.4 × and sell 0.25 ×" in band["note"]
 
     def test_levels_that_never_moved_are_still_two_flat_lines(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY], self.history([207.0] * 3), monkeypatch)
@@ -1080,7 +1078,7 @@ class TestHighLow2Overlay:
         )["items"]
         buy = next(i for i in items if i["label"] == "Buy level")
         assert buy["value"] == pytest.approx(204.0 - 0.75 * 3.0)
-        assert "(HighLow2)" in buy["note"]
+        assert f"({codenames.HIGHLOW2})" in buy["note"]
 
     def test_both_highlow_ranges_draw_together_from_their_own_models(self, stubbed):
         items = mo.compute([mo.HIGHLOW_RANGE_KEY, mo.HIGHLOW2_RANGE_KEY], "AAPL", minute_bars(),
@@ -1155,7 +1153,7 @@ class TestHighLow3mOverlay:
         )["items"]
         buy = next(i for i in items if i["label"] == "Buy level")
         assert buy["value"] == pytest.approx(203.0 - 0.75 * 3.0)
-        assert "(HighLow_3m)" in buy["note"]
+        assert f"({codenames.HIGHLOW3M})" in buy["note"]
 
     def test_a_highlow3m_run_opens_showing_its_range(self):
         assert mo.for_models([apple_models.HIGHLOW3M_KEY], "AAPL")["keys"] == [mo.HIGHLOW3M_RANGE_KEY]

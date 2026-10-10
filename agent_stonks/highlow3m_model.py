@@ -97,7 +97,7 @@ try:  # pragma: no cover - depends on which optional extras are installed
 except ImportError:
     pass
 
-from . import market_hours, model_store  # noqa: E402
+from . import codenames, market_hours, model_store  # noqa: E402
 from .highlow2_model import (  # noqa: E402
     OHLCV,
     _fetch_tape,
@@ -1148,7 +1148,7 @@ def _credentials(key: "str | None", secret: "str | None") -> "tuple[str, str]":
     secret = secret or os.getenv("ALPACA_SECRET", "")
     if not (key and secret):
         raise ValueError(
-            "the HighLow_3m forecast needs Alpaca SIP, IEX and option history and no Alpaca "
+            f"the {codenames.HIGHLOW3M} forecast needs Alpaca SIP, IEX and option history and no Alpaca "
             "credentials are available (sidebar connection, or ALPACA_API_KEY / "
             "ALPACA_SECRET in the environment)."
         )
@@ -1872,7 +1872,7 @@ def forecast_from(bundle: dict, history: History, opening: pd.DataFrame, session
     if len(history.sessions) < MIN_PRIOR_SESSIONS:
         raise ValueError(
             f"only {len(history.sessions)} complete SIP sessions of history before {day.date()}; "
-            f"the HighLow_3m forecast needs {MIN_PRIOR_SESSIONS} for its 126-day windows."
+            f"the {codenames.HIGHLOW3M} forecast needs {MIN_PRIOR_SESSIONS} for its 126-day windows."
         )
     model = bundle["model"]
     if bundle.get("reads_options", True) and (positioning is None or not len(positioning)):

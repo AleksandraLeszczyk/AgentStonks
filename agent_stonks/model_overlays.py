@@ -96,8 +96,8 @@ import numpy as np
 import pandas as pd
 
 from . import (
-    apple_models, clock, event_days, historical, intraday_vol_model, market_hours,
-    momentum_regime, profile_model,
+    apple_models, clock, codenames, event_days, historical, intraday_vol_model,
+    market_hours, momentum_regime, profile_model,
 )
 from .config import MODEL_OVERLAY_COLORS
 
@@ -151,10 +151,10 @@ class ModelOverlay:
 OVERLAYS: "dict[str, ModelOverlay]" = {
     DAY_RANGE_KEY: ModelOverlay(
         key=DAY_RANGE_KEY,
-        label="Predicted day range (TimeToChange3)",
-        name="TimeToChange3",
+        label=codenames.DAYRANGE,
+        name=codenames.DAYRANGE,
         summary=(
-            "TimeToChange3's forecast of the session's high and low, made once from "
+            f"{codenames.DAYRANGE}'s forecast of the session's high and low, made once from "
             "the first five minutes. Two levels and the band between them while the "
             "session stays inside it, and a stepped pair once it trades outside and "
             "the forecast is revised."
@@ -167,10 +167,10 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
-        label="Predicted price profile range (LevelsML)",
-        name="LevelsML",
+        label=codenames.OPEN_PROFILE,
+        name=codenames.OPEN_PROFILE,
         summary=(
-            "The LevelsML density model's outer quantiles and point of control, as "
+            f"The {codenames.OPEN_PROFILE} density model's outer quantiles and point of control, as "
             "price levels. The same prediction the profile curve draws, on the "
             "price axis."
         ),
@@ -179,26 +179,27 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     INTRADAY_RANGE_KEY: ModelOverlay(
         key=INTRADAY_RANGE_KEY,
-        label="Predicted intraday range (IntradayVolatility)",
-        name="IntradayVolatility",
+        label=codenames.INTRADAY_VOL,
+        name=codenames.INTRADAY_VOL,
         summary=(
-            "IntradayVolatility's time-of-day volatility curve around the open, scaled "
+            f"{codenames.INTRADAY_VOL}'s time-of-day volatility curve around the open, scaled "
             "to its own forecast of the day's range: widest at 09:30, narrowest at "
             "midday, opening up again into the close. Known at the open."
         ),
-        requires="the IntradayVolatility export (intravol_<TICKER>.json)",
+        requires=f"the {codenames.INTRADAY_VOL} export (intravol_<TICKER>.json)",
         tickers=intraday_vol_model.TICKERS,
     ),
     INTRADAY_DAYRANGE_KEY: ModelOverlay(
         key=INTRADAY_DAYRANGE_KEY,
-        label="Predicted intraday range × day range (IntradayVolatility × TimeToChange3)",
-        name="IntradayVolatility × TimeToChange3",
+        label=codenames.DAYRANGE_INTRADAY,
+        name=codenames.DAYRANGE_INTRADAY,
         summary=(
-            "The same time-of-day curve, stretched so it tops out at TimeToChange3's "
+            f"The same time-of-day curve, stretched so it tops out at {codenames.DAYRANGE}'s "
             "predicted high and bottoms out at its predicted low. Made at 09:35."
         ),
         requires=(
-            "the IntradayVolatility export plus PyTorch, LightGBM and the day-range bundle"
+            f"the {codenames.INTRADAY_VOL} export plus PyTorch, LightGBM and the "
+            f"{codenames.DAYRANGE} bundle"
         ),
         tickers=apple_models.DAYRANGE_INTRADAY_TICKERS,
         # This curve *is* what "Day Range × Intraday Volatility" measures its
@@ -207,24 +208,24 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     HIGHLOW_RANGE_KEY: ModelOverlay(
         key=HIGHLOW_RANGE_KEY,
-        label="Predicted day range (HighLow)",
-        name="HighLow",
+        label=codenames.HIGHLOW,
+        name=codenames.HIGHLOW,
         summary=(
-            "HighLow's forecast of the session's high and low, made once from the "
+            f"{codenames.HIGHLOW}'s forecast of the session's high and low, made once from the "
             "first five minutes and anchored on the 9:35 price. Drawn like the "
-            "TimeToChange3 range: flat while the session stays inside it, stepped "
+            f"{codenames.DAYRANGE} range: flat while the session stays inside it, stepped "
             "once it trades outside."
         ),
-        requires="PyTorch, LightGBM, the HighLow bundle and Alpaca SIP minute history",
+        requires=f"PyTorch, LightGBM, the {codenames.HIGHLOW} bundle and Alpaca SIP minute history",
         tickers=apple_models.HIGHLOW_TICKERS,
         models=(apple_models.HIGHLOW_KEY,),
     ),
     HIGHLOW2_RANGE_KEY: ModelOverlay(
         key=HIGHLOW2_RANGE_KEY,
-        label="Predicted day range (HighLow2)",
-        name="HighLow2",
+        label=codenames.HIGHLOW2,
+        name=codenames.HIGHLOW2,
         summary=(
-            "HighLow2's forecast of the session's high and low, made once at 9:35 from "
+            f"{codenames.HIGHLOW2}'s forecast of the session's high and low, made once at 9:35 from "
             "IEX's first five minutes and the pre-market. Drawn like the other ranges: "
             "flat while the session stays inside it, stepped once it trades outside. "
             "On INTC it is the forecast of the high and low *after* 9:35 -- the pair "
@@ -232,7 +233,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
             "outside it and are not a breach of it."
         ),
         requires=(
-            "LightGBM, the HighLow2 bundle and Alpaca SIP and IEX minute history "
+            f"LightGBM, the {codenames.HIGHLOW2} bundle and Alpaca SIP and IEX minute history "
             "(extended hours)"
         ),
         tickers=apple_models.HIGHLOW2_TICKERS,
@@ -240,17 +241,17 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     HIGHLOW3M_RANGE_KEY: ModelOverlay(
         key=HIGHLOW3M_RANGE_KEY,
-        label="Predicted rest-of-day range (HighLow_3m)",
-        name="HighLow_3m",
+        label=codenames.HIGHLOW3M,
+        name=codenames.HIGHLOW3M,
         summary=(
-            "HighLow_3m's forecast of how high and how low the price trades from 9:33 to "
+            f"{codenames.HIGHLOW3M}'s forecast of how high and how low the price trades from 9:33 to "
             "the close, made once at 9:33 from IEX's first three minutes and last night's "
             "option positioning. Not the whole day's range: the first three minutes can "
             "sit outside it. Drawn like the other ranges, stepped once the tape after "
             "9:33 trades outside."
         ),
         requires=(
-            "LightGBM, SciPy, the HighLow_3m bundle, Alpaca SIP and IEX minute history, "
+            f"LightGBM, SciPy, the {codenames.HIGHLOW3M} bundle, Alpaca SIP and IEX minute history, "
             "Alpaca's option contracts and daily option bars, and Yahoo's ^IRX"
         ),
         tickers=apple_models.HIGHLOW3M_TICKERS,
@@ -1052,7 +1053,7 @@ def _intraday_model(symbol: str, label_: str) -> "tuple[dict | None, str]":
     model = intraday_vol_model.load(symbol)
     if model is None:
         return None, (
-            f"{label_}: no IntradayVolatility model at "
+            f"{label_}: no {codenames.INTRADAY_VOL} model at "
             f"{intraday_vol_model.model_path(symbol)} — export it with "
             "FinNotebooks/IntradayVolatility/scripts/export_app_model.py."
         )
@@ -1258,7 +1259,7 @@ def _trader_levels_items(
     )
     if early:
         how += (
-            f"; before its forecast, HighLow_3m's 9:33 window: buy "
+            f"; before its forecast, {codenames.HIGHLOW3M}'s 9:33 window: buy "
             f"{getattr(config, 'buy_3m_k', 0.0):g} × and sell "
             f"{getattr(config, 'sell_3m_k', 0.0):g} × under that model's predicted high"
         )

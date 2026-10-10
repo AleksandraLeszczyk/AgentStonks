@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
 
-from . import apple_models, intraday_vol_model, model_store
+from . import apple_models, codenames, intraday_vol_model, model_store
 
 # The shared store beside the AgentStonks checkout, where every model family
 # resolves its files from (see `model_store.ModelStore`).
@@ -404,7 +404,7 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
         summary=apple_models.get(apple_models.DAYRANGE_KEY).summary,
         ticker=ticker,
         ticker_note="",
-        project="TimeToChange3, mirrors `dayrange`",
+        project=codenames.DAYRANGE,
         predicts=(
             "Where the **whole session's** high and low will land, called once at "
             "9:35 from the daily history plus the first five 1-minute bars, then "
@@ -423,7 +423,7 @@ def _dayrange_spec(ticker: str) -> ModelSpec:
             "observed 5-minute range"
         ),
         family="LightGBM + N-BEATS + N-HiTS blend",
-        consumers=("Apple Trader — day-range strategy", "Chart overlay — predicted day range"),
+        consumers=("Apple Trader — day-range strategy", f"Chart overlay — {codenames.DAYRANGE}"),
         features=features,
         inputs=(
             f"~252 sessions of unadjusted daily bars (a {meta.get('lookback', 32)}-day "
@@ -511,7 +511,7 @@ def _open_profile_spec() -> ModelSpec:
         metrics["training rows"] = meta["n_rows"]
     return ModelSpec(
         key=OPEN_PROFILE_KEY,
-        label="Open price profile (LevelsML)",
+        label=codenames.OPEN_PROFILE,
         summary=(
             "A density model rather than a point forecast: one LightGBM booster per "
             "quantile of the day's volume-weighted price profile, fitted across a "
@@ -527,7 +527,7 @@ def _open_profile_spec() -> ModelSpec:
             if meta.get("universe")
             else "fitted to transfer across symbols"
         ),
-        project="LevelsML (notebook 11 workflow), mirrors `levelsml/features.py`",
+        project=f"{codenames.OPEN_PROFILE} (notebook 11 workflow)",
         predicts=(
             "**Where today's volume will trade** — one LightGBM booster per "
             f"volume-quantile of the day's price profile ({len(levels)} of them: "
@@ -537,7 +537,7 @@ def _open_profile_spec() -> ModelSpec:
         target=str(pack.get("target") or "session volume quantiles, bps vs the 9:30 open"),
         algorithm=str(pack.get("model") or "LightGBM, per-quantile L1 (EMD)"),
         family=f"LightGBM quantile boosters (×{len(levels) or 11})",
-        consumers=("Live chart — price distribution curve", "Chart overlay — profile range"),
+        consumers=("Live chart — price distribution curve", f"Chart overlay — {codenames.OPEN_PROFILE}"),
         features=tuple(pack.get("features") or ()),
         inputs=(
             f"≥{21} completed daily bars (the 20-day rolling features) plus today's "
@@ -611,17 +611,17 @@ def _intraday_vol_spec(ticker: str) -> ModelSpec:
 
     return ModelSpec(
         key=INTRADAY_VOL_KEY,
-        label="Intraday volatility (IntradayVolatility)",
+        label=codenames.INTRADAY_VOL,
         summary=(
             "How volatile each minute of the session usually is — a five-parameter "
             "power-law curve, widest at the open, flat through midday, with a short "
             "ramp into the close — plus a daily-bar forecast of how wide the whole day "
             "will be. Drawn on the charts as a time-of-day price envelope, on its own "
-            "or stretched to the day-range model's high and low."
+            f"or stretched to {codenames.DAYRANGE}'s high and low."
         ),
         ticker=ticker,
         ticker_note="",
-        project="IntradayVolatility, exported by `scripts/export_app_model.py`",
+        project=f"{codenames.INTRADAY_VOL}, exported by `scripts/export_app_model.py`",
         predicts=(
             "**The shape of volatility through the session** — relative volatility at "
             "each minute, fitted to the 5-minute diurnal variance factor — and **the "
@@ -637,8 +637,8 @@ def _intraday_vol_spec(ticker: str) -> ModelSpec:
         ),
         family="Power-law profile + HAR",
         consumers=(
-            "Chart overlay — predicted intraday range",
-            "Chart overlay — intraday range × day range",
+            f"Chart overlay — {codenames.INTRADAY_VOL}",
+            f"Chart overlay — {codenames.DAYRANGE_INTRADAY}",
         ),
         features=tuple((day_range.get("features") or {}).keys()),
         inputs="22 completed daily bars plus today's opening print",
@@ -666,7 +666,7 @@ def _intraday_vol_spec(ticker: str) -> ModelSpec:
             "bars because the app keeps no minute history, it explains "
             f"{format_metric(pooled.get('r2'))} of a test year's variance in log range "
             f"and removes {format_metric(pooled.get('skill_vs_mean22'))} of a 22-day "
-            "mean's error — so for the band's width, prefer the day-range model's high "
+            f"mean's error — so for the band's width, prefer {codenames.DAYRANGE}'s high "
             "and low. Nothing here updates during the session."
         ),
     )
@@ -709,11 +709,11 @@ def _highlow_spec(ticker: str) -> ModelSpec:
         summary=model.summary,
         ticker=ticker,
         ticker_note="",
-        project="HighLow_5m, mirrors `highlow`",
+        project=codenames.HIGHLOW,
         predicts=(
             "Where the **whole session's** high and low will land, called once at "
             "9:35 and measured from the 9:35 price in 14-day average ranges. Like "
-            "TimeToChange3 it forecasts the *width* of the day well and its centre "
+            f"{codenames.DAYRANGE} it forecasts the *width* of the day well and its centre "
             "only roughly."
         ),
         target="up = log(high / close5) / adr14, down = log(close5 / low) / adr14",
@@ -723,7 +723,7 @@ def _highlow_spec(ticker: str) -> ModelSpec:
             + ", L1 loss, clipped to contain the observed 5-minute range"
         ),
         family="LightGBM + N-BEATS blend",
-        consumers=("Apple Trader — day-range strategy", "Chart overlay — predicted day range (HighLow)"),
+        consumers=("Apple Trader — day-range strategy", f"Chart overlay — {codenames.HIGHLOW}"),
         features=tuple(list(meta.get("features") or []) + list(meta.get("sequence_channels") or [])),
         inputs=(
             f"~127 sessions of SIP minute bars rolled up to daily (a "
@@ -786,12 +786,12 @@ def _highlow_spec(ticker: str) -> ModelSpec:
             + f"MAE {format_metric(test.get('mae_mean'))} log units on the "
             f"{', '.join((meta.get('splits') or {}).get('test') or []) or 'test'} window"
             + (
-                ", against TimeToChange3's published "
+                f", against {codenames.DAYRANGE}'s published "
                 f"{format_metric(meta.get('ttc3_published_test_mae_mean'))}"
                 if meta.get("ttc3_published_test_mae_mean") is not None
                 else ""
             )
-            + ". The shipped trading distances were swept on TimeToChange3's forecast, "
+            + f". The shipped trading distances were swept on {codenames.DAYRANGE}'s forecast, "
             "not this one."
         ),
     )
@@ -816,7 +816,7 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         # miss by that session's own 14-day range.
         metrics = {"MAE (% of ADR)": error_pct, **metrics}
     for window, change in (meta.get("walk_forward_vs_highlow5m") or {}).items():
-        metrics[f"walk-forward vs HighLow_5m · {window}"] = change
+        metrics[f"walk-forward vs {codenames.HIGHLOW} · {window}"] = change
     # A bundle with a rest-of-session head (INTC's) hands the trader that head's
     # forecast, so its `test_metrics` are the rest head's, against the extremes
     # after 9:35; the day head's sit beside them.
@@ -841,7 +841,7 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
             "own 14-day-range units"
             if meta.get("training_pool") else ""
         ),
-        project="HighLow2_5m, mirrors `highlow2`",
+        project=codenames.HIGHLOW2,
         predicts=(
             (
                 "Where the high and low **after 9:35** will land — from the 9:35 bar to the "
@@ -873,8 +873,7 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         family="LightGBM (3 seeds)",
         consumers=(
             "Apple Trader — day-range strategy",
-            "Chart overlay — predicted range after 9:35 (HighLow2)" if rest
-            else "Chart overlay — predicted day range (HighLow2)",
+            f"Chart overlay — {codenames.HIGHLOW2}",
         ),
         features=tuple(meta.get("features") or []),
         inputs=(
@@ -921,7 +920,7 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
                 "the rest, and ships it because a rest-of-session forecast was asked for. "
                 if rest else ""
             )
-            + "Level with HighLow_5m over the notebook's walk-forward and slightly ahead — "
+            + f"Level with {codenames.HIGHLOW} over the notebook's walk-forward and slightly ahead — "
             "its README calls it parity with a small edge, not a clear win. The shipped "
             "trading distances were never swept on this forecast."
         ),
@@ -979,7 +978,7 @@ def _highlow3m_spec(ticker: str) -> ModelSpec:
             "own 14-day-range units"
             if data.get("pool") else ""
         ),
-        project="HighLow_3m, mirrors `highlow3m`",
+        project=codenames.HIGHLOW3M,
         predicts=(
             "How high and how low the price trades **from 9:33 to the close** — not the whole "
             "session's extremes, which print in the first three minutes on about half of "
@@ -998,7 +997,7 @@ def _highlow3m_spec(ticker: str) -> ModelSpec:
         family="LightGBM (3 seeds) + linear median",
         consumers=(
             "Apple Trader — day-range strategy",
-            "Chart overlay — predicted rest-of-day range (HighLow_3m)",
+            f"Chart overlay — {codenames.HIGHLOW3M}",
         ),
         features=tuple(meta.get("feature_cols") or []),
         inputs=(

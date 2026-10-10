@@ -91,6 +91,7 @@ import numpy as np
 
 from agent_stonks import (
     apple_models,
+    codenames,
     intraday_vol_model,
     model_catalogue,
     momentum_regime,
@@ -599,7 +600,7 @@ DAYRANGE_METRICS = (
     Metric("mae", "Mean absolute error of the high and low", "(log units)",
            short="MAE (log units)",
            help="|log(predicted ÷ actual)| for the session high and for the low, averaged — "
-                "the units TimeToChange3 reports its held-out test error in."),
+                f"the units {codenames.DAYRANGE} reports its held-out test error in."),
     Metric("mae_usd", "Mean absolute error in dollars", "(USD)", "%.2f", ".2f",
            short="MAE (USD)",
            help="The same error in price: how far the predicted high and low were from the "
@@ -659,7 +660,7 @@ def dayrange_training_from_metadata(meta: dict) -> dict:
         if test.get(field) is not None:
             references.append(Reference(
                 metric, float(test[field]), "Held-out test window",
-                "TimeToChange3's ~130-session test window, which ends before the minute data",
+                f"{codenames.DAYRANGE}'s ~130-session test window, which ends before the minute data",
             ))
     return {"cutoffs": cutoffs, "references": references}
 
@@ -746,7 +747,7 @@ def evaluate_dayrange(ticker: str, feed: str) -> dict:
 # project that reports its test error in them.
 HIGHLOW_METRICS = tuple(
     replace(m, help="|log(predicted ÷ actual)| for the session high and for the low, "
-                    "averaged — the units HighLow reports its held-out test error in.")
+                    f"averaged — the units {codenames.HIGHLOW} reports its held-out test error in.")
     if m.key == "mae" else m
     for m in DAYRANGE_METRICS
 )
@@ -1107,7 +1108,7 @@ def evaluate_intraday_vol(ticker: str, feed: str) -> dict:
     model = intraday_vol_model.load(symbol)
     if model is None:
         return {"rows": [], "notes": [
-            f"No IntradayVolatility model at {intraday_vol_model.model_path(symbol)} — export "
+            f"No {codenames.INTRADAY_VOL} model at {intraday_vol_model.model_path(symbol)} — export "
             "it with FinNotebooks/IntradayVolatility/scripts/export_app_model.py."
         ]}
     daily = _daily(symbol, feed)
@@ -1152,9 +1153,9 @@ def evaluate_intraday_vol(ticker: str, feed: str) -> dict:
 OPEN_PROFILE_METRICS = (
     Metric("emd_bps", "Earth mover's distance to the realised profile", "(bps)", "%.1f", ".1f",
            short="EMD (bps)",
-           help="The volume-quantile weighted |predicted − realised| LevelsML scores the model "
+           help=f"The volume-quantile weighted |predicted − realised| {codenames.OPEN_PROFILE} scores the model "
                 "with, in bps of the open. The realised profile here is built from stored minute "
-                "bars; LevelsML built its from 1-hour bars, so its walk-forward number is a close "
+                f"bars; {codenames.OPEN_PROFILE} built its from 1-hour bars, so its walk-forward number is a close "
                 "reference, not an identical one."),
     Metric("inside_band", "Volume inside the predicted outer quantiles", "(%)", "%.1f", ".1f",
            better="higher", short="Volume inside band (%)",
@@ -1219,7 +1220,7 @@ def open_profile_training_from_pack(pack: dict) -> dict:
     if walk_forward.get("lgbm live-features") is not None:
         references.append(Reference(
             "emd_bps", float(walk_forward["lgbm live-features"]), "Walk-forward EMD",
-            "LevelsML's walk-forward score for this feature set, on 1-hour-bar profiles",
+            f"{codenames.OPEN_PROFILE}'s walk-forward score for this feature set, on 1-hour-bar profiles",
         ))
     if walk_forward.get("ATR climatology") is not None:
         references.append(Reference(
@@ -1322,7 +1323,7 @@ MODELS: "dict[str, DriftModel]" = {
         label=apple_models.get(apple_models.HIGHLOW_KEY).label,
         summary=(
             "The 9:35 forecast of the session high and low against the day's actual ones, on "
-            "every stored session with its opening minutes — scored like TimeToChange3 above, "
+            f"every stored session with its opening minutes — scored like {codenames.DAYRANGE} above, "
             "so the two can be read against each other. Refitted on every session before its "
             "held-out week, so the sessions from that week on are the ones it never saw."
         ),
@@ -1387,7 +1388,7 @@ MODELS: "dict[str, DriftModel]" = {
     ),
     "intraday_vol": DriftModel(
         key="intraday_vol",
-        label="Intraday volatility (IntradayVolatility)",
+        label=codenames.INTRADAY_VOL,
         summary=(
             "The daily-bar forecast of how wide each day will be, over the whole stored daily "
             "history, and how well each session's intraday volatility follows the fitted "
@@ -1408,7 +1409,7 @@ MODELS: "dict[str, DriftModel]" = {
     ),
     model_catalogue.OPEN_PROFILE_KEY: DriftModel(
         key=model_catalogue.OPEN_PROFILE_KEY,
-        label="Open price profile (LevelsML)",
+        label=codenames.OPEN_PROFILE,
         summary=(
             "Where the session's volume was predicted to trade, at the open, against where it "
             "did — on every stored session with minute bars. Fitted to transfer, so any stored "
@@ -1422,7 +1423,7 @@ MODELS: "dict[str, DriftModel]" = {
         headline="emd_bps",
         catalogue_metric=(
             "walk-forward EMD (bps) — the same quantity the ML Models tab reports, on "
-            "profiles rebuilt from stored minute bars rather than LevelsML's 1-hour ones"
+            f"profiles rebuilt from stored minute bars rather than {codenames.OPEN_PROFILE}'s 1-hour ones"
         ),
     ),
 }
