@@ -62,6 +62,16 @@ def _response(content: str | None = None, tool_calls: list | None = None) -> Sim
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
+# A stand-aside record that passes validation: an alert decision with nothing
+# armed must say why, with numbers. "needs_reassessment" because several tests
+# park an alert ABOVE price, which a "no_actionable_level" claim would not get
+# away with (see TestStandAsideAndProtection).
+_STAND_ASIDE = {
+    "reason": "needs_reassessment",
+    "evidence": {"price": 148.2, "rvol_pace_armable": 0.8, "atr": 0.45, "catalyst": "none"},
+}
+
+
 class FakeClient:
     """Returns canned chat-completion responses in sequence."""
 
@@ -450,6 +460,14 @@ class TestRunAgentCycle:
             _response(tool_calls=[_tool_call("c1", "analyze_daily_trend", {"limit": 60})]),
             _response(
                 tool_calls=[
+                    _tool_call("t1", "set_tactics", {
+                        "symbol": "AAPL",
+                        "actions": [{
+                            "action": "sell", "quantity_pct": 100,
+                            "conditions": [{"field": "last_price", "condition": "below", "value": 98.0}],
+                        }],
+                        "reasoning": "stop under the base",
+                    }),
                     _tool_call(
                         "c2",
                         "submit_decision",
@@ -457,7 +475,7 @@ class TestRunAgentCycle:
                             "action": "buy", "quantity": 2, "regime": "bullish",
                             "reasoning": "uptrend confirmed", "wake_in_minutes": 15,
                         },
-                    )
+                    ),
                 ]
             ),
         ]
@@ -469,8 +487,7 @@ class TestRunAgentCycle:
         snap = tracker.snapshot()
         assert snap["positions"] == {"AAPL": 2.0}
         assert snap["cash"] == 800.0
-        assert len(snap["decisions"]) == 1
-        assert snap["decisions"][0].action == "buy"
+        assert [d.action for d in snap["decisions"]] == ["tactics", "buy"]
         # The check-in it asked for is what runs it next.
         assert before + timedelta(minutes=15) <= state.agent_wake_at <= clock.now() + timedelta(minutes=15)
 
@@ -480,14 +497,17 @@ class TestRunAgentCycle:
         assert "decision" in log_types
 
     def test_trade_that_leaves_nothing_to_wake_on_is_rejected_and_retried(self):
-        """With no cycle timer, a buy that arms nothing and sets no check-in
-        would leave the position unmanaged until news happened to arrive."""
+        """With no cycle timer, a trade that arms nothing and sets no check-in
+        would leave the agent asleep until news happened to arrive. (A buy can
+        no longer get here -- it must arm a protective stop, which wakes it --
+        so this is the exit that leaves the book flat.)"""
         state, _ = _app()
         tracker = DecisionTracker(starting_cash=1000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
-        buy = {"action": "buy", "symbol": "AAPL", "quantity": 2, "reasoning": "go"}
+        tracker.record_trade("AAPL", "buy", 2, "earlier entry", "k", "s", "iex")
+        sell = {"action": "sell", "symbol": "AAPL", "quantity": 2, "reasoning": "exit"}
         client = FakeClient([
-            _response(tool_calls=[_tool_call("c1", "submit_decision", buy)]),
-            _response(tool_calls=[_tool_call("c2", "submit_decision", {**buy, "wake_in_minutes": 5})]),
+            _response(tool_calls=[_tool_call("c1", "submit_decision", sell)]),
+            _response(tool_calls=[_tool_call("c2", "submit_decision", {**sell, "wake_in_minutes": 5})]),
         ])
 
         run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
@@ -495,8 +515,8 @@ class TestRunAgentCycle:
         rejection = next(m for m in client.calls[1] if m.get("tool_call_id") == "c1")
         assert "nothing would wake you" in rejection["content"]
         snap = tracker.snapshot()
-        assert [d.action for d in snap["decisions"]] == ["buy"]  # bought once, not twice
-        assert snap["positions"] == {"AAPL": 2.0}
+        assert [d.action for d in snap["decisions"]] == ["buy", "sell"]  # sold once, not twice
+        assert not snap["positions"].get("AAPL")
         assert state.agent_wake_at is not None
 
     def test_trade_with_tactics_armed_needs_no_check_in(self):
@@ -529,7 +549,7 @@ class TestRunAgentCycle:
         tracker = DecisionTracker(broker=FakeBroker())
         client = FakeClient([
             _response(tool_calls=[_tool_call("c1", "submit_decision", {
-                "action": "alert", "reasoning": "base still forming", "wake_in_minutes": 20,
+                "action": "alert", "reasoning": "base still forming", "stand_aside": _STAND_ASIDE, "wake_in_minutes": 20,
             })]),
         ])
 
@@ -544,7 +564,7 @@ class TestRunAgentCycle:
         tracker = DecisionTracker(broker=FakeBroker())
         client = FakeClient([
             _response(tool_calls=[_tool_call("c1", "submit_decision", {
-                "action": "alert", "reasoning": "see you tomorrow", "wake_in_minutes": 5000,
+                "action": "alert", "reasoning": "see you tomorrow", "stand_aside": _STAND_ASIDE, "wake_in_minutes": 5000,
             })]),
         ])
 
@@ -624,6 +644,7 @@ class TestRunAgentCycle:
                             "action": "alert",
                             "reasoning": "no setup",
                             "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                            "stand_aside": _STAND_ASIDE,
                         },
                     )
                 ]
@@ -665,6 +686,7 @@ class TestRunAgentCycle:
                             "action": "alert",
                             "reasoning": "stand aside until price reclaims resistance",
                             "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                            "stand_aside": _STAND_ASIDE,
                         },
                     )
                 ]
@@ -701,6 +723,7 @@ class TestRunAgentCycle:
                             "action": "alert",
                             "reasoning": "wait for breakout above resistance",
                             "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                            "stand_aside": _STAND_ASIDE,
                         },
                     )
                 ]
@@ -718,6 +741,7 @@ class TestRunAgentCycle:
         assert decision.price is None
         assert decision.alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
         assert state.sym("AAPL").alerts == [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 150.0}]
+        assert decision.stand_aside == _STAND_ASIDE
 
     def test_alert_decision_supports_multiple_conditions_across_fields(self):
         state = AppState()
@@ -739,6 +763,7 @@ class TestRunAgentCycle:
                                 {"field": "last_price", "condition": "below", "value": 95.0},
                                 {"field": "volume_ratio", "condition": "above", "value": 2.0},
                             ],
+                            "stand_aside": _STAND_ASIDE,
                         },
                     )
                 ]
@@ -782,6 +807,7 @@ class TestRunAgentCycle:
                             "action": "alert",
                             "reasoning": "watching for a breakout above resistance",
                             "alerts": [{"field": "last_price", "condition": "above", "value": 150.0}],
+                            "stand_aside": _STAND_ASIDE,
                         },
                     )
                 ]
@@ -835,6 +861,7 @@ class TestRunAgentCycle:
                             "action": "alert",
                             "reasoning": "stand aside until a real breakdown",
                             "alerts": [{"field": "last_price", "condition": "below", "value": 95.0}],
+                            "stand_aside": _STAND_ASIDE,
                         },
                     )
                 ]
@@ -1241,3 +1268,208 @@ class TestSellEverythingAndStop:
         assert [d.symbol for d in decisions] == ["MSFT"]
         assert len(errors) == 1 and "AAPL" in errors[0]
         assert tracker.position_for("MSFT") == 0.0
+
+
+def _stop_tactics(stop: float, symbol: str = "AAPL", target: "float | None" = None) -> dict:
+    actions = [{
+        "action": "sell", "quantity_pct": 100, "note": "stop",
+        "conditions": [{"field": "last_price", "condition": "below", "value": stop}],
+    }]
+    if target is not None:
+        actions.append({
+            "action": "sell", "quantity_pct": 100, "note": "target",
+            "conditions": [{"field": "last_price", "condition": "above", "value": target}],
+        })
+    return {"symbol": symbol, "actions": actions, "reasoning": "bracket"}
+
+
+def _tool_result(client: FakeClient, call_id: str) -> str:
+    # FakeClient keeps the live messages list, so the last call holds them all.
+    return next(m["content"] for m in client.calls[-1] if m.get("tool_call_id") == call_id)
+
+
+class TestStandAsideAndProtection:
+    """The 2026-10-10 fix for agents that never traded: a stand-aside has to
+    justify itself with numbers, a parked entry level is refused as such, a
+    held position always sleeps behind a stop, and +1R wakes the agent."""
+
+    def test_a_bare_alert_must_say_why_with_numbers(self):
+        state, _ = _app()
+        tracker = DecisionTracker(broker=FakeBroker())
+        alert = {
+            "action": "alert", "reasoning": "no base yet",
+            "alerts": [{"field": "last_price", "condition": "below", "value": 95.0}],
+        }
+        thin = {"reason": "no_actionable_level", "evidence": {"price": 100.0}}
+        full = {
+            "reason": "no_actionable_level",
+            "evidence": {"price": 100.0, "atr": 0.4, "rvol_pace_armable": 0.7, "catalyst": "none"},
+        }
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", alert)]),
+            _response(tool_calls=[_tool_call("c2", "submit_decision", {**alert, "stand_aside": thin})]),
+            _response(tool_calls=[_tool_call("c3", "submit_decision", {**alert, "stand_aside": full})]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+
+        assert "stand-aside must say why" in _tool_result(client, "c1")
+        assert "cites 1 number(s)" in _tool_result(client, "c2")
+        decisions = tracker.snapshot()["decisions"]
+        assert [d.action for d in decisions] == ["alert"]
+        assert decisions[0].stand_aside == full
+
+    def test_an_entry_level_parked_in_an_alert_is_not_no_actionable_level(self):
+        """The SimLab freeze: 40 cycles each ending in 'previous_minute_close
+        above <base_high>' as an alert. That alert IS the level."""
+        state, _ = _app()
+        tracker = DecisionTracker(broker=FakeBroker())
+        evidence = {"price": 334.0, "base_high": 335.58, "base_low": 333.54, "best_reward_risk": 1.98}
+        alert = {
+            "action": "alert", "reasoning": "no defensible entry",
+            "alerts": [{"field": "previous_minute_close", "condition": "above", "value": 335.58}],
+        }
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", {
+                **alert, "stand_aside": {"reason": "no_actionable_level", "evidence": evidence},
+            })]),
+            _response(tool_calls=[_tool_call("c2", "submit_decision", {
+                **alert, "stand_aside": {"reason": "reward_risk_fails", "evidence": evidence},
+            })]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+
+        assert "is a measured entry level" in _tool_result(client, "c1")
+        decisions = tracker.snapshot()["decisions"]
+        assert decisions[-1].stand_aside["reason"] == "reward_risk_fails"
+
+    def test_an_armed_plan_needs_no_stand_aside(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(broker=FakeBroker())
+        client = FakeClient([
+            _response(tool_calls=[
+                _tool_call("t1", "set_tactics", {
+                    "symbol": "AAPL",
+                    "actions": [{
+                        "action": "buy", "quantity": 10,
+                        "conditions": [
+                            {"field": "previous_minute_close", "condition": "above", "value": 101.0},
+                            {"field": "previous_minute_volume_ratio", "condition": "above", "value": 1.5},
+                        ],
+                    }],
+                    "reasoning": "flag break on a volume bar",
+                }),
+                _tool_call("c1", "submit_decision", {"action": "alert", "reasoning": "armed", "alerts": []}),
+            ]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        decisions = tracker.snapshot()["decisions"]
+        assert [d.action for d in decisions] == ["tactics", "alert"]
+        assert decisions[-1].stand_aside is None
+        assert sym_state.tactics is not None
+
+    def test_a_buy_with_no_protective_stop_is_rejected(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        buy = {"action": "buy", "symbol": "AAPL", "quantity": 10, "reasoning": "break", "wake_in_minutes": 10}
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", buy)]),
+            _response(tool_calls=[
+                _tool_call("t1", "set_tactics", _stop_tactics(95.0)),
+                _tool_call("c2", "submit_decision", buy),
+            ]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+
+        assert "no protective stop armed" in _tool_result(client, "c1")
+        snap = tracker.snapshot()
+        assert [d.action for d in snap["decisions"]] == ["tactics", "buy"]
+        assert snap["positions"] == {"AAPL": 10.0}
+        # Entry 100, stop 95: the +1R wake-up sits at 105.
+        assert sym_state.alerts == [
+            {"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 105.0}
+        ]
+        assert "AAPL last_price above 105" in _tool_result(client, "c2")
+
+    def test_holding_with_no_stop_cannot_go_back_to_sleep(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        tracker.record_trade("AAPL", "buy", 10, "tactic fill", "k", "s", "iex")
+        alert = {"action": "alert", "reasoning": "holding", "alerts": [], "wake_in_minutes": 30}
+        client = FakeClient([
+            _response(tool_calls=[_tool_call("c1", "submit_decision", alert)]),
+            _response(tool_calls=[
+                _tool_call("t1", "set_tactics", _stop_tactics(96.0, target=110.0)),
+                _tool_call("c2", "submit_decision", alert),
+            ]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=5)
+
+        assert "no protective stop armed" in _tool_result(client, "c1")
+        assert [a["value"] for a in sym_state.alerts] == [104.0]
+
+    def test_no_checkpoint_when_the_agent_set_its_own(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        tracker.record_trade("AAPL", "buy", 10, "tactic fill", "k", "s", "iex")
+        own = {"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 103.0}
+        client = FakeClient([
+            _response(tool_calls=[
+                _tool_call("t1", "set_tactics", _stop_tactics(96.0)),
+                _tool_call("c1", "submit_decision", {"action": "alert", "reasoning": "holding", "alerts": [own]}),
+            ]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        assert sym_state.alerts == [own]
+
+    def test_no_checkpoint_once_the_stop_is_at_breakeven(self):
+        state, sym_state = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(price=100.0), trade_cost=0.0)
+        tracker.record_trade("AAPL", "buy", 10, "tactic fill", "k", "s", "iex")
+        client = FakeClient([
+            _response(tool_calls=[
+                _tool_call("t1", "set_tactics", _stop_tactics(100.0)),
+                _tool_call("c1", "submit_decision", {"action": "alert", "reasoning": "breakeven", "alerts": []}),
+            ]),
+        ])
+
+        run_agent_cycle(client, "m", ["AAPL"], state, tracker, max_iters=3)
+
+        assert sym_state.alerts == []
+
+    def test_geometry_sizes_from_the_fixed_risk_budget(self):
+        app, _ = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(), trade_cost=0.0)
+        result = _dispatch_tool(
+            "breakout_trade_geometry",
+            {"entry": 100.0, "stop": 98.0, "base_height": 1.9, "pole_height": 5.0},
+            app, tracker,
+        )
+        # 1% of $10,000 = $100 at $2/share risk = 50 shares; cash buys 100.
+        assert result["account_risk_budget_usd"] == 100.0
+        assert result["suggested_quantity"] == 50
+        assert result["meets_min_reward_risk"] is True
+
+    def test_geometry_sizing_is_capped_by_cash(self):
+        app, _ = _app()
+        tracker = DecisionTracker(starting_cash=1_000.0, broker=FakeBroker(), trade_cost=0.0)
+        result = _dispatch_tool(
+            "vwap_reversion_geometry", {"entry": 98.0, "vwap": 100.0, "std_dev": 0.1}, app, tracker
+        )
+        # $10 budget / $0.10 risk = 100 shares, but $1,000 buys only 10.
+        assert result["suggested_quantity"] == 10
+
+    def test_stand_aside_reasons_match_the_schema(self):
+        from agent_stonks.agent import STAND_ASIDE_REASONS
+        from agent_stonks.agent_tools import STAND_ASIDE_REASON_KEYS, _TOOL_SUBMIT_DECISION
+
+        assert tuple(STAND_ASIDE_REASONS) == STAND_ASIDE_REASON_KEYS
+        schema = _TOOL_SUBMIT_DECISION["function"]["parameters"]["properties"]["stand_aside"]
+        assert schema["properties"]["reason"]["enum"] == list(STAND_ASIDE_REASON_KEYS)

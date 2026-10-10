@@ -22,6 +22,7 @@ from .state import (
     SymbolState,
     alert_field_value,
     alert_triggered,
+    completed_bar_volume_ratio,
     format_alert,
     today_daily_volume,
 )
@@ -80,6 +81,7 @@ def record_bar_close(state: SymbolState, bar: dict) -> None:
             state.previous_minute_low = bar["l"]
         if "c" in bar:
             state.previous_minute_close = bar["c"]
+        state.previous_minute_volume_ratio = completed_bar_volume_ratio(state.bars, bar)
     if "l" in bar:
         scoring.record_price(state.app, state.symbol, bar["l"])
     if "h" in bar:
@@ -282,6 +284,7 @@ def reset_symbol_for_new_stream(state: SymbolState) -> None:
         state.previous_minute_high = last_bar.get("h") if last_bar else None
         state.previous_minute_low = last_bar.get("l") if last_bar else None
         state.previous_minute_close = last_bar.get("c") if last_bar else None
+        state.previous_minute_volume_ratio = completed_bar_volume_ratio(state.bars, last_bar)
         # Seed today's running volume from today's partial daily bar (0 if the
         # latest daily bar isn't today, e.g. pre-open/weekend).
         state.day_volume = today_daily_volume(state.daily_bars)

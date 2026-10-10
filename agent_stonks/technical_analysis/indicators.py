@@ -356,11 +356,22 @@ def analyze_intraday(
 
     momentum = _hl_momentum_pattern(bars)
 
+    # Session VWAP, computed from today's bars the way analyze_vwap_bands and
+    # detect_regime_shift compute it. This used to read the last bar's `vw`,
+    # which is that ONE bar's own volume-weighted price on Alpaca bars (not the
+    # session's) and is absent from yfinance bars altogether -- so the momentum
+    # agent's VWAP-reclaim setup either measured the wrong thing or, in every
+    # SimLab run, could never be measured at all.
+    vwap = None
     vwap_note = None
-    if "vw" in bars[-1] and bars[-1]["vw"]:
-        vwap = float(bars[-1]["vw"])
+    vwap_cross = None
+    vwap_session = full_session_bars if full_session_bars else _session_bars(bars)
+    vwap_series = session_vwap_series(vwap_session)
+    if vwap_series:
+        vwap = vwap_series[-1]
         vwap_diff_pct = (price - vwap) / vwap * 100 if vwap else 0.0
-        vwap_note = f"price is {abs(vwap_diff_pct):.2f}% {'above' if vwap_diff_pct >= 0 else 'below'} session VWAP"
+        vwap_note = f"price is {abs(vwap_diff_pct):.2f}% {'above' if vwap_diff_pct >= 0 else 'below'} session VWAP {vwap:.2f}"
+        vwap_cross = _last_close_vs_vwap_cross(vwap_session, vwap_series)
 
     atr_value = atr(bars, period=min(14, len(bars) - 1))
     volatility_pct = (atr_value / price * 100) if (atr_value is not None and price) else None
@@ -424,6 +435,11 @@ def analyze_intraday(
     ]
     if vwap_note:
         summary_parts.append(vwap_note.capitalize() + ".")
+    if vwap_cross is not None:
+        summary_parts.append(
+            f"Last close-vs-VWAP cross: {vwap_cross['direction'].replace('_', ' ')} "
+            f"{vwap_cross['bars_ago']} bars ago at VWAP {vwap_cross['vwap_at_cross']:.2f}."
+        )
     if volatility_pct is not None:
         summary_parts.append(f"ATR-based volatility ~{volatility_pct:.2f}% of price.")
     if today_block:
@@ -447,7 +463,9 @@ def analyze_intraday(
     return {
         "pct_change_in_window": round(pct_change, 2),
         "momentum_pattern": momentum,
+        "vwap": round(vwap, 4) if vwap is not None else None,
         "vwap_position": vwap_note,
+        "last_vwap_cross": vwap_cross,
         "atr": atr_value,
         "volatility_pct_of_price": round(volatility_pct, 2) if volatility_pct is not None else None,
         "yesterday_momentum": yesterday_block,
@@ -469,6 +487,38 @@ def _session_bars(bars: list[dict]) -> list[dict]:
         return bars
     day_bars = [b for b in bars if str(b.get("t", ""))[:10] == today]
     return day_bars or bars
+
+
+def session_vwap_series(session: list[dict]) -> list[float]:
+    """Running typical-price VWAP over `session` (one value per bar), or [] when
+    the bars carry no volume or no usable prices."""
+    out: list[float] = []
+    cum_pv = cum_v = 0.0
+    for bar in session:
+        try:
+            typical = (float(bar["h"]) + float(bar["l"]) + float(bar["c"])) / 3.0
+            vol = float(bar.get("v") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            return []
+        cum_pv += typical * vol
+        cum_v += vol
+        out.append(cum_pv / cum_v if cum_v > 0 else typical)
+    return out if cum_v > 0 else []
+
+
+def _last_close_vs_vwap_cross(session: list[dict], vwaps: list[float]) -> "dict | None":
+    """The most recent bar whose close switched sides of the running VWAP:
+    'reclaimed_vwap' (closed back above) or 'lost_vwap' (closed below)."""
+    closes = [float(b["c"]) for b in session]
+    side = [1 if c >= v else -1 for c, v in zip(closes, vwaps)]
+    for i in range(len(side) - 1, 0, -1):
+        if side[i] != side[i - 1]:
+            return {
+                "direction": "reclaimed_vwap" if side[i] > 0 else "lost_vwap",
+                "bars_ago": len(side) - 1 - i,
+                "vwap_at_cross": round(vwaps[i], 4),
+            }
+    return None
 
 def _rejection_candle(bar: dict) -> "str | None":
     """Classify a bar as a bullish/bearish rejection (long-tail) candle.
@@ -597,13 +647,20 @@ def analyze_vwap_bands(bars: list[dict], num_std: float = 2.0) -> dict:
 # Participation gate: session pace AND local participation must both clear.
 # Pace alone passed at every losing tactic entry in the SimLab run store --
 # it stays elevated all session once a name is busy, so it cannot tell a move
-# buyers are still in from one they have already left.
-PARTICIPATION_MIN_PACE = 2.0
+# buyers are still in from one they have already left. The pace half was 2.0
+# until 2026-10-10; on the stored large-cap days (AAPL, NVDA) armable pace sits
+# at a 0.6-0.9 median and passes even 1.5 only around the open, so 2.0 kept the
+# momentum agent at zero trades. 1.5 matches the breakout gate.
+PARTICIPATION_MIN_PACE = 1.5
 
 PARTICIPATION_MIN_LOCAL = 1.2
 
 # Bars behind `volume_burst` -- short enough to catch volume arriving now.
 VOLUME_BURST_BARS = 3
+
+# A move into a base counts as a flagpole only when it is at least this many
+# base heights tall; a shorter rise is just the lower half of a range.
+FLAGPOLE_MIN_BASE_MULTIPLE = 1.5
 
 def analyze_volume(
     bars: list[dict],
@@ -775,6 +832,22 @@ def analyze_consolidation(bars: list[dict], base_bars: int = 10, prior_bars: int
 
     is_coiling = range_contraction_pct > 10 and volume_trend_in_base in ("declining", "flat")
 
+    # The flagpole: the advance INTO the base, from the prior window's low up
+    # to the highest high after it. It is what a bull flag's measured-move
+    # target projects (breakout + pole height). The base height alone cannot
+    # serve: with the stop under `base_low` the risk IS the base height, so
+    # even a 2x-base target pays 2h / (h + buffers) -- just under 2:1, every
+    # time. Only reported when the window actually rose into the base and the
+    # rise dwarfs the base; otherwise this is a range, not a flag.
+    pole_low = pole_height = None
+    if prior_window:
+        lows = [float(b["l"]) for b in prior_window]
+        i_low = lows.index(min(lows))
+        top = max([float(b["h"]) for b in prior_window[i_low:]] + [base_high])
+        height = top - lows[i_low]
+        if lows[i_low] < base_low and height > 0 and height >= FLAGPOLE_MIN_BASE_MULTIPLE * base_height:
+            pole_low, pole_height = lows[i_low], height
+
     summary_parts = [
         f"Base over the last {len(base)} bars: {base_low:.2f}-{base_high:.2f} "
         f"(height {base_height:.2f}, {base_height_pct:.1f}% of price)."
@@ -792,6 +865,16 @@ def analyze_consolidation(bars: list[dict], base_bars: int = 10, prior_bars: int
         summary_parts.append("This reads as a genuine tight base/coil -- a break of either edge carries weight.")
     else:
         summary_parts.append("This does not yet read as a tight, coiling base -- be skeptical of a break either way.")
+    if pole_height is not None:
+        summary_parts.append(
+            f"Flagpole: advance from {pole_low:.2f} into the base (height {pole_height:.2f}, "
+            f"{pole_height / base_height:.1f}x the base) -- the flag's measured-move target is "
+            f"base_high + pole_height = {base_high + pole_height:.2f}."
+            if base_height
+            else f"Flagpole: advance from {pole_low:.2f} into the base (height {pole_height:.2f})."
+        )
+    else:
+        summary_parts.append("No flagpole: the bars before the base did not advance into it.")
 
     return {
         "base_bars": len(base),
@@ -799,6 +882,8 @@ def analyze_consolidation(bars: list[dict], base_bars: int = 10, prior_bars: int
         "base_low": round(base_low, 4),
         "base_height": round(base_height, 4),
         "base_height_pct": round(base_height_pct, 2),
+        "pole_low": round(pole_low, 4) if pole_low is not None else None,
+        "pole_height": round(pole_height, 4) if pole_height is not None else None,
         "range_contraction_pct": round(range_contraction_pct, 1),
         "volume_trend_in_base": volume_trend_in_base,
         "touches_at_resistance": touches_at_resistance,

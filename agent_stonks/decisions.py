@@ -69,6 +69,10 @@ class Decision:
     # side of `limit_price` -- a miss, not a refusal: the same order may fill
     # on the next try, which a rejection for cash or tradability will not.
     limit_missed: bool = False
+    # For an "alert" that stood aside with nothing armed: why ({"reason": one
+    # of agent.STAND_ASIDE_REASONS, "evidence": {name: number, ...}}). The
+    # audit trail that tells disciplined abstention from freezing.
+    stand_aside: Optional[dict] = None
 
 
 class DecisionTracker:
@@ -200,7 +204,13 @@ class DecisionTracker:
             self.decisions.append(decision)
         return decision
 
-    def record_alert(self, symbol: str, alerts: list[dict], reasoning: str) -> Decision:
+    def record_alert(
+        self,
+        symbol: str,
+        alerts: list[dict],
+        reasoning: str,
+        stand_aside: Optional[dict] = None,
+    ) -> Decision:
         """Record a no-op cycle where the agent set one or more condition alerts instead of trading.
 
         Each entry is shaped {"symbol": str, "field": str, "condition": "above" | "below",
@@ -208,7 +218,9 @@ class DecisionTracker:
         spread, day volume, volume ratio, portfolio value, ...) to wake the agent early
         when it crosses the value.
         """
-        decision = self._noop_decision(symbol, "alert", reasoning, alerts=alerts)
+        decision = self._noop_decision(
+            symbol, "alert", reasoning, alerts=alerts, stand_aside=stand_aside
+        )
         with self.lock:
             self.decisions.append(decision)
         return decision

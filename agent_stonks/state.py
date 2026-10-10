@@ -48,6 +48,14 @@ ALERTABLE_FIELDS: dict[str, str] = {
         "last_price to require a full bar to CLOSE through a level, filtering the "
         "one-tick wick fakeouts that trigger a raw last_price cross"
     ),
+    "previous_minute_volume_ratio": (
+        "Volume of the last completed 1-minute bar divided by the average volume of "
+        "the (up to 20) completed session bars before it -- 1.0 = an ordinary bar, "
+        "1.5+ = the bar drew clearly more participation than the tape around it. "
+        "Self-normalizing, so it still works on a quiet session where rvol_pace never "
+        "gets near 1.5. Pair it with a previous_minute_close cross on an entry: the "
+        "bar that CLOSES through the level must also be a volume bar"
+    ),
     "day_volume": "Cumulative shares traded so far today",
     "volume_ratio": (
         "Today's cumulative volume divided by the average FULL day's volume -- climbs "
@@ -135,6 +143,9 @@ class SymbolState:
         self.previous_minute_high: float | None = None
         self.previous_minute_low: float | None = None
         self.previous_minute_close: float | None = None
+        # The same completed bar's volume vs the session bars before it (see
+        # `completed_bar_volume_ratio`); set wherever the three above are.
+        self.previous_minute_volume_ratio: float | None = None
         self.day_volume: float | None = None
         # Today's completed opening range, cached once measured (see
         # technical_analysis.compute_opening_range) so the ORB read survives
@@ -707,6 +718,87 @@ def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW
     if baseline is None or baseline == 0:
         return None
     return (latest_close / baseline - 1.0) * 100.0
+
+
+# How many completed session bars a bar's volume is measured against for
+# `previous_minute_volume_ratio`, and the fewest that still make a baseline.
+BAR_VOLUME_RATIO_LOOKBACK = 20
+BAR_VOLUME_RATIO_MIN_BARS = 5
+
+
+def completed_bar_volume_ratio(
+    bars: Iterable[dict],
+    bar: "dict | None",
+    lookback: int = BAR_VOLUME_RATIO_LOOKBACK,
+    min_bars: int = BAR_VOLUME_RATIO_MIN_BARS,
+) -> "float | None":
+    """`bar`'s volume divided by the mean volume of the bars before it in `bars`.
+
+    The breakout-bar participation read behind `previous_minute_volume_ratio`.
+    Unlike rvol_pace it needs no daily baseline and no intraday volume curve, so
+    a quiet large-cap session -- whose cumulative pace sits below 1.0 all day --
+    can still show that the one bar closing through a level was a volume bar.
+
+    Only bars of the same ET date count, and only regular-session ones when
+    `bar` is itself in the regular session: thin pre-market prints would make
+    every opening bar look like a surge. `bars` is chronological; bars at or
+    after `bar` (it may already be in the list, an in-progress one after it)
+    are skipped. None until `min_bars` earlier bars exist, or with no volume.
+
+    Volume is only compared within one tape. The live buffer mixes them by
+    age (SIP when settled, IEX for the last 15 minutes after a Start, the
+    socket's own candles since), and IEX carries ~4% of the consolidated
+    volume -- so the first streamed bar after a mid-session Start, read
+    against IEX bars, would look like a 25x surge and fire an entry on
+    nothing. Bars with the same `src` tag are the baseline; when there are
+    too few, the same family (IEX vs consolidated: SIP / Finnhub / yfinance).
+    Untagged bars (SimLab's store) compare with untagged bars.
+    """
+    bar_t = clock.bar_dt(bar) if bar else None
+    if bar_t is None:
+        return None
+    try:
+        volume = float(bar.get("v") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    bar_et = bar_t.astimezone(MARKET_TZ)
+    regular = bar_et.time() >= MARKET_OPEN
+    src = bar.get("src")
+    family = _volume_family(src)
+    same_src: list[float] = []
+    same_family: list[float] = []
+    for earlier in reversed(list(bars)):
+        t = clock.bar_dt(earlier)
+        if t is None or t >= bar_t:
+            continue
+        et = t.astimezone(MARKET_TZ)
+        if et.date() != bar_et.date() or (regular and et.time() < MARKET_OPEN):
+            break
+        try:
+            v = float(earlier.get("v") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        earlier_src = earlier.get("src")
+        if earlier_src == src and len(same_src) < lookback:
+            same_src.append(v)
+        if _volume_family(earlier_src) == family and len(same_family) < lookback:
+            same_family.append(v)
+        if len(same_src) >= lookback:
+            break
+    prior = same_src if len(same_src) >= min_bars else same_family
+    if len(prior) < min_bars:
+        return None
+    baseline = sum(prior) / len(prior)
+    return volume / baseline if baseline > 0 else None
+
+
+def _volume_family(src: "str | None") -> "str | None":
+    """Which volume scale a bar's tape is on: single-venue IEX, or the
+    consolidated tape (SIP, and Finnhub/yfinance, which the app reads as
+    consolidated -- see the volume band). None for an untagged bar."""
+    if src is None:
+        return None
+    return "iex" if src == "iex" else "consolidated"
 
 
 def alert_field_value(state: "SymbolState", field: "str | None") -> "float | None":

@@ -206,8 +206,16 @@ AGENT_MAX_TOOL_ITERS = 8
 # offering only the finalizing tools (set_tactics / submit_decision /
 # stand_down). Without them a model that researches every ticker before
 # deciding (gemini-3.8-flash on a 12-ticker basket) runs out of turns every
-# cycle and is put to sleep with nothing armed.
-AGENT_FINALIZE_ITERS = 2
+# cycle and is put to sleep with nothing armed. Three since 2026-10-10: a
+# decision can now be handed back once more (a stand-aside with no evidence, a
+# held position with no protective stop), and that retry needs a turn too.
+AGENT_FINALIZE_ITERS = 3
+# The fixed slice of the account a new LLM-agent trade may lose if its stop is
+# hit, in percent of portfolio value. breakout_trade_geometry and
+# vwap_reversion_geometry turn it into `suggested_quantity` (budget / risk per
+# share, capped by what the cash can buy), so sizing is a number the tools
+# hand over rather than one each model improvises.
+AGENT_RISK_PER_TRADE_PCT = 1.0
 PAPER_STARTING_CASH = 100_000.0
 TRADE_FIXED_COST = 1.15
 

@@ -64,14 +64,23 @@ def breakout_trade_geometry(
     base_height: "float | None" = None,
     atr: "float | None" = None,
     overhead_resistance: "float | None" = None,
+    pole_height: "float | None" = None,
+    target: "float | None" = None,
 ) -> dict:
     """Mechanical entry/stop/target math for a long breakout trade.
 
-    Projects targets by adding 1x and 2x the base height (the classic
-    "measured move") and/or 1x and 2x ATR above entry, then expresses each as
-    a reward-to-risk multiple of the entry-to-stop distance. `meets_min_reward_risk`
-    flags whether the best available target clears the 2:1 minimum breakout
-    traders require before taking the trade.
+    Projects targets by adding 1x and 2x the base height and/or 1x and 2x ATR
+    above entry, plus -- when given -- the flagpole height (a bull flag's
+    classic measured move: breakout + pole) and an explicit structural
+    `target` (e.g. the first level overhead that leaves room), then expresses
+    each as a reward-to-risk multiple of the entry-to-stop distance.
+    `meets_min_reward_risk` flags whether the best available target clears the
+    2:1 minimum breakout traders require before taking the trade.
+
+    The base-height targets on their own can never clear it for a flag whose
+    stop sits under the base: the risk then IS the base height plus buffers,
+    so 2x the base pays just under 2:1. The pole target is the one built for
+    that geometry, which is why the summary says so when it is missing.
 
     `overhead_resistance` -- the nearest structural level above the entry (from
     key_levels) -- caps the realistic first target: `room_to_run` is true only
@@ -92,10 +101,14 @@ def breakout_trade_geometry(
     if atr is not None and atr > 0:
         targets["target1_atr"] = round(entry + atr, 4)
         targets["target2_atr"] = round(entry + 2 * atr, 4)
+    if pole_height is not None and pole_height > 0:
+        targets["target_pole"] = round(entry + pole_height, 4)
+    if target is not None and target > entry:
+        targets["target_structural"] = round(target, 4)
 
     reward_risk: dict[str, float] = {}
-    for key, target in targets.items():
-        reward = target - entry
+    for key, level in targets.items():
+        reward = level - entry
         reward_risk[key.replace("target", "rr")] = round(reward / risk_per_share, 2)
 
     best_rr = max(reward_risk.values()) if reward_risk else None
@@ -137,8 +150,14 @@ def breakout_trade_geometry(
             if meets_min_rr
             else "Does NOT meet the 2:1 minimum reward-to-risk -- skip, or wait for a tighter stop/better entry."
         )
+        if not meets_min_rr and base_height and pole_height is None and target is None:
+            summary_parts.append(
+                "With the stop under the base, base-height targets top out just under 2:1 "
+                "by construction -- pass pole_height (analyze_consolidation) for the flag's "
+                "measured move, or a structural target."
+            )
     else:
-        summary_parts.append("No base_height or atr given -- cannot project a target.")
+        summary_parts.append("No base_height, atr, pole_height or target given -- cannot project a target.")
     if resistance_note:
         summary_parts.append(resistance_note)
 

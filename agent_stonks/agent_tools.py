@@ -20,6 +20,18 @@ from .state import ALERTABLE_FIELDS
 from .tactics import TACTIC_CONDITION_FIELDS
 
 
+# submit_decision's stand_aside reasons. The descriptions and the validation
+# live in `agent.STAND_ASIDE_REASONS` (agent imports this module, not the other
+# way round); test_agent checks the two lists match.
+STAND_ASIDE_REASON_KEYS: tuple[str, ...] = (
+    "no_actionable_level",
+    "needs_reassessment",
+    "reward_risk_fails",
+    "session_window",
+    "no_buying_power",
+)
+
+
 _TOOL_GET_QUOTE = {
     "type": "function",
     "function": {
@@ -40,8 +52,10 @@ _TOOL_ANALYZE_INTRADAY_MOMENTUM = {
         "name": "analyze_intraday_momentum",
         "description": (
             "Analyze recent intraday price action for the ticker: momentum pattern "
-            "(higher highs/lows vs lower highs/lows), position relative to session VWAP, "
-            "and ATR-based volatility. Also reports yesterday's momentum, today's total "
+            "(higher highs/lows vs lower highs/lows), the session VWAP (`vwap`, a "
+            "price you can arm a reclaim at) with price's position vs it and the "
+            "latest close-vs-VWAP cross (`last_vwap_cross`: reclaimed_vwap / "
+            "lost_vwap, how many bars ago), and ATR-based volatility. Also reports yesterday's momentum, today's total "
             "momentum over the full session, how long the current momentum leg has lasted "
             "(via piecewise-linear regime detection), and market-neutral momentum -- the "
             "ticker's move with the beta-scaled broad-market (SPY) move removed. Returns "
@@ -108,9 +122,14 @@ _TOOL_ANALYZE_VOLUME = {
             "clearly elevated), while the local `relative_volume` (last 10 bars vs the "
             "prior 10) is participation RIGHT NOW. Pace stays elevated all session once a "
             "name is busy, so it alone cannot tell a live move from one buyers have already "
-            "left -- use `participation_ok`, which is true only when BOTH clear (pace >= 2.0 "
+            "left -- use `participation_ok`, which is true only when BOTH clear (pace >= 1.5 "
             "and local >= 1.2), and `volume_burst` (last 3 bars vs the 10-bar average) for "
-            "the shortest-horizon read. Also returns the on-balance-volume trend and whether "
+            "the shortest-horizon read. participation_ok is the gate for buying RIGHT NOW; "
+            "an ARMED entry checks participation at the moment of the break through its "
+            "own conditions instead (rvol_pace, or previous_minute_volume_ratio -- the "
+            "completed bar's volume vs the 20 before it, reported here as "
+            "`previous_minute_volume_ratio_armable`), so a quiet tape now is no reason "
+            "not to arm one. Also returns the on-balance-volume trend and whether "
             "volume confirms or diverges from the recent price move. Volume is sourced from "
             "the consolidated tape (yfinance, all exchanges) for accuracy rather than "
             "Alpaca's single-venue feed. IMPORTANT: armed tactic conditions on rvol_pace "
@@ -133,7 +152,11 @@ _TOOL_ANALYZE_CONSOLIDATION = {
             "trigger to arm a buy at), its low (`base_low`, the structural stop), its height "
             "(for a measured-move target), whether the range has contracted on declining volume "
             "(`is_coiling` -- a genuine tight flag), and how many times each edge has been "
-            "tested. Use these measured levels instead of estimating the flag high by eye."
+            "tested. Also measures the flagpole -- the advance into the base -- as "
+            "`pole_height` (None when the bars before the base did not rise into it): "
+            "pass it to breakout_trade_geometry for the flag's measured-move target "
+            "(breakout + pole). Use these measured levels instead of estimating the flag "
+            "high by eye."
         ),
         "parameters": {
             "type": "object",
@@ -415,7 +438,10 @@ _TOOL_SUBMIT_DECISION = {
             "alert condition is met, an armed tactic executes, fresh news arrives, or "
             "the check-in you set with wake_in_minutes comes due. A decision that "
             "leaves none of those (no alerts, no armed tactics, no wake_in_minutes) "
-            "is rejected."
+            "is rejected. An 'alert' with nothing armed must carry `stand_aside` "
+            "(reason + the numbers behind it), and a decision that leaves you holding "
+            "shares must leave a protective stop armed -- a +1R wake-up alert is then "
+            "armed for you automatically."
         ),
         "parameters": {
             "type": "object",
@@ -480,6 +506,58 @@ _TOOL_SUBMIT_DECISION = {
                         },
                         "required": ["symbol", "field", "condition", "value"],
                     },
+                },
+                "stand_aside": {
+                    "type": "object",
+                    "description": (
+                        "REQUIRED when action is 'alert' and nothing is armed with set_tactics "
+                        "for any of your tickers (a stand-aside); ignored otherwise. Why you "
+                        "are not trading, with the numbers -- this is what separates "
+                        "disciplined abstention from freezing. For a basket, cite the ticker "
+                        "that came closest. A bare alert parked at an entry level you could "
+                        "have armed is rejected."
+                    ),
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "enum": list(STAND_ASIDE_REASON_KEYS),
+                            "description": (
+                                "no_actionable_level: no measured entry level exists to arm. "
+                                "needs_reassessment: a level exists but entering there depends "
+                                "on something tactics cannot watch (ADX/regime, a catalyst). "
+                                "reward_risk_fails: even an entry armed above the overhead "
+                                "resistance cannot pay 2:1 against a structural stop. "
+                                "session_window: closed, too close to the bell, or a window "
+                                "the strategy does not trade. no_buying_power: no cash."
+                            ),
+                        },
+                        "evidence": {
+                            "type": "object",
+                            "description": (
+                                "The tool readings behind the reason -- at least 3 numbers. "
+                                "Fill the ones you measured; add others by name if relevant."
+                            ),
+                            "properties": {
+                                "symbol": {"type": "string"},
+                                "price": {"type": "number"},
+                                "gap_pct": {"type": "number"},
+                                "rvol_pace_armable": {"type": "number"},
+                                "relative_volume": {"type": "number"},
+                                "previous_minute_volume_ratio": {"type": "number"},
+                                "vwap": {"type": "number"},
+                                "atr": {"type": "number"},
+                                "base_high": {"type": "number"},
+                                "base_low": {"type": "number"},
+                                "is_coiling": {"type": "boolean"},
+                                "overhead_resistance": {"type": "number"},
+                                "best_reward_risk": {"type": "number"},
+                                "adx": {"type": "number"},
+                                "z_score": {"type": "number"},
+                                "catalyst": {"type": "string"},
+                            },
+                        },
+                    },
+                    "required": ["reason", "evidence"],
                 },
                 "wake_in_minutes": {
                     "type": "integer",
@@ -690,8 +768,9 @@ _TOOL_VWAP_REVERSION_GEOMETRY = {
             "Compute the mechanical entry/stop/target math for a VWAP mean-reversion trade. "
             "Target is always VWAP; the stop sits one standard deviation beyond entry (past the "
             "next band). Returns the reward-to-risk ratio and whether it clears the 1.5:1 "
-            "mean-reversion minimum. Use this instead of doing the arithmetic yourself before "
-            "sizing a trade."
+            "mean-reversion minimum, and for a long the size the fixed account-risk budget "
+            "allows (`suggested_quantity`: the budget over the risk per share, capped by "
+            "cash). Use this instead of doing the arithmetic yourself before sizing a trade."
         ),
         "parameters": {
             "type": "object",
@@ -719,11 +798,16 @@ _TOOL_BREAKOUT_TRADE_GEOMETRY = {
         "name": "breakout_trade_geometry",
         "description": (
             "Compute the mechanical entry/stop/target math for a long breakout trade: targets "
-            "projected from ATR and/or the base height (1x and 2x each), the resulting "
-            "reward-to-risk ratio for each, and whether the best one clears the 2:1 minimum. "
-            "Pass the nearest overhead resistance (from get_key_levels) to also get "
-            "`room_to_run` -- whether that ceiling sits at least 2x the stop distance above "
-            "the entry. Use this instead of doing the arithmetic yourself before sizing a trade."
+            "projected from ATR and/or the base height (1x and 2x each), the flagpole "
+            "measured move (entry + pole_height) and an explicit structural target, the "
+            "resulting reward-to-risk ratio for each, and whether the best one clears the "
+            "2:1 minimum. With the stop under base_low the base-height targets alone top out "
+            "just under 2:1 by construction -- pass pole_height or a structural target. Pass "
+            "the overhead resistance (from get_key_levels) to also get `room_to_run` -- "
+            "whether that ceiling sits at least 2x the stop distance above the entry. Also "
+            "returns the size the fixed account-risk budget allows (`suggested_quantity`: "
+            "the budget over the risk per share, capped by cash). Use this instead of doing "
+            "the arithmetic yourself before sizing a trade."
         ),
         "parameters": {
             "type": "object",
@@ -739,6 +823,20 @@ _TOOL_BREAKOUT_TRADE_GEOMETRY = {
                     "description": (
                         "Height of the consolidation base (from analyze_consolidation), for a "
                         "measured-move target."
+                    ),
+                },
+                "pole_height": {
+                    "type": "number",
+                    "description": (
+                        "Flagpole height (analyze_consolidation's `pole_height`), for the bull "
+                        "flag's classic measured-move target: entry + pole height."
+                    ),
+                },
+                "target": {
+                    "type": "number",
+                    "description": (
+                        "An explicit structural target above the entry (e.g. the first level "
+                        "overhead that leaves room), scored like the projected ones."
                     ),
                 },
                 "overhead_resistance": {

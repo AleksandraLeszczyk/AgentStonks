@@ -11,6 +11,7 @@ of the app, so any configured provider can judge any provider's run.
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import timedelta
 from typing import Optional
 
@@ -23,6 +24,11 @@ from .market import SimMarket, parse_ts
 # Tape shown to the judge around each entry.
 CONTEXT_BARS_BEFORE = 30
 OUTCOME_WINDOW_MIN = 60
+# Non-trading cycles shown to the run reviewer, evenly spaced over the session:
+# enough to see the pattern without pasting 40 near-identical stand-asides.
+STAND_ASIDE_SAMPLE = 12
+ARMED_PLAN_SAMPLE = 8
+REASONING_CHARS = 280
 
 JUDGE_SYSTEM = """\
 You are a strict but fair trading coach reviewing a single simulated intraday \
@@ -43,7 +49,16 @@ available on the tape), and per-entry judgments already produced by a trade \
 reviewer. Assess how well the agent executed ITS OWN strategy: selectivity \
 (trading only its A+ setups vs overtrading or freezing), entry quality, exit \
 and risk management, and honest use of the data. Be concrete and reference the \
-numbers. Score 0-10 overall; list the most important improvements."""
+numbers. Score 0-10 overall; list the most important improvements.
+
+You also get the session's non-trading cycles: how many conditional plans the \
+agent armed, why it stood aside (each stand-aside records a reason and the \
+numbers behind it), and an evenly spaced sample of both. Use them to tell \
+disciplined abstention from freezing: standing aside is disciplined when the \
+cited numbers show no setup, or the setup was armed as a conditional order that \
+the tape never triggered; it is freezing when a measured entry level sat in a \
+bare alert instead. Judge what the records show rather than asking for \
+evidence that is already in front of you."""
 
 
 class EntryJudgment(BaseModel):
@@ -118,6 +133,67 @@ def _entry_context(entry: dict, exit_decision: "dict | None", market: SimMarket)
     else:
         lines.append("EXIT: position still open at session end (marked to close).")
     return "\n".join(lines)
+
+
+def _evenly_spaced(items: list, k: int) -> list:
+    """At most `k` of `items`, spread across the list (first and last kept)."""
+    if len(items) <= k:
+        return list(items)
+    step = (len(items) - 1) / (k - 1)
+    return [items[round(i * step)] for i in range(k)]
+
+
+def _fmt_alert(alert: dict) -> str:
+    return f"{alert.get('symbol')} {alert.get('field')} {alert.get('condition')} {alert.get('value')}"
+
+
+def _non_trading_context(decisions: list[dict]) -> list[str]:
+    """The run reviewer's view of the cycles that did not trade: armed plans,
+    stand-aside reasons, and an evenly spaced sample of each.
+
+    Without it a session with no fills reached the reviewer as a row of zeros,
+    and its verdict could only be "cannot verify" -- the reasoning that would
+    tell a disciplined stand-aside from a frozen one was never shown.
+    """
+    alerts = [d for d in decisions if d.get("action") == "alert"]
+    armed = [d for d in decisions if d.get("action") == "tactics"]
+    if not alerts and not armed:
+        return []
+    stand_asides = [d for d in alerts if d.get("stand_aside")]
+    reasons = Counter(d["stand_aside"].get("reason") for d in stand_asides)
+    lines = [
+        "",
+        f"NON-TRADING CYCLES: {len(alerts)} finalized with an alert, {len(armed)} "
+        "conditional plans armed with set_tactics.",
+        "Stand-aside reasons (alert with nothing armed): "
+        + (", ".join(f"{r} x{n}" for r, n in reasons.most_common()) or "none recorded"),
+    ]
+    unrecorded = len(alerts) - len(stand_asides)
+    if unrecorded:
+        lines.append(
+            f"({unrecorded} alert decisions carry no stand-aside record: a plan was "
+            "armed at the time, or the run predates stand-aside records.)"
+        )
+    if stand_asides:
+        sample = _evenly_spaced(stand_asides, STAND_ASIDE_SAMPLE)
+        lines.append(f"STAND-ASIDE SAMPLE ({len(sample)} of {len(stand_asides)}):")
+        for d in sample:
+            record = d["stand_aside"]
+            watched = "; ".join(_fmt_alert(a) for a in d.get("alerts") or []) or "none"
+            lines.append(
+                f"- {str(d.get('ts'))[11:16]} {d.get('symbol')} [{record.get('reason')}] "
+                f"evidence {record.get('evidence')} | alerts: {watched} | "
+                f"{str(d.get('reasoning') or '')[:REASONING_CHARS]}"
+            )
+    if armed:
+        sample = _evenly_spaced(armed, ARMED_PLAN_SAMPLE)
+        lines.append(f"ARMED PLAN SAMPLE ({len(sample)} of {len(armed)}):")
+        for d in sample:
+            lines.append(
+                f"- {str(d.get('ts'))[11:16]} {d.get('symbol')}: "
+                + "; ".join(d.get("tactics") or [])
+            )
+    return lines
 
 
 def _first_exit_after(entry: dict, decisions: list[dict]) -> "dict | None":
@@ -196,6 +272,7 @@ def judge_run(
                 ]
                 or ["(no entries were made this session)"]
             ),
+            *_non_trading_context(decisions),
         ]
     )
     overall: dict = {}

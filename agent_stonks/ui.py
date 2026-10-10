@@ -1877,8 +1877,26 @@ def _agent_entry_body(entry: dict) -> str:
         wake = entry.get("wake_in_minutes")
         if isinstance(wake, int):
             extra += f" · Check in after <b>{wake} min</b>"
+        checkpoints = entry.get("checkpoints") or []
+        if checkpoints:
+            levels = " or ".join(f"<b>{html.escape(format_alert(a))}</b>" for a in checkpoints)
+            extra += f" · +1R checkpoint {levels}"
+        stand_aside = entry.get("stand_aside")
+        evidence_html = ""
+        if isinstance(stand_aside, dict) and stand_aside.get("reason"):
+            reason = html.escape(str(stand_aside["reason"]).replace("_", " "))
+            extra += f" · Stand aside: <b>{reason}</b>"
+            evidence = " · ".join(
+                f"{k}={v}" for k, v in (stand_aside.get("evidence") or {}).items()
+            )
+            if evidence:
+                evidence_html = (
+                    f"<div style='margin-top:4px;font-family:monospace;font-size:11px;"
+                    f"color:{PALETTE['muted']}'>{html.escape(evidence)}</div>"
+                )
         return (
             f"<div>Regime: <b>{regime}</b> · Qty: <b>{qty:.2f}</b> · Price: <b>{price_str}</b>{extra}</div>"
+            f"{evidence_html}"
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
         )
     if etype == "tactics_set":

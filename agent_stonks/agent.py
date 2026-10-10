@@ -32,6 +32,7 @@ from .config import (
     AGENT_FINALIZE_ITERS,
     AGENT_MAX_TOOL_ITERS,
     AGENT_RETRY_SEC,
+    AGENT_RISK_PER_TRADE_PCT,
     AGENT_WAKE_MAX_MINUTES,
     QUOTE_STALE_SEC,
     QUOTE_WIDE_SPREAD_PCT,
@@ -41,6 +42,7 @@ from .llm import DEFAULT_AGENT_MODELS, get_agent_client
 from .rest import fetch_bars_window, fetch_corporate_actions, fetch_news_window
 from .state import (
     ALERTABLE_FIELDS,
+    PRICE_AXIS_ALERT_FIELDS,
     alert_triggered,
     append_agent_log,
     format_alert,
@@ -49,7 +51,9 @@ from .state import (
 )
 from .tactics import (
     TacticsExecutor,
+    last_buy_price,
     normalize_tactics,
+    protective_stop_levels,
     tactics_summaries,
 )
 
@@ -381,6 +385,13 @@ def _tool_analyze_volume(state: "SymbolState") -> dict:
         result["rvol_pace_armable"] = (
             round(pace_armable, 2) if pace_armable is not None else None
         )
+        # The breakout-bar read an armed entry can watch
+        # (`previous_minute_volume_ratio`), as the executor sees it right now.
+        with state.lock:
+            bar_ratio = state.previous_minute_volume_ratio
+        result["previous_minute_volume_ratio_armable"] = (
+            round(bar_ratio, 2) if bar_ratio is not None else None
+        )
         if pace_armable is not None and result.get("summary"):
             result["summary"] += (
                 f" Armed tactic conditions on rvol_pace evaluate the trading feed's "
@@ -644,12 +655,54 @@ def _handle_set_tactics(args: dict, app: "AppState", tracker: "DecisionTracker")
     }
 
 
+def _risk_sizing(
+    app: "AppState", tracker: "DecisionTracker", entry: float, risk_per_share: float
+) -> dict:
+    """The fixed account-risk budget turned into a share count for one trade.
+
+    The budget is AGENT_RISK_PER_TRADE_PCT of portfolio value; the shares are
+    that budget over the entry-to-stop distance, capped by what the cash can
+    buy at `entry` after the fee. Every agent's prompt says "risk a small,
+    fixed slice of the account" -- this makes the slice a number rather than
+    something each model improvises (or skips).
+    """
+    if entry <= 0 or risk_per_share <= 0:
+        return {}
+    cash = float(tracker.snapshot()["cash"])
+    equity = app.portfolio_value
+    equity = float(equity) if equity else cash
+    budget = equity * AGENT_RISK_PER_TRADE_PCT / 100.0
+    by_risk = whole_shares(budget / risk_per_share)
+    affordable = whole_shares(max(0.0, cash - tracker.trade_cost) / entry)
+    quantity = min(by_risk, affordable)
+    return {
+        "account_risk_budget_pct": AGENT_RISK_PER_TRADE_PCT,
+        "account_risk_budget_usd": round(budget, 2),
+        "suggested_quantity": int(quantity),
+        "risk_at_suggested_quantity_usd": round(quantity * risk_per_share, 2),
+        "sizing_note": (
+            f"{AGENT_RISK_PER_TRADE_PCT:g}% of the account (${budget:,.0f}) at "
+            f"${risk_per_share:.2f}/share risk allows {int(by_risk)} shares; cash buys "
+            f"{int(affordable)}. Size at suggested_quantity or less -- never more."
+        ),
+    }
+
+
+def _sized(app: "AppState", tracker: "DecisionTracker", result: dict, entry: object) -> dict:
+    """A long geometry result with the risk-budget sizing added to it."""
+    if "risk_per_share" in result and result.get("side", "long") == "long":
+        result.update(_risk_sizing(app, tracker, float(entry), float(result["risk_per_share"])))
+    return result
+
+
 def _tool_breakout_trade_geometry(
     entry: object,
     stop: object,
     atr: object = None,
     base_height: object = None,
     overhead_resistance: object = None,
+    pole_height: object = None,
+    target: object = None,
 ) -> dict:
     return ta.breakout_trade_geometry(
         float(entry),
@@ -657,6 +710,8 @@ def _tool_breakout_trade_geometry(
         base_height=float(base_height) if base_height is not None else None,
         atr=float(atr) if atr is not None else None,
         overhead_resistance=float(overhead_resistance) if overhead_resistance is not None else None,
+        pole_height=float(pole_height) if pole_height is not None else None,
+        target=float(target) if target is not None else None,
     )
 
 
@@ -728,16 +783,28 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
     "analyze_volume_profile_2": _per_symbol(_tool_analyze_volume_profile_2, "bins", "date"),
     "detect_regime_shift": _per_symbol(_tool_detect_regime_shift),
     "get_floor_pivots": _per_symbol(_tool_get_floor_pivots),
-    "breakout_trade_geometry": lambda args, app, tracker: _tool_breakout_trade_geometry(
+    "breakout_trade_geometry": lambda args, app, tracker: _sized(
+        app,
+        tracker,
+        _tool_breakout_trade_geometry(
+            args.get("entry"),
+            args.get("stop"),
+            args.get("atr"),
+            args.get("base_height"),
+            args.get("overhead_resistance"),
+            args.get("pole_height"),
+            args.get("target"),
+        ),
         args.get("entry"),
-        args.get("stop"),
-        args.get("atr"),
-        args.get("base_height"),
-        args.get("overhead_resistance"),
     ),
     "analyze_vwap_bands": _per_symbol(_tool_analyze_vwap_bands, "num_std"),
-    "vwap_reversion_geometry": lambda args, app, tracker: _tool_vwap_reversion_geometry(
-        args.get("entry"), args.get("vwap"), args.get("std_dev"), args.get("side")
+    "vwap_reversion_geometry": lambda args, app, tracker: _sized(
+        app,
+        tracker,
+        _tool_vwap_reversion_geometry(
+            args.get("entry"), args.get("vwap"), args.get("std_dev"), args.get("side")
+        ),
+        args.get("entry"),
     ),
     "analyze_order_blocks": _per_symbol(_tool_analyze_order_blocks),
     "get_corporate_actions": _per_symbol(_tool_get_corporate_actions, "days_ahead"),
@@ -759,6 +826,182 @@ def _dispatch_tool(name: str, args: dict, app: "AppState", tracker: "DecisionTra
             result = {"error": str(exc)}
     scoring.record_tool_call(app, name, result)
     return result
+
+
+# Why a cycle may finalize with a bare alert and nothing armed (submit_decision's
+# `stand_aside.reason`). The point is the audit trail: a model that cites one of
+# these plus the numbers behind it is abstaining; one that keeps parking a
+# breakout level in an alert is freezing, and the two used to look identical --
+# 40 bare alerts and no tactics in a SimLab day read the same either way.
+STAND_ASIDE_REASONS: dict[str, str] = {
+    "no_actionable_level": (
+        "no measured entry level exists to arm -- no base, reclaim, band or range "
+        "level from your tools"
+    ),
+    "needs_reassessment": (
+        "a level exists, but whether to enter there depends on something tactics "
+        "cannot watch (an ADX/regime read, a catalyst), so you wake at it to re-check"
+    ),
+    "reward_risk_fails": (
+        "a measured level exists, but even an entry armed above the overhead "
+        "resistance cannot pay 2:1 against a structural stop"
+    ),
+    "session_window": (
+        "the session is closed, too close to the bell, or in a window your strategy "
+        "does not trade"
+    ),
+    "no_buying_power": "there is no cash to open a position",
+}
+# Numbers a stand-aside must cite (its `evidence`).
+STAND_ASIDE_MIN_EVIDENCE = 3
+# Fields an entry is armed on: an 'above' alert on one of them while flat is an
+# entry level left as a wake-up call instead of armed as a conditional order.
+_ENTRY_ALERT_FIELDS = frozenset({"last_price", "previous_minute_close", "previous_minute_high"})
+
+
+def _cycle_has_tactics(state: "AppState", symbols: list[str]) -> bool:
+    """Whether any of THIS cycle's tickers has a plan armed (under the
+    Strategist the other strategies' tickers are not this cycle's business)."""
+    return any(ss is not None and ss.tactics is not None for ss in map(state.sym, symbols))
+
+
+def _validate_stand_aside(
+    raw: object, alerts: list[dict], tracker: "DecisionTracker"
+) -> "tuple[dict | None, str | None]":
+    """submit_decision's `stand_aside`, cleaned, or (None, what to fix).
+
+    Required when a cycle finalizes 'alert' with nothing armed. It must name a
+    reason and cite the numbers behind it; and a 'no_actionable_level' claim
+    is refused when the decision's own alerts include an upward cross on a
+    price field while flat -- that alert IS an actionable level.
+    """
+    reasons = ", ".join(f"'{k}' ({v})" for k, v in STAND_ASIDE_REASONS.items())
+    if not isinstance(raw, dict):
+        return None, (
+            "You are finalizing with action 'alert' and nothing armed with set_tactics, "
+            "so this is a stand-aside -- and a stand-aside must say why, with numbers. "
+            "Call submit_decision again with `stand_aside`: {reason, evidence}. reason "
+            f"is one of: {reasons}. evidence holds the readings that justify it (at "
+            f"least {STAND_ASIDE_MIN_EVIDENCE} numbers, e.g. gap_pct, rvol_pace_armable, "
+            "relative_volume, vwap, atr, base_high, base_low, overhead_resistance, "
+            "best_reward_risk, plus catalyst as text). If a measured setup exists, arm it "
+            "with set_tactics instead -- that needs no stand_aside."
+        )
+    reason = raw.get("reason")
+    if reason not in STAND_ASIDE_REASONS:
+        return None, f"stand_aside.reason must be one of: {reasons}. Call submit_decision again."
+    evidence_raw = raw.get("evidence")
+    evidence: dict = {}
+    if isinstance(evidence_raw, dict):
+        for name, value in evidence_raw.items():
+            if isinstance(value, bool) or value is None:
+                evidence[str(name)] = value
+            elif isinstance(value, (int, float)):
+                evidence[str(name)] = value
+            elif isinstance(value, str):
+                evidence[str(name)] = value[:200]
+    numbers = [
+        v for v in evidence.values() if isinstance(v, (int, float)) and not isinstance(v, bool)
+    ]
+    if len(numbers) < STAND_ASIDE_MIN_EVIDENCE:
+        return None, (
+            f"stand_aside.evidence cites {len(numbers)} number(s); it needs at least "
+            f"{STAND_ASIDE_MIN_EVIDENCE} -- the actual tool readings behind '{reason}' "
+            "(gap_pct, rvol_pace_armable, relative_volume, vwap, atr, base_high, base_low, "
+            "overhead_resistance, best_reward_risk, ...). Call submit_decision again."
+        )
+    if reason == "no_actionable_level":
+        parked = [
+            a for a in alerts
+            if a.get("field") in _ENTRY_ALERT_FIELDS
+            and a.get("condition") == "above"
+            and tracker.position_for(a.get("symbol", "")) <= 0
+        ]
+        if parked:
+            return None, (
+                f"stand_aside says 'no_actionable_level', but your alert "
+                f"'{format_alert(parked[0])}' is a measured entry level. Arm it as a "
+                "conditional entry with set_tactics instead -- a completed-bar close "
+                "through it (previous_minute_close above), a volume condition, a "
+                "structural stop and a target -- or, if it genuinely cannot be traded "
+                "mechanically, give the reason that says why ('needs_reassessment' or "
+                "'reward_risk_fails'). Then call submit_decision again."
+            )
+    return {"reason": reason, "evidence": evidence}, None
+
+
+def _unprotected_holdings(
+    state: "AppState",
+    tracker: "DecisionTracker",
+    symbols: list[str],
+    action: str,
+    trade_symbol: "str | None",
+    quantity: float,
+) -> list[str]:
+    """This cycle's tickers that will be held after the decision with no
+    protective stop armed (a sell tactic with a 'below' condition on a price
+    field). A sell of the whole position leaves nothing to protect."""
+    positions = tracker.snapshot()["positions"]
+    held = {s for s in symbols if positions.get(s, 0.0) > 0}
+    if action == "buy" and trade_symbol:
+        held.add(trade_symbol)
+    elif action == "sell" and trade_symbol and quantity >= positions.get(trade_symbol, 0.0):
+        held.discard(trade_symbol)
+    return sorted(
+        s for s in held
+        if (ss := state.sym(s)) is not None and not protective_stop_levels(ss.tactics)
+    )
+
+
+def _arm_checkpoints(
+    state: "AppState", tracker: "DecisionTracker", symbols: list[str]
+) -> list[dict]:
+    """Arm a +1R wake-up alert on every held ticker of this cycle that lacks one.
+
+    +1R is the entry plus one entry-to-stop distance, from the most recent buy
+    fill and the highest protective stop armed below it. It is where the prompt
+    says to move the stop to breakeven -- and a model asleep on a bracket is
+    never there to do it unless something wakes it, which the prompts asking
+    for this alert did not reliably achieve. Skipped when the stop is already
+    at/above the entry, price is already past +1R, or an alert or take-profit
+    at/below +1R would wake the agent there anyway.
+    """
+    snap = tracker.snapshot()
+    armed: list[dict] = []
+    for symbol in symbols:
+        ss = state.sym(symbol)
+        if ss is None or snap["positions"].get(symbol, 0.0) <= 0:
+            continue
+        entry = last_buy_price(snap["decisions"], symbol)
+        stops = [v for v in protective_stop_levels(ss.tactics) if entry is not None and v < entry]
+        if entry is None or not stops:
+            continue
+        level = round(entry + (entry - max(stops)), 2)
+        with ss.lock:
+            price = ss.last_price
+        if price is not None and price >= level:
+            continue
+        wakes_by_then = any(
+            a.get("condition") == "above"
+            and a.get("field") in PRICE_AXIS_ALERT_FIELDS
+            and float(a.get("value", float("inf"))) <= level
+            for a in ss.alerts
+        ) or any(
+            c.condition == "above" and c.field in PRICE_AXIS_ALERT_FIELDS and c.value <= level
+            for a in ss.tactics.actions
+            if a.action == "sell"
+            for c in a.conditions
+        )
+        if wakes_by_then:
+            continue
+        alert = normalize_alert(
+            {"symbol": symbol, "field": "last_price", "condition": "above", "value": level},
+            symbols=symbols,
+        )
+        if alert is not None:
+            ss.alerts = [*ss.alerts, alert]
+            armed.append(alert)
+    return armed
 
 
 def _reject(messages: list[dict], tool_call_id: str, error: str) -> None:
@@ -1016,6 +1259,19 @@ def run_agent_cycle(
                     )
                     continue
 
+                if action not in ("buy", "sell", "alert"):
+                    # Unknown / removed action (e.g. a model still reaching for the old
+                    # "sleep"). There is no do-nothing path: reject and retry.
+                    _reject(
+                        messages,
+                        tc.id,
+                        "action must be one of 'buy', 'sell', or 'alert'. To stand aside "
+                        "without trading, use action 'alert' with one or more conditions "
+                        "to watch -- there is no 'sleep' or do-nothing action. Call "
+                        "submit_decision again.",
+                    )
+                    continue
+
                 if action in ("buy", "sell") and quantity <= 0:
                     # A trade with no size is not a trade. Don't silently record a
                     # no-op -- make the model either commit to a size or stand aside
@@ -1051,6 +1307,7 @@ def run_agent_cycle(
                     )
                     continue
 
+                trade_symbol = None
                 if action in ("buy", "sell"):
                     trade_state, symbol_error = _resolve_symbol_state(app=state, args=args)
                     if symbol_error is not None:
@@ -1061,33 +1318,61 @@ def run_agent_cycle(
                             "Call submit_decision again with the ticker to trade.",
                         )
                         continue
+                    trade_symbol = trade_state.symbol
+
+                # Every position this decision leaves open sleeps behind a stop:
+                # the agent is not awake to cut it, so the stop is the only exit
+                # a failed setup gets.
+                unprotected = _unprotected_holdings(
+                    state, tracker, symbols, action, trade_symbol, quantity
+                )
+                if unprotected:
+                    _reject(
+                        messages,
+                        tc.id,
+                        f"after this {action} you would hold {', '.join(unprotected)} with no "
+                        "protective stop armed, and you sleep until something wakes you. "
+                        "Arm a structural stop first with set_tactics (a sell when "
+                        "last_price is below the level that invalidates the setup -- under "
+                        "base_low, VWAP, the range low or the band, never a round number), "
+                        "together with the take-profit, then call submit_decision again. "
+                        "To exit instead, sell the whole position.",
+                    )
+                    continue
+
+                # A bare alert with nothing armed is a stand-aside, and has to
+                # say why -- with numbers -- so abstaining on the evidence can be
+                # told apart from parking an entry level in a wake-up call.
+                # (After the stop check: holding with nothing armed is a missing
+                # stop, not a stand-aside.)
+                stand_aside = None
+                if action == "alert" and not _cycle_has_tactics(state, symbols):
+                    stand_aside, stand_aside_error = _validate_stand_aside(
+                        args.get("stand_aside"), alerts, tracker
+                    )
+                    if stand_aside_error is not None:
+                        _reject(messages, tc.id, stand_aside_error)
+                        continue
+
+                if action in ("buy", "sell"):
                     decision = tracker.record_trade(
-                        trade_state.symbol, action, quantity, reasoning,
+                        trade_symbol, action, quantity, reasoning,
                         state.api_key, state.api_secret, state.feed,
                     )
-                elif action == "alert":
+                else:
                     involved = sorted({a["symbol"] for a in alerts}) or list(symbols)
-                    decision = tracker.record_alert(", ".join(involved), alerts, reasoning)
+                    decision = tracker.record_alert(
+                        ", ".join(involved), alerts, reasoning, stand_aside=stand_aside
+                    )
                     # Distribute each condition to the SymbolState whose stream
                     # watches it (cycle start cleared the previous set).
                     for a in alerts:
                         alert_state = state.sym(a["symbol"])
                         if alert_state is not None:
                             alert_state.alerts = [*alert_state.alerts, a]
-                else:
-                    # Unknown / removed action (e.g. a model still reaching for the old
-                    # "sleep"). There is no do-nothing path: reject and retry.
-                    _reject(
-                        messages,
-                        tc.id,
-                        "action must be one of 'buy', 'sell', or 'alert'. To stand aside "
-                        "without trading, use action 'alert' with one or more conditions "
-                        "to watch -- there is no 'sleep' or do-nothing action. Call "
-                        "submit_decision again.",
-                    )
-                    continue
                 if wake_minutes is not None:
                     state.schedule_wake(clock.now() + timedelta(minutes=wake_minutes))
+                checkpoints = _arm_checkpoints(state, tracker, symbols)
                 _log(
                     state,
                     {
@@ -1101,18 +1386,26 @@ def run_agent_cycle(
                         "regime": regime,
                         "alerts": decision.alerts,
                         "wake_in_minutes": wake_minutes,
+                        "stand_aside": stand_aside,
+                        "checkpoints": checkpoints or None,
                     },
                 )
-                result_content = json.dumps(
-                    {
-                        "status": decision.status,
-                        "filled_quantity": decision.filled_quantity,
-                        "price": decision.price,
-                        "cash_after": decision.cash_after,
-                        "position_after": decision.position_after,
-                        "wake_in_minutes": wake_minutes,
-                    }
-                )
+                result: dict = {
+                    "status": decision.status,
+                    "filled_quantity": decision.filled_quantity,
+                    "price": decision.price,
+                    "cash_after": decision.cash_after,
+                    "position_after": decision.position_after,
+                    "wake_in_minutes": wake_minutes,
+                }
+                if checkpoints:
+                    result["checkpoints_armed"] = [format_alert(a) for a in checkpoints]
+                    result["checkpoint_note"] = (
+                        "A +1R wake-up alert was armed for you (entry + one stop-distance). "
+                        "When it wakes you, move the stop to at least breakeven and keep "
+                        "ratcheting it under fresh structure."
+                    )
+                result_content = json.dumps(result)
                 decision_made = True
                 obs.update_trace(
                     output={"action": decision.action, "regime": regime, "reasoning": reasoning}

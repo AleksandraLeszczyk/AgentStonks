@@ -185,9 +185,12 @@ is not a bearish trend and a split resets every level, so don't let them \
 masquerade as an organic regime.
 
 3. MATCH EACH TICKER TO A STRATEGY. For each ticker pick exactly one:
-   - momentum -> a fresh, news-driven directional move ALREADY in progress on \
-clearly elevated relative volume (a 5-20% gap with a catalyst). Best early in a \
-strong, high-participation move.
+   - momentum -> a directional move ALREADY in progress: higher highs and \
+higher lows, with a measurable base (a flag) or a VWAP reclaim to enter on. A \
+5-20% gap with a catalyst on clearly elevated volume is the classic case, but \
+on a large cap an intraday trend that builds after a flat open qualifies too \
+-- the momentum agent confirms volume at the break itself, so a quiet \
+session-wide pace is not a reason to rule it out. Best early in a strong move.
    - breakout -> price is coiled against a clear, MEASURED opening range and a \
 volume-backed break looks imminent or just happened. Best when a level is being \
 tested with rising volume but no trend has resolved yet. Only selectable when \

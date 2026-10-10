@@ -25,7 +25,7 @@ from simlab import prompts as sim_prompts
 from simlab import results as sim_results
 from simlab import tuning as sim_tuning
 from simlab.engine import SimulationConfig, SimulationEngine
-from simlab.judge import _entry_context, _first_exit_after
+from simlab.judge import _entry_context, _first_exit_after, _non_trading_context
 from simlab.market import SimMarket, parse_ts
 from simlab.patches import simulation_context
 from simlab.rule_agents import RULE_AGENTS, rule_agent
@@ -824,6 +824,10 @@ def _scripted_client():
         _tool_call("c3a", "submit_decision", {
             "action": "alert", "regime": "neutral", "reasoning": "nothing to do",
             "alerts": [{"symbol": "TEST", "field": "last_price", "condition": "above", "value": 99999}],
+            "stand_aside": {
+                "reason": "session_window",
+                "evidence": {"price": 105.0, "atr": 0.2, "rvol_pace_armable": 0.9},
+            },
         }),
     ])
     return FakeClient([cycle1, cycle2, cycle3])
@@ -1468,6 +1472,39 @@ class TestJudgeContext:
         assert "TAPE BEFORE ENTRY" in context
         assert "max favorable excursion" in context
         assert "EXIT: sold" in context
+
+    def test_run_reviewer_sees_why_the_agent_stood_aside(self):
+        """A no-trade session used to reach the reviewer as a row of zeros, so it
+        could only say "cannot verify" -- now it gets the stand-aside records
+        and the plans that were armed."""
+        def alert(minute, reason=None):
+            return {
+                "ts": f"2026-09-17T14:{minute:02d}:00+00:00", "symbol": "AAPL", "action": "alert",
+                "reasoning": "no setup", "alerts": [
+                    {"symbol": "AAPL", "field": "last_price", "condition": "below", "value": 330.0}
+                ],
+                "stand_aside": (
+                    {"reason": reason, "evidence": {"rvol_pace_armable": 0.7, "atr": 0.3}} if reason else None
+                ),
+            }
+        decisions = [alert(m, "no_actionable_level") for m in range(30)] + [
+            alert(31, "reward_risk_fails"),
+            alert(32),
+            {"ts": "2026-09-17T14:40:00+00:00", "symbol": "AAPL", "action": "tactics",
+             "tactics": ["buy 10 AAPL when previous_minute_close above 335.6"]},
+        ]
+
+        lines = _non_trading_context(decisions)
+        text = "\n".join(lines)
+
+        assert "32 finalized with an alert, 1 conditional plans armed" in text
+        assert "no_actionable_level x30, reward_risk_fails x1" in text
+        assert "1 alert decisions carry no stand-aside record" in text
+        assert "STAND-ASIDE SAMPLE (12 of 31)" in text
+        assert "previous_minute_close above 335.6" in text
+
+    def test_run_reviewer_context_is_empty_without_non_trading_cycles(self):
+        assert _non_trading_context([{"action": "buy", "status": "filled"}]) == []
 
 
 class TestPatches:

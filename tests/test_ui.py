@@ -642,3 +642,18 @@ class TestOrchestraIsItsOwnAgent:
         )
         sym = SimpleNamespace(symbol="INTC", tactics=None, alerts=[])
         assert _agent_momentum(state, sym) == (7, "Orchestra")
+
+
+def test_agent_log_card_shows_the_stand_aside_and_the_checkpoint():
+    from agent_stonks.ui import _agent_entry_body
+
+    body = _agent_entry_body({
+        "type": "decision", "action": "alert", "price": None, "quantity": 0,
+        "regime": "neutral", "reasoning": "quiet tape",
+        "alerts": [{"symbol": "AAPL", "field": "last_price", "condition": "below", "value": 330.0}],
+        "stand_aside": {"reason": "reward_risk_fails", "evidence": {"rvol_pace_armable": 0.7, "best_reward_risk": 1.6}},
+        "checkpoints": [{"symbol": "AAPL", "field": "last_price", "condition": "above", "value": 105.0}],
+    })
+    assert "Stand aside: <b>reward risk fails</b>" in body
+    assert "rvol_pace_armable=0.7" in body
+    assert "+1R checkpoint <b>AAPL last_price above 105" in body

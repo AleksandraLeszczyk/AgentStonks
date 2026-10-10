@@ -41,7 +41,7 @@ from .news import (
     YF_NEWS_SOURCE, fetch_news_with_fallback, fetch_yfinance_news, merge_news, published_at,
 )
 from .rest import fetch_bars, fetch_latest_quote, fetch_trades
-from .state import AppState, SymbolState
+from .state import AppState, SymbolState, completed_bar_volume_ratio
 from .stream_common import merge_missing_bars  # noqa: F401  (re-export)
 from .ws_reconnect import ReconnectingSocket
 
@@ -377,6 +377,7 @@ def _poll_symbol_via_rest(
         state.previous_minute_high = last_bar.get("h")
         state.previous_minute_low = last_bar.get("l")
         state.previous_minute_close = last_bar.get("c")
+        state.previous_minute_volume_ratio = completed_bar_volume_ratio(state.bars, last_bar)
         state.day_volume = sum(float(b.get("v") or 0.0) for b in bars)
         if quote:
             _apply_quote(state, quote)

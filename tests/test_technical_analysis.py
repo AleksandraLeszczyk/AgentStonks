@@ -133,10 +133,29 @@ class TestAnalyzeIntraday:
         assert "downtrend" in result["momentum_pattern"]
 
     def test_vwap_position_reported_when_present(self):
-        closes = [100.0] * 10
-        bars = _make_bars(closes, vwaps=[99.0] * 10)
+        # Heavy volume traded low, price now higher: price sits above the session VWAP.
+        closes = [99.0] * 5 + [101.0] * 5
+        bars = _make_bars(closes, volumes=[5000] * 5 + [500] * 5)
         result = analyze_intraday(bars)
         assert "above" in result["vwap_position"]
+        assert result["vwap"] < 101.0
+
+    def test_session_vwap_is_computed_not_read_from_the_bar(self):
+        """Alpaca's per-bar `vw` is that ONE bar's VWAP, and yfinance bars have
+        none -- the session VWAP has to be computed from the session's bars,
+        or the VWAP-reclaim setup can never be measured."""
+        closes = [100.0] * 10
+        with_vw = analyze_intraday(_make_bars(closes, vwaps=[90.0] * 10))
+        without_vw = analyze_intraday(_make_bars(closes))
+        assert with_vw["vwap"] == without_vw["vwap"] == 100.0
+
+    def test_vwap_reclaim_is_reported(self):
+        closes = [100.0] * 10 + [98.0] * 10 + [101.0] * 3
+        bars = _make_bars(closes, volumes=[1000] * 23)
+        result = analyze_intraday(bars, full_session_bars=bars)
+        cross = result["last_vwap_cross"]
+        assert cross["direction"] == "reclaimed_vwap"
+        assert cross["bars_ago"] == 2
 
     def test_yesterday_momentum_block_from_prev_session(self):
         today = _make_bars([100.0 + i for i in range(20)])
@@ -405,6 +424,23 @@ class TestAnalyzeConsolidation:
 
         assert result["touches_at_resistance"] == 3
         assert result["well_tested"] is True
+
+    def test_flagpole_measured_when_the_window_rose_into_the_base(self):
+        pole = [90.0 + i for i in range(20)]  # 90 -> 109: the advance
+        prior_bars = _make_bars(pole, highs=[c + 0.5 for c in pole], lows=[c - 0.5 for c in pole])
+        base_bars = _make_bars([109.0] * 10, highs=[109.5] * 10, lows=[108.5] * 10)
+        result = analyze_consolidation(prior_bars + base_bars, base_bars=10, prior_bars=20)
+
+        assert result["pole_low"] == 89.5
+        assert result["pole_height"] == 20.0  # 89.5 -> 109.5
+        assert "measured-move target" in result["summary"]
+
+    def test_no_flagpole_in_a_flat_tape(self):
+        prior_bars = _make_bars([100.0] * 20, highs=[100.5] * 20, lows=[99.5] * 20)
+        base_bars = _make_bars([100.0] * 10, highs=[100.4] * 10, lows=[99.6] * 10)
+        result = analyze_consolidation(prior_bars + base_bars, base_bars=10, prior_bars=20)
+
+        assert result["pole_height"] is None
 
 
 class TestSessionTimeWindow:
@@ -892,6 +928,28 @@ class TestBreakoutTradeGeometry:
     def test_no_resistance_given_omits_room_to_run(self):
         result = breakout_trade_geometry(entry=100.0, stop=98.0, atr=3.0)
         assert "room_to_run" not in result
+
+    def test_flag_with_stop_under_base_cannot_reach_two_to_one_on_base_height(self):
+        """Entry a cent over base_high, stop a cent under base_low: the risk IS the
+        base, so 2x the base pays just under 2:1 -- every flag, every time."""
+        result = breakout_trade_geometry(entry=335.59, stop=333.53, base_height=2.04)
+        assert result["meets_min_reward_risk"] is False
+        assert result["best_reward_risk_ratio"] < 2.0
+        assert "pass pole_height" in result["summary"]
+
+    def test_pole_target_is_the_flag_measured_move(self):
+        result = breakout_trade_geometry(
+            entry=335.59, stop=333.53, base_height=2.04, pole_height=5.0
+        )
+        assert result["target_pole"] == 340.59
+        assert result["rr_pole"] == 2.43
+        assert result["meets_min_reward_risk"] is True
+
+    def test_explicit_structural_target_is_scored(self):
+        result = breakout_trade_geometry(entry=100.0, stop=99.0, target=102.5)
+        assert result["target_structural"] == 102.5
+        assert result["rr_structural"] == 2.5
+        assert result["meets_min_reward_risk"] is True
 
 
 def _ohlc(o, h, l, c, v=1000):

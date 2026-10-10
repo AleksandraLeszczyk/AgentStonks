@@ -2,9 +2,12 @@ import threading
 
 from agent_stonks.config import MAX_BARS, PAPER_STARTING_CASH
 from agent_stonks.state import (
+    ALERTABLE_FIELDS,
     AppState,
+    alert_field_value,
     average_daily_volume,
     bar_tape,
+    completed_bar_volume_ratio,
     completed_daily_bars,
     current_volume_ratio,
     today_daily_bar,
@@ -249,3 +252,60 @@ class TestBarTape:
         s = AppState()
         s.bar_tape_override = "yfinance"
         assert bar_tape(s) == "yfinance"
+
+
+class TestCompletedBarVolumeRatio:
+    @staticmethod
+    def _bar(minute: int, volume: float, hour: int = 14) -> dict:
+        # 14:xx UTC is 10:xx ET in September (regular session).
+        return {"t": f"2026-09-17T{hour:02d}:{minute:02d}:00Z", "o": 1, "h": 1, "l": 1, "c": 1, "v": volume}
+
+    def test_bar_volume_against_the_bars_before_it(self):
+        bars = [self._bar(m, 100.0) for m in range(20)] + [self._bar(20, 250.0)]
+        assert completed_bar_volume_ratio(bars, bars[-1]) == 2.5
+
+    def test_only_the_last_twenty_bars_count(self):
+        bars = [self._bar(m, 1000.0) for m in range(10)] + [self._bar(m, 100.0) for m in range(10, 30)]
+        bars.append(self._bar(30, 150.0))
+        assert completed_bar_volume_ratio(bars, bars[-1]) == 1.5
+
+    def test_an_in_progress_bar_after_it_is_ignored(self):
+        bars = [self._bar(m, 100.0) for m in range(10)] + [self._bar(10, 200.0), self._bar(11, 9999.0)]
+        assert completed_bar_volume_ratio(bars, bars[-2]) == 2.0
+
+    def test_pre_market_prints_are_not_the_baseline_for_a_session_bar(self):
+        # 13:xx UTC before 13:30 is pre-market ET: thin, and excluded.
+        pre = [self._bar(m, 1.0, hour=13) for m in range(0, 29)]
+        session = [self._bar(m, 100.0, hour=13) for m in range(30, 40)]
+        bar = self._bar(40, 300.0, hour=13)
+        assert completed_bar_volume_ratio(pre + session + [bar], bar) == 3.0
+
+    def test_only_the_same_tape_is_the_baseline(self):
+        """After a mid-session Start the last 15 minutes are IEX (~4% of the
+        consolidated volume); the first streamed bar must not read as a surge
+        against them."""
+        sip = [{**self._bar(m, 100_000.0), "src": "sip"} for m in range(10)]
+        iex = [{**self._bar(m, 4_000.0), "src": "iex"} for m in range(10, 25)]
+        streamed = {**self._bar(25, 120_000.0), "src": "finnhub"}
+        bars = sip + iex + [streamed]
+        # No earlier finnhub bars: falls back to the consolidated family (SIP),
+        # skipping the IEX ones -- 1.2x, not 30x.
+        assert completed_bar_volume_ratio(bars, streamed) == 1.2
+
+    def test_same_source_bars_preferred_when_there_are_enough(self):
+        sip = [{**self._bar(m, 100_000.0), "src": "sip"} for m in range(10)]
+        fh = [{**self._bar(m, 50_000.0), "src": "finnhub"} for m in range(10, 20)]
+        bar = {**self._bar(20, 100_000.0), "src": "finnhub"}
+        assert completed_bar_volume_ratio(sip + fh + [bar], bar) == 2.0
+
+    def test_none_until_enough_bars(self):
+        bars = [self._bar(m, 100.0) for m in range(3)] + [self._bar(3, 500.0)]
+        assert completed_bar_volume_ratio(bars, bars[-1]) is None
+
+    def test_is_watchable_by_alerts_and_tactics(self):
+        app = AppState()
+        app.set_symbols(["AAPL"])
+        ss = app.sym("AAPL")
+        ss.previous_minute_volume_ratio = 1.8
+        assert "previous_minute_volume_ratio" in ALERTABLE_FIELDS
+        assert alert_field_value(ss, "previous_minute_volume_ratio") == 1.8

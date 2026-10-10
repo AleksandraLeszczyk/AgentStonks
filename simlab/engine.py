@@ -45,7 +45,12 @@ from agent_stonks.agent import (
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.market_hours import MARKET_TZ
-from agent_stonks.state import AppState, alert_triggered, format_alert
+from agent_stonks.state import (
+    AppState,
+    alert_triggered,
+    completed_bar_volume_ratio,
+    format_alert,
+)
 from agent_stonks.tactics import TacticsExecutor
 
 from . import data as sim_data
@@ -262,6 +267,7 @@ class SimulationEngine:
                     ss.previous_minute_high = float(last["h"])
                     ss.previous_minute_low = float(last["l"])
                     ss.previous_minute_close = close
+                    ss.previous_minute_volume_ratio = completed_bar_volume_ratio(ss.bars, last)
                     ss.quote_ts = t.isoformat()
                     mono = clock.monotonic()
                     for key in ("o", "h", "l", "c"):

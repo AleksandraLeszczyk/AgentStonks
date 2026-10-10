@@ -78,7 +78,7 @@ from .broker import Broker
 from .config import MAX_BARS
 from .market_hours import MARKET_OPEN, MARKET_TZ
 from .news import merge_news
-from .state import AppState, SymbolState
+from .state import AppState, SymbolState, completed_bar_volume_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +396,7 @@ class ReplaySession:
             ss.previous_minute_high = last.get("h") if last else None
             ss.previous_minute_low = last.get("l") if last else None
             ss.previous_minute_close = last.get("c") if last else None
+            ss.previous_minute_volume_ratio = completed_bar_volume_ratio(ss.bars, last)
             ss.day_volume = self.market.day_volume(sym, t0)
             ss.recent_prices.clear()
             if ss.last_price is not None:

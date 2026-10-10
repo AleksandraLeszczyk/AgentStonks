@@ -132,10 +132,18 @@ class TestStandDown:
         responses = [
             _response(
                 tool_calls=[
+                    _tool_call("t1", "set_tactics", {
+                        "symbol": "AAPL",
+                        "actions": [{
+                            "action": "sell", "quantity_pct": 100,
+                            "conditions": [{"field": "last_price", "condition": "below", "value": 98.0}],
+                        }],
+                        "reasoning": "stop under the base",
+                    }),
                     _tool_call(
                         "c1", "submit_decision",
                         {"action": "buy", "quantity": 1, "reasoning": "go", "wake_in_minutes": 5},
-                    )
+                    ),
                 ]
             )
         ]

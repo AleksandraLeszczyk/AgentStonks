@@ -583,6 +583,10 @@ class TestAgentSetTactics:
                             "action": "alert",
                             "reasoning": "nap",
                             "alerts": [{"field": "last_price", "condition": "above", "value": 120}],
+                            "stand_aside": {
+                                "reason": "needs_reassessment",
+                                "evidence": {"price": 100.0, "atr": 0.5, "rvol_pace_armable": 0.7},
+                            },
                         },
                     )
                 ]

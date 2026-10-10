@@ -283,6 +283,36 @@ def tactic_price_levels(tactics: "Tactics | None") -> list[dict]:
     return levels
 
 
+def protective_stop_levels(tactics: "Tactics | None") -> list[float]:
+    """Armed protective-stop levels: every 'below' condition on a price-axis
+    field of a sell action, at the level it was ARMED at (a trailed stop keeps
+    its original level in `initial_value`, which is what one R is measured
+    from). [] when nothing protective is armed."""
+    if tactics is None or tactics.status != "armed":
+        return []
+    return [
+        cond.initial_value if cond.initial_value is not None else cond.value
+        for action in tactics.actions
+        if action.action == "sell"
+        for cond in action.conditions
+        if cond.field in PRICE_AXIS_ALERT_FIELDS and cond.condition == "below"
+    ]
+
+
+def last_buy_price(decisions: list, symbol: str) -> "float | None":
+    """Fill price of the most recent filled buy of `symbol` in a decision list
+    (the ledger's entry-price convention -- see the trailing-stop ratchet)."""
+    for decision in reversed(decisions):
+        if (
+            decision.symbol == symbol
+            and decision.action == "buy"
+            and decision.status == "filled"
+            and decision.price
+        ):
+            return float(decision.price)
+    return None
+
+
 def fetch_vix_level() -> "float | None":
     """Latest VIX close from the cached broad-market fetch, or None if unavailable."""
     try:
@@ -449,15 +479,7 @@ class TacticsExecutor:
 
     def _entry_price(self, snap: dict) -> "float | None":
         """Fill price of the most recent filled buy in this symbol, or None."""
-        for decision in reversed(snap["decisions"]):
-            if (
-                decision.symbol == self.state.symbol
-                and decision.action == "buy"
-                and decision.status == "filled"
-                and decision.price
-            ):
-                return float(decision.price)
-        return None
+        return last_buy_price(snap["decisions"], self.state.symbol)
 
     def _ratchet_trailing_stop(self, tactics: Tactics) -> None:
         """Trail armed protective sell stops up as the price advances toward
