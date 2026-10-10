@@ -80,7 +80,7 @@ class TestOpenAIToolRouting:
 
     def test_model_refusing_reasoning_none_is_routed_to_responses_and_remembered(self):
         raw, client = _openai_client(chat_error=_BadRequest("reasoning_effort"))
-        kwargs = dict(model="gpt-6-astra", messages=[{"role": "user", "content": "hi"}], tools=_TOOLS, tool_choice="auto")
+        kwargs = dict(model="gpt-6-nova", messages=[{"role": "user", "content": "hi"}], tools=_TOOLS, tool_choice="auto")
 
         client.chat.completions.create(**kwargs)
         client.chat.completions.create(**kwargs)
@@ -88,7 +88,14 @@ class TestOpenAIToolRouting:
         assert len(raw.chat.completions.calls) == 1  # the second call skips chat-completions
         assert len(raw.responses.calls) == 2
         assert "reasoning_effort" not in raw.responses.calls[0]
-        assert llm._RESPONSES_API_MODELS == {"gpt-6-astra"}
+        assert llm._RESPONSES_API_MODELS == {"gpt-6-nova"}
+
+    @pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6.1-sol"])
+    def test_known_responses_only_models_skip_the_reasoning_none_probe(self, model):
+        raw, client = _openai_client(chat_error=_BadRequest("reasoning_effort"))
+        client.chat.completions.create(model=model, messages=[], tools=_TOOLS, tool_choice="auto")
+        assert raw.chat.completions.calls == []
+        assert len(raw.responses.calls) == 1
 
     def test_other_bad_requests_are_raised(self):
         raw, client = _openai_client(chat_error=_BadRequest("messages"))

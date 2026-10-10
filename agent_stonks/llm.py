@@ -183,10 +183,12 @@ class AnthropicChatClient:
         self.chat = SimpleNamespace(completions=_AnthropicCompletions(self._client))
 
 
-# Models that rejected function tools on /v1/chat/completions at every
-# reasoning_effort (gpt-6-astra and gpt-6.1-sol refuse "none", and any other
-# value disallows tools there). Filled in on the first rejection so later calls
-# go straight to /v1/responses.
+# Models that reject function tools on /v1/chat/completions at every
+# reasoning_effort (they refuse "none", and any other value disallows tools
+# there). The known ones go straight to /v1/responses: probing them costs a
+# wasted 400 per process (and per Streamlit module reload), which Langfuse logs
+# as a WARNING. Any other model that refuses is learned on its first rejection.
+_KNOWN_RESPONSES_API_MODELS = frozenset({"gpt-6-astra", "gpt-6.1-sol"})
 _RESPONSES_API_MODELS: set[str] = set()
 
 
@@ -284,9 +286,9 @@ class _OpenAIToolCompletions:
     supported ... set reasoning_effort to 'none'." We forward that documented
     workaround by defaulting `reasoning_effort="none"` on any tool-carrying call
     (unless the caller set it explicitly). Models that refuse "none" as well
-    (gpt-6-astra, gpt-6.1-sol) are switched to `/v1/responses`, where their
-    tools work at the server's default effort. Tool-less calls are passed
-    through untouched.
+    (gpt-6-astra, gpt-6.1-sol, routed up front; others after their first 400)
+    are switched to `/v1/responses`, where their tools work at the server's
+    default effort. Tool-less calls are passed through untouched.
     """
 
     def __init__(self, completions: Any, responses: _OpenAIResponsesCompletions) -> None:
@@ -297,7 +299,7 @@ class _OpenAIToolCompletions:
         if not kwargs.get("tools") or "reasoning_effort" in kwargs:
             return self._completions.create(*args, **kwargs)
         model = kwargs.get("model")
-        if model in _RESPONSES_API_MODELS:
+        if model in _KNOWN_RESPONSES_API_MODELS or model in _RESPONSES_API_MODELS:
             return self._responses.create(**kwargs)
         try:
             return self._completions.create(*args, **kwargs, reasoning_effort="none")
