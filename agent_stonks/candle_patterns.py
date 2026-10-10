@@ -14,8 +14,7 @@ One pattern so far
         gap's price range, reaching right until price trades through its far
         edge (then faded and ended at that bar) or to the session's last bar
         while it is still open. Detection is
-        `technical_analysis.fair_value_gaps`, the same definition the agent's
-        `analyze_fair_value_gaps` tool reads.
+        `technical_analysis.fair_value_gaps`.
 
 Two filters, because the raw pattern is everywhere on 1-minute bars
 ------------------------------------------------------------------

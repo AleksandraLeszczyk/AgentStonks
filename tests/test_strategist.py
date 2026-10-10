@@ -223,6 +223,17 @@ class TestRunRegimeCycle:
         enum = _TOOL_STAND_DOWN["function"]["parameters"]["properties"]["reasoning"]
         assert enum["type"] == "string"
 
+    def test_prompt_describes_exactly_the_selectable_strategies(self):
+        # A strategy the prompt describes but the enum forbids costs a rejected
+        # pick and a re-pick -- the prompt kept offering Smart Money after it was
+        # switched off.
+        import re
+
+        from agent_stonks.strategist import STRATEGIST_SYSTEM_PROMPT
+
+        described = set(re.findall(r"^   - ([a-z_]+) ->", STRATEGIST_SYSTEM_PROMPT, re.M))
+        assert described == set(SELECTABLE_STRATEGIES)
+
 
 class TestBreakoutActivationGate:
     """select_strategy('breakout') is deterministically rejected when the ORB

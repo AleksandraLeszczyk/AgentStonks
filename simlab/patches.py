@@ -11,10 +11,10 @@ duration of a simulation:
 - ``historical.fetch_market_indicators`` -> stored SPY/VIX/VIX3M closes,
   clipped to the simulated date (also covers ``tactics.fetch_vix_level`` and
   the ``vix`` tactic condition, which read through the same function)
-- ``historical.fetch_analyst_targets`` / ``fetch_smart_money_flow`` ->
-  honest "not available in simulation" notes (point-in-time histories of
-  these aren't stored; a note keeps the agent reasoning on real data instead
-  of on today's targets leaking into the past)
+- ``historical.fetch_analyst_targets`` -> an honest "not available in
+  simulation" note (no point-in-time history of targets is stored; a note
+  keeps the agent reasoning on real data instead of on today's targets
+  leaking into the past)
 - ``historical.fetch_intraday_volume_bars`` / ``fetch_intraday_bars`` /
   ``fetch_intraday_bars_for_date`` / ``fetch_daily_volume_bars`` (the volume
   tools' and the opening window's consolidated-tape reads)
@@ -114,14 +114,6 @@ def patch_table(market: SimMarket, original=getattr) -> "list[tuple[object, str,
             )
         }
 
-    def fake_smart_money_flow(symbol):
-        return {
-            "note": (
-                "insider/institutional ownership data is not available in simulation "
-                "(no point-in-time history stored) -- weigh the technical read instead"
-            )
-        }
-
     def _bars_for_day(symbol: str, day, now: datetime) -> list[dict]:
         """Stored minute bars for one ET `day`, completed by `now` -- a full
         day for a past session, clipped mid-day for the simulated one."""
@@ -213,7 +205,6 @@ def patch_table(market: SimMarket, original=getattr) -> "list[tuple[object, str,
         (agent_mod, "fetch_corporate_actions", fake_corporate_actions),
         (historical, "fetch_market_indicators", fake_market_indicators),
         (historical, "fetch_analyst_targets", fake_analyst_targets),
-        (historical, "fetch_smart_money_flow", fake_smart_money_flow),
         (historical, "fetch_intraday_volume_bars", fake_intraday_volume_bars),
         (historical, "fetch_intraday_bars", fake_intraday_volume_bars),
         (historical, "fetch_intraday_bars_for_date", fake_intraday_bars_for_date),

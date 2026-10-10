@@ -12,7 +12,6 @@ from agent_stonks.agent import (
     MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
     REVERSAL_TOOLS,
-    SMART_MONEY_TOOLS,
     VOLUME_DETECTIVE_SYSTEM_PROMPT,
     VOLUME_DETECTIVE_TOOLS,
     _FINALIZE_NOW,
@@ -25,7 +24,6 @@ from agent_stonks.agent import (
     _tool_get_corporate_actions,
     _tool_get_news,
     _tool_get_quote,
-    _tool_smart_money_trade_geometry,
     _tool_vwap_reversion_geometry,
     _wait_for_next_cycle,
     run_agent_cycle,
@@ -432,31 +430,6 @@ class TestToolHandlers:
         assert result["articles"][0]["headline"] == "tsla news"
         result = _dispatch_tool("get_news", {"symbol": "AAPL"}, app, DecisionTracker())
         assert result["articles"] == []
-
-    def test_smart_money_personality_uses_smart_money_tools(self):
-        assert PERSONALITY_TOOLS["smart_money"] is SMART_MONEY_TOOLS
-        names = {t["function"]["name"] for t in SMART_MONEY_TOOLS}
-        assert {
-            "analyze_daily_trend",
-            "analyze_order_blocks",
-            "analyze_smart_money_setup",
-            "analyze_fair_value_gaps",
-            "smart_money_trade_geometry",
-        } <= names
-        assert "analyze_market" not in names
-        assert "get_put_call_walls" not in names
-        assert "analyze_opening_range" not in names
-        assert "analyze_vwap_bands" not in names
-
-    def test_smart_money_trade_geometry_tool_computes_reward_risk(self):
-        result = _tool_smart_money_trade_geometry(entry=100.0, stop=98.0, target=110.0)
-        assert result["reward_risk_ratio"] == 5.0
-        assert result["meets_min_reward_risk"] is True
-
-    def test_analyze_smart_money_setup_dispatches_without_daily_bars(self):
-        app, _ = _app()
-        result = _dispatch_tool("analyze_smart_money_setup", {}, app, DecisionTracker())
-        assert "note" in result  # no daily bars yet
 
     def test_analyze_order_blocks_dispatches_without_daily_bars(self):
         app, _ = _app()

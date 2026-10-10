@@ -771,144 +771,6 @@ _TOOL_ANALYZE_ORDER_BLOCKS = {
     },
 }
 
-_TOOL_ANALYZE_FAIR_VALUE_GAPS = {
-    "type": "function",
-    "function": {
-        "name": "analyze_fair_value_gaps",
-        "description": (
-            "Locate fair value gaps (FVGs) -- three-candle price imbalances -- in recent intraday "
-            "bars. Returns each gap's boundaries and whether it has been filled, plus the nearest "
-            "bullish FVG at/below price (a support imbalance price may be filling now). A held fill "
-            "of a bullish FVG is one of the intraday confirmations for a Smart Money long entry. "
-            "Labeled values plus a one-line summary."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of most recent intraday bars to scan (default 50, max 300).",
-                }
-            },
-            "required": [],
-        },
-    },
-}
-
-_TOOL_ANALYZE_SMART_MONEY_SETUP = {
-    "type": "function",
-    "function": {
-        "name": "analyze_smart_money_setup",
-        "description": (
-            "The composite Smart Money read: ties a higher-timeframe bullish demand order block "
-            "(daily) to today's intraday price action. Returns the demand block being watched, "
-            "whether price is inside it, which intraday confirmations are present (bullish "
-            "rejection candle, filled bullish FVG, or intraday break-of-structure/breaker), the "
-            "suggested entry/stop (just beyond the block)/structural target, the reward-to-risk to "
-            "that target, and a `signal`: 'long_setup' (return into demand, confirmed, clears 3:1), "
-            "'watching' (valid block but not all conditions met), or 'no_setup'. Plus a `quality` "
-            "grade and a one-line summary."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
-_TOOL_SMART_MONEY_GEOMETRY = {
-    "type": "function",
-    "function": {
-        "name": "smart_money_trade_geometry",
-        "description": (
-            "Compute the mechanical entry/stop/target math for a long Smart Money setup: entry at "
-            "the demand block on a return, stop just beyond the block, target at the next opposing "
-            "structural level. Returns the reward-to-risk ratio and whether it clears the 3:1 "
-            "minimum this setup demands (it typically runs 3:1 to 5:1). Use this instead of doing "
-            "the arithmetic yourself before sizing a trade."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "entry": {"type": "number", "description": "Planned entry price, inside the order block."},
-                "stop": {"type": "number", "description": "Planned stop-loss price, just beyond (below) the block."},
-                "target": {"type": "number", "description": "Target price -- the next opposing structural level above entry."},
-            },
-            "required": ["entry", "stop", "target"],
-        },
-    },
-}
-
-_TOOL_ANALYZE_LIQUIDITY = {
-    "type": "function",
-    "function": {
-        "name": "analyze_liquidity",
-        "description": (
-            "Map resting liquidity and recent stop-runs on the intraday timeframe -- the core "
-            "Smart Money 'stop hunt' read. Returns buy-side liquidity pools above price (clustered "
-            "swing highs where buy stops rest) and sell-side pools below (swing lows where sell "
-            "stops rest), the nearest of each to price, and whether a recent liquidity SWEEP "
-            "occurred: price piercing a prior swing level then closing back through it. A bullish "
-            "sweep (a swing low undercut and reclaimed -- a stop-run below support that reversed) "
-            "is one of the strongest intraday confirmations for a long off a demand block. Labeled "
-            "values plus a one-line summary."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
-_TOOL_ANALYZE_PREMIUM_DISCOUNT = {
-    "type": "function",
-    "function": {
-        "name": "analyze_premium_discount",
-        "description": (
-            "Locate price within the recent daily dealing range: the range high/low, its midpoint "
-            "(equilibrium), and whether price sits in the DISCOUNT half (cheap, below equilibrium -- "
-            "where Smart Money buys), the PREMIUM half (expensive, above it -- where Smart Money "
-            "sells), or at equilibrium. Also returns the deep-discount OTE (optimal trade entry) "
-            "zone, the 0.618-0.79 retracement down from the high. A long off a demand block that is "
-            "ALSO in discount is higher quality than the same block in premium. Labeled values plus "
-            "a one-line summary."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
-_TOOL_GET_SMART_MONEY_FLOW = {
-    "type": "function",
-    "function": {
-        "name": "get_smart_money_flow",
-        "description": (
-            "The institutional 'smart money' ownership footprint for the ticker, from free SEC-"
-            "derived disclosures: the percentage of shares held by insiders vs institutions, net "
-            "insider buying/selling over the trailing 6 months (Form 4), and the largest "
-            "institutional holders with their quarter-over-quarter share changes (13F). This is "
-            "slow-moving (quarterly/Form-4 cadence), not an intraday timing signal -- use it as "
-            "corroboration: net insider/institutional ACCUMULATION behind a bullish demand block "
-            "strengthens the long thesis; DISTRIBUTION is a caution flag. Labeled values plus a "
-            "one-line summary."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
-_TOOL_GET_ANALYST_TARGETS = {
-    "type": "function",
-    "function": {
-        "name": "get_analyst_targets",
-        "description": (
-            "Current Wall Street price targets for the ticker with the actionable read: the "
-            "yfinance CONSENSUS (mean/median/high/low target across every covering analyst, the "
-            "analyst count, and the recommendation) plus the standing target from UBS, Morgan "
-            "Stanley, and Barclays -- each annotated with the implied upside/downside vs the "
-            "current price. Use it to gauge how much room the Street sees: price near or above "
-            "the consensus mean means limited upside (don't chase a gap into it -- it acts as "
-            "resistance/an objective); a wide gap below the mean leaves room to run; price "
-            "outside the whole high-low range is a valuation extreme. Targets update at most a "
-            "few times a day (cached), so this is positional context, not an intraday trigger. "
-            "Returns labeled values, a list of actionable `insights`, and a one-line summary."
-        ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}
-
 _TOOL_GET_CORPORATE_ACTIONS = {
     "type": "function",
     "function": {
@@ -971,12 +833,6 @@ for _tool in (
     _TOOL_GET_NEWS,
     _TOOL_ANALYZE_VWAP_BANDS,
     _TOOL_ANALYZE_ORDER_BLOCKS,
-    _TOOL_ANALYZE_FAIR_VALUE_GAPS,
-    _TOOL_ANALYZE_SMART_MONEY_SETUP,
-    _TOOL_ANALYZE_LIQUIDITY,
-    _TOOL_ANALYZE_PREMIUM_DISCOUNT,
-    _TOOL_GET_SMART_MONEY_FLOW,
-    _TOOL_GET_ANALYST_TARGETS,
     _TOOL_GET_CORPORATE_ACTIONS,
     _TOOL_SET_TACTICS,
 ):
@@ -1040,28 +896,6 @@ REVERSAL_TOOLS: list[dict] = [
     _TOOL_SUBMIT_DECISION,
 ]
 
-# Smart Money (highest-edge): higher-timeframe daily structure (trend + order
-# blocks) + intraday confirmation (the composite read + FVG drill-in) + volume +
-# SMC geometry + news + price. The composite tool does the heavy lifting; the
-# order-block / FVG tools let the agent drill into the structure behind it.
-SMART_MONEY_TOOLS: list[dict] = [
-    _TOOL_GET_QUOTE,
-    _TOOL_ANALYZE_DAILY_TREND,
-    _TOOL_ANALYZE_ORDER_BLOCKS,
-    _TOOL_ANALYZE_PREMIUM_DISCOUNT,
-    _TOOL_ANALYZE_SMART_MONEY_SETUP,
-    _TOOL_ANALYZE_FAIR_VALUE_GAPS,
-    _TOOL_ANALYZE_LIQUIDITY,
-    _TOOL_ANALYZE_VOLUME,
-    _TOOL_GET_SMART_MONEY_FLOW,
-    _TOOL_GET_ANALYST_TARGETS,
-    _TOOL_SMART_MONEY_GEOMETRY,
-    _TOOL_GET_NEWS,
-    _TOOL_GET_POSITION,
-    _TOOL_SET_TACTICS,
-    _TOOL_SUBMIT_DECISION,
-]
-
 # Volume Signal Detective: spike-classified demand/supply lines are the primary
 # read (analyze_volume_profile_2), cross-examined against session structure
 # (get_key_levels), participation (analyze_volume), the approach into the level
@@ -1090,7 +924,6 @@ PERSONALITY_TOOLS: dict[str, list[dict]] = {
     "momentum": MOMENTUM_TOOLS,
     "breakout": BREAKOUT_TOOLS,
     "reversal": REVERSAL_TOOLS,
-    "smart_money": SMART_MONEY_TOOLS,
     "volume_detective": VOLUME_DETECTIVE_TOOLS,
 }
 

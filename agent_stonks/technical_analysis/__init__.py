@@ -18,9 +18,9 @@ book and the market backdrop share a vocabulary of bars and nothing else.
     market        the broad-market backdrop
     options_flow  put/call walls and dealer gamma
     geometry      risk/reward arithmetic and the session clock
-    smart_money   order blocks, fair-value gaps, liquidity, premium/discount
+    zones         order blocks and fair-value gaps
 
-`indicators` is the base layer; every other module imports from it and none of
+`indicators` is the base layer most of the others build on, and none of
 them import from each other, apart from the two news-timestamp helpers in
 `_shared`. Everything public is re-exported here, so `technical_analysis.X`
 still resolves for the agent tools, the UI and SimLab, which is what let the
@@ -67,16 +67,10 @@ from .geometry import (  # noqa: F401
     session_time_window,
     vwap_reversion_geometry,
 )
-from .smart_money import (  # noqa: F401
-    analyze_fair_value_gaps,
-    analyze_liquidity,
+from .zones import (  # noqa: F401
     analyze_order_blocks,
-    analyze_premium_discount,
-    analyze_smart_money_setup,
     fair_value_gaps,
-    find_fair_value_gaps,
     find_order_blocks,
-    smart_money_trade_geometry,
 )
 
 # Private helpers that callers outside the package name directly.

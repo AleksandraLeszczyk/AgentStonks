@@ -72,7 +72,6 @@ from .agent_prompts import (  # noqa: F401
     MULTI_SYMBOL_ADDENDUM,
     REVERSAL_SYSTEM_PROMPT,
     SESSION_CLOSED_ADDENDUM,
-    SMART_MONEY_SYSTEM_PROMPT,
     STRATEGIST_MODE_ADDENDUM,
     TACTICS_ADDENDUM,
     VOLUME_DETECTIVE_SYSTEM_PROMPT,
@@ -86,7 +85,6 @@ from .agent_tools import (  # noqa: F401
     MOMENTUM_TOOLS,
     PERSONALITY_TOOLS,
     REVERSAL_TOOLS,
-    SMART_MONEY_TOOLS,
     VOLUME_DETECTIVE_TOOLS,
     _TOOL_STAND_DOWN,
 )
@@ -689,66 +687,6 @@ def _tool_analyze_order_blocks(state: "SymbolState") -> dict:
     return ta.analyze_order_blocks(bars, spot=spot)
 
 
-def _tool_analyze_fair_value_gaps(state: "SymbolState", limit: object = None) -> dict:
-    n = max(1, min(int(limit or 50), 300))
-    with state.lock:
-        bars = list(state.bars)[-n:]
-        spot = state.last_price
-    if not bars:
-        return {"note": "no intraday bars available yet"}
-    return ta.analyze_fair_value_gaps(bars, spot=spot)
-
-
-def _tool_analyze_smart_money_setup(state: "SymbolState") -> dict:
-    daily = list(state.daily_bars)
-    if not daily:
-        return {"note": "no daily bars available yet"}
-    with state.lock:
-        intraday = list(state.bars)
-        spot = state.last_price
-    return ta.analyze_smart_money_setup(daily, intraday_bars=intraday, spot=spot)
-
-
-def _tool_smart_money_trade_geometry(entry: object, stop: object, target: object) -> dict:
-    return ta.smart_money_trade_geometry(float(entry), float(stop), float(target))
-
-
-def _tool_analyze_liquidity(state: "SymbolState") -> dict:
-    with state.lock:
-        bars = list(state.bars)
-        spot = state.last_price
-    if not bars:
-        return {"note": "no intraday bars available yet"}
-    return ta.analyze_liquidity(bars, spot=spot)
-
-
-def _tool_analyze_premium_discount(state: "SymbolState") -> dict:
-    daily = list(state.daily_bars)
-    if not daily:
-        return {"note": "no daily bars available yet"}
-    with state.lock:
-        spot = state.last_price
-    return ta.analyze_premium_discount(daily, spot=spot)
-
-
-def _tool_get_smart_money_flow(state: "SymbolState") -> dict:
-    symbol = state.symbol
-    if not symbol:
-        return {"note": "no symbol set"}
-    return historical.fetch_smart_money_flow(symbol)
-
-
-def _tool_get_analyst_targets(state: "SymbolState") -> dict:
-    symbol = state.symbol
-    if not symbol:
-        return {"note": "no symbol set"}
-    # Pass the live streamed price so the upside math is anchored to the current
-    # tape rather than Yahoo's slower quote.
-    with state.lock:
-        spot = state.last_price
-    return historical.fetch_analyst_targets(symbol, current_price=spot)
-
-
 def _tool_get_corporate_actions(state: "SymbolState", days_ahead: object = None) -> dict:
     symbol = state.symbol
     if not symbol:
@@ -802,16 +740,7 @@ _DISPATCH: dict[str, Callable[[dict, "AppState", "DecisionTracker"], dict]] = {
         args.get("entry"), args.get("vwap"), args.get("std_dev"), args.get("side")
     ),
     "analyze_order_blocks": _per_symbol(_tool_analyze_order_blocks),
-    "analyze_fair_value_gaps": _per_symbol(_tool_analyze_fair_value_gaps, "limit"),
-    "analyze_smart_money_setup": _per_symbol(_tool_analyze_smart_money_setup),
-    "analyze_liquidity": _per_symbol(_tool_analyze_liquidity),
-    "analyze_premium_discount": _per_symbol(_tool_analyze_premium_discount),
-    "get_smart_money_flow": _per_symbol(_tool_get_smart_money_flow),
-    "get_analyst_targets": _per_symbol(_tool_get_analyst_targets),
     "get_corporate_actions": _per_symbol(_tool_get_corporate_actions, "days_ahead"),
-    "smart_money_trade_geometry": lambda args, app, tracker: _tool_smart_money_trade_geometry(
-        args.get("entry"), args.get("stop"), args.get("target")
-    ),
     "get_put_call_walls": _per_symbol(_tool_get_put_call_walls),
     "get_session_clock": lambda args, app, tracker: ta.session_time_window(),
     "get_news": _per_symbol(_tool_get_news, "limit"),

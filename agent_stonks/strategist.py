@@ -198,10 +198,8 @@ zone); selecting it otherwise is rejected and you must re-pick for that ticker.
    - reversal -> a confirmed RANGE (ADX below 20, no catalyst, large-cap quiet \
 tape) where price is stretched from VWAP. Best in the quiet middle of the \
 session with no trend. Do NOT pick this when ADX shows a real trend.
-   - smart_money -> price is returning to a higher-timeframe bullish demand \
-order block in a non-bearish regime -- the highest-edge, most all-conditions \
-setup when such a zone exists at/below price. When none of the above fits \
-cleanly for a ticker, default to momentum as the broadest-purpose intraday read.
+   When none of the above fits cleanly for a ticker, default to momentum as \
+the broadest-purpose intraday read.
 
 4. FINALIZE. Call select_strategy ONCE PER TICKER -- every ticker you were given \
 must get exactly one call, and you are not finished until all of them do. Each \
