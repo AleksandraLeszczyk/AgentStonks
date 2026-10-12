@@ -1437,8 +1437,9 @@ def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
 
     A race (`orchestra`) keeps one of each per racer, and races both models of
     a symbol when it has two, so the chart of a symbol has to pick: the racer
-    holding the position when it trades this symbol, otherwise the first racer
-    on it in the race's order. Its own record when it has one, otherwise the
+    holding the position when it trades this symbol (under a split, the first
+    pair on it with a position), otherwise the first racer on it in the race's
+    order. Its own record when it has one, otherwise the
     form's configuration for it, walked like any configuration without a record.
     A symbol the race does not trade gets neither, and draws the instrument's
     shipped configuration.
@@ -1462,8 +1463,8 @@ def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
     ]
     if not on_symbol:
         return None, None
-    holder = race.get("holder")
-    key = holder if holder in on_symbol else on_symbol[0]
+    holders = list(race.get("holders") or []) or [race.get("holder")]
+    key = next((k for k in on_symbol if k in holders), on_symbol[0])
     record = records.get(key)
     if record:
         return record.get("config") or configs.get(key), record

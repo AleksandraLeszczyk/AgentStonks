@@ -188,17 +188,22 @@ def _orchestra_levels_record(records: "dict | None") -> dict:
 
 def _orchestra_record(race: "dict | None") -> "dict | None":
     """What a restart needs of Orchestra itself: its racers in order, which one
-    held the position and the day's candidate selection. The board is rebuilt
-    by the next cycle."""
+    held the position and the day's candidate selection -- or, under a split,
+    the day's budget and each pair's account. The board is rebuilt by the next
+    cycle."""
     if not race:
         return None
     return {
         "date": race.get("date"),
+        "mode": race.get("mode") or "race",
         "order": list(race.get("order") or []),
         "labels": dict(race.get("labels") or {}),
         "holder": race.get("holder"),
+        "holders": list(race.get("holders") or []),
         # Today's 09:34 candidates: made once, so a restart keeps them.
         "selection": race.get("selection"),
+        # A split's budget and accounts: read once, at the first open bar.
+        "budget": race.get("budget"),
     }
 
 
@@ -496,6 +501,7 @@ def _signature(state) -> tuple:
         repr(levels.get("memory")),
         racers,
         race.get("holder"),
+        repr(race.get("budget")),
         (race.get("selection") or {}).get("date"),
         # A stop has to reach the file promptly, or a crash right after it
         # would start the stopped run again.

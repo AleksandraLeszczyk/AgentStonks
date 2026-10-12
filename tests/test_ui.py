@@ -643,6 +643,31 @@ class TestOrchestraIsItsOwnAgent:
         sym = SimpleNamespace(symbol="INTC", tactics=None, alerts=[])
         assert _agent_momentum(state, sym) == (7, "Orchestra")
 
+    def test_a_restart_starts_the_same_orchestra_again(self):
+        """The run spec ▶ Start saved decodes to the Orchestra it was: the mode,
+        each pair's share and the 09:34 pick, not just the pairs."""
+        from dataclasses import asdict
+
+        from agent_stonks import ui
+        from agent_stonks.apple_trader import AppleTraderConfig
+        from agent_stonks.candidates import SelectionRules
+        from agent_stonks.orchestra import MODE_SPLIT, build_orchestra_config
+
+        pairs = ["AAPL:dayrange", "INTC:dayrange"]
+        split = build_orchestra_config(
+            pairs, AppleTraderConfig(), mode=MODE_SPLIT,
+            budget_pct={"AAPL:dayrange": 70.0, "INTC:dayrange": 30.0},
+        )
+        race = build_orchestra_config(pairs, AppleTraderConfig(), selection=SelectionRules(max_pairs=1))
+        assert ui._apple_config_from(asdict(split)) == split
+        assert ui._apple_config_from(asdict(race)) == race
+
+    def test_its_mode_and_shares_are_remembered(self):
+        from agent_stonks import last_setup
+
+        assert last_setup.is_kept("orchestra_mode")
+        assert last_setup.is_kept("orchestra_budget_pct_highlow_AAPL")
+
 
 def test_agent_log_card_shows_the_stand_aside_and_the_checkpoint():
     from agent_stonks.ui import _agent_entry_body

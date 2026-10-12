@@ -1452,6 +1452,11 @@ class DayRangeTrader(BaseTrader):
         # fresh ▶ Start trades again. SimLab never reads it -- a replay has no
         # ▶ Start, so there the stand-down simply lasts the session.
         self.halt: "str | None" = None
+        # Whether a run started again today re-arms a session that was stopped
+        # out (`_resume`). A single run stops on a stop-out, so being started
+        # again is the say-so; a split Orchestra (`orchestra`) runs on past one
+        # pair's stop-out, so for its pairs a restart is not.
+        self.rearm_after_stop = True
         # Where the published record and the sidebar form live (`TraderSlot`).
         self.slot: TraderSlot = SINGLE_SLOT
         # Whether the per-bar read line goes to the log. A race silences the
@@ -2502,13 +2507,14 @@ class DayRangeTrader(BaseTrader):
         ledger it continues is flat, and keeps it only while shares are held.
 
         A stop-out's stand-down is the one thing not taken back: the stop ended
-        that run, and pressing ▶ Start again is the say-so to trade again today.
-        The breaker's stand-down (`_close_out`) did not stop the run, so it
-        still holds."""
+        that run, and pressing ▶ Start again is the say-so to trade again today
+        -- unless `rearm_after_stop` is off (a split Orchestra's pairs), when it
+        holds like any other. The breaker's stand-down (`_close_out`) did not
+        stop the run, so it still holds."""
         if not memory:
             return
         stand_down = memory.get("stand_down")
-        if stand_down == self.STOPPED_OUT:
+        if stand_down == self.STOPPED_OUT and self.rearm_after_stop:
             _log(
                 state,
                 {

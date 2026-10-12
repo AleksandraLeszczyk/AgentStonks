@@ -32,6 +32,7 @@ scan; in a tooltip it is there for whoever asks.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -691,8 +692,9 @@ def orchestra_params(
     seed: "OrchestraConfig | None" = None,
     briefing_choices: "list[tuple[str, str]] | None" = None,
 ) -> "OrchestraConfig | None":
-    """Orchestra's setup: which (ticker, model) pairs, each pair's own numbers,
-    and the rules they all share. None while no pair is picked.
+    """Orchestra's setup: race or split, which (ticker, model) pairs, each
+    pair's own numbers -- under a split, its share of the budget too -- and the
+    rules they all share. None while no pair is picked.
 
     Its own agent with its own settings: `copy` carries Orchestra's widget-key
     prefix, so nothing here is shared with Apple Trader's form. Every per-pair
@@ -707,6 +709,7 @@ def orchestra_params(
     is the one read.
     """
     from .orchestra import (
+        MODE_LABELS, MODE_SPLIT,
         build_orchestra_config, default_pairs, all_pairs, racer_key, racer_label,
     )
 
@@ -717,6 +720,14 @@ def orchestra_params(
         text = racer_label(key)
         return text if not available or ticker in available else f"{text} ({copy.unavailable_suffix})"
 
+    mode = st.radio(
+        "Mode",
+        list(MODE_LABELS),
+        format_func=MODE_LABELS.get,
+        key=copy.key("mode"),
+        help=copy.help.get("mode"),
+    )
+    split = mode == MODE_SPLIT
     # The chips carry the plain label: Streamlit keeps a chip's text from when
     # it was picked, so a "(not streamed)" there would outlive the fix. The
     # rows below say it instead.
@@ -731,7 +742,8 @@ def orchestra_params(
     if not pairs:
         st.info("Pick at least one (ticker, model) pair.", icon=":material/info:")
         return None
-    selection = selection_params(copy, briefing_choices)
+    # The 09:34 pick narrows a race; a split trades every pair it is given.
+    selection = None if split else selection_params(copy, briefing_choices)
 
     defaults = AppleTraderConfig()
     section("Levels", copy.sections.get("pairs"))
@@ -741,19 +753,25 @@ def orchestra_params(
         racer_key(r): r for r in (seed.racers if seed is not None else [])
         if r.level_unit == level_unit
     }
-    head = st.columns([2.2, 1, 1, 1])
+    widths = [2.2, 1, 1, 1, 1] if split else [2.2, 1, 1, 1]
+    head = st.columns(widths)
     head[0].caption("Pair")
     head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
     head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
     head[3].caption("Min win", help=copy.help.get("pair_min_win_k"))
+    if split:
+        head[4].caption("Budget %", help=copy.help.get("pair_budget_pct"))
+    # An even split, rounded down to a tenth so it never adds up past 100.
+    even = math.floor(1000.0 / len(pairs)) / 10.0
     levels: dict = {}
+    budget_pct: dict = {}
     for key in pairs:
         ticker, _, model_key = key.partition(":")
         default_buy, default_sell = dayrange_levels(ticker, model_key)
         start_buy, start_sell = default_buy, default_sell
         if key in seeded:
             start_buy, start_sell = float(seeded[key].buy_k), float(seeded[key].sell_k)
-        row = st.columns([2.2, 1, 1, 1], vertical_alignment="center")
+        row = st.columns(widths, vertical_alignment="center")
         row[0].markdown(label(key))
         buy_k = row[1].number_input(
             f"{key} buy", min_value=0.05, max_value=3.0, value=start_buy, step=0.05,
@@ -770,6 +788,12 @@ def orchestra_params(
             step=0.05, format="%.2f", key=copy.key(f"min_win_k_{model_key}_{ticker}"),
             label_visibility="collapsed",
         )
+        if split:
+            budget_pct[key] = float(row[4].number_input(
+                f"{key} budget %", min_value=0.5, max_value=100.0, value=even, step=5.0,
+                format="%.1f", key=copy.key(f"budget_pct_{model_key}_{ticker}"),
+                label_visibility="collapsed",
+            ))
         sell_k = repaired_sell(float(buy_k), float(sell_k), racer_label(key))
         if min_win_k and min_win_k >= float(buy_k) - sell_k:
             st.warning(
@@ -779,6 +803,13 @@ def orchestra_params(
                 icon=":material/warning:",
             )
         levels[key] = (float(buy_k), float(sell_k), float(min_win_k))
+    if split:
+        total = sum(budget_pct.values())
+        if total <= 100.0 + 1e-6:
+            st.caption(
+                f"The pairs share {total:g}% of the budget"
+                + (f"; {100.0 - total:g}% stays in cash." if total < 100.0 - 1e-6 else ".")
+            )
 
     col_a, col_b = st.columns(2)
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
@@ -789,7 +820,10 @@ def orchestra_params(
     )
     base = replace(defaults, level_unit=level_unit, **sizing, **rules)
     try:
-        return build_orchestra_config(list(pairs), base, levels, selection=selection)
+        return build_orchestra_config(
+            list(pairs), base, levels, selection=selection,
+            mode=mode, budget_pct=budget_pct if split else None,
+        )
     except ValueError as exc:
         st.error(str(exc), icon=":material/error:")
         return None

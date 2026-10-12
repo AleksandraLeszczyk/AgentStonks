@@ -2244,11 +2244,20 @@ def _orchestra_board(state: AppState) -> None:
     board = race.get("board") or []
     if not board or state.llm_personality != ORCHESTRA_KEY:
         return
+    split = race.get("mode") == "split"
     holder = race.get("holder")
-    title = (
-        f"🎼 Orchestra — following **{(race.get('labels') or {}).get(holder, holder)}**"
-        if holder else "🎼 Orchestra — open, the first buy to fill takes it"
-    )
+    if split:
+        budget = race.get("budget") or {}
+        held = len(race.get("holders") or [])
+        title = (
+            f"🎼 Orchestra — split, {held} of {len(board)} pairs holding"
+            + (f", budget ${budget['base']:,.2f}" if budget.get("base") is not None else "")
+        )
+    else:
+        title = (
+            f"🎼 Orchestra — following **{(race.get('labels') or {}).get(holder, holder)}**"
+            if holder else "🎼 Orchestra — open, the first buy to fill takes it"
+        )
     if not race.get("running"):
         title += " (stopped)"
     st.markdown(title)
@@ -2261,6 +2270,14 @@ def _orchestra_board(state: AppState) -> None:
                 "Last": row["close"],
                 "Buy": row["buy"],
                 "Sell": row["sell"],
+                **(
+                    {
+                        "Budget %": row.get("budget_pct"),
+                        "Cash": row.get("cash"),
+                        "Shares": row.get("shares"),
+                    }
+                    if split else {}
+                ),
             }
             for row in board
         ]),
@@ -2270,6 +2287,12 @@ def _orchestra_board(state: AppState) -> None:
             "Last": st.column_config.NumberColumn(format="$%.2f"),
             "Buy": st.column_config.NumberColumn(format="$%.2f"),
             "Sell": st.column_config.NumberColumn(format="$%.2f"),
+            "Budget %": st.column_config.NumberColumn(format="%g%%"),
+            "Cash": st.column_config.NumberColumn(
+                format="$%.2f",
+                help="What the pair's share of today's budget has left to buy with.",
+            ),
+            "Shares": st.column_config.NumberColumn(format="%g"),
             "Above buy (units)": st.column_config.NumberColumn(
                 format="%+.2f",
                 help="(last close − buy level) ÷ the pair's level unit. The pair "
@@ -2926,11 +2949,27 @@ _ORCHESTRA_COPY = dc_replace(
             "- **Buy / Sell** — each pair's own distances, starting from its tuned pair.\n"
             "- **Min win** — each pair's circuit breaker: a trade that closes for no more "
             "than this stands *that pair* down for the day; the others keep racing.\n"
+            "- **Budget %** (Split only) — the pair's share of the budget.\n"
             "- Everything below the table is shared by every pair."
         ),
     },
     help={
         **_APPLE_TRADER_COPY.help,
+        "mode": (
+            "**Race** — every pair watches for its buy; the first whose buy fills takes "
+            "the budget and is the only one that trades until its position is closed, "
+            "then the race is open again. A stop-out stops the agent.\n\n"
+            "**Split** — every pair trades at once, each on its own share of the budget "
+            "(the Budget % column). A pair sizes every buy off the cash its share has "
+            "left, and holds only the shares it bought itself. The budget is what the "
+            "account is worth at the first bar after the open. A stop-out stands that "
+            "pair down for the day, and the others keep trading. No 09:34 candidate pick."
+        ),
+        "pair_budget_pct": (
+            "Split only: this pair's share of the budget, in percent. Together at most "
+            "100; what is left stays in cash. Position size below is then a share of "
+            "the pair's own cash, not of the account's."
+        ),
         "pairs": (
             "The (ticker, model) pairs Orchestra watches — AAPL on the day-range model "
             "and AAPL on HighLow are two pairs. The defaults are the pairs SimLab's "
@@ -3211,7 +3250,10 @@ def _start_agent(
     if not syms:
         st.error("Enter at least one symbol in the sidebar first.")
     elif is_orchestra and not isinstance(apple_config, OrchestraConfig):
-        st.error("Pick at least one (ticker, model) pair for Orchestra.")
+        st.error(
+            "Orchestra's rules are not complete: pick at least one (ticker, model) pair, "
+            "and fix what the Orchestra rules panel flags."
+        )
     elif is_rule_agent and unstreamed:
         st.error(
             f"{_personality_label(personality)} is configured to trade "
@@ -3338,7 +3380,9 @@ def _start_agent(
                 for key, record in (getattr(state, "orchestra_levels", None) or {}).items()
             }
             if getattr(state, "orchestra", None):
-                state.orchestra = {**state.orchestra, "holder": None}
+                # A fresh ledger: nobody holds, and a split reads its budget
+                # off it again.
+                state.orchestra = {**state.orchestra, "holder": None, "holders": [], "budget": None}
         state.decision_tracker = tracker
         state.session_date = session_store.session_date()
         state.session_restored = None
@@ -3479,7 +3523,7 @@ def _agent_panel(
         "The exceptions are Apple Trader and Orchestra, which have no LLM at all: "
         "Apple Trader is a fixed loop over a saved day-range forecast on one "
         "instrument, and Orchestra runs those rules on several (ticker, model) pairs "
-        "at once, following the first whose buy fills."
+        "at once — racing them for the budget, or splitting the budget between them."
     )
     with st.expander("LLM", expanded=True):
         # The Strategist first: it picks and switches between the individual
@@ -3519,9 +3563,11 @@ def _agent_panel(
             st.caption(
                 "🎼 Orchestra runs no LLM. It plays Apple Trader's rules on several "
                 "**(ticker, model) pairs** at once — AAPL on the day-range model and AAPL "
-                "on HighLow are two pairs. Each forecasts its own day at 9:35; the first "
-                "whose buy fills is followed alone until its position is closed, then the "
-                "others may buy again. A stop-out stops the agent."
+                "on HighLow are two pairs. Each forecasts its own day at 9:35. **Race:** "
+                "the first whose buy fills is followed alone until its position is closed, "
+                "then the others may buy again; a stop-out stops the agent. **Split:** "
+                "every pair trades in parallel on its own share of the budget; a stop-out "
+                "stands only that pair down."
             )
         if personality in RULE_AGENT_KEYS:
             # No LLM in the loop, so no LLM settings on screen. The stored
@@ -3971,12 +4017,25 @@ def _orchestra_candidates_panel() -> None:
     out now, from what is known so far."""
     state = _get_state()
     today = session_store.session_date()
-    decided = (getattr(state, "orchestra", None) or {}).get("selection") or {}
+    race = getattr(state, "orchestra", None) or {}
+    # A split run publishes no pick; one a race made earlier today is not its.
+    decided = (race.get("selection") or {}) if race.get("mode") != "split" else {}
     form = getattr(state, "orchestra_form", None)
     rows: "list[dict]" = []
     if decided.get("date") == today and decided.get("rows"):
         rows = decided["rows"]
         st.markdown("**🎼 Orchestra's candidates for today** — picked at 09:34 ET")
+    elif form is not None and form.split:
+        st.markdown("**🎼 Orchestra's candidates for today**")
+        st.caption(
+            "Orchestra splits the budget in its rules, so there is no 09:34 pick: every "
+            "pair trades all day on its own share — "
+            + ", ".join(
+                f"{racer_label(r)} {form.budget_pct.get(f'{r.ticker}:{r.model_key}', 0):g}%"
+                for r in form.racers
+            ) + "."
+        )
+        return
     elif form is not None and form.selection is None:
         st.markdown("**🎼 Orchestra's candidates for today**")
         st.caption(
@@ -4299,10 +4358,15 @@ def _apple_config_from(raw: "dict | None") -> "AppleTraderConfig | OrchestraConf
         return None
     known = {f.name for f in fields(AppleTraderConfig)}
     if "racers" in raw:
-        return OrchestraConfig([
-            AppleTraderConfig(**{k: v for k, v in racer.items() if k in known})
-            for racer in raw["racers"]
-        ])
+        return OrchestraConfig(
+            [
+                AppleTraderConfig(**{k: v for k, v in racer.items() if k in known})
+                for racer in raw["racers"]
+            ],
+            selection=raw.get("selection"),
+            mode=raw.get("mode") or "race",
+            budget_pct=raw.get("budget_pct") or {},
+        )
     return AppleTraderConfig(**{k: v for k, v in raw.items() if k in known})
 
 

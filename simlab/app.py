@@ -215,11 +215,13 @@ def _render_rule_agent(personality: str) -> None:
         st.markdown(
             "Apple Trader's rules on several **(ticker, model) pairs** at once, from one "
             "cash balance. Every pair forecasts its own session at 9:35 and rests its own "
-            "levels; the first whose buy fills is the only one that trades until its "
-            "position is closed, and then the others may buy again. A stop-out stands "
-            "every pair down for the rest of that session. Each pair's own rules are "
-            "Apple Trader's, unchanged — Orchestra with one pair replays exactly as "
-            "Apple Trader."
+            "levels. In a **race** the first whose buy fills is the only one that trades "
+            "until its position is closed, and then the others may buy again; a stop-out "
+            "stands every pair down for the rest of that session. In a **split** every "
+            "pair trades at once on its own share of the session's budget, and a "
+            "stop-out stands only that pair down. Each pair's own rules are Apple "
+            "Trader's, unchanged — Orchestra with one pair (at 100% in a split) replays "
+            "exactly as Apple Trader."
         )
         st.caption(
             ":material/database: A dataset must carry every pair's symbol, and the "
@@ -2124,6 +2126,18 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "in the datasets. The order is the tie-break when two buys fill on one bar. "
             "Each Orchestra setup is one row in Results; compare it with Apple Trader "
             "setups on the same pairs."
+        ),
+        "mode": (
+            "**Race** — the first pair whose buy fills takes the whole cash and trades "
+            "alone until it is flat. **Split** — every pair trades at once on its own "
+            "share of the budget (Budget %); the budget is the ledger's worth at each "
+            "session's first bar, so it compounds day to day. A split of one pair at "
+            "100% replays exactly as Apple Trader."
+        ),
+        "pair_budget_pct": (
+            "Split only: this pair's share of each session's budget, in percent. "
+            "Together at most 100; the rest stays in cash. Position size is then a "
+            "share of the pair's own cash."
         ),
     }
     fields["sections"] = {

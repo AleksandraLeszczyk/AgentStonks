@@ -306,9 +306,12 @@ def _orchestra_from_record(raw: "dict | None") -> OrchestraConfig:
             default_pairs(), AppleTraderConfig(), selection=SelectionRules(),
         )
     # A record without `selection` was made before the 09:34 selection existed
-    # and raced every pair all day; None replays it -- and signs it -- so.
+    # and raced every pair all day; None replays it -- and signs it -- so. One
+    # without `mode` was made before the split existed, and is a race.
     return OrchestraConfig(
         [_apple_from_record(r) for r in racers], selection=(raw or {}).get("selection"),
+        mode=(raw or {}).get("mode") or "race",
+        budget_pct=(raw or {}).get("budget_pct") or {},
     )
 
 
