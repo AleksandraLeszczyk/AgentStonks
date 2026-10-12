@@ -185,6 +185,22 @@ class TestScoring:
         assert out["late"]["status"] == M.STATUS_PENDING
         assert out["future"]["status"] == M.STATUS_PENDING
 
+    def test_a_window_reading_provisional_bars_is_marked(self, tape):
+        bars, market = tape
+        now = pd.Timestamp("2026-09-04 12:00", tz=MARKET_TZ)
+        # IEX from 11:44 on: a release at 11:45 reads the 11:44 bar, 11:44 does not.
+        first_iex = pd.Timestamp("2026-09-04 11:44", tz=MARKET_TZ)
+        articles = [_article("settled", "2026-09-04 11:44:59"), _article("young", "2026-09-04 11:45")]
+        out = M.score_articles(_bundle(), articles, bars, market, now, provisional_from=first_iex)
+        assert out["settled"]["status"] == out["young"]["status"] == M.STATUS_SCORED
+        assert not out["settled"]["provisional"]
+        assert out["young"]["provisional"]
+        assert "Provisional" in out["young"]["reason"]
+        # The flag changes nothing the model reads.
+        plain = M.score_articles(_bundle(), articles, bars, market, now)
+        assert out["young"]["z_pre"] == plain["young"]["z_pre"]
+        assert not plain["young"]["provisional"]
+
     def test_news_count_and_hour_are_the_notebooks(self, tape):
         bars, market = tape
         pipe = FakePipeline()
@@ -289,6 +305,40 @@ class TestPublishing:
         sym_state.news_impact_details = {"1": {"source": M.SOURCE_MODEL, "status": M.STATUS_NOT_SCORABLE}}
         assert not M.needs_refresh(sym_state)
 
+    def test_provisional_verdicts_keep_asking_for_a_refresh(self):
+        sym_state = SymbolState("AAPL", AppState())
+        sym_state.news = [{"id": "1"}]
+        scored = {"source": M.SOURCE_MODEL, "status": M.STATUS_SCORED}
+        sym_state.news_impact_details = {"1": {**scored, "provisional": True}}
+        assert M.needs_refresh(sym_state)
+        sym_state.news_impact_details = {"1": {**scored, "provisional": False}}
+        assert not M.needs_refresh(sym_state)
+
+    def test_today_reads_the_live_tiers_and_says_where_iex_starts(self, monkeypatch):
+        from agent_stonks import bar_history
+
+        def bar(when):
+            ts = pd.Timestamp(when, tz=MARKET_TZ).tz_convert("UTC").isoformat()
+            return {"t": ts, "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}
+
+        bars = [bar("2026-09-04 08:00"), bar("2026-09-04 09:30"), bar("2026-09-04 09:31"),
+                bar("2026-09-04 09:32"), bar("2026-09-04 09:33")]
+        # The premarket bar is IEX too (no SIP for it), but never reaches the grid.
+        provisional = {bar_history.bar_key(b["t"]) for b in (bars[0], bars[3], bars[4])}
+        monkeypatch.setattr(
+            bar_history, "fetch_live_bars",
+            lambda *a, **k: bar_history.LiveBars(bars=bars, provisional=provisional),
+        )
+        M.reset_bar_caches()
+        try:
+            frame, first = M.fetch_today(
+                "AAPL", "", "", "sip_delayed", pd.Timestamp("2026-09-04 09:34:10", tz=MARKET_TZ)
+            )
+        finally:
+            M.reset_bar_caches()
+        assert len(frame) == 4
+        assert first == pd.Timestamp("2026-09-04 09:32", tz=MARKET_TZ)
+
     def test_badge_names_the_model_and_carries_its_reason(self):
         from agent_stonks.ui import build_news_html
 
@@ -303,9 +353,12 @@ class TestPublishing:
             "2": {"source": "model", "status": "not_scorable", "short": "premarket", "reason": "before"},
         }
         html = build_news_html(news, "AAPL", {"1": "positive", "2": "unknown"}, details)
-        assert "positive impact · model" in html
+        assert "positive impact · model<" in html
         assert 'title="up 60% &lt;b&gt;"' in html
         assert "premarket · model" in html
+        details["1"]["provisional"] = True
+        html = build_news_html(news, "AAPL", {"1": "positive", "2": "unknown"}, details)
+        assert "positive impact · model · provisional" in html
 
 
 # ------------------------------------------------------------- against the notebook

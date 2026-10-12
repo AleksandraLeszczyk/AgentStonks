@@ -469,6 +469,8 @@ def _impact_badge(impact: str, detail: Optional[dict] = None) -> str:
         if detail.get("status") != newsimpact_model.STATUS_SCORED:
             label = detail.get("short") or "unknown"
         label = f"{label} · model"
+        if detail.get("provisional"):
+            label += " · provisional"
         title = f' title="{html.escape(detail.get("reason", ""), quote=True)}"'
     return (
         f'<span{title} style="display:inline-flex;align-items:center;gap:5px;'

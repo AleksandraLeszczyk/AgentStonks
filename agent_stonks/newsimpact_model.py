@@ -57,7 +57,10 @@ are reported as not scorable (the badge stays "unknown") rather than
 approximated. More than half of AAPL's articles are out of session.
 
 A release from *today* needs its 15 minutes of bars to have arrived; until then
-it is `pending` and re-scored on the next refresh.
+it is `pending` and re-scored on the next refresh. Those minutes are usually
+younger than 16 minutes, which a delayed-SIP key cannot have yet, so they are
+read off IEX and the verdict is marked `provisional` until SIP covers them (see
+`fetch_today`).
 
 The mirror contract
 -------------------
@@ -89,8 +92,9 @@ minute bars behind it, of the ticker *and* of SPY, for its z to be the
 notebook's; with 25 the notebook's own code moves z by up to ~10%
 (`history_sessions`). Those come from Alpaca SIP, split-adjusted -- the tape the
 model was fitted on -- with no fallback (see `fetch_history`). Today's bars come
-through `bar_history.fetch_history_bars` on the session's resolved feed. Both
-are cached: history per trading day, today's bars for `TODAY_TTL_SEC`.
+through `bar_history.fetch_live_bars`, the live chart's tiers: the session's
+resolved feed for settled bars, IEX for the youngest. Both are cached: history
+per trading day, today's bars for `TODAY_TTL_SEC`.
 
 Adding a ticker
 ---------------
@@ -161,6 +165,8 @@ IMPACT_METHODS: dict[str, str] = {
 }
 
 STATUS_SCORED = "scored"
+# A scored verdict whose window reads IEX bars also carries "provisional": True,
+# and is scored again until the consolidated bars replace them.
 STATUS_PENDING = "pending"
 STATUS_NOT_SCORABLE = "not_scorable"
 SOURCE_MODEL = "model"
@@ -671,6 +677,7 @@ def score_articles(
     bars: pd.DataFrame,
     market: pd.DataFrame,
     now,
+    provisional_from: "pd.Timestamp | None" = None,
 ) -> "dict[str, dict]":
     """{news_id: result} for every article with an id.
 
@@ -680,6 +687,11 @@ def score_articles(
     the badge `label`, `status` (scored / pending / not_scorable), a `short`
     and a `reason` for the tooltip, and for a scored article the three
     post-release probabilities and the momentum before it.
+
+    `provisional_from` is the stamp of the first bar, in either frame, that is
+    not yet the consolidated tape (IEX standing in for delayed SIP); every bar
+    from it on is. A scored article whose window reaches it is marked
+    `provisional`.
 
     The article list is also the news count's population
     (`n_prior_news_30m`), as the notebook's was the ticker's whole feed.
@@ -748,21 +760,31 @@ def score_articles(
         p_flat = max(0.0, 1.0 - p_up - p_down)
         state_pre = str(X["state_pre"].iloc[j])
         z_pre = float(pm["z_pre"].iloc[i])
+        reason = (
+            f"{bundle['post']}-min momentum after the release: up {p_up:.0%} · "
+            f"flat {p_flat:.0%} · down {p_down:.0%}. Before it: "
+            f"{_STATE_WORDS.get(state_pre, state_pre)} (z {z_pre:+.2f}, {basis})."
+        )
+        # The window's last bar is the one before the release (P0).
+        last_bar = rows[i][1].floor("min") - pd.Timedelta(minutes=1)
+        provisional = provisional_from is not None and last_bar >= provisional_from
+        if provisional:
+            reason += (
+                " Provisional: its last minutes are IEX bars until the consolidated "
+                "(SIP) ones arrive, then it is scored again."
+            )
         out[rows[i][0]] = {
             "label": impact_label(p_up, p_flat, p_down),
             "source": SOURCE_MODEL,
             "status": STATUS_SCORED,
             "short": "model",
-            "reason": (
-                f"{bundle['post']}-min momentum after the release: up {p_up:.0%} · "
-                f"flat {p_flat:.0%} · down {p_down:.0%}. Before it: "
-                f"{_STATE_WORDS.get(state_pre, state_pre)} (z {z_pre:+.2f}, {basis})."
-            ),
+            "reason": reason,
             "p_up": p_up,
             "p_flat": p_flat,
             "p_down": p_down,
             "state_pre": state_pre,
             "z_pre": z_pre,
+            "provisional": provisional,
         }
     return out
 
@@ -770,7 +792,7 @@ def score_articles(
 # --- bars for the live path --------------------------------------------------
 
 _history_cache: "dict[tuple[str, date, date], pd.DataFrame]" = {}
-_today_cache: "dict[str, tuple[float, date, pd.DataFrame]]" = {}
+_today_cache: "dict[str, tuple[float, date, pd.DataFrame, pd.Timestamp | None]]" = {}
 _cache_lock = threading.Lock()
 
 
@@ -819,26 +841,45 @@ def fetch_history(symbol: str, first_day: date, today: date, key: str, secret: s
     return frame
 
 
-def fetch_today(symbol: str, key: str, secret: str, feed: str, now: pd.Timestamp) -> pd.DataFrame:
-    """Today's regular-session minute bars on the session's resolved feed."""
+def fetch_today(
+    symbol: str, key: str, secret: str, feed: str, now: pd.Timestamp
+) -> "tuple[pd.DataFrame, pd.Timestamp | None]":
+    """Today's regular-session minute bars, and the stamp of the first
+    provisional one (None when all are settled).
+
+    The live chart's tiers (`bar_history.fetch_live_bars`): the session's
+    resolved feed for bars older than `SETTLED_BAR_AGE_MIN`, IEX for younger
+    ones. On a delayed-SIP key the resolved feed alone stops 16 minutes short of
+    now, and a release cannot be scored before the bar just before it exists, so
+    every release stayed `pending` for ~16 minutes -- longer than the 15 it
+    forecasts (2026-10-12). The IEX bars are flagged, so `score_articles` can
+    mark what read them, and replaced by SIP once they settle.
+    """
     today = now.date()
     with _cache_lock:
         cached = _today_cache.get(symbol)
     if cached is not None and cached[1] == today and _time.monotonic() - cached[0] < TODAY_TTL_SEC:
-        return cached[2]
+        return cached[2], cached[3]
     open_ts = pd.Timestamp(today).tz_localize(MARKET_TZ) + pd.Timedelta(hours=9, minutes=30)
-    frame = bars_frame([])
+    frame, provisional_from = bars_frame([]), None
     if now > open_ts:
         hours = int((now - open_ts) / pd.Timedelta(hours=1)) + 2
-        bars, _source, _failures = bar_history.fetch_history_bars(
+        live = bar_history.fetch_live_bars(
             symbol, "1Min", key, secret, feed, limit=10000, lookback_hours=hours,
             what="minute bars (news impact)",
         )
-        frame = bars_frame(bars)
+        frame = bars_frame(live.bars)
         frame = frame[frame["date"] == pd.Timestamp(today)]
+        # Only regular-session minutes reach the grid: a provisional premarket
+        # bar must not make the whole day provisional.
+        provisional = frame.index.intersection(
+            bars_frame([b for b in live.bars if bar_history.bar_key(b["t"]) in live.provisional]).index
+        )
+        if len(provisional):
+            provisional_from = provisional.min()
     with _cache_lock:
-        _today_cache[symbol] = (_time.monotonic(), today, frame)
-    return frame
+        _today_cache[symbol] = (_time.monotonic(), today, frame, provisional_from)
+    return frame, provisional_from
 
 
 def reset_bar_caches() -> None:
@@ -867,14 +908,20 @@ def score_symbol_news(
     first_day = oldest - timedelta(days=_calendar_days(history_sessions(bundle)))
 
     frames = {}
+    provisional = []
     for sym in (symbol, bundle["market_symbol"]):
         past = fetch_history(sym, first_day, today, key, secret)
         try:
-            live = fetch_today(sym, key, secret, feed, now)
+            live, provisional_from = fetch_today(sym, key, secret, feed, now)
         except Exception:
-            live = bars_frame([])  # today's articles stay pending
+            live, provisional_from = bars_frame([]), None  # today's articles stay pending
+        if provisional_from is not None:
+            provisional.append(provisional_from)
         frames[sym] = pd.concat([f for f in (past, live) if len(f)]) if len(past) or len(live) else past
-    return score_articles(bundle, articles, frames[symbol], frames[bundle["market_symbol"]], now)
+    return score_articles(
+        bundle, articles, frames[symbol], frames[bundle["market_symbol"]], now,
+        provisional_from=min(provisional, default=None),
+    )
 
 
 # --- the News tab's background refresh ---------------------------------------
@@ -892,7 +939,12 @@ def needs_refresh(sym_state) -> bool:
             if not news_id:
                 continue
             detail = details.get(news_id)
-            if detail is None or detail.get("source") != SOURCE_MODEL or detail.get("status") == STATUS_PENDING:
+            if (
+                detail is None
+                or detail.get("source") != SOURCE_MODEL
+                or detail.get("status") == STATUS_PENDING
+                or detail.get("provisional")
+            ):
                 return True
     return False
 
