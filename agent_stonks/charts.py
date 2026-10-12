@@ -1986,9 +1986,18 @@ def build_chart(
     day_range_lines: Optional[dict] = None,
     net_gamma: Optional[dict] = None,
     prior_profile: Optional[dict] = None,
+    window_minutes: Optional[int] = None,
 ) -> go.Figure:
     """The live price chart: candles and volume, the optional momentum panels
     and overlays.
+
+    `window_minutes` shows only that many minutes back from the newest bar
+    (the live tab's "Last hour" / "Last 2 hours"): the time axis starts there
+    and every panel's value axis is fitted to what is drawn inside it
+    (`_fit_y_to_window`). Everything is still computed from the whole session
+    -- VWAP, the moving averages, momentum, the profile -- so only the view
+    changes. None, or a window reaching back past `session_start`, is the
+    whole session.
 
     `net_gamma` adds a panel at the bottom -- under the momentum Δ one when
     that is shown -- with the options chain's net dealer gamma at each bar's
@@ -2015,6 +2024,15 @@ def build_chart(
         return empty_chart("Waiting for data…")
     if fill_gaps:
         df = _fill_intraday_gaps(df)
+
+    view_start = pd.Timestamp(session_start)
+    if window_minutes:
+        view_start = max(view_start, df["t"].max() - pd.Timedelta(minutes=window_minutes))
+    windowed = view_start > pd.Timestamp(session_start)
+    # Where the overlays start drawing: from the first bar, or from the
+    # window's edge -- a level's label sits at its left end, and one left at
+    # the first bar would be off-screen.
+    x_view0 = max(df["t"].iloc[0], view_start)
 
     df_trades = pd.DataFrame.from_records(trades) if trades else pd.DataFrame(columns=["p", "s", "t"])
     if not df_trades.empty:
@@ -2319,13 +2337,18 @@ def build_chart(
         _add_day_range_lines(day_range_lines, fig, df["t"].iloc[0], df["t"].iloc[-1])
     if model_overlays:
         add_model_overlays(
-            model_overlays, fig, df["t"].iloc[0], df["t"].iloc[-1],
+            model_overlays, fig, x_view0, df["t"].iloc[-1],
             row=1, col=1, profile_axes=("x2", "y2"), volume_row=2,
         )
     if candle_patterns:
         add_candle_patterns(
-            candle_patterns, fig, df["t"].iloc[0], df["t"].iloc[-1], row=1, col=1,
+            candle_patterns, fig, x_view0, df["t"].iloc[-1], row=1, col=1,
         )
+
+    # A forward-looking overlay -- "momentum holds for the next 15 bars" --
+    # lives entirely to the right of the newest bar, so the axis has to make
+    # room for it or it is drawn off-screen.
+    x_max = overlay_x_max(model_overlays, df["t"].max())
 
     last = df.iloc[-1]
     color = PALETTE["up"] if last["c"] >= last["o"] else PALETTE["down"]
@@ -2353,13 +2376,7 @@ def build_chart(
             x=0.02,
         ),
         xaxis=dict(
-            range=[
-                pd.Timestamp(session_start).isoformat(),
-                # A forward-looking overlay -- "momentum holds for the next 15
-                # bars" -- lives entirely to the right of the newest bar, so
-                # the axis has to make room for it or it is drawn off-screen.
-                overlay_x_max(model_overlays, df["t"].max()).isoformat(),
-            ],
+            range=[pd.Timestamp(session_start).isoformat(), x_max.isoformat()],
             rangeslider=dict(visible=False),
         ),
         xaxis2=dict(showgrid=True, gridcolor=PALETTE["grid"]),
@@ -2400,7 +2417,103 @@ def build_chart(
             row=gamma_row,
             col=1,
         )
+    if windowed:
+        # On every left-column time axis, autorange off: they are all matched
+        # to the bottom panel's, and the group's autorange overrides a range
+        # set on the top one alone. A bar's room on the right, so the newest
+        # isn't cut in half at the edge.
+        right = x_max + pd.Timedelta(minutes=_bar_minutes(df["t"]))
+        fig.update_xaxes(
+            range=[view_start.isoformat(), right.isoformat()], autorange=False, col=1,
+        )
+        _fit_y_to_window(fig, view_start, x_max, n_rows)
     return fig
+
+
+# Headroom either side of a value axis fitted to a time window, as a fraction
+# of the span drawn -- about what plotly's own autorange leaves.
+_WINDOW_Y_PAD = 0.05
+
+
+def _fit_y_to_window(fig: go.Figure, x0: pd.Timestamp, x1: pd.Timestamp, n_rows: int) -> None:
+    """Fit each left-column panel's value axis to what is drawn between `x0`
+    and `x1`.
+
+    Narrowing the time axis is not enough on its own: plotly autoranges a
+    value axis over every point of its traces, in view or not, so after a big
+    morning the last hour's candles -- and its volume and momentum bars --
+    would be a flat strip in a band sized for the open. This is the autorange
+    plotly would do had the chart only the window in it: the traces' points
+    inside it (a bar from its base to its top, a fill to zero from zero), and
+    the lines and boxes that reach into it. Annotations and full-height
+    columns don't count. A panel with nothing in the window keeps its
+    autorange.
+
+    The price profile's axis follows the price axis it is matched to.
+    """
+    x0, x1 = pd.Timestamp(x0), pd.Timestamp(x1)
+    for row in range(1, n_rows + 1):
+        axis = fig.get_subplot(row, 1).yaxis
+        ref = "y" + axis.plotly_name[len("yaxis"):]
+        log = axis.type == "log"
+        values: list = []
+        for trace in fig.data:
+            if (trace.yaxis or "y") == ref:
+                values += _trace_values_in(trace, x0, x1, log)
+        for shape in fig.layout.shapes:
+            if shape.yref == ref and _shape_reaches(shape, x0, x1):
+                values += [shape.y0, shape.y1]
+        y = pd.to_numeric(pd.Series(values, dtype=object), errors="coerce").dropna()
+        if log:
+            y = np.log10(y[y > 0])
+        if y.empty:
+            continue
+        lo, hi = float(y.min()), float(y.max())
+        pad = (hi - lo) * _WINDOW_Y_PAD or max(abs(hi) * 0.001, 0.1 if log else 0.01)
+        fig.update_yaxes(range=[lo - pad, hi + pad], autorange=False, row=row, col=1)
+
+
+def _as_utc(values) -> pd.Series:
+    """Plotly-held x values -- Timestamps, naive UTC strings, None gaps -- as
+    UTC timestamps, NaT for the gaps."""
+    return pd.to_datetime(pd.Series(list(values), dtype=object), utc=True, errors="coerce")
+
+
+def _trace_values_in(trace, x0: pd.Timestamp, x1: pd.Timestamp, log: bool) -> list:
+    """The y extent of `trace`'s points between `x0` and `x1`."""
+    if trace.x is None or trace.y is None or len(trace.x) != len(trace.y):
+        return []
+    x = _as_utc(trace.x)
+    inside = ((x >= x0) & (x <= x1)).to_numpy()
+    if not inside.any():
+        return []
+    y = pd.to_numeric(pd.Series(list(trace.y), dtype=object), errors="coerce").to_numpy(float)
+    if trace.type == "bar":
+        base = trace.base
+        if base is None:
+            base = np.zeros(len(y))
+        base = np.broadcast_to(np.asarray(base, dtype=float), y.shape)
+        # A bar on a log axis has no bottom to show.
+        ends = [y + base] if log else [base, y + base]
+        return [v for end in ends for v in end[inside].tolist()]
+    out = y[inside].tolist()
+    if getattr(trace, "fill", None) == "tozeroy" and not log:
+        out.append(0.0)
+    return out
+
+
+def _shape_reaches(shape, x0: pd.Timestamp, x1: pd.Timestamp) -> bool:
+    """Whether a line or box drawn at data heights crosses `x0`-`x1`. A shape
+    spanning the panel's width (`add_hline`) always does."""
+    if shape.type not in ("line", "rect"):
+        return False
+    xref = shape.xref or "x"
+    if xref == "paper" or xref.endswith("domain"):
+        return True
+    ends = _as_utc([shape.x0, shape.x1])
+    if ends.isna().any():
+        return False
+    return ends.min() <= x1 and ends.max() >= x0
 
 
 def build_performance_chart(

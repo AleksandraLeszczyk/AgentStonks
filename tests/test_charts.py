@@ -1068,3 +1068,103 @@ class TestOptionWalls:
         # Down from the top edge, one under the other; the bottom edge's own first.
         assert (call.yshift or 0) == 0 and flip.yshift < 0
         assert put.y == 0 and (put.yshift or 0) == 0
+
+
+class TestTimeWindow:
+    """Chart Settings → Show: "Last hour" / "Last 2 hours" (`window_minutes`)."""
+
+    # Three hours of 1-minute bars from 14:30 UTC: a spike to 120 on 9M-share
+    # bars in the first half hour, then a quiet 100-101 on 1-2k shares.
+    START = pd.Timestamp("2024-01-15T14:30Z")
+
+    def bars(self, minutes=180):
+        out = []
+        for i in range(minutes):
+            early = i < 30
+            base = 110.0 if early else 100.0 + (i % 5) * 0.2
+            out.append({
+                "t": (self.START + pd.Timedelta(minutes=i)).isoformat(),
+                "o": base, "c": base + (5.0 if early and i % 2 else 0.1),
+                "h": 120.0 if early else base + 0.3, "l": base - 0.2,
+                "v": 9_000_000 if early else 1000 + (i % 2) * 1000,
+            })
+        return out
+
+    def last_hour(self, bars, minutes=60):
+        last = pd.Timestamp(bars[-1]["t"])
+        return [b for b in bars if pd.Timestamp(b["t"]) >= last - pd.Timedelta(minutes=minutes)]
+
+    def axis_of(self, fig, name):
+        trace = next(t for t in fig.data if t.name == name)
+        return fig.layout["yaxis" + (trace.yaxis or "y")[1:]]
+
+    def test_whole_session_by_default(self):
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START)
+        assert fig.layout.xaxis.range[0] == pd.Timestamp(SESSION_START).isoformat()
+        assert fig.layout.yaxis.range is None
+
+    @pytest.mark.parametrize("minutes", [60, 120])
+    @pytest.mark.parametrize("show_momentum", [False, True])
+    def test_every_panel_shows_the_window_back_from_the_newest_bar(self, minutes, show_momentum):
+        bars = self.bars()
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, window_minutes=minutes,
+                          show_momentum=show_momentum)
+        start = pd.Timestamp(bars[-1]["t"]) - pd.Timedelta(minutes=minutes)
+        # A bar's room past the newest one.
+        end = pd.Timestamp(bars[-1]["t"]) + pd.Timedelta(minutes=1)
+        # Each panel's own axis: they are matched to the bottom one, so a range
+        # on the top axis alone is overridden by the group's autorange.
+        rows = 4 if show_momentum else 2
+        for row in range(1, rows + 1):
+            axis = fig.get_subplot(row, 1).xaxis
+            assert axis.autorange is False
+            assert [pd.Timestamp(x) for x in axis.range] == [start, end]
+
+    def test_the_price_axis_fits_the_window_not_the_morning_spike(self):
+        bars = self.bars()
+        # No average lines: the 7d one is on by default, and the spike's volume
+        # puts it near 112 -- a line across the window, so it would count.
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, window_minutes=60,
+                          show_7d_avg=False, show_28d_avg=False)
+        lo, hi = fig.layout.yaxis.range
+        shown = self.last_hour(bars)
+        assert lo < min(b["l"] for b in shown)
+        assert hi > max(b["h"] for b in shown)
+        assert hi < 105.0
+
+    def test_the_volume_axis_fits_the_window(self):
+        bars = self.bars()
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, window_minutes=60)
+        axis = self.axis_of(fig, "Volume")
+        assert axis.type == "log"
+        lo, hi = axis.range
+        assert lo < np.log10(1000) and np.log10(2000) < hi < np.log10(9_000_000)
+
+    def test_the_momentum_panels_fit_the_window(self):
+        bars = self.bars()
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          window_minutes=60, show_momentum=True)
+        for name in ("Momentum", "Momentum change"):
+            lo, hi = self.axis_of(fig, name).range
+            # The window moves at most $0.8 a bar; the spike moved $5 and more.
+            assert -2.0 < lo < 0 < hi < 2.0
+
+    def test_a_level_reaching_into_the_window_counts(self):
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START, window_minutes=60,
+                          price_alerts=[{"field": "price", "condition": "above", "value": 104.0}])
+        assert fig.layout.yaxis.range[1] > 104.0
+
+    def test_a_model_level_label_starts_at_the_window(self):
+        bars = self.bars()
+        level = {"kind": "level", "key": "k", "label": "Buy", "value": 100.5,
+                 "x0": bars[0]["t"], "x1": bars[-1]["t"]}
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, window_minutes=60,
+                          model_overlays=[level])
+        label = next(a for a in fig.layout.annotations if a.text and "Buy" in a.text)
+        assert pd.Timestamp(label.x) == pd.Timestamp(fig.layout.xaxis.range[0])
+
+    def test_a_session_shorter_than_the_window_is_the_whole_session(self):
+        fig = build_chart(self.bars(minutes=40), [], [], "AAPL", SESSION_START,
+                          window_minutes=120)
+        assert fig.layout.xaxis.range[0] == pd.Timestamp(SESSION_START).isoformat()
+        assert fig.layout.yaxis.range is None

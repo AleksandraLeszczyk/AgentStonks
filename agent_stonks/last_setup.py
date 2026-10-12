@@ -64,6 +64,7 @@ KEYS = frozenset({
     "chart_fill_gaps",
     "chart_vwap",
     "chart_pre_market",
+    "chart_window",
     "chart_vwma",
     "chart_avg_lines",
     "chart_option_walls",

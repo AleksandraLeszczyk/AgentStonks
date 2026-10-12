@@ -929,6 +929,10 @@ def _chart_panel() -> None:
             day_range_lines=day_range_lines,
             net_gamma=net_gamma,
             prior_profile=prior_profile_levels,
+            # getattr: an AppState built before this setting existed and kept
+            # across a code save falls back to the old class's defaults,
+            # which don't have it.
+            window_minutes=getattr(state, "chart_window_min", 0),
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
@@ -1002,7 +1006,22 @@ def _agent_momentum_kwargs(state, sym_state) -> dict:
 def _live_chart_controls() -> None:
     state = _get_state()
     with st.expander("Chart Settings"):
-        st.selectbox("Timeframe", TIMEFRAMES, index=0, key="live_timeframe")
+        c_tf, c_window = st.columns(2)
+        with c_tf:
+            st.selectbox("Timeframe", TIMEFRAMES, index=0, key="live_timeframe")
+        with c_window:
+            window_min = st.selectbox(
+                "Show",
+                list(_CHART_WINDOWS),
+                format_func=_CHART_WINDOWS.get,
+                key="chart_window",
+                help="Only the last hour or two of the chart, up to the newest "
+                "bar, with the price and every panel under it rescaled to what "
+                "is in view. VWAP, the averages, momentum and the levels are "
+                "still worked out from the whole session — only the view "
+                "narrows. Early in the day, while the session is shorter than "
+                "the window, it is the whole session.",
+            )
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1254,6 +1273,7 @@ def _live_chart_controls() -> None:
     state.show_momentum = show_momentum
     state.show_net_gamma = show_net_gamma
     state.show_pre_market = show_pre_market
+    state.chart_window_min = window_min
     state.volume_baseline_window = volume_baseline_window
     state.fill_gaps = fill_gaps
     state.vwap_style = "dot" if show_vwap else "hide"
@@ -1274,6 +1294,10 @@ def _live_chart_controls() -> None:
     state.fvg_hide_filled = fvg_hide_filled
 
 
+
+# Chart Settings → Show: minutes back from the newest bar, 0 for the whole
+# session (`build_chart`'s `window_minutes`).
+_CHART_WINDOWS = {0: "Whole session", 60: "Last hour", 120: "Last 2 hours"}
 
 # `_help_row`'s icon column inside one of Chart Settings' two half-width columns.
 _HALF_WIDTH_ICON = 0.16
