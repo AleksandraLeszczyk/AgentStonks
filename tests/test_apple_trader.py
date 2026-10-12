@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 import pandas as pd
 import pytest
 
-from agent_stonks import apple_models, codenames, intraday_vol_model
+from agent_stonks import apple_models, intraday_vol_model
 from agent_stonks import apple_trader as at
 from agent_stonks import clock
 from agent_stonks import rule_agent
@@ -1189,14 +1189,14 @@ class TestDayRangeIntradayModel:
         )
         assert apple_models.load(self.KEY, TICKER) is None
         why = apple_models.unavailable_reason(self.KEY, TICKER)
-        assert codenames.INTRADAY_VOL in why and "missing" in why
+        assert "IntradayVolatility" in why and "missing" in why
 
     def test_a_missing_day_range_bundle_says_so_instead(self, monkeypatch):
         monkeypatch.setattr(
             apple_models, "_load_dayrange", lambda ticker=TICKER: None
         )
         why = apple_models.unavailable_reason(self.KEY, TICKER)
-        assert f"{codenames.DAYRANGE} bundle" in why
+        assert "day-range bundle" in why
 
     def test_both_models_drive_the_same_rule_set(self):
         assert (
@@ -1286,7 +1286,7 @@ class TestHighLowModel:
 
     def test_it_is_refused_on_a_symbol_it_was_not_fitted_on(self):
         config = AppleTraderConfig(ticker="GOOGL", model_key=self.KEY)
-        assert apple_models.get(self.KEY).label in at.model_ticker_error(config)
+        assert "HighLow" in at.model_ticker_error(config)
 
     def test_it_signs_its_own_row_in_results(self):
         sig = config_signature(AppleTraderConfig(model_key=self.KEY))
@@ -1365,8 +1365,11 @@ class TestHighLow3mModel(TestHighLow2Model):
         self, state, market_open, monkeypatch
     ):
         """The other models' ranges cover the whole session: a window high
-        above one has falsified it, as before."""
-        forecast = {**FORECAST, "pred_high": 101.2, "pred_low": 99.0}
+        above one has falsified it, as before. The window is the one the
+        forecast read (`or_high`, the tape's window here; see
+        `TestOpeningWindowRevision`)."""
+        forecast = {**FORECAST, "pred_high": 101.2, "pred_low": 99.0,
+                    "or_high": 101.5, "or_low": 100.9}
         updates, high = self._breaches(
             monkeypatch, state, forecast, TestHighLowModel.BUNDLE, at._highlow(),
         )
@@ -1725,7 +1728,7 @@ class TestIntradayLevelSource:
         assert trader.plan["reference"] == FORECAST["pred_high"]
         assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
         assert any(
-            f"{codenames.INTRADAY_VOL} shape" in e.get("text", "")
+            "IntradayVolatility shape" in e.get("text", "")
             for e in state.agent_log if e.get("type") == "error"
         )
 
@@ -1751,7 +1754,7 @@ class TestIntradayLevelSourceAvailability:
         monkeypatch.setattr(at.apple_models, "covers", lambda *a, **k: True)
         config = dayrange_config(ticker="MSFT", level_source="intraday")
         error = at.config_error(config)
-        assert error is not None and "MSFT" in error and codenames.INTRADAY_VOL in error
+        assert error is not None and "MSFT" in error and "IntradayVolatility" in error
 
     def test_a_missing_export_is_refused_with_the_path_it_looked_for(self, monkeypatch):
         monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
@@ -2597,6 +2600,65 @@ class TestKeepWidth:
         assert "keep_width" not in config_signature(held)
 
 
+class TestOpeningWindowRevision:
+    """The opening window is read as the forecast read it (`or_high`/`or_low`).
+
+    Live AAPL 2026-10-12: HighLow clipped its predicted low to the opening
+    window's $337.63; at 09:46 the buffer swapped the 09:30 bar for SIP's, whose
+    low was $337.60, and the trader logged a breach of a low nothing after 09:35
+    had traded -- moving both sides of the range, and the levels with them.
+    """
+
+    # Clipped to the Tape's opening window (lows 100.9, highs 101.5), as every
+    # whole-session model clips its forecast.
+    CLIPPED = {**FORECAST, "pred_low": 100.9, "or_low": 100.9, "or_high": 101.5}
+
+    def _setup(self, state, monkeypatch, forecast):
+        tape = Tape(monkeypatch)
+        monkeypatch.setattr(at._dayrange(), "forecast_session", lambda *a, **k: dict(forecast))
+        trader = at.DayRangeTrader(dayrange_config(
+            breach_update="brownian", keep_width=True, level_unit=UNIT_PRED_RANGE,
+        ))
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(103.0))
+        return tape, lambda: trader.run_cycle(DAYRANGE_BUNDLE, state, tracker), trader
+
+    def test_a_revised_opening_bar_is_not_a_breach(self, state, market_open, monkeypatch):
+        tape, cycle, trader = self._setup(state, monkeypatch, self.CLIPPED)
+        tape.append(103.0, high=103.5, low=102.5)
+        cycle()
+        tape.rows[0]["low"] = 100.87   # SIP's 09:30 bar, swapped in 15 min later
+        tape.append(103.0, high=103.5, low=102.5)
+        cycle()
+
+        assert "range_updates" not in trader.plan
+        assert trader.plan["pred_low"] == pytest.approx(100.9)
+        assert not [e for e in state.agent_log if "forecast updated" in e.get("text", "")]
+
+    def test_a_bar_after_the_window_through_the_same_price_still_is(
+        self, state, market_open, monkeypatch
+    ):
+        tape, cycle, trader = self._setup(state, monkeypatch, self.CLIPPED)
+        tape.append(101.0, low=100.87)
+        cycle()
+
+        assert trader.plan["range_updates"] == 1
+        assert trader.plan["pred_low"] < 100.87
+
+    def test_the_followed_side_still_holds_the_window_the_forecast_saw(
+        self, state, market_open, monkeypatch
+    ):
+        """Containment keeps reading the window: a low breach under the
+        predicted-range width would pull the high below the window's own
+        high, which is a price already printed."""
+        narrow = {**self.CLIPPED, "pred_high": 101.6, "pred_low": 100.9,
+                  "or_high": 101.5, "or_low": 100.9}
+        tape, cycle, trader = self._setup(state, monkeypatch, narrow)
+        tape.append(100.0, high=100.5, low=99.0)
+        cycle()
+
+        assert trader.plan["pred_high"] == pytest.approx(101.5)
+
+
 class TestBreachExit:
     """A bar through the predicted high closes an open position.
 
@@ -3035,38 +3097,6 @@ class TestInstrument:
             ), 60, threading.Event(),
         )
         assert asked == [("dayrange", NON_AAPL)]
-
-
-class TestDisplaySignature:
-    """A run signature is shown with each model's codename in place of its key,
-    and the stored string -- a record's identity -- is left alone."""
-
-    def test_an_apple_trader_signature_reads_the_codename(self):
-        assert apple_models.display_signature("highlow3m_AAPL(buy=H-0.4R,size=95%)") == (
-            f"{codenames.HIGHLOW3M} · AAPL(buy=H-0.4R,size=95%)"
-        )
-
-    def test_a_key_is_not_matched_inside_a_longer_one(self):
-        assert apple_models.display_signature("dayrange_intraday_AAPL(buy=H-0.4A)") == (
-            f"{codenames.DAYRANGE_INTRADAY} · AAPL(buy=H-0.4A)"
-        )
-        assert apple_models.display_signature("highlow2_INTC(buy=H-0.6R)").startswith(
-            f"{codenames.HIGHLOW2} · INTC("
-        )
-
-    def test_every_pair_of_an_orchestra_is_renamed(self):
-        shown = apple_models.display_signature(
-            "orchestra[dayrange_AAPL@0.4/0.25R,highlow_MU@0.55/0.35R](size=95%)"
-        )
-        assert shown == (
-            f"orchestra[{codenames.DAYRANGE} · AAPL@0.4/0.25R,"
-            f"{codenames.HIGHLOW} · MU@0.55/0.35R](size=95%)"
-        )
-
-    def test_anything_else_is_shown_as_it_is(self):
-        assert apple_models.display_signature("nbeats_AAPL(anticipate)") == "nbeats_AAPL(anticipate)"
-        assert apple_models.display_signature("openai/gpt-5") == "openai/gpt-5"
-        assert apple_models.display_signature(None) == ""
 
 
 class TestStopOutEndsTheRun:
@@ -4684,7 +4714,7 @@ class TestHighLow3mWindow:
         assert trader.entry["early"] and trader.entry["price"] == pytest.approx(self.FILL)
         assert trader._stop_price() is None
         reasoning = tracker.snapshot()["decisions"][-1].reasoning
-        assert f"{codenames.HIGHLOW3M} window" in reasoning and "$102.00" in reasoning
+        assert "HighLow_3m window" in reasoning and "$102.00" in reasoning
 
     def test_a_position_open_at_935_is_handed_to_the_935_rules(
         self, state, market_open, monkeypatch
@@ -4848,7 +4878,7 @@ class TestHighLow3mWindowConfig:
     def test_the_armed_line_says_so(self):
         config = dayrange_config(use_3m=True)
         line = at._armed_summary(config, apple_models.get("dayrange"), DAYRANGE_BUNDLE)
-        assert f"from 9:33 it trades {codenames.HIGHLOW3M}'s 9:33 forecast" in line
+        assert "from 9:33 it trades HighLow_3m's 9:33 forecast" in line
         assert "9:33" not in at._armed_summary(
             dayrange_config(), apple_models.get("dayrange"), DAYRANGE_BUNDLE
         )
