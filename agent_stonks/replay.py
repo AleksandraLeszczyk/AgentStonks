@@ -401,8 +401,9 @@ class ReplaySession:
             ss.recent_prices.clear()
             if ss.last_price is not None:
                 ss.recent_prices.append((time.monotonic(), float(ss.last_price)))
-            # The volume-at-price panel reads trades; the session's minutes so
-            # far stand in for them, one print per minute at its close.
+            # The chart's trade-percentile candle bodies read trades (the
+            # price profile reads the bars); the session's minutes so far
+            # stand in for them, one print per minute at its close.
             ss.trades = [
                 {"p": float(b["c"]), "s": float(b.get("v") or 0.0),
                  "t": _trade_ts(clock.parse_iso_strict(b["t"]))}

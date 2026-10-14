@@ -72,18 +72,33 @@ def volume_at_price(bars: "list[dict]", n_bins: int = N_BINS) -> "tuple[np.ndarr
     if not high > low:
         return None
     edges = np.linspace(low, high, n_bins + 1)
-    volume = np.zeros(n_bins)
-    for l, h, v in rows:
-        if v <= 0:
-            continue
-        if h > l:
-            overlap = np.clip(np.minimum(edges[1:], h) - np.maximum(edges[:-1], l), 0.0, None)
-            volume += v * overlap / (h - l)
-        else:
-            volume[min(n_bins - 1, int((l - low) / (high - low) * n_bins))] += v
+    lows, highs, volumes = (np.array(col, dtype=float) for col in zip(*rows))
+    volume = spread_volume(lows, highs, volumes, edges).sum(axis=0)
     if not volume.sum() > 0:
         return None
     return (edges[:-1] + edges[1:]) / 2, volume
+
+
+def spread_volume(lows: np.ndarray, highs: np.ndarray, volumes: np.ndarray,
+                  edges: np.ndarray) -> np.ndarray:
+    """Each bar's volume spread evenly over its own low-high across the slices
+    between `edges`: one row per bar, one column per slice. A bar with no range
+    puts it all in the slice holding its price; a missing or negative volume
+    counts as none. The live chart's price profile is built the same way."""
+    lows, highs = np.asarray(lows, dtype=float), np.asarray(highs, dtype=float)
+    volumes = np.nan_to_num(np.asarray(volumes, dtype=float)).clip(min=0.0)
+    span = highs - lows
+    overlap = np.clip(
+        np.minimum(edges[1:], highs[:, None]) - np.maximum(edges[:-1], lows[:, None]),
+        0.0, None,
+    )
+    ranged = span > 0
+    out = np.zeros_like(overlap)
+    out[ranged] = overlap[ranged] * (volumes[ranged] / span[ranged])[:, None]
+    flat = np.flatnonzero(~ranged)
+    slot = np.clip(np.searchsorted(edges, lows[flat], side="right") - 1, 0, len(edges) - 2)
+    out[flat, slot] = volumes[flat]
+    return out
 
 
 def _smooth(values: np.ndarray, sigma: float) -> np.ndarray:

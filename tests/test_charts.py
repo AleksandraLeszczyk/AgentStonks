@@ -1120,6 +1120,18 @@ class TestTimeWindow:
             assert axis.autorange is False
             assert [pd.Timestamp(x) for x in axis.range] == [start, end]
 
+    @pytest.mark.parametrize("show_momentum", [False, True])
+    def test_the_profiles_volume_axis_autoranges_under_a_window(self, show_momentum):
+        # Left unset, plotly.js 3.6 hands col 1's `autorange: false` to the
+        # profile column's match group, which then shows -1..6 shares: every
+        # bin a full-width bar (2026-10-14).
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START, window_minutes=60,
+                          show_momentum=show_momentum)
+        rows = 4 if show_momentum else 2
+        for row in range(1, rows + 1):
+            axis = fig.get_subplot(row, 2).xaxis
+            assert axis.autorange is True and axis.range is None
+
     def test_the_price_axis_fits_the_window_not_the_morning_spike(self):
         bars = self.bars()
         # No average lines: the 7d one is on by default, and the spike's volume
@@ -1179,29 +1191,40 @@ class TestTimeWindow:
         volume = np.concatenate([np.asarray(t.x, float) for t in bars])
         return prices[volume > 0], volume[volume > 0]
 
-    def test_the_price_profile_is_the_windows_trades(self):
+    def test_the_price_profile_is_the_windows_bars(self):
         bars = self.bars()
         fig = build_chart(bars, [], self.trades(bars), "AAPL", SESSION_START,
                           window_minutes=60)
         prices, volume = self.profile(fig)
         shown = self.last_hour(bars)
-        # The morning's 9M-share prints at 110-115 are out of view, so out of
+        # The morning's 9M-share bars at 110-120 are out of view, so out of
         # the profile; the window's own volume is all of it.
-        assert prices.max() < 105.0
-        assert volume.sum() == sum(b["v"] for b in shown)
+        assert prices.min() >= min(b["l"] for b in shown)
+        assert prices.max() <= max(b["h"] for b in shown)
+        assert volume.sum() == pytest.approx(sum(b["v"] for b in shown))
         hover = next(t for t in fig.data if t.orientation == "h").hovertemplate
         assert "of view" in hover
 
-    def test_the_whole_session_profile_is_every_trade(self):
+    def test_the_whole_session_profile_is_every_bar(self):
         bars = self.bars()
         fig = build_chart(bars, [], self.trades(bars), "AAPL", SESSION_START)
         prices, volume = self.profile(fig)
-        assert prices.max() > 110.0
-        assert volume.sum() == sum(b["v"] for b in bars)
+        assert prices.max() > 115.0
+        assert volume.sum() == pytest.approx(sum(b["v"] for b in bars))
 
-    def test_no_trades_in_the_window_draws_no_profile(self):
+    def test_the_profile_does_not_read_the_trade_tape(self):
+        # The live tape after a restart (2026-10-14): the oldest 10,000 prints
+        # of the morning, then nothing until the stream took over -- the
+        # window had no trades in it. The bars cover it all.
         bars = self.bars()
-        # The tape stopped after the morning: nothing printed in the last hour.
-        trades = self.trades(bars[:60])
-        fig = build_chart(bars, [], trades, "AAPL", SESSION_START, window_minutes=60)
-        assert not [t for t in fig.data if t.type == "bar" and t.orientation == "h"]
+        fig = build_chart(bars, [], self.trades(bars[:40]), "AAPL", SESSION_START,
+                          window_minutes=60)
+        _, volume = self.profile(fig)
+        assert volume.sum() == pytest.approx(sum(b["v"] for b in self.last_hour(bars)))
+
+    def test_a_bar_spreads_its_volume_over_its_range(self):
+        # One bar 100-101 with 1000 shares: 20 shares in each of the 50 slices.
+        bars = [{"t": self.START.isoformat(), "o": 100.0, "h": 101.0, "l": 100.0,
+                 "c": 101.0, "v": 1000}]
+        _, volume = self.profile(build_chart(bars, [], [], "AAPL", SESSION_START))
+        assert volume == pytest.approx(np.full(50, 20.0))

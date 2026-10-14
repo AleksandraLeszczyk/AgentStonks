@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from . import market_hours, momentum_regime
+from .prior_profile import spread_volume
 from .config import (
     AVG_LINE_COLORS,
     CANDLE_PATTERN_COLORS,
@@ -220,7 +221,7 @@ def _fit_mixture(
 
 
 def _plot_price_distribution(
-    df_trades: pd.DataFrame,
+    df_bars: pd.DataFrame,
     fig: go.Figure,
     n_price_bins: int = 50,
     n_time_buckets: int = 20,
@@ -231,9 +232,14 @@ def _plot_price_distribution(
     period_name: str = "session",
 ) -> tuple[go.Figure, list[tuple[str, list[tuple[float, float, float]]]]]:
     """
-    Add a horizontal volume-weighted price distribution histogram to col 2.
-    Colors run violet→red from oldest to newest trades; `period_name` is what
-    the hover calls the span they cover ("session", or "view" for a window).
+    Add a horizontal volume-at-price histogram to col 2, built from the
+    chart's own bars (`df_bars`: l, h, v): each bar's volume spread evenly
+    over its low-high, as `prior_profile.spread_volume` does. Not from the
+    trade tape: that is only the oldest 10,000 IEX prints of the morning plus
+    the stream's since the last start, so it has a hole and two volume scales.
+    Colors run violet→red from the oldest bars to the newest; `period_name` is
+    what the hover calls the span they cover ("session", or "view" for a
+    window).
 
     `predicted_profile` ({"prices", "density", ...} from
     profile_model.predicted_open_profile) is drawn as a curve over the
@@ -243,23 +249,30 @@ def _plot_price_distribution(
     and drawn separately. Returns the figure and one (distribution,
     components) pair per fitted mixture.
     """
-    df = df_trades.sort_values("t").reset_index(drop=True)
-    has_trades = not df.empty
+    df = df_bars.dropna(subset=["l", "h"]).reset_index(drop=True)
+    volumes = pd.to_numeric(df["v"], errors="coerce").fillna(0.0).to_numpy(float) \
+        if "v" in df else np.zeros(len(df))
+    has_volume = bool(
+        (volumes > 0).any() and df["h"].max() > df["l"].min()
+    )
 
     bin_centers = np.array([])
     total_per_bin = np.array([])
     bin_width = 0.0
-    if has_trades:
-        price_min, price_max = df["p"].min(), df["p"].max()
+    if has_volume:
+        price_min, price_max = df["l"].min(), df["h"].max()
         bin_edges = np.linspace(price_min, price_max, n_price_bins + 1)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         bin_width = bin_edges[1] - bin_edges[0]
-        df["bin_idx"] = np.searchsorted(bin_edges[1:-1], df["p"].values)
+        per_bar = spread_volume(df["l"].to_numpy(float), df["h"].to_numpy(float),
+                                volumes, bin_edges)
 
+        # The bars are a minute (or a timeframe) each, so equal runs of them
+        # are equal stretches of time.
         n = len(df)
-        df["bucket"] = np.clip(
-            df.index.to_numpy() * n_time_buckets // max(n, 1), 0, n_time_buckets - 1
-        )
+        bucket = np.clip(np.arange(n) * n_time_buckets // max(n, 1), 0, n_time_buckets - 1)
+        per_bucket = np.zeros((n_time_buckets, n_price_bins))
+        np.add.at(per_bucket, bucket, per_bar)
 
         def _hsv_to_rgb(hue_deg: float, s: float = 0.85, v: float = 0.95) -> str:
             r, g, b = colorsys.hsv_to_rgb(hue_deg / 360.0, s, v)
@@ -270,28 +283,14 @@ def _plot_price_distribution(
             for b in range(n_time_buckets)
         ]
 
-        agg = (
-            df.groupby(["bin_idx", "bucket"])["s"]
-            .sum()
-            .reindex(
-                pd.MultiIndex.from_product(
-                    [range(n_price_bins), range(n_time_buckets)],
-                    names=["bin_idx", "bucket"],
-                ),
-                fill_value=0,
-            )
-            .reset_index()
-        )
-
         for bucket in range(n_time_buckets):
-            bdata = agg[agg["bucket"] == bucket]
             t_lo = bucket / n_time_buckets
             t_hi = (bucket + 1) / n_time_buckets
             fig.add_trace(
                 go.Bar(
                     orientation="h",
-                    y=bin_centers[bdata["bin_idx"].values],
-                    x=bdata["s"].values,
+                    y=bin_centers,
+                    x=per_bucket[bucket],
                     width=bin_width * 0.9,
                     marker_color=bucket_colors[bucket],
                     marker_line_width=0,
@@ -308,12 +307,7 @@ def _plot_price_distribution(
                 col=2,
             )
 
-        total_per_bin = (
-            agg.groupby("bin_idx")["s"]
-            .sum()
-            .reindex(range(n_price_bins), fill_value=0)
-            .values
-        )
+        total_per_bin = per_bucket.sum(axis=0)
 
     pred_prices = pred_weights = None
     pred_step = 0.0
@@ -413,7 +407,7 @@ def _plot_price_distribution(
                 )
             color_offset += len(components)
 
-    if not has_trades:
+    if not has_volume:
         fig.update_layout(
             barmode="stack",
             plot_bgcolor="rgba(0,0,0,0)",
@@ -2136,7 +2130,7 @@ def build_chart(
     `window_minutes` shows only that many minutes back from the newest bar
     (the live tab's "Last hour" / "Last 2 hours"): the time axis starts there
     and every panel's value axis is fitted to what is drawn inside it
-    (`_fit_y_to_window`). The price profile is the window's trades only, the
+    (`_fit_y_to_window`). The price profile is the window's bars only, the
     volume at each price of the candles in view. Everything else is still
     computed from the whole session -- VWAP, the moving averages, momentum --
     so only the view changes. None, or a window reaching back past
@@ -2215,13 +2209,13 @@ def build_chart(
         column_widths=[0.8, 0.2],
     )
 
-    # With a window, the profile is the trades inside it: it sits beside the
-    # candles in view, and the morning's volume would otherwise outweigh them
+    # The price profile is the volume of the candles drawn: with a window,
+    # the bars inside it -- the morning's volume would otherwise outweigh them
     # at prices the window's price axis no longer even shows.
-    profile_trades = df_trades[df_trades["t"] >= view_start] if windowed else df_trades
-    if not profile_trades.empty or predicted_profile is not None:
+    profile_bars = df[df["t"] >= view_start] if windowed else df
+    if not profile_bars.empty or predicted_profile is not None:
         fig, mixture_fits = _plot_price_distribution(
-            profile_trades, fig,
+            profile_bars, fig,
             mixture_distribution=mixture_distribution,
             mixture_max_components=mixture_max_components,
             predicted_profile=predicted_profile,
@@ -2575,6 +2569,12 @@ def build_chart(
         fig.update_xaxes(
             range=[view_start.isoformat(), right.isoformat()], autorange=False, col=1,
         )
+        # And autorange spelled out on the price profile's volume axes (col
+        # 2, matched like col 1's). Left unset, plotly.js (3.6, Streamlit's)
+        # carries col 1's `autorange: false` over to that match group too,
+        # and with no range of its own the profile gets the empty axis's
+        # -1..6: every bin a full-width bar, no profile (2026-10-14).
+        fig.update_xaxes(autorange=True, col=2)
         _fit_y_to_window(fig, view_start, x_max, n_rows)
     if momentum_row is not None:
         # After the window's fit, which ranges the bars' axis alone.
