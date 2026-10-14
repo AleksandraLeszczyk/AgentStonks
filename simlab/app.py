@@ -495,16 +495,15 @@ def render_datasets_tab() -> None:
         start = col_start.date_input("Start", value=date.today() - timedelta(days=7))
         end = col_end.date_input("End", value=date.today() - timedelta(days=1))
         feed = col_feed.selectbox("Feed", list(sim_data.FEEDS))
-        col_key, col_secret = st.columns(2)
-        api_key = col_key.text_input(
-            "Alpaca API key", value=os.getenv("ALPACA_API_KEY", ""), type="password"
-        )
-        api_secret = col_secret.text_input(
-            "Alpaca secret", value=os.getenv("ALPACA_SECRET", ""), type="password"
-        )
+        # Read from the environment only, never drawn: a password field still
+        # sends its value to the browser.
+        api_key = os.getenv("ALPACA_API_KEY", "")
+        api_secret = os.getenv("ALPACA_SECRET", "")
         st.caption(
-            "Alpaca credentials are required for the `iex`/`sip` feeds. On `yfinance` "
-            "they are optional and fetch news only — without them the dataset has no news."
+            "Alpaca credentials come from `ALPACA_API_KEY` / `ALPACA_SECRET` in the "
+            f"environment ({'set' if api_key and api_secret else '**not set**'}). They are "
+            "required for the `iex`/`sip` feeds. On `yfinance` they are optional and fetch "
+            "news only — without them the dataset has no news."
         )
         submitted = st.form_submit_button("Download dataset", icon=":material/download:", type="primary")
 
@@ -513,7 +512,10 @@ def render_datasets_tab() -> None:
         if not name.strip() or not symbols:
             st.error("A dataset needs a name and at least one symbol.")
         elif feed != "yfinance" and not (api_key and api_secret):
-            st.error(f"Alpaca credentials are required for the `{feed}` feed.")
+            st.error(
+                f"Alpaca credentials are required for the `{feed}` feed. Set "
+                "`ALPACA_API_KEY` and `ALPACA_SECRET` in `.env` and restart SimLab."
+            )
         else:
             with st.status(f"Downloading '{name}'…", expanded=True) as status:
                 try:
