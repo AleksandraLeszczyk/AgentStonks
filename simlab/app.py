@@ -911,6 +911,12 @@ def _run_overlay_controls(
             entry = f"{day}: {note}" if len(days) > 1 else note
             if entry not in notes:
                 notes.append(entry)
+    # `_price_chart` has no momentum panel to put a forecast line on.
+    for key in dict.fromkeys(i["key"] for i in items if i.get("kind") == "series"):
+        notes.append(
+            f"{model_overlays.label(key)}: the forecast line is drawn on the live chart's "
+            "momentum panel, which this replay chart does not have — only its signals show here."
+        )
     return {"items": items, "notes": notes}
 
 

@@ -1168,3 +1168,40 @@ class TestTimeWindow:
                           window_minutes=120)
         assert fig.layout.xaxis.range[0] == pd.Timestamp(SESSION_START).isoformat()
         assert fig.layout.yaxis.range is None
+
+    def trades(self, bars):
+        # One print per bar, at its close with its volume.
+        return [{"p": b["c"], "s": b["v"], "t": b["t"]} for b in bars]
+
+    def profile(self, fig):
+        bars = [t for t in fig.data if t.type == "bar" and t.orientation == "h"]
+        prices = np.concatenate([np.asarray(t.y, float) for t in bars])
+        volume = np.concatenate([np.asarray(t.x, float) for t in bars])
+        return prices[volume > 0], volume[volume > 0]
+
+    def test_the_price_profile_is_the_windows_trades(self):
+        bars = self.bars()
+        fig = build_chart(bars, [], self.trades(bars), "AAPL", SESSION_START,
+                          window_minutes=60)
+        prices, volume = self.profile(fig)
+        shown = self.last_hour(bars)
+        # The morning's 9M-share prints at 110-115 are out of view, so out of
+        # the profile; the window's own volume is all of it.
+        assert prices.max() < 105.0
+        assert volume.sum() == sum(b["v"] for b in shown)
+        hover = next(t for t in fig.data if t.orientation == "h").hovertemplate
+        assert "of view" in hover
+
+    def test_the_whole_session_profile_is_every_trade(self):
+        bars = self.bars()
+        fig = build_chart(bars, [], self.trades(bars), "AAPL", SESSION_START)
+        prices, volume = self.profile(fig)
+        assert prices.max() > 110.0
+        assert volume.sum() == sum(b["v"] for b in bars)
+
+    def test_no_trades_in_the_window_draws_no_profile(self):
+        bars = self.bars()
+        # The tape stopped after the morning: nothing printed in the last hour.
+        trades = self.trades(bars[:60])
+        fig = build_chart(bars, [], trades, "AAPL", SESSION_START, window_minutes=60)
+        assert not [t for t in fig.data if t.type == "bar" and t.orientation == "h"]

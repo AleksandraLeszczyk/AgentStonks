@@ -937,6 +937,14 @@ def _chart_panel() -> None:
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
         for note in overlays["notes"]:
             st.caption(f":material/info: {sym} — {note}")
+        if not state.show_momentum:
+            for key in dict.fromkeys(
+                item["key"] for item in overlays["items"] if item.get("kind") == "series"
+            ):
+                st.caption(
+                    f":material/info: {sym} — {model_overlays.label(key)}: the forecast line is "
+                    "drawn on the momentum panel, which is hidden (Chart Settings → Momentum)."
+                )
     if not rendered:
         st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
 
@@ -1019,10 +1027,11 @@ def _live_chart_controls() -> None:
                 key="chart_window",
                 help="Only the last hour or two of the chart, up to the newest "
                 "bar, with the price and every panel under it rescaled to what "
-                "is in view. VWAP, the averages, momentum and the levels are "
-                "still worked out from the whole session — only the view "
-                "narrows. Early in the day, while the session is shorter than "
-                "the window, it is the whole session.",
+                "is in view. The price profile beside it is the volume traded "
+                "in the window only. VWAP, the averages, momentum and the "
+                "levels are still worked out from the whole session — for "
+                "them only the view narrows. Early in the day, while the "
+                "session is shorter than the window, it is the whole session.",
             )
 
         c1, c2 = st.columns(2)
@@ -1169,6 +1178,10 @@ def _live_chart_controls() -> None:
                 "Trader's momentum confirmation period or an LLM agent's armed "
                 "momentum tactic — and over 5 "
                 "minutes when it reads no momentum.\n\n"
+                "With the **Fast&Furious** model prediction selected, the yellow line "
+                "is its forecast of the next 30 minutes' average move, in bps per "
+                "minute on the right-hand axis, between its buy (green) and sell "
+                "(red) thresholds.\n\n"
                 "Regular session only, and each day starts fresh.",
             )
             show_net_gamma = st.checkbox(
@@ -1464,6 +1477,11 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
         "- **IntradayVolatility** (alone or × TimeToChange3) — time-of-day "
         "ranges: a shaded envelope, widest at the open and narrowing through "
         "midday.\n"
+        "- **Fast&Furious** — its forecast of the next 30 minutes' average "
+        "momentum, every minute: a yellow line on the momentum panel (bps per "
+        "minute, right axis) between the buy and sell thresholds, and ▲/▼ on "
+        "the candles where it crosses one. **Fast&Furious 2-hour range** is "
+        "the second model in its bundle, which only sizes the stop.\n"
         "- **Apple Trader** — buy/sell levels, not a forecast: the two orders "
         "the agent configured below would rest, following whatever settings "
         "that form is holding."

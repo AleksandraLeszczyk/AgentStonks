@@ -1107,7 +1107,7 @@ def _fastfurious_spec(ticker: str) -> ModelSpec:
         family="LightGBM (3 seeds) + range pair",
         consumers=(
             "Apple Trader — momentum strategy (Fast&Furious rules)",
-            "Chart overlay — Fast&Furious 2-hour range and signals",
+            "Chart overlays — Fast&Furious momentum forecast and signals; 2-hour range",
         ),
         features=tuple(meta.get("momentum_features") or [])
         + tuple(f for f in meta.get("range_features") or [] if f not in (meta.get("momentum_features") or [])),

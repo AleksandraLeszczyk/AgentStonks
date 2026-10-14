@@ -228,10 +228,12 @@ def _plot_price_distribution(
     mixture_max_components: int = 0,
     predicted_profile: Optional[dict] = None,
     mixture_fit_target: str = "live",
+    period_name: str = "session",
 ) -> tuple[go.Figure, list[tuple[str, list[tuple[float, float, float]]]]]:
     """
     Add a horizontal volume-weighted price distribution histogram to col 2.
-    Colors run violet→red from oldest to newest trades.
+    Colors run violet→red from oldest to newest trades; `period_name` is what
+    the hover calls the span they cover ("session", or "view" for a window).
 
     `predicted_profile` ({"prices", "density", ...} from
     profile_model.predicted_open_profile) is drawn as a curve over the
@@ -298,7 +300,7 @@ def _plot_price_distribution(
                     hovertemplate=(
                         "<b>Price bin:</b> %{y:.4f}<br>"
                         "<b>Volume:</b> %{x:,.0f}<br>"
-                        f"<b>Period:</b> {t_lo:.0%}–{t_hi:.0%} of session"
+                        f"<b>Period:</b> {t_lo:.0%}–{t_hi:.0%} of {period_name}"
                         "<extra></extra>"
                     ),
                 ),
@@ -1687,6 +1689,127 @@ def _add_bands(
         fig.data = fig.data[first:] + fig.data[:first]
 
 
+# How far right of the momentum panel the forecast axis's tick labels start, in
+# pixels: past the widest last-value label `_add_bar_by_bar_panel` writes there.
+OVERLAY_SERIES_TICK_STANDOFF_PX = 52
+
+
+def _add_overlay_series(
+    series: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: int,
+    legend_keys: "set | None" = None,
+) -> None:
+    """Forecasts that are not prices (`model_overlays._series`) as lines over
+    the momentum panel in `row`, on a value axis of their own on its right.
+
+    Their own axis because they share no unit with the bars: Fast&Furious's
+    forecast is in bps per minute and a few hundredths of one, the bars are a
+    bar's move in dollars, and on the bars' axis the line would be flat at
+    zero. The axis is added as an overlay of the panel's (`overlaying`) rather
+    than through `make_subplots(specs=secondary_y)`, which renumbers every
+    later subplot's axes -- and the rest of this module addresses the price
+    profile as `x2`/`y2`. `_center_overlay_zero` lines its zero up with the
+    bars' once the figure is built.
+
+    Clipped to `x0`-`x1` like a band. One legend entry per overlay key, unless
+    `legend_keys` says its markers already have one: those join it, so one
+    click hides the markers and the line together.
+    """
+    sub = fig.get_subplot(row, 1)
+    x_ref = "x" + sub.xaxis.plotly_name[len("xaxis"):]
+    y_ref = "y" + sub.yaxis.plotly_name[len("yaxis"):]
+    taken = [
+        int(name[len("yaxis"):] or 1)
+        for name in fig.layout.to_plotly_json() if name.startswith("yaxis")
+    ]
+    number = max(taken, default=1) + 1
+    unit = series[0].get("unit", "")
+    first_color = series[0].get("color") or PALETTE["accent"]
+    fig.update_layout({
+        f"yaxis{number}": dict(
+            overlaying=y_ref, anchor=x_ref, side="right",
+            showgrid=False, zeroline=False,
+            tickfont=dict(size=10, color=first_color),
+            tickformat=".2f",
+            # Clear of the bars' last-value label (" -$0.02"), which hangs off
+            # the newest bar into this margin when a window ends on it.
+            ticklabelstandoff=OVERLAY_SERIES_TICK_STANDOFF_PX,
+            title=dict(text=unit, font=dict(size=10, color=first_color)),
+        )
+    })
+    shown = set(legend_keys or ())
+    for item in series:
+        stamps = pd.to_datetime(pd.Series(item.get("t") or [], dtype=object), utc=True)
+        stamps = stamps.dt.tz_localize(None) if x0.tzinfo is None else stamps.dt.tz_convert(x0.tz)
+        visible = ((stamps >= x0) & (stamps <= x1)).to_numpy()
+        if visible.sum() < 2:
+            continue
+        key = item.get("key")
+        label = item.get("label", "")
+        text = item.get("text")
+        customdata = (
+            np.asarray(text, dtype=object)[visible] if text
+            else [item.get("note", "")] * int(visible.sum())
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=stamps[visible],
+                y=np.asarray(item.get("values") or [], float)[visible],
+                mode="lines",
+                line=dict(color=item.get("color") or PALETTE["accent"],
+                          width=item.get("width", 1.8), dash=item.get("dash", "solid")),
+                connectgaps=False,
+                name=item.get("group") or label,
+                legendgroup=key,
+                showlegend=key not in shown,
+                customdata=customdata,
+                hovertemplate=f"<b>{label}</b> %{{y:+.3f}} {item.get('unit', '')}"
+                "<br>%{x|%H:%M} · %{customdata}<extra></extra>",
+                xaxis=x_ref,
+                yaxis=f"y{number}",
+            )
+        )
+        shown.add(key)
+
+
+def _center_overlay_zero(fig: go.Figure, row: int, x0: pd.Timestamp, x1: pd.Timestamp) -> None:
+    """Put zero in the middle of the panel in `row` on both its value axes,
+    when `_add_overlay_series` gave it a second one.
+
+    Plotly ranges two overlaid axes independently, so the line's zero would sit
+    wherever the bars' axis happened to put its own -- and a forecast just
+    above zero would be drawn under the bars' zero line, reading as negative.
+    Each axis is made symmetric about zero over what is drawn between `x0` and
+    `x1` (as `_fit_y_to_window` reads it), which lines the two zeros up. An
+    axis with nothing in view keeps its autorange.
+    """
+    axis = fig.get_subplot(row, 1).yaxis
+    ref = "y" + axis.plotly_name[len("yaxis"):]
+    overlays = [
+        name for name, value in fig.layout.to_plotly_json().items()
+        if name.startswith("yaxis") and isinstance(value, dict)
+        and value.get("overlaying") == ref
+    ]
+    if not overlays:
+        return
+    x0, x1 = pd.Timestamp(x0), pd.Timestamp(x1)
+    for name in [axis.plotly_name] + overlays:
+        trace_ref = "y" + name[len("yaxis"):]
+        values: list = []
+        for trace in fig.data:
+            if (trace.yaxis or "y") == trace_ref:
+                values += _trace_values_in(trace, x0, x1, False)
+        y = pd.to_numeric(pd.Series(values, dtype=object), errors="coerce").abs()
+        y = y[np.isfinite(y)]
+        if y.empty or float(y.max()) == 0.0:
+            continue
+        reach = float(y.max()) * (1 + _WINDOW_Y_PAD)
+        fig.layout[name].update(range=[-reach, reach], autorange=False)
+
+
 def add_model_overlays(
     overlays: list[dict],
     fig: go.Figure,
@@ -1696,12 +1819,17 @@ def add_model_overlays(
     col: Optional[int] = 1,
     profile_axes: Optional[tuple[str, str]] = None,
     volume_row: Optional[int] = None,
+    momentum_row: Optional[int] = None,
 ) -> None:
     """Draw `model_overlays.compute` items onto `fig`.
 
     `x0`/`x1` are the visible time span: spans are clipped to it unless they
     are flagged `forward`, so a band that starts before the first drawn bar
     does not drag the axis backwards.
+
+    `series` items -- forecasts that are not prices -- go on the momentum
+    panel in `momentum_row`, against a value axis of their own
+    (`_add_overlay_series`). A figure without that panel draws none of them.
 
     Levels and price-bounded bands are drawn in the price panel and, when
     `profile_axes` names the price-profile subplot's `(xaxis, yaxis)`, again
@@ -1726,6 +1854,7 @@ def add_model_overlays(
 
     events: list[dict] = []
     bands: list[dict] = []
+    series: list[dict] = []
     for item in overlays:
         kind = item.get("kind")
         color = item.get("color") or PALETTE["accent"]
@@ -1808,14 +1937,26 @@ def add_model_overlays(
         elif kind in ("band", "path"):
             bands.append(item)
 
+        elif kind == "series":
+            series.append(item)
+
     if bands:
         _add_bands(bands, fig, pd.Timestamp(x0), pd.Timestamp(x1), row, col)
+
+    event_keys = set(e["key"] for e in events)
+    if series and momentum_row is not None:
+        _add_overlay_series(
+            series, fig, pd.Timestamp(x0), pd.Timestamp(x1), momentum_row,
+            legend_keys=event_keys,
+        )
+    series_keys = set(s["key"] for s in series) if momentum_row is not None else set()
 
     if not events:
         return
 
     # One trace per overlay key rather than one per event: the legend then names
-    # the overlay once, and clicking it hides the whole set.
+    # the overlay once, and clicking it hides the whole set -- with the
+    # overlay's line on the momentum panel, when it has one.
     for key in dict.fromkeys(e["key"] for e in events):
         group = [e for e in events if e["key"] == key]
         fig.add_trace(
@@ -1833,6 +1974,7 @@ def add_model_overlays(
                     line=dict(width=2, color=[e["color"] for e in group]),
                 ),
                 name=group[0].get("group") or group[0].get("label", key),
+                legendgroup=key if key in series_keys else None,
                 customdata=[[e.get("label", ""), e.get("note", "")] for e in group],
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>%{x|%H:%M}<br>"
@@ -1994,10 +2136,11 @@ def build_chart(
     `window_minutes` shows only that many minutes back from the newest bar
     (the live tab's "Last hour" / "Last 2 hours"): the time axis starts there
     and every panel's value axis is fitted to what is drawn inside it
-    (`_fit_y_to_window`). Everything is still computed from the whole session
-    -- VWAP, the moving averages, momentum, the profile -- so only the view
-    changes. None, or a window reaching back past `session_start`, is the
-    whole session.
+    (`_fit_y_to_window`). The price profile is the window's trades only, the
+    volume at each price of the candles in view. Everything else is still
+    computed from the whole session -- VWAP, the moving averages, momentum --
+    so only the view changes. None, or a window reaching back past
+    `session_start`, is the whole session.
 
     `net_gamma` adds a panel at the bottom -- under the momentum Δ one when
     that is shown -- with the options chain's net dealer gamma at each bar's
@@ -2072,13 +2215,18 @@ def build_chart(
         column_widths=[0.8, 0.2],
     )
 
-    if not df_trades.empty or predicted_profile is not None:
+    # With a window, the profile is the trades inside it: it sits beside the
+    # candles in view, and the morning's volume would otherwise outweigh them
+    # at prices the window's price axis no longer even shows.
+    profile_trades = df_trades[df_trades["t"] >= view_start] if windowed else df_trades
+    if not profile_trades.empty or predicted_profile is not None:
         fig, mixture_fits = _plot_price_distribution(
-            df_trades, fig,
+            profile_trades, fig,
             mixture_distribution=mixture_distribution,
             mixture_max_components=mixture_max_components,
             predicted_profile=predicted_profile,
             mixture_fit_target=mixture_fit_target,
+            period_name="view" if windowed else "session",
         )
     else:
         mixture_fits = []
@@ -2339,6 +2487,7 @@ def build_chart(
         add_model_overlays(
             model_overlays, fig, x_view0, df["t"].iloc[-1],
             row=1, col=1, profile_axes=("x2", "y2"), volume_row=2,
+            momentum_row=momentum_row,
         )
     if candle_patterns:
         add_candle_patterns(
@@ -2427,6 +2576,9 @@ def build_chart(
             range=[view_start.isoformat(), right.isoformat()], autorange=False, col=1,
         )
         _fit_y_to_window(fig, view_start, x_max, n_rows)
+    if momentum_row is not None:
+        # After the window's fit, which ranges the bars' axis alone.
+        _center_overlay_zero(fig, momentum_row, view_start, x_max)
     return fig
 
 

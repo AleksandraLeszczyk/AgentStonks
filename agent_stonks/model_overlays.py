@@ -38,12 +38,16 @@ Nine overlays
 `highlow3m_range`    HighLow_3m's forecast of the range *after* 9:33, drawn the
                      same way from the 09:32 bar on; the first three minutes'
                      own extremes are not a breach of it. See `highlow3m_model`.
-`fastfurious_signal` Fast&Furious's forecasts, read at the close of every bar:
-                     the next two hours' predicted high and low from that
-                     bar's price as a band, and a marker on each bar where the
-                     30-minute momentum forecast crosses the entry threshold
-                     (▲ a buy signal, ▼ a sell signal). See
-                     `fastfurious_model`.
+`fastfurious_signal` Fast&Furious's forecast of the next 30 minutes' average
+                     momentum, read at the close of every bar: a line in bps
+                     per minute on the momentum panel with the entry
+                     threshold either side of zero, and a marker on the
+                     candles where it crosses one (▲ a buy signal, ▼ a sell
+                     signal). See `fastfurious_model`.
+`fastfurious_range`  The next two hours' predicted high and low from each
+                     bar's price, as a band: the second model in the bundle,
+                     which only sizes the stop. Its own key so that it is off
+                     unless asked for.
 `trader_levels`      where Apple Trader would rest its buy and its sell, from
                      the forecast of the model its configuration names. The odd one out: every other overlay
                      draws what a *model* said, this one draws what an *agent*
@@ -74,6 +78,9 @@ changes through the day, and the chart draws each one differently. So
             timestamp                           between them tinted, behind the
                                                 candles; no profile mirror, as
                                                 a curve has no single price.
+    series  a value that is not a price,     -> a line on a value axis of its
+            per timestamp, in a unit of its     own over the momentum panel; not
+            own                                 drawn where there is none.
 
 Nothing here knows about plotly: `charts.add_model_overlays` is the only
 renderer, and SimLab draws the same items into a different figure. Nothing here
@@ -120,6 +127,7 @@ HIGHLOW_RANGE_KEY = "highlow_range"
 HIGHLOW2_RANGE_KEY = "highlow2_range"
 HIGHLOW3M_RANGE_KEY = "highlow3m_range"
 FASTFURIOUS_SIGNAL_KEY = "fastfurious_signal"
+FASTFURIOUS_RANGE_KEY = "fastfurious_range"
 
 
 @dataclass(frozen=True)
@@ -266,20 +274,36 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
     ),
     FASTFURIOUS_SIGNAL_KEY: ModelOverlay(
         key=FASTFURIOUS_SIGNAL_KEY,
-        label="Fast&Furious forecast (2-hour range, buy/sell signals)",
+        label="Fast&Furious 30-min momentum forecast (buy/sell signals)",
         name="Fast&Furious",
         summary=(
-            "Fast&Furious's forecasts, made at the close of every bar from 09:31 to 15:30: "
-            "the next two hours' predicted high and low from that bar's price, as a band, "
-            "and a marker where the forecast of the next 30 minutes' momentum reaches the "
-            "entry threshold — ▲ a buy signal, ▼ a sell signal."
+            "Fast&Furious's forecast of the next 30 minutes' average momentum, made at the "
+            "close of every bar from 09:31 to 15:30: a line in bps per minute on the momentum "
+            "panel (right axis) with the entry threshold above and below zero, and a marker "
+            "on the candles where it crosses one — ▲ a buy signal, ▼ a sell signal."
+        ),
+        requires="LightGBM, the Fast&Furious bundle, and Alpaca SIP and IEX minute bars",
+        tickers=apple_models.FASTFURIOUS_TICKERS,
+        models=(apple_models.FASTFURIOUS_KEY,),
+    ),
+    FASTFURIOUS_RANGE_KEY: ModelOverlay(
+        key=FASTFURIOUS_RANGE_KEY,
+        label="Fast&Furious 2-hour range (the stop's forecast)",
+        name="Fast&Furious 2-hour range",
+        summary=(
+            "The second model in the Fast&Furious bundle: the next two hours' high and low "
+            "from each bar's price, as a band. Not the momentum forecast the trades are made "
+            "on — the agent only hangs its stop off the predicted low."
         ),
         requires=(
             "LightGBM, the Fast&Furious bundle, Alpaca SIP and IEX minute bars, and "
-            "HighLow_3m's option tables for the band"
+            "HighLow_3m's option tables"
         ),
         tickers=apple_models.FASTFURIOUS_TICKERS,
-        models=(apple_models.FASTFURIOUS_KEY,),
+        # Deliberately not `models=(FASTFURIOUS_KEY,)`: `for_models` pre-selects
+        # what a run's model said, and drawn by default this band reads as the
+        # model's forecast when it is only the stop's input.
+        models=(),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -535,6 +559,40 @@ def _path(key: str, label_: str, ts, values, color: str,
     }
 
 
+def _series(key: str, label_: str, ts, values, color: str, unit: str,
+            dash: str = "solid", width: float = 1.8, note: str = "",
+            text: "list[str] | None" = None) -> dict:
+    """A forecast that is not a price, through the session.
+
+    Drawn as a line on the momentum panel against a value axis of its own,
+    labelled `unit`, rather than on the price axis: Fast&Furious's momentum
+    forecast is a few hundredths of a bp per minute, which on the candles' axis
+    -- or the momentum bars' dollars -- is a flat line at zero. The renderer
+    centres that axis on zero with the bars', so above zero is above zero on
+    both. Every series of a chart shares the one axis and the first one's
+    `unit`. `text` is a hover line per timestamp. A chart without a momentum
+    panel does not draw it.
+    """
+    stamps = pd.DatetimeIndex(ts)
+    if stamps.tz is None:
+        stamps = stamps.tz_localize(market_hours.MARKET_TZ)
+    return {
+        "kind": "series",
+        "key": key,
+        "label": label_,
+        "group": OVERLAYS[key].label if key in OVERLAYS else key,
+        "t": [stamp.isoformat() for stamp in stamps.tz_convert("UTC")],
+        "values": [float("nan") if v is None else float(v) for v in values],
+        "unit": unit,
+        "color": color,
+        "dash": dash,
+        "width": width,
+        "note": note,
+        "text": None if text is None else [str(t) for t in text],
+        "forward": False,
+    }
+
+
 def _iso(ts) -> str:
     """A timestamp in the one form every consumer here accepts.
 
@@ -630,6 +688,13 @@ def compute(
             memo[model_key] = _highlow_forecast(symbol, session, day, credentials, model_key)
         return memo[model_key]
 
+    def fastfurious_forecast() -> dict:
+        if "fastfurious" not in memo:
+            memo["fastfurious"] = _fastfurious_forecast(
+                symbol, session, day, credentials, trader_config
+            )
+        return memo["fastfurious"]
+
     def trader_forecast() -> dict:
         model_key = trader_model(trader_config, symbol)
         if model_key in _HIGHLOW_MODULES:
@@ -692,9 +757,8 @@ def compute(
         HIGHLOW3M_RANGE_KEY: lambda: range_items(
             HIGHLOW3M_RANGE_KEY, lambda: highlow_forecast(apple_models.HIGHLOW3M_KEY)
         ),
-        FASTFURIOUS_SIGNAL_KEY: lambda: _fastfurious_items(
-            symbol, session, day, credentials, trader_config
-        ),
+        FASTFURIOUS_SIGNAL_KEY: lambda: _fastfurious_signal_items(fastfurious_forecast()),
+        FASTFURIOUS_RANGE_KEY: lambda: _fastfurious_range_items(fastfurious_forecast()),
         TRADER_LEVELS_KEY: trader_items,
     }
 
@@ -1347,91 +1411,156 @@ def _trader_levels_items(
 # --- Fast&Furious -----------------------------------------------------------
 
 
-def _fastfurious_items(
+def _fastfurious_forecast(
     symbol: str,
     session: pd.DataFrame,
     day: pd.Timestamp,
     credentials: "tuple[str, str] | None",
     config=None,
-) -> "tuple[list[dict], str]":
-    """The 2-hour band and the signals, every minute of the session so far.
+) -> dict:
+    """Every minute's Fast&Furious forecast of the session so far, for the two
+    overlays that draw it.
 
     Each minute's forecast is the one made at that bar's close, read from the
     model's own tape (SIP to 15 minutes back, IEX since), so a past session is
     drawn with what the model said at each minute and a live one with what it
     has said so far. The threshold is the configured run's quantile when the
     chart's configuration is a Fast&Furious one, the notebook's otherwise.
+
+    Returns `{"fc", "stamps", "theta", "sessions", "quantile", "problem",
+    "threshold_problem"}`: `problem` says why there is no forecast at all,
+    `threshold_problem` why there is no threshold -- which only the signals
+    need, so the range is still drawn without one.
     """
-    overlay = OVERLAYS[FASTFURIOUS_SIGNAL_KEY]
     model_key = apple_models.FASTFURIOUS_KEY
     from .config import APPLE_TRADER_FF_ENTRY_QUANTILE
 
     quantile = APPLE_TRADER_FF_ENTRY_QUANTILE
     if config is not None and getattr(config, "model_key", None) == model_key:
         quantile = float(config.ff_entry_quantile)
+    out = {"fc": None, "stamps": [], "theta": float("nan"), "sessions": 0,
+           "quantile": quantile, "problem": "", "threshold_problem": ""}
     try:
         bundle = apple_models.load(model_key, symbol)
         if bundle is None:
-            return [], f"{overlay.label}: {apple_models.unavailable_reason(model_key, symbol)}"
+            return {**out, "problem": apple_models.unavailable_reason(model_key, symbol)}
         module = importlib.import_module(".fastfurious_model", __package__)
         # Closed bars only: a live buffer's newest row can be the minute still
         # trading, whose forecast does not exist yet.
         closed = session[session.index + pd.Timedelta(minutes=1) <= pd.Timestamp(clock.now())]
         if not len(closed):
-            return [], f"{overlay.label}: no bar of the session has closed yet."
+            return {**out, "problem": "no bar of the session has closed yet."}
         last = int(round(float(closed["minutes_from_open"].iloc[-1])))
         key, secret = credentials or (None, None)
         fc = module.session_forecasts(bundle, symbol, day, last, key, secret, wait=False)
-        theta, sessions = module.threshold(bundle, symbol, day, quantile, key, secret)
     except Exception as exc:  # a decoration must never take the chart down
-        return [], f"{overlay.label}: {exc}"
+        return {**out, "problem": str(exc)}
     if not len(fc):
-        return [], f"{overlay.label}: no forecast yet — IEX has not printed this session."
-
-    color = MODEL_OVERLAY_COLORS["fastfurious"]
+        return {**out, "problem": "no forecast yet — IEX has not printed this session."}
+    try:
+        theta, sessions = module.threshold(bundle, symbol, day, quantile, key, secret)
+        problem = "" if np.isfinite(theta) else f"no entry threshold ({sessions} earlier sessions)."
+    except Exception as exc:
+        theta, sessions, problem = float("nan"), 0, f"no entry threshold ({exc})."
     open_ts = pd.Timestamp(day).tz_localize(market_hours.MARKET_TZ) + pd.Timedelta(
         hours=market_hours.MARKET_OPEN.hour, minutes=market_hours.MARKET_OPEN.minute
     )
-    stamps = [open_ts + pd.Timedelta(minutes=int(m)) for m in fc.index]
-    items: "list[dict]" = []
-    notes = []
-    ranged = fc["pred_high"].notna()
-    if ranged.any():
-        items.append(_band(
-            FASTFURIOUS_SIGNAL_KEY, "2-hour range",
-            [s for s, ok in zip(stamps, ranged) if ok],
-            fc.loc[ranged, "pred_low"], fc.loc[ranged, "pred_high"], color,
-            lower_label="Forecast 2-hour low", upper_label="Forecast 2-hour high",
-            note="where the next two hours' high and low are forecast to land, from each "
-                 "bar's price at its close",
+    return {
+        **out,
+        "fc": fc,
+        "stamps": [open_ts + pd.Timedelta(minutes=int(m)) for m in fc.index],
+        "theta": float(theta),
+        "sessions": int(sessions),
+        "threshold_problem": problem,
+    }
+
+
+def _fastfurious_signal_items(result: dict) -> "tuple[list[dict], str]":
+    """The momentum forecast the trades are made on, and its signals.
+
+    The forecast is drawn in bps per minute (`mom_bps`) on the momentum panel,
+    with the entry threshold either side of zero in the same unit. The model
+    compares `y_hat` with a fixed threshold in units of `s30`, the usual size
+    of a 30-minute move at that time of day, so in bps per minute the threshold
+    is a curve: wide at the open and into the close, narrow at midday. The
+    line crosses it exactly where `y_hat` crosses the fixed one, which is where
+    a ▲ or ▼ goes on the candles.
+    """
+    overlay = OVERLAYS[FASTFURIOUS_SIGNAL_KEY]
+    if result["problem"]:
+        return [], f"{overlay.label}: {result['problem']}"
+    fc, stamps = result["fc"], result["stamps"]
+    theta, sessions, quantile = result["theta"], result["sessions"], result["quantile"]
+    color = MODEL_OVERLAY_COLORS["fastfurious"]
+    sell_color = MODEL_OVERLAY_COLORS["trader_stop"]
+    has_theta = np.isfinite(theta)
+    # bps per minute for one unit of y: what turns y_hat into `mom_bps`.
+    per_y = fc["s30"] / 30 * 1e4
+    text = [f"y {y:+.4f}" for y in fc["y_hat"]]
+    if has_theta:
+        text = [f"{t} · {y / theta:+.0%} of the threshold" for t, y in zip(text, fc["y_hat"])]
+    items: "list[dict]" = [_series(
+        FASTFURIOUS_SIGNAL_KEY, "30-min momentum forecast", stamps, fc["mom_bps"],
+        MODEL_OVERLAY_COLORS["fastfurious_forecast"], unit="bps/min",
+        note="the average 1-minute move forecast for the next 30 minutes, at each bar's close",
+        text=text,
+    )]
+    if not has_theta:
+        return items, f"{overlay.label}: {result['threshold_problem']}"
+    edge = (theta * per_y).tolist()
+    where = (
+        f"±{theta:.4f} in y, the {quantile:.0%} quantile of the last {sessions} sessions' "
+        "forecasts"
+    )
+    items += [
+        _series(FASTFURIOUS_SIGNAL_KEY, "Buy threshold", stamps, edge, color,
+                unit="bps/min", dash="dash", width=1.0, note=where),
+        _series(FASTFURIOUS_SIGNAL_KEY, "Sell threshold", stamps, [-v for v in edge],
+                sell_color, unit="bps/min", dash="dash", width=1.0, note=where),
+    ]
+    sign = np.where(fc["y_hat"] >= theta, 1, np.where(fc["y_hat"] <= -theta, -1, 0))
+    # The first bar of each run of the same signal: the trader acts on
+    # every one of them, but forty markers in a row say nothing more.
+    previous = np.r_[0, sign[:-1]]
+    for stamp, (minute, row), s, before in zip(stamps, fc.iterrows(), sign, previous):
+        if not s or s == before:
+            continue
+        items.append(_event(
+            FASTFURIOUS_SIGNAL_KEY,
+            f"{'Buy' if s > 0 else 'Sell'} signal: {row['mom_bps']:+.3f} bps/min",
+            stamp,
+            color if s > 0 else sell_color,
+            icon="▲" if s > 0 else "▼",
+            price=float(row["p"]),
+            line=False,
+            note=(
+                f"forecast y {row['y_hat']:+.4f} against a threshold of ±{theta:.4f} (the "
+                f"{quantile:.0%} quantile of the last {sessions} sessions' forecasts)"
+            ),
         ))
-    else:
+    return items, ""
+
+
+def _fastfurious_range_items(result: dict) -> "tuple[list[dict], str]":
+    """The next two hours' predicted high and low from each bar's price -- the
+    range model the stop hangs off, not the forecast the trades are made on."""
+    overlay = OVERLAYS[FASTFURIOUS_RANGE_KEY]
+    if result["problem"]:
+        return [], f"{overlay.label}: {result['problem']}"
+    fc, stamps = result["fc"], result["stamps"]
+    ranged = fc["pred_high"].notna()
+    if not ranged.any():
         problem = fc.attrs.get("range_problem") or "no option table"
-        notes.append(f"{overlay.label}: no 2-hour range ({problem}).")
-    if np.isfinite(theta):
-        sign = np.where(fc["y_hat"] >= theta, 1, np.where(fc["y_hat"] <= -theta, -1, 0))
-        # The first bar of each run of the same signal: the trader acts on
-        # every one of them, but forty markers in a row say nothing more.
-        previous = np.r_[0, sign[:-1]]
-        for stamp, (minute, row), s, before in zip(stamps, fc.iterrows(), sign, previous):
-            if not s or s == before:
-                continue
-            items.append(_event(
-                FASTFURIOUS_SIGNAL_KEY,
-                f"{'Buy' if s > 0 else 'Sell'} signal: {row['mom_bps']:+.3f} bps/min",
-                stamp,
-                color if s > 0 else MODEL_OVERLAY_COLORS["trader_stop"],
-                icon="▲" if s > 0 else "▼",
-                price=float(row["p"]),
-                line=False,
-                note=(
-                    f"forecast y {row['y_hat']:+.4f} against a threshold of ±{theta:.4f} (the "
-                    f"{quantile:.0%} quantile of the last {sessions} sessions' forecasts)"
-                ),
-            ))
-    else:
-        notes.append(f"{overlay.label}: no entry threshold ({sessions} earlier sessions).")
-    return items, " ".join(notes)
+        return [], f"{overlay.label}: no 2-hour range ({problem})."
+    return [_band(
+        FASTFURIOUS_RANGE_KEY, "2-hour range",
+        [s for s, ok in zip(stamps, ranged) if ok],
+        fc.loc[ranged, "pred_low"], fc.loc[ranged, "pred_high"],
+        MODEL_OVERLAY_COLORS["fastfurious"],
+        lower_label="Forecast 2-hour low", upper_label="Forecast 2-hour high",
+        note="where the next two hours' high and low are forecast to land, from each "
+             "bar's price at its close",
+    )], ""
 
 
 def _momentum_trader_items(

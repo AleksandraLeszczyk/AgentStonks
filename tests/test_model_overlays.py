@@ -1169,6 +1169,105 @@ class TestHighLow3mOverlay:
         assert f"{result['made_at']:%H:%M}" == "09:32"
 
 
+class TestFastFuriousOverlay:
+    """Fast&Furious trades on its 30-minute momentum forecast, so that is what
+    its overlay draws -- a line on the momentum panel between the two entry
+    thresholds, and the signals on the candles. The 2-hour range, which only
+    sizes the stop, is an overlay of its own that nothing selects for you."""
+
+    THETA = 0.04
+
+    @pytest.fixture()
+    def stubbed(self, monkeypatch):
+        ff = pytest.importorskip("agent_stonks.fastfurious_model")
+        calls: list = []
+        minutes = np.arange(1, 41)
+        y = np.zeros(len(minutes))
+        y[10:13] = 0.05   # a buy run of three minutes: one marker
+        y[25] = -0.06     # one sell minute
+        s30 = np.linspace(0.006, 0.003, len(minutes))
+        self.fc = pd.DataFrame(
+            {"y_hat": y, "mom_bps": y * s30 / 30 * 1e4, "p": 200.0 + minutes * 0.01,
+             "s30": s30, "pred_high": 202.0, "pred_low": 198.0},
+            index=pd.Index(minutes),
+        )
+        self.theta = (self.THETA, 20)
+        monkeypatch.setattr(apple_models, "load", lambda key, ticker=None: {"kind": "fastfurious"})
+
+        def forecasts(bundle, symbol, day, last, key=None, secret=None, wait=True):
+            calls.append(last)
+            return self.fc.copy()
+
+        monkeypatch.setattr(ff, "session_forecasts", forecasts)
+        monkeypatch.setattr(ff, "threshold", lambda *a, **k: self.theta)
+        return calls
+
+    def compute(self, keys):
+        return mo.compute(keys, "AAPL", minute_bars(n=60), session_date=SESSION)
+
+    def test_the_signal_overlay_is_the_momentum_forecast_not_the_range(self, stubbed):
+        result = self.compute([mo.FASTFURIOUS_SIGNAL_KEY])
+        assert result["notes"] == []
+        assert not [i for i in result["items"] if i["kind"] == "band"]
+        series = {i["label"]: i for i in result["items"] if i["kind"] == "series"}
+        assert set(series) == {"30-min momentum forecast", "Buy threshold", "Sell threshold"}
+        assert {i["unit"] for i in series.values()} == {"bps/min"}
+        line = series["30-min momentum forecast"]["values"]
+        assert line == pytest.approx(list(self.fc["mom_bps"]))
+        # The threshold is fixed in y, so in bps per minute it follows s30.
+        edge = self.THETA * self.fc["s30"] / 30 * 1e4
+        assert series["Buy threshold"]["values"] == pytest.approx(list(edge))
+        assert series["Sell threshold"]["values"] == pytest.approx(list(-edge))
+
+    def test_a_marker_sits_where_the_line_crosses_a_threshold(self, stubbed):
+        items = self.compute([mo.FASTFURIOUS_SIGNAL_KEY])["items"]
+        events = [i for i in items if i["kind"] == "event"]
+        assert [e["icon"] for e in events] == ["▲", "▼"]
+        series = {i["label"]: i for i in items if i["kind"] == "series"}
+        at = {t: n for n, t in enumerate(series["30-min momentum forecast"]["t"])}
+        line = series["30-min momentum forecast"]["values"]
+        buy, sell = (at[e["ts"]] for e in events)
+        assert line[buy] >= series["Buy threshold"]["values"][buy]
+        assert line[buy - 1] < series["Buy threshold"]["values"][buy - 1]
+        assert line[sell] <= series["Sell threshold"]["values"][sell]
+        # Markers stay on the candles, at the price the forecast was read at.
+        assert events[0]["price"] == pytest.approx(self.fc["p"].iloc[buy])
+
+    def test_the_range_is_its_own_overlay(self, stubbed):
+        result = self.compute([mo.FASTFURIOUS_RANGE_KEY])
+        assert [(i["kind"], i["key"]) for i in result["items"]] == [
+            ("band", mo.FASTFURIOUS_RANGE_KEY)
+        ]
+        band_ = result["items"][0]
+        assert set(band_["upper"]) == {202.0} and set(band_["lower"]) == {198.0}
+
+    def test_both_overlays_read_one_forecast(self, stubbed):
+        self.compute([mo.FASTFURIOUS_SIGNAL_KEY, mo.FASTFURIOUS_RANGE_KEY])
+        assert len(stubbed) == 1
+
+    def test_a_fastfurious_run_opens_without_the_range(self):
+        assert mo.for_models([apple_models.FASTFURIOUS_KEY], "AAPL")["keys"] == [
+            mo.FASTFURIOUS_SIGNAL_KEY
+        ]
+        assert mo.FASTFURIOUS_RANGE_KEY in mo.keys_for("AAPL")
+
+    def test_no_threshold_still_draws_the_line_and_says_why(self, stubbed):
+        self.theta = (float("nan"), 3)
+        result = self.compute([mo.FASTFURIOUS_SIGNAL_KEY])
+        assert [i["label"] for i in result["items"]] == ["30-min momentum forecast"]
+        assert "no entry threshold (3 earlier sessions)" in result["notes"][0]
+
+    def test_a_missing_option_table_only_empties_the_range(self, stubbed):
+        self.fc[["pred_high", "pred_low"]] = np.nan
+        self.fc.attrs["range_problem"] = "no option table for 2026-08-06"
+        result = self.compute([mo.FASTFURIOUS_SIGNAL_KEY, mo.FASTFURIOUS_RANGE_KEY])
+        assert {i["key"] for i in result["items"]} == {mo.FASTFURIOUS_SIGNAL_KEY}
+        assert result["notes"] == [
+            f"{mo.label(mo.FASTFURIOUS_RANGE_KEY)}: no 2-hour range "
+            "(no option table for 2026-08-06)."
+        ]
+
+
 class TestLiveOverlays:
     LONG_HISTORY = [{"t": "2026-08-06", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}]
 
@@ -1591,3 +1690,85 @@ class TestRenderer:
     def test_overlay_x_max_handles_a_naive_reference(self):
         naive = pd.Timestamp(BARS[-1]["t"]).tz_localize(None)
         assert overlay_x_max([window()], naive).tzinfo is None
+
+
+def forecast_line(key="ff", label="Forecast", values=None, start=1):
+    """A `series` item over BARS[start:], in bps per minute."""
+    stamps = [b["t"] for b in BARS[start:]]
+    if values is None:
+        values = list(np.linspace(-0.05, 0.12, len(stamps)))
+    return {"kind": "series", "key": key, "label": label, "group": "Fast&Furious",
+            "t": stamps, "values": values, "unit": "bps/min", "color": "#facc15",
+            "dash": "solid", "width": 1.8, "note": "why", "text": None, "forward": False}
+
+
+class TestSeriesRenderer:
+    """A forecast that is not a price goes on the momentum panel, on a value
+    axis of its own whose zero lines up with the bars'."""
+
+    def chart(self, items, **kwargs):
+        kwargs.setdefault("show_momentum", True)
+        return build_chart(BARS, [], [], "AAPL", SESSION_START, model_overlays=items, **kwargs)
+
+    @staticmethod
+    def line(fig, name="Fast&Furious"):
+        return next(t for t in fig.data if t.name == name and t.type == "scatter")
+
+    def test_the_line_is_on_its_own_axis_over_the_momentum_panel(self):
+        fig = self.chart([forecast_line()])
+        panel = fig.get_subplot(3, 1)
+        trace = self.line(fig)
+        axis = fig.layout["yaxis" + trace.yaxis[1:]]
+        assert axis.overlaying == "y" + panel.yaxis.plotly_name[len("yaxis"):]
+        assert trace.xaxis == "x" + panel.xaxis.plotly_name[len("xaxis"):]
+        assert axis.side == "right" and axis.title.text == "bps/min"
+
+    def test_the_other_subplots_keep_their_axis_ids(self):
+        """`make_subplots(secondary_y=...)` would have renumbered them, and the
+        price profile is addressed as x2/y2."""
+        fig = self.chart([forecast_line()])
+        assert fig.get_subplot(1, 2).xaxis.plotly_name == "xaxis2"
+        assert fig.get_subplot(1, 2).yaxis.plotly_name == "yaxis2"
+
+    def test_both_axes_are_centred_on_zero(self):
+        fig = self.chart([forecast_line()])
+        own = fig.layout["yaxis" + self.line(fig).yaxis[1:]].range
+        bars = fig.layout[fig.get_subplot(3, 1).yaxis.plotly_name].range
+        assert own[0] == pytest.approx(-own[1]) and own[1] >= 0.12
+        assert bars[0] == pytest.approx(-bars[1]) and bars[1] > 0
+
+    def test_a_window_centres_on_what_it_shows(self):
+        values = [0.5] + [0.02] * (len(BARS) - 2)
+        fig = self.chart([forecast_line(values=values)], window_minutes=30)
+        own = fig.layout["yaxis" + self.line(fig).yaxis[1:]].range
+        assert own[1] == pytest.approx(0.02 * 1.05)
+
+    def test_without_a_momentum_panel_nothing_is_drawn(self):
+        fig = self.chart([forecast_line()], show_momentum=False)
+        assert not [t for t in fig.data if t.name == "Fast&Furious"]
+        assert not [k for k, v in fig.layout.to_plotly_json().items()
+                    if k.startswith("yaxis") and v.get("overlaying")]
+
+    def test_simlabs_plain_figure_skips_it(self):
+        fig = go.Figure(go.Scatter(x=[b["t"] for b in BARS], y=[b["c"] for b in BARS]))
+        add_model_overlays([forecast_line()], fig, pd.Timestamp(BARS[0]["t"]),
+                           pd.Timestamp(BARS[-1]["t"]), row=None, col=None)
+        assert len(fig.data) == 1
+
+    def test_the_line_joins_its_markers_legend_entry(self):
+        marker = {**moment(), "key": "ff", "group": "Fast&Furious"}
+        fig = self.chart([forecast_line(), forecast_line(label="Buy threshold"), marker])
+        lines = [t for t in fig.data if t.yaxis not in (None, "y") and t.legendgroup == "ff"]
+        assert len(lines) == 2 and not any(t.showlegend for t in lines)
+        markers = next(t for t in fig.data if getattr(t, "mode", None) == "markers+text")
+        assert markers.legendgroup == "ff" and markers.showlegend
+
+    def test_with_no_markers_the_line_has_the_legend_entry(self):
+        fig = self.chart([forecast_line(), forecast_line(label="Buy threshold")])
+        lines = [t for t in fig.data if t.legendgroup == "ff"]
+        assert [t.showlegend for t in lines] == [True, False]
+
+    def test_other_overlays_markers_keep_no_legend_group(self):
+        fig = self.chart([moment()])
+        markers = next(t for t in fig.data if getattr(t, "mode", None) == "markers+text")
+        assert markers.legendgroup is None

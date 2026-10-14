@@ -912,10 +912,13 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     # And the stop under that buy: red, because it is the one line on the chart
     # that marks a loss rather than an order meant to make money.
     "trader_stop": "#f87171",
-    # Fast&Furious's 2-hour high/low band and its entry signals: green, away
-    # from every day-range blue -- a different question (the next two hours
-    # from each minute's price, not the session's extremes).
+    # Fast&Furious's 2-hour high/low band, its entry signals and its buy
+    # threshold: green, away from every day-range blue -- a different question
+    # (the next two hours from each minute's price, not the session's extremes).
     "fastfurious": "#4ade80",
+    # Its momentum forecast line, drawn over the momentum panel's green and red
+    # bars, so neither: yellow.
+    "fastfurious_forecast": "#facc15",
 }
 
 # Alpha for the semi-transparent backgrounds overlays paint behind the candles.
