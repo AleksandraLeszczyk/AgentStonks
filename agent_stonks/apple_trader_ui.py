@@ -33,13 +33,15 @@ scan; in a tooltip it is there for whoever asks.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from . import apple_models, event_days
-from .apple_trader import AppleTraderConfig, dayrange_levels, min_win_for, stop_for
+from . import apple_models, base_configs, event_days
+from .apple_trader import (
+    AppleTraderConfig, dayrange_levels, default_config, min_win_for, shipped_config,
+)
 
 if TYPE_CHECKING:
     from .candidates import SelectionRules
@@ -78,9 +80,12 @@ class FormCopy:
     #: Help text per knob, and per model as `model_<key>` -- the latter is
     #: appended to the model picker's own help for the model selected.
     help: "dict[str, str]" = field(default_factory=dict)
+    #: Appended to every key past the model picker: the pair's base
+    #: configuration's digest (`base_configs.key_suffix`), set by `params`.
+    suffix: str = ""
 
     def key(self, name: str) -> str:
-        return f"{self.prefix}_{name}"
+        return f"{self.prefix}_{name}{self.suffix}"
 
 
 def params(
@@ -99,11 +104,16 @@ def params(
     screen for a run. A running agent adopts what these two widgets hold
     (`DayRangeTrader._adopt_form_levels`), so re-seeding them from the shipped
     pair would quietly move its orders.
+
+    Everything past the model opens on the pair's base configuration when
+    SimLab has set one (`default_config`), and keeps what the form has no knob
+    for -- a level source, the fill rule -- from it too. Every key past the
+    model carries the base's digest, so a new base re-seeds the whole form.
     """
-    defaults = AppleTraderConfig()
-    ticker = instrument_row(defaults, symbols, copy)
+    start = AppleTraderConfig()
+    ticker = instrument_row(start, symbols, copy)
     keys = apple_models.keys_for(ticker)
-    default_key = defaults.model_key if defaults.model_key in keys else keys[0]
+    default_key = start.model_key if start.model_key in keys else keys[0]
     # Scoped to the instrument: the models on offer change with it, and a
     # widget holding one that is no longer an option would be a stale
     # selection rather than a choice.
@@ -116,13 +126,75 @@ def params(
             index=keys.index(default_key),
             format_func=model_label,
             key=model_widget,
-            help=model_help(shown if shown in keys else default_key, copy),
+            help=model_help(shown if shown in keys else default_key, copy, ticker),
         )
     )
     bundle = apple_models.load(model_key, ticker)
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
+    defaults = default_config(ticker, model_key)
+    copy = replace(copy, suffix=base_configs.key_suffix(model_key, ticker))
+    if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
+        return momentum_params(defaults, model_key, ticker, copy)
     return dayrange_params(defaults, model_key, ticker, copy, seed)
+
+
+def momentum_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
+) -> AppleTraderConfig:
+    """Fast&Furious's rules: the entry threshold, the clock, the stop and the
+    sell signal -- notebook 06's pick by default.
+
+    Keyed by instrument like the levels, since a threshold and a stop picked on
+    one symbol's forecasts say nothing about another's. Read once, at ▶ Start:
+    nothing here is adopted by a running agent, so there is no running
+    configuration to seed from. The size is the day-range form's own widget,
+    so one number is the position size whichever model is picked.
+    """
+    section("Signal", copy.sections.get("momentum"))
+    col_a, col_b = st.columns(2)
+    quantile = col_a.number_input(
+        "Entry threshold (quantile of the last 20 sessions)",
+        min_value=0.50, max_value=0.995, value=float(defaults.ff_entry_quantile), step=0.01,
+        format="%.3f", key=copy.key(f"ff_entry_quantile_{model_key}_{ticker}"),
+        help=copy.help.get("ff_entry_quantile"),
+    )
+    hold = col_b.number_input(
+        "Hold after the last buy signal (min)",
+        min_value=1, max_value=120, value=int(defaults.ff_hold_minutes), step=1,
+        key=copy.key(f"ff_hold_minutes_{model_key}_{ticker}"),
+        help=copy.help.get("ff_hold_minutes"),
+    )
+    position_pct = col_a.number_input(
+        "Position size (% of cash)",
+        min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
+        key=copy.key("dayrange_size"),
+        help=copy.help.get("position_pct"),
+    )
+    stop_k = col_b.number_input(
+        "Stop (× the forecast 2-hour drop, 0 = off)",
+        min_value=0.0, max_value=5.0, value=float(defaults.ff_stop_k), step=0.25, format="%.2f",
+        key=copy.key(f"ff_stop_k_{model_key}_{ticker}"),
+        help=copy.help.get("ff_stop_k"),
+    )
+    exit_on_sell = st.checkbox(
+        "Sell on a sell signal",
+        value=bool(defaults.ff_exit_on_sell_signal),
+        key=copy.key(f"ff_exit_on_sell_signal_{model_key}_{ticker}"),
+        help=copy.help.get("ff_exit_on_sell_signal"),
+    )
+    skip_events = skip_param(defaults, copy)
+    return replace(
+        defaults,
+        model_key=model_key,
+        ticker=ticker,
+        position_pct=float(position_pct),
+        ff_entry_quantile=float(quantile),
+        ff_hold_minutes=int(hold),
+        ff_stop_k=float(stop_k),
+        ff_exit_on_sell_signal=bool(exit_on_sell),
+        skip_events=skip_events,
+    )
 
 
 def instrument_row(
@@ -162,7 +234,7 @@ def instrument_help(options: "list[str]", copy: FormCopy) -> str:
     return f"{copy.instrument_help}\n\n**Models fitted per instrument**\n\n{fitted}"
 
 
-def model_help(key: str, copy: FormCopy) -> str:
+def model_help(key: str, copy: FormCopy, ticker: str = "") -> str:
     """The model picker's `?`: what picking a model means, then the one picked.
 
     The registry's summary says what the model is; the app's own note, keyed by
@@ -170,14 +242,61 @@ def model_help(key: str, copy: FormCopy) -> str:
     day-range models share a rule set and differ only in what the levels are
     measured below, which is exactly what a reader choosing between them needs.
     The help is built before the widget renders, so it describes the selection
-    the widget is holding: the one on screen.
+    the widget is holding: the one on screen. Last, whether the pair opens on
+    a base configuration (`base_help`).
     """
     model = apple_models.get(key)
     parts = [copy.model_help, f"**{model.label}**", model.summary]
     note = copy.help.get(f"model_{key}")
     if note:
         parts.append(note)
+    if ticker:
+        parts.append(base_help(key, ticker))
     return "\n\n".join(p for p in parts if p)
+
+
+def base_help(model_key: str, ticker: str) -> str:
+    """Where the form's starting values come from when the pair has a base
+    configuration (`base_configs`): when it was set, from what, and every field
+    in which it differs from the shipped defaults -- the ones without a knob
+    here included, since nothing else on the form shows them. Empty without one.
+    """
+    found = base_configs.entry(model_key, ticker)
+    if not found:
+        return ""
+    changed = config_changes(
+        default_config(ticker, model_key), shipped_config(ticker, model_key), "shipped"
+    )
+    source = found.get("source") or {}
+    origin = f" from tuning job `{source['job_id']}`" if source.get("job_id") else ""
+    lines = [
+        f"**Base configuration.** Set {str(found.get('set_at', ''))[:10]}{origin}: this "
+        "form opens on it rather than on the shipped defaults."
+    ]
+    lines.append(
+        "It differs from them in " + "; ".join(changed) + "." if changed
+        else "It is the same as the shipped defaults."
+    )
+    return "\n\n".join(lines)
+
+
+def config_changes(new: AppleTraderConfig, old: AppleTraderConfig, word: str) -> "list[str]":
+    """Every field in which `new` differs from `old`, as "`field` new (word old)"."""
+    return [
+        f"`{f.name}` {_field_text(getattr(new, f.name))} "
+        f"({word} {_field_text(getattr(old, f.name))})"
+        for f in fields(AppleTraderConfig)
+        if f.name not in ("model_key", "ticker")
+        and getattr(new, f.name) != getattr(old, f.name)
+    ]
+
+
+def _field_text(value) -> str:
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, (tuple, list)):
+        return "+".join(str(v) for v in value) or "none"
+    return str(value)
 
 
 def model_label(key: str) -> str:
@@ -197,7 +316,7 @@ def dayrange_params(
     was tuned with them.
     """
     section("Levels", copy.sections.get("dayrange"))
-    default_buy, default_sell = dayrange_levels(ticker, model_key)
+    default_buy, default_sell = float(defaults.buy_k), float(defaults.sell_k)
     levels = dict(ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}")
     # Before the two distances, because it decides what they are counted in and
     # a label that named the wrong unit would be worse than no label at all.
@@ -228,15 +347,17 @@ def dayrange_params(
     )
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
     sell_k = repaired_sell(float(buy_k), float(sell_k))
-    early = early_params(model_key, ticker, unit_label, copy, seed)
+    early = early_params(defaults, model_key, ticker, unit_label, copy, seed)
     rules = rule_params(
-        replace(defaults, stop_gain_fraction=stop_for(ticker, model_key)),
-        float(buy_k), float(sell_k), unit_label, copy,
+        defaults, float(buy_k), float(sell_k), unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
         stop_scope=f"{model_key}_{ticker}", stop_seed=stop_seed,
     )
-    min_win_k = min_win_param(ticker, float(buy_k), float(sell_k), unit_label, copy)
-    return AppleTraderConfig(
+    min_win_k = min_win_param(
+        ticker, float(buy_k), float(sell_k), unit_label, copy, float(defaults.min_win_k)
+    )
+    return replace(
+        defaults,
         model_key=model_key,
         ticker=ticker,
         buy_k=float(buy_k),
@@ -250,8 +371,8 @@ def dayrange_params(
 
 
 def early_params(
-    model_key: str, ticker: str, unit_label: str, copy: FormCopy,
-    seed: "AppleTraderConfig | None" = None,
+    defaults: AppleTraderConfig, model_key: str, ticker: str, unit_label: str,
+    copy: FormCopy, seed: "AppleTraderConfig | None" = None,
 ) -> dict:
     """HighLow_3m's 9:33 window (`use_3m`): the switch and its two distances.
 
@@ -262,20 +383,21 @@ def early_params(
     window is on, so a run with it off is the same configuration whatever the
     greyed-out boxes hold. `seed` -- a running agent's configuration for the
     same instrument and model -- reopens all three on its values: the run reads
-    them once, at ▶ Start.
+    them once, at ▶ Start. Otherwise they open on `defaults`, the pair's base
+    configuration (`default_config`).
     """
     if model_key != apple_models.HIGHLOW_KEY or not apple_models.covers(
         apple_models.HIGHLOW3M_KEY, ticker
     ):
         return {}
     section("HighLow_3m window (9:33–9:35)", copy.sections.get("dayrange_3m"))
-    default_buy, default_sell = dayrange_levels(ticker, apple_models.HIGHLOW3M_KEY)
+    default_buy, default_sell = float(defaults.buy_3m_k), float(defaults.sell_3m_k)
     same_pair = (
         seed is not None
         and (seed.ticker or "").upper() == ticker
         and seed.model_key == model_key
     )
-    start_on = bool(seed.use_3m) if same_pair else False
+    start_on = bool(seed.use_3m) if same_pair else bool(defaults.use_3m)
     start_buy = float(seed.buy_3m_k) if same_pair else default_buy
     start_sell = float(seed.sell_3m_k) if same_pair else default_sell
     levels = dict(ticker=ticker, buy_3m_k=f"{default_buy:g}", sell_3m_k=f"{default_sell:g}")
@@ -418,7 +540,8 @@ def skip_param(defaults: AppleTraderConfig, copy: FormCopy) -> "tuple[str, ...]"
 
 
 def min_win_param(
-    ticker: str, buy_k: float, sell_k: float, unit_label: str, copy: FormCopy
+    ticker: str, buy_k: float, sell_k: float, unit_label: str, copy: FormCopy,
+    default: "float | None" = None,
 ) -> float:
     """The session circuit breaker, and the one thing worth checking it against.
 
@@ -433,14 +556,16 @@ def min_win_param(
     Keyed by ticker, like the levels and for the same reason: the default is per
     instrument because it only means something against that symbol's own pair,
     so switching symbol must re-seed it rather than carry the last one across.
+    `default` is the pair's own (its base configuration's), else the symbol's.
     """
     section("Circuit breaker", copy.sections.get("dayrange_breaker"))
+    default = min_win_for(ticker) if default is None else float(default)
     min_win_k = st.number_input(
         f"Stand down after a trade under (× {unit_label} a share)",
-        min_value=0.0, max_value=3.0, value=min_win_for(ticker), step=0.05, format="%.2f",
+        min_value=0.0, max_value=3.0, value=default, step=0.05, format="%.2f",
         key=copy.key(f"min_win_k_{ticker}"),
         help=copy.help.get("min_win_k", "").format(
-            ticker=ticker, min_win_k=f"{min_win_for(ticker):g}", unit=unit_label
+            ticker=ticker, min_win_k=f"{default:g}", unit=unit_label
         ),
     )
     target_gain = buy_k - sell_k
@@ -767,7 +892,10 @@ def orchestra_params(
     budget_pct: dict = {}
     for key in pairs:
         ticker, _, model_key = key.partition(":")
+        # The pair's base configuration's numbers (`dayrange_levels` reads it
+        # first), and its digest on the row's keys so a new base re-seeds them.
         default_buy, default_sell = dayrange_levels(ticker, model_key)
+        suffix = base_configs.key_suffix(model_key, ticker)
         start_buy, start_sell = default_buy, default_sell
         if key in seeded:
             start_buy, start_sell = float(seeded[key].buy_k), float(seeded[key].sell_k)
@@ -775,17 +903,18 @@ def orchestra_params(
         row[0].markdown(label(key))
         buy_k = row[1].number_input(
             f"{key} buy", min_value=0.05, max_value=3.0, value=start_buy, step=0.05,
-            format="%.2f", key=copy.key(f"buy_k_{model_key}_{ticker}"),
+            format="%.2f", key=copy.key(f"buy_k_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
         sell_k = row[2].number_input(
             f"{key} sell", min_value=0.0, max_value=3.0, value=start_sell, step=0.05,
-            format="%.2f", key=copy.key(f"sell_k_{model_key}_{ticker}"),
+            format="%.2f", key=copy.key(f"sell_k_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
         min_win_k = row[3].number_input(
-            f"{key} min win", min_value=0.0, max_value=3.0, value=min_win_for(ticker),
-            step=0.05, format="%.2f", key=copy.key(f"min_win_k_{model_key}_{ticker}"),
+            f"{key} min win", min_value=0.0, max_value=3.0,
+            value=min_win_for(ticker, model_key),
+            step=0.05, format="%.2f", key=copy.key(f"min_win_k_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
         if split:

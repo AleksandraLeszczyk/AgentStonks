@@ -25,6 +25,7 @@ import streamlit as st
 
 from agent_stonks import (
     apple_models,
+    base_configs,
     candle_patterns,
     clock,
     minute_momentum,
@@ -41,6 +42,8 @@ from agent_stonks.apple_trader import (
     APPLE_TRADER_KEY,
     RULE_PROVIDER,
     AppleTraderConfig,
+    base_error,
+    default_config,
 )
 from agent_stonks import apple_trader_ui
 from agent_stonks.orchestra import ORCHESTRA_KEY
@@ -337,7 +340,29 @@ def _render_apple_rules() -> None:
                         f"naming this model on {symbol} will fail until it is available."
                     )
                     continue
-                _render_dayrange_bundle(bundle)
+                if bundle.get("kind") == "fastfurious":
+                    _render_fastfurious_bundle(bundle)
+                else:
+                    _render_dayrange_bundle(bundle)
+
+
+def _render_fastfurious_bundle(bundle: dict) -> None:
+    """Fast&Furious's provenance: a ranking score per walk-forward year, no
+    dollar error -- it forecasts momentum, not a price."""
+    metadata = bundle.get("metadata") or {}
+    scores = metadata.get("walk_forward_scores") or {}
+    cols = st.columns(4)
+    cols[0].metric("Fitted through", str(metadata.get("fit_end", "?")))
+    cols[1].metric("IC 2025", f"{(scores.get('2025') or {}).get('ic', float('nan')):.3f}")
+    cols[2].metric("IC 2026", f"{(scores.get('2026') or {}).get('ic', float('nan')):.3f}")
+    cols[3].metric("Sign right 2026", f"{(scores.get('2026') or {}).get('hit', float('nan')):.1%}")
+    st.caption(
+        "IC is the rank correlation between the forecast and the next 30 minutes' return over "
+        "every minute of a year, from monthly walk-forward refits; on the 24-session test "
+        "month (8 Sep – 9 Oct 2026) it was -0.03."
+    )
+    st.json({"walk_forward_scores": scores, "momentum_features": metadata.get("momentum_features"),
+             "range_features": metadata.get("range_features")}, expanded=False)
 
 
 def _render_dayrange_bundle(bundle: dict) -> None:
@@ -1692,8 +1717,36 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- Its own axis on the Tuning tab, and worth one: it changes how many trades "
             "a session takes at all — the number most of the other knobs only nudge."
         ),
+        "momentum": (
+            "Fast&Furious's rules: a forecast of the next 30 minutes' momentum at every bar, "
+            "bought when it is extreme.\n\n"
+            "- **Entry threshold** — the quantile of |forecast| over the last 20 sessions "
+            "it has to reach; **hold** — how long after the last buy signal; **stop** — in "
+            "forecast 2-hour drops under the fill; **sell signal** — close a long on a "
+            "forecast at or under minus the threshold.\n"
+            "- In the signature as `q=0.95,stop=1.5dn,hold=30m,sellexit`; the day-range "
+            "fields are not, since nothing reads them under this model.\n"
+            "- The defaults are notebook 06's pick on 2025, long side only. Its long trades "
+            "made +$116 on 2026 to 4 September and +$191 on the test month at $10,000 a "
+            "trade — inside what luck alone makes, by the notebook's placebo."
+        ),
     },
     help={
+        "model_fastfurious": (
+            "Its own rules, not the day-range levels: a buy when the 30-minute momentum "
+            "forecast is in the top 5% of the last 20 sessions', out 30 minutes after the "
+            "last signal, on a sell signal or at a stop sized by its 2-hour range "
+            "forecast.\n\n"
+            "- Reads every input from Alpaca, whatever the dataset's tape: ~200 days of SIP "
+            "and IEX minute bars before each replayed day and the day's own, cut at each "
+            "minute to SIP 15 minutes back and IEX since (ALPACA_API_KEY / ALPACA_SECRET), "
+            "cached under `data/fastfurious/`; the stop's option table is HighLow_3m's "
+            "(`data/highlow3m/`). A cold first replay fetches for about two minutes.\n"
+            "- The trades are the dataset's tape and fills, the forecast the model's own "
+            "tape: on a yfinance dataset a stop is checked on yfinance's lows.\n"
+            "- A stop does not end the session: the next buy waits until the forecast has "
+            "left the buy zone, as in the notebook."
+        ),
         "model_dayrange": (
             "The predicted high, flat for the session — what the shipped buy/sell "
             "distances were swept against, and what every stored record replays as."
@@ -1942,10 +1995,11 @@ def _sweep_axes(base: AppleTraderConfig, prefix: str) -> "list[dict]":
     """
     names = st.multiselect(
         "Vary these settings",
-        list(sim_tuning.SWEEPABLE),
+        sim_tuning.axes_for(base.model_key, sim_tuning.SWEEPABLE),
         default=[],
         format_func=sim_tuning.sweep_label,
-        key=f"{prefix}_sweep_axes",
+        # Per rule set: the two offer different settings.
+        key=f"{prefix}_sweep_axes_{base.strategy}",
         help="Each one selected multiplies the setup out: every combination of the "
              "values below is queued as its own experiment and lands in Results as "
              "its own configuration. Leave empty to queue this setup as it stands.",
@@ -3693,10 +3747,14 @@ def _render_tuning_form() -> None:
 
     st.markdown("**Parameters to tune**")
     names = st.multiselect(
-        "Tune", [a for a in sim_tuning.AXES if a not in sim_tuning.LEGACY_AXES],
-        default=["buy_k", "sell_k"],
+        "Tune",
+        sim_tuning.axes_for(
+            base.model_key, [a for a in sim_tuning.AXES if a not in sim_tuning.LEGACY_AXES]
+        ),
+        default=list(sim_tuning.DEFAULT_AXES[base.strategy]),
         max_selections=sim_tuning.MAX_AXES,
-        format_func=sim_tuning.sweep_label, key="tune_axes",
+        # Per rule set: the two offer different parameters.
+        format_func=sim_tuning.sweep_label, key=f"tune_axes_{base.strategy}",
         help="One parameter draws a bar chart, two a heatmap — the first one is its rows. "
              "A third is shown over that heatmap one value at a time, or collapsed: each "
              "square at its best value of the third, or averaged over all of them. "
@@ -4302,20 +4360,116 @@ def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
     return rows
 
 
-def _tuning_usd(value: float) -> str:
-    """A signed dollar amount for markdown: `+$134`, `−$517`.
+def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> None:
+    """"Set as base configuration": the configuration on screen -- the pick, or
+    the square clicked -- becomes what every new run of its (model, ticker)
+    pair starts from, in the live app's Apple Trader and Orchestra forms and in
+    SimLab's Simulate and Tuning forms (`base_configs`). Beside it, what that
+    would change, and the way back to the shipped defaults.
+
+    The whole configuration is kept, not only the swept values: the pick was
+    measured under every other rule of the job's base too.
+    """
+    job_id = job["job_id"]
+    try:
+        config = sim_tuning.make_config(job["spec"]["base"], shown)
+    except (TypeError, ValueError):
+        return
+    record = rule_agent(APPLE_TRADER_KEY).to_record(config)
+    model_key, ticker = config.model_key, config.ticker
+    pair = f"{_apple_model_label(model_key)} on {ticker}"
+    what = "the pick" if chosen is None else "the selected square"
+    current = base_configs.entry(model_key, ticker)
+    is_base = current is not None and (
+        base_configs.digest(current["config"]) == base_configs.digest(record)
+    )
+    refusal = (
+        "The job is still running, so its pick can still move." if job["status"] == sim_tuning.RUNNING
+        else base_error(config)
+    )
+    with st.container(horizontal=True, vertical_alignment="center"):
+        set_clicked = st.button(
+            "Set as base configuration", icon=":material/push_pin:",
+            key=f"tune_set_base_{job_id}", disabled=is_base or bool(refusal),
+            help=f"Make {what} what every new run of {pair} starts from: the live app's "
+            "Apple Trader and Orchestra forms and SimLab's Simulate and Tuning forms open "
+            "on it, open pages included. The whole configuration is kept, not only the "
+            "values swept here. Nothing already running or already stored changes.",
+        )
+        clear_clicked = current is not None and st.button(
+            "Restore shipped defaults", icon=":material/restart_alt:",
+            key=f"tune_clear_base_{job_id}",
+            help=f"Drop {pair}'s base configuration: new runs of it start from the "
+            "defaults the code ships again.",
+        )
+    if current is not None:
+        source = current.get("source") or {}
+        origin = f" from job `{source['job_id']}`" if source.get("job_id") else ""
+        starts = f"its base configuration, set {str(current.get('set_at', ''))[:10]}{origin}"
+    else:
+        starts = "the shipped defaults"
+    if is_base:
+        st.caption(
+            f":material/check_circle: {what.capitalize()} is {pair}'s base configuration "
+            f"(set {str(current.get('set_at', ''))[:10]}): new runs of the pair start from it."
+        )
+    elif refusal:
+        st.caption(
+            f":material/block: {what.capitalize()} cannot be set as the base "
+            f"configuration. {refusal} New runs of {pair} start from {starts}."
+        )
+    else:
+        changes = apple_trader_ui.config_changes(config, default_config(ticker, model_key), "now")
+        st.caption(
+            f"New runs of {pair} start from {starts}. "
+            + (
+                f"Setting {what} changes {'; '.join(changes)}." if changes
+                else f"{what.capitalize()} starts from the same configuration."
+            )
+        )
+    if set_clicked:
+        base_configs.set_base(record, source={
+            "job_id": job_id, "overrides": shown,
+            "label": "pick" if chosen is None else "selected",
+        })
+        st.toast(f"{pair} now starts from {what}.", icon=":material/push_pin:")
+        st.rerun()
+    if clear_clicked:
+        base_configs.clear(model_key, ticker)
+        st.toast(f"{pair} starts from the shipped defaults again.", icon=":material/restart_alt:")
+        st.rerun()
+
+
+def _tuning_usd(value: float, cents: bool = False) -> str:
+    """A signed dollar amount for markdown: `+$134`, `−$517` (`+$82.40` with cents).
 
     The `$` is escaped because Streamlit's markdown reads a pair of bare dollar
     signs as a formula and typesets everything between them.
     """
-    return f"{'+' if value >= 0 else '−'}\\${abs(value):,.0f}"
+    return f"{'+' if value >= 0 else '−'}\\${abs(value):,.{2 if cents else 0}f}"
+
+
+def _tuning_per_day(cell: dict) -> "tuple[float, float]":
+    """A scored cell's average profit a session: dollars, and percent of the
+    starting cash.
+
+    Every session counts, traded or not -- a configuration that sits a day out
+    earns nothing that day. A summed cell's return is its datasets' returns
+    added, each on the same starting cash, so dividing by every session of
+    every dataset is the average day's return on that cash.
+    """
+    days = max(int(cell.get("days") or 0), 1)
+    return cell["profit"] / days, cell["return_pct"] / days
 
 
 def _tuning_verdict(job: dict) -> "str | None":
-    """One line: how the pick did in total, and against the base configuration.
+    """One line: how the pick did on an average day, and against the base
+    configuration.
 
-    Every dataset is in sample -- the pick is read off their sum -- so the
-    robustness read is how many of them it made money on, not one held-out week.
+    A day's average rather than the total, so jobs over different numbers of
+    sessions read on one scale. Every dataset is in sample -- the pick is read off their
+    sum -- so the robustness read is how many of them it made money on, not one
+    held-out week.
     """
     spec = job["spec"]
     names = sim_tuning.dataset_names(spec)
@@ -4327,16 +4481,23 @@ def _tuning_verdict(job: dict) -> "str | None":
                 "eligible — lower the minimum share of days, or widen the grid."
             )
         return None
-    where = f"summed over {len(names)} datasets" if len(names) > 1 else f"on `{names[0]}`"
+    sessions = f"{best['days']} session{'s' if best['days'] != 1 else ''}"
+    where = (
+        f"over {sessions} in {len(names)} datasets" if len(names) > 1
+        else f"over {sessions} of `{names[0]}`"
+    )
+    profit, return_pct = _tuning_per_day(best)
     detail = (
-        f"The pick made **{_tuning_usd(best['profit'])}** ({best['return_pct']:+.2f}%) {where}"
+        f"The pick made **{_tuning_usd(profit, cents=True)} a day** ({return_pct:+.3f}% of "
+        f"the starting cash) on average {where}"
     )
     if len(names) > 1:
         detail += f", in profit on {best['datasets_up']} of them"
     if sim_tuning.is_scored(base):
+        profit, return_pct = _tuning_per_day(base)
         detail += (
-            f"; the base configuration made {_tuning_usd(base['profit'])} "
-            f"({base['return_pct']:+.2f}%)"
+            f"; the base configuration made {_tuning_usd(profit, cents=True)} a day "
+            f"({return_pct:+.3f}%)"
         )
     beat_base = not sim_tuning.is_scored(base) or best["profit"] >= base["profit"]
     if best["profit"] > 0 and beat_base:
@@ -4991,6 +5152,9 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             "shown_worst": money(f"{who} worst day ($)", format="%+.2f"),
         },
     )
+    shown = chosen if chosen is not None else (best or {}).get("overrides")
+    if shown is not None:
+        _render_tuning_set_base(job, shown, chosen)
 
     marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
     if chosen is not None:
@@ -5068,7 +5232,6 @@ def _render_tuning_results(jobs: list[dict]) -> None:
                 ),
             })
 
-    shown = chosen if chosen is not None else (best or {}).get("overrides")
     if _tuning_shown_days(job, chosen) and shown is not None:
         context = _tuning_session_context(job, chosen)
         forecasts = _tuning_forecasts(job, chosen)

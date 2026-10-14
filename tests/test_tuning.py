@@ -814,6 +814,88 @@ class TestClickedSquare:
         )
 
 
+class TestVerdict:
+    """The line above a job's results: the pick's average day, not its total
+    (simlab/app.py)."""
+
+    def record(self) -> dict:
+        record = job_record({
+            "w1": [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)],
+            "w2": [scored({"buy_k": 0.3}, -700.0), scored({"buy_k": 0.5}, 350.0)],
+        })
+        return tu.refresh_pick(record)
+
+    def test_profit_and_return_are_a_sessions_average(self):
+        from simlab import app as sim_app
+
+        # The pick, 0.5, made 750 over 2 datasets x 5 sessions; each dataset's
+        # return is on the same starting cash, so they add (`scored` writes a
+        # return of profit / 100).
+        verdict = sim_app._tuning_verdict(self.record())
+        assert verdict.startswith(":green[**Beats the base configuration.**]")
+        assert "**+\\$75.00 a day** (+0.750% of the starting cash) on average over " \
+            "10 sessions in 2 datasets, in profit on 2 of them" in verdict
+        assert "the base configuration made +\\$0.20 a day (+0.002%)" in verdict
+
+    def test_one_dataset_names_it(self):
+        from simlab import app as sim_app
+
+        record = tu.refresh_pick(job_record({"w1": [scored({"buy_k": 0.3}, -50.0)]}))
+        verdict = sim_app._tuning_verdict(record)
+        assert verdict.startswith(":red[")
+        assert "**−\\$10.00 a day** (-0.100% of the starting cash) on average over " \
+            "5 sessions of `w1`" in verdict
+
+
+def _set_base_app(record: dict, chosen) -> None:
+    from simlab import app as sim_app
+
+    shown = chosen if chosen is not None else record["best"]["overrides"]
+    sim_app._render_tuning_set_base(record, shown, chosen)
+
+
+class TestSetBase:
+    """"Set as base configuration" on a job's results: the configuration on
+    screen becomes its pair's default in both apps (`base_configs`)."""
+
+    def record(self, status=tu.FINISHED) -> dict:
+        record = job_record({"w1": [scored({"buy_k": 0.3}, 90.0), scored({"buy_k": 0.5}, 40.0)]})
+        record["status"] = status
+        return tu.refresh_pick(record)
+
+    def app(self, record, chosen=None):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_set_base_app, args=(record, chosen), default_timeout=30)
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_the_shown_configuration_becomes_the_pairs_default(self):
+        from agent_stonks import base_configs
+        from agent_stonks.apple_trader import default_config
+
+        record = self.record()
+        app = self.app(record, chosen={"buy_k": 0.5})
+        assert app.button(key="tune_set_base_j").disabled is False
+        assert not [b for b in app.button if b.key == "tune_clear_base_j"]
+        app.button(key="tune_set_base_j").click().run()
+        assert not app.exception
+        expected = tu.make_config(record["spec"]["base"], {"buy_k": 0.5})
+        assert default_config(TICKER, expected.model_key) == expected
+        found = base_configs.entry(expected.model_key, TICKER)
+        assert found["source"] == {"job_id": "j", "overrides": {"buy_k": 0.5}, "label": "selected"}
+        # Now it is the base: nothing left to set, and the way back is offered.
+        assert app.button(key="tune_set_base_j").disabled is True
+        app.button(key="tune_clear_base_j").click().run()
+        assert base_configs.entry(expected.model_key, TICKER) is None
+
+    def test_a_running_job_cannot_set_its_pick(self):
+        app = self.app(self.record(status=tu.RUNNING))
+        assert app.button(key="tune_set_base_j").disabled is True
+        assert "still running" in app.caption[0].value
+
+
 class TestPredictedRange:
     """The session-by-session chart boxes each session's predicted high and low
     behind its daily candle, from the model the shown configuration trades on."""

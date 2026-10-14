@@ -230,10 +230,12 @@ data/simlab/
 data/highlow/
 data/highlow2/
 data/highlow3m/
+data/fastfurious/
 data/event_days/
 data/minute_momentum/
 data/net_gamma/
 data/sessions/
 data/last_setup.json
+data/apple_trader_base.json
 data/logs/
 data/replay/

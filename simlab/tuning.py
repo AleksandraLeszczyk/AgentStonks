@@ -82,7 +82,8 @@ from agent_stonks.config import (
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
 )
-from agent_stonks import minute_momentum
+from agent_stonks import apple_models, minute_momentum
+from agent_stonks.apple_models import STRATEGY_DAYRANGE, STRATEGY_MOMENTUM
 from agent_stonks.market_hours import MARKET_TZ
 
 TUNING_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "tuning"
@@ -236,6 +237,20 @@ TUNABLES: "dict[str, Tunable]" = {
             "flatten_before_close_min", "Flatten before close (min)", 1, 60, 1,
             (1, 15, 2), "%d", integer=True,
         ),
+        # Fast&Furious's rules (the momentum strategy): only a grid on that
+        # model offers them, and only they are offered there (`axes_for`).
+        Tunable(
+            "ff_entry_quantile", "Entry threshold (quantile of the last 20 sessions)",
+            0.50, 0.995, 0.005, (0.90, 0.98, 0.02), "%.3f",
+        ),
+        Tunable(
+            "ff_stop_k", "Stop (× the forecast 2-hour drop)", 0.0, 5.0, 0.25,
+            (0.75, 2.0, 0.25),
+        ),
+        Tunable(
+            "ff_hold_minutes", "Hold after the last buy signal (min)", 1, 120, 1,
+            (15, 60, 15), "%d", integer=True,
+        ),
     )
 }
 
@@ -315,12 +330,35 @@ SWEEPABLE: "tuple[str, ...]" = (
     "hold_min_gain_k",
     "min_win_k",
     "position_pct",
+    "ff_entry_quantile",
+    "ff_stop_k",
+    "ff_hold_minutes",
 )
 
 
 # Everything a grid axis may be, numbers first: the order the Tuning tab and
 # the Simulate tab's sweep both list their pickers in.
 AXES: "tuple[str, ...]" = tuple(TUNABLES) + tuple(CHOICES)
+
+# The fields Fast&Furious's rules read, and so the only axes a grid on it can
+# move -- a day-range field varied under it would queue the same replay many
+# times over (the signature leaves those out), and these varied under a
+# day-range model the same.
+MOMENTUM_AXES: "tuple[str, ...]" = (
+    "ff_entry_quantile", "ff_stop_k", "ff_hold_minutes", "position_pct",
+)
+# What a new grid on each rule set starts from.
+DEFAULT_AXES = {
+    STRATEGY_DAYRANGE: ("buy_k", "sell_k"),
+    STRATEGY_MOMENTUM: ("ff_entry_quantile", "ff_stop_k"),
+}
+
+
+def axes_for(model_key: "str | None", names) -> "list[str]":
+    """`names`, narrowed to the axes the named model's rule set reads."""
+    if apple_models.strategy(model_key) == STRATEGY_MOMENTUM:
+        return [n for n in names if n in MOMENTUM_AXES]
+    return [n for n in names if not n.startswith("ff_")]
 
 # Axes a stored grid may have but a new one is not offered: a field kept only
 # so old records replay.

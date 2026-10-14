@@ -676,6 +676,30 @@ def _intraday_vol_spec(ticker: str) -> ModelSpec:
 _HIGHLOW_NETS = {"nbeats": "N-BEATS", "nhits": "N-HiTS"}
 
 
+def _highlow_group_inputs(meta: dict) -> "list[str]":
+    """What a HighLow bundle's custom feature groups read beyond its own SIP
+    history, one clause per group its nets read (`custom_features_kept`).
+    Column prefixes stand in for `highlow_model.GROUP_COLS`, which needs torch."""
+    kept = set(meta.get("custom_features_kept") or ())
+    sip_opening = str(meta.get("opening_feed") or "sip").lower() == "sip"
+    out = []
+    if meta.get("peers") and kept & {"lead_or_ret_adr", "theme_or_ret", "theme_gap", "theme_range",
+                                     "theme_dispersion", "beta_theme63", "own_vs_theme"}:
+        # BE reads its peers on IEX; a SIP-opening notebook (ORCL's) on SIP
+        out.append(f"; the same first minutes of its theme peers {', '.join(meta['peers'])} "
+                   f"(from {'SIP' if sip_opening else 'IEX'}), with their SIP history")
+    if any(c.startswith("mkt_") or c in {"rel_vol", "beta63", "corr63", "idio_or_ret_adr", "idio_gap_adr"}
+           for c in kept):
+        out.append(f"; {meta.get('market_proxy') or 'SPY'}'s first minutes and SIP history")
+    if any(c.startswith("pm_") for c in kept):
+        out.append("; this morning's SIP pre-market to 09:19")
+    if any(c.startswith("ah_") for c in kept):
+        out.append("; the previous evening's after-hours")
+    if kept & {"or_vwap_pos", "or_first_bar_share", "or_trades_rel", "or_size_rel", "gap_fill"}:
+        out.append("; the first minutes' trade counts and VWAP")
+    return out
+
+
 def _highlow_spec(ticker: str) -> ModelSpec:
     path = _saved_path("APPLE_HIGHLOW_MODEL", "highlow15m_{ticker}.joblib", ticker)
     meta = _read_json(path.with_suffix(".json"))
@@ -733,21 +757,7 @@ def _highlow_spec(ticker: str) -> ModelSpec:
                 f", read from {str(meta['opening_feed']).upper()}"
                 if str(meta.get("opening_feed") or "sip").lower() != "sip" else ""
             )
-            + (
-                # BE: the theme group, whose lead-peer column its nets read
-                f"; the same first minutes of its theme peers {', '.join(meta['peers'])} "
-                "(from IEX), with their SIP history"
-                if meta.get("peers") and "lead_or_ret_adr" in (meta.get("custom_features_kept") or ())
-                else ""
-            )
-            + (
-                # NVDA: the market, pre-market and after-hours groups
-                f"; {meta.get('market_proxy') or 'SPY'}'s first minutes and SIP history, this "
-                "morning's SIP pre-market to 09:19 and the previous evening's after-hours"
-                if {"mkt_or_ret_adr", "pm_gap_extend", "ah_ret_adr"}
-                & set(meta.get("custom_features_kept") or ())
-                else ""
-            )
+            + "".join(_highlow_group_inputs(meta))
         ),
         metrics=metrics,
         headline=(
@@ -1050,11 +1060,96 @@ def _highlow3m_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _fastfurious_spec(ticker: str) -> ModelSpec:
+    path = _saved_path("APPLE_FASTFURIOUS_MODEL", "fastfurious_{ticker}.joblib", ticker)
+    files = (
+        ModelFile("bundle", path),
+        ModelFile("metadata", path.with_suffix(".json")),
+    )
+    available, reason = _availability(files, "lightgbm", "scipy", "joblib")
+    meta = _read_json(path.with_suffix(".json"))
+    scores = meta.get("walk_forward_scores") or {}
+    # The headline is the 2026 walk-forward IC (monthly refits, every forecast
+    # out of sample) -- the README's own measure; R2 against forecasting zero
+    # is near nothing by construction (the forecasts are shrunk toward zero).
+    holdout = scores.get("2026") or {}
+    metrics: "dict[str, object]" = {}
+    for window in ("2025", "2026"):
+        for name in ("ic", "hit", "spread", "r2", "n"):
+            value = (scores.get(window) or {}).get(name)
+            if value is not None:
+                metrics[f"{window} walk-forward · {name}"] = value
+    params = meta.get("momentum_params") or {}
+    ranges = meta.get("range_params") or {}
+    model = apple_models.get(apple_models.FASTFURIOUS_KEY)
+    return ModelSpec(
+        key=apple_models.FASTFURIOUS_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note="",
+        project="Fast&Furious, mirrors `fastfurious`",
+        predicts=(
+            "The **average 1-minute momentum over the next 30 minutes**, at the close of every "
+            "bar from 09:31 to 15:30, in units of the 30-minute move expected at that time of "
+            "day (the 14-day range times the share of the day's variance those minutes carry). "
+            "Beside it, the next two hours' high and low (a LightGBM pair, L1) for the stop."
+        ),
+        target=str(meta.get("target") or "y = log(close[t+30] / close[t]) / s30"),
+        algorithm=(
+            f"LightGBM, {params.get('objective', '?')} loss, {params.get('num_leaves', '?')} "
+            f"leaves, {params.get('n_estimators', '?')} trees, leaves of at least "
+            f"{params.get('min_child_samples', '?')} rows, averaged over seeds "
+            f"{', '.join(str(s) for s in meta.get('seeds') or []) or '?'}; range pair: LightGBM, "
+            f"{ranges.get('objective', '?')}, {ranges.get('num_leaves', '?')} leaves, "
+            f"{ranges.get('n_estimators', '?')} trees"
+        ),
+        family="LightGBM (3 seeds) + range pair",
+        consumers=(
+            "Apple Trader — momentum strategy (Fast&Furious rules)",
+            "Chart overlay — Fast&Furious 2-hour range and signals",
+        ),
+        features=tuple(meta.get("momentum_features") or [])
+        + tuple(f for f in meta.get("range_features") or [] if f not in (meta.get("momentum_features") or [])),
+        inputs=(
+            "Today's session as the basic plan shows it at each bar's close — SIP to 15 minutes "
+            "back, IEX since — plus 60 sessions' time-of-day variance profile, 20 sessions' "
+            "outcomes at the same minute and volume curve, the 14-day range and the 126-day "
+            "high from ~200 days of SIP minute bars; last night's option positioning (the "
+            "range pair only)"
+        ),
+        metrics=metrics,
+        headline=(
+            ("IC, 2026 walk-forward", f"{float(holdout['ic']):.3f}")
+            if holdout.get("ic") is not None else None
+        ),
+        files=files,
+        trained_at=str(meta.get("fit_end") or ""),
+        data_note=(
+            f"Fitted through {meta.get('fit_end', '?')} on {meta.get('fit_rows', '?')} origins "
+            "(every 5 minutes, the offset rotating by day) · test window 8 Sep – 9 Oct 2026"
+            if meta else ""
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            "A weak ranking edge: the forecast's rank correlation with the next half hour is "
+            "0.03 on 2025 and on 2026, with lower 95% bounds just under zero, and -0.03 on "
+            "the 24-session test month. Traded by notebook 06's rules it broke even on 2026 "
+            "after costs and beat only 57% of placebo runs; holding the stock made more."
+        ),
+    )
+
+
 _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.HIGHLOW_KEY: _highlow_spec,
     apple_models.HIGHLOW2_KEY: _highlow2_spec,
     apple_models.HIGHLOW3M_KEY: _highlow3m_spec,
+    apple_models.FASTFURIOUS_KEY: _fastfurious_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,
 }
 

@@ -8,8 +8,8 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Eight overlays
---------------
+Nine overlays
+-------------
 `day_range`          TimeToChange3's forecast of where the session's high and
                      low will land, made once from the first five minutes -- the
                      model's claim about the *width* of the day. Two price levels
@@ -38,12 +38,19 @@ Eight overlays
 `highlow3m_range`    HighLow_3m's forecast of the range *after* 9:33, drawn the
                      same way from the 09:32 bar on; the first three minutes'
                      own extremes are not a breach of it. See `highlow3m_model`.
+`fastfurious_signal` Fast&Furious's forecasts, read at the close of every bar:
+                     the next two hours' predicted high and low from that
+                     bar's price as a band, and a marker on each bar where the
+                     30-minute momentum forecast crosses the entry threshold
+                     (▲ a buy signal, ▼ a sell signal). See
+                     `fastfurious_model`.
 `trader_levels`      where Apple Trader would rest its buy and its sell, from
                      the forecast of the model its configuration names. The odd one out: every other overlay
                      draws what a *model* said, this one draws what an *agent*
                      would do about it, so it takes a configuration and asks
                      `apple_trader.session_levels` rather than deriving the
-                     levels itself.
+                     levels itself. Under Fast&Furious, which rests no levels,
+                     it is the running agent's stop.
 
 Both envelopes are widest at 09:30, narrow to roughly a fifth of that by
 midday and open again into the close. They are a picture of *how far the day
@@ -112,6 +119,7 @@ TRADER_LEVELS_KEY = "trader_levels"
 HIGHLOW_RANGE_KEY = "highlow_range"
 HIGHLOW2_RANGE_KEY = "highlow2_range"
 HIGHLOW3M_RANGE_KEY = "highlow3m_range"
+FASTFURIOUS_SIGNAL_KEY = "fastfurious_signal"
 
 
 @dataclass(frozen=True)
@@ -255,6 +263,23 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         tickers=apple_models.HIGHLOW3M_TICKERS,
         models=(apple_models.HIGHLOW3M_KEY,),
+    ),
+    FASTFURIOUS_SIGNAL_KEY: ModelOverlay(
+        key=FASTFURIOUS_SIGNAL_KEY,
+        label="Fast&Furious forecast (2-hour range, buy/sell signals)",
+        name="Fast&Furious",
+        summary=(
+            "Fast&Furious's forecasts, made at the close of every bar from 09:31 to 15:30: "
+            "the next two hours' predicted high and low from that bar's price, as a band, "
+            "and a marker where the forecast of the next 30 minutes' momentum reaches the "
+            "entry threshold — ▲ a buy signal, ▼ a sell signal."
+        ),
+        requires=(
+            "LightGBM, the Fast&Furious bundle, Alpaca SIP and IEX minute bars, and "
+            "HighLow_3m's option tables for the band"
+        ),
+        tickers=apple_models.FASTFURIOUS_TICKERS,
+        models=(apple_models.FASTFURIOUS_KEY,),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -629,6 +654,13 @@ def compute(
         )
 
     def trader_items() -> "tuple[list[dict], str]":
+        if apple_models.strategy(trader_model(trader_config, symbol)) == apple_models.STRATEGY_MOMENTUM:
+            # Only a record Fast&Furious wrote: a day-range run's earlier today
+            # is not this configuration's stop.
+            own = recorded is not None and apple_models.strategy(
+                getattr(recorded[1], "model_key", None)
+            ) == apple_models.STRATEGY_MOMENTUM
+            return _momentum_trader_items(symbol, recorded if own else None)
         if recorded is not None:
             rows, config = recorded
             return _trader_levels_items(
@@ -659,6 +691,9 @@ def compute(
         ),
         HIGHLOW3M_RANGE_KEY: lambda: range_items(
             HIGHLOW3M_RANGE_KEY, lambda: highlow_forecast(apple_models.HIGHLOW3M_KEY)
+        ),
+        FASTFURIOUS_SIGNAL_KEY: lambda: _fastfurious_items(
+            symbol, session, day, credentials, trader_config
         ),
         TRADER_LEVELS_KEY: trader_items,
     }
@@ -730,7 +765,15 @@ def session_forecast(
     symbol = (ticker or "").upper()
     overlay = _RANGE_OVERLAYS.get(model_key or "", DAY_RANGE_KEY)
     day, session, problem = _session_of(bars or [], session_date)
-    if session is None:
+    if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
+        # Its forecast is made every minute and is not a range of the day.
+        label = apple_models.get(model_key).label
+        result = {"forecast": None, "made_at": None, "problem": (
+            f"{label} makes no morning forecast of the day's range: it forecasts the next 30 "
+            "minutes at every bar."
+        )}
+        overlay = FASTFURIOUS_SIGNAL_KEY
+    elif session is None:
         result = {"forecast": None, "made_at": None, "problem": problem}
     elif overlay == DAY_RANGE_KEY:
         result = _day_range_forecast(symbol, session, daily_bars or [], day, open_price)
@@ -1180,10 +1223,10 @@ def _sat_out(symbol: str, day: pd.Timestamp, config=None) -> "str | None":
     levels it would never have rested. Asked before the forecast, which such a
     session never needs. None when it trades, or when the check cannot be read
     (the walk is drawn then, as before the rule)."""
-    from .apple_trader import AppleTraderConfig  # heavy-ish, and only here
+    from .apple_trader import default_config  # heavy-ish, and only here
 
     if config is None or (config.ticker or "").upper() != symbol:
-        config = AppleTraderConfig(ticker=symbol, model_key=trader_model(None, symbol))
+        config = default_config(symbol, trader_model(None, symbol))
     if not config.skip_events:
         return None
     try:
@@ -1220,7 +1263,7 @@ def _trader_levels_items(
     of `session_levels`' walk under `config`.
     """
     from .apple_trader import (  # heavy-ish, and only here
-        AppleTraderConfig, session_levels, stop_phrase,
+        default_config, session_levels, stop_phrase,
     )
 
     overlay = OVERLAYS[TRADER_LEVELS_KEY]
@@ -1229,8 +1272,9 @@ def _trader_levels_items(
         return [], f"{overlay.label}: {result['problem']}"
     if config is None or (config.ticker or "").upper() != symbol:
         # A configuration for another symbol is not this chart's strategy, and
-        # its distances were swept on that symbol's tape. The shipped ones are.
-        config = AppleTraderConfig(ticker=symbol, model_key=trader_model(None, symbol))
+        # its distances were swept on that symbol's tape. The pair's defaults
+        # are: its base configuration, else the shipped ones.
+        config = default_config(symbol, trader_model(None, symbol))
 
     made_at = result["made_at"]
     recorded = levels is not None
@@ -1298,6 +1342,122 @@ def _trader_levels_items(
         ],
         "",
     )
+
+
+# --- Fast&Furious -----------------------------------------------------------
+
+
+def _fastfurious_items(
+    symbol: str,
+    session: pd.DataFrame,
+    day: pd.Timestamp,
+    credentials: "tuple[str, str] | None",
+    config=None,
+) -> "tuple[list[dict], str]":
+    """The 2-hour band and the signals, every minute of the session so far.
+
+    Each minute's forecast is the one made at that bar's close, read from the
+    model's own tape (SIP to 15 minutes back, IEX since), so a past session is
+    drawn with what the model said at each minute and a live one with what it
+    has said so far. The threshold is the configured run's quantile when the
+    chart's configuration is a Fast&Furious one, the notebook's otherwise.
+    """
+    overlay = OVERLAYS[FASTFURIOUS_SIGNAL_KEY]
+    model_key = apple_models.FASTFURIOUS_KEY
+    from .config import APPLE_TRADER_FF_ENTRY_QUANTILE
+
+    quantile = APPLE_TRADER_FF_ENTRY_QUANTILE
+    if config is not None and getattr(config, "model_key", None) == model_key:
+        quantile = float(config.ff_entry_quantile)
+    try:
+        bundle = apple_models.load(model_key, symbol)
+        if bundle is None:
+            return [], f"{overlay.label}: {apple_models.unavailable_reason(model_key, symbol)}"
+        module = importlib.import_module(".fastfurious_model", __package__)
+        # Closed bars only: a live buffer's newest row can be the minute still
+        # trading, whose forecast does not exist yet.
+        closed = session[session.index + pd.Timedelta(minutes=1) <= pd.Timestamp(clock.now())]
+        if not len(closed):
+            return [], f"{overlay.label}: no bar of the session has closed yet."
+        last = int(round(float(closed["minutes_from_open"].iloc[-1])))
+        key, secret = credentials or (None, None)
+        fc = module.session_forecasts(bundle, symbol, day, last, key, secret, wait=False)
+        theta, sessions = module.threshold(bundle, symbol, day, quantile, key, secret)
+    except Exception as exc:  # a decoration must never take the chart down
+        return [], f"{overlay.label}: {exc}"
+    if not len(fc):
+        return [], f"{overlay.label}: no forecast yet — IEX has not printed this session."
+
+    color = MODEL_OVERLAY_COLORS["fastfurious"]
+    open_ts = pd.Timestamp(day).tz_localize(market_hours.MARKET_TZ) + pd.Timedelta(
+        hours=market_hours.MARKET_OPEN.hour, minutes=market_hours.MARKET_OPEN.minute
+    )
+    stamps = [open_ts + pd.Timedelta(minutes=int(m)) for m in fc.index]
+    items: "list[dict]" = []
+    notes = []
+    ranged = fc["pred_high"].notna()
+    if ranged.any():
+        items.append(_band(
+            FASTFURIOUS_SIGNAL_KEY, "2-hour range",
+            [s for s, ok in zip(stamps, ranged) if ok],
+            fc.loc[ranged, "pred_low"], fc.loc[ranged, "pred_high"], color,
+            lower_label="Forecast 2-hour low", upper_label="Forecast 2-hour high",
+            note="where the next two hours' high and low are forecast to land, from each "
+                 "bar's price at its close",
+        ))
+    else:
+        problem = fc.attrs.get("range_problem") or "no option table"
+        notes.append(f"{overlay.label}: no 2-hour range ({problem}).")
+    if np.isfinite(theta):
+        sign = np.where(fc["y_hat"] >= theta, 1, np.where(fc["y_hat"] <= -theta, -1, 0))
+        # The first bar of each run of the same signal: the trader acts on
+        # every one of them, but forty markers in a row say nothing more.
+        previous = np.r_[0, sign[:-1]]
+        for stamp, (minute, row), s, before in zip(stamps, fc.iterrows(), sign, previous):
+            if not s or s == before:
+                continue
+            items.append(_event(
+                FASTFURIOUS_SIGNAL_KEY,
+                f"{'Buy' if s > 0 else 'Sell'} signal: {row['mom_bps']:+.3f} bps/min",
+                stamp,
+                color if s > 0 else MODEL_OVERLAY_COLORS["trader_stop"],
+                icon="▲" if s > 0 else "▼",
+                price=float(row["p"]),
+                line=False,
+                note=(
+                    f"forecast y {row['y_hat']:+.4f} against a threshold of ±{theta:.4f} (the "
+                    f"{quantile:.0%} quantile of the last {sessions} sessions' forecasts)"
+                ),
+            ))
+    else:
+        notes.append(f"{overlay.label}: no entry threshold ({sessions} earlier sessions).")
+    return items, " ".join(notes)
+
+
+def _momentum_trader_items(
+    symbol: str, recorded: "tuple[list[dict], object] | None"
+) -> "tuple[list[dict], str]":
+    """`trader_levels` under Fast&Furious: the running agent's stop while it
+    holds a position. It rests no buy or sell -- its entries are the signals
+    `fastfurious_signal` draws."""
+    overlay = OVERLAYS[TRADER_LEVELS_KEY]
+    if recorded is None:
+        return [], (
+            f"{overlay.label}: Fast&Furious rests no levels — its buys and sells are signals "
+            "(the Fast&Furious overlay); a running agent's stop is drawn here."
+        )
+    rows, config = recorded
+    stops = [row.get("stop") for row in rows]
+    if not any(v is not None for v in stops):
+        return [], ""
+    return [_path(
+        TRADER_LEVELS_KEY, "Stop level", [row["t"] for row in rows], stops,
+        MODEL_OVERLAY_COLORS["trader_stop"], step=True,
+        note=(
+            f"Apple Trader's stop, {getattr(config, 'ff_stop_k', 0):g} × the forecast 2-hour "
+            "drop under the fill, while a position is open"
+        ),
+    )], ""
 
 
 # --- predicted profile range (LevelsML) -------------------------------------

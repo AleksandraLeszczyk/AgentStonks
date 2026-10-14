@@ -978,10 +978,12 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
             running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
             config = running.get("config") or getattr(state, "apple_trader_config", None)
         name = _personality_label(personality).split(" (")[0]
-        confirm = int(getattr(config, "momentum_confirmation_bars", 0) or 0)
+        # Fast&Furious reads its own forecast, not the tape's N-bar momentum.
+        day_range = getattr(config, "strategy", None) != apple_models.STRATEGY_MOMENTUM
+        confirm = int(getattr(config, "momentum_confirmation_bars", 0) or 0) if day_range else 0
         if confirm:
             return confirm, name
-        if config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
+        if day_range and config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
             return int(config.fall_bars), name
     elif _reads_momentum_pct(sym_state):
         return minutes_to_bars(TACTICS_MOMENTUM_WINDOW_MIN), "armed tactic"
@@ -2681,8 +2683,71 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- **A trade that barely paid** — the forecast said the day was wide enough "
             "for the dip to be worth buying, and the trade says otherwise."
         ),
+        "momentum": (
+            "At the close of every bar from 09:31 to 15:30 the model forecasts the average "
+            "momentum of the **next 30 minutes**, and the rules act on it straight away — "
+            "no levels.\n\n"
+            "- **Buy** — when the forecast is in the top few percent of what it said over "
+            "the last 20 sessions (the threshold below), at market.\n"
+            "- **Hold** — for a fixed time after the last buy signal; a fresh one restarts "
+            "the clock.\n"
+            "- **Sell** — when the clock runs out, on a sell signal, at the stop, or at the "
+            "closing flatten.\n\n"
+            "Notebook 06's rules, long side only. Their record: +$2,092 on 2025 (where they "
+            "were chosen), +$116 on 2026 to 4 September, +$191 on the test month, at "
+            "$10,000 a trade after 1 bp a side — and in the notebook's own words, no edge "
+            "out of sample that luck does not also produce."
+        ),
     },
     help={
+        "model_fastfurious": (
+            "A different strategy from the range models: no levels, a signal every minute.\n\n"
+            "- It reads today's session only, as the basic plan shows it: **SIP up to 15 "
+            "minutes ago and IEX since** — fetched from Alpaca every minute, whatever the "
+            "stream's feed.\n"
+            "- The stop is sized by a second model's forecast of the next two hours' low, "
+            "which reads last night's option table (HighLow_3m's, shared, under "
+            "`data/highlow3m/`).\n"
+            "- At ▶ Start it needs ~200 days of SIP and IEX minute bars (cached under "
+            "`data/fastfurious/`, tens of seconds the first time) and forecasts the last 20 "
+            "sessions to set today's threshold — in the background when the agent is "
+            "started before the open.\n"
+            "- A stop does **not** end the day here: the next buy waits until the forecast "
+            "has left the buy zone, as in the notebook.\n"
+            "- The defaults are the notebook's, never swept on this app's tape; the threshold, "
+            "the stop and the hold are axes on SimLab's Tuning tab."
+        ),
+        "ff_entry_quantile": (
+            "How extreme the forecast has to be to buy: the quantile of |forecast| over "
+            "every minute of the last 20 sessions.\n\n"
+            "- **0.95** (the notebook's pick) buys on the top 5% — about one trade a day.\n"
+            "- The forecast is shrunk toward zero, so its rank carries the information, "
+            "not its size: the threshold follows what the model has been saying lately.\n"
+            "- A forecast at or under minus the same threshold is a sell signal."
+        ),
+        "ff_hold_minutes": (
+            "How long a position is held after the last buy signal. Every fresh signal "
+            "while it is held restarts the clock.\n\n"
+            "- **30** is the forecast's own horizon and the notebook's rule."
+        ),
+        "ff_stop_k": (
+            "A stop under the fill, in multiples of the forecast drop over the next two "
+            "hours (from the bar the signal came on).\n\n"
+            "- **1.5** is the notebook's pick (it was chosen among 0.75, 1, 1.5 and 2 on "
+            "2025; in 2026 no stop would have done better).\n"
+            "- Checked on each closed bar's low and sold at market after it — the "
+            "notebook's resting stop fills at the stop, so expect a worse fill here.\n"
+            "- After a stop, the next buy waits for the forecast to leave the buy zone.\n"
+            "- **0** switches it off."
+        ),
+        "ff_exit_on_sell_signal": (
+            "Close a long as soon as the forecast is at or under minus the entry "
+            "threshold.\n\n"
+            "- **On** is the notebook's chosen system (it reverses into a short there; "
+            "this ledger only holds longs, so it closes).\n"
+            "- **Off** is its long-only variant: a long leaves only on the clock, the stop "
+            "or the flatten."
+        ),
         "model_dayrange": (
             "The levels hang off the predicted high — one number for the whole session. "
             "The notebook's rule, and what the buy and sell distances were swept against."
@@ -3056,7 +3121,9 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
         config = apple_trader_ui.params(symbols, _APPLE_TRADER_COPY, seed=seed)
         if running.get("config") is not None:
             st.caption(
-                "The running agent picks up a change to the model or to the buy or "
+                "Every setting takes effect on ▶ Start: a Fast&Furious run reads its rules once."
+                if getattr(running["config"], "strategy", None) == apple_models.STRATEGY_MOMENTUM
+                else "The running agent picks up a change to the model or to the buy or "
                 "sell distance at its next bar. Every other setting takes effect on "
                 "▶ Start."
             )

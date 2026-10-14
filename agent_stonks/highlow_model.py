@@ -14,19 +14,19 @@ asked of a much larger dataset and anchored differently. FinNotebooks'
 mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
 on validation and the bundle records it: AAPL and AVGO ship 0.5 LightGBM + 0.5
 N-BEATS, INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS,
-BE 0.75 N-BEATS + 0.25 N-HiTS, NVDA 0.5 LightGBM + 0.5 N-HiTS; every other
+BE 0.75 N-BEATS + 0.25 N-HiTS, NVDA 0.5 LightGBM + 0.5 N-HiTS, QCOM and ORCL
+0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, META N-BEATS alone; every other
 candidate is in the bundle at weight 0 and is not loaded. On the 129-session
 test window AAPL scores 0.0050 mean absolute log error per extreme ($1.37)
 against TimeToChange3's 0.0077, INTC 0.0150 ($1.22) against 0.0216.
 
 Each notebook may build custom feature groups beside the base 48 and keep
 whichever earn their place on validation. Mirrored here (`GROUP_COLS`): BE's
-"theme" (below) and the five NVDA reads (further below) -- market, regime,
-premarket, afterhours, opening_shape. Not mirrored: microstructure (trade
-counts and VWAP, which these bars do not carry; INTC's linear median reads it
-at weight 0) and calendar. `_build_bundle` refuses a bundle whose weighted
-candidates read a column outside the mirror rather than predicting off a
-missing one.
+"theme" (below), the five NVDA reads (further below) -- market, regime,
+premarket, afterhours, opening_shape -- and QCOM's, ORCL's and META's
+microstructure (last). Not mirrored: calendar (only weight-0 linear medians
+read it so far). `_build_bundle` refuses a bundle whose weighted candidates
+read a column outside the mirror rather than predicting off a missing one.
 
 Half days: the notebook drops an explicit list of NYSE 13:00 closes (a bar
 count misses some -- INTC's 28 Nov 2025 passed it). That list ends in 2025, so
@@ -166,6 +166,29 @@ the same 15 sessions on IEX bars moved the predicted high a mean -0.08 ADR.
 The mirror matches the notebook to ~4e-7 $ on all 644 sessions it can forecast
 (from March 2024), and the live Alpaca path reproduces 2026-08-27, 09-14,
 09-21 and 10-02. A cold fetch of NVDA and SPY took 39 s.
+
+Trade counts, SIP peers and a late first print (QCOM, ORCL, META)
+-----------------------------------------------------------------
+The three bundles saved 2026-10-13 follow NVDA's recipe, and all three read
+the "microstructure" group: the opening five minutes' VWAP against the 9:35
+price (`or_vwap_pos`, the only one QCOM reads), the first bar's share of the
+window's volume, its trade count and average trade size each against their
+own 20 sessions, and how much of the overnight gap was given back
+(`gap_fill`). Alpaca's bars carry the trade count and VWAP (`n`, `vw`), so
+the history cache keeps them per session (`_MICRO_SUMMARY`, rebuilt on a cache
+written before them: `micro`). The caller's bars do not -- neither the bar
+buffer nor yfinance has them -- so `forecast_session` fetches the ticker's own
+window for them, on SIP once SIP has released it (every replay, as in the
+notebook) and on IEX before that (live at 9:35: `market_window_feed`). A
+window without them is refused rather than read as zero.
+
+ORCL also reads SPY (as NVDA) and its theme on MSFT, AMZN and GOOGL. Its
+notebook reads the peers on SIP (`load_peers(feed="sip")`), so a SIP-opening
+bundle's peers are cached on SIP and today's windows come off the released
+feed like SPY's; BE's stay on IEX (`peer_feed`). And ORCL's notebook keeps a
+session whose first SIP bar printed at 09:31 or 09:32 (`max_first_minute`,
+not in the sidecar: `NOTEBOOK_MAX_FIRST_MINUTE`) -- 13 quiet days of 2023-24,
+outside any live history window, but part of the mirror check.
 """
 
 from __future__ import annotations
@@ -213,8 +236,9 @@ OPENING_MINUTES = 5
 # sidecar without the key predates it and read SIP.
 OPENING_FEED_SIP = "sip"
 OPENING_FEED_IEX = "iex"
-# The feed a theme peer's opening is read from (`highlow.data.load_peers`'
-# default, whatever the modelled ticker's own opening feed).
+# The feed a thin-opening bundle's (BE's) theme peers are read on
+# (`highlow.data.load_peers`' default). The SIP-opening notebooks (ORCL's) ask
+# for `feed="sip"`: `peer_feed`.
 PEER_OPENING_FEED = OPENING_FEED_IEX
 SESSION_MINUTES = 390
 # A full session has 390 bars. Anything under this is a half day or a feed gap
@@ -226,6 +250,11 @@ MIN_BARS_PER_SESSION = 385
 # minutes -- 184 sessions of 329-384 bars, each running 9:30 to the close --
 # so its notebook keeps sessions from 320 bars. The sidecar wins when it has one.
 NOTEBOOK_MIN_BARS: "dict[str, int]" = {"AVGO": 320}
+# The same for the first bar (`config._TICKERS[...]["max_first_minute"]`): on 13
+# quiet ORCL sessions of 2023-24 the opening auction printed in the 09:31 bar
+# (once 09:32) and SIP has no 09:30 bar, so its notebook keeps a session whose
+# first bar is up to two minutes late. Everywhere else it must be 09:30's.
+NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {"ORCL": 2}
 
 # Prior sessions the feature row needs: 126-day momentum and volatility read
 # `mid.shift(126)` of a series that is itself shifted a day.
@@ -341,7 +370,8 @@ def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPEN
                premarket: "pd.DataFrame | None" = None,
                afterhours: "pd.DataFrame | None" = None,
                shape_minute: "pd.DataFrame | None" = None,
-               regime: bool = False) -> pd.DataFrame:
+               regime: bool = False,
+               micro: "pd.DataFrame | None" = None) -> pd.DataFrame:
     """`highlow.features.build_panel` from its two inputs' summaries.
 
     The notebook's `build_panel(minute, daily)` is `daily_features(daily)`
@@ -359,10 +389,11 @@ def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPEN
     * `premarket` -- per-session pre-market summaries (`premarket_summary`);
     * `afterhours` -- per-evening after-hours summaries (`evening_summary`);
     * `shape_minute` -- the opening-feed minute bars, "opening_shape";
-    * `regime` -- reads the daily bars alone.
+    * `regime` -- reads the daily bars alone;
+    * `micro` -- per-session opening trade summaries (`microstructure_summary`),
+      "microstructure".
 
-    Microstructure (trade counts and VWAP, which these bars do not carry) and
-    calendar are not mirrored.
+    Calendar is not mirrored.
     """
     f = daily_features(daily).join(opening, how="inner")
 
@@ -409,6 +440,12 @@ def panel_from(daily: pd.DataFrame, opening: pd.DataFrame, n_minutes: int = OPEN
         f["or_last_ret_adr"] = f["or_last_ret"] / f["adr14"]
     if regime:
         f = f.join(regime_features(daily))
+    if micro is not None:
+        f = f.join(microstructure_from(micro, daily))
+        f["or_vwap_pos"] = np.log(f["close5"] / f["vwap5"]) / f["adr14"]
+        # share of the overnight gap given back by 9:35; only for gaps worth the name
+        filled = (f["open5"] - f["close5"]) / (f["open5"] - f["prev_close"])
+        f["gap_fill"] = filled.where(f["gap"].abs() > 0.1 * f["adr14"], 0.0).clip(-2, 2)
     return f
 
 
@@ -489,10 +526,11 @@ REGIME_COLS: "list[str]" = ["adr_pct126", "range_cv28", "big_days20", "rv_ratio_
 PREMARKET_COLS: "list[str]" = ["pm_range_adr", "pm_ret_adr", "pm_volume_rel", "pm_open_pos", "pm_gap_extend"]
 AFTERHOURS_COLS: "list[str]" = ["ah_range_adr", "ah_ret_adr", "ah_volume_rel", "ah_rest_of_gap_adr"]
 OPENING_SHAPE_COLS: "list[str]" = ["or_drive", "or_high_first", "or_last_ret_adr", "or_bars_frac"]
+MICROSTRUCTURE_COLS: "list[str]" = ["or_vwap_pos", "or_first_bar_share", "or_trades_rel", "or_size_rel", "gap_fill"]
 
 # Every custom group this module can build (`highlow.features.EXTRA_COLS`'
-# names). Microstructure and calendar are not here: `_build_bundle` refuses a
-# bundle whose weighted candidates read them.
+# names). Calendar is not here (read only by weight-0 linear medians so far):
+# `_build_bundle` refuses a bundle whose weighted candidates read it.
 GROUP_COLS: "dict[str, list[str]]" = {
     "market": MARKET_COLS,
     "theme": THEME_COLS,
@@ -500,6 +538,7 @@ GROUP_COLS: "dict[str, list[str]]" = {
     "afterhours": AFTERHOURS_COLS,
     "opening_shape": OPENING_SHAPE_COLS,
     "regime": REGIME_COLS,
+    "microstructure": MICROSTRUCTURE_COLS,
 }
 
 # The extended-hours windows the notebook downloads (`config.PREMARKET_WINDOW`,
@@ -620,6 +659,44 @@ def afterhours_from(evenings: pd.DataFrame, daily: pd.DataFrame, max_age_days: i
     return f.drop(columns="ah_volume")
 
 
+_MICRO_SUMMARY = ["ms_volume", "ms_trades", "ms_vwap", "ms_opener"]
+
+
+def microstructure_summary(opening_minute: pd.DataFrame, n_minutes: int = OPENING_MINUTES) -> pd.DataFrame:
+    """The per-session half of `highlow.features.microstructure_features`,
+    verbatim but for NaN rather than zero where the bars carry no trade counts
+    or VWAP (yfinance's, a test's): the opening's volume, trade count, VWAP and
+    first printed bar's volume, one row per session."""
+    first = opening_minute[opening_minute["minute"] < n_minutes]
+    first = first.assign(**{c: np.nan for c in TRADE_COLS if c not in first})
+    g = first.groupby("date")
+    vol5 = g["volume"].sum()
+    return pd.DataFrame({
+        "ms_volume": vol5,
+        "ms_trades": g["trades"].sum(min_count=1),
+        "ms_vwap": (first["vwap"] * first["volume"]).groupby(first["date"]).sum(min_count=1) / vol5,
+        # "first printed" rather than "9:30", because a thin feed can miss the 9:30 minute
+        "ms_opener": first.sort_values("minute").groupby("date").first()["volume"],
+    })
+
+
+def microstructure_from(summary: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """The rest of `microstructure_features`, verbatim, from cached summaries
+    (`microstructure_summary`'s rows, one per session the opening feed printed in)."""
+    vol5, trades5 = summary["ms_volume"], summary["ms_trades"]
+    f = pd.DataFrame(index=vol5.index)
+    f["vwap5"] = summary["ms_vwap"]
+    # the first bar carries the opening auction; a big share means a heavy cross
+    f["or_first_bar_share"] = summary["ms_opener"] / vol5
+    log_trades = np.log(trades5)
+    f["or_trades_rel"] = log_trades - log_trades.rolling(20).mean().shift(1)
+    # average trade size against its own recent norm - block flow versus retail
+    size = np.log(vol5 / trades5)
+    f["or_size_rel"] = size - size.rolling(20).mean().shift(1)
+    f["prev_close"] = daily["close"].shift(1).reindex(f.index)
+    return f
+
+
 def opening_shape_features(opening_minute: pd.DataFrame, n_minutes: int = OPENING_MINUTES) -> pd.DataFrame:
     """Did the first five minutes trend or chop? For a momentum name the shape matters."""
     first = opening_minute[opening_minute["minute"] < n_minutes]
@@ -675,7 +752,8 @@ def sane_bars(minute: pd.DataFrame) -> pd.Series:
     )
 
 
-def session_report(minute: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION) -> pd.DataFrame:
+def session_report(minute: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION,
+                   max_first_minute: int = 0) -> pd.DataFrame:
     """One row per session: bar count, first and last minute, and whether it is kept."""
     rep = minute.groupby("date").agg(
         n_bars=("close", "size"), first_minute=("minute", "min"),
@@ -687,18 +765,25 @@ def session_report(minute: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION) -
     # that generates it -- identical on every date it covers -- stands in here.
     rep["half_day"] = early_close(pd.DatetimeIndex(rep.index))
     rep["short"] = rep["n_bars"] < min_bars
-    rep["no_open_bar"] = rep["first_minute"] != 0
+    rep["no_open_bar"] = rep["first_minute"] > max_first_minute
     rep["early_end"] = rep["last_minute"] < SESSION_MINUTES - 5
     rep["kept"] = ~(rep["half_day"] | rep["short"] | rep["no_open_bar"] | rep["early_end"])
     return rep
 
 
-def clean_minute(raw: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION) -> "tuple[pd.DataFrame, pd.DataFrame]":
+# The bar columns beyond OHLCV the notebook keeps through cleaning (Alpaca's
+# `n` and `vw`); the microstructure group reads them.
+TRADE_COLS = ["trades", "vwap"]
+
+
+def clean_minute(raw: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION,
+                 max_first_minute: int = 0) -> "tuple[pd.DataFrame, pd.DataFrame]":
     """Drop broken bars and incomplete sessions (half days, feed gaps)."""
     minute = raw[sane_bars(raw)]
-    minute = add_session_columns(minute[OHLCV])
+    extra = [c for c in TRADE_COLS if c in minute]
+    minute = add_session_columns(minute[OHLCV + extra])
     minute["volume"] = minute["volume"].astype("int64")
-    rep = session_report(minute, min_bars)
+    rep = session_report(minute, min_bars, max_first_minute)
     kept = rep.index[rep["kept"]]
     return minute[minute["date"].isin(kept)], rep
 
@@ -724,9 +809,11 @@ def minute_frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
 
 def all_hours_frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
     """`minute_frame_from_bars` without the cut to regular hours: Alpaca's
-    minute bars carry the pre-market and the evening too."""
+    minute bars carry the pre-market and the evening too. `trades` and `vwap`
+    are Alpaca's `n` and `vw`, NaN on a bar without them (yfinance's, a test's)."""
     if not bars:
-        return pd.DataFrame(columns=OHLCV, index=pd.DatetimeIndex([], tz=market_hours.MARKET_TZ))
+        return pd.DataFrame(columns=OHLCV + TRADE_COLS,
+                            index=pd.DatetimeIndex([], tz=market_hours.MARKET_TZ))
     idx = pd.to_datetime([b["t"] for b in bars], utc=True, format="ISO8601").tz_convert(
         market_hours.MARKET_TZ
     )
@@ -737,6 +824,8 @@ def all_hours_frame_from_bars(bars: "list[dict]") -> pd.DataFrame:
             "low": [float(b["l"]) for b in bars],
             "close": [float(b["c"]) for b in bars],
             "volume": [float(b.get("v") or 0.0) for b in bars],
+            "trades": [float(b["n"]) if b.get("n") is not None else np.nan for b in bars],
+            "vwap": [float(b["vw"]) if b.get("vw") is not None else np.nan for b in bars],
         },
         index=idx,
     )
@@ -759,7 +848,7 @@ def opening_minute_frame(raw: pd.DataFrame, keep_dates) -> pd.DataFrame:
     """Another tape's minute bars -- a thin feed's opening, the pre-market, the
     evening -- as the notebook reads them: sane bars on the sessions the SIP
     tape kept, and no bar count of their own (notebook 1's `trim`)."""
-    frame = add_session_columns(raw[sane_bars(raw)][OHLCV])
+    frame = add_session_columns(raw[sane_bars(raw)][OHLCV + [c for c in TRADE_COLS if c in raw]])
     return frame[frame["date"].isin(keep_dates)]
 
 
@@ -780,43 +869,47 @@ def extended_summaries(all_hours: pd.DataFrame, keep_dates) -> pd.DataFrame:
 def session_rollups(
     raw: pd.DataFrame, opening_raw: "pd.DataFrame | None" = None,
     min_bars: int = MIN_BARS_PER_SESSION, all_hours: "pd.DataFrame | None" = None,
+    max_first_minute: int = 0,
 ) -> "tuple[pd.DataFrame, list[pd.Timestamp]]":
     """Raw regular-hours minute bars -> `(rollups, dropped_dates)`.
 
-    `rollups` has one row per kept session with `_ROLLUP_COLS` and the opening
-    summary; `dropped_dates` are the sessions `clean_minute` refused (half days,
-    feed gaps), remembered so the cache knows it has already looked at them.
+    `rollups` has one row per kept session with `_ROLLUP_COLS`, the opening
+    summary and the opening's trade summary (`_MICRO_SUMMARY`, NaN where the
+    bars carry no trade counts); `dropped_dates` are the sessions `clean_minute`
+    refused (half days, feed gaps, ORCL's opening print after `max_first_minute`),
+    remembered so the cache knows it has already looked at them.
     Every step groups by date, so rolling up in chunks gives the same rows as
     rolling up the whole history at once.
 
     `opening_raw` is another feed's bars for the same stretch (an IEX-opening
-    bundle's): the opening summary is then read from it, and a kept session it
+    bundle's): the opening summaries are then read from it, and a kept session it
     printed nothing in has NaN there rather than no row.
 
     `all_hours` is the same SIP stretch with its extended hours: given, each
     row also carries `extended_summaries`.
     """
-    cols = _ROLLUP_COLS + _OPENING_COLS + (_EXTENDED_COLS if all_hours is not None else [])
+    cols = (_ROLLUP_COLS + _OPENING_COLS + _MICRO_SUMMARY
+            + (_EXTENDED_COLS if all_hours is not None else []))
     if raw.empty:
         return pd.DataFrame(columns=cols), []
-    minute, rep = clean_minute(raw, min_bars)
+    minute, rep = clean_minute(raw, min_bars, max_first_minute)
     dropped = list(rep.index[~rep["kept"]])
     if minute.empty:
         return pd.DataFrame(columns=cols), dropped
     daily = daily_bars(minute)
     if opening_raw is None:
-        opening = opening_features(minute)[_OPENING_COLS]
+        opening = opening_features(minute)[_OPENING_COLS].join(microstructure_summary(minute))
         rollups = daily.join(opening, how="inner")
     else:
         thin = opening_minute_frame(opening_raw, daily.index)
-        opening = opening_features(thin)[_OPENING_COLS] if len(thin) else None
-        rollups = daily.join(
-            opening if opening is not None else pd.DataFrame(columns=_OPENING_COLS, dtype=float),
-            how="left",
+        opening = (
+            opening_features(thin)[_OPENING_COLS].join(microstructure_summary(thin))
+            if len(thin) else pd.DataFrame(columns=_OPENING_COLS + _MICRO_SUMMARY, dtype=float)
         )
+        rollups = daily.join(opening, how="left")
     if all_hours is not None:
         rollups = rollups.join(extended_summaries(all_hours, daily.index))
-    return rollups, dropped
+    return rollups[cols], dropped
 
 
 # --- models (mirrors the inference half of highlow.models) --------------------
@@ -1109,7 +1202,7 @@ def _build_bundle(path: Path) -> "dict | None":
     ticker = str(metadata.get("ticker") or "").upper() or None
 
     # The base features are mirrored, and the custom groups in `GROUP_COLS`.
-    # A weighted candidate reading anything else (INTC's microstructure) would
+    # A weighted candidate reading anything else (the calendar group) would
     # hit columns this module never builds, so the bundle is refused here
     # rather than failing -- or worse, predicting -- at 9:35. So is one whose
     # groups lack the inputs the sidecar has to name.
@@ -1119,9 +1212,7 @@ def _build_bundle(path: Path) -> "dict | None":
     groups = tuple(g for g, cols in GROUP_COLS.items() if read & set(cols))
     if read - set(FEATURE_COLS) - {c for g in groups for c in GROUP_COLS[g]}:
         return None
-    if "theme" in groups and (not peers or feed == OPENING_FEED_SIP):
-        # BE's peers are read on IEX, as `load_peers` defaults to; a SIP-opening
-        # ticker's notebook (NVDA's) reads them on SIP, which is not mirrored.
+    if "theme" in groups and not peers:
         return None
     market_proxy = str(metadata.get("market_proxy") or "").upper() or None
     if "market" in groups and not market_proxy:
@@ -1142,7 +1233,12 @@ def _build_bundle(path: Path) -> "dict | None":
         "opening_feed": feed,
         "min_bars": int(metadata.get("min_bars_per_session")
                         or NOTEBOOK_MIN_BARS.get(ticker or "", MIN_BARS_PER_SESSION)),
+        "max_first_minute": int(metadata.get("max_first_minute")
+                                or NOTEBOOK_MAX_FIRST_MINUTE.get(ticker or "", 0)),
         "peers": peers,
+        # BE's notebook reads its peers' openings on IEX (`load_peers`' default),
+        # the SIP-opening ones (ORCL's) on SIP: the bundle's own opening feed.
+        "peer_feed": PEER_OPENING_FEED if feed != OPENING_FEED_SIP else OPENING_FEED_SIP,
         "groups": groups,
         "market_proxy": market_proxy if "market" in groups else None,
         "reads": sorted(read),
@@ -1177,9 +1273,28 @@ def min_bars(bundle: "dict | None" = None) -> int:
         return MIN_BARS_PER_SESSION
 
 
+def max_first_minute(bundle: "dict | None" = None) -> int:
+    """How late a kept session's first bar may print, in minutes after 09:30:
+    0, or the notebook's (ORCL 2)."""
+    try:
+        return int((bundle or {})["max_first_minute"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
 def peers(bundle: "dict | None" = None) -> "tuple[str, ...]":
     """The theme peers the shipped blend reads, lead first; () for most bundles."""
     return tuple((bundle or {}).get("peers") or ())
+
+
+def peer_feed(bundle: "dict | None" = None) -> str:
+    """The tape the theme peers' openings are read from: IEX (BE) or SIP (ORCL)."""
+    return str((bundle or {}).get("peer_feed") or PEER_OPENING_FEED)
+
+
+def reads_microstructure(bundle: "dict | None" = None) -> bool:
+    """Whether the blend reads the opening's trade counts and VWAP (QCOM, ORCL, META)."""
+    return "microstructure" in groups(bundle)
 
 
 def groups(bundle: "dict | None" = None) -> "tuple[str, ...]":
@@ -1208,25 +1323,29 @@ def history_path(symbol: str) -> Path:
 
 def _read_cache(
     symbol: str, opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
-    extended: bool = False,
+    extended: bool = False, micro: bool = False, max_first_minute: int = 0,
 ) -> dict:
     """The symbol's cache, or an empty one if it holds another feed's openings
-    or sessions cleaned at another bar count (a file written before either key
-    existed holds SIP's, at 385) -- or, when `extended` is asked for, if any of
-    its sessions lacks the extended-hours summaries (every file written before
-    2026-10-04)."""
+    or sessions cleaned at another bar count or first-bar limit (a file written
+    before those keys existed holds SIP's, at 385 and 09:30) -- or, when
+    `extended` or `micro` is asked for, if any of its sessions lacks the
+    extended-hours summaries (every file written before 2026-10-04) or the
+    opening's trade summary (before 2026-10-13)."""
     try:
         payload = json.loads(history_path(symbol).read_text())
     except (OSError, ValueError):
-        return _empty_cache(opening_feed, min_bars)
+        return _empty_cache(opening_feed, min_bars, max_first_minute)
     if (payload.get("opening_feed", OPENING_FEED_SIP) != opening_feed
             or int(payload.get("min_bars", MIN_BARS_PER_SESSION)) != min_bars
-            or (extended and not payload.get("extended", False))):
-        return _empty_cache(opening_feed, min_bars)
+            or int(payload.get("max_first_minute", 0)) != max_first_minute
+            or (extended and not payload.get("extended", False))
+            or (micro and not payload.get("micro", False))):
+        return _empty_cache(opening_feed, min_bars, max_first_minute)
     payload.setdefault("sessions", {})
     payload.setdefault("dropped", [])
     payload["opening_feed"] = opening_feed
     payload["min_bars"] = min_bars
+    payload["max_first_minute"] = max_first_minute
     return payload
 
 
@@ -1254,6 +1373,7 @@ def _credentials(key: "str | None", secret: "str | None") -> "tuple[str, str]":
 def _fetch_rollups(
     symbol: str, first: date, before: date, key: str, secret: str,
     opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
+    max_first_minute: int = 0,
 ):
     """Rollups for the sessions in [first, before), straight from Alpaca SIP --
     with the opening summaries from `opening_feed` when that is not SIP, and
@@ -1272,7 +1392,7 @@ def _fetch_rollups(
         ))
     all_hours = all_hours_frame_from_bars(bars)
     rth = all_hours.between_time(model_store.RTH_START, model_store.RTH_END)
-    rollups, dropped = session_rollups(rth, opening_raw, min_bars, all_hours)
+    rollups, dropped = session_rollups(rth, opening_raw, min_bars, all_hours, max_first_minute)
     log_fetch(
         "minute bars (HighLow history)",
         "Alpaca REST (SIP, split-adjusted)" if opening_raw is None
@@ -1289,11 +1409,13 @@ def _rows(frame: pd.DataFrame) -> dict:
     }
 
 
-def _empty_cache(opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION) -> dict:
-    # `extended`: every session carries `_EXTENDED_COLS`. True until a fetch
-    # without them is merged in.
+def _empty_cache(opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
+                 max_first_minute: int = 0) -> dict:
+    # `extended` / `micro`: every session carries `_EXTENDED_COLS` /
+    # `_MICRO_SUMMARY`. True until a fetch without them is merged in.
     return {"sessions": {}, "dropped": [], "from": None, "through": None,
-            "opening_feed": opening_feed, "min_bars": min_bars, "extended": True}
+            "opening_feed": opening_feed, "min_bars": min_bars,
+            "max_first_minute": max_first_minute, "extended": True, "micro": True}
 
 
 def _merge(cache: dict, rollups: pd.DataFrame, dropped, seam: "str | None") -> bool:
@@ -1307,6 +1429,8 @@ def _merge(cache: dict, rollups: pd.DataFrame, dropped, seam: "str | None") -> b
     sessions.update(fresh)
     if fresh and not set(_EXTENDED_COLS) <= set(rollups.columns):
         cache["extended"] = False
+    if fresh and not set(_MICRO_SUMMARY) <= set(rollups.columns):
+        cache["micro"] = False
     cache["dropped"] = sorted(
         set(cache["dropped"]) | {pd.Timestamp(d).strftime("%Y-%m-%d") for d in dropped}
     )
@@ -1321,12 +1445,16 @@ def history_frame(
     opening_feed: str = OPENING_FEED_SIP,
     min_bars: int = MIN_BARS_PER_SESSION,
     extended: bool = False,
+    micro: bool = False,
+    max_first_minute: int = 0,
 ) -> pd.DataFrame:
     """Per-session rollups of the SIP tape for the sessions strictly before
     `before`, oldest first: `_ROLLUP_COLS` plus the opening summary, read from
     `opening_feed` (NaN on a session that feed printed nothing in), sessions
-    kept at `min_bars` -- and with `extended`, each session's pre-market and
-    evening summaries (`_EXTENDED_COLS`), rebuilding a cache written without them.
+    kept at `min_bars` and `max_first_minute` -- with `extended`, each
+    session's pre-market and evening summaries (`_EXTENDED_COLS`), and with
+    `micro` its opening's trade summary (`_MICRO_SUMMARY`), rebuilding a cache
+    written without them.
 
     The cache remembers which calendar days it has looked at (`from` ..
     `through`), and only the days outside that stretch are fetched -- so a live
@@ -1340,22 +1468,23 @@ def history_frame(
     first_wanted = before - timedelta(days=HISTORY_CALENDAR_DAYS)
     last_wanted = before - timedelta(days=1)
     with _history_lock:
-        cache = _read_cache(symbol, opening_feed, min_bars, extended)
+        cache = _read_cache(symbol, opening_feed, min_bars, extended, micro, max_first_minute)
         lo = date.fromisoformat(cache["from"]) if cache.get("from") else None
         hi = date.fromisoformat(cache["through"]) if cache.get("through") else None
         if lo is None or hi is None or not cache["sessions"]:
-            cache, lo, hi = _empty_cache(opening_feed, min_bars), None, None
+            cache, lo, hi = _empty_cache(opening_feed, min_bars, max_first_minute), None, None
 
         if lo is None or lo > first_wanted or hi < last_wanted:
             key, secret = _credentials(key, secret)
 
             def fetch(first: date, upto: date):
-                return _fetch_rollups(symbol, first, upto, key, secret, opening_feed, min_bars)
+                return _fetch_rollups(symbol, first, upto, key, secret, opening_feed, min_bars,
+                                      max_first_minute=max_first_minute)
 
             ok = True
             if lo is None or hi < first_wanted or lo > last_wanted:
                 # Nothing usable overlaps: fetch the whole window.
-                cache = _empty_cache(opening_feed, min_bars)
+                cache = _empty_cache(opening_feed, min_bars, max_first_minute)
                 _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             else:
@@ -1369,13 +1498,14 @@ def history_frame(
                     ok = _merge(cache, *fetch(date.fromisoformat(seam), before), seam)
                     hi = last_wanted
             if not ok:
-                cache = _empty_cache(opening_feed, min_bars)
+                cache = _empty_cache(opening_feed, min_bars, max_first_minute)
                 _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             cache["from"], cache["through"] = lo.isoformat(), hi.isoformat()
             _write_cache(symbol, cache)
 
-    cols = _ROLLUP_COLS + _OPENING_COLS + (_EXTENDED_COLS if extended else [])
+    cols = (_ROLLUP_COLS + _OPENING_COLS + (_MICRO_SUMMARY if micro else [])
+            + (_EXTENDED_COLS if extended else []))
     lo_s, hi_s = first_wanted.isoformat(), before.isoformat()
     rows = {d: v for d, v in cache["sessions"].items() if lo_s <= d < hi_s}
     if not rows:
@@ -1464,8 +1594,8 @@ def _peer_inputs(
     peer_data: "dict[str, tuple[pd.DataFrame, pd.DataFrame | None]]", day: pd.Timestamp, want: int,
 ) -> "tuple[dict, dict]":
     """`theme_from`'s `(openings, dailies)` from each peer's cached history and
-    today's IEX window, in the peers' order. A peer IEX printed nothing for
-    gets no row today, and so falls back as in the notebook."""
+    today's window, in the peers' order. A peer whose window holds nothing gets
+    no row today, and so falls back as in the notebook."""
     openings, dailies = {}, {}
     for name, (history, window) in peer_data.items():
         openings[name], dailies[name] = _with_today(history, window, day, want)
@@ -1511,6 +1641,7 @@ def forecast_from(
     peer_data: "dict[str, tuple[pd.DataFrame, pd.DataFrame | None]] | None" = None,
     market_data: "tuple[pd.DataFrame, pd.DataFrame | None] | None" = None,
     premarket_bars: "pd.DataFrame | None" = None,
+    micro_window: "pd.DataFrame | None" = None,
 ) -> dict:
     """The day's predicted high and low from a history of session rollups
     (`history_frame`) and today's first five minute bars.
@@ -1521,16 +1652,22 @@ def forecast_from(
     short -- the notebook keeps a window IEX printed three bars in -- but not
     empty.
 
-    `peer_data` is `{peer: (history, today's IEX window)}` for a bundle that
-    reads the theme group (`peers`, BE): each peer's `history_frame` on
-    `PEER_OPENING_FEED`, and its window as `fetch_opening_window` returns it
-    (None or empty when IEX printed nothing).
+    `peer_data` is `{peer: (history, today's window)}` for a bundle that
+    reads the theme group (`peers`, BE and ORCL): each peer's `history_frame`
+    on `peer_feed`, and its window as `fetch_opening_window` returns it (None
+    or empty when the feed printed nothing).
 
     For a bundle that reads the other custom groups (`groups`, NVDA):
     `market_data` is the market proxy's `(history_frame, today's window)`;
     `premarket_bars` today's SIP bars before the open (any hours: they are cut
     to 04:00-09:19 here); and the pre-market and evening history comes from
     `history`'s extended-hours columns (`history_frame(..., extended=True)`).
+
+    For one reading the microstructure group (QCOM, ORCL, META), `micro_window`
+    is today's opening window with Alpaca's trade counts and VWAP (`trades`,
+    `vwap`) on SIP's tape, and the history's trade summaries come from
+    `history_frame(..., micro=True)`. A non-SIP-opening bundle reads them off
+    `opening_window` instead, as the notebook reads them off its opening feed.
 
     Returns the keys `dayrange_model.forecast_session` returns --
     `{"pred_high", "pred_low", "prev_avg", "adr14_abs", "or_high", "or_low"}`
@@ -1558,7 +1695,7 @@ def forecast_from(
     # from the daily row (every other statistic is shifted a day), so the
     # partial row cannot leak the session's outcome.
     minute = add_session_columns(_market_indexed(opening_bars.iloc[:want][OHLCV]))
-    if int(minute["minute"].iloc[0]) != 0:
+    if int(minute["minute"].iloc[0]) > max_first_minute(bundle):
         raise ValueError("the opening window does not start at 09:30.")
     minute = minute[minute["date"] == day]
     if len(minute) < want:
@@ -1605,6 +1742,21 @@ def forecast_from(
             [history[_PREMARKET_SUMMARY]] + ([premarket_summary(pre)] if len(pre) else [])
         )
     afterhours = history[_EVENING_SUMMARY] if "afterhours" in read else None
+    micro = None
+    if "microstructure" in read:
+        if not set(_MICRO_SUMMARY) <= set(history.columns):
+            raise ValueError("this model reads the opening's trade counts and VWAP, and the "
+                             "history carries no trade summaries.")
+        # The notebook reads them off its opening feed: SIP's window, fetched
+        # with Alpaca's `n` and `vw`, or a thin-opening bundle's own window.
+        source = micro_window if feed == OPENING_FEED_SIP else opening_window
+        today_micro = []
+        if source is not None and len(source):
+            bars = opening_minute_frame(_market_indexed(source), [day])
+            bars = bars[bars["minute"] < want]
+            if len(bars):
+                today_micro = [microstructure_summary(bars, want)]
+        micro = pd.concat([history.loc[history["open5"].notna(), _MICRO_SUMMARY]] + today_micro)
 
     daily = pd.concat([history[_ROLLUP_COLS], today_daily[_ROLLUP_COLS]])
     # A past session the opening feed printed nothing in keeps its daily row but
@@ -1613,6 +1765,7 @@ def forecast_from(
     panel = panel_from(
         daily, opening, want, theme, market=market, premarket=premarket, afterhours=afterhours,
         shape_minute=opening_minute if "opening_shape" in read else None, regime="regime" in read,
+        micro=micro,
     )
     row = panel.loc[[day]]
 
@@ -1641,12 +1794,22 @@ def forecast_from(
 def _incomplete_because(missing: set, bundle: dict) -> str:
     """Why a feature row has holes, for the refusal."""
     if missing <= set(THEME_COLS):
-        return (f"none of the theme peers ({', '.join(peers(bundle))}) has an IEX opening "
-                "and 14 sessions of history this morning")
+        return (f"none of the theme peers ({', '.join(peers(bundle))}) has an "
+                f"{peer_feed(bundle).upper()} opening and 14 sessions of history this morning")
+    if missing <= set(MICROSTRUCTURE_COLS):
+        return ("this morning's trade counts and VWAP could not be read, or the SIP history "
+                "of them is shorter than 20 sessions")
     if missing <= set(MARKET_COLS):
         return (f"{market_proxy(bundle)} has no opening this morning or too little SIP history "
                 "beside this ticker's")
     return "the SIP history is too short or has gaps"
+
+
+def _own_history(bundle: dict, ticker: str, before, key: "str | None", secret: "str | None"):
+    """The ticker's own `history_frame`, with whatever the bundle reads of it."""
+    return history_frame(ticker, before, key, secret, opening_feed(bundle), min_bars(bundle),
+                         extended=reads_extended_hours(bundle), micro=reads_microstructure(bundle),
+                         max_first_minute=max_first_minute(bundle))
 
 
 def warm_history(
@@ -1654,10 +1817,9 @@ def warm_history(
 ) -> None:
     """Stretch the history caches `forecast_session` reads -- the ticker's,
     each theme peer's and the market proxy's -- over the sessions before `before`."""
-    history_frame(ticker, before, key, secret, opening_feed(bundle), min_bars(bundle),
-                  extended=reads_extended_hours(bundle))
+    _own_history(bundle, ticker, before, key, secret)
     for peer in peers(bundle):
-        history_frame(peer, before, key, secret, PEER_OPENING_FEED)
+        history_frame(peer, before, key, secret, peer_feed(bundle))
     if market_proxy(bundle):
         history_frame(market_proxy(bundle), before, key, secret, OPENING_FEED_SIP)
 
@@ -1682,8 +1844,11 @@ def forecast_session(
 
     A bundle reading the market group (NVDA) gets the proxy's history and
     today's window -- on SIP when SIP has released it, so every replay reads
-    the notebook's tape, and on IEX live at 9:35 (`market_window_feed`). One
-    reading the pre-market gets today's SIP bars to 09:19.
+    the notebook's tape, and on IEX live at 9:35 (`market_window_feed`). So do
+    SIP theme peers (ORCL's), and the trade counts and VWAP of the ticker's own
+    window for a bundle reading the microstructure group (QCOM, ORCL, META):
+    the caller's bars carry neither. One reading the pre-market gets today's
+    SIP bars to 09:19.
     """
     want = opening_minutes(bundle)
     feed = opening_feed(bundle)
@@ -1696,17 +1861,19 @@ def forecast_session(
     cached = _forecast_cache.get(memo)
     if cached is not None:
         return dict(cached)
-    history = history_frame(ticker, session_date, key, secret, feed, min_bars(bundle),
-                            extended=reads_extended_hours(bundle))
+    history = _own_history(bundle, ticker, session_date, key, secret)
     thin = None
     if feed != OPENING_FEED_SIP:
         thin = fetch_opening_window(ticker, session_date, want, feed, key, secret)
+    released = market_window_feed(session_date, want)
     peer_data = None
     if peers(bundle):
+        on = peer_feed(bundle)
         peer_data = {
             peer: (
-                history_frame(peer, session_date, key, secret, PEER_OPENING_FEED),
-                fetch_opening_window(peer, session_date, want, PEER_OPENING_FEED, key, secret),
+                history_frame(peer, session_date, key, secret, on),
+                fetch_opening_window(peer, session_date, want,
+                                     on if on != OPENING_FEED_SIP else released, key, secret),
             )
             for peer in peers(bundle)
         }
@@ -1715,14 +1882,17 @@ def forecast_session(
     if proxy:
         market_data = (
             history_frame(proxy, session_date, key, secret, OPENING_FEED_SIP),
-            fetch_opening_window(proxy, session_date, want, market_window_feed(session_date, want),
-                                 key, secret),
+            fetch_opening_window(proxy, session_date, want, released, key, secret),
         )
     premarket_bars = None
     if "premarket" in groups(bundle):
         premarket_bars = fetch_premarket(ticker, session_date, key, secret)
+    micro_window = None
+    if reads_microstructure(bundle) and feed == OPENING_FEED_SIP:
+        micro_window = fetch_opening_window(ticker, session_date, want, released, key, secret)
     out = forecast_from(bundle, history, opening_bars, session_date, thin, peer_data,
-                        market_data=market_data, premarket_bars=premarket_bars)
+                        market_data=market_data, premarket_bars=premarket_bars,
+                        micro_window=micro_window)
     if len(_forecast_cache) >= _FORECAST_CACHE_MAX:
         _forecast_cache.clear()
     _forecast_cache[memo] = dict(out)

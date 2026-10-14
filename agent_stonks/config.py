@@ -805,6 +805,35 @@ APPLE_TRADER_BRIEFING_WAIT_BARS = 10
 # 5% of minutes, so 0.10 refuses most buys made while the price is still
 # sliding and waits for the fall to flatten out. Not swept either.
 APPLE_TRADER_MAX_FALL_K = 0.10
+# Fast&Furious (`apple_models.FASTFURIOUS_KEY`, `apple_trader.FastFuriousTrader`):
+# a forecast of the next 30 minutes' average momentum at the close of every
+# bar, and notebook 06's rules for it -- picked on 2025 as the best Sharpe of
+# daily P&L among 64 candidates with at least 50 trades:
+#
+#   * enter when the forecast is at or above the ENTRY_QUANTILE of |forecast|
+#     over the previous 20 sessions' every minute (the threshold adapts to the
+#     scale of the model's output);
+#   * a stop STOP_K x the forecast 2-hour adverse excursion under the fill;
+#   * out HOLD_MINUTES after the last signal (a fresh one restarts the clock),
+#     at once on a signal the other way (EXIT_ON_SELL_SIGNAL), at the close at
+#     the latest.
+#
+# The notebook trades both sides; this ledger is long-only, so these are that
+# system's long trades exactly (its reversal into a short is a close here).
+# Notebook 06's long trades, $10,000 a trade, 1 bp a side:
+#
+#   window            trades  win   net bps/trade  net P&L
+#   2025 (chosen on)    249   56%        8.4        +2,092
+#   2026 to 4 Sep       111   50%        1.1          +116
+#   8 Sep - 9 Oct        21   48%        9.1          +191
+#
+# The notebook's own verdict on the whole system: out of sample no edge that
+# luck does not also produce (it beats 57% of placebos on 2026), and holding
+# AAPL through every session made more. Not tuned here.
+APPLE_TRADER_FF_ENTRY_QUANTILE = 0.95
+APPLE_TRADER_FF_STOP_K = 1.5
+APPLE_TRADER_FF_HOLD_MINUTES = 30
+APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL = True
 # Flatten this many minutes before the close: the day-range forecast is a
 # statement about one session, and the momentum regime does not survive the
 # overnight gap either.
@@ -883,6 +912,10 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     # And the stop under that buy: red, because it is the one line on the chart
     # that marks a loss rather than an order meant to make money.
     "trader_stop": "#f87171",
+    # Fast&Furious's 2-hour high/low band and its entry signals: green, away
+    # from every day-range blue -- a different question (the next two hours
+    # from each minute's price, not the session's extremes).
+    "fastfurious": "#4ade80",
 }
 
 # Alpha for the semi-transparent backgrounds overlays paint behind the candles.

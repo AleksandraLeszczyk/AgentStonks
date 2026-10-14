@@ -138,6 +138,7 @@ SHORT_MODEL_NAMES = {
     "highlow": "HighLow",
     "highlow2": "HighLow2",
     "highlow3m": "HighLow_3m",
+    "fastfurious": "Fast&Furious",
 }
 
 
@@ -155,11 +156,13 @@ def racer_label(config_or_key) -> str:
 
 def all_pairs() -> "list[str]":
     """Every (ticker, model) pair Orchestra can be given, as racer keys: each
-    symbol some model covers, with each model it has, in picker order."""
+    symbol some model covers, with each day-range model it has, in picker
+    order. Fast&Furious drives its own rules (a per-minute signal, no levels),
+    which neither the race nor the 09:34 selection is written for."""
     return [
         f"{ticker}:{key}"
         for ticker in apple_models.tickers()
-        for key in apple_models.keys_for(ticker)
+        for key in apple_models.keys_for_strategy(ticker, apple_models.STRATEGY_DAYRANGE)
     ]
 
 
@@ -202,6 +205,12 @@ class OrchestraConfig:
             raise ValueError("Orchestra needs at least one (ticker, model) pair")
         if self.mode not in MODE_LABELS:
             raise ValueError(f"Orchestra has no mode {self.mode!r}")
+        other = [r for r in self.racers if r.strategy != apple_models.STRATEGY_DAYRANGE]
+        if other:
+            raise ValueError(
+                f"Orchestra races the day-range rules, and {racer_label(other[0])} runs its "
+                "own: run it as Apple Trader"
+            )
         # Its candidates are picked at 09:34, after the window's first trade
         # could have been made, and its signature has no place for it.
         if any(r.use_3m for r in self.racers):
@@ -276,7 +285,7 @@ def build_orchestra_config(
     for key in pairs:
         ticker, model_key = split_key(key)
         buy_k, sell_k = at.dayrange_levels(ticker, model_key)
-        min_win_k = at.min_win_for(ticker)
+        min_win_k = at.min_win_for(ticker, model_key)
         if key in levels:
             buy_k, sell_k, min_win_k = levels[key]
         racers.append(replace(

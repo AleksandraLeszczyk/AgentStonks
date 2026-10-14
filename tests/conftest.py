@@ -89,3 +89,14 @@ def _last_setup_in_tmp(monkeypatch, tmp_path):
     from agent_stonks import last_setup
 
     monkeypatch.setattr(last_setup, "SETUP_PATH", tmp_path / "last_setup.json")
+
+
+@pytest.fixture(autouse=True)
+def _base_configs_in_tmp(monkeypatch, tmp_path):
+    """Keep the pairs' base configurations (`base_configs`) out of the real
+    data/apple_trader_base.json, so every test starts from the shipped
+    defaults whatever SimLab has set on this machine."""
+    from agent_stonks import base_configs
+
+    monkeypatch.setattr(base_configs, "BASE_PATH", tmp_path / "apple_trader_base.json")
+    monkeypatch.setattr(base_configs, "_cache", None)

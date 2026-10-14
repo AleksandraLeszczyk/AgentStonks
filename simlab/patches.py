@@ -55,6 +55,12 @@ tables (``positioning_rows`` -- the contract list, the daily option bars and
 ^IRX) are all cut at the previous close of the session date it is handed, never
 the wall clock, and cached under ``data/highlow3m/``. A positioning row is only
 ever built for a close that is over on the real clock.
+And for ``fastfurious_model``, which forecasts at every bar: a replayed
+session's own SIP and IEX minute bars are read whole from its cache
+(``data/fastfurious/``) or Alpaca and cut, minute by minute, at SIP 15 bars
+back and IEX through the bar -- the live view of that minute -- so a replay of
+any dataset forecasts from the tape the model was fitted on, not the dataset's.
+Only a session that is today on the real clock is fetched live.
 
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead

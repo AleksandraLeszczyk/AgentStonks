@@ -113,19 +113,55 @@ NVDA_FORECASTS = {
     "2026-09-21": (225.2065022842249, 221.0988011605764, 4.872142857142857),
     "2026-10-02": (238.31206881509854, 233.84640363077662, 4.331221428571425),
 }
+# QCOM, ORCL and META, saved 2026-10-13 on NVDA's recipe (fitted through
+# 2026-09-11, held out the three weeks after), all reading the opening's trade
+# counts and VWAP. The mornings after results evenings: QCOM 2025-11-06 and
+# 2026-07-30, ORCL 2025-09-10 (the backlog jump) and 2026-09-11, META 2025-10-30
+# and 2026-07-30. ORCL also reads SPY and its SIP peers MSFT, AMZN and GOOGL,
+# and keeps sessions whose first SIP bar printed late: 2024-05-03 starts at
+# 09:31, 2024-07-16 at 09:32 (07-17 reads it as yesterday).
+QCOM_FORECASTS = {
+    "2025-11-06": (178.53379085128552, 172.07724482662405, 7.091357142857144),
+    "2026-03-02": (139.49750738326694, 136.22550067174865, 3.513921428571424),
+    "2026-07-30": (154.18849901034432, 146.0, 6.7293214285714305),
+    "2026-09-14": (176.47917602686746, 169.44318384599953, 6.097685714285713),
+    "2026-09-21": (184.43757187055803, 177.75930557826086, 8.212850000000001),
+    "2026-10-02": (187.99036899603894, 182.44954656305347, 8.948742857142859),
+}
+ORCL_FORECASTS = {
+    "2024-05-03": (116.63738592412194, 115.08607241795097, 2.241257142857141),
+    "2024-07-16": (144.03678496649653, 141.99635062120075, 3.0093928571428523),
+    "2024-07-17": (141.63276215762528, 139.04601065124723, 2.940821428571423),
+    "2025-09-10": (338.3776459554302, 312.09, 6.535392857142853),
+    "2026-03-02": (145.9566752019453, 140.29462983145982, 7.15372142857143),
+    "2026-09-11": (166.0, 150.34934103752846, 5.717857142857143),
+    "2026-09-14": (146.84638734436578, 139.55037926600713, 6.461428571428572),
+    "2026-10-02": (145.6143902898878, 140.19950775877965, 5.502821428571431),
+}
+META_FORECASTS = {
+    "2025-10-30": (671.5275195038935, 650.0537511165068, 14.588828571428573),
+    "2026-03-02": (651.2686924897537, 633.9976668259108, 17.230157142857163),
+    "2026-07-30": (540.9664659944181, 522.4033104690162, 19.63481428571428),
+    "2026-09-14": (662.9581153181897, 644.1331402946303, 18.41187857142858),
+    "2026-09-21": (707.8884532398749, 679.6, 18.84087142857143),
+    "2026-10-02": (741.58, 720.4196161827942, 27.165607142857148),
+}
 NOTEBOOK_FORECASTS = {
     "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS, "BE": BE_FORECASTS,
-    "AVGO": AVGO_FORECASTS, "NVDA": NVDA_FORECASTS,
+    "AVGO": AVGO_FORECASTS, "NVDA": NVDA_FORECASTS, "QCOM": QCOM_FORECASTS,
+    "ORCL": ORCL_FORECASTS, "META": META_FORECASTS,
 }
 # The candidates each bundle ships with non-zero weight.
 SHIPPED = {
     "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
     "BE": ["nbeats", "nhits"], "AVGO": ["lgbm", "nbeats"], "NVDA": ["lgbm", "nhits"],
+    "QCOM": ["lgbm", "nbeats", "nhits"], "ORCL": ["lgbm", "nbeats", "nhits"], "META": ["nbeats"],
 }
 # The tape each bundle reads the opening from.
-OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex", "AVGO": "sip", "NVDA": "sip"}
+OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex", "AVGO": "sip", "NVDA": "sip",
+                 "QCOM": "sip", "ORCL": "sip", "META": "sip"}
 # The last session of each notebook's tape the mirror test reads.
-NOTEBOOK_TAPE_END = {"NVDA": "2026-10-02"}
+NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META")}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -170,10 +206,11 @@ class FakeSip:
         self.calls: "list[tuple[date, date]]" = []
 
     def __call__(self, symbol, first, before, key, secret, opening_feed="sip",
-                 min_bars=H.MIN_BARS_PER_SESSION):
+                 min_bars=H.MIN_BARS_PER_SESSION, max_first_minute=0):
         self.calls.append((first, before))
         bars = [b for d, day_bars in self.tape.items() if first <= d < before for b in day_bars]
-        return H.session_rollups(H.minute_frame_from_bars(bars), min_bars=min_bars)
+        return H.session_rollups(H.minute_frame_from_bars(bars), min_bars=min_bars,
+                                 max_first_minute=max_first_minute)
 
 
 @pytest.fixture
@@ -184,7 +221,7 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU", "BE"):
+        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
@@ -258,7 +295,7 @@ class TestThinOpeningFeed:
         asked = {}
         monkeypatch.setattr(
             H, "history_frame",
-            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False:
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False, **_:
                 asked.setdefault("history", opening_feed) and pd.DataFrame(),
         )
         monkeypatch.setattr(
@@ -289,7 +326,7 @@ class TestThemePeers:
         histories, windows = [], []
         monkeypatch.setattr(
             H, "history_frame",
-            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False:
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False, **_:
                 histories.append((symbol, opening_feed, min_bars)) or pd.DataFrame({"s": [symbol]}),
         )
         monkeypatch.setattr(
@@ -417,7 +454,7 @@ class TestExtendedHoursAndMarket:
         H.history_frame("NVDA", date(2026, 9, 14), "k", "s")
         assert len(old.calls) == 1
 
-        def with_extended(symbol, first, before, key, secret, opening_feed="sip", min_bars=385):
+        def with_extended(symbol, first, before, key, secret, opening_feed="sip", min_bars=385, **_):
             bars = [b for d, day_bars in old.tape.items() if first <= d < before for b in day_bars]
             return H.session_rollups(H.minute_frame_from_bars(bars), min_bars=min_bars,
                                      all_hours=H.all_hours_frame_from_bars(bars))
@@ -439,7 +476,7 @@ class TestExtendedHoursAndMarket:
         asked = []
         monkeypatch.setattr(
             H, "history_frame",
-            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False:
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False, **_:
                 asked.append(("history", symbol, opening_feed, extended)) or pd.DataFrame({"s": [symbol]}),
         )
         monkeypatch.setattr(
@@ -493,15 +530,135 @@ class TestExtendedHoursAndMarket:
         path = self._copy("NVDA", tmp_path, lambda m: {**m, "market_proxy": None})
         assert H._build_bundle(path) is None
 
-    def test_theme_peers_on_a_sip_opening_are_refused(self, tmp_path):
-        """NVDA's notebook reads its peers on SIP; only BE's IEX peers are mirrored."""
-        path = self._copy("BE", tmp_path, lambda m: {**m, "opening_feed": "sip"})
-        assert H._build_bundle(path) is None
+    def test_theme_peers_are_read_on_the_bundles_opening_feed(self, tmp_path):
+        """BE's notebook reads its peers on IEX (`load_peers`' default), the
+        SIP-opening ones (ORCL's) ask for `feed="sip"`."""
+        assert H.peer_feed(H._build_bundle(self._copy("BE", tmp_path))) == "iex"
+        orcl = H._build_bundle(self._copy("ORCL", tmp_path))
+        assert H.peers(orcl) == ("MSFT", "AMZN", "GOOGL") and H.peer_feed(orcl) == "sip"
 
     def test_avgo_keeps_sessions_from_its_notebooks_threshold(self, tmp_path):
         bundle = H._build_bundle(self._copy("AVGO", tmp_path))
         assert "min_bars_per_session" not in bundle["metadata"]
         assert H.min_bars(bundle) == 320 and H.groups(bundle) == ()
+
+    def test_qcom_orcl_and_meta_read_the_microstructure_group(self, tmp_path):
+        groups = {t: H.groups(H._build_bundle(self._copy(t, tmp_path))) for t in ("QCOM", "ORCL", "META")}
+        assert groups == {
+            "QCOM": ("premarket", "afterhours", "microstructure"),
+            "ORCL": ("market", "theme", "premarket", "afterhours", "opening_shape", "regime",
+                     "microstructure"),
+            # its linear median reads the theme too, at weight 0: no peers fetched
+            "META": ("premarket", "afterhours", "opening_shape", "regime", "microstructure"),
+        }
+
+    def test_orcl_keeps_sessions_whose_first_bar_is_two_minutes_late(self, tmp_path):
+        bundle = H._build_bundle(self._copy("ORCL", tmp_path))
+        assert "max_first_minute" not in bundle["metadata"]
+        assert H.max_first_minute(bundle) == 2
+        assert H.max_first_minute(H._build_bundle(self._copy("META", tmp_path))) == 0
+
+
+class TestMicrostructure:
+    """QCOM's, ORCL's and META's group: the opening's trade counts and VWAP,
+    cached per session off Alpaca's `n` and `vw`, and today's read off a window
+    fetched for them -- the caller's bars carry neither."""
+
+    def test_the_rollups_carry_the_openings_trade_summary(self):
+        day = date(2026, 3, 2)
+        bars = [{**b, "n": 10 + i, "vw": b["c"]} for i, b in enumerate(_tape(day, day)[day])]
+        row = H.session_rollups(H.minute_frame_from_bars(bars))[0].iloc[0]
+        first5 = bars[:5]
+        assert row["ms_trades"] == 10 + 11 + 12 + 13 + 14
+        assert row["ms_volume"] == row["volume5"] == sum(b["v"] for b in first5)
+        assert row["ms_opener"] == first5[0]["v"]
+        assert row["ms_vwap"] == pytest.approx(
+            sum(b["c"] * b["v"] for b in first5) / sum(b["v"] for b in first5)
+        )
+
+    def test_bars_without_trade_counts_leave_it_empty_rather_than_zero(self):
+        day = date(2026, 3, 2)
+        row = H.session_rollups(H.minute_frame_from_bars(_tape(day, day)[day]))[0].iloc[0]
+        assert np.isnan(row["ms_trades"]) and np.isnan(row["ms_vwap"])
+
+    def test_a_cache_written_without_them_is_rebuilt_only_when_asked(self, cache_dir, monkeypatch):
+        import json
+        sip = FakeSip(_tape(date(2025, 12, 1), date(2026, 9, 30)))
+        monkeypatch.setattr(H, "_fetch_rollups", sip)
+        H.history_frame("QCOM", date(2026, 9, 14), "k", "s")
+        path = H.history_path("QCOM")
+        payload = json.loads(path.read_text())
+        del payload["micro"]  # as every file written before 2026-10-13
+        path.write_text(json.dumps(payload))
+
+        H.history_frame("QCOM", date(2026, 9, 14), "k", "s")
+        assert len(sip.calls) == 1
+        frame = H.history_frame("QCOM", date(2026, 9, 14), "k", "s", micro=True)
+        assert len(sip.calls) == 2 and set(H._MICRO_SUMMARY) <= set(frame.columns)
+        assert H._read_cache("QCOM", micro=True)["micro"] is True
+
+    def test_forecast_session_fetches_the_windows_on_the_released_feed(self, monkeypatch):
+        """Live at 9:35 SIP has released neither ORCL's own window (for its trade
+        counts) nor its SIP peers': both are read from IEX then, from SIP in a replay."""
+        H._forecast_cache.clear()
+        asked = []
+        monkeypatch.setattr(
+            H, "history_frame",
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385,
+            extended=False, micro=False, max_first_minute=0:
+                asked.append(("history", symbol, opening_feed, micro, max_first_minute))
+                or pd.DataFrame({"s": [symbol]}),
+        )
+        monkeypatch.setattr(
+            H, "fetch_opening_window",
+            lambda symbol, day, want, feed, key=None, secret=None:
+                asked.append(("window", symbol, feed)) or pd.DataFrame({"w": [symbol]}),
+        )
+        monkeypatch.setattr(H, "market_window_feed", lambda day, want, now=None: "iex")
+        monkeypatch.setattr(H, "forecast_from", lambda *a, **k: k)
+        opening = H.minute_frame_from_bars(_tape(date(2026, 7, 1), date(2026, 7, 1))[date(2026, 7, 1)][:5])
+        bundle = {"path": "orcl", "groups": ("theme", "microstructure"), "peers": ("MSFT", "AMZN"),
+                  "peer_feed": "sip", "max_first_minute": 2}
+        out = H.forecast_session(bundle, "ORCL", opening, date(2026, 7, 1))
+        assert asked == [
+            ("history", "ORCL", "sip", True, 2),
+            ("history", "MSFT", "sip", False, 0), ("window", "MSFT", "iex"),
+            ("history", "AMZN", "sip", False, 0), ("window", "AMZN", "iex"),
+            ("window", "ORCL", "iex"),
+        ]
+        assert out["micro_window"]["w"][0] == "ORCL"
+        H._forecast_cache.clear()
+
+    def test_a_morning_without_trade_counts_is_refused(self):
+        bundle, raw, _, history, _, extras = notebook_inputs("QCOM")
+        stamp = pd.Timestamp("2026-09-14")
+        inputs = _extra_inputs(extras, stamp)
+        inputs["micro_window"] = inputs["micro_window"][H.OHLCV]  # yfinance-like: no n, no vw
+        with pytest.raises(ValueError, match="trade counts and VWAP"):
+            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp, **inputs)
+
+
+class TestLateFirstPrint:
+    """ORCL's notebook keeps a session whose first SIP bar printed at 09:31 or
+    09:32 (the opening auction landed there on 13 quiet days of 2023-24)."""
+
+    def test_such_a_session_is_kept_only_up_to_the_bundles_limit(self):
+        day = date(2026, 3, 2)
+        bars = _tape(day, day)[day][1:]  # 389 bars from 09:31
+        frame = H.minute_frame_from_bars(bars)
+        assert H.session_rollups(frame)[0].empty
+        rollups = H.session_rollups(frame, max_first_minute=2)[0]
+        assert len(rollups) == 1 and rollups["open5"].iloc[0] == pytest.approx(bars[0]["o"])
+        assert H.session_rollups(H.minute_frame_from_bars(bars[2:]), max_first_minute=2)[0].empty
+
+    def test_a_cache_cleaned_at_another_limit_is_rebuilt(self, cache_dir, monkeypatch):
+        sip = FakeSip(_tape(date(2025, 12, 1), date(2026, 9, 30)))
+        monkeypatch.setattr(H, "_fetch_rollups", sip)
+        H.history_frame("ORCL", date(2026, 9, 14), "k", "s")
+        H.history_frame("ORCL", date(2026, 9, 14), "k", "s", max_first_minute=2)
+        assert len(sip.calls) == 2
+        assert H._read_cache("ORCL", max_first_minute=2)["max_first_minute"] == 2
+        assert H._read_cache("ORCL")["sessions"] == {}
 
 
 class TestHalfDays:
@@ -630,7 +787,9 @@ def notebook_inputs(ticker: str):
     def tape(paths, hours=("09:30", "15:59")):
         raw = pd.concat(pd.read_parquet(f) for f in paths).sort_index()
         raw = raw[~raw.index.duplicated()].loc["2023-01-01":f"{end} 23:59"]
-        return raw.tz_convert("America/New_York").between_time(*hours)[H.OHLCV]
+        # trade counts and VWAP too, where the notebook downloaded them
+        cols = H.OHLCV + [c for c in H.TRADE_COLS if c in raw]
+        return raw.tz_convert("America/New_York").between_time(*hours)[cols]
 
     raw = tape(files)
     thin = None
@@ -645,32 +804,41 @@ def notebook_inputs(ticker: str):
         extras["pre"] = tape(sorted(folder.glob(f"{ticker}_20??_pre.parquet")), ("00:00", "23:59"))
         post = tape(sorted(folder.glob(f"{ticker}_20??_post.parquet")), ("00:00", "23:59"))
         all_hours = pd.concat([raw, extras["pre"], post]).sort_index()
-    history, _ = H.session_rollups(raw, thin, H.min_bars(bundle), all_hours)
+    history, _ = H.session_rollups(raw, thin, H.min_bars(bundle), all_hours, H.max_first_minute(bundle))
+    if H.reads_microstructure(bundle):
+        extras["micro"] = raw
     proxy = H.market_proxy(bundle)
     if proxy:
         m_raw = tape(sorted((NOTEBOOK / "data" / proxy / "raw").glob(f"{proxy}_20??.parquet")))
         extras["market"] = (H.session_rollups(m_raw)[0], m_raw)
     # Each theme peer as the notebook's `load_peers` reads it: SIP rollups at 385
-    # bars, IEX openings trimmed to the sessions SIP kept -- and the raw IEX tape.
+    # bars, openings on the peer feed (BE's IEX, trimmed to the sessions SIP
+    # kept; ORCL's SIP, the kept sessions' own) -- and that feed's raw tape.
     peer_tapes = {}
     for peer in H.peers(bundle):
         peer_raw = NOTEBOOK / "data" / peer / "raw"
-        p_iex = tape(sorted(peer_raw.glob(f"{peer}_20??_iex.parquet")))
-        p_history, _ = H.session_rollups(tape(sorted(peer_raw.glob(f"{peer}_20??.parquet"))), p_iex)
-        peer_tapes[peer] = (p_history, H.opening_minute_frame(p_iex, p_history.index)[H.OHLCV], p_iex)
+        p_sip = tape(sorted(peer_raw.glob(f"{peer}_20??.parquet")))
+        p_thin = None
+        if H.peer_feed(bundle) != "sip":
+            p_thin = tape(sorted(peer_raw.glob(f"{peer}_20??_{H.peer_feed(bundle)}.parquet")))
+        p_history, _ = H.session_rollups(p_sip, p_thin)
+        p_open = p_sip if p_thin is None else p_thin
+        peer_tapes[peer] = (p_history, H.opening_minute_frame(p_open, p_history.index)[H.OHLCV], p_open)
     _NOTEBOOK_INPUTS[ticker] = (bundle, raw, thin, history, peer_tapes, extras)
     return _NOTEBOOK_INPUTS[ticker]
 
 
 def _extra_inputs(extras, stamp):
-    """`forecast_from`'s market and pre-market inputs for one day, the market's
-    window as the notebook read it (SIP's first five minutes)."""
+    """`forecast_from`'s market, pre-market and trade-count inputs for one day,
+    the windows as the notebook read them (SIP's first five minutes)."""
     out = {}
     if "market" in extras:
         m_history, m_raw = extras["market"]
         out["market_data"] = (m_history, _one_day(m_raw, stamp, 5))
     if "pre" in extras:
         out["premarket_bars"] = _one_day(extras["pre"], stamp)
+    if "micro" in extras:
+        out["micro_window"] = _one_day(extras["micro"], stamp, 5)
     return out
 
 
@@ -730,16 +898,18 @@ class TestAgainstTheNotebook:
         assert bundle["ticker"] == ticker  # the file that loaded is the right one
         assert sorted(bundle["daily_models"]) == SHIPPED[ticker]
 
-    def test_a_bundle_whose_shipped_candidate_reads_a_custom_group_is_refused(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("ticker,refused", [("ORCL", True), ("INTC", False)])
+    def test_a_bundle_whose_shipped_candidate_reads_an_unmirrored_group_is_refused(
+        self, tmp_path, ticker, refused
     ):
-        """INTC's linear median reads microstructure columns this module never
-        builds; at weight 0 that is harmless, weighted it must not load."""
+        """ORCL's linear median reads the calendar group, which this module never
+        builds; at weight 0 that is harmless, weighted it must not load. INTC's
+        reads microstructure, mirrored since 2026-10-13: weighted, it loads."""
         import joblib
 
-        src = H.model_path("INTC")
+        src = H.model_path(ticker)
         if not src.exists():
-            pytest.skip("the HighLow INTC bundle is not installed")
+            pytest.skip(f"the HighLow {ticker} bundle is not installed")
         H._register_unpickle_alias()
         import warnings
         with warnings.catch_warnings():
@@ -748,6 +918,13 @@ class TestAgainstTheNotebook:
         blob["weights"] = {**blob["weights"], "linear": 1.0}
         target = tmp_path / src.name
         joblib.dump(blob, target)
-        for extra in (src.with_name(f"{src.stem}_nhits.pt"), src.with_suffix(".json")):
-            (tmp_path / extra.name).write_bytes(extra.read_bytes())
-        assert H._build_bundle(target) is None
+        for extra in (src.with_name(f"{src.stem}_nbeats.pt"), src.with_name(f"{src.stem}_nhits.pt"),
+                      src.with_suffix(".json")):
+            if extra.exists():
+                (tmp_path / extra.name).write_bytes(extra.read_bytes())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            bundle = H._build_bundle(target)
+        assert (bundle is None) is refused
+        if not refused:
+            assert "microstructure" in H.groups(bundle)

@@ -2,8 +2,8 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are five, and they
-share a rule set:
+named X" and never branch on which one they got. Today there are six; the
+first five share a rule set:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
                      an opening ridge, forecasting where the *whole session's*
@@ -39,6 +39,15 @@ share a rule set:
                      `highlow3m_model`; the range is marked as starting after
                      the opening window, so the trader measures breaches on
                      the bars after it.
+`fastfurious`        Fast&Furious's forecast of a different kind of number:
+                     the average momentum of the next 30 minutes, made at the
+                     close of every minute from 09:31 to 15:30, with a forecast
+                     of the next two hours' high and low beside it. It drives
+                     its own rule set (`STRATEGY_MOMENTUM`): buy when the
+                     forecast is in the top 5% of the last 20 sessions', a
+                     stop under the forecast low, out 30 minutes after the
+                     last signal. Its bundle carries `kind="fastfurious"` and
+                     the forecasts come from `fastfurious_model`.
 
 That second entry is why `AppleModel` carries `level_source`: what the levels
 are measured below used to be a separate setting beside the model picker, which
@@ -68,9 +77,11 @@ in `Code/Models`) is the whole change needed to offer it -- ORCL, for instance,
 is trained in `FinNotebooks/Models` and is one entry away.
 
 `AppleModel.strategy` names which rule set a model drives, and
-`apple_trader.build_trader` turns it into a state machine. With one model there
-is one strategy, but the seam is kept: a second model is a registry entry and a
-trader class, not an edit to every caller.
+`apple_trader.build_trader` turns it into a state machine: the five range
+models drive the day-range rules (two resting levels), Fast&Furious the
+momentum rules (a per-minute signal). A caller written for one of them --
+Orchestra, the day-range levels on the chart, a tuning axis -- asks
+`strategy(key)` rather than assuming.
 
 Every model is optional: a missing file or a missing dependency makes it
 *unavailable*, reported as such, rather than an agent that silently never
@@ -88,6 +99,7 @@ from .config import APPLE_TRADER_MODEL, LEVELS_DAYRANGE, LEVELS_INTRADAY
 
 # The rule sets a model can drive.
 STRATEGY_DAYRANGE = "dayrange"
+STRATEGY_MOMENTUM = "momentum"
 
 # The symbol everything here defaults to, and what a config or a stored record
 # arriving without one means.
@@ -102,13 +114,16 @@ DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 # AAPL (saved 2026-09-15), INTC (2026-09-21), MU (2026-09-30, its opening
 # read from IEX -- see `highlow_model`), BE (2026-09-30, IEX opening plus its
 # theme peers VST, PLUG and XLU), AVGO (2026-10-04, base features, sessions
-# kept from 320 bars) and NVDA (2026-10-04, reads SPY, the pre-market, the
-# previous evening, the opening's shape and the volatility regime); GOOGL is
-# in the notebook's config but has not been run through it. Adding one is this
-# tuple plus its files in `Code/Models` -- and a check that the bundle's shipped
-# candidates read only the base features and the custom groups `highlow_model`
-# mirrors (`GROUP_COLS`; `_build_bundle` refuses anything else).
-HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA")
+# kept from 320 bars), NVDA (2026-10-04, reads SPY, the pre-market, the
+# previous evening, the opening's shape and the volatility regime), and QCOM,
+# ORCL and META (2026-10-13, NVDA's recipe; all three read the opening's trade
+# counts and VWAP, and ORCL also SPY and its SIP theme peers MSFT, AMZN and
+# GOOGL); GOOGL is in the notebook's config but has not been run through it.
+# Adding one is this tuple plus its files in `Code/Models` -- and a check that
+# the bundle's shipped candidates read only the base features and the custom
+# groups `highlow_model` mirrors (`GROUP_COLS`; `_build_bundle` refuses
+# anything else).
+HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META")
 
 # Which symbols HighLow2_5m has saved a bundle for (`highlow2_5m_<TICKER>.*`):
 # AAPL (saved 2026-10-04) and INTC (2026-10-06, AAPL's recipe with ten stocks
@@ -128,6 +143,14 @@ HIGHLOW2_TICKERS = (DEFAULT_TICKER, "INTC")
 # option group, the notebook's per-ticker option settings in
 # `highlow3m_model.NOTEBOOK_OPTIONS` (`_build_bundle` refuses it without them).
 HIGHLOW3M_TICKERS = (DEFAULT_TICKER,)
+
+# Which symbols Fast&Furious has saved a bundle for (`fastfurious_<TICKER>.*`):
+# AAPL (fitted through 2026-09-04, saved 2026-10-12). GOOGL, MSFT, AMZN, META
+# and NVDA were processed as a training pool and made the model worse, so none
+# has a model. Adding one is this tuple plus its two files in `Code/Models`,
+# and -- since the stop's range model reads the option tables -- the ticker's
+# entry in `highlow3m_model.NOTEBOOK_OPTIONS`.
+FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
 
 
 @dataclass(frozen=True)
@@ -292,11 +315,29 @@ def _highlow3m_path(ticker: str = DEFAULT_TICKER) -> Path:
     return highlow3m_model.model_path(ticker)
 
 
+def _load_fastfurious(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The Fast&Furious bundle for one ticker, imported late (LightGBM)."""
+    try:
+        from . import fastfurious_model
+    except ImportError:
+        return None
+    return fastfurious_model.load_bundle(ticker)
+
+
+def _fastfurious_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import fastfurious_model
+    except ImportError:
+        return Path(f"fastfurious_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return fastfurious_model.model_path(ticker)
+
+
 DAYRANGE_KEY = "dayrange"
 DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 HIGHLOW3M_KEY = "highlow3m"
+FASTFURIOUS_KEY = "fastfurious"
 # Both saved models have to exist for the pairing, so the symbols it covers are
 # the symbols both were fitted on.
 DAYRANGE_INTRADAY_TICKERS = tuple(
@@ -358,15 +399,19 @@ MODELS: "dict[str, AppleModel]" = {
             "will land, made once at 9:35 -- measured from the 9:35 price in units "
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL and AVGO: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + "
-            "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS), fitted on "
+            "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS; QCOM and "
+            "ORCL: LightGBM + N-BEATS + N-HiTS; META: N-BEATS alone), fitted on "
             "every session since 2023 with its first five minutes (MU's and BE's read "
             "from IEX, the only tape there is at 9:35 on a basic plan; BE's also with "
             "VST's opening move, its lead AI-power peer; NVDA's with SPY's opening, the "
-            "pre-market to 9:19 and the previous evening's after-hours). On the "
+            "pre-market to 9:19 and the previous evening's after-hours; QCOM's, ORCL's "
+            "and META's also with the opening's trade counts and VWAP, and ORCL's with "
+            "SPY and its cloud peers MSFT, AMZN and GOOGL). On the "
             "129-session test window its error is 35% below "
             "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
             "INTC; MU, BE and AVGO have no TimeToChange3 bundle, and beat that approach "
-            "retrained on them by 25%, 33% and 34%. "
+            "retrained on them by 25%, 33% and 34%, QCOM, ORCL and META by 43%, 31% "
+            "and 29%. "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -374,8 +419,9 @@ MODELS: "dict[str, AppleModel]" = {
         requires=(
             "PyTorch, LightGBM, scikit-learn and joblib, the weighted network "
             "checkpoints, and Alpaca credentials for ~150 sessions of SIP minute history "
-            "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, and on NVDA "
-            "SPY's history and this morning's SIP pre-market)"
+            "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, on NVDA "
+            "and ORCL SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, and on "
+            "NVDA, QCOM, ORCL and META this morning's SIP pre-market)"
         ),
         strategy=STRATEGY_DAYRANGE,
         tickers=HIGHLOW_TICKERS,
@@ -440,6 +486,36 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=HIGHLOW3M_TICKERS,
         load=_load_highlow3m,
         path=_highlow3m_path,
+    ),
+    FASTFURIOUS_KEY: AppleModel(
+        key=FASTFURIOUS_KEY,
+        label="Fast&Furious model",
+        summary=(
+            "FinNotebooks' Fast&Furious forecast of the average momentum of the next 30 "
+            "minutes, made at the close of every minute from 09:31 to 15:30 -- not a range "
+            "made once in the morning. It reads only today's session as a live trader on a "
+            "basic plan sees it (SIP to 15 minutes ago, IEX since): the return since the "
+            "open, the gap, the distance to the session's high, low and VWAP, the opening "
+            "range, realised volatility and volume against their norms, the signed-volume "
+            "share, the time of day and this minute's recent history. LightGBM, Huber loss, "
+            "three seeds; a second LightGBM pair forecasts the next two hours' high and low "
+            "(with last night's option walls and implied move) for the stop. Its ranking "
+            "edge is small -- a rank correlation of 0.03 with the next half hour on 2025 and "
+            "on 2026, and -0.03 on its 24-session test month. It drives its own rules: buy "
+            "when the forecast is in the top 5% of the last 20 sessions', a stop 1.5 × the "
+            "forecast 2-hour drop under the fill, out 30 minutes after the last signal or "
+            "at once on a sell signal. The notebook's verdict on those rules: out of sample "
+            "no edge that luck does not also produce."
+        ),
+        requires=(
+            "LightGBM, SciPy and joblib, Alpaca credentials for ~200 days of SIP and IEX "
+            "minute bars and today's live ones, and (for the stop) HighLow_3m's option "
+            "tables: the contract list, ~4 months of daily option bars and Yahoo's ^IRX"
+        ),
+        strategy=STRATEGY_MOMENTUM,
+        tickers=FASTFURIOUS_TICKERS,
+        load=_load_fastfurious,
+        path=_fastfurious_path,
     ),
 }
 
@@ -528,3 +604,10 @@ def unavailable_reason(key: "str | None", ticker: "str | None" = None) -> str:
 def strategy(key: "str | None") -> str:
     """Which rule set the named model drives."""
     return get(key).strategy
+
+
+def keys_for_strategy(ticker: "str | None", rule_set: str) -> "list[str]":
+    """`keys_for(ticker)` narrowed to the models that drive one rule set --
+    what a caller written for one of them offers (Orchestra races day-range
+    pairs only)."""
+    return [key for key in keys_for(ticker) if MODELS[key].strategy == rule_set]
