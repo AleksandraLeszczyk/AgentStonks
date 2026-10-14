@@ -3273,14 +3273,6 @@ def _execution_controls() -> str:
                 "that happened to be a live key, whether real money moved would come "
                 "down to which variable was already set."
             )
-        elif _get_state().trading_mode != "alpaca_live":
-            # A pre-Start caution only: once a live run is on, the status block
-            # under the Start button says so and this would be a second banner.
-            st.warning(
-                "**This will trade real money.** Pressing ▶ Start arms an automated "
-                "strategy on your live Alpaca account, and it will place orders "
-                "without asking again per trade."
-            )
     elif mode == "alpaca_paper":
         if not keyed:
             key_var, secret_var = TRADING_ENV_KEYS["alpaca_paper"]
