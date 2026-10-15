@@ -5,9 +5,13 @@ import pandas as pd
 import pytest
 
 from agent_stonks.options import (
+    NoExpiryInWindow,
     _bs_gamma,
     _select_expiry,
+    combine_chains,
+    expiry_window,
     fetch_option_chain,
+    fetch_option_window,
     gamma_flip,
     net_gamma_exposure,
 )
@@ -184,3 +188,134 @@ class TestGammaFlip:
         assert gamma_flip(no_ivs) is None
         assert gamma_flip({}) is None
         assert gamma_flip(None) is None
+
+
+def _et(text: str) -> datetime:
+    """An ET wall-clock time as an aware datetime (EDT in October 2026)."""
+    return datetime.fromisoformat(text + "-04:00")
+
+
+class TestExpiryWindow:
+    # Thursday 2026-10-15 is the reference week; Friday 10-16, month end 10-31.
+    def test_mid_session_thursday(self):
+        now = _et("2026-10-15T11:00")
+        d = datetime.fromisoformat
+        assert expiry_window("tomorrow", now) == (d("2026-10-15").date(), d("2026-10-16").date())
+        assert expiry_window("week", now) == (d("2026-10-15").date(), d("2026-10-16").date())
+        assert expiry_window("month", now) == (d("2026-10-15").date(), d("2026-10-31").date())
+
+    def test_after_the_close_todays_expiry_is_gone(self):
+        first, last = expiry_window("tomorrow", _et("2026-10-15T16:30"))
+        assert (first.isoformat(), last.isoformat()) == ("2026-10-16", "2026-10-16")
+
+    def test_tomorrow_from_a_friday_is_monday(self):
+        first, last = expiry_window("tomorrow", _et("2026-10-16T10:00"))
+        assert (first.isoformat(), last.isoformat()) == ("2026-10-16", "2026-10-19")
+
+    def test_after_fridays_close_and_at_the_weekend_the_week_is_the_next(self):
+        for now in ("2026-10-16T16:30", "2026-10-17T12:00", "2026-10-18T20:00"):
+            first, last = expiry_window("week", _et(now))
+            assert (first.isoformat(), last.isoformat()) == ("2026-10-19", "2026-10-23"), now
+            first, last = expiry_window("tomorrow", _et(now))
+            assert (first.isoformat(), last.isoformat()) == ("2026-10-19", "2026-10-19"), now
+
+    def test_after_the_months_last_session_the_month_is_the_next(self):
+        # Friday 2026-10-30 is October's last session.
+        first, last = expiry_window("month", _et("2026-10-30T16:30"))
+        assert (first.isoformat(), last.isoformat()) == ("2026-11-02", "2026-11-30")
+
+    def test_the_date_is_new_yorks_not_utcs(self):
+        # 21:00 ET Thursday is already Friday in UTC.
+        first, last = expiry_window("tomorrow", _et("2026-10-15T21:00"))
+        assert (first.isoformat(), last.isoformat()) == ("2026-10-16", "2026-10-16")
+
+    def test_unknown_window_raises(self):
+        with pytest.raises(ValueError, match="unknown expiry window"):
+            expiry_window("year", _et("2026-10-15T11:00"))
+
+
+class MultiExpiryTicker(FakeTicker):
+    """A listing whose every expiry answers with its own frames."""
+
+    def __init__(self, frames: dict, spot: float):
+        super().__init__(list(frames), None, None, spot)
+        self._frames = frames
+        self.asked: list[str] = []
+
+    def option_chain(self, expiry):
+        self.asked.append(expiry)
+        calls, puts = self._frames[expiry]
+        return SimpleNamespace(calls=calls, puts=puts)
+
+
+def _frames(strikes, calls_oi, puts_oi):
+    calls = pd.DataFrame({"strike": strikes, "openInterest": calls_oi, "impliedVolatility": [0.3] * len(strikes)})
+    puts = pd.DataFrame({"strike": strikes, "openInterest": puts_oi, "impliedVolatility": [0.3] * len(strikes)})
+    return calls, puts
+
+
+class TestFetchOptionWindow:
+    NOW = _et("2026-10-15T11:00")
+    FRAMES = {
+        "2026-10-16": _frames([95.0, 100.0], [10, 20], [30, 40]),
+        "2026-10-23": _frames([100.0, 105.0], [1, 2], [3, 4]),
+        "2026-10-30": _frames([110.0], [5], [6]),
+        "2026-11-20": _frames([100.0], [1000], [1000]),
+    }
+
+    def _ticker(self, monkeypatch, frames=None):
+        ticker = MultiExpiryTicker(frames or self.FRAMES, spot=100.0)
+        monkeypatch.setattr("agent_stonks.options.yf.Ticker", lambda symbol: ticker)
+        return ticker
+
+    def test_sums_every_expiry_in_the_window_per_strike(self, monkeypatch):
+        ticker = self._ticker(monkeypatch)
+        data = fetch_option_window("AAPL", "month", now=self.NOW)
+
+        assert ticker.asked == ["2026-10-16", "2026-10-23", "2026-10-30"]  # not November's
+        assert data["expiries"] == ["2026-10-16", "2026-10-23", "2026-10-30"]
+        assert data["strikes"] == [95.0, 100.0, 105.0, 110.0]
+        assert data["calls_oi"] == [10.0, 21.0, 2.0, 5.0]
+        assert data["puts_oi"] == [30.0, 43.0, 4.0, 6.0]
+        assert data["spot"] == 100.0
+        # Each expiry's gamma at its own time to expiry, then summed.
+        singles = [fetch_option_chain("AAPL", spot=100.0, expiry=e) for e in data["expiries"]]
+        for name in ("calls_gamma_exposure", "puts_gamma_exposure"):
+            assert sum(data[name]) == pytest.approx(sum(sum(one[name]) for one in singles))
+        # No single maturity to re-price a sum of expiries at.
+        assert net_gamma_exposure(data, [100.0]) is None
+
+    def test_one_expiry_in_the_window_is_that_chain_as_it_is(self, monkeypatch):
+        self._ticker(monkeypatch)
+        data = fetch_option_window("AAPL", "tomorrow", spot=101.0, now=self.NOW)
+        alone = fetch_option_chain("AAPL", spot=101.0, expiry="2026-10-16")
+        assert data["expiries"] == ["2026-10-16"]
+        assert {k: v for k, v in data.items() if k not in ("expiries", "fetched_at")} == {
+            k: v for k, v in alone.items() if k != "fetched_at"
+        }
+
+    def test_nothing_in_the_window_names_the_next_expiry(self, monkeypatch):
+        self._ticker(monkeypatch, {"2026-10-23": self.FRAMES["2026-10-23"]})
+        with pytest.raises(NoExpiryInWindow, match="No AAPL options expire by Fri 2026-10-16 — the next is Fri 2026-10-23"):
+            fetch_option_window("AAPL", "tomorrow", now=self.NOW)
+
+    def test_one_failed_expiry_fails_the_whole_window(self, monkeypatch):
+        frames = dict(self.FRAMES)
+        frames["2026-10-23"] = (None, None)
+        self._ticker(monkeypatch, frames)
+        with pytest.raises(ValueError, match="no contracts for expiry 2026-10-23"):
+            fetch_option_window("AAPL", "month", now=self.NOW)
+
+
+class TestCombineChains:
+    def test_strikes_only_one_expiry_lists_keep_their_own_values(self):
+        a = {"symbol": "X", "expiry": "2026-10-16", "spot": 10.0, "strikes": [1.0, 2.0],
+             "calls_oi": [1, 2], "puts_oi": [3, 4], "calls_gamma_exposure": [0.5, 0.25],
+             "puts_gamma_exposure": [-0.5, -0.25], "fetched_at": "2026-10-15T15:00:00+00:00"}
+        b = {**a, "expiry": "2026-10-23", "strikes": [2.0, 3.0], "fetched_at": "2026-10-15T15:00:01+00:00"}
+        data = combine_chains([a, b])
+        assert data["strikes"] == [1.0, 2.0, 3.0]
+        assert data["calls_oi"] == [1.0, 3.0, 2.0]
+        assert data["puts_gamma_exposure"] == [-0.5, -0.75, -0.25]
+        assert data["expiry"] == "2026-10-16 to 2026-10-23"
+        assert data["fetched_at"] == "2026-10-15T15:00:01+00:00"

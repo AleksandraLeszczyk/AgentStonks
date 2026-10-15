@@ -2755,6 +2755,11 @@ def build_gamma_chart(data: dict, analysis: dict, symbol: str) -> go.Figure:
     puts_oi = data["puts_oi"]
     net_gamma = [c + p for c, p in zip(data["calls_gamma_exposure"], data["puts_gamma_exposure"])]
     spot = data["spot"]
+    expiries = data.get("expiries") or []
+    if len(expiries) > 1:
+        expiry_text = f"{len(expiries)} expiries, {expiries[0]} to {expiries[-1]}"
+    else:
+        expiry_text = f"expiry {data.get('expiry', '')}"
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -2824,7 +2829,7 @@ def build_gamma_chart(data: dict, analysis: dict, symbol: str) -> go.Figure:
         plot_bgcolor=PALETTE["panel"],
         font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
         title=dict(
-            text=f"<b>{symbol}</b> put/call walls &amp; gamma — expiry {data.get('expiry', '')}",
+            text=f"<b>{symbol}</b> put/call walls &amp; gamma — {expiry_text}",
             font=dict(size=18),
             x=0.02,
         ),

@@ -280,6 +280,103 @@ class TestLiveOptionWalls:
         assert calls == ["AAPL"]
 
 
+def _walls_tab_app():
+    from agent_stonks import ui
+    ui._options_walls_panel(["AAPL"])
+
+
+class TestOptionsWallsPanel:
+    """The Put/Call Walls tab's Expiring choice. The agent's nearest-expiry chain
+    and its walls history stay whatever the tab shows."""
+
+    NEAREST = {
+        "symbol": "AAPL", "expiry": "2026-10-16", "spot": 100.0,
+        "strikes": [95.0, 100.0, 105.0], "calls_oi": [10, 50, 400], "puts_oi": [300, 40, 5],
+        "calls_gamma_exposure": [1.0, 2.0, 1.0], "puts_gamma_exposure": [-1.0, -2.0, -1.0],
+        "fetched_at": "2026-10-15T13:00:00+00:00",
+    }
+    MONTH = {
+        **NEAREST, "expiry": "2026-10-16 to 2026-10-30",
+        "expiries": ["2026-10-16", "2026-10-23", "2026-10-30"],
+        "strikes": [90.0, 100.0, 110.0], "calls_oi": [1, 2, 900], "puts_oi": [800, 2, 1],
+    }
+
+    def _setup(self, monkeypatch, window_fetch):
+        from agent_stonks import ui
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        monkeypatch.setattr(ui, "_get_state", lambda: state)
+        monkeypatch.setattr(ui, "_walls_window_chains", {})
+        monkeypatch.setattr(ui, "_walls_window_history", {})
+        monkeypatch.setattr(ui, "fetch_options_walls_data", lambda sym, spot=None: self.NEAREST)
+        asked = []
+
+        def fetch(sym, window, spot=None):
+            asked.append(window)
+            return window_fetch(window)
+
+        monkeypatch.setattr(ui, "fetch_options_window_data", fetch)
+        return state.sym("AAPL"), asked
+
+    def test_the_chosen_window_is_drawn_and_the_agent_keeps_the_nearest(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks import ui
+        chains = {"tomorrow": {**self.NEAREST, "expiries": ["2026-10-16"]}, "month": self.MONTH}
+        sym_state, asked = self._setup(monkeypatch, chains.__getitem__)
+
+        app = AppTest.from_function(_walls_tab_app).run()
+        assert not app.exception
+        assert app.radio(key="walls_expiry_window").value == "tomorrow"
+        assert any("Expiry 2026-10-16 ·" in c.value for c in app.caption)
+        assert app.metric[0].value == "$105.00"
+
+        app.radio(key="walls_expiry_window").set_value("month").run()
+        assert not app.exception
+        assert asked == ["tomorrow", "month"]
+        assert any("Expiries 2026-10-16, 2026-10-23, 2026-10-30" in c.value for c in app.caption)
+        assert app.metric[0].value == "$110.00"
+        assert app.metric[1].value == "$90.00"
+        # The agent's chain and walls history are the nearest expiry's throughout.
+        assert sym_state.options_chain is self.NEAREST
+        assert [(h["call_wall"], h["put_wall"]) for h in sym_state.options_wall_history] == [(105.0, 95.0)]
+        # Each window keeps its own history.
+        assert sorted(key[1] for key in ui._walls_window_history) == ["month", "tomorrow"]
+
+    def test_no_expiry_in_the_window_says_so(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks.options import NoExpiryInWindow
+
+        def fetch(window):
+            raise NoExpiryInWindow("No AAPL options expire by Tue 2026-10-20 — the next is Fri 2026-10-23.")
+
+        sym_state, _ = self._setup(monkeypatch, fetch)
+        app = AppTest.from_function(_walls_tab_app).run()
+        assert not app.exception
+        assert "No AAPL options expire by Tue 2026-10-20" in app.info[0].value
+        assert not app.error
+        assert sym_state.options_chain is self.NEAREST
+
+    def test_a_failed_refresh_shows_the_last_chain_for_that_window(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks import ui
+        answers = [self.MONTH]
+
+        def fetch(window):
+            if answers:
+                return answers.pop()
+            raise RuntimeError("Yahoo said no")
+
+        self._setup(monkeypatch, fetch)
+        app = AppTest.from_function(_walls_tab_app).run()
+        assert not app.exception
+        history = dict(ui._walls_window_history)
+        app.run()
+        assert not app.exception
+        assert "refresh failed: Yahoo said no" in app.warning[0].value
+        assert any("Expiries 2026-10-16, 2026-10-23, 2026-10-30" in c.value for c in app.caption)
+        assert ui._walls_window_history == history  # a stale chain adds no snapshot
+
+
 class TestLivePriorProfile:
     LEVELS = {"date": "2026-10-05", "poc": 100.0, "peaks": [98.0, 103.0]}
     BARS = [{"t": "2026-10-06T14:00:00Z", "o": 1, "h": 1, "l": 1, "c": 1, "v": 1}]

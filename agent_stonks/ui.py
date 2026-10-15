@@ -100,7 +100,16 @@ from .premarket import (
     PremarketBriefing,
     launch_premarket_analysis,
 )
-from .options import FLIP_WINDOW, fetch_options_walls_data, gamma_flip, net_gamma_exposure
+from .options import (
+    EXPIRY_WINDOWS,
+    FLIP_WINDOW,
+    NoExpiryInWindow,
+    expiry_window,
+    fetch_options_walls_data,
+    fetch_options_window_data,
+    gamma_flip,
+    net_gamma_exposure,
+)
 from .performance import compute_equity_curve, decision_markers, summarize
 from .profile_model import predicted_open_profile
 from .report import build_report_html
@@ -1089,7 +1098,8 @@ def _live_chart_controls() -> None:
                 "days, from yfinance and refreshed every minute.\n\n"
                 "- **Call wall** / **Put wall** — the strikes with the most call "
                 "open interest (likely resistance) and put open interest (likely "
-                "support): the same walls as the Put/Call Walls tab.\n"
+                "support): the same walls as the Put/Call Walls tab's when it "
+                "shows only that expiry.\n"
                 "- **Gamma flip** — the price nearest the last trade at which "
                 "net dealer gamma changes sign: where the Net gamma panel's bars "
                 "change colour. The chain is re-priced at every price "
@@ -1194,9 +1204,10 @@ def _live_chart_controls() -> None:
                 "rallies and buys dips, damping moves — red where they are short "
                 "and their hedging amplifies them.\n\n"
                 "From the nearest expiry within 45 days (yfinance, refreshed every "
-                "minute — the same chain as the Put/Call Walls tab and the Net "
-                "Gamma card). Each bar is priced once, at its close, with the "
-                "chain the app had then, and keeps that value — across a reload "
+                "minute — the same chain as the Net Gamma card; the Put/Call "
+                "Walls tab can sum several expiries). Each bar is priced once, "
+                "at its close, with the chain the app had then, and keeps that "
+                "value — across a reload "
                 "or a restart too. Only the bar still forming moves. Bars that "
                 "closed before the first chain arrived (a start mid-day) are "
                 "priced with that first chain: open interest only changes "
@@ -1759,31 +1770,74 @@ def _technical_analysis_panel(symbols: list[str]) -> None:
         st.divider()
 
 
-def _record_wall_snapshot(sym_state: SymbolState, call_wall: float, put_wall: float) -> list[dict]:
-    """Append a {call_wall, put_wall} snapshot if it differs from the last one, so the
-    agent's trend read (rising/falling walls) reflects real shifts, not poll noise."""
-    with sym_state.lock:
-        history = list(sym_state.options_wall_history)
-        last = history[-1] if history else None
-        if last is None or last.get("call_wall") != call_wall or last.get("put_wall") != put_wall:
-            history.append(
-                {
-                    "ts": pd.Timestamp.now(tz="UTC").isoformat(),
-                    "call_wall": call_wall,
-                    "put_wall": put_wall,
-                }
-            )
-            history = history[-OPTIONS_WALL_HISTORY_MAXLEN:]
-            sym_state.options_wall_history = history
+def _with_wall_snapshot(history: list[dict], call_wall: float, put_wall: float) -> list[dict]:
+    """`history` with a {call_wall, put_wall} snapshot appended if it differs from the
+    last one, so a trend read (rising/falling walls) reflects real shifts, not poll noise."""
+    last = history[-1] if history else None
+    if last is not None and last.get("call_wall") == call_wall and last.get("put_wall") == put_wall:
         return history
+    snapshot = {"ts": pd.Timestamp.now(tz="UTC").isoformat(), "call_wall": call_wall, "put_wall": put_wall}
+    return [*history, snapshot][-OPTIONS_WALL_HISTORY_MAXLEN:]
+
+
+def _record_wall_snapshot(sym_state: SymbolState, call_wall: float, put_wall: float) -> list[dict]:
+    """Add a snapshot to the agent's walls history (`_with_wall_snapshot`)."""
+    with sym_state.lock:
+        sym_state.options_wall_history = _with_wall_snapshot(
+            list(sym_state.options_wall_history), call_wall, put_wall
+        )
+        return sym_state.options_wall_history
+
+
+# The Put/Call Walls tab's own reads, process-wide like the chain caches: the
+# last chain fetched per (symbol, expiry window), and the wall snapshots per
+# (symbol, window, first, last expiry date), so a trend never spans two sets
+# of expiries. Kept off SymbolState so the tab works on states built before a
+# code save (see `as_config` in apple_trader). The agent and the live chart
+# read only the nearest-expiry `SymbolState.options_chain`.
+_walls_window_lock = threading.Lock()
+_walls_window_chains: dict[tuple[str, str], dict] = {}
+_walls_window_history: dict[tuple, list[dict]] = {}
+
+
+def _walls_analysis(data: dict, history: "list[dict] | None" = None) -> dict:
+    return get_put_call_walls_and_gamma(
+        strikes=data["strikes"],
+        calls_oi=data["calls_oi"],
+        puts_oi=data["puts_oi"],
+        calls_gamma_exposure=data["calls_gamma_exposure"],
+        puts_gamma_exposure=data["puts_gamma_exposure"],
+        spot=data["spot"],
+        wall_history=history,
+    )
+
+
+def _refresh_agent_walls(sym: str, sym_state: "SymbolState | None", spot: "float | None") -> None:
+    """Keep the agent's walls read current whatever expiries the tab shows: the
+    nearest-expiry chain stored on the symbol (what get_put_call_walls, the live
+    chart's options levels and its net gamma panel read) and a snapshot of its
+    walls for the tool's trend. A failed fetch is logged by `fetch_option_chain`
+    and keeps the last chain."""
+    if sym_state is None:
+        return
+    try:
+        data = fetch_options_walls_data(sym, spot=spot)
+    except Exception:
+        return
+    with sym_state.lock:
+        sym_state.options_chain = data
+    if data.get("strikes"):
+        analysis = _walls_analysis(data)
+        _record_wall_snapshot(sym_state, analysis["call_wall"], analysis["put_wall"])
 
 
 @st.fragment(run_every=OPTIONS_POLL_SEC)
 def _options_walls_panel(symbols: list[str]) -> None:
     """Independently fetches/refreshes each symbol's options chain (cached, on its
     own poll loop -- never triggered by the agent) and renders the Call Wall /
-    Put Wall / gamma read. The agent's get_put_call_walls tool only reads whatever
-    this last stored on the SymbolState."""
+    Put Wall / gamma read of every expiry the "Expiring" choice takes in. The
+    agent's get_put_call_walls tool only reads the nearest-expiry chain this (or
+    the live chart) last stored on the SymbolState."""
     state = _get_state()
     if replay.is_replay(state):
         st.info(
@@ -1796,6 +1850,23 @@ def _options_walls_panel(symbols: list[str]) -> None:
         st.plotly_chart(empty_chart("Enter symbols in the sidebar"), width='stretch')
         return
 
+    window = st.radio(
+        "Expiring",
+        list(EXPIRY_WINDOWS),
+        format_func=EXPIRY_WINDOWS.get,
+        horizontal=True,
+        key="walls_expiry_window",
+        help=(
+            "Which options the walls and gamma are read from, summed per strike: "
+            "every expiry from today's (after the close, the next weekday's) up to "
+            "tomorrow's (Monday's from a Friday), this Friday's, or the month's "
+            "last. Each expiry's gamma is priced at its own time to expiry.\n\n"
+            "The agent's walls tool, the live chart's options levels and its net "
+            "gamma panel keep reading the nearest expiry."
+        ),
+    )
+    first, last = expiry_window(window)
+
     for sym in symbols:
         sym_state = state.sym(sym)
         st.subheader(sym)
@@ -1803,40 +1874,41 @@ def _options_walls_panel(symbols: list[str]) -> None:
         if sym_state is not None:
             with sym_state.lock:
                 live_spot = sym_state.last_price
+        _refresh_agent_walls(sym, sym_state, live_spot)
 
+        fresh = True
         try:
-            data = fetch_options_walls_data(sym, spot=live_spot)
+            data = fetch_options_window_data(sym, window, spot=live_spot)
+        except NoExpiryInWindow as exc:
+            st.info(str(exc))
+            st.divider()
+            continue
         except Exception as exc:
-            data = None
-            if sym_state is not None:
-                with sym_state.lock:
-                    data = sym_state.options_chain
+            fresh = False
+            with _walls_window_lock:
+                data = _walls_window_chains.get((sym, window))
             if not data:
                 st.error(f"Failed to fetch options chain for {sym}: {exc}")
                 continue
             st.warning(f"Using last successful options fetch for {sym} -- refresh failed: {exc}")
-        else:
-            if sym_state is not None:
-                with sym_state.lock:
-                    sym_state.options_chain = data
 
-        prior_history: list[dict] = []
-        if sym_state is not None:
-            with sym_state.lock:
-                prior_history = list(sym_state.options_wall_history)
-        analysis = get_put_call_walls_and_gamma(
-            strikes=data["strikes"],
-            calls_oi=data["calls_oi"],
-            puts_oi=data["puts_oi"],
-            calls_gamma_exposure=data["calls_gamma_exposure"],
-            puts_gamma_exposure=data["puts_gamma_exposure"],
-            spot=data["spot"],
-            wall_history=prior_history,
+        history_key = (sym, window, first, last)
+        with _walls_window_lock:
+            if fresh:
+                _walls_window_chains[(sym, window)] = data
+            prior_history = list(_walls_window_history.get(history_key, []))
+        analysis = _walls_analysis(data, prior_history)
+        if fresh:
+            with _walls_window_lock:
+                _walls_window_history[history_key] = _with_wall_snapshot(
+                    prior_history, analysis["call_wall"], analysis["put_wall"]
+                )
+
+        expiries = data.get("expiries") or [data["expiry"]]
+        st.caption(
+            f"{'Expiry' if len(expiries) == 1 else 'Expiries'} {', '.join(expiries)} "
+            f"· fetched {data['fetched_at']}"
         )
-        if sym_state is not None:
-            _record_wall_snapshot(sym_state, analysis["call_wall"], analysis["put_wall"])
-
-        st.caption(f"Expiry {data['expiry']} · fetched {data['fetched_at']}")
         fig = build_gamma_chart(data, analysis, sym)
         st.plotly_chart(fig, width='stretch', key=f"gamma_chart_{sym}")
 
@@ -1849,6 +1921,7 @@ def _options_walls_panel(symbols: list[str]) -> None:
         for insight in analysis["insights"]:
             st.markdown(f"- {insight}")
         st.divider()
+    last_setup.remember()
 
 
 def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
@@ -2463,9 +2536,10 @@ def _report_news_cards(state: AppState, syms: list[str]) -> list[str]:
 
 
 def _report_option_walls(state: AppState, syms: list[str]) -> list[dict]:
-    """The Put/Call Walls tab's chart and read per symbol, from the chain that
-    tab (or the live chart's wall overlay) last stored. A symbol with none yet
-    gets one fetch through the same 5-minute cache; one that fails is left out."""
+    """The Put/Call Walls tab's chart and read per symbol, from the nearest-expiry
+    chain the tab (or the live chart's wall overlay) last stored -- not the tab's
+    Expiring choice. A symbol with none yet gets one fetch through the same
+    5-minute cache; one that fails is left out."""
     walls = []
     for sym in syms:
         sym_state = state.sym(sym)

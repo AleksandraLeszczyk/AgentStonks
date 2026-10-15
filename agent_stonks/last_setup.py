@@ -83,6 +83,8 @@ KEYS = frozenset({
     "news_impact_method_select",
     "news_llm_provider_select",
     "premarket_provider",
+    # Put/Call Walls tab
+    "walls_expiry_window",
     # Agent tab
     "agent_llm_personality",
     "agent_llm_provider",
