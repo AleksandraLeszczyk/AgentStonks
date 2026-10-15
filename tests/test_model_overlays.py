@@ -1219,14 +1219,29 @@ class TestFastFuriousOverlay:
         assert series["Buy threshold"]["values"] == pytest.approx(list(edge))
         assert series["Sell threshold"]["values"] == pytest.approx(list(-edge))
 
-    def test_a_marker_sits_where_the_line_crosses_a_threshold(self, stubbed):
+    def test_the_line_is_drawn_at_the_end_of_the_window_it_forecasts(self, stubbed):
+        items = self.compute([mo.FASTFURIOUS_SIGNAL_KEY])["items"]
+        open_ = pd.Timestamp(f"{SESSION} 09:30", tz="America/New_York")
+        made = [open_ + pd.Timedelta(minutes=int(m)) for m in self.fc.index]
+        due = [(t + pd.Timedelta(minutes=30)).tz_convert("UTC").isoformat() for t in made]
+        for item in (i for i in items if i["kind"] == "series"):
+            assert item["t"] == due, item["label"]
+        line = next(i for i in items if i["label"] == "30-min momentum forecast")
+        assert line["text"][0].startswith("made at the 09:31 bar · ")
+        # The signals stay at the bar the trader acts on.
+        buy = next(i for i in items if i["kind"] == "event")
+        assert buy["ts"] == made[10].tz_convert("UTC").isoformat()
+
+    def test_a_marker_sits_30_minutes_before_the_line_crosses_a_threshold(self, stubbed):
         items = self.compute([mo.FASTFURIOUS_SIGNAL_KEY])["items"]
         events = [i for i in items if i["kind"] == "event"]
         assert [e["icon"] for e in events] == ["▲", "▼"]
         series = {i["label"]: i for i in items if i["kind"] == "series"}
         at = {t: n for n, t in enumerate(series["30-min momentum forecast"]["t"])}
         line = series["30-min momentum forecast"]["values"]
-        buy, sell = (at[e["ts"]] for e in events)
+        buy, sell = (
+            at[(pd.Timestamp(e["ts"]) + pd.Timedelta(minutes=30)).isoformat()] for e in events
+        )
         assert line[buy] >= series["Buy threshold"]["values"][buy]
         assert line[buy - 1] < series["Buy threshold"]["values"][buy - 1]
         assert line[sell] <= series["Sell threshold"]["values"][sell]

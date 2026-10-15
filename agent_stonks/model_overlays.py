@@ -40,10 +40,11 @@ Nine overlays
                      own extremes are not a breach of it. See `highlow3m_model`.
 `fastfurious_signal` Fast&Furious's forecast of the next 30 minutes' average
                      momentum, read at the close of every bar: a line in bps
-                     per minute on the momentum panel with the entry
+                     per minute on the momentum panel, drawn 30 minutes
+                     later over the bars it forecast, with the entry
                      threshold either side of zero, and a marker on the
-                     candles where it crosses one (▲ a buy signal, ▼ a sell
-                     signal). See `fastfurious_model`.
+                     candles at the bar where it crosses one (▲ a buy
+                     signal, ▼ a sell signal). See `fastfurious_model`.
 `fastfurious_range`  The next two hours' predicted high and low from each
                      bar's price, as a band: the second model in the bundle,
                      which only sizes the stop. Its own key so that it is off
@@ -279,8 +280,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         summary=(
             "Fast&Furious's forecast of the next 30 minutes' average momentum, made at the "
             "close of every bar from 09:31 to 15:30: a line in bps per minute on the momentum "
-            "panel (right axis) with the entry threshold above and below zero, and a marker "
-            "on the candles where it crosses one — ▲ a buy signal, ▼ a sell signal."
+            "panel (right axis), drawn 30 minutes after it was made — over the bars it "
+            "forecast — with the entry threshold above and below zero, and a marker on the "
+            "candles at the bar where it crosses one — ▲ a buy signal, ▼ a sell signal."
         ),
         requires="LightGBM, the Fast&Furious bundle, and Alpaca SIP and IEX minute bars",
         tickers=apple_models.FASTFURIOUS_TICKERS,
@@ -1427,10 +1429,12 @@ def _fastfurious_forecast(
     has said so far. The threshold is the configured run's quantile when the
     chart's configuration is a Fast&Furious one, the notebook's otherwise.
 
-    Returns `{"fc", "stamps", "theta", "sessions", "quantile", "problem",
-    "threshold_problem"}`: `problem` says why there is no forecast at all,
-    `threshold_problem` why there is no threshold -- which only the signals
-    need, so the range is still drawn without one.
+    Returns `{"fc", "stamps", "horizon", "theta", "sessions", "quantile",
+    "problem", "threshold_problem"}`: `stamps` are the bars each forecast was
+    made at, `horizon` how many minutes the momentum forecast looks ahead,
+    `problem` says why there is no forecast at all, `threshold_problem` why
+    there is no threshold -- which only the signals need, so the range is still
+    drawn without one.
     """
     model_key = apple_models.FASTFURIOUS_KEY
     from .config import APPLE_TRADER_FF_ENTRY_QUANTILE
@@ -1438,7 +1442,7 @@ def _fastfurious_forecast(
     quantile = APPLE_TRADER_FF_ENTRY_QUANTILE
     if config is not None and getattr(config, "model_key", None) == model_key:
         quantile = float(config.ff_entry_quantile)
-    out = {"fc": None, "stamps": [], "theta": float("nan"), "sessions": 0,
+    out = {"fc": None, "stamps": [], "horizon": 0, "theta": float("nan"), "sessions": 0,
            "quantile": quantile, "problem": "", "threshold_problem": ""}
     try:
         bundle = apple_models.load(model_key, symbol)
@@ -1469,6 +1473,7 @@ def _fastfurious_forecast(
         **out,
         "fc": fc,
         "stamps": [open_ts + pd.Timedelta(minutes=int(m)) for m in fc.index],
+        "horizon": int(module.HORIZON),
         "theta": float(theta),
         "sessions": int(sessions),
         "threshold_problem": problem,
@@ -1485,24 +1490,34 @@ def _fastfurious_signal_items(result: dict) -> "tuple[list[dict], str]":
     is a curve: wide at the open and into the close, narrow at midday. The
     line crosses it exactly where `y_hat` crosses the fixed one, which is where
     a ▲ or ▼ goes on the candles.
+
+    The line and the thresholds are drawn `horizon` (30) minutes after the bar
+    each forecast was made at -- at the end of the window it is about -- so it
+    sits over the momentum bars it was a forecast of, and the newest half hour
+    of forecasts is not drawn until that time comes. The markers stay at the
+    bar the forecast was made at, which is when the trader acts on it, so a
+    marker is `horizon` minutes left of where the line crosses a threshold.
     """
     overlay = OVERLAYS[FASTFURIOUS_SIGNAL_KEY]
     if result["problem"]:
         return [], f"{overlay.label}: {result['problem']}"
     fc, stamps = result["fc"], result["stamps"]
     theta, sessions, quantile = result["theta"], result["sessions"], result["quantile"]
+    horizon = pd.Timedelta(minutes=result["horizon"])
+    due = [stamp + horizon for stamp in stamps]
     color = MODEL_OVERLAY_COLORS["fastfurious"]
     sell_color = MODEL_OVERLAY_COLORS["trader_stop"]
     has_theta = np.isfinite(theta)
     # bps per minute for one unit of y: what turns y_hat into `mom_bps`.
     per_y = fc["s30"] / 30 * 1e4
-    text = [f"y {y:+.4f}" for y in fc["y_hat"]]
+    text = [f"made at the {stamp:%H:%M} bar · y {y:+.4f}" for stamp, y in zip(stamps, fc["y_hat"])]
     if has_theta:
         text = [f"{t} · {y / theta:+.0%} of the threshold" for t, y in zip(text, fc["y_hat"])]
     items: "list[dict]" = [_series(
-        FASTFURIOUS_SIGNAL_KEY, "30-min momentum forecast", stamps, fc["mom_bps"],
+        FASTFURIOUS_SIGNAL_KEY, "30-min momentum forecast", due, fc["mom_bps"],
         MODEL_OVERLAY_COLORS["fastfurious_forecast"], unit="bps/min",
-        note="the average 1-minute move forecast for the next 30 minutes, at each bar's close",
+        note="the average 1-minute move forecast at a bar's close for the next 30 minutes, "
+             "drawn at the end of them",
         text=text,
     )]
     if not has_theta:
@@ -1513,9 +1528,9 @@ def _fastfurious_signal_items(result: dict) -> "tuple[list[dict], str]":
         "forecasts"
     )
     items += [
-        _series(FASTFURIOUS_SIGNAL_KEY, "Buy threshold", stamps, edge, color,
+        _series(FASTFURIOUS_SIGNAL_KEY, "Buy threshold", due, edge, color,
                 unit="bps/min", dash="dash", width=1.0, note=where),
-        _series(FASTFURIOUS_SIGNAL_KEY, "Sell threshold", stamps, [-v for v in edge],
+        _series(FASTFURIOUS_SIGNAL_KEY, "Sell threshold", due, [-v for v in edge],
                 sell_color, unit="bps/min", dash="dash", width=1.0, note=where),
     ]
     sign = np.where(fc["y_hat"] >= theta, 1, np.where(fc["y_hat"] <= -theta, -1, 0))
