@@ -1228,3 +1228,69 @@ class TestTimeWindow:
                  "c": 101.0, "v": 1000}]
         _, volume = self.profile(build_chart(bars, [], [], "AAPL", SESSION_START))
         assert volume == pytest.approx(np.full(50, 20.0))
+
+    def shadow(self, fig):
+        """The session shadow's slices: (low edge, high edge, length) each."""
+        shapes = [s for s in fig.layout.shapes if s.name == "Session profile"]
+        if not shapes:
+            return None
+        (shape,) = shapes
+        points = [tuple(map(float, p.lstrip("ML").split(",")))
+                  for p in shape.path.rstrip(" Z").split()]
+        # M0,first  then  L(len,lo) L(len,hi) per slice  then  L0,last.
+        steps = points[1:-1]
+        return [(lo[1], hi[1], lo[0]) for lo, hi in zip(steps[::2], steps[1::2])]
+
+    def test_a_window_has_the_session_profile_as_a_black_shadow(self):
+        bars = self.bars()
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, window_minutes=60)
+        (shape,) = [s for s in fig.layout.shapes if s.name == "Session profile"]
+        assert shape.fillcolor == charts.SESSION_PROFILE_SHADOW == "rgba(0, 0, 0, 0.7)"
+        # On the profile's axes, under its bars.
+        assert (shape.xref, shape.yref, shape.layer) == ("x2", "y2", "between")
+
+    def test_the_shadow_covers_the_whole_session(self):
+        bars = self.bars()
+        slices = self.shadow(build_chart(bars, [], [], "AAPL", SESSION_START,
+                                         window_minutes=60))
+        assert slices[0][0] <= min(b["l"] for b in bars)
+        assert slices[-1][1] >= max(b["h"] for b in bars)
+        # Its longest slice is the morning's 9M-share bars, off the window's
+        # price axis; the quiet afternoon is a sliver beside it.
+        longest = max(slices, key=lambda s: s[2])
+        assert 109.8 <= longest[0] < 120.0
+        quiet = [length for lo, hi, length in slices if hi <= 101.2]
+        assert max(quiet) < 0.05 * longest[2]
+
+    def test_the_shadow_is_as_long_as_the_windows_profile(self):
+        # Scaled to it, or the window's own bars would be a sliver.
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START, window_minutes=60)
+        bars = [t for t in fig.data if t.type == "bar" and t.orientation == "h"]
+        tallest = np.sum([np.asarray(t.x, float) for t in bars], axis=0).max()
+        assert max(s[2] for s in self.shadow(fig)) == pytest.approx(tallest, rel=1e-5)
+
+    def test_the_shadows_slices_line_up_with_the_windows_bins(self):
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START, window_minutes=60)
+        window = np.asarray(next(t for t in fig.data if t.orientation == "h").y, float)
+        width = window[1] - window[0]
+        slices = self.shadow(fig)
+        assert all(hi - lo == pytest.approx(width) for lo, hi, _ in slices)
+        lows = np.array([lo for lo, _, _ in slices])
+        for center in window:
+            assert np.isclose(lows, center - width / 2).any()
+
+    def test_a_still_window_caps_the_shadows_slices(self):
+        # A window a cent wide under a day 20 dollars wide: at its slice width
+        # the shadow would be 100,000 slices.
+        bars = self.bars()
+        for b in bars[-60:]:
+            b.update(o=100.0, c=100.0, l=100.0, h=100.01)
+        slices = self.shadow(build_chart(bars, [], [], "AAPL", SESSION_START,
+                                         window_minutes=60))
+        assert len(slices) <= charts._MAX_SHADOW_BINS + 1
+
+    def test_the_whole_session_view_has_no_shadow(self):
+        # Its profile is the session's already.
+        assert self.shadow(build_chart(self.bars(), [], [], "AAPL", SESSION_START)) is None
+        assert self.shadow(build_chart(self.bars(minutes=40), [], [], "AAPL", SESSION_START,
+                                       window_minutes=120)) is None

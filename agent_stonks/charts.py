@@ -230,6 +230,7 @@ def _plot_price_distribution(
     predicted_profile: Optional[dict] = None,
     mixture_fit_target: str = "live",
     period_name: str = "session",
+    session_bars: Optional[pd.DataFrame] = None,
 ) -> tuple[go.Figure, list[tuple[str, list[tuple[float, float, float]]]]]:
     """
     Add a horizontal volume-at-price histogram to col 2, built from the
@@ -239,7 +240,8 @@ def _plot_price_distribution(
     the stream's since the last start, so it has a hole and two volume scales.
     Colors run violet→red from the oldest bars to the newest; `period_name` is
     what the hover calls the span they cover ("session", or "view" for a
-    window).
+    window). `session_bars`, when `df_bars` is a window of them, is drawn
+    behind it as a black shadow (`_add_session_shadow`).
 
     `predicted_profile` ({"prices", "density", ...} from
     profile_model.predicted_open_profile) is drawn as a curve over the
@@ -308,6 +310,8 @@ def _plot_price_distribution(
             )
 
         total_per_bin = per_bucket.sum(axis=0)
+        if session_bars is not None:
+            _add_session_shadow(fig, session_bars, bin_edges, float(total_per_bin.max()))
 
     pred_prices = pred_weights = None
     pred_step = 0.0
@@ -460,6 +464,66 @@ def _plot_price_distribution(
         height=700,
     )
     return fig, fitted
+
+
+# The whole session's price profile behind a window's: near-black like the
+# usual-minute-move band, so it reads as a shadow behind the window's bars.
+SESSION_PROFILE_SHADOW = "rgba(0, 0, 0, 0.7)"
+# The most slices the shadow is cut into: at the window's slice width, a
+# quiet hour's slices over a whole day's range could run to thousands.
+_MAX_SHADOW_BINS = 1000
+
+
+def _add_session_shadow(
+    fig: go.Figure, df_bars: pd.DataFrame, window_edges: np.ndarray, peak: float,
+) -> None:
+    """The whole session's volume at price (`df_bars`: l, h, v) as a black
+    silhouette behind a window's price profile in col 2 (2026-10-15).
+
+    Its slices line up with the window's (`window_edges`, extended over the
+    session's range), and it is scaled so that its tallest slice is as long as
+    the window's tallest bin (`peak`): on one volume scale the window, an hour
+    of a day, would be a sliver against it. So it shows where the day's
+    volume sits, not how much of it -- the session's busiest price may well be
+    off the window's price axis, leaving little shadow on it.
+
+    A path shape under the traces rather than a trace: the profile's bars
+    stack (`barmode="stack"`), and a filled line would be drawn over them.
+    """
+    df = df_bars.dropna(subset=["l", "h"])
+    if df.empty or "v" not in df or not peak > 0:
+        return
+    volumes = pd.to_numeric(df["v"], errors="coerce").fillna(0.0).to_numpy(float)
+    lo, hi = float(df["l"].min()), float(df["h"].max())
+    origin = float(window_edges[0])
+    width = max(float(window_edges[1] - window_edges[0]), (hi - lo) / _MAX_SHADOW_BINS)
+    if not width > 0:
+        return
+    # A hair of slack, so a price on an edge doesn't add an empty slice.
+    first = np.floor((lo - origin) / width + 1e-9)
+    last = max(np.ceil((hi - origin) / width - 1e-9), first + 1)
+    edges = origin + width * np.arange(first, last + 1)
+    volume = spread_volume(df["l"].to_numpy(float), df["h"].to_numpy(float),
+                           volumes, edges).sum(axis=0)
+    if not volume.max() > 0:
+        return
+    length = volume * (peak / volume.max())
+    # A step outline: out to each slice's length along its low and high edge.
+    steps = " ".join(
+        f"L{x:.6g},{y_lo:.10g} L{x:.6g},{y_hi:.10g}"
+        for x, y_lo, y_hi in zip(length, edges[:-1], edges[1:])
+    )
+    fig.add_shape(
+        type="path",
+        path=f"M0,{edges[0]:.10g} {steps} L0,{edges[-1]:.10g} Z",
+        fillcolor=SESSION_PROFILE_SHADOW,
+        line_width=0,
+        # Over the grid, under the window's bars.
+        layer="between",
+        name="Session profile",
+        row=1,
+        col=2,
+    )
 
 
 def _add_moving_averages(df: pd.DataFrame, fig: go.Figure, periods: list[int]) -> None:
@@ -2131,7 +2195,8 @@ def build_chart(
     (the live tab's "Last hour" / "Last 2 hours"): the time axis starts there
     and every panel's value axis is fitted to what is drawn inside it
     (`_fit_y_to_window`). The price profile is the window's bars only, the
-    volume at each price of the candles in view. Everything else is still
+    volume at each price of the candles in view, with the whole session's
+    profile as a black shadow behind it. Everything else is still
     computed from the whole session -- VWAP, the moving averages, momentum --
     so only the view changes. None, or a window reaching back past
     `session_start`, is the whole session.
@@ -2211,7 +2276,8 @@ def build_chart(
 
     # The price profile is the volume of the candles drawn: with a window,
     # the bars inside it -- the morning's volume would otherwise outweigh them
-    # at prices the window's price axis no longer even shows.
+    # at prices the window's price axis no longer even shows. The whole
+    # session's stays behind it as a black shadow.
     profile_bars = df[df["t"] >= view_start] if windowed else df
     if not profile_bars.empty or predicted_profile is not None:
         fig, mixture_fits = _plot_price_distribution(
@@ -2221,6 +2287,7 @@ def build_chart(
             predicted_profile=predicted_profile,
             mixture_fit_target=mixture_fit_target,
             period_name="view" if windowed else "session",
+            session_bars=df if windowed else None,
         )
     else:
         mixture_fits = []
