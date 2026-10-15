@@ -129,6 +129,7 @@ from . import bar_history, gamma_history, minute_momentum, newsimpact_model, pri
 from .trade_sound import next_trade_cue, play_trade_sound
 from .page_watchdog import WATCHDOG_BEAT_SEC, describe_reload, page_watchdog
 from .quote_card import quote_card
+from .agent_log_view import agent_log_view
 from .trading_mode import (
     ENV_KEYS as TRADING_ENV_KEYS,
     MODE_LABELS,
@@ -2152,6 +2153,8 @@ def _long_text_html(text: str) -> str:
 
 
 def _agent_log_html(log: list[dict]) -> str:
+    """The log's cards, newest first. `agent_log_view` puts them in their
+    scroll box."""
     if not log:
         return f"<p style='color:{PALETTE['muted']};padding:12px'>No agent activity yet.</p>"
     cards = []
@@ -2177,10 +2180,7 @@ def _agent_log_html(log: list[dict]) -> str:
           {_agent_entry_body(entry)}
         </div>"""
         )
-    return (
-        "<div style='font-family:Inter,sans-serif; max-height:420px; overflow-y:auto;'>"
-        f"{''.join(cards)}</div>"
-    )
+    return "".join(cards)
 
 
 def _current_tactics_html(state: AppState) -> str:
@@ -2410,24 +2410,28 @@ def _cash_label(state: AppState) -> str:
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
 def _agent_log_panel() -> None:
     state = _get_state()
-    tracker = state.decision_tracker
-    if tracker:
-        snap = tracker.snapshot()
-        positions = {s: q for s, q in snap["positions"].items() if q}
-        c1, c2, c3 = st.columns(3)
-        c1.metric(_cash_label(state), f"${snap['cash']:,.2f}")
-        c2.metric(
-            "Positions",
-            " · ".join(f"{s} {q:.2f} sh" for s, q in positions.items()) if positions else "flat",
-        )
-        c3.metric("Decisions", len(snap["decisions"]))
-    tactics_html = _current_tactics_html(state)
-    if tactics_html:
-        st.html(tactics_html)
-    _orchestra_board(state)
+    # Whatever of this shows up this run, it is one element: the log below
+    # keeps its place in the fragment, and an element whose place changes is
+    # mounted afresh -- which would throw away the reader's scroll.
+    with st.container():
+        tracker = state.decision_tracker
+        if tracker:
+            snap = tracker.snapshot()
+            positions = {s: q for s, q in snap["positions"].items() if q}
+            c1, c2, c3 = st.columns(3)
+            c1.metric(_cash_label(state), f"${snap['cash']:,.2f}")
+            c2.metric(
+                "Positions",
+                " · ".join(f"{s} {q:.2f} sh" for s, q in positions.items()) if positions else "flat",
+            )
+            c3.metric("Decisions", len(snap["decisions"]))
+        tactics_html = _current_tactics_html(state)
+        if tactics_html:
+            st.html(tactics_html)
+        _orchestra_board(state)
     with state.lock:
         log = list(state.agent_log)
-    st.html(_agent_log_html(log[-50:]))
+    agent_log_view(_agent_log_html(log[-50:]), key="agent_log")
 
 
 def _orchestra_board(state: AppState) -> None:
