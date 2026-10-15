@@ -80,6 +80,10 @@ class TestDecisionMarkers:
         assert markers[0]["action"] == "buy"
         assert markers[0]["value"] == 898.85 + 1.0 * 100.0
 
+    def test_carries_what_the_hover_shows(self):
+        (marker,) = decision_markers([_decision("2024-01-15T14:00:30Z", "buy", 100.0, 898.85, 1.0)], SESSION_START)
+        assert (marker["price"], marker["filled_quantity"], marker["reasoning"]) == (100.0, 1, "x")
+
     def test_filters_out_decisions_before_session_start(self):
         decisions = [_decision("2024-01-15T10:00:00Z", "buy", 100.0, 898.85, 1.0)]
         assert decision_markers(decisions, SESSION_START) == []

@@ -43,6 +43,7 @@ from .rest import fetch_bars_window, fetch_corporate_actions, fetch_news_window
 from .state import (
     ALERTABLE_FIELDS,
     PRICE_AXIS_ALERT_FIELDS,
+    agent_log_tagged,
     alert_triggered,
     append_agent_log,
     format_alert,
@@ -1557,8 +1558,9 @@ def launch_agent(
     state.agent_running = True
     scoring.begin_session(state, personality, symbols)
     start_tactics_executor(state, tracker)
+    # Every line the run writes names its agent, so the log can say who decided.
     threading.Thread(
-        target=clock.inherit(_agent_loop),
+        target=clock.inherit(agent_log_tagged(_agent_loop, agent=personality)),
         args=(state, tracker, symbols, provider, api_key, model, stop_event, personality),
         daemon=True,
     ).start()

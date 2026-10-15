@@ -25,6 +25,20 @@ def _key(ts: str) -> str:
     return bar_history.bar_key(ts)
 
 
+def _minutes(start: str, end: str) -> "list[datetime]":
+    """Every minute in [start, end)."""
+    t, stop = bar_history.clock.parse_iso_strict(start), bar_history.clock.parse_iso_strict(end)
+    out = []
+    while t < stop:
+        out.append(t)
+        t += timedelta(minutes=1)
+    return out
+
+
+def _iso(t: datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class TestFetchLiveBars:
     def _patch(self, monkeypatch, base, yf, recent, calls=None, base_feed="sip_delayed"):
         calls = calls if calls is not None else {}
@@ -33,8 +47,9 @@ class TestFetchLiveBars:
             return base, bar_history.SOURCE_LABELS[base_feed], []
 
         def _yf(symbol, interval, start, end):
-            calls["yf_end"] = end
-            return yf
+            calls["yf_start"], calls["yf_end"] = start, end
+            calls["yf_calls"] = calls.get("yf_calls", 0) + 1
+            return [b for b in yf if start <= bar_history.clock.parse_iso_strict(b["t"]) < end]
 
         def _recent(symbol, timeframe, start, end, key, secret, feed):
             calls["recent"] = (start, end, feed)
@@ -70,8 +85,6 @@ class TestFetchLiveBars:
         assert by_t[_key(regular_sip["t"])]["src"] == "sip"
         assert by_t[_key(young_iex["t"])]["src"] == "iex"
         assert "src" not in young_iex  # the fetchers' own (cached) bars are untouched
-        # With SIP in hand yfinance is not asked.
-        assert "yf_end" not in calls
         # The young window stops short of the minute in progress, on IEX.
         start, end, feed = calls["recent"]
         assert end == datetime(2026, 9, 25, 18, 0, tzinfo=timezone.utc)
@@ -96,7 +109,69 @@ class TestFetchLiveBars:
         assert by_t[_key(premarket_iex["t"])]["v"] == 20     # yfinance's 0 never used
         assert live.provisional == {_key(premarket_iex["t"])}
         assert live.settled == {_key(regular_iex["t"])}
-        assert calls["yf_end"] == datetime(2026, 9, 25, 17, 45, 30, tzinfo=timezone.utc)
+        # One download up to the bar in progress serves both yfinance jobs.
+        assert calls["yf_end"] == datetime(2026, 9, 25, 18, 0, tzinfo=timezone.utc)
+        assert calls["yf_calls"] == 1
+
+    def test_minutes_alpaca_lost_come_from_yfinance(self, monkeypatch):
+        # 2026-10-15: no SIP or IEX bar at all from 12:57 to 14:10 ET. Here SIP
+        # lacks 12:57-13:10 ET and IEX 13:50-13:52 ET, at 14:00:30 ET.
+        sip = [
+            _bar(_iso(t), v=50000)
+            for t in _minutes("2026-09-25T16:00:00Z", "2026-09-25T17:46:00Z")
+            if not "2026-09-25T16:57:00Z" <= _iso(t) <= "2026-09-25T17:10:00Z"
+        ]
+        iex = [
+            _bar(_iso(t), v=1500)
+            for t in _minutes("2026-09-25T17:46:00Z", "2026-09-25T18:00:00Z")
+            if not "2026-09-25T17:50:00Z" <= _iso(t) <= "2026-09-25T17:52:00Z"
+        ]
+        yf = [_bar(_iso(t), v=7) for t in _minutes("2026-09-25T13:30:00Z", "2026-09-25T18:00:00Z")]
+        calls = self._patch(monkeypatch, base=sip, yf=yf, recent=iex)
+
+        live = bar_history.fetch_live_bars("AAPL", "1Min", "k", "s", "sip_delayed", now=NOW)
+
+        by_t = {_key(b["t"]): b for b in live.bars}
+        lost = {_key(_iso(t)) for t in _minutes("2026-09-25T16:57:00Z", "2026-09-25T17:11:00Z")}
+        young_lost = {_key(_iso(t)) for t in _minutes("2026-09-25T17:50:00Z", "2026-09-25T17:53:00Z")}
+        assert {k for k, b in by_t.items() if b["src"] == "yfinance"} == lost | young_lost
+        assert all(by_t[k]["v"] == 7 for k in lost | young_lost)
+        # Every other minute keeps its Alpaca bar.
+        assert by_t[_key("2026-09-25T16:56:00Z")]["src"] == "sip"
+        assert by_t[_key("2026-09-25T17:49:00Z")]["src"] == "iex"
+        # Old enough: settled, so it replaces a streamed candle. The young
+        # ones are provisional, so the SIP bar replaces them once it settles.
+        assert lost <= live.settled
+        assert young_lost <= live.provisional
+        assert not young_lost & live.settled
+        # Downloaded from the first hole, up to the bar in progress.
+        assert calls["yf_start"] == datetime(2026, 9, 25, 16, 57, tzinfo=timezone.utc)
+        assert calls["yf_end"] == datetime(2026, 9, 25, 18, 0, tzinfo=timezone.utc)
+        assert "where Alpaca had no bar" in live.source
+
+    def test_complete_alpaca_bars_never_ask_yfinance(self, monkeypatch):
+        iex = [_bar(_iso(t)) for t in _minutes("2026-09-25T17:46:00Z", "2026-09-25T18:00:00Z")]
+        # Pre-market minutes without a trade are not holes.
+        premarket = [_bar("2026-09-25T12:00:00Z"), _bar("2026-09-25T12:07:00Z")]
+        session = [_bar(_iso(t)) for t in _minutes("2026-09-25T13:30:00Z", "2026-09-25T17:46:00Z")]
+        calls = self._patch(monkeypatch, base=premarket + session, yf=[], recent=iex)
+        bar_history.fetch_live_bars("AAPL", "1Min", "k", "s", "sip_delayed", now=NOW)
+        assert "yf_calls" not in calls
+
+        # Nor is the morning before the oldest bar `limit` let through.
+        calls = self._patch(monkeypatch, base=session[90:], yf=[], recent=iex)
+        bar_history.fetch_live_bars("AAPL", "1Min", "k", "s", "sip_delayed", now=NOW)
+        assert "yf_calls" not in calls
+
+    def test_hour_bars_are_never_filled_from_yfinance(self, monkeypatch):
+        # yfinance's hours start at :30, Alpaca's on the hour.
+        calls = self._patch(
+            monkeypatch, base=[_bar("2026-09-25T13:00:00Z")], yf=[], recent=[]
+        )
+
+        bar_history.fetch_live_bars("AAPL", "1Hour", "k", "s", "sip_delayed", now=NOW)
+
+        assert "yf_calls" not in calls
 
     def test_a_bar_still_in_progress_is_not_settled(self, monkeypatch):
         # 15Min at 14:00:30 ET: the 13:30 ET bar ended 13:45, before the

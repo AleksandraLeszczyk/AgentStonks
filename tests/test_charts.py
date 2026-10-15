@@ -213,6 +213,24 @@ class TestBuildPerformanceChart:
         assert "Agent buy" in names
         assert "Agent sell" in names
 
+    def test_trade_markers_say_why_like_the_live_chart(self):
+        points = [{"ts": "2024-01-15T14:00:00Z", "price": 100.0, "cash": 900.0, "position": 1.0, "value": 1000.0}]
+        markers = [
+            {"ts": "2024-01-15T14:00:00Z", "action": "buy", "symbol": "AAPL", "value": 1000.0,
+             "price": 100.25, "filled_quantity": 3.0, "reasoning": "Momentum <positive> at the buy level."},
+            {"ts": "2024-01-15T14:00:30Z", "action": "sell", "symbol": "AAPL", "value": 1005.0,
+             "price": 101.0, "filled_quantity": 3.0, "reasoning": None},
+        ]
+        fig = build_performance_chart(points, markers, "AAPL")
+        (buy,) = [t for t in fig.data if t.name == "Agent buy"]
+        assert "<b>Why</b>" in buy.hovertemplate and "Agent buy %{customdata[3]}" in buy.hovertemplate
+        qty, why, price, symbol = buy.customdata[0]
+        assert (qty, price, symbol) == ("3.00", "100.2500", "AAPL")
+        assert why == "Momentum &lt;positive&gt; at the buy level."
+        # No reasoning, no empty "Why" heading.
+        (sell,) = [t for t in fig.data if t.name == "Agent sell"]
+        assert "Why" not in sell.hovertemplate
+
 
 class TestFillIntradayGaps:
     GAPPY_BARS = [
@@ -474,7 +492,35 @@ class TestMomentumPanel:
     def test_no_net_gamma_panel_by_default(self):
         fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
         assert "Net gamma" not in [tr.name for tr in fig.data]
-        assert fig.layout.height == 760
+        assert fig.layout.height == 395 + 3 * charts.PANEL_PX
+
+    def test_momentum_change_can_be_left_out(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          show_momentum_change=False, agent_momentum_bars=5)
+        names = [tr.name for tr in fig.data]
+        assert self.trace(fig, "Momentum").yaxis == "y5"
+        assert "Momentum change" not in names
+        assert names.count("Agent momentum") == 1 and "Agent momentum change" not in names
+        assert "yaxis7" not in fig.layout
+        # A panel shorter; the candles keep their height.
+        assert fig.layout.height == 395 + 2 * charts.PANEL_PX
+        # Net gamma moves up under momentum.
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          show_momentum_change=False, net_gamma=self.gamma(bars))
+        assert self.trace(fig, "Net gamma").yaxis == "y7"
+
+    def test_momentum_change_can_be_drawn_alone(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          show_momentum_change=True, agent_momentum_bars=5)
+        names = [tr.name for tr in fig.data]
+        # In row 3, where momentum would have been.
+        assert self.trace(fig, "Momentum change").yaxis == "y5"
+        assert "Momentum" not in names and "Agent momentum" not in names
+        assert names.count("Agent momentum change") == 1
+        assert fig.layout.yaxis5.title.text == "Momentum Δ"
+        assert fig.layout.height == 395 + 2 * charts.PANEL_PX
 
     def test_price_profile_keeps_its_axis_ids(self):
         # add_model_overlays addresses the profile column as x2/y2, so the

@@ -156,6 +156,10 @@ def decision_markers(
                 "symbol": d.get("symbol"),
                 "value": value,
                 "label": " · ".join(d.get("tactics") or []) if is_tactics else None,
+                # For the marker's hover, as on the live chart's.
+                "price": d.get("price"),
+                "filled_quantity": d.get("filled_quantity"),
+                "reasoning": d.get("reasoning"),
             }
         )
     return markers

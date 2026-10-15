@@ -35,7 +35,7 @@ The sidebar's ▶ Start downloads the day (and the week before it, for the
 history and the momentum band) into SimLab's store, seeds the bar buffer with
 everything completed at the start time (09:29 ET by default), prepares the
 pre-market briefing -- from the replay's own cache when it has one -- and
-waits there. The Agent tab's ▶ Start Agent sets the clock running. From then
+waits there. The sidebar's ▶ Start Agent sets the clock running. From then
 on a feed thread does what the Finnhub socket does live: the minute in progress
 is a forming candle that walks from the stored bar's open through its extremes
 to its close (the order inside a minute is not stored, so it is made up --
@@ -471,7 +471,7 @@ class ReplaySession:
         elif self.clock.running:
             self.app.status = f"{head} · playing (dummy data)"
         else:
-            self.app.status = f"{head} · ready — ▶ Start Agent in the Agent tab plays it"
+            self.app.status = f"{head} · ready — ▶ Start Agent plays it"
 
     def _feed_loop(self) -> None:
         clock.bind(self)

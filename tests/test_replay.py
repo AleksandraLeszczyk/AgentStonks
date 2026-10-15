@@ -458,3 +458,24 @@ def test_start_agent_plays_the_replay_on_its_own_broker(store, monkeypatch):
     assert session.clock.running
     assert session.app.trading_mode == "local"
     assert session.app.agent_start_time >= et(DAY, 9, 29)
+
+
+def test_what_the_start_found_goes_to_the_agent_log_not_a_banner(store, monkeypatch):
+    session = make_session()
+    replay._current = session
+    monkeypatch.setattr(ui.st, "session_state", {ui.DUMMY_DATA_KEY: True})
+    banners = []
+    for name in ("info", "success", "warning"):
+        monkeypatch.setattr(ui.st, name, lambda *a, **k: banners.append(a))
+    monkeypatch.setattr(ui.st, "error", lambda *a, **k: None)
+    monkeypatch.setattr(session_store, "archive", lambda *a, **k: None)
+    monkeypatch.setattr(ui, "launch_apple_trader", lambda *a, **k: None)
+    clock.bind(session)
+    assert ui._start_agent(
+        session.app, ["AAPL"], personality="apple_trader", provider="openai", model="",
+        apple_config=AppleTraderConfig(), trading_mode_choice="local",
+        starting_budget=10_000.0, continue_today=False,
+    )
+    assert banners == []
+    statuses = [e["text"] for e in session.app.agent_log if e["type"] == "status"]
+    assert any(t.startswith("Replay — dummy data") for t in statuses)

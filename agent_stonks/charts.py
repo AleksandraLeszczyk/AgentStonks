@@ -890,14 +890,42 @@ def _hover_paragraph(text: str) -> str:
     return "<br>".join(lines)
 
 
+def _trade_hover_text(sub: pd.DataFrame) -> "tuple[list[str], list[str], str]":
+    """A trade marker's hover pieces, per row of `sub`: the quantity labels,
+    the wrapped reasoning, and the "Why" block for a template whose
+    `customdata[1]` is that reasoning -- empty when no row carries any, since
+    an empty "Why" heading on every marker is worse than none (hand-built
+    marker dicts and older logs have no reasoning).
+
+    The quantity is pre-formatted rather than formatted in the template:
+    customdata carrying a text column arrives as one array of strings, and a
+    numeric format spec applied to that renders literally.
+    """
+    quantities = sub.get("filled_quantity", sub.get("quantity"))
+    qty_labels = (
+        [f"{float(q):,.2f}" if pd.notna(q) else "\u2014" for q in quantities]
+        if quantities is not None
+        else ["\u2014"] * len(sub)
+    )
+    reasons = (
+        [_hover_paragraph(r if isinstance(r, str) else "") for r in sub["reasoning"]]
+        if "reasoning" in sub.columns
+        else [""] * len(sub)
+    )
+    why = "<br><br><b>Why</b><br>%{customdata[1]}" if any(reasons) else ""
+    return qty_labels, reasons, why
+
+
+def _trade_hoverlabel(color: str) -> dict:
+    return dict(align="left", bgcolor=PALETTE["panel"], bordercolor=color, font=dict(size=11))
+
+
 def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: datetime) -> None:
     """Plot filled agent buy/sell decisions as markers on the price chart.
 
     Each marker carries the reasoning recorded with the decision, so hovering a
     trade answers *why* it happened without leaving the chart for the decision
-    log. The quantity is pre-formatted into customdata rather than formatted in
-    the template: customdata carrying a text column arrives as one array of
-    strings, and a numeric format spec applied to that renders literally.
+    log (`_trade_hover_text`).
     """
     if not decisions:
         return
@@ -917,21 +945,7 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
         sub = df[df["action"] == action]
         if sub.empty:
             continue
-        quantities = sub.get("filled_quantity", sub.get("quantity"))
-        qty_labels = (
-            [f"{float(q):,.2f}" if pd.notna(q) else "\u2014" for q in quantities]
-            if quantities is not None
-            else ["\u2014"] * len(sub)
-        )
-        reasons = (
-            [_hover_paragraph(r) for r in sub["reasoning"]]
-            if "reasoning" in sub.columns
-            else [""] * len(sub)
-        )
-        # An empty "Why" heading on every marker is worse than no heading, so
-        # the block joins the template only when the decisions actually carry
-        # their reasoning (hand-built marker dicts and older logs do not).
-        why = "<br><br><b>Why</b><br>%{customdata[1]}" if any(reasons) else ""
+        qty_labels, reasons, why = _trade_hover_text(sub)
         fig.add_trace(
             go.Scatter(
                 x=sub["ts"],
@@ -940,12 +954,7 @@ def _add_decision_markers(decisions: list[dict], fig: go.Figure, session_start: 
                 marker=dict(symbol=marker_symbol, size=14, color=color, line=dict(width=1.5, color="#ffffff")),
                 name=f"Agent {action}",
                 customdata=list(zip(qty_labels, reasons)),
-                hoverlabel=dict(
-                    align="left",
-                    bgcolor=PALETTE["panel"],
-                    bordercolor=color,
-                    font=dict(size=11),
-                ),
+                hoverlabel=_trade_hoverlabel(color),
                 hovertemplate=(
                     f"<b>Agent {action}</b><br>Price: %{{y:.4f}}<br>Qty: %{{customdata[0]}}"
                     f"{why}<extra></extra>"
@@ -1138,14 +1147,15 @@ def _add_volume_baseline(
 def _add_momentum_panels(
     df: pd.DataFrame,
     fig: go.Figure,
-    momentum_row: int,
-    change_row: int,
+    momentum_row: "int | None",
+    change_row: "int | None",
     minute_profile: "dict[int, float] | None" = None,
     change_profile: "dict[int, float] | None" = None,
     agent_bars: "int | None" = None,
     agent_label: str = "",
 ) -> None:
-    """Bar-by-bar momentum and its change, in two rows under the volume.
+    """Bar-by-bar momentum and its change, in two rows under the volume --
+    or either alone, the other's row None.
 
     Both are measured over *one bar of the chart*, so they follow its
     resolution: on 1-minute bars a value per minute, on 5-minute bars one per
@@ -1198,25 +1208,27 @@ def _add_momentum_panels(
     else:
         close = mom = change = pct = pd.Series(dtype=float)
 
-    _add_bar_by_bar_panel(
-        df, fig, momentum_row, mom, pct,
-        name="Momentum",
-        hover="Momentum %{y:+$.2f} (%{customdata:+.2f}%)<extra></extra>",
-        warm_up="Momentum starts at the second regular-session bar",
-    )
-    if mom.notna().any():
-        _add_minute_momentum_profile(df, fig, momentum_row, minute_profile)
-    _add_bar_by_bar_panel(
-        df, fig, change_row, change, None,
-        name="Momentum change",
-        hover="Momentum change %{y:+$.2f}<extra></extra>",
-        warm_up="Momentum change starts at the third regular-session bar",
-    )
-    if change.notna().any():
-        _add_minute_momentum_profile(
-            df, fig, change_row, change_profile,
-            name="Mean minute move change", what="|1-min momentum \u0394|",
+    if momentum_row is not None:
+        _add_bar_by_bar_panel(
+            df, fig, momentum_row, mom, pct,
+            name="Momentum",
+            hover="Momentum %{y:+$.2f} (%{customdata:+.2f}%)<extra></extra>",
+            warm_up="Momentum starts at the second regular-session bar",
         )
+        if mom.notna().any():
+            _add_minute_momentum_profile(df, fig, momentum_row, minute_profile)
+    if change_row is not None:
+        _add_bar_by_bar_panel(
+            df, fig, change_row, change, None,
+            name="Momentum change",
+            hover="Momentum change %{y:+$.2f}<extra></extra>",
+            warm_up="Momentum change starts at the third regular-session bar",
+        )
+        if change.notna().any():
+            _add_minute_momentum_profile(
+                df, fig, change_row, change_profile,
+                name="Mean minute move change", what="|1-min momentum \u0394|",
+            )
 
     n = int(agent_bars or 0)
     if n > 1 and len(frame):
@@ -1228,14 +1240,15 @@ def _add_momentum_panels(
             (momentum_row, mom_n, "momentum", mom),
             (change_row, change_n, "momentum change", change),
         ):
-            # Only over a panel that has its bars: a warming-up panel carries
-            # its note, and a line under it would contradict it.
-            if drawn.notna().any() and series.notna().any():
+            # Only over a panel that is drawn and has its bars: a warming-up
+            # panel carries its note, and a line under it would contradict it.
+            if row is not None and drawn.notna().any() and series.notna().any():
                 _add_agent_momentum_line(fig, row, series, label, what)
 
 
-# One panel under the price in the chart with the net gamma row, in pixels.
-GAMMA_PANEL_PX = 122.0
+# One panel under the price (volume, momentum, momentum Δ, net gamma), in
+# pixels.
+PANEL_PX = 122.0
 
 
 def _add_net_gamma_panel(df: pd.DataFrame, fig: go.Figure, row: int, net_gamma: dict) -> None:
@@ -2177,6 +2190,7 @@ def build_chart(
     model_overlays: Optional[list[dict]] = None,
     candle_patterns: Optional[list[dict]] = None,
     show_momentum: bool = False,
+    show_momentum_change: Optional[bool] = None,
     minute_momentum_profile: Optional[dict] = None,
     minute_momentum_change_profile: Optional[dict] = None,
     agent_momentum_bars: Optional[int] = None,
@@ -2201,8 +2215,12 @@ def build_chart(
     so only the view changes. None, or a window reaching back past
     `session_start`, is the whole session.
 
-    `net_gamma` adds a panel at the bottom -- under the momentum Δ one when
-    that is shown -- with the options chain's net dealer gamma at each bar's
+    `show_momentum` and `show_momentum_change` draw the momentum and the
+    momentum Δ panel, each on its own; `show_momentum_change` left None follows
+    `show_momentum`, the two panels together.
+
+    `net_gamma` adds a panel at the bottom -- under the momentum panels when
+    they are shown -- with the options chain's net dealer gamma at each bar's
     close: `{"t": [...], "value": [...], "note": str}`, values in $ per 1%
     move (`options.net_gamma_exposure`). Empty values draw the panel with
     `note` in it; None draws no panel.
@@ -2246,21 +2264,23 @@ def build_chart(
     # on zero, and sharing the price axis would either flatten them or stretch
     # the candles. Appending the rows keeps the price-profile column at (1, 2)
     # -- and so at `x2`/`y2`, which `add_model_overlays` addresses by axis id.
+    if show_momentum_change is None:
+        show_momentum_change = show_momentum
     momentum_row = 3 if show_momentum else None
-    change_row = 4 if show_momentum else None
-    # Net gamma goes last, so it sits under momentum Δ when that is shown.
-    n_rows = 4 if show_momentum else 2
+    change_row = (4 if show_momentum else 3) if show_momentum_change else None
+    n_rows = max(2, momentum_row or 0, change_row or 0)
+    # Net gamma goes last, so it sits under the momentum panels when shown.
     gamma_row = None
     if net_gamma is not None:
         n_rows += 1
         gamma_row = n_rows
-    if gamma_row is None:
-        row_heights = [0.52, 0.16, 0.16, 0.16] if show_momentum else [0.75, 0.25]
-        height = 760 if show_momentum else 520
+    if n_rows == 2:
+        row_heights = [0.75, 0.25]
+        height = 520
     else:
-        # A row more without squeezing the candles: the chart grows by one
-        # panel's worth, and the price keeps the height it has without it.
-        pixels = [395.0] + [GAMMA_PANEL_PX] * (n_rows - 1)
+        # Each panel under the price its own height, so a row more or less
+        # grows or shrinks the chart by that and leaves the candles as tall.
+        pixels = [395.0] + [PANEL_PX] * (n_rows - 1)
         row_heights = [p / sum(pixels) for p in pixels]
         height = int(sum(pixels))
     fig = make_subplots(
@@ -2414,7 +2434,7 @@ def build_chart(
     )
     _add_volume_baseline(df, fig, volume_baseline, row=2)
 
-    if show_momentum:
+    if show_momentum or show_momentum_change:
         _add_momentum_panels(
             df, fig, momentum_row, change_row, minute_profile=minute_momentum_profile,
             change_profile=minute_momentum_change_profile,
@@ -2601,8 +2621,8 @@ def build_chart(
     # Both columns of the row, because the profile column's axis is matched to
     # the volume axis by `shared_yaxes` and matched axes must share a type.
     fig.update_yaxes(type="log", row=2)
-    if show_momentum:
-        for row, title in ((momentum_row, "Momentum"), (change_row, "Momentum Δ")):
+    for row, title in ((momentum_row, "Momentum"), (change_row, "Momentum Δ")):
+        if row is not None:
             fig.update_xaxes(showgrid=True, gridcolor=PALETTE["grid"], row=row, col=1)
             fig.update_yaxes(
                 showgrid=True,
@@ -2770,6 +2790,15 @@ def build_performance_chart(
             sub = df_m[df_m["action"] == action]
             if sub.empty:
                 continue
+            # The live chart's hover (`_add_decision_markers`) on the value
+            # curve: the fill's price and size, and why it was made. And the
+            # symbol, since this curve is the whole basket's.
+            qty_labels, reasons, why = _trade_hover_text(sub)
+            prices = [
+                f"{float(p):.4f}" if pd.notna(p) else "\u2014"
+                for p in sub.get("price", pd.Series([None] * len(sub)))
+            ]
+            symbols = [str(x) if isinstance(x, str) else "" for x in sub.get("symbol", [""] * len(sub))]
             fig.add_trace(
                 go.Scatter(
                     x=sub["ts"],
@@ -2777,7 +2806,13 @@ def build_performance_chart(
                     mode="markers",
                     marker=dict(symbol=marker_symbol, size=12, color=color, line=dict(width=1.5, color="#ffffff")),
                     name=f"Agent {action}",
-                    hovertemplate=f"<b>Agent {action}</b><br>Value: $%{{y:,.2f}}<extra></extra>",
+                    customdata=list(zip(qty_labels, reasons, prices, symbols)),
+                    hoverlabel=_trade_hoverlabel(color),
+                    hovertemplate=(
+                        f"<b>Agent {action} %{{customdata[3]}}</b><br>Value: $%{{y:,.2f}}"
+                        f"<br>Price: %{{customdata[2]}}<br>Qty: %{{customdata[0]}}"
+                        f"{why}<extra></extra>"
+                    ),
                 )
             )
         # Moments the agent armed a conditional trade plan (tactics), so the

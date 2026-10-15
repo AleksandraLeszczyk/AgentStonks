@@ -5,7 +5,7 @@ import os
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, fields, replace as dc_replace
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
@@ -430,6 +430,10 @@ def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
     return [mapping[s] for s in ma_selection if s in mapping]
 
 
+# The panels Chart Settings can draw under the volume, top to bottom.
+_CHART_PANELS = ("Momentum", "Momentum Δ", "Net gamma")
+
+
 def _parse_avg_flags(ma_selection: list[str]) -> tuple[bool, bool, bool]:
     return "7d Avg" in ma_selection, "28d Avg" in ma_selection, "1y Avg" in ma_selection
 
@@ -784,9 +788,6 @@ def _day_range_lines(symbol: str, daily_bars: list[dict], bars: list[dict]) -> "
 @st.fragment(run_every=POLL_SEC)
 def _price_ticker() -> None:
     state = _get_state()
-    st.caption(f"Status: {state.status}")
-    if state.news_status not in ("Idle", state.status):
-        st.caption(f"News: {state.news_status}")
     for sym_state in state.iter_symbol_states():
         with sym_state.lock:
             last_price = sym_state.last_price
@@ -930,6 +931,8 @@ def _chart_panel() -> None:
             model_overlays=overlays["items"],
             candle_patterns=_live_candle_patterns(state, bars),
             show_momentum=state.show_momentum,
+            # getattr: like window_minutes below.
+            show_momentum_change=getattr(state, "show_momentum_change", True),
             minute_momentum_profile=sym_state.minute_momentum_profile,
             minute_momentum_change_profile=sym_state.minute_momentum_change_profile,
             **_agent_momentum_kwargs(state, sym_state),
@@ -952,7 +955,7 @@ def _chart_panel() -> None:
             ):
                 st.caption(
                     f":material/info: {sym} — {model_overlays.label(key)}: the forecast line is "
-                    "drawn on the momentum panel, which is hidden (Chart Settings → Momentum)."
+                    "drawn on the momentum panel, which is hidden (Chart Settings → Panels → Momentum)."
                 )
     if not rendered:
         st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
@@ -1168,54 +1171,56 @@ def _live_chart_controls() -> None:
                     key="chart_volume_baseline",
                     label_visibility="collapsed",
                 )
-            show_momentum = st.checkbox(
-                "Momentum panel",
-                value=True,
-                key="chart_momentum",
-                help="Two panels under the volume, one bar per chart bar, so "
-                "they follow the timeframe (a bar a minute on 1Min, one per five "
-                "minutes on 5Min):\n\n"
+            with _help_row(
+                "Panels under the volume, one bar per chart bar, so they follow "
+                "the timeframe (a bar a minute on 1Min, one per five minutes on "
+                "5Min):\n\n"
                 "- **Momentum** — the close minus the previous close, in dollars. "
                 "On 1Min bars the dark band at ± is the mean + 1σ of the absolute "
                 "one-minute move at that time of day over the last five sessions "
-                "(±5 minutes pooled), measured once a day on ▶ Start.\n"
+                "(±5 minutes pooled), measured once a day on ▶ Start. With the "
+                "**Fast&Furious** model prediction selected, the yellow line is "
+                "its forecast of the next 30 minutes' average move, in bps per "
+                "minute on the right-hand axis, between its buy (green) and sell "
+                "(red) thresholds.\n"
                 "- **Momentum Δ** — this bar's momentum minus the previous bar's: "
                 "above zero the move is speeding up (or a fall is easing), below "
                 "zero it is slowing (or a fall is steepening). Its dark band is the "
-                "same mean + 1σ, of the absolute Δ.\n\n"
-                "The semitransparent blue lines are the same two measures averaged "
-                "per bar over the look-back the selected agent decides on — Apple "
-                "Trader's momentum confirmation period or an LLM agent's armed "
-                "momentum tactic — and over 5 "
-                "minutes when it reads no momentum.\n\n"
-                "With the **Fast&Furious** model prediction selected, the yellow line "
-                "is its forecast of the next 30 minutes' average move, in bps per "
-                "minute on the right-hand axis, between its buy (green) and sell "
-                "(red) thresholds.\n\n"
-                "Regular session only, and each day starts fresh.",
-            )
-            show_net_gamma = st.checkbox(
-                "Net gamma panel",
-                value=True,
-                key="chart_net_gamma",
-                help="A panel at the bottom, under Momentum Δ: the options "
-                "market's net dealer gamma, in $M per 1% move, at each bar's "
-                "close. Green where dealers are long gamma — their hedging sells "
-                "rallies and buys dips, damping moves — red where they are short "
-                "and their hedging amplifies them.\n\n"
-                "From the nearest expiry within 45 days (yfinance, refreshed every "
-                "minute — the same chain as the Net Gamma card; the Put/Call "
-                "Walls tab can sum several expiries). Each bar is priced once, "
-                "at its close, with the chain the app had then, and keeps that "
-                "value — across a reload "
-                "or a restart too. Only the bar still forming moves. Bars that "
-                "closed before the first chain arrived (a start mid-day) are "
-                "priced with that first chain: open interest only changes "
-                "overnight, so it is re-priced at their closes, holding its "
-                "implied volatility.\n\n"
-                "Options levels → Gamma flip draws the price where the colour "
-                "changes.",
-            )
+                "same mean + 1σ, of the absolute Δ.\n"
+                "- **Net gamma** — the options market's net dealer gamma, in $M "
+                "per 1% move, at each bar's close. Green where dealers are long "
+                "gamma — their hedging sells rallies and buys dips, damping moves "
+                "— red where they are short and their hedging amplifies them. "
+                "From the nearest expiry within 45 days (yfinance, refreshed "
+                "every minute — the same chain as the Net Gamma card; the "
+                "Put/Call Walls tab can sum several expiries). Each bar is priced "
+                "once, at its close, with the chain the app had then, and keeps "
+                "that value — across a reload or a restart too. Only the bar "
+                "still forming moves. Bars that closed before the first chain "
+                "arrived (a start mid-day) are priced with that first chain: open "
+                "interest only changes overnight, so it is re-priced at their "
+                "closes, holding its implied volatility. Options levels → Gamma "
+                "flip draws the price where the colour changes.\n\n"
+                "On both momentum panels the semitransparent blue line is the same "
+                "measure averaged per bar over the look-back the selected agent "
+                "decides on — Apple Trader's momentum confirmation period or an "
+                "LLM agent's armed momentum tactic — and over 5 minutes when it "
+                "reads no momentum. Momentum is regular session only, and each "
+                "day starts fresh. Each panel adds to the chart's height; the "
+                "candles keep theirs.",
+                icon_ratio=_HALF_WIDTH_ICON,
+            ):
+                panel_selection = st.multiselect(
+                    "Panels",
+                    list(_CHART_PANELS),
+                    default=list(_CHART_PANELS),
+                    key="chart_panels",
+                    placeholder="Panels",
+                    label_visibility="collapsed",
+                )
+            show_momentum = "Momentum" in panel_selection
+            show_momentum_change = "Momentum Δ" in panel_selection
+            show_net_gamma = "Net gamma" in panel_selection
 
         st.markdown("**Price Profile Fit**")
         with _help_row(
@@ -1297,6 +1302,7 @@ def _live_chart_controls() -> None:
     state.show_percentile_body = show_percentile_body
     state.show_whiskers = show_whiskers
     state.show_momentum = show_momentum
+    state.show_momentum_change = show_momentum_change
     state.show_net_gamma = show_net_gamma
     state.show_pre_market = show_pre_market
     state.chart_window_min = window_min
@@ -1924,17 +1930,29 @@ def _options_walls_panel(symbols: list[str]) -> None:
     last_setup.remember()
 
 
+def _agent_entry_author(entry: dict) -> str:
+    """"Momentum Trader: " for a line its agent's run wrote, "" otherwise -- a
+    line from before agents were stamped, a manual sell-all, or a personality
+    that no longer exists (no guessing a name for it)."""
+    key = entry.get("agent")
+    if key in _NON_LLM_AGENTS or key in AGENT_PERSONALITIES:
+        # The name alone: "Apple Trader", not the picker's "(rule-based, no LLM)".
+        return f"{_personality_label(key).split(' (')[0]}: "
+    return ""
+
+
 def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
     """Return (icon, accent_color, label) for an agent log entry."""
     etype = entry.get("type")
     symbol = entry.get("symbol")
     suffix = f" {symbol}" if symbol else ""
+    who = _agent_entry_author(entry)
     if etype == "decision":
         action = entry.get("action")
         if action == "buy":
-            return "🟢", PALETTE["up"], f"BUY{suffix}"
+            return "🟢", PALETTE["up"], f"{who}BUY{suffix}"
         if action == "sell":
-            return "🔴", PALETTE["down"], f"SELL{suffix}"
+            return "🔴", PALETTE["down"], f"{who}SELL{suffix}"
         if action == "alert":
             return "⏰", PALETTE["accent"], "ALERT"
         return "💤", PALETTE["muted"], "SLEEP"
@@ -1956,7 +1974,7 @@ def _agent_entry_style(entry: dict) -> tuple[str, str, str]:
     if etype == "tool_call":
         return "🛠️", PALETTE["accent"], str(entry.get("name", "tool"))
     if etype == "analysis":
-        return "🧠", PALETTE["text"], "analysis"
+        return "🧠", PALETTE["text"], f"{who}analysis"
     if etype == "cycle_start":
         return "🔄", PALETTE["accent"], "cycle start"
     if etype == "news_alert":
@@ -2083,9 +2101,54 @@ def _agent_entry_body(entry: dict) -> str:
             f"<div><b>{label}</b> relinquished control{quiet_str}</div>"
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
         )
-    if etype in ("analysis", "error", "status", "cycle_start", "news_alert"):
+    if etype == "status":
+        return _long_text_html(entry.get("text", ""))
+    if etype in ("analysis", "error", "cycle_start", "news_alert"):
         return f"<div>{html.escape(entry.get('text', ''))}</div>"
     return ""
+
+
+# A status line this long is laid out as a lead and bullets instead of one
+# paragraph: the rule agents' armed summary and the Strategist's assignment run
+# to a thousand characters each.
+_LONG_STATUS_CHARS = 400
+# A sentence ends at . ! or ? after a word, figure or bracket, before the next
+# one's capital or figure -- not inside "0.55" or "16:09:02".
+_SENTENCE_BREAK = re.compile(r"(?<=[a-z0-9%)\]][.!?])\s+(?=[A-Z0-9$▶(\[\"'])")
+_NOT_A_SENTENCE_END = re.compile(r"\b(?:vs|e\.g|i\.e|approx|cf)\.$", re.IGNORECASE)
+
+
+def _sentences(text: str) -> list[str]:
+    parts: list[str] = []
+    for piece in _SENTENCE_BREAK.split(text.strip()):
+        if parts and _NOT_A_SENTENCE_END.search(parts[-1]):
+            parts[-1] = f"{parts[-1]} {piece}"
+        else:
+            parts.append(piece)
+    return parts
+
+
+def _long_text_html(text: str) -> str:
+    """A short line as it is; a long one as its lead in bold -- what happened,
+    "Apple Trader armed on HighLow model (…)" -- over one bullet per sentence."""
+    if len(text) < _LONG_STATUS_CHARS:
+        return f"<div>{html.escape(text)}</div>"
+    sentences = _sentences(text)
+    lead, sep, rest = sentences[0].partition(": ")
+    if sep and rest and len(lead) <= 160:
+        sentences[0] = rest[:1].upper() + rest[1:]
+    else:
+        lead = ""
+    if not lead and len(sentences) < 2:
+        return f"<div>{html.escape(text)}</div>"
+    lead_html = f"<div style='font-weight:600'>{html.escape(lead)}</div>" if lead else ""
+    # Streamlit's own list style sets 16px type; the card's 12px is inherited
+    # only when asked for.
+    font = "font-size:inherit;line-height:inherit"
+    items = "".join(
+        f"<li style='margin:2px 0;{font}'>{html.escape(s)}</li>" for s in sentences
+    )
+    return f"{lead_html}<ul style='margin:4px 0 0;padding-left:18px;{font}'>{items}</ul>"
 
 
 def _agent_log_html(log: list[dict]) -> str:
@@ -2193,13 +2256,23 @@ def _trade_sound_fragment() -> None:
     play_trade_sound(cue, volume=state.trade_sound_volume)
 
 
-@st.fragment(run_every=AGENT_LOG_POLL_SEC)
-def _agent_status_line() -> None:
-    """The one-line run status: running or idle, the venue, the symbols, and
-    what the agent itself is doing. Polled, because the last of those changes
-    on the agent's thread -- the session opening, a buy, a stand-down -- and a
-    run that ends on its own (a stop-out) has to stop saying "running"."""
+@st.fragment(run_every=POLL_SEC)
+def _sidebar_status() -> None:
+    """The stream's, the news feed's and the agent's one-line status, under
+    the sidebar's Start/Stop -- on screen whichever tab is open. Polled,
+    because all three change on other threads: a socket dropping, a news poll,
+    the agent's session opening, a buy, a run that ends on its own (a
+    stop-out) and has to stop saying "running"."""
     state = _get_state()
+    st.caption(f"Stream: {state.status}")
+    if state.news_status not in ("Idle", state.status):
+        st.caption(f"News: {state.news_status}")
+    st.caption(f"Agent: {_agent_status_text(state)}")
+
+
+def _agent_status_text(state: AppState) -> str:
+    """Running or idle, the venue, the symbols, and what the agent itself is
+    doing."""
     status = "🟢 running" if state.agent_running else "⚪ idle"
     watching = (
         f" — watching {', '.join(state.symbols)}"
@@ -2214,10 +2287,12 @@ def _agent_status_line() -> None:
     if state.trading_mode_requested:
         venue = f" · {_venue_badge(state.trading_mode)}"
     else:
-        venue = " · no venue resolved yet — press ▶ Start"
+        # The sidebar's own ▶ Start is the stream's; the venue is resolved by
+        # the Agent tab's.
+        venue = " · no venue resolved yet — press ▶ Start Agent"
     activity = state.agent_activity if state.agent_running else None
     doing = f" · {activity[0]} {activity[1]}" if activity else ""
-    st.caption(f"Status: {status}{venue}{watching}{doing}")
+    return f"{status}{venue}{watching}{doing}"
 
 
 @st.fragment(run_every=AGENT_LOG_POLL_SEC)
@@ -2633,6 +2708,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     )["items"],
                     candle_patterns=_live_candle_patterns(state, bars),
                     show_momentum=state.show_momentum,
+                    show_momentum_change=getattr(state, "show_momentum_change", True),
                     minute_momentum_profile=sym_state.minute_momentum_profile,
                     minute_momentum_change_profile=sym_state.minute_momentum_change_profile,
                     **_agent_momentum_kwargs(state, sym_state),
@@ -3301,13 +3377,22 @@ def _add_sidebar_symbols(symbols: "list[str]") -> None:
     )
 
 
-def _execution_controls() -> str:
-    """Where this agent run's orders go. Returns the requested mode.
+def _trading_mode_choice() -> str:
+    """The venue the sidebar's Order execution asks for: "local" under Dummy
+    data, whatever it says (see `_execution_controls`)."""
+    if _replaying():
+        return "local"
+    return st.session_state.get("agent_trading_mode", DEFAULT_TRADING_MODE)
 
-    Rendered above the Start button rather than tucked in an expander: which
-    account an automated strategy is about to trade is the single most
-    consequential setting on this page, and it should not be possible to press
-    ▶ Start without having seen it.
+
+def _execution_controls() -> str:
+    """Where this agent run's orders go, in the sidebar. Returns the requested
+    mode.
+
+    In the sidebar rather than tucked in an expander or one tab: which account
+    an automated strategy is about to trade is the single most consequential
+    setting on this page, and it should be on screen whatever tab is open --
+    and not possible to press ▶ Start Agent without having seen it.
 
     A replay (Dummy data) has one venue whatever this says: `ReplayBroker`,
     filling at the replayed price. The picker is drawn disabled so its choice
@@ -3346,7 +3431,9 @@ def _execution_controls() -> str:
 
     # Whether this venue can actually be reached is knowable right here, from
     # the environment alone, and telling the user now beats letting them press
-    # ▶ Start and discover the run quietly degraded to simulation.
+    # ▶ Start and discover the run quietly degraded to simulation. A venue
+    # that works says nothing more: the option's name and its help already
+    # say where orders go.
     keyed = credentials_for(mode).configured if mode != "local" else True
 
     if mode == "alpaca_live":
@@ -3365,19 +3452,13 @@ def _execution_controls() -> str:
                 "that happened to be a live key, whether real money moved would come "
                 "down to which variable was already set."
             )
-    elif mode == "alpaca_paper":
-        if not keyed:
-            key_var, secret_var = TRADING_ENV_KEYS["alpaca_paper"]
-            st.error(
-                f"**No paper credentials.** Set `{key_var}` / `{secret_var}` (or "
-                f"`{PAPER_FALLBACK_ENV[0]}` / `{PAPER_FALLBACK_ENV[1]}`, if those are "
-                "your paper keys). Until then this run falls back to local simulation."
-            )
-        else:
-            st.caption(
-                "Orders go to your Alpaca **paper** account — no real money, but real "
-                "order routing, so rejections and partial fills are real too."
-            )
+    elif mode == "alpaca_paper" and not keyed:
+        key_var, secret_var = TRADING_ENV_KEYS["alpaca_paper"]
+        st.error(
+            f"**No paper credentials.** Set `{key_var}` / `{secret_var}` (or "
+            f"`{PAPER_FALLBACK_ENV[0]}` / `{PAPER_FALLBACK_ENV[1]}`, if those are "
+            "your paper keys). Until then this run falls back to local simulation."
+        )
     return mode
 
 
@@ -3483,9 +3564,13 @@ def _start_agent(
                     history_feed=history_feed,
                 )
     if stream_ready:
+        # What the start found out about this run goes to the agent log, not a
+        # banner: a banner is gone at the next rerun, the log keeps the run's
+        # story in one place. Written once the log is set up for the run below.
+        start_notes: list[dict] = []
         if not market_hours.is_market_open():
             open_et = market_hours.next_market_open().astimezone(market_hours.MARKET_TZ)
-            st.info(
+            start_notes.append({"type": "status", "text": (
                 f"The trading session hasn't started yet (next open: "
                 f"{open_et.strftime('%a %Y-%m-%d %H:%M')} ET). "
                 + (
@@ -3500,7 +3585,7 @@ def _start_agent(
                     "studies structure and arms plans for the open instead of "
                     "trading the stale tape."
                 )
-            )
+            )})
         # Resolve the venue before anything starts. Every refusal inside
         # resolve_broker degrades to local simulation and says so, so a
         # misconfigured or blocked account can never silently become a
@@ -3523,11 +3608,11 @@ def _start_agent(
         state.trading_mode = effective_mode
         state.trading_mode_requested = trading_mode_choice
         state.trading_status = broker_message
-        # Only local simulation is announced here: a degraded, paper or live
-        # venue gets its banner from the persistent status block below,
-        # and announcing it here too would stack two banners saying the same.
+        # Only local simulation is logged here: a degraded venue gets its
+        # warning from the persistent status block below, and a paper or live
+        # venue is named by the status line's badge.
         if effective_mode == trading_mode_choice == "local":
-            st.success(broker_message)
+            start_notes.append({"type": "status", "text": broker_message})
 
         # Today's ledger goes on (session_store): a restart or a Stop is not
         # the end of the trading day.
@@ -3583,17 +3668,21 @@ def _start_agent(
                         else snap["cash"]
                     )
                 held = {s: q for s, q in snap["positions"].items() if q}
-                if held:
-                    st.info(
+                # A continued day says what it holds in its own line below.
+                if held and not continuing:
+                    start_notes.append({"type": "status", "text": (
                         "Existing positions on this account: "
                         + ", ".join(f"{s} {q:g}" for s, q in held.items())
                         + " — the agent starts from these, not from flat."
-                    )
+                    )})
             else:
-                st.warning(
-                    "Could not read the account balance; the ledger starts from "
-                    "the configured budget and will reconcile on the first order."
-                )
+                start_notes.append({
+                    "type": "error",
+                    "text": (
+                        "Could not read the account balance; the ledger starts from "
+                        "the configured budget and will reconcile on the first order."
+                    ),
+                })
         if continuing:
             snap = state.decision_tracker.snapshot()
             held = {s: q for s, q in snap["positions"].items() if q}
@@ -3619,6 +3708,8 @@ def _start_agent(
             state.agent_log = []
             state.agent_start_time = clock.now()
             state.agent_equity_history = []
+        for note in start_notes:
+            append_agent_log(state, note)
         # How this run was started, saved with the day while it runs, so a
         # restart of the app can start it again the same way.
         state.run_spec = {
@@ -3682,7 +3773,13 @@ def _agent_panel(
     data_source: str = DEFAULT_DATA_SOURCE,
     finnhub_token: str = "",
     history_feed: str = DEFAULT_HISTORY_FEED,
+    clicks: "tuple[bool, bool, bool]" = (False, False, False),
+    feedback=None,
 ) -> None:
+    """The Agent tab. `clicks` are the sidebar's ▶ Start Agent, ⏹ Stop Agent
+    and Sell everything and stop (`_agent_buttons`) for this run, and
+    `feedback` the sidebar container under them that their messages go to."""
+    feedback = feedback if feedback is not None else nullcontext()
     state = _get_state()
     st.caption(
         "Runs an LLM research agent that reads already-fetched data for every streamed "
@@ -3785,93 +3882,55 @@ def _agent_panel(
         state.apple_trader_config = None
         state.orchestra_configs, state.orchestra_form = {}, None
 
-    trading_mode_choice = _execution_controls()
-
-    state.trade_sound_volume = st.slider(
-        "Trade sound",
-        min_value=0.0,
-        max_value=0.60,
-        value=state.trade_sound_volume,
-        step=0.05,
-        key="agent_trade_sound_volume",
-        help="Volume of a short chime whenever an order fills — rising for a buy, "
-        "falling for a sell. 0 (the default) is off. Your browser only allows "
-        "sound after you interact with the page, which starting the agent satisfies.",
+    # The sidebar's Order execution and Continue box (`_execution_controls`,
+    # `_session_checkboxes`), drawn earlier in this run.
+    trading_mode_choice = _trading_mode_choice()
+    continue_today = (
+        bool(st.session_state.get(CONTINUE_TODAY_KEY, True))
+        if _has_today_ledger(state)
+        else True
     )
-
-    # A ledger from earlier today -- this run's, or one restored after a restart
-    # -- is carried on by ▶ Start unless this is unticked.
-    continue_today = True
-    if (
-        state.decision_tracker is not None
-        and getattr(state, "session_date", "") == session_store.session_date()
-    ):
-        kept = len(state.decision_tracker.decisions)
-        continue_today = st.checkbox(
-            f"Continue today's session ({kept} decision{'s' if kept != 1 else ''} so far)",
-            value=True,
-            key="agent_continue_today",
-            help="▶ Start carries on today's ledger — cash, positions and every "
-            "decision — with the agent log, the equity curve and Apple Trader's "
-            "levels, an open position and a stand-down. Unticked, Start opens a "
-            "fresh ledger on the starting budget; today's saved session is kept "
-            "beside it in data/sessions/ rather than overwritten. A different "
-            "venue always starts fresh.",
+    if trading_mode_choice == "local":
+        c1, _ = st.columns([1, 3])
+        starting_budget = c1.number_input(
+            "Starting budget ($)",
+            min_value=0.0,
+            value=PAPER_STARTING_CASH,
+            step=100.0,
+            key="agent_starting_budget",
+            help="The cash the simulated ledger opens with.",
         )
-    st.checkbox(
-        "Resume automatically after a restart",
-        value=True,
-        key=AUTO_RESUME_KEY,
-        help="If the app goes down while the live stream or the agent is running "
-        "— a crash, a hang the supervisor (run_app.py) restarted, or a restart "
-        "of the server — the first page to open afterwards starts them again "
-        "as they were, on the same venue, continuing today's ledger. A run "
-        "that was stopped (⏹ Stop Agent, a stop-out) stays stopped. A page "
-        "that only lost its connection needs none of this: it takes back the "
-        "session that kept running.",
-    )
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.3])
-    starting_budget = c1.number_input(
-        "Starting budget ($)",
-        min_value=0.0,
-        value=PAPER_STARTING_CASH,
-        step=100.0,
-        key="agent_starting_budget",
-        help="Only used by local simulation. On an Alpaca account this is ignored: "
-        "the balance, the holdings and the portfolio value all come from that "
-        "account, read from Alpaca and refreshed while the agent runs.",
-        disabled=trading_mode_choice != "local",
-    )
-    start_clicked = c2.button("▶ Start Agent", type="primary", width='stretch', key="agent_start")
-    stop_clicked = c3.button("⏹ Stop Agent", width='stretch', key="agent_stop")
-    sell_all_clicked = c4.button(
-        "Sell everything and stop",
-        width='stretch',
-        key="agent_sell_all_stop",
-        disabled=state.decision_tracker is None,
-        help="Stops the agent, then sells every open position at market. On an "
-        "Alpaca account that is everything the account holds, not only what this "
-        "session bought.",
-    )
-
+    else:
+        # Not drawn on an Alpaca account, whose balance, holdings and value
+        # come from the account itself. Still passed on: a run that falls back
+        # to local simulation, or that cannot read the balance, opens on it.
+        # (Undrawn, Streamlit drops the key; last_setup puts a changed value
+        # back on the next full run.)
+        starting_budget = float(
+            st.session_state.get("agent_starting_budget", PAPER_STARTING_CASH)
+        )
+    # The sidebar's buttons (`_agent_buttons`), handled here, where the
+    # agent's own settings are; what they report goes under them.
+    start_clicked, stop_clicked, sell_all_clicked = clicks
     if start_clicked:
-        _start_agent(
-            state,
-            list(symbols or state.symbols),
-            personality=personality,
-            provider=provider,
-            model=model,
-            apple_config=apple_config,
-            trading_mode_choice=trading_mode_choice,
-            starting_budget=starting_budget,
-            continue_today=continue_today,
-            alpaca_key=alpaca_key,
-            alpaca_secret=alpaca_secret,
-            feed=feed,
-            data_source=data_source,
-            finnhub_token=finnhub_token,
-            history_feed=history_feed,
-        )
+        with feedback:
+            _start_agent(
+                state,
+                list(symbols or state.symbols),
+                personality=personality,
+                provider=provider,
+                model=model,
+                apple_config=apple_config,
+                trading_mode_choice=trading_mode_choice,
+                starting_budget=starting_budget,
+                continue_today=continue_today,
+                alpaca_key=alpaca_key,
+                alpaca_secret=alpaca_secret,
+                feed=feed,
+                data_source=data_source,
+                finnhub_token=finnhub_token,
+                history_feed=history_feed,
+            )
         if _get_state() is not state:
             # ▶ Start Agent loaded a new replay (Dummy data): its state has not
             # had this page's settings drawn onto it yet, so draw it again.
@@ -3888,23 +3947,23 @@ def _agent_panel(
         session_store.save(state)
         filled = [d for d in sold if d.status == "filled"]
         refused = [d for d in sold if d.status != "filled"]
-        if filled:
-            st.success(
-                "Agent stopped and sold "
-                + ", ".join(
-                    f"{d.filled_quantity:g} {d.symbol} @ ${d.price:,.2f}" for d in filled
+        with feedback:
+            if filled:
+                st.success(
+                    "Agent stopped and sold "
+                    + ", ".join(
+                        f"{d.filled_quantity:g} {d.symbol} @ ${d.price:,.2f}" for d in filled
+                    )
+                    + "."
                 )
-                + "."
-            )
-        if refused or errors:
-            st.error(
-                "Not sold: "
-                + "; ".join([f"{d.symbol} ({d.reasoning})" for d in refused] + errors)
-            )
-        if not sold and not errors:
-            st.info("Agent stopped. There were no open positions to sell.")
+            if refused or errors:
+                st.error(
+                    "Not sold: "
+                    + "; ".join([f"{d.symbol} ({d.reasoning})" for d in refused] + errors)
+                )
+            if not sold and not errors:
+                st.info("Agent stopped. There were no open positions to sell.")
 
-    _agent_status_line()
     restored = getattr(state, "session_restored", None)
     if (
         restored
@@ -3921,7 +3980,7 @@ def _agent_panel(
             f"Restored today's session ({restored['date']}, saved {saved}): "
             f"{restored['decisions']} decisions, {restored['fills']} fills, "
             + ("holding " + ", ".join(f"{s} {q:g}" for s, q in held.items()) if held else "flat")
-            + ". ▶ Start continues it."
+            + ". ▶ Start Agent continues it."
         )
     _trade_sound_fragment()
 
@@ -3934,10 +3993,6 @@ def _agent_panel(
         st.warning(
             f"**Not {_venue_badge(state.trading_mode_requested)}.** This run is on "
             f"{_venue_badge(state.trading_mode)} instead — {state.trading_status}"
-        )
-    elif state.trading_mode == "alpaca_paper":
-        st.info(
-            f"📝 Orders routed to your Alpaca **paper** account. {state.trading_status}"
         )
     _agent_identity_panel()
 
@@ -4520,8 +4575,84 @@ def _start_live_session(
 
 # --- recovery after a dropped connection or a restart ---------------------------
 
-# The Agent tab's "Resume automatically after a restart" box (kept in last_setup).
+# The sidebar's "Resume automatically after a restart" box (kept in last_setup).
 AUTO_RESUME_KEY = "agent_auto_resume"
+# The sidebar's "Continue today's session" box (not kept: it is about the day).
+CONTINUE_TODAY_KEY = "agent_continue_today"
+
+
+def _has_today_ledger(state: AppState) -> bool:
+    """A ledger from earlier today -- this run's, or one restored after a
+    restart -- that ▶ Start Agent can carry on."""
+    return (
+        state.decision_tracker is not None
+        and getattr(state, "session_date", "") == session_store.session_date()
+    )
+
+
+def _trade_sound_control(state: AppState) -> None:
+    """The fill chime's volume, in the sidebar."""
+    state.trade_sound_volume = st.slider(
+        "Trade sound",
+        min_value=0.0,
+        max_value=0.60,
+        value=state.trade_sound_volume,
+        step=0.05,
+        key="agent_trade_sound_volume",
+        help="Volume of a short chime whenever an order fills — rising for a buy, "
+        "falling for a sell. 0 (the default) is off. Your browser only allows "
+        "sound after you interact with the page, which starting the agent satisfies.",
+    )
+
+
+def _agent_buttons(state: AppState) -> "tuple[bool, bool, bool]":
+    """▶ Start Agent, ⏹ Stop Agent and Sell everything and stop, in the
+    sidebar: whether each was clicked this run. The Agent tab acts on them
+    (`_agent_panel`), since starting needs the agent settings drawn there."""
+    c1, c2 = st.columns(2)
+    start = c1.button("▶ Start Agent", type="primary", width="stretch", key="agent_start")
+    stop = c2.button("⏹ Stop Agent", width="stretch", key="agent_stop")
+    sell_all = st.button(
+        "Sell everything and stop",
+        width="stretch",
+        key="agent_sell_all_stop",
+        disabled=state.decision_tracker is None,
+        help="Stops the agent, then sells every open position at market. On an "
+        "Alpaca account that is everything the account holds, not only what this "
+        "session bought.",
+    )
+    return start, stop, sell_all
+
+
+def _session_checkboxes(state: AppState) -> None:
+    """The day's two run settings, in the sidebar: whether ▶ Start Agent
+    continues today's ledger, and whether a restart starts the run again.
+    Drawn before the Agent tab and the restart check that read them."""
+    if _has_today_ledger(state):
+        kept = len(state.decision_tracker.decisions)
+        st.checkbox(
+            f"Continue today's session ({kept} decision{'s' if kept != 1 else ''} so far)",
+            value=True,
+            key=CONTINUE_TODAY_KEY,
+            help="▶ Start Agent carries on today's ledger — cash, positions and "
+            "every decision — with the agent log, the equity curve and Apple "
+            "Trader's levels, an open position and a stand-down. Unticked, it "
+            "opens a fresh ledger on the starting budget; today's saved session "
+            "is kept beside it in data/sessions/ rather than overwritten. A "
+            "different venue always starts fresh.",
+        )
+    st.checkbox(
+        "Resume automatically after a restart",
+        value=True,
+        key=AUTO_RESUME_KEY,
+        help="If the app goes down while the live stream or the agent is running "
+        "— a crash, a hang the supervisor (run_app.py) restarted, or a restart "
+        "of the server — the first page to open afterwards starts them again "
+        "as they were, on the same venue, continuing today's ledger. A run "
+        "that was stopped (⏹ Stop Agent, a stop-out) stays stopped. A page "
+        "that only lost its connection needs none of this: it takes back the "
+        "session that kept running.",
+    )
 # How often a resume that could not start (no network yet) is tried again.
 RESUME_RETRY_SEC = 30
 # How long the banner saying what was recovered stays above the tabs.
@@ -4566,7 +4697,7 @@ def _resume_after_restart(
     (`session_store.take_resume`): the live stream, the agent, or both. The
     first session after a restart starts them as they were -- the agent on the
     same venue, continuing today's ledger, Apple Trader taking back its open
-    position and stand-down -- unless the Agent tab's "Resume automatically
+    position and stand-down -- unless the sidebar's "Resume automatically
     after a restart" is unticked. A stream that cannot start yet (whatever
     took the app down may have taken the network with it) is tried again
     every RESUME_RETRY_SEC; an agent the setup refuses is reported, not retried.
@@ -4722,7 +4853,7 @@ def _recovery_banner(state: AppState) -> None:
         st.success(
             f"♻️ The app restarted while {_run_label(run)} was running, and started it "
             "again" + (" — continuing today's ledger" if run.get("agent") else "")
-            + ". Untick \"Resume automatically after a restart\" in the Agent tab to "
+            + ". Untick \"Resume automatically after a restart\" in the sidebar to "
             "leave it stopped next time."
         )
 
@@ -4735,7 +4866,7 @@ def _replay_banner() -> None:
     if replay.session_of(state) is None:
         st.caption(
             "🎬 **Dummy data** — ▶ Start in the sidebar loads the replayed day; "
-            "▶ Start Agent in the Agent tab plays it, at the speed of a real session."
+            "▶ Start Agent below it plays it, at the speed of a real session."
         )
         return
     st.caption(state.status)
@@ -4775,12 +4906,7 @@ def build_ui() -> None:
     last_setup.restore()
 
     with st.sidebar:
-        st.header("Controls")
-        c1, c2 = st.columns(2)
-        start_clicked = c1.button("▶ Start", type="primary", width='stretch')
-        stop_clicked = c2.button("⏹ Stop", width='stretch')
-        if _replaying():
-            st.caption("🎬 Dummy data is on (Connection): Start loads a replay.")
+        # What ▶ Start streams, above it.
         symbols_input = st.text_input(
             "Symbols",
             value="AAPL",
@@ -4789,6 +4915,22 @@ def build_ui() -> None:
             help="One or more tickers, comma- or space-separated. All live plots, "
             "analyses, and the trading agent cover every listed symbol.",
         )
+        c1, c2 = st.columns(2)
+        start_clicked = c1.button("▶ Start", type="primary", width='stretch')
+        stop_clicked = c2.button("⏹ Stop", width='stretch')
+        if _replaying():
+            st.caption("🎬 Dummy data is on (Connection): Start loads a replay.")
+        # Filled at the end of the run, after every Start/Stop below has acted,
+        # so a click shows its own result rather than the state before it.
+        status_slot = st.container()
+        # The agent's run settings, ahead of the Agent tab that reads them.
+        run_state = _get_state()
+        _execution_controls()
+        _trade_sound_control(run_state)
+        _session_checkboxes(run_state)
+        agent_clicks = _agent_buttons(run_state)
+        # What the agent buttons report, under them: filled by the Agent tab.
+        agent_feedback = st.container()
         with st.expander("Connection"):
             dummy_data = st.checkbox(
                 "Dummy data — replay a past session",
@@ -4798,8 +4940,8 @@ def build_ui() -> None:
                     "it were live, one second per second — for demos.\n\n"
                     "**▶ Start** (above) downloads the day, shows the chart as it stood "
                     "at the start time and prepares the pre-market briefing (or loads "
-                    "the one written for that day before). **▶ Start Agent** in the "
-                    "Agent tab sets the clock running and starts the agent, as on a "
+                    "the one written for that day before). **▶ Start Agent** "
+                    "sets the clock running and starts the agent, as on a "
                     "real morning.\n\n"
                     "Orders only ever fill locally at the replayed price. Your live "
                     "session is left as it is and comes back when this is switched off."
@@ -5026,6 +5168,8 @@ def build_ui() -> None:
             data_source=data_source,
             finnhub_token=finnhub_token,
             history_feed=history_feed,
+            clicks=agent_clicks,
+            feedback=agent_feedback,
         )
 
     # After the Agent tab: Orchestra's form there publishes the setup the
@@ -5035,5 +5179,8 @@ def build_ui() -> None:
 
     with tab_models, _panel_guard("The ML Models tab"):
         model_catalogue_panel()
+
+    with status_slot:
+        _sidebar_status()
 
     last_setup.remember()

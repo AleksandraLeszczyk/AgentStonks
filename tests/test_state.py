@@ -309,3 +309,24 @@ class TestCompletedBarVolumeRatio:
         ss.previous_minute_volume_ratio = 1.8
         assert "previous_minute_volume_ratio" in ALERTABLE_FIELDS
         assert alert_field_value(ss, "previous_minute_volume_ratio") == 1.8
+
+
+def test_a_tagged_thread_target_stamps_its_agent_on_every_line():
+    from agent_stonks.state import agent_log_tag, agent_log_tagged, append_agent_log
+
+    app = AppState()
+
+    def run():
+        append_agent_log(app, {"type": "analysis", "text": "regime read"})
+        # A strategy run inside the Strategist's thread writes as itself.
+        with agent_log_tag(agent="momentum"):
+            append_agent_log(app, {"type": "decision", "action": "sell"})
+
+    # Set on the launching thread too: a new thread must not need it.
+    with agent_log_tag(agent="ignored"):
+        thread = threading.Thread(target=agent_log_tagged(run, agent="automatic"))
+    thread.start()
+    thread.join()
+    append_agent_log(app, {"type": "status", "text": "manual"})
+
+    assert [e.get("agent") for e in app.agent_log] == ["automatic", "momentum", None]

@@ -88,7 +88,7 @@ from .config import (
 )
 from .decisions import DecisionTracker
 from .llm import DEFAULT_AGENT_MODELS, get_agent_client
-from .state import AppState
+from .state import AppState, agent_log_tag, agent_log_tagged
 
 # The key keeps the Strategist's old name. It is what every stored run says
 # it used -- `data/last_setup.json`, the day files' `run_spec` (which a restart
@@ -769,10 +769,12 @@ def _strategist_loop(
             if not woken and not any(s in fresh for s in group_symbols):
                 continue
             try:
-                status = run_agent_cycle(
-                    client, model, group_symbols, state, tracker,
-                    personality=strategy, under_strategist=True,
-                )
+                # The strategy's lines are its own, not the Strategist's.
+                with agent_log_tag(agent=strategy):
+                    status = run_agent_cycle(
+                        client, model, group_symbols, state, tracker,
+                        personality=strategy, under_strategist=True,
+                    )
             except Exception as exc:
                 _log(state, {"type": "error", "text": f"Strategy cycle failed: {exc}"})
                 schedule_retry(state)
@@ -834,7 +836,7 @@ def launch_strategist(
     _publish_assignments(state, {})
     state.strategist_waiting = None
     threading.Thread(
-        target=clock.inherit(_strategist_loop),
+        target=clock.inherit(agent_log_tagged(_strategist_loop, agent=STRATEGIST_KEY)),
         args=(state, tracker, symbols, provider, api_key, model, stop_event),
         daemon=True,
     ).start()

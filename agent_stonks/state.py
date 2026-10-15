@@ -273,6 +273,7 @@ _DEFAULTS: dict[str, object] = {
     "show_percentile_body": False,
     "show_whiskers": True,
     "show_momentum": True,
+    "show_momentum_change": True,
     "show_net_gamma": True,
     "show_pre_market": False,
     "chart_window_min": 0,
@@ -424,6 +425,8 @@ class AppState:
         self.show_whiskers: bool = True
         # Draw the session momentum score in a panel under the price/volume.
         self.show_momentum: bool = True
+        # ...and its change (momentum Δ) in one more under that.
+        self.show_momentum_change: bool = True
         # Draw the options chain's net dealer gamma in a panel under momentum Δ.
         self.show_net_gamma: bool = True
         # Start the live chart at the day's first bar rather than
@@ -682,6 +685,19 @@ def agent_log_tag(**fields):
         yield
     finally:
         _LOG_TAG.reset(token)
+
+
+def agent_log_tagged(target, **fields):
+    """`target` wrapped to run inside `agent_log_tag(**fields)`.
+
+    For a thread's target: a new thread starts with an empty context, so a tag
+    the launching thread set would never reach the agent's own log lines.
+    """
+    def run(*args, **kwargs):
+        with agent_log_tag(**fields):
+            return target(*args, **kwargs)
+
+    return run
 
 
 def append_agent_log(state: "AppState", entry: dict) -> None:

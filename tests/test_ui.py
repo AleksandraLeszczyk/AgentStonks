@@ -779,3 +779,58 @@ def test_agent_log_card_shows_the_stand_aside_and_the_checkpoint():
     assert "Stand aside: <b>reward risk fails</b>" in body
     assert "rvol_pace_armable=0.7" in body
     assert "+1R checkpoint <b>AAPL last_price above 105" in body
+
+
+def test_agent_log_label_names_the_agent_on_analysis_and_trades():
+    from agent_stonks.ui import _agent_entry_style
+
+    def label(entry):
+        return _agent_entry_style(entry)[2]
+
+    assert label({"type": "analysis", "agent": "momentum", "text": "x"}) == "Momentum Trader: analysis"
+    assert label({"type": "decision", "action": "sell", "symbol": "AAPL", "agent": "momentum"}) == (
+        "Momentum Trader: SELL AAPL"
+    )
+    assert label({"type": "decision", "action": "buy", "symbol": "AAPL", "agent": "apple_trader"}) == (
+        "Apple Trader: BUY AAPL"
+    )
+    # Old lines, a manual sell-all, and a key nobody knows keep the bare label.
+    assert label({"type": "analysis", "text": "x"}) == "analysis"
+    assert label({"type": "decision", "action": "sell", "symbol": "AAPL"}) == "SELL AAPL"
+    assert label({"type": "decision", "action": "sell", "symbol": "AAPL", "agent": "gone"}) == "SELL AAPL"
+
+
+def test_a_long_status_reads_as_a_lead_and_bullets():
+    from agent_stonks.ui import _agent_entry_body
+
+    text = (
+        "Apple Trader armed on HighLow model (fitted 2026-09-15T21:25:55, held-out mean error $1.37): "
+        "at 9:35 it forecasts where today's AAPL high and low will land, then rests a buy 0.7 × the "
+        "predicted range below the predicted high and a sell 0.1 below it, until the closing flatten. "
+        "A session that trades outside the forecast moves both sides of it (brownian extension, "
+        "volatility implied by adr) and both levels with it. Both levels wait for momentum over the "
+        "last 3 bars, vs. the prior bar. A stop-out stops the agent."
+    )
+    body = _agent_entry_body({"type": "status", "text": text})
+    assert "font-weight:600'>Apple Trader armed on HighLow model (fitted 2026-09-15T21:25:55, " in body
+    assert body.count("<li") == 4
+    assert ">At 9:35 it forecasts" in body
+    assert "vs. the prior bar. A stop-out" not in body and "vs. the prior bar.</li>" in body
+
+    short = _agent_entry_body({"type": "status", "text": "Agent stopped. Bye."})
+    assert short == "<div>Agent stopped. Bye.</div>"
+
+
+def test_the_sidebar_agent_line_names_the_venue_and_what_the_agent_does():
+    from agent_stonks.ui import _agent_status_text
+
+    state = AppState()
+    assert _agent_status_text(state) == "⚪ idle · no venue resolved yet — press ▶ Start Agent"
+
+    state.trading_mode = state.trading_mode_requested = "alpaca_paper"
+    state.agent_running = True
+    state.symbols = ["AAPL"]
+    state.agent_activity = ("🟢", "Agent holding AAPL")
+    assert _agent_status_text(state) == (
+        "🟢 running · 📝 Alpaca paper — watching AAPL · 🟢 Agent holding AAPL"
+    )

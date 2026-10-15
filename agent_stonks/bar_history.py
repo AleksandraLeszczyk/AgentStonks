@@ -438,6 +438,31 @@ def _bucket_start(now: datetime, timeframe: str) -> datetime:
     return now.replace(hour=floored // 60, minute=floored % 60, second=0, microsecond=0)
 
 
+# Timeframes whose yfinance bars start on the same clock buckets as Alpaca's,
+# so a yfinance bar can stand in for one Alpaca does not have. yfinance's 60m
+# bars start at :30 (09:30, 10:30, ...) and Alpaca's 1Hour bars on the hour.
+_YF_HOLE_FILL_TIMEFRAMES = ("1Min", "5Min", "15Min", "30Min")
+
+
+def _regular_session_buckets(start: datetime, end: datetime, timeframe: str) -> "list[str]":
+    """`bar_key` of every `timeframe` bucket starting in [start, end) inside a
+    weekday's regular session -- the bars a liquid symbol always has."""
+    step = timedelta(minutes=_BAR_MINUTES[timeframe])
+    keys: list[str] = []
+    day = start.astimezone(MARKET_TZ).date()
+    last_day = end.astimezone(MARKET_TZ).date()
+    while day <= last_day:
+        if day.weekday() < 5:
+            t = datetime.combine(day, MARKET_OPEN, MARKET_TZ)
+            close = datetime.combine(day, MARKET_CLOSE, MARKET_TZ)
+            while t < close:
+                if start <= t < end:
+                    keys.append(bar_key(t.astimezone(timezone.utc).isoformat()))
+                t += step
+        day += timedelta(days=1)
+    return keys
+
+
 def _yfinance_window(symbol: str, interval: str, start: datetime, end: datetime) -> "list[dict]":
     """yfinance bars in [start, end), through a short cache."""
     cache_key = (symbol, interval)
@@ -480,7 +505,9 @@ def fetch_live_bars(
     Finished consolidated bars older than SETTLED_BAR_AGE_MIN are listed in
     `settled`: they replace a buffered bar from a lesser source, streamed
     candles included (`stream_common.merge_live_bars`). A real-time SIP key
-    serves the young tier too, and then nothing is provisional.
+    serves the young tier too, and then nothing is provisional. A
+    regular-session minute that no Alpaca tier has comes from yfinance:
+    settled once old enough, provisional before that.
 
     Raises only when no tier returned anything and something failed.
     """
@@ -525,19 +552,32 @@ def fetch_live_bars(
     if kept:
         sources.append(base_label)
 
+    # yfinance is downloaded at most once per call, up to the bar in progress,
+    # for the two jobs below.
+    yf_interval = YF_INTERVALS.get(timeframe)
+    yf_fetched: "list[list[dict]]" = []
+
+    def yf_bars_from(start: datetime) -> "list[dict]":
+        if not yf_fetched:
+            try:
+                yf_fetched.append(
+                    tag_source(_yfinance_window(symbol, yf_interval, start, current), "yfinance")
+                )
+            except Exception as exc:
+                failures.append((SOURCE_LABELS["yfinance"], exc))
+                yf_fetched.append([])
+        return yf_fetched[0]
+
     # Settled regular-session minutes from yfinance, where the resolved feed
     # was not SIP: over its IEX bars, or in place of a SIP fetch that failed.
-    yf_interval = YF_INTERVALS.get(timeframe)
     if yf_interval is not None and base_src not in ("sip", "yfinance"):
-        start = now - timedelta(hours=lookback_hours)
-        try:
-            yf_bars = _yfinance_window(symbol, yf_interval, start, settled_cut)
-        except Exception as exc:
-            failures.append((SOURCE_LABELS["yfinance"], exc))
-            yf_bars = []
         replaced = 0
-        for bar in tag_source(yf_bars, "yfinance"):
-            if "t" in bar and _in_regular_session(bar["t"]):
+        for bar in yf_bars_from(now - timedelta(hours=lookback_hours)):
+            if (
+                "t" in bar
+                and clock.parse_iso_strict(bar["t"]) < settled_cut
+                and _in_regular_session(bar["t"])
+            ):
                 k = bar_key(bar["t"])
                 by_key[k] = bar
                 provisional.discard(k)
@@ -574,6 +614,38 @@ def fetch_live_bars(
                 f"{SOURCE_LABELS[recent_feed]} last {SETTLED_BAR_AGE_MIN}min"
                 + (", provisional" if recent_feed == "iex" else "")
             )
+
+    # Regular-session minutes no Alpaca tier had, from yfinance. Alpaca can lose
+    # a stretch of the tape outright: on 2026-10-15 neither SIP nor IEX had a
+    # single AAPL bar from 12:57 to 14:10 ET, hours later, while yfinance had
+    # every minute -- and a liquid symbol never really goes a regular-session
+    # minute without a trade. Counted from the oldest bar fetched, since
+    # `limit`, not a hole, is what ends it. A settled yfinance bar ranks below
+    # SIP, so the SIP bar takes the minute back if Alpaca ever repairs it.
+    if yf_interval is not None and timeframe in _YF_HOLE_FILL_TIMEFRAMES:
+        hole_start = min(
+            (clock.parse_iso_strict(k) for k in by_key),
+            default=now - timedelta(hours=lookback_hours),
+        )
+        holes = [
+            k for k in _regular_session_buckets(hole_start, current, timeframe)
+            if k not in by_key
+        ]
+        filled = 0
+        if holes:
+            wanted = set(holes)
+            for bar in yf_bars_from(clock.parse_iso_strict(holes[0])):
+                k = bar_key(bar["t"]) if "t" in bar else None
+                if k not in wanted:
+                    continue
+                by_key[k] = bar
+                filled += 1
+                if _over_by(bar["t"], timeframe, settled_cut):
+                    settled.add(k)
+                else:
+                    provisional.add(k)
+        if filled:
+            sources.append(f"{SOURCE_LABELS['yfinance']} where Alpaca had no bar")
 
     if not by_key and failures:
         log_fetch_failure(
