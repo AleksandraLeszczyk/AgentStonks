@@ -1,6 +1,6 @@
 {
-  "email_to": "",
-  "on_transaction": false,
-  "every_n_minutes": false,
-  "interval_minutes": 1
+  "email_to": "aleksandra.leszczyk@gmail.com",
+  "on_transaction": true,
+  "every_n_minutes": true,
+  "interval_minutes": 60
 }

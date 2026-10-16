@@ -1492,23 +1492,7 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     st.session_state["model_overlay_keys"] = stored
 
     st.markdown("**Model Predictions**")
-    with _help_row(
-        "Draws what the trained models predict for this session:\n"
-        "- **TimeToChange3**, **HighLow**, **HighLow2**, **LevelsML** — price ranges: "
-        "horizontal lines, in the candles and in the profile beside them. "
-        "**HighLow_3m**'s is the range *after 9:33*, not the day's.\n"
-        "- **IntradayVolatility** (alone or × TimeToChange3) — time-of-day "
-        "ranges: a shaded envelope, widest at the open and narrowing through "
-        "midday.\n"
-        "- **Fast&Furious** — its forecast of the next 30 minutes' average "
-        "momentum, every minute: a yellow line on the momentum panel (bps per "
-        "minute, right axis) between the buy and sell thresholds, and ▲/▼ on "
-        "the candles where it crosses one. **Fast&Furious 2-hour range** is "
-        "the second model in its bundle, which only sizes the stop.\n"
-        "- **Apple Trader** — buy/sell levels, not a forecast: the two orders "
-        "the agent configured below would rest, following whatever settings "
-        "that form is holding."
-    ):
+    with _help_row(_model_overlay_help(available)):
         selected = st.multiselect(
             "Model predictions",
             available,
@@ -1517,11 +1501,21 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
             placeholder="None",
             label_visibility="collapsed",
         )
-    for key in selected:
+    return selected
+
+
+def _model_overlay_help(keys: "list[str]") -> str:
+    """The Model Predictions help: every model on offer with its catalogue
+    summary, so the hover is the one place that says what each draws."""
+    lines = [
+        "Draws what the trained models predict for this session. Price ranges are "
+        "horizontal lines, in the candles and in the profile beside them."
+    ]
+    for key in keys:
         overlay = model_overlays.get(key)
         if overlay:
-            st.caption(f"{overlay.name} — {overlay.summary}")
-    return selected
+            lines.append(f"- **{overlay.name}** — {overlay.summary}")
+    return "\n".join(lines)
 
 
 def _candle_pattern_controls() -> dict:

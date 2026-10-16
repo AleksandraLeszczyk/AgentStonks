@@ -200,8 +200,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         name="IntradayVolatility",
         summary=(
             "IntradayVolatility's time-of-day volatility curve around the open, scaled "
-            "to its own forecast of the day's range: widest at 09:30, narrowest at "
-            "midday, opening up again into the close. Known at the open."
+            "to its own forecast of the day's range, as a shaded envelope: widest at "
+            "09:30, narrowest at midday, opening up again into the close. Known at the "
+            "open."
         ),
         requires="the IntradayVolatility export (intravol_<TICKER>.json)",
         tickers=intraday_vol_model.TICKERS,
@@ -279,8 +280,8 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         name="Fast&Furious",
         summary=(
             "Fast&Furious's forecast of the next 30 minutes' average momentum, made at the "
-            "close of every bar from 09:31 to 15:30: a line in bps per minute on the momentum "
-            "panel (right axis), drawn 30 minutes after it was made — over the bars it "
+            "close of every bar from 09:31 to 15:30: a yellow line in bps per minute on the "
+            "momentum panel (right axis), drawn 30 minutes after it was made — over the bars it "
             "forecast — with the entry threshold above and below zero, and a marker on the "
             "candles at the bar where it crosses one — ▲ a buy signal, ▼ a sell signal."
         ),
@@ -313,8 +314,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         name="Apple Trader",
         summary=(
             "Where the configured Apple Trader rests its two orders: the buy and the "
-            "sell, each a distance in ADRs under the day-range forecast. The only "
-            "overlay here that draws an agent's orders rather than a model's answer."
+            "sell, each a distance in ADRs under the day-range forecast, following "
+            "whatever settings the Apple Trader form is holding. The only overlay here "
+            "that draws an agent's orders rather than a model's answer."
         ),
         requires="PyTorch, LightGBM and the forecast bundle of the model the agent runs",
         # Every symbol some Apple Trader model covers: the levels hang off
