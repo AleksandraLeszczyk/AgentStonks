@@ -23,11 +23,13 @@ from . import (
     last_setup,
     market_hours,
     model_overlays,
+    notifications,
     replay,
     session_store,
 )
 from . import apple_trader_ui
 from .model_catalogue_ui import model_catalogue_panel
+from .notifications_ui import notifications_panel
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
@@ -359,6 +361,7 @@ def _get_state() -> AppState:
         st.session_state["app_state"] = fresh
     state = st.session_state["app_state"]
     session_store.start_autosave(state)
+    notifications.start_watch(state)
     # Streamlit's dev-mode autoreload reruns this script on every save but keeps
     # the same AppState instance alive in session_state. If a field was added to
     # AppState after this instance was constructed, the instance's __class__ (and
@@ -5048,11 +5051,12 @@ def build_ui() -> None:
 
     (
         tab_agent, tab_live, tab_news, tab_premarket, tab_candidates, tab_analysis,
-        tab_walls, tab_models,
+        tab_walls, tab_models, tab_notifications,
     ) = st.tabs(
         [
             "🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🎼 Candidates",
             "🔬 Technical Analysis", "🧱 Put/Call Walls", "🧠 ML Models",
+            "🔔 Notifications",
         ]
     )
 
@@ -5183,6 +5187,9 @@ def build_ui() -> None:
 
     with tab_models, _panel_guard("The ML Models tab"):
         model_catalogue_panel()
+
+    with tab_notifications, _panel_guard("The Notifications tab"):
+        notifications_panel(state)
 
     with status_slot:
         _sidebar_status()

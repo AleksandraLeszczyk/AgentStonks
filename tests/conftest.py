@@ -100,3 +100,12 @@ def _base_configs_in_tmp(monkeypatch, tmp_path):
 
     monkeypatch.setattr(base_configs, "BASE_PATH", tmp_path / "apple_trader_base.json")
     monkeypatch.setattr(base_configs, "_cache", None)
+
+
+@pytest.fixture(autouse=True)
+def _notification_settings_in_tmp(monkeypatch, tmp_path):
+    """Keep the email settings out of the real data/notifications.json, so no
+    test that fills a trade can email whoever is set there."""
+    from agent_stonks import notifications
+
+    monkeypatch.setattr(notifications, "SETTINGS_PATH", tmp_path / "notifications.json")

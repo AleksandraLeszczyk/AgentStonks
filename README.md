@@ -187,6 +187,8 @@ docker run -p 8501:8501 --env-file .env agentstonks
 | `WORLD_NEWS_API_KEY` | (optional) WorldNews API key, used as a fallback news source |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | (optional) Langfuse keys — enables agent cycle tracing; no-op if unset |
 | `LANGFUSE_HOST` | (optional) Langfuse host — Langfuse Cloud is used if unset |
+| `SMTP_USER` / `SMTP_PASSWORD` | (optional) mail account the Notifications tab's emails are sent from — for Gmail, the address and an app password |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_FROM` | (optional) default to `smtp.gmail.com`, `587` (STARTTLS; `465` uses SSL) and `SMTP_USER` |
 | `OPEN_PROFILE_MODEL` | (optional) path to the LevelsML density-model pack — defaults to `../Models/open_profile_lgbm.json.gz` |
 | `APPLE_DAYRANGE_MODEL` | (optional) path to the **AAPL** TimeToChange3 day-range bundle Apple Trader runs on — defaults to `../Models/timetochange3_dayrange_AAPL.joblib`; the two `.pt` checkpoints and the metadata JSON are read from beside it under the same stem. It names one file, so it stands in for AAPL's bundle only |
 | `APPLE_DAYRANGE_MODEL_<TICKER>` | (optional) path to another ticker's day-range bundle (e.g. `APPLE_DAYRANGE_MODEL_GOOGL`) — defaults to `../Models/timetochange3_dayrange_<TICKER>.joblib`, one bundle per symbol the model was fitted on |
