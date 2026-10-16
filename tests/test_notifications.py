@@ -165,40 +165,77 @@ def test_a_failed_send_is_logged_not_raised(monkeypatch):
     assert len(notifications.sent_log(state)) == 1
 
 
-def test_send_email_is_plain_text_over_starttls(monkeypatch):
-    calls = []
+class FakeSMTP:
+    """Records what send_email does; `reject` answers AUTH like Gmail does
+    to a wrong password."""
 
-    class FakeSMTP:
-        def __init__(self, host, port, timeout):
-            calls.append(("connect", host, port))
+    calls: list = []
+    reject = False
 
-        def __enter__(self):
-            return self
+    def __init__(self, host, port, timeout):
+        self.calls.append(("connect", host, port))
+        self.esmtp_features = {}
 
-        def __exit__(self, *exc):
-            return False
+    def __enter__(self):
+        return self
 
-        def starttls(self, context):
-            calls.append(("starttls",))
+    def __exit__(self, *exc):
+        return False
 
-        def login(self, user, password):
-            calls.append(("login", user, password))
+    def starttls(self, context):
+        self.calls.append(("starttls",))
 
-        def send_message(self, msg):
-            calls.append(("send", msg["To"], msg["Subject"], msg.get_content_type(), msg.get_content()))
+    def ehlo_or_helo_if_needed(self):
+        self.esmtp_features = {"auth": " LOGIN PLAIN XOAUTH2"}
 
+    def auth_plain(self):
+        return f"\0{self.user}\0{self.password}"
+
+    def auth(self, mechanism, authobject):
+        self.calls.append(("auth", mechanism, self.user, self.password))
+        if self.reject:
+            raise notifications.smtplib.SMTPAuthenticationError(
+                535, b"5.7.8 Username and Password not accepted. For more information, go to\n"
+                b"5.7.8  https://support.google.com/mail/?p=BadCredentials - gsmtp",
+            )
+        return 235, b"2.7.0 Accepted"
+
+    def send_message(self, msg):
+        self.calls.append(("send", msg["To"], msg["Subject"], msg.get_content_type(), msg.get_content()))
+
+
+@pytest.fixture
+def fake_smtp(monkeypatch):
+    monkeypatch.setattr(FakeSMTP, "calls", [])
     monkeypatch.setattr(notifications.smtplib, "SMTP", FakeSMTP)
     monkeypatch.setenv("SMTP_USER", "bot@example.com")
     monkeypatch.setenv("SMTP_PASSWORD", "app-password")
     monkeypatch.delenv("SMTP_HOST", raising=False)
     monkeypatch.delenv("SMTP_PORT", raising=False)
+    return FakeSMTP
+
+
+def test_send_email_is_plain_text_over_starttls(fake_smtp):
     notifications.send_email("me@example.com", "Hi", "Body\n")
-    assert calls == [
+    assert fake_smtp.calls == [
         ("connect", "smtp.gmail.com", 587),
         ("starttls",),
-        ("login", "bot@example.com", "app-password"),
+        ("auth", "PLAIN", "bot@example.com", "app-password"),
         ("send", "me@example.com", "Hi", "text/plain", "Body\n"),
     ]
+
+
+def test_a_rejected_login_says_why_and_tries_once(fake_smtp, monkeypatch):
+    # smtplib's own login retried with AUTH LOGIN on the connection Gmail had
+    # closed, and the 535 surfaced as "Connection unexpectedly closed".
+    monkeypatch.setattr(fake_smtp, "reject", True)
+    error = notifications.send_and_log(_state(), "me@example.com", "Hi", "Body\n")
+    assert [c[0] for c in fake_smtp.calls] == ["connect", "starttls", "auth"]
+    assert error.startswith(
+        "SMTPAuthenticationError: 535 5.7.8 Username and Password not accepted. "
+        "For more information, go to 5.7.8 https://support.google.com/"
+    )
+    assert "app password" in error
 
 
 def test_send_email_refuses_without_credentials(monkeypatch):

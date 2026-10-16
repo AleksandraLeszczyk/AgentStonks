@@ -148,8 +148,41 @@ def send_email(
     with server:
         if smtp.port != 465:
             server.starttls(context=context)
-        server.login(smtp.user, smtp.password)
+        _login(server, smtp.user, smtp.password)
         server.send_message(msg)
+
+
+def _login(server: smtplib.SMTP, user: str, password: str) -> None:
+    """`server.login`, but with one AUTH method. Refused on its first method,
+    smtplib's login tries the next one on the same connection; Gmail has hung
+    up by then, so its "535 Username and Password not accepted" reached the
+    tab as "SMTPServerDisconnected: Connection unexpectedly closed"."""
+    server.ehlo_or_helo_if_needed()
+    advertised = server.esmtp_features.get("auth", "").upper().split()
+    method = next((m for m in ("PLAIN", "LOGIN") if m in advertised), None)
+    if method is None:
+        # No AUTH, or only methods we don't pick: smtplib's own error.
+        server.login(user, password)
+        return
+    server.user, server.password = user, password
+    server.auth(method, getattr(server, f"auth_{method.lower()}"))
+
+
+def _describe(exc: Exception) -> str:
+    """One readable line for the log and the tab. An SMTP reply's text is
+    bytes with line breaks; a 535 gets the usual Gmail cause."""
+    if not isinstance(exc, smtplib.SMTPResponseException):
+        return f"{type(exc).__name__}: {exc}"
+    reply = exc.smtp_error
+    if isinstance(reply, bytes):
+        reply = reply.decode(errors="replace")
+    text = f"{type(exc).__name__}: {exc.smtp_code} {' '.join(str(reply).split())}"
+    if exc.smtp_code == 535:
+        text += (
+            " (for Gmail, SMTP_PASSWORD must be an app password from Google "
+            "account → Security → App passwords, not the account password)"
+        )
+    return text
 
 
 def send_and_log(state, to: str, subject: str, body: str) -> "str | None":
@@ -160,7 +193,7 @@ def send_and_log(state, to: str, subject: str, body: str) -> "str | None":
         send_email(to, subject, body)
         logger.info("Email sent to %s: %s", to, subject)
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        error = _describe(exc)
         logger.warning("Email to %s failed (%s): %s", to, subject, error)
     log = state.__dict__.setdefault("_notify_sent", [])
     log.append({"at": time.time(), "to": to, "subject": subject, "error": error})
