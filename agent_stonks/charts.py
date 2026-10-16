@@ -24,6 +24,7 @@ from .config import (
     PALETTE,
     PRIOR_PROFILE_COLOR,
     SESSION_MARKER_COLOR,
+    STALL_COLORS,
 )
 
 
@@ -2071,7 +2072,22 @@ def add_candle_patterns(
     row: Optional[int] = 1,
     col: Optional[int] = 1,
 ) -> None:
-    """Draw fair value gaps as boxes behind the candles.
+    """Draw fair value gaps as boxes behind the candles and volume-node
+    stalls as marks over them, between `x0` and `x1`."""
+    items = patterns or []
+    _add_fvg_boxes([p for p in items if p.get("kind") == "fvg"], fig, x0, x1, row, col)
+    _add_stall_marks([p for p in items if p.get("kind") == "stall"], fig, x0, x1, row, col)
+
+
+def _add_fvg_boxes(
+    gaps: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: Optional[int],
+    col: Optional[int],
+) -> None:
+    """Fair value gaps as boxes behind the candles.
 
     Traces rather than shapes, so the legend can hide a whole direction and a
     gap can say what it is on hover: each (direction, filled) set is one
@@ -2083,7 +2099,6 @@ def add_candle_patterns(
     polygons are moved to the front of `fig.data`, which puts them behind the
     candles, as `_add_bands` does for the same reason.
     """
-    gaps = [p for p in patterns or [] if p.get("kind") == "fvg"]
     if not gaps:
         return
     x0, x1 = pd.Timestamp(x0), pd.Timestamp(x1)
@@ -2159,6 +2174,88 @@ def _fvg_hover(gap: dict) -> str:
         lines.append(f"Open · revisited {touched}")
     else:
         lines.append("Open")
+    return "<br>".join(lines)
+
+
+def _add_stall_marks(
+    stalls: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: Optional[int],
+    col: Optional[int],
+) -> None:
+    """Volume-node stalls: ▼ above the bar where a rise stalled under
+    resistance, ▲ under the bar where a fall stalled on support, and a dashed
+    line at the node from the stall's first bar until price closed through it.
+
+    One line trace and one mark trace per side, sharing a legend entry, so a
+    side can be hidden at once; the mark carries the hover. Lines are clipped
+    to `x0`/`x1` like the gaps, and a mark outside them is left out.
+    """
+    if not stalls:
+        return
+    x0, x1 = pd.Timestamp(x0), pd.Timestamp(x1)
+    for side, symbol in (("resistance", "triangle-down"), ("support", "triangle-up")):
+        group = [s for s in stalls if s["side"] == side]
+        color = STALL_COLORS[side]
+        name = f"{side.capitalize()} stall"
+        legendgroup = f"stall_{side}"
+        xs: list = []
+        ys: list = []
+        for stall in group:
+            sx0 = max(_as_tz_of(stall["x0"], x0), x0)
+            sx1 = min(_as_tz_of(stall["x1"], x0), x1)
+            if sx1 > sx0:
+                xs += [sx0, sx1, None]
+                ys += [stall["level"], stall["level"], None]
+        marks = [s for s in group if x0 <= _as_tz_of(s["x"], x0) <= x1]
+        if xs:
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=ys, mode="lines",
+                    line=dict(color=color, width=1.5, dash="dash"),
+                    name=name, legendgroup=legendgroup, showlegend=not marks,
+                    hoverinfo="skip",
+                ),
+                row=row, col=col,
+            )
+        if marks:
+            fig.add_trace(
+                go.Scatter(
+                    x=[_as_tz_of(s["x"], x0) for s in marks],
+                    y=[s["y"] for s in marks],
+                    mode="markers",
+                    marker=dict(symbol=symbol, size=11, color=color,
+                                line=dict(width=1, color=PALETTE["bg"])),
+                    name=name, legendgroup=legendgroup,
+                    customdata=[_stall_hover(s) for s in marks],
+                    hovertemplate="%{customdata}<extra></extra>",
+                ),
+                row=row, col=col,
+            )
+
+
+def _stall_hover(stall: dict) -> str:
+    def hhmm(stamp) -> str:
+        return pd.Timestamp(stamp).tz_convert(market_hours.MARKET_TZ).strftime("%H:%M")
+
+    resistance = stall["side"] == "resistance"
+    node = "POC" if stall.get("poc") else "Volume peak"
+    lines = [
+        f"<b>{'Resistance' if resistance else 'Support'} stall</b> at {stall['level']:.2f} ({node})",
+        f"{'Rose' if resistance else 'Fell'} ${abs(stall['approach']):.2f} in {stall['bars']} bars, "
+        f"then {'+' if stall['stall_move'] >= 0 else '−'}${abs(stall['stall_move']):.2f} "
+        f"in the next {stall['bars']} (stalled {hhmm(stall['x'])})",
+        f"Node holds {stall['node_share']:.0%} of the volume traded before the "
+        f"{'rise' if resistance else 'fall'} (within ±${stall['near']:.2f})",
+    ]
+    if stall.get("volume_ratio") is not None:
+        lines.append(f"Stall volume {stall['volume_ratio']:.1f}× the bars before the move")
+    lines.append(
+        f"Closed through at {hhmm(stall['x1'])}" if stall.get("broken")
+        else f"Not closed through by {hhmm(stall['x1'])}"
+    )
     return "<br>".join(lines)
 
 

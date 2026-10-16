@@ -78,6 +78,8 @@ KEYS = frozenset({
     "candle_pattern_keys",
     "fvg_min_size",
     "fvg_hide_filled",
+    "stall_approach",
+    "stall_min_volume",
     # News and Pre-Market tabs
     "news_impact_method_select",
     "news_llm_provider_select",

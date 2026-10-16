@@ -936,6 +936,12 @@ CANDLE_PATTERN_COLORS: dict[str, str] = {
 }
 CANDLE_PATTERN_OPEN_ALPHA = 0.22
 CANDLE_PATTERN_FILLED_ALPHA = 0.08
+# A volume-node stall's mark and node line: away from the gaps' green/red,
+# so the two patterns read apart when both are on.
+STALL_COLORS: dict[str, str] = {
+    "resistance": "#ffa726",
+    "support": "#4fc3f7",
+}
 
 MA_COLORS: dict[int, str] = {
     5:  "#60a5fa",  # blue

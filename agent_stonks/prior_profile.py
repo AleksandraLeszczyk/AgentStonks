@@ -133,9 +133,10 @@ def _prominences(values: np.ndarray) -> "list[tuple[int, float]]":
     return out
 
 
-def profile_levels(bars: "list[dict]") -> "dict | None":
-    """{"poc", "peaks"} of `bars`' volume profile -- the POC and the other peaks
-    (ascending) as prices -- or None when there is no profile."""
+def profile_peaks(bars: "list[dict]") -> "tuple[np.ndarray, np.ndarray, list[int]] | None":
+    """(slice centres, smoothed volume per slice, peak slices) of `bars`'
+    volume profile, the POC's slice first and the other peaks after it in
+    price order; None when there is no profile."""
     profile = volume_at_price(bars)
     if profile is None:
         return None
@@ -143,11 +144,21 @@ def profile_levels(bars: "list[dict]") -> "dict | None":
     smoothed = _smooth(volume, SMOOTH_BINS)
     top = int(np.argmax(smoothed))
     peaks = [
-        float(centers[i])
+        i
         for i, prominence in _prominences(smoothed)
         if i != top and prominence >= MIN_PROMINENCE * smoothed[top]
     ]
-    return {"poc": float(centers[top]), "peaks": sorted(peaks)}
+    return centers, smoothed, [top] + sorted(peaks)
+
+
+def profile_levels(bars: "list[dict]") -> "dict | None":
+    """{"poc", "peaks"} of `bars`' volume profile -- the POC and the other peaks
+    (ascending) as prices -- or None when there is no profile."""
+    found = profile_peaks(bars)
+    if found is None:
+        return None
+    centers, _, (top, *peaks) = found
+    return {"poc": float(centers[top]), "peaks": [float(centers[i]) for i in peaks]}
 
 
 def previous_session(chart_day: date, daily_bars: "list[dict] | None" = None) -> "date | None":

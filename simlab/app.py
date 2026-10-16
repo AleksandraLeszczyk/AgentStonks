@@ -920,11 +920,18 @@ def _run_overlay_controls(
     return {"items": items, "notes": notes}
 
 
-def _run_pattern_controls(record: dict, symbol: str, bars: "list[dict]") -> "list[dict]":
+def _run_pattern_controls(
+    record: dict, market: SimMarket, symbol: str, days: "list[date]", bars: "list[dict]",
+) -> "list[dict]":
     """Pick which candle patterns to draw over a replayed tape, and find them.
 
     Nothing is pre-selected: unlike a model overlay, no run traded on a
     pattern. Each replayed day is read on its own (`candle_patterns.compute`).
+
+    The stall reads momentum over the run's Apple Trader confirmation period
+    (`DEFAULT_STALL_BARS` for any other run, or one with it off) and each
+    day's typical minute move as the run's trader saw it
+    (`SimMarket.abs_mean_minute_momentum`, last week on the run's feed).
     """
     run_id = record.get("run_id") or "run"
     c1, c2, c3 = st.columns([2, 1.2, 0.8], vertical_alignment="bottom")
@@ -937,27 +944,64 @@ def _run_pattern_controls(record: dict, symbol: str, bars: "list[dict]") -> "lis
             help="Shapes read off the replayed candles themselves. A fair value "
             "gap is three candles where candle 1's wick and candle 3's wick "
             "don't overlap: boxed from candle 1, green up / red down, faded once "
-            "price trades through it. Regular session only.",
+            "price trades through it. A volume-node stall is price running into "
+            "a price where a lot of volume already traded that day and its "
+            "average momentum falling to about zero: orange ▼ under resistance, "
+            "blue ▲ on support, a dashed line at the node until price closes "
+            "through it. Regular session only.",
         )
-    if candle_patterns.FVG_KEY not in selected:
-        return candle_patterns.compute(selected, bars)
-    with c2:
-        min_size = st.slider(
-            "Min FVG size (× avg bar range)",
-            min_value=0.0, max_value=2.0, step=0.25,
-            value=candle_patterns.DEFAULT_FVG_MIN_SIZE,
-            key=f"sim_fvg_min_{run_id}_{symbol}",
-            help="Drops gaps narrower than this many times the average high-low "
-            "range of the 14 bars before them; 0 draws every one.",
+    settings: dict = {}
+    if candle_patterns.FVG_KEY in selected:
+        with c2:
+            settings["min_size"] = st.slider(
+                "Min FVG size (× avg bar range)",
+                min_value=0.0, max_value=2.0, step=0.25,
+                value=candle_patterns.DEFAULT_FVG_MIN_SIZE,
+                key=f"sim_fvg_min_{run_id}_{symbol}",
+                help="Drops gaps narrower than this many times the average high-low "
+                "range of the 14 bars before them; 0 draws every one.",
+            )
+        with c3:
+            settings["hide_filled"] = st.checkbox(
+                "Hide filled", key=f"sim_fvg_hide_{run_id}_{symbol}",
+                help="Only draw gaps price had not traded through by the end of the day.",
+            )
+    if candle_patterns.STALL_KEY in selected:
+        config = _apple_config_from(_apple_config_key(record, symbol))
+        look_back = int(getattr(config, "momentum_confirmation_bars", 0) or 0)
+        settings["stall_bars"] = look_back or candle_patterns.DEFAULT_STALL_BARS
+        s1, s2 = st.columns(2, vertical_alignment="bottom")
+        with s1:
+            settings["stall_approach"] = st.slider(
+                "Stall approach (× minute move)",
+                min_value=0.25, max_value=2.0, step=0.25,
+                value=candle_patterns.DEFAULT_STALL_APPROACH,
+                key=f"sim_stall_approach_{run_id}_{symbol}",
+                help="How fast price must have been moving into the node: its "
+                "average momentum over the look-back before the stall, in typical "
+                "minute moves (the week before each day's mean |1-minute move|).",
+            )
+        with s2:
+            settings["stall_min_volume"] = st.slider(
+                "Min stall volume (× before)",
+                min_value=0.0, max_value=2.0, step=0.25,
+                value=candle_patterns.DEFAULT_STALL_MIN_VOLUME,
+                key=f"sim_stall_volume_{run_id}_{symbol}",
+                help="Only mark a stall whose bars average at least this many times "
+                "the volume of the 30 bars before the move; 0 turns the check off.",
+            )
+        settings["minute_move"] = {
+            day: market.abs_mean_minute_momentum(
+                symbol, datetime.combine(day, time(9, 30), tzinfo=MARKET_TZ)
+            )
+            for day in days
+        }
+        st.caption(
+            f":material/info: Stall look-back {settings['stall_bars']} bars "
+            + ("(the run's momentum confirmation period)." if look_back
+               else "(the run reads no N-bar momentum).")
         )
-    with c3:
-        hide_filled = st.checkbox(
-            "Hide filled", key=f"sim_fvg_hide_{run_id}_{symbol}",
-            help="Only draw gaps price had not traded through by the end of the day.",
-        )
-    return candle_patterns.compute(
-        selected, bars, min_size=min_size, hide_filled=hide_filled
-    )
+    return candle_patterns.compute(selected, bars, **settings)
 
 
 def _render_judge_report(judge_report: dict) -> None:
@@ -1037,7 +1081,7 @@ def _render_run(record: dict) -> None:
                     bars = market.series[sym].minute_bars
                     if bars:
                         overlays = _run_overlay_controls(record, market, sym, days)
-                        patterns = _run_pattern_controls(record, sym, bars)
+                        patterns = _run_pattern_controls(record, market, sym, days, bars)
                         st.plotly_chart(
                             _price_chart(sym, bars, decisions, overlays["items"], patterns)
                         )

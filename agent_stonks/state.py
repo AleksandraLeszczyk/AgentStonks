@@ -419,6 +419,10 @@ class AppState:
         self.candle_pattern_keys: list[str] = []
         self.fvg_min_size: float = 0.5
         self.fvg_hide_filled: bool = False
+        # The volume-node stall's approach (in typical minute moves) and its
+        # minimum stall volume (x the bars before the move, 0 = off).
+        self.stall_approach: float = 1.0
+        self.stall_min_volume: float = 0.0
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False

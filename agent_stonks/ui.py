@@ -933,7 +933,7 @@ def _chart_panel() -> None:
             news_impacts=sym_state.news_impacts,
             fill_gaps=state.fill_gaps,
             model_overlays=overlays["items"],
-            candle_patterns=_live_candle_patterns(state, bars),
+            candle_patterns=_live_candle_patterns(state, sym_state, bars),
             show_momentum=state.show_momentum,
             # getattr: like window_minutes below.
             show_momentum_change=getattr(state, "show_momentum_change", True),
@@ -1269,7 +1269,7 @@ def _live_chart_controls() -> None:
                 )
 
         overlay_keys = _model_overlay_controls(state)
-        pattern_keys, fvg_min_size, fvg_hide_filled = _candle_pattern_controls()
+        patterns = _candle_pattern_controls()
 
         backfill_clicked = st.button(
             "⟲ Backfill missing bars",
@@ -1325,9 +1325,11 @@ def _live_chart_controls() -> None:
         else "live"
     )
     state.model_overlay_keys = overlay_keys
-    state.candle_pattern_keys = pattern_keys
-    state.fvg_min_size = fvg_min_size
-    state.fvg_hide_filled = fvg_hide_filled
+    state.candle_pattern_keys = patterns["keys"]
+    state.fvg_min_size = patterns["fvg_min_size"]
+    state.fvg_hide_filled = patterns["fvg_hide_filled"]
+    state.stall_approach = patterns["stall_approach"]
+    state.stall_min_volume = patterns["stall_min_volume"]
 
 
 
@@ -1522,11 +1524,12 @@ def _model_overlay_controls(state: AppState) -> "list[str]":
     return selected
 
 
-def _candle_pattern_controls() -> "tuple[list[str], float, bool]":
-    """Which candle patterns the price chart draws, and the FVG filters.
+def _candle_pattern_controls() -> dict:
+    """Which candle patterns the price chart draws, and their settings.
 
-    Returns `(keys, fvg_min_size, fvg_hide_filled)`. The filters only show
-    once a fair value gap is selected; the defaults stand otherwise.
+    Returns `{"keys", "fvg_min_size", "fvg_hide_filled", "stall_approach",
+    "stall_min_volume"}`. A pattern's settings only show once it is selected;
+    the defaults stand otherwise.
     """
     st.markdown("**Candle Patterns**")
     with _help_row(
@@ -1535,7 +1538,15 @@ def _candle_pattern_controls() -> "tuple[list[str], float, bool]":
         "candle 3's wick don't overlap. The gap between them is boxed from "
         "candle 1: green for a gap up, red for a gap down, running right until "
         "price trades through it, then faded. Hover a box's left edge for its "
-        "range and when it formed and filled. Regular session only."
+        "range and when it formed and filled. Regular session only.\n"
+        "- **Volume-node stall** — price ran into a price where a lot of volume "
+        "had already traded today (the POC or a peak of the profile before the "
+        "move), and its average momentum over the agent line's look-back fell "
+        "to about zero (inside Apple Trader's neutral band). Orange ▼ where a "
+        "rise stalled under resistance, blue ▲ where a fall stalled on support; "
+        "the dashed line at the node runs until price closes through it. On "
+        "267 stored sessions it did not reliably predict a turn: a visual cue, "
+        "not a signal."
     ):
         selected = st.multiselect(
             "Candle patterns",
@@ -1547,6 +1558,8 @@ def _candle_pattern_controls() -> "tuple[list[str], float, bool]":
         )
     min_size = candle_patterns.DEFAULT_FVG_MIN_SIZE
     hide_filled = False
+    approach = candle_patterns.DEFAULT_STALL_APPROACH
+    min_volume = candle_patterns.DEFAULT_STALL_MIN_VOLUME
     if candle_patterns.FVG_KEY in selected:
         c1, c2 = st.columns(2, vertical_alignment="bottom")
         with c1:
@@ -1566,14 +1579,55 @@ def _candle_pattern_controls() -> "tuple[list[str], float, bool]":
                 key="fvg_hide_filled",
                 help="Only draw gaps price has not yet traded through.",
             )
-    return selected, float(min_size), bool(hide_filled)
+    if candle_patterns.STALL_KEY in selected:
+        c1, c2 = st.columns(2, vertical_alignment="bottom")
+        with c1:
+            approach = st.slider(
+                "Stall approach (× minute move)",
+                min_value=0.25, max_value=2.0, step=0.25,
+                value=candle_patterns.DEFAULT_STALL_APPROACH,
+                key="stall_approach",
+                help="How fast price must have been moving into the node: its "
+                "average momentum over the look-back before the stall, in "
+                "typical minute moves (last week's mean |1-minute move|). On "
+                "stored sessions, with a 5-bar look-back: 1.0 marks about one "
+                "stall every two sessions, 0.5 about two a session, 0.25 about "
+                "five.",
+            )
+        with c2:
+            min_volume = st.slider(
+                "Min stall volume (× before)",
+                min_value=0.0, max_value=2.0, step=0.25,
+                value=candle_patterns.DEFAULT_STALL_MIN_VOLUME,
+                key="stall_min_volume",
+                help="Only mark a stall whose bars average at least this many "
+                "times the volume of the 30 bars before the move: heavy "
+                "trading with no progress. 0 turns the check off. On stored "
+                "sessions it made a turn less likely, not more.",
+            )
+    return {
+        "keys": selected,
+        "fvg_min_size": float(min_size),
+        "fvg_hide_filled": bool(hide_filled),
+        "stall_approach": float(approach),
+        "stall_min_volume": float(min_volume),
+    }
 
 
-def _live_candle_patterns(state: AppState, bars: "list[dict]") -> "list[dict]":
-    """The selected candle patterns over one symbol's live bars."""
+def _live_candle_patterns(state: AppState, sym_state, bars: "list[dict]") -> "list[dict]":
+    """The selected candle patterns over one symbol's live bars. The stall
+    reads momentum over the agent line's look-back and, on 1-minute bars,
+    against last week's typical minute move; on coarser bars, or before that
+    is measured, against the session's own."""
+    one_minute = TF_MINUTES.get(getattr(state, "timeframe", "1Min"), 1) == 1
     return candle_patterns.compute(
         state.candle_pattern_keys, bars,
         min_size=state.fvg_min_size, hide_filled=state.fvg_hide_filled,
+        stall_bars=_agent_momentum(state, sym_state)[0],
+        minute_move=sym_state.abs_mean_minute_momentum if one_minute else None,
+        # getattr: an AppState kept across a code save predates these.
+        stall_approach=getattr(state, "stall_approach", candle_patterns.DEFAULT_STALL_APPROACH),
+        stall_min_volume=getattr(state, "stall_min_volume", candle_patterns.DEFAULT_STALL_MIN_VOLUME),
     )
 
 
@@ -2713,7 +2767,7 @@ def _build_agent_report_html(state: AppState, symbols: list[str]) -> str:
                     model_overlays=model_overlays.live_overlays(
                         sym_state, bars, state.model_overlay_keys,
                     )["items"],
-                    candle_patterns=_live_candle_patterns(state, bars),
+                    candle_patterns=_live_candle_patterns(state, sym_state, bars),
                     show_momentum=state.show_momentum,
                     show_momentum_change=getattr(state, "show_momentum_change", True),
                     minute_momentum_profile=sym_state.minute_momentum_profile,
