@@ -137,12 +137,12 @@ def notifications_panel(state) -> None:
             icon=":material/send:",
             disabled=bool(missing) or not to,
             key="notify_test",
+            help="Sends the status email now, as it reads at this moment, with "
+            "today's trades — whether or not the agent is running.",
         ):
             with st.spinner(f"Sending to {to}…"):
-                error = notifications.send_and_log(
-                    state, to, "Agent Stonks test email",
-                    "Notifications from Agent Stonks reach this address.\n",
-                )
+                subject, body = notifications.current_status_email(state)
+                error = notifications.send_and_log(state, to, subject, body)
             if error:
                 st.error(f"Not sent: {error}")
             else:

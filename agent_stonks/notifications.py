@@ -18,6 +18,7 @@ has closed the page.
   inside one poll go out in one email.
 - **The status email** goes every N minutes while the agent is running, the
   first one N minutes after it started (or after the option was switched on).
+  The tab's "Send test email" sends it once, as it reads at that moment.
 - **Never a replay**: Dummy data trades nothing real.
 - A failed send is logged and shown in the tab, not retried: retrying a dead
   server every poll would only fill the log.
@@ -270,19 +271,38 @@ def transaction_email(trades: list, venue: str) -> "tuple[str, str]":
     return subject, "\n".join(lines) + "\n"
 
 
-def summary_email(state, trades_since: list, now: "datetime | None" = None) -> "tuple[str, str]":
-    """(subject, body) for the every-N-minutes status email."""
+def summary_email(
+    state,
+    trades_since: list,
+    now: "datetime | None" = None,
+    trades_label: str = "Trades since last update",
+) -> "tuple[str, str]":
+    """(subject, body) for the status email: what the agent and the stream are
+    doing, the portfolio, and `trades_since` under `trades_label`."""
     now = now or datetime.now(timezone.utc)
     tracker = state.decision_tracker
+    symbols = ", ".join(state.symbols) or "no symbols"
+    running = "running" if state.agent_running else "stopped"
+    # Before the first ▶ Start Agent no venue has been resolved, and
+    # trading_mode's "local" default is not one the user chose.
+    if state.trading_mode_requested:
+        venue = f"on {_VENUES.get(state.trading_mode, state.trading_mode)}"
+    else:
+        venue = "(no venue chosen yet)"
+
+    subject = f"Agent Stonks {_et(now)}"
+    lines = [f"{_et(now)}. Agent {running} {venue} ({symbols})."]
+    activity = state.agent_activity if state.agent_running else None
+    if activity:
+        lines.append(f"{activity[1]}.")
+    lines.append(f"Stream: {state.status}")
+    if tracker is None:
+        lines.append("No ledger yet: the agent has not been started.")
+        return subject, "\n".join(lines) + "\n"
+
     snap = tracker.snapshot()
     value = state.mark_to_market()
     start = float(getattr(state, "starting_budget", 0.0) or 0.0)
-    venue_name = _VENUES.get(state.trading_mode, state.trading_mode)
-    symbols = ", ".join(state.symbols) or "no symbols"
-    running = "running" if state.agent_running else "stopped"
-
-    subject = f"Agent Stonks {_et(now)}"
-    lines = [f"{_et(now)}. Agent {running} on {venue_name} ({symbols})."]
     if value is not None:
         change = value - start if start else None
         if change is not None:
@@ -306,12 +326,28 @@ def summary_email(state, trades_since: list, now: "datetime | None" = None) -> "
         lines.append(f"Open: {', '.join(parts)}.")
     else:
         lines.append("Open: none.")
-    lines.append(f"Trades since last update: {len(trades_since)}")
+    lines.append(f"{trades_label}: {len(trades_since)}")
     for d in trades_since[-SUMMARY_TRADE_LINES:]:
         lines.append(f"  {_trade_line(d)}")
     if len(trades_since) > SUMMARY_TRADE_LINES:
         lines.append(f"  (and {len(trades_since) - SUMMARY_TRADE_LINES} earlier)")
     return subject, "\n".join(lines) + "\n"
+
+
+def current_status_email(state, now: "datetime | None" = None) -> "tuple[str, str]":
+    """(subject, body) for the tab's test send: the status email as it reads
+    now, whether or not the agent runs, listing today's trades (there is no
+    last update to count from)."""
+    now = now or datetime.now(timezone.utc)
+    tracker = state.decision_tracker
+    fills = filled_trades(tracker.snapshot()["decisions"]) if tracker is not None else []
+    today = now.astimezone(MARKET_TZ).date()
+    todays = [
+        d for d in fills
+        if (ts := parse_iso(d.ts)) is not None and ts.astimezone(MARKET_TZ).date() == today
+    ]
+    subject, body = summary_email(state, todays, now, trades_label="Trades today")
+    return f"Test: {subject}", body
 
 
 # --- the watcher -------------------------------------------------------------

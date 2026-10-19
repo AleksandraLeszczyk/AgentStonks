@@ -33,7 +33,7 @@ def _fill(ts, action="buy", qty=10.0, price=230.15, symbol="AAPL", status="fille
 def _state(*decisions, running=True):
     state = AppState()
     state.symbols = ["AAPL"]
-    state.trading_mode = "alpaca_paper"
+    state.trading_mode = state.trading_mode_requested = "alpaca_paper"
     state.agent_running = running
     state.starting_budget = 100_000.0
     tracker = DecisionTracker(starting_cash=100_000.0)
@@ -123,10 +123,17 @@ def test_status_email_every_n_minutes_while_running(outbox, monkeypatch):
 
     state.decision_tracker.decisions.append(_fill(T0 + timedelta(minutes=10)))
     state.decision_tracker.positions = {"AAPL": 10.0}
+    state.agent_activity = ("🟢", "Agent holding 10 AAPL")
+    state.status = "✅ Streaming AAPL (SIP)"
     watcher.poll(state, settings, T0 + timedelta(minutes=30))
     assert len(outbox) == 1
     mail = outbox[0]
     assert mail["subject"] == "Agent Stonks 10:30 ET: $101,234.56 (+$1,234.56)"
+    assert mail["body"].startswith(
+        "10:30 ET. Agent running on Alpaca paper (AAPL).\n"
+        "Agent holding 10 AAPL.\n"
+        "Stream: ✅ Streaming AAPL (SIP)\n"
+    )
     assert "+1.23% since start" in mail["body"]
     assert "Open: 10 AAPL" in mail["body"]
     assert "Trades since last update: 1" in mail["body"]
@@ -146,6 +153,35 @@ def test_no_status_email_while_the_agent_is_stopped(outbox):
     for minute in range(0, 60, 5):
         watcher.poll(state, settings, T0 + timedelta(minutes=minute))
     assert outbox == []
+
+
+def test_test_send_is_the_status_email_now_with_todays_trades(monkeypatch):
+    state = _state(
+        _fill(T0 - timedelta(days=1)),
+        _fill(T0, "buy", 10, 230.15),
+        _fill(T0 + timedelta(minutes=5), "sell", 10, 231.0),
+        running=False,
+    )
+    state.agent_activity = ("🟢", "Agent holding 10 AAPL")  # stale: not running
+    monkeypatch.setattr(state, "mark_to_market", lambda: 100_008.50)
+    subject, body = notifications.current_status_email(state, T0 + timedelta(minutes=30))
+    assert subject == "Test: Agent Stonks 10:30 ET: $100,008.50 (+$8.50)"
+    assert body.startswith("10:30 ET. Agent stopped on Alpaca paper (AAPL).\nStream: Idle\n")
+    assert "Trades today: 2" in body
+    assert "10:00 ET buy 10 AAPL @ $230.15" in body
+    assert "10:05 ET sell 10 AAPL @ $231.00" in body
+
+
+def test_test_send_before_the_agent_ever_ran():
+    state = AppState()
+    state.symbols = ["AAPL", "INTC"]
+    subject, body = notifications.current_status_email(state, T0)
+    assert subject == "Test: Agent Stonks 10:00 ET"
+    assert body == (
+        "10:00 ET. Agent stopped (no venue chosen yet) (AAPL, INTC).\n"
+        "Stream: Idle\n"
+        "No ledger yet: the agent has not been started.\n"
+    )
 
 
 def test_a_failed_send_is_logged_not_raised(monkeypatch):
@@ -289,3 +325,19 @@ def test_tab_picks_up_a_change_made_in_another_tab(monkeypatch):
     notifications.save_settings(Settings(email_to="other@example.com"))
     at.run()
     assert at.text_input(key="notify_email_to").value == "other@example.com"
+
+
+def test_tab_test_button_sends_the_status_email(monkeypatch, outbox):
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("SMTP_USER", "bot@example.com")
+    monkeypatch.setenv("SMTP_PASSWORD", "app-password")
+    notifications.save_settings(Settings(email_to="me@example.com"))
+    at = AppTest.from_function(_tab_app).run()
+    at.button(key="notify_test").click().run()
+    assert not at.exception
+    assert len(outbox) == 1
+    assert outbox[0]["to"] == "me@example.com"
+    assert outbox[0]["subject"].startswith("Test: Agent Stonks ")
+    assert "No ledger yet: the agent has not been started." in outbox[0]["body"]
+    assert at.success[0].value == "Sent to me@example.com."
