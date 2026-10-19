@@ -494,6 +494,60 @@ class TestMomentumPanel:
         assert "Net gamma" not in [tr.name for tr in fig.data]
         assert fig.layout.height == 395 + 3 * charts.PANEL_PX
 
+    def aggressiveness(self, bars, settled_upto=None):
+        n = len(bars)
+        settled_upto = n if settled_upto is None else settled_upto
+        return {
+            "t": [b["t"] for b in bars],
+            "value": [(-1) ** i * 0.1 * (i % 7) for i in range(n)],
+            "settled": [i < settled_upto for i in range(n)],
+            "traded": [2.5e6] * n,
+            "note": "",
+        }
+
+    def test_aggressiveness_sits_under_momentum_and_over_net_gamma(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          aggressiveness=self.aggressiveness(bars), net_gamma=self.gamma(bars))
+        # Row 5 col 1 is y9, under momentum Δ's y7; net gamma one further down.
+        assert self.trace(fig, "Aggressiveness").yaxis == "y9"
+        assert self.trace(fig, "Net gamma").yaxis == "y11"
+        assert fig.layout.yaxis9.title.text == "Aggressiveness"
+        assert fig.layout.height == 395 + 5 * charts.PANEL_PX
+
+    def test_aggressiveness_under_the_volume_without_momentum(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          aggressiveness=self.aggressiveness(bars))
+        assert self.trace(fig, "Aggressiveness").yaxis == "y5"
+
+    def test_unsettled_aggressiveness_bars_are_paler(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          aggressiveness=self.aggressiveness(bars, settled_upto=44))
+        tr = self.trace(fig, "Aggressiveness")
+        assert list(tr.marker.opacity) == [0.8] * 44 + [0.35] * 16
+        assert tr.customdata[0] == "SIP · $2.5M traded"
+        assert tr.customdata[-1].startswith("IEX")
+
+    def test_aggressiveness_label_is_a_ratio_not_dollars(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          aggressiveness=self.aggressiveness(bars))
+        last = 0.1 * (59 % 7) * (-1) ** 59
+        labels = [a.text for a in fig.layout.annotations if a.yref == "y5"]
+        assert f" -{abs(last):.2f}" in labels
+
+    def test_no_aggressiveness_yet_says_so_in_the_panel(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True,
+                          aggressiveness={"t": [], "value": [], "settled": [], "traded": [],
+                                          "note": "Fetching trades and quotes…"})
+        assert any(a.text == "Fetching trades and quotes…" for a in fig.layout.annotations)
+
+    def test_no_aggressiveness_panel_by_default(self):
+        fig = build_chart(self.rth_bars(60), [], [], "AAPL", SESSION_START, show_momentum=True)
+        assert "Aggressiveness" not in [tr.name for tr in fig.data]
+
     def test_momentum_change_can_be_left_out(self):
         bars = self.rth_bars(60)
         fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,

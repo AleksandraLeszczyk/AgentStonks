@@ -737,6 +737,32 @@ class TestBuyTime:
         assert _buy_time([old], self.START, "first") is None
 
 
+def _chart_settings_app():
+    from agent_stonks import ui
+    ui._live_chart_controls()
+
+
+class TestAggressivenessPanelChoice:
+    """Chart Settings → Panels: Aggressiveness is offered, and off until chosen."""
+
+    def test_off_by_default_and_on_when_chosen(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks import ui
+        state = AppState()
+        monkeypatch.setattr(ui, "_get_state", lambda: state)
+
+        app = AppTest.from_function(_chart_settings_app).run()
+        assert not app.exception
+        panels = app.multiselect(key="chart_panels")
+        assert "Aggressiveness" in panels.options
+        assert "Aggressiveness" not in panels.value
+        assert state.show_aggressiveness is False and state.show_net_gamma is True
+
+        panels.select("Aggressiveness").run()
+        assert not app.exception
+        assert state.show_aggressiveness is True
+
+
 class TestOrchestraIsItsOwnAgent:
     """Orchestra is a personality of its own, not a mode of Apple Trader."""
 

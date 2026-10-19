@@ -87,6 +87,7 @@ from .config import (
     PREMARKET_POLL_SEC,
     ORCHESTRA_CANDIDATES_POLL_SEC,
     SESSION_START,
+    SIP_DELAY_MIN,
     TACTICS_MOMENTUM_WINDOW_MIN,
     TIMEFRAMES,
     TRADE_FIXED_COST,
@@ -127,7 +128,7 @@ from .state import (
     today_daily_bar,
 )
 from .tactics import tactic_price_levels, tactics_summaries
-from . import bar_history, gamma_history, minute_momentum, newsimpact_model, prior_profile, stream_common
+from . import aggressiveness, bar_history, gamma_history, minute_momentum, newsimpact_model, prior_profile, stream_common
 from .trade_sound import next_trade_cue, play_trade_sound
 from .page_watchdog import WATCHDOG_BEAT_SEC, describe_reload, page_watchdog
 from .quote_card import quote_card
@@ -434,8 +435,10 @@ def _parse_ma_periods(ma_selection: list[str]) -> list[int]:
     return [mapping[s] for s in ma_selection if s in mapping]
 
 
-# The panels Chart Settings can draw under the volume, top to bottom.
-_CHART_PANELS = ("Momentum", "Momentum Δ", "Net gamma")
+# The panels Chart Settings can draw under the volume, top to bottom, and the
+# ones drawn until chosen otherwise.
+_CHART_PANELS = ("Momentum", "Momentum Δ", "Aggressiveness", "Net gamma")
+_DEFAULT_CHART_PANELS = ("Momentum", "Momentum Δ", "Net gamma")
 
 
 def _parse_avg_flags(ma_selection: list[str]) -> tuple[bool, bool, bool]:
@@ -908,6 +911,13 @@ def _chart_panel() -> None:
             _live_gamma_series(sym_state, bars, state.timeframe)
             if state.show_net_gamma else None
         )
+        # getattr: like window_minutes below.
+        aggressiveness_series = (
+            aggressiveness.series(
+                sym, state.timeframe, bars, state.api_key, state.api_secret,
+            )
+            if getattr(state, "show_aggressiveness", False) else None
+        )
 
         fig = build_chart(
             bars,
@@ -946,6 +956,7 @@ def _chart_panel() -> None:
             option_walls=option_walls,
             day_range_lines=day_range_lines,
             net_gamma=net_gamma,
+            aggressiveness=aggressiveness_series,
             prior_profile=prior_profile_levels,
             # getattr: an AppState built before this setting existed and kept
             # across a code save falls back to the old class's defaults,
@@ -1211,6 +1222,21 @@ def _live_chart_controls() -> None:
                 "above zero the move is speeding up (or a fall is easing), below "
                 "zero it is slowing (or a fall is steepening). Its dark band is the "
                 "same mean + 1σ, of the absolute Δ.\n"
+                "- **Aggressiveness** — (value traded closer to the ask − value "
+                "traded closer to the bid) ÷ value of every trade, from −1 "
+                "(every dollar hit the bid) to +1 (every dollar lifted the "
+                "offer). Each trade, price × size, is compared with the last "
+                "quote before it; a trade at the midpoint counts only in the "
+                "total, so the consolidated tape's many midpoint prints (dark "
+                "pools) pull it towards zero. Auction crosses, late or "
+                "out-of-sequence reports and average-price prints are left "
+                "out. Trades and quotes come from Alpaca REST: the consolidated "
+                f"tape (SIP) for minutes over {SIP_DELAY_MIN} minutes old, IEX "
+                "for the ones since — paler bars, replaced by SIP as they age. "
+                "Regular session only. Fetched in the background only while the "
+                "panel is shown — after a mid-day start a few minutes to fill "
+                "the morning in, newest first — and kept per minute, across a "
+                "reload or a restart too.\n"
                 "- **Net gamma** — the options market's net dealer gamma, in $M "
                 "per 1% move, at each bar's close. Green where dealers are long "
                 "gamma — their hedging sells rallies and buys dips, damping moves "
@@ -1237,13 +1263,14 @@ def _live_chart_controls() -> None:
                 panel_selection = st.multiselect(
                     "Panels",
                     list(_CHART_PANELS),
-                    default=list(_CHART_PANELS),
+                    default=list(_DEFAULT_CHART_PANELS),
                     key="chart_panels",
                     placeholder="Panels",
                     label_visibility="collapsed",
                 )
             show_momentum = "Momentum" in panel_selection
             show_momentum_change = "Momentum Δ" in panel_selection
+            show_aggressiveness = "Aggressiveness" in panel_selection
             show_net_gamma = "Net gamma" in panel_selection
 
         st.markdown("**Price Profile Fit**")
@@ -1327,6 +1354,7 @@ def _live_chart_controls() -> None:
     state.show_whiskers = show_whiskers
     state.show_momentum = show_momentum
     state.show_momentum_change = show_momentum_change
+    state.show_aggressiveness = show_aggressiveness
     state.show_net_gamma = show_net_gamma
     state.show_pre_market = show_pre_market
     state.chart_window_min = window_min if isinstance(window_min, int) else 0

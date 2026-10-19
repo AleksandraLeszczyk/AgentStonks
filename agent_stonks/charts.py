@@ -1249,8 +1249,8 @@ def _add_momentum_panels(
                 _add_agent_momentum_line(fig, row, series, label, what)
 
 
-# One panel under the price (volume, momentum, momentum Δ, net gamma), in
-# pixels.
+# One panel under the price (volume, momentum, momentum Δ, aggressiveness,
+# net gamma), in pixels.
 PANEL_PX = 122.0
 
 
@@ -1273,6 +1273,37 @@ def _add_net_gamma_panel(df: pd.DataFrame, fig: go.Figure, row: int, net_gamma: 
         hover="Net gamma %{y:+$,.1f}M per 1% move<extra></extra>",
         warm_up=net_gamma.get("note") or "No options chain yet",
         unit="M",
+    )
+
+
+# How opaque an aggressiveness bar is once settled on SIP, and before.
+AGGRESSIVENESS_OPACITY = {True: 0.8, False: 0.35}
+
+
+def _add_aggressiveness_panel(
+    df: pd.DataFrame, fig: go.Figure, row: int, aggressiveness: dict
+) -> None:
+    """Each bar's transaction aggressiveness, -1 to +1: green where more of
+    the value traded closer to the ask, red closer to the bid, paler while
+    the bar is on IEX. See `build_chart`'s `aggressiveness`."""
+    stamps = pd.to_datetime(pd.Series(aggressiveness.get("t") or [], dtype=object), utc=True)
+    index = pd.DatetimeIndex(stamps)
+    values = pd.Series(aggressiveness.get("value") or [], index=index, dtype=float)
+    settled = pd.Series(aggressiveness.get("settled") or [True] * len(values), index=index)
+    traded = pd.Series(aggressiveness.get("traded") or [0.0] * len(values), index=index)
+    # Only over the candles drawn.
+    shown = values.index >= df["t"].iloc[0] if len(values) else []
+    values, settled, traded = values[shown], settled[shown], traded[shown]
+    tape = ["SIP" if s else "IEX until SIP replaces it" for s in settled]
+    _add_bar_by_bar_panel(
+        df, fig, row, values,
+        pd.Series([f"{t} · ${v / 1e6:,.1f}M traded" for t, v in zip(tape, traded)],
+                  index=values.index, dtype=object),
+        name="Aggressiveness",
+        hover="Aggressiveness %{y:+.2f}<br>%{customdata}<extra></extra>",
+        warm_up=aggressiveness.get("note") or "No trades with a quote yet",
+        prefix="",
+        marker_opacity=[AGGRESSIVENESS_OPACITY[bool(s)] for s in settled],
     )
 
 
@@ -1394,9 +1425,13 @@ def _add_bar_by_bar_panel(
     hover: str,
     warm_up: str,
     unit: str = "",
+    prefix: str = "$",
+    marker_opacity: "list[float] | None" = None,
 ) -> None:
     """One dollar series as a bar per chart bar, green above zero, red below.
-    `unit` follows the last value's label ("M" for a series in $M)."""
+    `prefix` leads and `unit` follows the last value's label ("M" for a series
+    in $M; no "$" for a ratio). `marker_opacity` sets each bar's own opacity
+    instead of one for all."""
     if not values.notna().any():
         # Say why the panel is empty rather than leaving a blank box. The panel
         # still gets one invisible trace over the drawn bars' span: its x axis
@@ -1434,7 +1469,8 @@ def _add_bar_by_bar_panel(
                 PALETTE["up"] if v >= 0 else PALETTE["down"] for v in values.fillna(0.0)
             ],
             marker_line_width=0,
-            opacity=0.8,
+            marker_opacity=marker_opacity,
+            opacity=0.8 if marker_opacity is None else 1.0,
             width=_bar_width_ms(df),
             name=name,
             showlegend=False,
@@ -1450,7 +1486,7 @@ def _add_bar_by_bar_panel(
     fig.add_annotation(
         x=last_at.tz_convert("UTC"),
         y=value,
-        text=f" {'+' if value >= 0 else '-'}${abs(value):.2f}{unit}",
+        text=f" {'+' if value >= 0 else '-'}{prefix}{abs(value):.2f}{unit}",
         font=dict(
             color=PALETTE["up"] if value >= 0 else PALETTE["down"],
             size=11,
@@ -2412,6 +2448,7 @@ def build_chart(
     option_walls: Optional[dict] = None,
     day_range_lines: Optional[dict] = None,
     net_gamma: Optional[dict] = None,
+    aggressiveness: Optional[dict] = None,
     prior_profile: Optional[dict] = None,
     window_minutes: Optional[int] = None,
     view_from: Optional[datetime] = None,
@@ -2438,11 +2475,18 @@ def build_chart(
     momentum Δ panel, each on its own; `show_momentum_change` left None follows
     `show_momentum`, the two panels together.
 
-    `net_gamma` adds a panel at the bottom -- under the momentum panels when
-    they are shown -- with the options chain's net dealer gamma at each bar's
-    close: `{"t": [...], "value": [...], "note": str}`, values in $ per 1%
-    move (`options.net_gamma_exposure`). Empty values draw the panel with
-    `note` in it; None draws no panel.
+    `aggressiveness` adds a panel under the momentum panels (or under the
+    volume without them) with each bar's transaction aggressiveness --
+    `{"t": [...], "value": [...], "settled": [...], "traded": [...], "note":
+    str}` from `aggressiveness.series`, values from -1 to +1. A bar not yet
+    `settled` is drawn paler: its minutes are on IEX until SIP replaces them.
+    Empty values draw the panel with `note` in it; None draws no panel.
+
+    `net_gamma` adds a panel at the bottom -- under the momentum and
+    aggressiveness panels when they are shown -- with the options chain's net
+    dealer gamma at each bar's close: `{"t": [...], "value": [...], "note":
+    str}`, values in $ per 1% move (`options.net_gamma_exposure`). Empty
+    values draw the panel with `note` in it; None draws no panel.
 
     `prior_profile` draws the previous session's volume-profile levels,
     `{"poc": float | None, "peaks": [float, ...]}` (`prior_profile.levels`),
@@ -2492,7 +2536,11 @@ def build_chart(
     momentum_row = 3 if show_momentum else None
     change_row = (4 if show_momentum else 3) if show_momentum_change else None
     n_rows = max(2, momentum_row or 0, change_row or 0)
-    # Net gamma goes last, so it sits under the momentum panels when shown.
+    # Aggressiveness straight under the momentum panels, net gamma last.
+    aggressiveness_row = None
+    if aggressiveness is not None:
+        n_rows += 1
+        aggressiveness_row = n_rows
     gamma_row = None
     if net_gamma is not None:
         n_rows += 1
@@ -2663,6 +2711,8 @@ def build_chart(
             change_profile=minute_momentum_change_profile,
             agent_bars=agent_momentum_bars, agent_label=agent_momentum_label,
         )
+    if aggressiveness_row is not None:
+        _add_aggressiveness_panel(df, fig, aggressiveness_row, aggressiveness)
     if gamma_row is not None:
         _add_net_gamma_panel(df, fig, gamma_row, net_gamma)
 
@@ -2857,6 +2907,18 @@ def build_chart(
                 row=row,
                 col=1,
             )
+    if aggressiveness_row is not None:
+        fig.update_xaxes(showgrid=True, gridcolor=PALETTE["grid"], row=aggressiveness_row, col=1)
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor=PALETTE["grid"],
+            tickfont=dict(size=10),
+            zeroline=False,
+            tickformat="+.1f",
+            title=dict(text="Aggressiveness", font=dict(size=10)),
+            row=aggressiveness_row,
+            col=1,
+        )
     if gamma_row is not None:
         fig.update_xaxes(showgrid=True, gridcolor=PALETTE["grid"], row=gamma_row, col=1)
         fig.update_yaxes(

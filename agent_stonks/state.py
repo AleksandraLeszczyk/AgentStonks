@@ -274,6 +274,7 @@ _DEFAULTS: dict[str, object] = {
     "show_whiskers": True,
     "show_momentum": True,
     "show_momentum_change": True,
+    "show_aggressiveness": False,
     "show_net_gamma": True,
     "show_pre_market": False,
     "chart_window_min": 0,
@@ -436,6 +437,9 @@ class AppState:
         self.show_momentum: bool = True
         # ...and its change (momentum Δ) in one more under that.
         self.show_momentum_change: bool = True
+        # Each bar's transaction aggressiveness in a panel under those
+        # (`agent_stonks.aggressiveness`).
+        self.show_aggressiveness: bool = False
         # Draw the options chain's net dealer gamma in a panel under momentum Δ.
         self.show_net_gamma: bool = True
         # Start the live chart at the day's first bar rather than

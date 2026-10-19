@@ -136,6 +136,43 @@ def fetch_bars_range(
         params["page_token"] = token
 
 
+def fetch_ticks(
+    kind: str,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    key: str,
+    secret: str,
+    feed: str = "sip",
+    page_limit: int = 10000,
+) -> list[dict]:
+    """Every trade (`kind` "trades") or quote ("quotes") in [start, end) from
+    Alpaca, oldest first, following `next_page_token`. Raises on HTTP error."""
+    params = dict(
+        symbols=symbol,
+        start=start.astimezone(timezone.utc).isoformat(),
+        end=end.astimezone(timezone.utc).isoformat(),
+        limit=page_limit,
+        feed=feed,
+        sort="asc",
+    )
+    ticks: list[dict] = []
+    while True:
+        r = requests.get(
+            f"{DATA_REST}/v2/stocks/{kind}",
+            headers=_headers(key, secret),
+            params=params,
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        ticks.extend((payload.get(kind) or {}).get(symbol) or [])
+        token = payload.get("next_page_token")
+        if not token:
+            return ticks
+        params["page_token"] = token
+
+
 def fetch_trades(
     symbol: str,
     key: str,
