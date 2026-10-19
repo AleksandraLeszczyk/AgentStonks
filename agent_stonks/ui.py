@@ -890,6 +890,8 @@ def _chart_panel() -> None:
         # Price levels at which armed tactics (standing conditional orders) execute.
         tactic_levels = tactic_price_levels(sym_state.tactics)
         decisions = tracker.trade_markers(symbol=sym) if tracker else None
+        window_buy = getattr(state, "chart_window_buy", "")
+        view_from = _buy_time(decisions, chart_start, window_buy) if window_buy else None
 
         predicted_profile = (
             predicted_open_profile(sym_state, bars)
@@ -949,8 +951,11 @@ def _chart_panel() -> None:
             # across a code save falls back to the old class's defaults,
             # which don't have it.
             window_minutes=getattr(state, "chart_window_min", 0),
+            view_from=view_from,
         )
         st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
+        if window_buy and view_from is None:
+            st.caption(f":material/info: {sym} — no buy yet today, so the whole session is shown.")
         for note in overlays["notes"]:
             st.caption(f":material/info: {sym} — {note}")
         if not state.show_momentum:
@@ -1029,6 +1034,19 @@ def _agent_momentum_kwargs(state, sym_state) -> dict:
     return {"agent_momentum_bars": bars, "agent_momentum_label": label}
 
 
+def _buy_time(decisions: "list[dict] | None", chart_start, which: str):
+    """When the chart's first ("first") or most recent ("last") filled buy
+    since `chart_start` was, or None before any."""
+    times = [
+        t for t in (pd.to_datetime(d["ts"], utc=True) for d in decisions or []
+                    if d.get("action") == "buy")
+        if t > pd.Timestamp(chart_start)
+    ]
+    if not times:
+        return None
+    return min(times) if which == "first" else max(times)
+
+
 def _live_chart_controls() -> None:
     state = _get_state()
     with st.expander("Chart Settings"):
@@ -1041,13 +1059,15 @@ def _live_chart_controls() -> None:
                 list(_CHART_WINDOWS),
                 format_func=_CHART_WINDOWS.get,
                 key="chart_window",
-                help="Only the last hour or two of the chart, up to the newest "
-                "bar, with the price and every panel under it rescaled to what "
-                "is in view. The price profile beside it is the volume traded "
-                "in the window only. VWAP, the averages, momentum and the "
-                "levels are still worked out from the whole session — for "
-                "them only the view narrows. Early in the day, while the "
-                "session is shorter than the window, it is the whole session.",
+                help="Only the last hour or two of the chart, or the part since "
+                "the agent's first or most recent buy today (from one bar "
+                "before it), up to the newest bar, with the price and every "
+                "panel under it rescaled to what is in view. The price profile "
+                "beside it is the volume traded in the window only. VWAP, the "
+                "averages, momentum and the levels are still worked out from "
+                "the whole session — for them only the view narrows. Early in "
+                "the day, while the session is shorter than the window, or "
+                "before the first buy, it is the whole session.",
             )
 
         c1, c2 = st.columns(2)
@@ -1309,7 +1329,8 @@ def _live_chart_controls() -> None:
     state.show_momentum_change = show_momentum_change
     state.show_net_gamma = show_net_gamma
     state.show_pre_market = show_pre_market
-    state.chart_window_min = window_min
+    state.chart_window_min = window_min if isinstance(window_min, int) else 0
+    state.chart_window_buy = window_min if isinstance(window_min, str) else ""
     state.volume_baseline_window = volume_baseline_window
     state.fill_gaps = fill_gaps
     state.vwap_style = "dot" if show_vwap else "hide"
@@ -1336,8 +1357,12 @@ def _live_chart_controls() -> None:
 
 
 # Chart Settings → Show: minutes back from the newest bar, 0 for the whole
-# session (`build_chart`'s `window_minutes`).
-_CHART_WINDOWS = {0: "Whole session", 60: "Last hour", 120: "Last 2 hours"}
+# session (`build_chart`'s `window_minutes`), or which of the day's buys the
+# view starts at (`_buy_time`, `build_chart`'s `view_from`).
+_CHART_WINDOWS = {
+    0: "Whole session", 60: "Last hour", 120: "Last 2 hours",
+    "first": "Since first buy", "last": "Since most recent buy",
+}
 
 # `_help_row`'s icon column inside one of Chart Settings' two half-width columns.
 _HALF_WIDTH_ICON = 0.16

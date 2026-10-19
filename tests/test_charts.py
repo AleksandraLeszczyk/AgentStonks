@@ -1227,6 +1227,56 @@ class TestTimeWindow:
         assert fig.layout.xaxis.range[0] == pd.Timestamp(SESSION_START).isoformat()
         assert fig.layout.yaxis.range is None
 
+    def x_ranges(self, fig, rows):
+        return [[pd.Timestamp(x) for x in fig.get_subplot(row, 1).xaxis.range]
+                for row in range(1, rows + 1)]
+
+    @pytest.mark.parametrize("show_momentum", [False, True])
+    def test_a_view_from_a_buy_starts_one_bar_before_its_bar(self, show_momentum):
+        # "Since first buy" / "Since most recent buy": a buy at 15:10:40 is in
+        # the 15:10 bar, and the view starts at 15:09 so neither that candle
+        # nor the marker is cut by the edge.
+        bars = self.bars()
+        buy = pd.Timestamp("2024-01-15T15:10:40Z")
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, view_from=buy,
+                          show_momentum=show_momentum)
+        end = pd.Timestamp(bars[-1]["t"]) + pd.Timedelta(minutes=1)
+        rows = 4 if show_momentum else 2
+        assert self.x_ranges(fig, rows) == [[pd.Timestamp("2024-01-15T15:09Z"), end]] * rows
+
+    def test_a_view_from_a_buy_fits_the_price_axis_to_it(self):
+        # After the morning spike: the same refit as a window.
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START,
+                          view_from=pd.Timestamp("2024-01-15T15:30Z"),
+                          show_7d_avg=False, show_28d_avg=False)
+        assert fig.layout.yaxis.range[1] < 105.0
+
+    def test_a_view_from_a_buy_counts_bars_of_the_charts_timeframe(self):
+        # 5-minute bars: a buy at 15:12 is in the 15:10 bar, one bar before is 15:05.
+        bars = self.bars()[::5]
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          view_from=pd.Timestamp("2024-01-15T15:12Z"))
+        assert pd.Timestamp(fig.layout.xaxis.range[0]) == pd.Timestamp("2024-01-15T15:05Z")
+
+    def test_a_buy_past_the_newest_bar_shows_the_newest_two(self):
+        # The fill's clock ahead of the bars: never an empty view.
+        bars = self.bars()
+        last = pd.Timestamp(bars[-1]["t"])
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          view_from=last + pd.Timedelta(minutes=3))
+        assert pd.Timestamp(fig.layout.xaxis.range[0]) == last - pd.Timedelta(minutes=1)
+
+    def test_a_buy_before_the_chart_starts_is_the_whole_session(self):
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START,
+                          view_from=pd.Timestamp(SESSION_START) - pd.Timedelta(hours=1))
+        assert fig.layout.xaxis.range[0] == pd.Timestamp(SESSION_START).isoformat()
+        assert fig.layout.yaxis.range is None
+
+    def test_a_naive_buy_time_is_utc(self):
+        fig = build_chart(self.bars(), [], [], "AAPL", SESSION_START,
+                          view_from="2024-01-15T15:10:40")
+        assert pd.Timestamp(fig.layout.xaxis.range[0]) == pd.Timestamp("2024-01-15T15:09Z")
+
     def trades(self, bars):
         # One print per bar, at its close with its volume.
         return [{"p": b["c"], "s": b["v"], "t": b["t"]} for b in bars]

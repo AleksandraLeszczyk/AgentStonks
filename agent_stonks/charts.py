@@ -2414,6 +2414,7 @@ def build_chart(
     net_gamma: Optional[dict] = None,
     prior_profile: Optional[dict] = None,
     window_minutes: Optional[int] = None,
+    view_from: Optional[datetime] = None,
 ) -> go.Figure:
     """The live price chart: candles and volume, the optional momentum panels
     and overlays.
@@ -2427,6 +2428,11 @@ def build_chart(
     computed from the whole session -- VWAP, the moving averages, momentum --
     so only the view changes. None, or a window reaching back past
     `session_start`, is the whole session.
+
+    `view_from` starts the same kind of view at a time instead (the live tab's
+    "Since first buy" / "Since most recent buy"): one bar before the bar it
+    falls in, so the candle and the marker at that time aren't cut by the edge.
+    A time past the newest bar is taken as the newest bar.
 
     `show_momentum` and `show_momentum_change` draw the momentum and the
     momentum Δ panel, each on its own; `show_momentum_change` left None follows
@@ -2461,6 +2467,10 @@ def build_chart(
     view_start = pd.Timestamp(session_start)
     if window_minutes:
         view_start = max(view_start, df["t"].max() - pd.Timedelta(minutes=window_minutes))
+    if view_from is not None:
+        bar = pd.Timedelta(minutes=_bar_minutes(df["t"]))
+        anchor = min(pd.to_datetime(view_from, utc=True).floor(bar), df["t"].max())
+        view_start = max(view_start, anchor - bar)
     windowed = view_start > pd.Timestamp(session_start)
     # Where the overlays start drawing: from the first bar, or from the
     # window's edge -- a level's label sits at its left end, and one left at

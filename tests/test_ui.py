@@ -2,6 +2,7 @@ from agent_stonks import config
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
     _agent_momentum,
+    _buy_time,
     _chart_start,
     _cash_label,
     _venue_badge,
@@ -698,6 +699,42 @@ class TestChartStart:
         # 23:30 ET on the 29th is 03:30 UTC on the 30th.
         start = self._et(_chart_start([{"t": "2026-09-30T03:30:00+00:00"}], pre_market=False))
         assert str(start.date()) == "2026-09-29"
+
+
+class TestBuyTime:
+    """Chart Settings → Show: "Since first buy" / "Since most recent buy"."""
+
+    START = "2026-10-19T13:25:00+00:00"
+
+    @staticmethod
+    def trade(action, ts):
+        return {"action": action, "ts": ts, "price": 100.0}
+
+    def decisions(self):
+        return [
+            self.trade("buy", "2026-10-19T13:41:10+00:00"),
+            self.trade("sell", "2026-10-19T14:02:00+00:00"),
+            self.trade("buy", "2026-10-19T14:30:30+00:00"),
+            self.trade("sell", "2026-10-19T15:10:00+00:00"),
+        ]
+
+    def test_the_first_and_the_most_recent_buy(self):
+        import pandas as pd
+
+        assert _buy_time(self.decisions(), self.START, "first") == pd.Timestamp("2026-10-19T13:41:10Z")
+        assert _buy_time(self.decisions(), self.START, "last") == pd.Timestamp("2026-10-19T14:30:30Z")
+
+    def test_sells_are_not_buys(self):
+        assert _buy_time([self.trade("sell", "2026-10-19T14:02:00+00:00")], self.START, "last") is None
+
+    def test_no_buy_yet(self):
+        assert _buy_time([], self.START, "first") is None
+        assert _buy_time(None, self.START, "last") is None
+
+    def test_a_buy_before_the_chart_is_not_today(self):
+        # Yesterday's buy, still in the tracker.
+        old = self.trade("buy", "2026-10-16T19:00:00+00:00")
+        assert _buy_time([old], self.START, "first") is None
 
 
 class TestOrchestraIsItsOwnAgent:

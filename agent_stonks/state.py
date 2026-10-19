@@ -277,6 +277,7 @@ _DEFAULTS: dict[str, object] = {
     "show_net_gamma": True,
     "show_pre_market": False,
     "chart_window_min": 0,
+    "chart_window_buy": "",
     "volume_baseline_window": DEFAULT_VOLUME_BASELINE,
     "fill_gaps": True,
     "agent_log": [],
@@ -443,6 +444,9 @@ class AppState:
         # Show only this many minutes back from the newest bar on the live
         # chart, 0 for the whole session (`charts.build_chart`'s window_minutes).
         self.chart_window_min: int = 0
+        # Or start it at the day's "first" or "last" filled buy, "" for neither
+        # (`charts.build_chart`'s view_from).
+        self.chart_window_buy: str = ""
         # Which prior window the volume panel's "usual volume" references are
         # built from -- a key of volume_baseline.VOLUME_BASELINE_WINDOWS.
         self.volume_baseline_window: str = DEFAULT_VOLUME_BASELINE
