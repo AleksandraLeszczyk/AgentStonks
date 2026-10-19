@@ -4495,6 +4495,185 @@ class TestMomentumConfirmation:
         assert "flattened" in tracker.snapshot()["decisions"][-1].reasoning
 
 
+class TestZoneTake:
+    """The take's other trigger: a stall zone forming under the position
+    (`take_trigger = "zone"`), the chart's grey Stall-zone box.
+
+    Notebook arithmetic (buy $102.50, sell $109.00), a typical minute move of
+    $0.10 and 5-bar zones 3 moves wide: five closes inside $0.30 of each other.
+    """
+
+    MINUTE_MOVE = 0.1
+
+    def _setup(self, state, monkeypatch, **kwargs):
+        kwargs.setdefault("take_trigger", "zone")
+        kwargs.setdefault("zone_min_bars", 5)
+        kwargs.setdefault("zone_width", 3.0)
+        kwargs.setdefault("negative_momentum_bars", 0)
+        broker = FakeBroker(101.4)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        state.sym(TICKER).abs_mean_minute_momentum = self.MINUTE_MOVE
+        return at.DayRangeTrader(dayrange_config(**kwargs)), tracker, tape
+
+    def _step(self, trader, tracker, tape, state, close, **kw):
+        tape.append(close, **kw)
+        return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+    def _enter(self, state, monkeypatch, **kwargs):
+        """Bought at $101.80, the first bar after the opening window."""
+        trader, tracker, tape = self._setup(state, monkeypatch, **kwargs)
+        assert self._step(trader, tracker, tape, state, 101.8) == "bought"
+        return trader, tracker, tape
+
+    def _reasoning(self, tracker):
+        return tracker.snapshot()["decisions"][-1].reasoning
+
+    # --- config ---------------------------------------------------------
+
+    def test_momentum_by_default_and_the_zone_signed_in_its_place(self):
+        config = AppleTraderConfig()
+        assert config.take_trigger == "momentum"
+        assert "@conf>=15m+loss," in config_signature(config)
+        zone = replace(config, take_trigger="zone")
+        signature = config_signature(zone)
+        assert "@zone20b/3u>=15m+loss," in signature and "@conf" not in signature
+        # The confirmation still gates the buy and the sell level.
+        assert ",confirm=3b" in signature
+        assert "@zone25b/2.5u" in config_signature(
+            replace(zone, zone_min_bars=25, zone_width=2.5)
+        )
+        # Read only under the zone: a momentum run signs the same whatever they say.
+        assert config_signature(replace(config, zone_min_bars=25)) == config_signature(config)
+
+    def test_the_take_is_on_without_the_confirmation(self):
+        config = AppleTraderConfig(take_trigger="zone", momentum_confirmation_bars=0)
+        assert config.has_take
+        assert "@zone20b/3u" in config_signature(config)
+        assert "confirm=" not in config_signature(config)
+
+    def test_refusals(self):
+        with pytest.raises(ValueError, match="legacy momentum take"):
+            AppleTraderConfig(
+                take_trigger="zone", momentum_confirmation_bars=0, negative_momentum_bars=15
+            )
+        with pytest.raises(ValueError, match="take_trigger"):
+            AppleTraderConfig(take_trigger="vibes")
+        # A record that carries no trigger at all reads the momentum take.
+        assert AppleTraderConfig(take_trigger=None).take_trigger == "momentum"
+        with pytest.raises(ValueError, match="zone_min_bars"):
+            AppleTraderConfig(zone_min_bars=1)
+        with pytest.raises(ValueError, match="zone_min_bars"):
+            AppleTraderConfig(zone_min_bars=2.5)
+        with pytest.raises(ValueError, match="zone_width"):
+            AppleTraderConfig(zone_width=0.0)
+
+    def test_it_is_announced(self):
+        config = dayrange_config(take_trigger="zone", negative_momentum_bars=0, zone_min_bars=5)
+        summary = at._armed_summary(
+            config, at.apple_models.get(config.model_key), DAYRANGE_BUNDLE
+        )
+        assert "once the price stalls (a stall zone forming after the fill: 5 bars" in summary
+
+    # --- the take ---------------------------------------------------------
+
+    def test_a_zone_formed_after_the_fill_takes_the_share(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        for _ in range(4):
+            assert self._step(trader, tracker, tape, state, 103.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+        # The fifth bar inside $0.30: a zone.
+        assert self._step(trader, tracker, tape, state, 103.1) == "sold"
+        left = tracker.position_for(TICKER)
+        assert 0 < left < shares
+        reasoning = self._reasoning(tracker)
+        assert reasoning.startswith("Zone take: the price has stalled")
+        assert "between $103.00 and $103.10" in reasoning
+        assert trader.entry["runner"]
+        # A runner is never trimmed again, however long the zone lasts.
+        for _ in range(3):
+            assert self._step(trader, tracker, tape, state, 103.0) == "hold"
+        assert tracker.position_for(TICKER) == left
+
+    def test_a_moving_price_is_not_taken(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        for close in (103.0, 103.2, 103.4, 103.6, 103.8, 103.6, 103.4, 103.2, 103.0):
+            assert self._step(trader, tracker, tape, state, close) == "hold"
+        assert tracker.position_for(TICKER) == shares
+
+    @pytest.mark.parametrize("trigger, outcome", [("momentum", "hold"), ("zone", "sold")])
+    def test_the_momentum_trigger_holds_the_same_stall(
+        self, state, market_open, monkeypatch, trigger, outcome
+    ):
+        """Flat after a rise reads neutral momentum -- no momentum take -- and
+        is exactly what the zone sells."""
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_trigger=trigger, momentum_confirmation_bars=3,
+        )
+        outcomes = [self._step(trader, tracker, tape, state, 103.0) for _ in range(5)]
+        assert outcomes == ["hold"] * 4 + [outcome]
+
+    def test_a_zone_already_there_at_the_buy_is_not_sold_for(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._setup(state, monkeypatch)
+        # Flat just above the buy level: a zone by the fifth bar, nothing bought.
+        for _ in range(5):
+            assert self._step(trader, tracker, tape, state, 102.6) == "hold"
+        # A tick onto the level, still inside the band: bought into the zone.
+        assert self._step(trader, tracker, tape, state, 102.5) == "bought"
+        shares = tracker.position_for(TICKER)
+        for _ in range(6):
+            assert self._step(trader, tracker, tape, state, 102.6) == "hold"
+        assert tracker.position_for(TICKER) == shares
+        # Out of it and into a new one, which formed under the position.
+        for _ in range(4):
+            assert self._step(trader, tracker, tape, state, 103.5) == "hold"
+        assert self._step(trader, tracker, tape, state, 103.5) == "sold"
+        assert "Zone take" in self._reasoning(tracker)
+
+    def test_the_wait_comes_first(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_after_minutes=7)
+        shares = tracker.position_for(TICKER)
+        # A zone from the fifth bar after the fill; 7 minutes is the seventh.
+        for _ in range(6):
+            assert self._step(trader, tracker, tape, state, 103.0) == "hold"
+        assert tracker.position_for(TICKER) == shares
+        assert self._step(trader, tracker, tape, state, 103.0) == "sold"
+
+    def test_a_stall_at_a_loss_is_left_to_the_stop_in_profit_only(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch)
+        shares = tracker.position_for(TICKER)
+        # Under the $101.80 fill, above the stop.
+        for _ in range(6):
+            assert self._step(trader, tracker, tape, state, 101.6) == "hold"
+        assert tracker.position_for(TICKER) == shares
+
+    def test_a_stall_at_a_loss_is_taken_with_the_loss_rule(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_in_loss=True)
+        # The fill bar's own $101.80 is inside the band, so it is the zone's
+        # first bar and the fourth $101.60 its fifth -- after the fill.
+        outcomes = [self._step(trader, tracker, tape, state, 101.6) for _ in range(4)]
+        assert outcomes == ["hold"] * 3 + ["sold"]
+        assert trader.entry["loss_runner"]
+        assert "at or under the $101.80 fill" in self._reasoning(tracker)
+
+    def test_the_read_line_shows_the_zone(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(state, monkeypatch, take_after_minutes=30)
+        for _ in range(5):
+            self._step(trader, tracker, tape, state, 103.0)
+        analysis = [e["text"] for e in state.agent_log if e.get("type") == "analysis"]
+        assert "zone 5 bars $103.00–$103.00" in analysis[-1]
+
+
 class TestNoBuyIntoAFall:
     """No buy -- first or add -- while the price is falling too fast to catch.
 

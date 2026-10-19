@@ -987,6 +987,22 @@ class TestRuleAgentRecords:
         assert "@conf>=15m+loss," in agent.signature(today)
         assert ",confirm=3b" in agent.signature(today)
 
+    def test_the_take_trigger_round_trips_and_old_records_read_momentum(self):
+        """A record from before 2026-10-19 has no `take_trigger` and replays the
+        momentum take it was run under; a zone take comes back as one."""
+        agent = rule_agent(APPLE_TRADER_KEY)
+        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        for name in ("take_trigger", "zone_min_bars", "zone_width"):
+            record.pop(name)
+        old = agent.from_record(record)
+        assert old.take_trigger == "momentum"
+        assert agent.signature(old) == agent.signature(AppleTraderConfig(model_key="dayrange"))
+
+        zone = AppleTraderConfig(model_key="dayrange", take_trigger="zone", zone_min_bars=25)
+        back = agent.from_record(agent.to_record(zone))
+        assert (back.take_trigger, back.zone_min_bars, back.zone_width) == ("zone", 25, 3.0)
+        assert "@zone25b/3u" in agent.signature(back)
+
     def test_a_record_from_the_gain_gate_keeps_it(self):
         """From 2026-09-29 to 10-02 the take waited for 0.2 of the predicted gain
         rather than for time. Such a record carries the 0.2 and no wait: it

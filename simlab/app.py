@@ -56,7 +56,7 @@ from agent_stonks.charts import (
     overlay_x_max,
     session_rangebreaks,
 )
-from agent_stonks.config import MODEL_OVERLAY_COLORS, PALETTE
+from agent_stonks.config import MODEL_OVERLAY_COLORS, PALETTE, TAKE_ZONE
 from agent_stonks.model_catalogue_ui import model_catalogue_panel
 from agent_stonks.llm import DEFAULT_AGENT_MODELS, ENV_KEYS, PROVIDERS, models_for
 from agent_stonks.market_hours import MARKET_TZ, is_market_open
@@ -1000,12 +1000,24 @@ def _run_pattern_controls(
                else "(the run reads no N-bar momentum).")
         )
     if candle_patterns.ZONE_KEY in selected:
+        # A run that sold at forming zones opens on its own zone, so the grey
+        # boxes are the ones its takes read.
+        config = _apple_config_from(_apple_config_key(record, symbol))
+        traded = config is not None and config.take_trigger == TAKE_ZONE
+        start_bars = (
+            min(max(config.zone_min_bars, 5), 60) if traded
+            else candle_patterns.DEFAULT_ZONE_MIN_BARS
+        )
+        start_width = (
+            min(max(config.zone_width, 1.0), 8.0) if traded
+            else candle_patterns.DEFAULT_ZONE_WIDTH
+        )
         z1, z2 = st.columns(2, vertical_alignment="bottom")
         with z1:
             settings["zone_min_bars"] = st.slider(
                 "Min zone length (bars)",
                 min_value=5, max_value=60, step=5,
-                value=candle_patterns.DEFAULT_ZONE_MIN_BARS,
+                value=start_bars,
                 key=f"sim_zone_bars_{run_id}_{symbol}",
                 help="The fewest bars a stretch must stay in its band to count as a zone.",
             )
@@ -1013,10 +1025,16 @@ def _run_pattern_controls(
             settings["zone_width"] = st.slider(
                 "Max zone band (× minute move)",
                 min_value=1.0, max_value=8.0, step=0.5,
-                value=candle_patterns.DEFAULT_ZONE_WIDTH,
+                value=start_width,
                 key=f"sim_zone_width_{run_id}_{symbol}",
                 help="How far apart a zone's closes may be, in typical minute moves "
                 "(the week before each day's mean |1-minute move|).",
+            )
+        if traded:
+            st.caption(
+                f":material/info: Opened on the run's own zone ({config.zone_min_bars} bars × "
+                f"{config.zone_width:g}): its takes sold where a grey box had formed after "
+                "the last buy."
             )
     if candle_patterns.STALL_KEY in selected or candle_patterns.ZONE_KEY in selected:
         settings["minute_move"] = {
@@ -2017,18 +2035,42 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "`@fade15b`, `@mom-1`) and any `nofall=` gate.\n"
             "- SimLab measures last week's mean move from the 5 stored sessions "
             "before each replayed day.\n"
-            "- Sweepable; 0 switches it off, and with it the take and the runner."
+            "- Sweepable; 0 switches it off, and with it the take and the runner — "
+            "unless the take sells at a forming zone."
+        ),
+        "take_trigger": (
+            "What makes the take sell short of the sell level.\n\n"
+            "- **Sell at momentum fade** — the behaviour table's take row over the "
+            "confirmation period. Signs as `take=70%@conf`.\n"
+            "- **Sell at forming zone** — the last *Zone length* bars all closed inside "
+            "a band *Zone band* × the day's typical minute move wide (the week before's "
+            "mean |1-minute move|), and the zone reached that length after the last buy. "
+            "The same zone Results' **Stall-zone levels** pattern boxes grey. Signs as "
+            "`take=70%@zone20b/3u`.\n"
+            "- Same share, runner, wait and loss rule either way; the confirmation still "
+            "gates the buy and the sell level.\n"
+            "- Sweepable as a rule axis, like the breach policy. Every run before "
+            "2026-10-19 replays as momentum fade."
+        ),
+        "zone_min_bars": (
+            "The forming-zone take's zone length, in bars. 20 is the chart's default "
+            "(about 4 zones a session on the stored days). In the signature only under "
+            "the zone take; sweepable."
+        ),
+        "zone_width": (
+            "The forming-zone take's band, in typical minute moves. 3 is the chart's "
+            "default. In the signature only under the zone take; sweepable."
         ),
         "position_pct": (
             "The share of available cash each entry spends. In the signature as `size=`."
         ),
         "take_fraction": (
-            "How much of the position a momentum take sells when a runner is kept.\n\n"
+            "How much of the position a take sells when a runner is kept.\n\n"
             "- In the signature only while the take is on.\n"
             "- Whole shares, rounded down, and at least one."
         ),
         "take_after_minutes": (
-            "The momentum take fires only once this many minutes of bars have passed "
+            "The take fires only once this many minutes of bars have passed "
             "since the last buy; a buy lower down starts the wait again.\n\n"
             "- In the signature as `take=70%@conf>=15m` while the take is on; a record "
             "from before it replays at 0 (from the first bar).\n"
@@ -3605,6 +3647,7 @@ _SHORT_FIELD_LABELS = {
     "level_unit": "unit",
     "contain_range": "contain",
     "breach_exit": "breach exit",
+    "take_trigger": "take on",
 }
 
 

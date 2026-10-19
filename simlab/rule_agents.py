@@ -32,6 +32,7 @@ from agent_stonks.config import (
     APPLE_TRADER_SELL_K,
     BREACH_OFF,
     LEVELS_DAYRANGE,
+    TAKE_MOMENTUM,
     UNIT_ADR,
 )
 from agent_stonks.apple_trader import (
@@ -245,6 +246,11 @@ _APPLE_LEGACY = {
     # position to the stop. False is that rule, and it is left out of the
     # signature.
     "take_in_loss": False,
+    # And before 2026-10-19 only momentum fired the take -- never a stall zone
+    # forming under the position. "momentum" is that rule, also today's default,
+    # so this entry is here to keep meaning the same if the default moves. A
+    # momentum take signs as it always did; only a zone take signs `@zone…`.
+    "take_trigger": TAKE_MOMENTUM,
     # And every buy was a market order, filling near the close of the bar that
     # reached the level even when that was above it (before 2026-09-30). False
     # is that rule, and it is left out of the signature.

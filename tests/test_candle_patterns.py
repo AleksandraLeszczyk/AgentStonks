@@ -329,3 +329,44 @@ class TestStallZone:
         assert [t.showlegend for t in zone].count(True) == 1
         hover = [t for t in zone if t.mode == "markers"]
         assert "Resistance zone</b> level 100.2" in hover[0].customdata[0]
+
+
+class TestFormingZone:
+    """`forming_zone`: the chart's grey box as one call on a session's closes,
+    which Apple Trader's zone take re-runs on every bar."""
+
+    def test_the_band_price_is_still_in(self):
+        closes = SLIDE_IN + ZONE
+        zone = candle_patterns.forming_zone(closes, U)
+        assert zone["start"] == 8 and zone["bars"] == 25
+        # The 20th bar of the zone is the first it is one at all.
+        assert zone["confirmed"] == 8 + 19
+        assert (zone["low"], zone["high"]) == (100.0, 100.2)
+        assert zone["width"] == pytest.approx(3 * U)
+
+    def test_none_once_price_has_left_or_before_the_length(self):
+        assert candle_patterns.forming_zone(SLIDE_IN + ZONE + SLIDE_OUT, U) is None
+        assert candle_patterns.forming_zone(SLIDE_IN + ZONE[:19], U) is None
+        assert candle_patterns.forming_zone(SLIDE_IN + ZONE[:20], U)["bars"] == 20
+
+    def test_the_settings_are_the_charts(self):
+        closes = SLIDE_IN + ZONE
+        assert candle_patterns.forming_zone(closes, U, min_bars=30) is None
+        assert candle_patterns.forming_zone(closes, U, width_k=1.5) is None
+
+    def test_it_agrees_with_the_charts_box_on_every_bar(self):
+        rng = np.random.default_rng(7)
+        closes = list(np.round(100 + np.cumsum(rng.normal(0, U, 390)), 2))
+        bars = _session(closes, list(rng.lognormal(8, 0.6, 390).round()))
+        seen = 0
+        for k in range(20, 391, 7):
+            drawn = [z for z in _zones(bars[:k], zone_min_bars=10) if z["role"] == "forming"]
+            zone = candle_patterns.forming_zone(closes[:k], U, min_bars=10)
+            if not drawn:
+                assert zone is None
+                continue
+            seen += 1
+            (box,) = drawn
+            assert pd.Timestamp(box["x0"]) == _bar(zone["start"])
+            assert (box["y0"], box["y1"]) == (zone["low"], zone["high"])
+        assert seen >= 3

@@ -52,6 +52,9 @@ from .config import (
     BREACH_OFFERED,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
+    TAKE_TRIGGER_LABELS,
+    TAKE_TRIGGERS,
+    TAKE_ZONE,
     UNIT_ADR,
     UNIT_PRED_RANGE,
 )
@@ -569,7 +572,7 @@ def rule_params(
     the stop fraction comes to against them."""
     breach_update = breach_param(defaults, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
-    stop_gain_fraction, take_fraction, hold_min_gain_k, take_after_minutes = exit_params(
+    exits = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
         stop_scope=stop_scope, stop_seed=stop_seed,
     )
@@ -578,10 +581,7 @@ def rule_params(
         "breach_update": breach_update,
         "contain_range": contain_range,
         "breach_exit": breach_exit,
-        "stop_gain_fraction": stop_gain_fraction,
-        "take_fraction": take_fraction,
-        "take_after_minutes": take_after_minutes,
-        "hold_min_gain_k": hold_min_gain_k,
+        **exits,
         "skip_events": skip_events,
     }
 
@@ -749,13 +749,17 @@ def exit_params(
     take_on: bool = True,
     stop_scope: str = "",
     stop_seed: "float | None" = None,
-) -> "tuple[float, float, float]":
-    """The managed exit: a stop under the fill, a momentum take, and a runner.
+) -> dict:
+    """The managed exit: a stop under the fill, a take, and a runner -- as the
+    config fields they set.
 
-    The take has no trigger of its own here: it is the behaviour table's sell
-    short of the sell level, read over the momentum confirmation period set
-    beside the levels. `take_on` is whether that period is on, and greys out
-    the two knobs that only mean something while it is.
+    The take sells short of the sell level on one of two triggers
+    (`take_trigger`): momentum fading -- the behaviour table's take row, read
+    over the momentum confirmation period set beside the levels, with no knob
+    of its own here -- or a stall zone forming, whose length and band are the
+    two knobs under the choice, greyed out under the other. `take_on` is
+    whether the confirmation period is on; the take is on with it or with the
+    zone, and greys out the knobs that only mean something while it is.
 
     Not keyed by ticker, unlike the levels: none of these was swept per
     instrument, so there is no per-symbol default for a switch to re-seed. The
@@ -794,11 +798,49 @@ def exit_params(
         ) if p),
     )
     stop_warning(col_a, float(stop_gain_fraction))
-    take_pct = col_b.number_input(
-        "Take on negative momentum (% of shares)",
+    # Before the knobs it greys out: the zone's two, and -- with the
+    # confirmation off -- the take's own.
+    take_trigger = col_b.selectbox(
+        "Take short of the sell level",
+        list(TAKE_TRIGGERS),
+        index=list(TAKE_TRIGGERS).index(defaults.take_trigger),
+        format_func=lambda key: TAKE_TRIGGER_LABELS[key],
+        key=copy.key("take_trigger"),
+        help=copy.help.get("take_trigger"),
+    )
+    zone = take_trigger == TAKE_ZONE
+    take_on = take_on or zone
+    col_a, col_b = st.columns(2)
+    zone_min_bars = col_a.number_input(
+        "Zone length (bars)",
+        min_value=2, max_value=120, value=int(defaults.zone_min_bars), step=1,
+        key=copy.key("zone_min_bars"),
+        help=copy.help.get("zone_min_bars"),
+        disabled=not zone,
+    )
+    zone_width = col_b.number_input(
+        "Zone band (× minute move)",
+        min_value=0.5, max_value=10.0, value=float(defaults.zone_width), step=0.5,
+        format="%.1f",
+        key=copy.key("zone_width"),
+        help=copy.help.get("zone_width"),
+        disabled=not zone,
+    )
+    col_a, col_b = st.columns(2)
+    # The label follows the trigger; the key does not, so the share is kept.
+    take_pct = col_a.number_input(
+        "Take at a forming zone (% of shares)" if zone
+        else "Take on negative momentum (% of shares)",
         min_value=1.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
         key=copy.key("take_pct"),
         help=copy.help.get("take_fraction"),
+        disabled=not take_on,
+    )
+    take_after_minutes = col_b.number_input(
+        "Take only after time (min)",
+        min_value=0, max_value=390, value=int(defaults.take_after_minutes), step=1,
+        key=copy.key("take_after_minutes"),
+        help=copy.help.get("take_after_minutes"),
         disabled=not take_on,
     )
     hold_min_gain_k = col_a.number_input(
@@ -809,17 +851,15 @@ def exit_params(
         help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
         disabled=not take_on,
     )
-    take_after_minutes = col_b.number_input(
-        "Take only after time (min)",
-        min_value=0, max_value=390, value=int(defaults.take_after_minutes), step=1,
-        key=copy.key("take_after_minutes"),
-        help=copy.help.get("take_after_minutes"),
-        disabled=not take_on,
-    )
-    return (
-        float(stop_gain_fraction), float(take_pct) / 100.0, float(hold_min_gain_k),
-        int(take_after_minutes),
-    )
+    return {
+        "stop_gain_fraction": float(stop_gain_fraction),
+        "take_trigger": str(take_trigger),
+        "zone_min_bars": int(zone_min_bars),
+        "zone_width": float(zone_width),
+        "take_fraction": float(take_pct) / 100.0,
+        "take_after_minutes": int(take_after_minutes),
+        "hold_min_gain_k": float(hold_min_gain_k),
+    }
 
 
 def stop_note(

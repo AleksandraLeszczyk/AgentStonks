@@ -493,6 +493,26 @@ APPLE_TRADER_TAKE_AFTER_MINUTES = 15
 # Not swept.
 APPLE_TRADER_TAKE_IN_LOSS = True
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
+# What fires that take short of the sell level (2026-10-19, at the user's
+# request: "add alternative to sell at momentum fade -- sell at forming zone").
+# "momentum" is the confirmation table's take row above; "zone" a stall zone
+# forming under the position -- APPLE_TRADER_ZONE_MIN_BARS bars whose closes all
+# sit inside a band APPLE_TRADER_ZONE_WIDTH x the ticker's typical minute move
+# wide, the chart's grey "forming" box of the Stall-zone levels pattern
+# (`candle_patterns.forming_zone`, whose own defaults these are). Either way the
+# take sells the same share, keeps the same runner and waits the same time.
+# "momentum" is every record made before it (`simlab.rule_agents._APPLE_LEGACY`).
+# Not swept.
+TAKE_MOMENTUM = "momentum"
+TAKE_ZONE = "zone"
+TAKE_TRIGGERS = (TAKE_MOMENTUM, TAKE_ZONE)
+TAKE_TRIGGER_LABELS = {
+    TAKE_MOMENTUM: "Sell at momentum fade",
+    TAKE_ZONE: "Sell at forming zone",
+}
+APPLE_TRADER_TAKE_TRIGGER = TAKE_MOMENTUM
+APPLE_TRADER_ZONE_MIN_BARS = 20
+APPLE_TRADER_ZONE_WIDTH = 3.0
 # What the agent does when the session trades through the forecast it was given
 # at 9:35 -- the vocabulary lives here rather than in `dayrange_model`, which
 # defines the arithmetic (`updated_range`) but costs 200 MB of torch to import,

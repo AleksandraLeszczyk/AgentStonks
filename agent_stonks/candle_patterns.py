@@ -448,10 +448,34 @@ def _zone_items(
         return []
     close = np.array([float(b["c"]) for b in session])
     volume = np.nan_to_num(np.array([float(b.get("v") or 0.0) for b in session]))
-    units = _units(close, minute_move)
     cum_volume = np.cumsum(volume)
 
     items: "list[dict]" = []
+    for i, j, lo, hi, unit in zone_spans(close, _units(close, minute_move), min_bars, width_k):
+        found = profile_peaks(session[i:j + 1])
+        if found is not None:
+            items.append(_zone_item(session, close, volume, cum_volume, i, j, lo, hi, unit, found))
+    return items
+
+
+def zone_spans(
+    close, units, min_bars: int, width_k: float
+) -> "list[tuple[int, int, float, float, float]]":
+    """`(first bar, last bar, lowest close, highest close, unit)` of each stall
+    zone in one session's closes, oldest first; see "The stall zone" in the
+    module doc. `units` is the typical minute move as of each bar (`_units`).
+
+    Causal: a zone that ended before the last bar was ended by a close the
+    scan has already read, so a later bar never moves an earlier zone -- which
+    is why Apple Trader's zone take (`forming_zone`) can re-run it on every
+    bar and agree with the chart's boxes drawn over the same closes.
+    """
+    close = [float(c) for c in close]
+    units = [float(u) for u in units]
+    count = len(close)
+    spans: "list[tuple[int, int, float, float, float]]" = []
+    if min_bars < 2:
+        return spans
     i = 0
     while i + min_bars <= count:
         unit = units[i + min_bars - 1]
@@ -467,11 +491,38 @@ def _zone_items(
         if j - i + 1 < min_bars:
             i += 1
             continue
-        found = profile_peaks(session[i:j + 1])
-        if found is not None:
-            items.append(_zone_item(session, close, volume, cum_volume, i, j, lo, hi, unit, found))
+        spans.append((i, j, lo, hi, unit))
         i = j + 1
-    return items
+    return spans
+
+
+def forming_zone(
+    closes, minute_move: "float | None", min_bars: int = DEFAULT_ZONE_MIN_BARS,
+    width_k: float = DEFAULT_ZONE_WIDTH,
+) -> "dict | None":
+    """The stall zone price is still inside at the last of `closes` -- the
+    chart's grey "forming" box -- or None when there is none.
+
+    `closes` are one regular session's, oldest first, and `minute_move` the
+    typical minute move (the session's own running mean when None), read as
+    `compute` reads them. `start` and `confirmed` are positions in `closes`:
+    the zone's first bar, and the bar it reached `min_bars` on -- the first
+    bar it was a zone at all.
+    """
+    close = np.asarray([float(c) for c in closes])
+    spans = zone_spans(close, _units(close, minute_move), int(min_bars), float(width_k))
+    if not spans or spans[-1][1] != len(close) - 1:
+        return None
+    i, j, lo, hi, unit = spans[-1]
+    return {
+        "start": i,
+        "confirmed": i + int(min_bars) - 1,
+        "bars": j - i + 1,
+        "low": lo,
+        "high": hi,
+        "unit": unit,
+        "width": float(width_k) * unit,
+    }
 
 
 def _zone_item(session, close, volume, cum_volume, i, j, lo, hi, unit, found) -> dict:

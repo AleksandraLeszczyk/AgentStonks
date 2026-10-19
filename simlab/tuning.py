@@ -81,6 +81,8 @@ from agent_stonks.config import (
     BREACH_POLICIES,
     LEVEL_SOURCES,
     LEVEL_SOURCE_LABELS,
+    TAKE_TRIGGERS,
+    TAKE_TRIGGER_LABELS,
 )
 from agent_stonks import apple_models, minute_momentum
 from agent_stonks.apple_models import STRATEGY_DAYRANGE, STRATEGY_MOMENTUM
@@ -206,6 +208,16 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 2.0, 0.5), "%.1f",
         ),
         Tunable("take_fraction", "Share taken on negative momentum", 0.05, 1.0, 0.05, (0.30, 1.0, 0.10)),
+        # The forming-zone take's zone (`take_trigger = "zone"`); nothing else
+        # reads them, and the signature leaves them out under "momentum".
+        Tunable(
+            "zone_min_bars", "Zone length (bars)", 2, 120, 1,
+            (10, 30, 5), "%d", integer=True,
+        ),
+        Tunable(
+            "zone_width", "Zone band (× minute move)", 0.5, 10.0, 0.5,
+            (2.0, 5.0, 1.0), "%.1f",
+        ),
         Tunable(
             "take_after_minutes", "Take only after time (min)", 0, 390, 1,
             (0, 30, 5), "%d", integer=True,
@@ -305,6 +317,10 @@ CHOICES: "dict[str, Choice]" = {
             tuple(BREACH_POLICIES), dict(BREACH_LABELS), short="Forecast breach",
             offered=tuple(BREACH_OFFERED),
         ),
+        Choice(
+            "take_trigger", "Take short of the sell level",
+            tuple(TAKE_TRIGGERS), dict(TAKE_TRIGGER_LABELS), short="Take trigger",
+        ),
     )
 }
 
@@ -325,6 +341,9 @@ SWEEPABLE: "tuple[str, ...]" = (
     "breach_update",
     "stop_gain_fraction",
     "momentum_confirmation_bars",
+    "take_trigger",
+    "zone_min_bars",
+    "zone_width",
     "take_fraction",
     "take_after_minutes",
     "hold_min_gain_k",
