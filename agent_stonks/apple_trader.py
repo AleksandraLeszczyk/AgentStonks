@@ -12,9 +12,11 @@ Two rule sets. The range models drive TimeToChange3's day-range rules
 will land, then two resting levels derived from it and nothing more asked of
 the model all day. Fast&Furious drives the momentum rules (`FastFuriousTrader`):
 a forecast of the next 30 minutes' momentum at every bar, bought when it is
-extreme. `AppleTraderConfig.model_key` names the model and `build_trader` turns
-it into a state machine -- see `agent_stonks.apple_models`, which owns that
-mapping.
+extreme. Fast&Furious + HighLow runs the day-range rules on HighLow's forecast
+with Fast&Furious's signal trading the five minutes before it
+(`FastFuriousHighLowTrader`). `AppleTraderConfig.model_key` names the model and
+`build_trader` turns it into a state machine -- see `agent_stonks.apple_models`,
+which owns that mapping.
 
 Which symbol, and why it is a setting rather than a name
 --------------------------------------------------------
@@ -145,12 +147,48 @@ class TraderSlot:
 SINGLE_SLOT = TraderSlot()
 
 
+def base_record(model_key: "str | None", ticker: str) -> "tuple[dict | None, str]":
+    """The pair's base configuration as a record, and the model it was set for.
+
+    A pair's own base first. A combined model with none of its own
+    (`apple_models.forecast_key` -- Fast&Furious + HighLow) starts from the base
+    of the model whose rules it trades after the opening window, re-keyed to
+    itself: from 9:35 on it *is* that model, so the levels, the stop and every
+    rule set up for it there are the ones it should open on. HighLow_3m's
+    window is dropped on the way, since a run that trades another window
+    refuses it (`early_window_error`). `(None, "")` without either.
+    """
+    model_key = str(model_key or APPLE_TRADER_MODEL)
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    record = base_configs.stored(model_key, symbol)
+    if record is not None:
+        return record, model_key
+    parent = apple_models.forecast_key(model_key)
+    if parent == model_key:
+        return None, ""
+    record = base_configs.stored(parent, symbol)
+    if record is None:
+        return None, ""
+    record.update(model_key=model_key, use_3m=False)
+    return record, parent
+
+
 def _base_number(model_key: "str | None", ticker: str, name: str) -> "float | None":
-    """One number of the pair's base configuration (`base_configs`), if it has
+    """One number of the pair's base configuration (`base_record`), if it has
     one and the number is set there."""
-    record = base_configs.stored(str(model_key or APPLE_TRADER_MODEL), ticker)
+    record, _ = base_record(model_key, ticker)
     value = (record or {}).get(name)
     return None if value is None else float(value)
+
+
+def _tuned(table: dict, model_key: "str | None", symbol: str):
+    """The pair's entry in a tuned table, else -- for a combined model -- the
+    entry of the model whose rules it trades after the opening window."""
+    model_key = str(model_key or APPLE_TRADER_MODEL)
+    found = table.get((model_key, symbol))
+    if found is None:
+        found = table.get((apple_models.forecast_key(model_key), symbol))
+    return found
 
 
 def dayrange_levels(
@@ -165,7 +203,9 @@ def dayrange_levels(
     (`config.APPLE_TRADER_TUNED_LEVELS`, with how far each deserves trust).
     A pair never tuned falls back to the instrument's notebook-05 sweep
     (`config.APPLE_TRADER_DAYRANGE_LEVELS`), and a symbol never swept at all
-    to the notebook's specified pair.
+    to the notebook's specified pair. A combined model with no base or tuning
+    of its own reads its forecast model's at each step (`base_record`,
+    `_tuned`).
     """
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
     if use_base:
@@ -173,7 +213,7 @@ def dayrange_levels(
         sell_k = _base_number(model_key, symbol, "sell_k")
         if buy_k is not None and sell_k is not None:
             return buy_k, sell_k
-    tuned = APPLE_TRADER_TUNED_LEVELS.get((str(model_key or APPLE_TRADER_MODEL), symbol))
+    tuned = _tuned(APPLE_TRADER_TUNED_LEVELS, model_key, symbol)
     if tuned is not None:
         return tuned
     return APPLE_TRADER_DAYRANGE_LEVELS.get(symbol, (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K))
@@ -193,9 +233,8 @@ def stop_for(ticker: str, model_key: "str | None" = None, use_base: bool = True)
         stop = _base_number(model_key, symbol, "stop_gain_fraction")
         if stop is not None:
             return stop
-    return APPLE_TRADER_TUNED_STOP.get(
-        (str(model_key or APPLE_TRADER_MODEL), symbol), APPLE_TRADER_STOP_GAIN_FRACTION
-    )
+    tuned = _tuned(APPLE_TRADER_TUNED_STOP, model_key, symbol)
+    return APPLE_TRADER_STOP_GAIN_FRACTION if tuned is None else tuned
 
 
 def min_win_for(
@@ -255,7 +294,8 @@ def shipped_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
 
 def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderConfig":
     """What a new run of this model on this symbol starts from: the pair's base
-    configuration (`base_configs`) when one is stored, the shipped defaults
+    configuration (`base_record` -- for a combined model, its forecast model's
+    when it has none of its own) when one is stored, the shipped defaults
     otherwise.
 
     A stored base today's config refuses -- a field since narrowed, a model
@@ -263,7 +303,7 @@ def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
     """
     model_key = str(model_key or APPLE_TRADER_MODEL)
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
-    record = base_configs.stored(model_key, symbol)
+    record, _ = base_record(model_key, symbol)
     if record is not None:
         known = {f.name for f in fields(AppleTraderConfig)}
         try:
@@ -1032,6 +1072,11 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # it was filed under; "H" there is HighLow_3m's predicted high.
     if c.use_3m:
         levels += f",3m=H-{c.buy_3m_k:g}{unit}/H-{c.sell_3m_k:g}{unit}"
+    # Fast&Furious's opening window (Fast&Furious + HighLow): its rules, as
+    # Fast&Furious's own signature writes them. The model key already says the
+    # window is there; these say how it was traded.
+    if apple_models.window_key(c.model_key) == apple_models.FASTFURIOUS_KEY:
+        levels += f",ff=[{_ff_rules(c)}]"
     # "H" in the two distances is whatever `level_source` says it is, which is
     # why that token is next to them rather than at the end.
     return (
@@ -1049,12 +1094,17 @@ def _momentum_signature(c: AppleTraderConfig) -> str:
     nothing under this model reads them, so two runs differing only there are
     one configuration.
     """
+    skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
+    return f"{c.model_key}_{c.ticker}({_ff_rules(c)},size={c.position_pct:g}%{skip})"
+
+
+def _ff_rules(c: AppleTraderConfig) -> str:
+    """Fast&Furious's four rules in signature form, wherever they are traded."""
     stop = f"{c.ff_stop_k:g}dn" if c.ff_stop_k else "off"
     rules = f"q={c.ff_entry_quantile:g},stop={stop},hold={c.ff_hold_minutes}m"
     if c.ff_exit_on_sell_signal:
         rules += ",sellexit"
-    skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
-    return f"{c.model_key}_{c.ticker}({rules},size={c.position_pct:g}%{skip})"
+    return rules
 
 
 def model_ticker_error(config: AppleTraderConfig) -> "str | None":
@@ -1120,6 +1170,13 @@ def early_window_error(config: AppleTraderConfig) -> "str | None":
             f"'Use {model.label}' trades the minutes between its 9:33 forecast and a "
             f"9:35 one, and this run is on {model.label} itself, which forecasts at "
             "9:33. Switch it off, or run HighLow."
+        )
+    window = apple_models.window_key(config.model_key)
+    if window:
+        return (
+            f"'Use {model.label}' trades the minutes before the 9:35 forecast, and "
+            f"{apple_models.get(config.model_key).label} trades them on "
+            f"{apple_models.get(window).label}'s signal already. Switch it off."
         )
     if not model.covers(config.ticker):
         return (
@@ -2087,6 +2144,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     #: entry like the exits below.
     EXIT_EARLY_TARGET = "highlow3m_target"
     EXIT_EARLY_DROPPED = "highlow3m_no_forecast"
+    #: What the hand-over and the drop call the window a position came from
+    #: (`FastFuriousHighLowTrader` trades another one).
+    WINDOW_NAME = "HighLow_3m's window"
 
     def _early_cycle(
         self, state: AppState, tracker: DecisionTracker, frame, today, want: int
@@ -2313,8 +2373,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             exits.append("the momentum take")
         _log(state, {"type": "analysis", "text": (
             f"{self.ticker}: the {position:g} sh bought at "
-            f"{pd.Timestamp(entry['ts']):%H:%M} in HighLow_3m's window are now managed by "
-            f"{apple_models.get(config.model_key).label}'s forecast: "
+            f"{pd.Timestamp(entry['ts']):%H:%M} in {self.WINDOW_NAME} are now managed by "
+            f"{apple_models.get(apple_models.forecast_key(config.model_key)).label}'s forecast: "
             f"{', '.join(exits)} and the closing flatten, as for any position."
         )})
 
@@ -2340,9 +2400,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         self.sell(
             state, tracker, position,
             (
-                "The position bought in HighLow_3m's window was waiting for the 9:35 "
-                f"forecast to manage it, and there is none today ({why}). Without its "
-                f"levels or a stop it is not held: sold at market ({pnl_pct:+.2f}%)."
+                f"The position bought in {self.WINDOW_NAME} was waiting for the 9:35 "
+                f"forecast to manage it, and there is none today ({why}). Nothing would "
+                f"manage it after the window, so it is not held: sold at market "
+                f"({pnl_pct:+.2f}%)."
             ),
             log_extra={"exit": self.EXIT_EARLY_DROPPED},
         )
@@ -2476,6 +2537,13 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             refusal = (
                 f"{apple_models.get(form.model_key).label} runs its own rules rather than the "
                 "day-range levels; switching to it needs ▶ Stop and ▶ Start"
+            )
+        elif apple_models.window_key(form.model_key) != apple_models.window_key(config.model_key):
+            # One trades the opening window on another model's signal and the
+            # other does not: a different state machine (`build_trader`).
+            refusal = (
+                "the two trade the opening window differently; switching between them needs "
+                "▶ Stop and ▶ Start"
             )
         elif form.level_unit != config.level_unit:
             refusal = (
@@ -4082,6 +4150,57 @@ def session_levels(
     return out
 
 
+# --- Fast&Furious's rules, wherever they are traded --------------------------
+#
+# All day under Fast&Furious (`FastFuriousTrader`), and in the opening window of
+# Fast&Furious + HighLow (`FastFuriousHighLowTrader`): one reading of a forecast
+# for both, so the window trades exactly the signal the model trades.
+
+
+def ff_credentials(state: AppState) -> "tuple[str | None, str | None]":
+    """The sidebar's Alpaca keys live; the environment's in a replay, whose
+    state carries placeholders (every dataset read is patched, Fast&Furious's
+    history is not)."""
+    if getattr(state, "bar_tape_override", ""):
+        return None, None
+    return state.api_key or None, state.api_secret or None
+
+
+def ff_signal(config: AppleTraderConfig, forecast: "dict | None") -> int:
+    """A bar's signal as the rules read it: +1 buy, -1 sell (when a sell signal
+    closes a long, `ff_exit_on_sell_signal`), 0 nothing -- or no forecast."""
+    if forecast is None:
+        return 0
+    signal = int(forecast["signal"])
+    if signal < 0 and not config.ff_exit_on_sell_signal:
+        return 0
+    return signal
+
+
+def ff_stop(config: AppleTraderConfig, forecast: "dict | None", fill: float) -> "float | None":
+    """The stop under a fill: `ff_stop_k` x the forecast 2-hour drop, in the
+    forecast's own log units. None without a stop, or without the range
+    forecast to size one."""
+    if not config.ff_stop_k or forecast is None:
+        return None
+    down, s120 = forecast.get("down_hat"), forecast.get("s120")
+    if down is None or s120 is None or not (math.isfinite(down) and math.isfinite(s120)):
+        return None
+    return float(fill * math.exp(-config.ff_stop_k * float(down) * float(s120)))
+
+
+def ff_threshold_words(
+    config: AppleTraderConfig, theta: float, sessions: int, forecast: "dict | None"
+) -> str:
+    """The session's entry threshold in a log line's words."""
+    bps = (forecast or {}).get("theta_bps")
+    scale = f", {bps:.3f} bps a minute at this minute's scale" if bps is not None else ""
+    return (
+        f"entry threshold (y ±{theta:.4f}, the {config.ff_entry_quantile:.0%} quantile of "
+        f"the last {sessions} sessions' forecasts{scale})"
+    )
+
+
 class FastFuriousTrader(_SitsOut, BaseTrader):
     """Fast&Furious's rules: a forecast of the next 30 minutes at every bar.
 
@@ -4258,14 +4377,8 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
         return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else rule_agent.HOLD
 
     def _want(self) -> int:
-        """The bar's signal as the rules read it: +1 buy, -1 sell (when a sell
-        signal closes a long), 0 nothing -- or no forecast."""
-        if self.forecast is None:
-            return 0
-        signal = int(self.forecast["signal"])
-        if signal < 0 and not self.config.ff_exit_on_sell_signal:
-            return 0
-        return signal
+        """The bar's signal as the rules read it (`ff_signal`)."""
+        return ff_signal(self.config, self.forecast)
 
     def _unblock(self, want: int) -> int:
         """The notebook's re-arm after a stop: the buy side stays blocked while
@@ -4291,12 +4404,7 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
             self.blocked = None
 
     def _credentials(self, state: AppState) -> "tuple[str | None, str | None]":
-        """The sidebar's Alpaca keys live; the environment's in a replay, whose
-        state carries placeholders (every dataset read is patched, this model's
-        history is not)."""
-        if getattr(state, "bar_tape_override", ""):
-            return None, None
-        return state.api_key or None, state.api_secret or None
+        return ff_credentials(state)
 
     def _prewarm(self, bundle: dict, state: AppState) -> None:
         """Fill the first forecast's caches in the background, once a session:
@@ -4393,15 +4501,8 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
     # --- orders -----------------------------------------------------------
 
     def _stop_for(self, fill: float) -> "float | None":
-        """The stop under a fill: `ff_stop_k` x the forecast 2-hour drop, in
-        the forecast's own log units. None without a stop, or without the
-        range forecast to size one."""
-        if not self.config.ff_stop_k or self.forecast is None:
-            return None
-        down, s120 = self.forecast.get("down_hat"), self.forecast.get("s120")
-        if down is None or s120 is None or not (math.isfinite(down) and math.isfinite(s120)):
-            return None
-        return float(fill * math.exp(-self.config.ff_stop_k * float(down) * float(s120)))
+        """The stop under a fill (`ff_stop`)."""
+        return ff_stop(self.config, self.forecast, fill)
 
     def _buy(self, state: AppState, tracker: DecisionTracker, bar, ts, minute: int) -> bool:
         fc = self.forecast
@@ -4511,12 +4612,8 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
         })
 
     def _threshold_words(self) -> str:
-        theta = self.session["theta"]
-        bps = (self.forecast or {}).get("theta_bps")
-        scale = f", {bps:.3f} bps a minute at this minute's scale" if bps is not None else ""
-        return (
-            f"entry threshold (y ±{theta:.4f}, the {self.config.ff_entry_quantile:.0%} quantile of "
-            f"the last {self.session['sessions']} sessions' forecasts{scale})"
+        return ff_threshold_words(
+            self.config, self.session["theta"], self.session["sessions"], self.forecast
         )
 
     def _read_summary(self, bar, ts, position: float) -> str:
@@ -4547,6 +4644,442 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
         return " · ".join(parts)
 
 
+class FastFuriousHighLowTrader(DayRangeTrader):
+    """Fast&Furious + HighLow: Fast&Furious's signal for the opening window,
+    HighLow's day-range rules after it.
+
+    The window is the run's own opening window -- the 09:30 to 09:34 bars
+    HighLow's 9:35 forecast is made from -- read by the bar's clock, so a run
+    started later has simply missed it. On each of those bars Fast&Furious's
+    rules run as they do all day on that model (`FastFuriousTrader`), on the
+    same forecast and the same session threshold:
+
+    * a **buy** at market when the forecast of the next 30 minutes' momentum
+      is at or above the entry threshold;
+    * a **stop** `ff_stop_k` x the forecast 2-hour drop under the fill, after
+      which nothing is bought until the forecast has left the buy zone;
+    * a **sale** on a sell signal (`ff_exit_on_sell_signal`), and
+      `ff_hold_minutes` after the last buy signal -- which the notebook's
+      30-minute clock never reaches inside five bars.
+
+    At 9:35 HighLow forecasts the day, and from then on this is a HighLow run,
+    bar for bar. A position the window left open is handed to it at the price
+    paid (`_hand_over`): HighLow's stop under that fill, its sell level, take
+    (timed from the fill), ladder and flatten. Fast&Furious's stop and clock end
+    there, and Fast&Furious is not asked again that day. A day with no 9:35
+    forecast -- sat out at 9:35, or one that failed -- sells what the window
+    bought (`_drop_early`).
+
+    What the window does not take from the day-range rules, as in HighLow_3m's
+    (`use_3m`): a trade it opens and closes is not judged by the circuit
+    breaker -- the levels that rule is about do not exist yet -- and a window
+    stop does not stop the run, which is Fast&Furious's own rule (a stop under
+    HighLow's levels still does). Nor does the window read the momentum
+    confirmation or rest a limit order: Fast&Furious's buys are market orders.
+    """
+
+    WINDOW_NAME = "Fast&Furious's opening window"
+    EXIT_EARLY_DROPPED = "fastfurious_no_forecast"
+    #: The window's own exits, apart from the ones Fast&Furious logs all day
+    #: under its own model.
+    EXIT_WINDOW_STOP = "fastfurious_stop"
+    EXIT_WINDOW_SELL_SIGNAL = "fastfurious_sell_signal"
+    EXIT_WINDOW_TIME = "fastfurious_time"
+    #: Fast&Furious's keys on a window entry, dropped when it is handed over.
+    _WINDOW_ENTRY_KEYS = ("due", "stop", "y_hat")
+
+    def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
+        super().__init__(config or AppleTraderConfig(model_key=apple_models.FF_HIGHLOW_KEY))
+        # This bar's Fast&Furious forecast inside the window, or None. `early`
+        # (the base's window slot) holds the session's threshold, or
+        # `{"date", "failed"}` when there is none.
+        self.forecast: "dict | None" = None
+        self._forecast_note: "str | None" = None
+        self._window_bundle: "dict | None" = None
+        self._window_prewarmed = None
+
+    @property
+    def _window_model(self) -> str:
+        return apple_models.window_key(self.config.model_key) or apple_models.FASTFURIOUS_KEY
+
+    def _window_ff(self) -> "dict | None":
+        """Fast&Furious's bundle, loaded once."""
+        if self._window_bundle is None:
+            self._window_bundle = apple_models.load(self._window_model, self.ticker)
+        return self._window_bundle
+
+    def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
+        # Before the market check, as a Fast&Furious run warms: the first
+        # window bar's forecast reads ~200 days of minute bars and the
+        # threshold's 20 sessions of forecasts.
+        self._prewarm_window(bundle, state)
+        return super().run_cycle(bundle, state, tracker)
+
+    def _prewarm_window(self, bundle: dict, state: AppState) -> None:
+        """Fill the window's caches in the background, once a session, while
+        there is still a window ahead. Live only; a failure is not reported,
+        the first forecast makes the same reads and reports its own."""
+        if getattr(state, "bar_tape_override", ""):
+            return
+        now = clock.now().astimezone(market_hours.MARKET_TZ)
+        today = pd.Timestamp(now.date())
+        if self._window_prewarmed == today:
+            return
+        window_end = pd.Timestamp(now).normalize() + pd.Timedelta(
+            hours=market_hours.MARKET_OPEN.hour,
+            minutes=market_hours.MARKET_OPEN.minute + _dayrange().opening_minutes(bundle),
+        )
+        module = _fastfurious()
+        if pd.Timestamp(now) >= window_end or not len(module.nyse_sessions([today])):
+            return
+        ff = self._window_ff()
+        if ff is None:
+            return
+        self._window_prewarmed = today
+        ticker = self.ticker
+        key, secret = ff_credentials(state)
+
+        def work() -> None:
+            try:
+                module.warm(ff, ticker, today, key, secret)
+            except Exception:  # noqa: BLE001 -- the first forecast retries and reports
+                pass
+
+        threading.Thread(
+            target=clock.inherit(work), name=f"fastfurious-warm-{ticker}", daemon=True
+        ).start()
+
+    # --- the window ----------------------------------------------------------
+
+    def _early_cycle(
+        self, state: AppState, tracker: DecisionTracker, frame, today, want: int
+    ) -> "str | None":
+        """One bar of the window, or None outside it (or with no threshold).
+
+        The order is Fast&Furious's (`FastFuriousTrader.run_cycle`): the stop
+        against the bar, then the bar's own signal. The 09:34 bar is the
+        window's last: it is read here, before HighLow's forecast is made from
+        it in the same cycle, so a buy on it is handed over at once.
+        """
+        if not len(frame):
+            return None
+        ts = frame.index[-1]
+        minute = int(round(self._minutes_from_open(ts)))
+        if not 0 <= minute <= want - 1:
+            return None
+        if self.early is None:
+            if self._sit_out(state, frame, today, 1):
+                return None
+            self._plan_window(state, today, want)
+        early = self.early
+        if early.get("failed"):
+            return None
+        if ts == self.last_bar_ts:
+            return rule_agent.HOLD
+        self.last_bar_ts = ts
+
+        last = frame.iloc[-1]
+        close = float(last["close"])
+        self.last_close = close
+        config = self.config
+        position = tracker.position_for(self.ticker)
+        if position > 0 and self.entry is None:
+            # A position this run does not remember (restarted inside the
+            # window onto a ledger that holds one): adopted at this bar with no
+            # stop -- the forecast it was bought on is not known -- and handed
+            # to HighLow at 9:35 with the rest.
+            self.entry = {
+                "price": close, "bars": 0, "ts": ts, "early": True, "fills": 1,
+                "last_fill": close, "due": minute + config.ff_hold_minutes, "stop": None,
+            }
+        if position <= 0:
+            self.entry = None
+        if self.entry is not None:
+            self.entry["bars"] = int(self.entry.get("bars") or 0) + 1
+
+        self.forecast = self._window_forecast(state, today, minute, ts)
+        self._publish_window(state)
+        if not self.quiet_read:
+            _log(state, {"type": "analysis", "text": self._window_read(last, ts, position)})
+
+        signal = ff_signal(config, self.forecast)
+        # 1. The stop, against this bar: it rested from the fill on.
+        stop = (self.entry or {}).get("stop")
+        if position > 0 and stop is not None and float(last["low"]) <= float(stop):
+            self._window_sell(state, tracker, position, self.EXIT_WINDOW_STOP, (
+                f"Fast&Furious window: the {ts:%H:%M} bar traded down to "
+                f"${float(last['low']):,.2f}, through the ${float(stop):,.2f} stop "
+                f"({config.ff_stop_k:g} × the forecast 2-hour drop under the fill). The next "
+                "buy waits for the forecast to leave the buy zone."
+            ))
+            early["blocked"] = True
+            self._unblock(signal)
+            return rule_agent.SOLD
+        # 2. The bar's own signal.
+        signal = self._unblock(signal)
+        if position > 0:
+            if signal == 1:
+                self.entry["due"] = minute + config.ff_hold_minutes
+                return rule_agent.HOLD
+            if signal == -1:
+                self._window_sell(state, tracker, position, self.EXIT_WINDOW_SELL_SIGNAL, (
+                    f"Fast&Furious window: the forecast turned to "
+                    f"{self.forecast['mom_bps']:+.3f} bps a minute over the next 30, at or "
+                    f"under minus the {self._window_threshold_words()} — a sell signal closes "
+                    "the long."
+                ))
+                return rule_agent.SOLD
+            if minute >= int(self.entry.get("due") or 0):
+                self._window_sell(state, tracker, position, self.EXIT_WINDOW_TIME, (
+                    f"Fast&Furious window: {config.ff_hold_minutes} minutes since the last buy "
+                    "signal and no fresh one."
+                ))
+                return rule_agent.SOLD
+            return rule_agent.HOLD
+        if signal != 1:
+            return rule_agent.HOLD
+        if self.entry_refused(state, ts):
+            return rule_agent.HOLD
+        return (
+            rule_agent.BOUGHT if self._window_buy(state, tracker, last, ts, minute, want)
+            else rule_agent.HOLD
+        )
+
+    def _plan_window(self, state: AppState, today, want: int) -> None:
+        """The session's entry threshold, into `self.early` -- or, when there
+        is none to be had, `{"date", "failed"}` and one line saying so: the
+        window is lost, HighLow's levels still trade from 9:35."""
+        config = self.config
+        model = apple_models.get(self._window_model)
+        after = apple_models.get(apple_models.forecast_key(config.model_key)).label
+        until = f"9:{30 + want:02d}"
+        module = _fastfurious()
+        key, secret = ff_credentials(state)
+        try:
+            bundle = self._window_ff()
+            if bundle is None:
+                raise ValueError(apple_models.unavailable_reason(self._window_model, self.ticker))
+            if module.is_half_day(today):
+                raise ValueError(
+                    "today closes at 13:00, and the model was fitted on full sessions only"
+                )
+            theta, sessions = module.threshold(
+                bundle, self.ticker, today, config.ff_entry_quantile, key, secret
+            )
+            if not math.isfinite(theta):
+                raise ValueError(
+                    f"only {sessions} earlier sessions have forecasts; the entry threshold "
+                    f"needs at least {module.THRESHOLD_MIN_SESSIONS}"
+                )
+        except Exception as exc:  # noqa: BLE001 -- costs the window, not the day
+            self.early = {"date": today, "failed": str(exc)}
+            _log(state, {"type": "error", "text": (
+                f"{model.label} cannot trade {self.ticker}'s opening window today, so nothing "
+                f"is bought before {after}'s {until} forecast: {exc}"
+            )})
+            return
+        self.early = {
+            "date": today, "theta": float(theta), "sessions": int(sessions), "blocked": False,
+            "until": want,
+        }
+        self._resume_window(state)
+        exits = []
+        if config.ff_stop_k:
+            exits.append(f"a stop {config.ff_stop_k:g} × the forecast 2-hour drop under the fill")
+        if config.ff_exit_on_sell_signal:
+            exits.append("a sale at or under minus the threshold")
+        _log(state, {"type": "analysis", "text": (
+            f"{self.ticker} {model.label} entry threshold for the opening window: a forecast y "
+            f"of ±{theta:.4f} — the {config.ff_entry_quantile:.0%} quantile of |y| over every "
+            f"minute of the last {sessions} sessions' forecasts. Until {after}'s {until} "
+            "forecast it buys at or above it"
+            + (f", with {' and '.join(exits)}" if exits else ", with no stop")
+            + f"; a position still open then is handed to {after}'s levels and exits."
+        )})
+
+    def _resume_window(self, state: AppState) -> None:
+        """Take back an earlier run's window position and a blocked buy side,
+        on a restart inside the window. Only from a record this model wrote
+        today; the entry is only a candidate (`_early_cycle` drops it if the
+        ledger is flat)."""
+        prior = self.slot.levels(state) or {}
+        if (
+            prior.get("ticker") != self.ticker
+            or pd.Timestamp(prior.get("date")) != pd.Timestamp(self.early["date"])
+            or getattr(prior.get("config"), "model_key", None) != self.config.model_key
+        ):
+            return
+        memory = prior.get("memory") or {}
+        self.early["blocked"] = bool(memory.get("window_blocked"))
+        entry = memory.get("entry")
+        if entry and entry.get("early") and self.entry is None:
+            self.entry = dict(entry)
+            stop = entry.get("stop")
+            _log(state, {"type": "status", "text": (
+                f"{self.ticker}: continuing today's earlier run's position from the opening "
+                "window" + (f" — stop ${float(stop):,.2f}" if stop else "") + "."
+            )})
+
+    def _window_forecast(self, state: AppState, today, minute: int, ts) -> "dict | None":
+        """This bar's forecast, or None when it cannot be made -- said once
+        per distinct reason, as Fast&Furious says it."""
+        key, secret = ff_credentials(state)
+        try:
+            found = _fastfurious().forecast_at(
+                self._window_ff(), self.ticker, today, minute,
+                self.config.ff_entry_quantile, key, secret,
+            )
+        except Exception as exc:  # noqa: BLE001 -- one bar without a forecast is not the window
+            note = str(exc)
+            if note != self._forecast_note:
+                self._forecast_note = note
+                _log(state, {"type": "error", "text": (
+                    f"No Fast&Furious forecast for {self.ticker} at the {ts:%H:%M} bar: {note}"
+                )})
+            return None
+        self._forecast_note = None
+        return found
+
+    def _unblock(self, signal: int) -> int:
+        """Fast&Furious's re-arm after a stop: the buy side stays blocked while
+        the forecast is still in the buy zone, and clears as soon as it is not."""
+        early = self.early
+        if not early.get("blocked"):
+            return signal
+        if signal != 1:
+            early["blocked"] = False
+            return signal
+        return 0
+
+    def _window_threshold_words(self) -> str:
+        return ff_threshold_words(
+            self.config, self.early["theta"], self.early["sessions"], self.forecast
+        )
+
+    def _window_buy(
+        self, state: AppState, tracker: DecisionTracker, bar, ts, minute: int, want: int
+    ) -> bool:
+        fc, config = self.forecast, self.config
+        if config.ff_stop_k and not math.isfinite(fc.get("down_hat", float("nan"))):
+            note = fc.get("range_problem") or "the 2-hour range forecast is missing"
+            _log(state, {"type": "status", "text": (
+                f"{self.ticker}: a Fast&Furious buy signal at {ts:%H:%M}, but there is no 2-hour "
+                f"range forecast to size the stop with ({note}), so it is not taken."
+            )})
+            return False
+        after = apple_models.get(apple_models.forecast_key(config.model_key)).label
+        exits = []
+        if config.ff_stop_k:
+            drop = 1 - math.exp(-config.ff_stop_k * fc["down_hat"] * fc["s120"])
+            exits.append(
+                f"a stop {drop:.2%} under the fill ({config.ff_stop_k:g} × the forecast 2-hour "
+                "drop)"
+            )
+        if config.ff_exit_on_sell_signal:
+            exits.append("a sale on a sell signal")
+        reasoning = (
+            f"Fast&Furious window: the forecast of the next 30 minutes' average momentum is "
+            f"{fc['mom_bps']:+.3f} bps a minute (y {fc['y_hat']:+.4f}), at or above the "
+            f"{self._window_threshold_words()}. Buying before {after}'s 9:{30 + want:02d} "
+            f"forecast; until then the exits are {' and '.join(exits) or 'none'}, and a position "
+            "still open then is handed to that forecast's levels, stop and take."
+        )
+        if not self.buy(state, tracker, float(bar["close"]), reasoning):
+            return False
+        fill = float(self.entry["price"])
+        self.entry.update({
+            "ts": ts, "early": True, "fills": 1, "last_fill": fill,
+            "due": minute + config.ff_hold_minutes, "stop": ff_stop(config, fc, fill),
+            "y_hat": float(fc["y_hat"]),
+        })
+        self._publish_window(state)
+        return True
+
+    def _window_sell(
+        self, state: AppState, tracker: DecisionTracker, quantity: float, kind: str,
+        reasoning: str,
+    ) -> None:
+        """Sell inside the window. Not judged by the circuit breaker, like
+        HighLow_3m's window trades: that rule is about the 9:35 levels."""
+        entry = dict(self.entry or {})
+        decision = self.sell(state, tracker, quantity, reasoning, log_extra={"exit": kind})
+        if (
+            decision.status == "filled" and self.entry is None
+            and tracker.position_for(self.ticker) > 0
+        ):
+            # Partly filled: what is left is the same position, same stop.
+            self.entry = entry
+
+    def _hand_over(self, state: AppState, tracker: DecisionTracker, frame) -> None:
+        """The base's hand-over (`DayRangeTrader._hand_over`), after dropping
+        Fast&Furious's stop and clock: from 9:35 the position has HighLow's."""
+        entry = self.entry
+        if entry and entry.get("early"):
+            for name in self._WINDOW_ENTRY_KEYS:
+                entry.pop(name, None)
+        super()._hand_over(state, tracker, frame)
+
+    def _publish_window(self, state: AppState) -> None:
+        """Publish the session's record during the window: no rows -- the
+        window rests no levels, and the chart draws its signals from the
+        Fast&Furious overlay -- but the memory, so a restart inside the window
+        (or the session file) knows the position and its stop. `_plan_session`
+        starts the rows at 9:35."""
+        early = self.early
+        if "history" not in early:
+            prior = self.slot.levels(state) or {}
+            same_day = (
+                prior.get("rows")
+                and prior.get("ticker") == self.ticker
+                and pd.Timestamp(prior.get("date")) == pd.Timestamp(early["date"])
+                and _record_strategy(prior) == self.config.strategy
+            )
+            early["history"] = list(prior["rows"]) if same_day else []
+        self.slot.publish(state, {
+            "ticker": self.ticker,
+            "date": early["date"],
+            "config": self.config,
+            "rows": early["history"],
+            "memory": self.memory(),
+            "seed": None,
+        })
+
+    def memory(self) -> dict:
+        """The base's, plus whether the window's buy side is blocked after a
+        stop -- what a restart inside the window needs back."""
+        memory = super().memory()
+        memory["window_blocked"] = bool((self.early or {}).get("blocked"))
+        return memory
+
+    def _window_read(self, bar, ts, position: float) -> str:
+        """The window's per-bar line, `FastFuriousTrader._read_summary`'s
+        counterpart."""
+        price = float(bar["close"])
+        parts = [f"{self.ticker} {ts:%H:%M} ${price:,.2f}"]
+        fc, theta = self.forecast, self.early["theta"]
+        if fc is not None:
+            share = fc["y_hat"] / theta if theta else 0.0
+            parts.append(
+                f"Fast&Furious next 30 min {fc['mom_bps']:+.3f} bps/min ({share:+.0%} of the "
+                "entry threshold)"
+            )
+            if fc["signal"]:
+                parts.append("buy signal" if fc["signal"] > 0 else "sell signal")
+        else:
+            parts.append("no Fast&Furious forecast")
+        if position > 0 and self.entry:
+            entry_price = float(self.entry["price"])
+            pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
+            parts.append(f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%)")
+            if self.entry.get("stop"):
+                parts.append(f"stop ${float(self.entry['stop']):,.2f}")
+            after = apple_models.get(apple_models.forecast_key(self.config.model_key)).label
+            parts.append(f"handed to {after} at 9:{30 + int(self.early['until']):02d}")
+        elif self.early.get("blocked"):
+            parts.append("stopped out — buys wait for the forecast to leave the buy zone")
+        return " · ".join(parts)
+
+
 def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """The state machine this configuration's model calls for.
 
@@ -4558,6 +5091,8 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """
     if config.strategy == apple_models.STRATEGY_MOMENTUM:
         return FastFuriousTrader(config)
+    if apple_models.window_key(config.model_key) == apple_models.FASTFURIOUS_KEY:
+        return FastFuriousHighLowTrader(config)
     return DayRangeTrader(config)
 
 
@@ -4687,6 +5222,22 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         "that forecast's levels and exits."
         if config.use_3m else ""
     )
+    window = apple_models.window_key(config.model_key)
+    if window:
+        exits = []
+        if config.ff_stop_k:
+            exits.append(f"a stop {config.ff_stop_k:g} × the forecast 2-hour drop under the fill")
+        if config.ff_exit_on_sell_signal:
+            exits.append("a sale on a sell signal")
+        early = (
+            f" Before that, on the 09:30 to 09:{made - 1:02d} bars, it trades "
+            f"{apple_models.get(window).label}'s forecast of the next 30 minutes' momentum: a "
+            f"buy at market when it is at or above the {config.ff_entry_quantile:.0%} quantile "
+            "of the last 20 sessions' forecasts, with "
+            + (" and ".join(exits) or "no exit of its own")
+            + f"; a position still open at 9:{made:02d} is handed to that forecast's levels "
+            "and exits."
+        )
     return (
         f"Apple Trader armed on {model.label} (fitted "
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:{made:02d} it forecasts where "

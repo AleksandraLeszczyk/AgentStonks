@@ -2,8 +2,9 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are six; the
-first five share a rule set:
+named X" and never branch on which one they got. Today there are seven: six
+saved models, the first five of which share a rule set, and one made of two of
+them:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
                      an opening ridge, forecasting where the *whole session's*
@@ -48,6 +49,16 @@ first five share a rule set:
                      stop under the forecast low, out 30 minutes after the
                      last signal. Its bundle carries `kind="fastfurious"` and
                      the forecasts come from `fastfurious_model`.
+`ff_highlow`         no saved model of its own: Fast&Furious's buy signal for
+                     the first five minutes, HighLow's day-range rules after
+                     them. Its bundle *is* HighLow's -- the levels hang off that
+                     9:35 forecast, and its tuned numbers and base configuration
+                     are where a pair starts (`forecast_key`) -- and the opening
+                     window is traded on Fast&Furious's per-minute forecast
+                     (`window_key`, `apple_trader.FastFuriousHighLowTrader`).
+                     It drives the day-range rule set: from 9:35 on it is
+                     HighLow.
+                     Available only where both bundles load.
 
 That second entry is why `AppleModel` carries `level_source`: what the levels
 are measured below used to be a separate setting beside the model picker, which
@@ -79,9 +90,11 @@ is trained in `FinNotebooks/Models` and is one entry away.
 `AppleModel.strategy` names which rule set a model drives, and
 `apple_trader.build_trader` turns it into a state machine: the five range
 models drive the day-range rules (two resting levels), Fast&Furious the
-momentum rules (a per-minute signal). A caller written for one of them --
-Orchestra, the day-range levels on the chart, a tuning axis -- asks
-`strategy(key)` rather than assuming.
+momentum rules (a per-minute signal), and Fast&Furious + HighLow the day-range
+rules with Fast&Furious's signal trading the opening window before them. A
+caller written for one of them -- Orchestra, the day-range levels on the chart,
+a tuning axis -- asks `strategy(key)` rather than assuming, and one that reads
+*the forecast* asks `forecast_key(key)`.
 
 Every model is optional: a missing file or a missing dependency makes it
 *unavailable*, reported as such, rather than an agent that silently never
@@ -155,6 +168,9 @@ HIGHLOW3M_TICKERS = (DEFAULT_TICKER,)
 # entry in `highlow3m_model.NOTEBOOK_OPTIONS`.
 FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
 
+# Fast&Furious + HighLow reads both bundles, so it exists where both were fitted.
+FF_HIGHLOW_TICKERS = tuple(t for t in FASTFURIOUS_TICKERS if t in HIGHLOW_TICKERS)
+
 
 @dataclass(frozen=True)
 class AppleModel:
@@ -188,6 +204,14 @@ class AppleModel:
     # reference as a separate choice: which curve the levels hang off is what
     # distinguishes these two models, so it is the model picker's answer.
     level_source: str = LEVELS_DAYRANGE
+    # For a model made of two others: the model whose morning forecast the
+    # levels hang off -- and whose tuned numbers and base configuration a pair
+    # of this one falls back to (`apple_trader.dayrange_levels`) -- and the
+    # model whose per-minute signal trades the opening window before that
+    # forecast exists. Empty for a model that is its own forecast and trades
+    # no window. See `forecast_key` and `window_key` below.
+    forecast_of: str = ""
+    window_of: str = ""
 
     def covers(self, ticker: "str | None") -> bool:
         return (ticker or DEFAULT_TICKER).upper() in self.tickers
@@ -335,12 +359,44 @@ def _fastfurious_path(ticker: str = DEFAULT_TICKER) -> Path:
     return fastfurious_model.model_path(ticker)
 
 
+def _load_ff_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """HighLow's bundle, but only when Fast&Furious's loads too.
+
+    HighLow's because that is the forecast the levels hang off from 9:35 on
+    (`apple_trader.session_forecast` dispatches on its `kind`); Fast&Furious's
+    is loaded where the opening window reads it. The refusal is the point, as
+    for the intraday pairing: without the second bundle a run would trade as
+    plain HighLow under this model's name.
+    """
+    bundle = _load_highlow(ticker)
+    if bundle is None or _load_fastfurious(ticker) is None:
+        return None
+    return bundle
+
+
+def _ff_highlow_unavailable(ticker: str = DEFAULT_TICKER) -> str:
+    """Which of the two bundles is missing."""
+    symbol = (ticker or DEFAULT_TICKER).upper()
+    if _load_highlow(symbol) is None:
+        return (
+            f"No HighLow bundle at {_highlow_path(symbol)} (or PyTorch, LightGBM, scikit-learn "
+            "and joblib are not installed); Fast&Furious + HighLow trades HighLow's levels "
+            "from 9:35."
+        )
+    return (
+        f"HighLow's bundle for {symbol} loaded, but Fast&Furious's at "
+        f"{_fastfurious_path(symbol)} is missing or unreadable (or LightGBM, SciPy and joblib "
+        "are not installed); it trades the first five minutes. Run HighLow alone instead."
+    )
+
+
 DAYRANGE_KEY = "dayrange"
 DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 HIGHLOW3M_KEY = "highlow3m"
 FASTFURIOUS_KEY = "fastfurious"
+FF_HIGHLOW_KEY = "ff_highlow"
 # Both saved models have to exist for the pairing, so the symbols it covers are
 # the symbols both were fitted on.
 DAYRANGE_INTRADAY_TICKERS = tuple(
@@ -523,6 +579,35 @@ MODELS: "dict[str, AppleModel]" = {
         load=_load_fastfurious,
         path=_fastfurious_path,
     ),
+    FF_HIGHLOW_KEY: AppleModel(
+        key=FF_HIGHLOW_KEY,
+        label="Fast&Furious + HighLow",
+        summary=(
+            "Two saved models, one after the other: Fast&Furious for the first five minutes, "
+            "HighLow for the rest of the day. From the 09:30 bar to the 09:34 one it buys when "
+            "Fast&Furious's forecast of the next 30 minutes' momentum is at or above its entry "
+            "threshold (the top 5% of the last 20 sessions' forecasts), under Fast&Furious's own "
+            "stop and sell signal -- the only rules there are before a range forecast exists. "
+            "At 9:35 HighLow forecasts the day's high and low, and from then on the day-range "
+            "rules trade it exactly as a HighLow run does: the buy and sell levels under the "
+            "predicted high, the stop, the take, the ladder, the breach rules. A position the "
+            "first five minutes left open is handed to them at the price paid. Its settings "
+            "start from HighLow's. Neither notebook tested the pairing: measure it in SimLab "
+            "against HighLow alone."
+        ),
+        requires=(
+            "everything HighLow and Fast&Furious each require: both bundles, PyTorch, LightGBM, "
+            "SciPy and joblib, Alpaca SIP and IEX minute history, and HighLow_3m's option tables "
+            "for Fast&Furious's stop"
+        ),
+        strategy=STRATEGY_DAYRANGE,
+        tickers=FF_HIGHLOW_TICKERS,
+        load=_load_ff_highlow,
+        path=_highlow_path,
+        unavailable=_ff_highlow_unavailable,
+        forecast_of=HIGHLOW_KEY,
+        window_of=FASTFURIOUS_KEY,
+    ),
 }
 
 DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else DAYRANGE_KEY
@@ -612,8 +697,43 @@ def strategy(key: "str | None") -> str:
     return get(key).strategy
 
 
-def keys_for_strategy(ticker: "str | None", rule_set: str) -> "list[str]":
+def keys_for_strategy(
+    ticker: "str | None", rule_set: str, windows: bool = True
+) -> "list[str]":
     """`keys_for(ticker)` narrowed to the models that drive one rule set --
     what a caller written for one of them offers (Orchestra races day-range
-    pairs only)."""
-    return [key for key in keys_for(ticker) if MODELS[key].strategy == rule_set]
+    pairs only). `windows` off also leaves out the models that trade an opening
+    window before their forecast (`window_key`)."""
+    return [
+        key for key in keys_for(ticker)
+        if MODELS[key].strategy == rule_set and (windows or not MODELS[key].window_of)
+    ]
+
+
+def forecast_key(key: "str | None") -> str:
+    """The model whose morning forecast a run on `key` hangs its levels off:
+    the model itself, or for a combined one (`AppleModel.forecast_of`) the model
+    it delegates to -- HighLow for Fast&Furious + HighLow. What a caller that
+    draws or scores *the forecast* dispatches on. An unknown key is returned as
+    it is, like `config_signature` writes it."""
+    model = MODELS.get(key or "")
+    if model is not None and model.forecast_of:
+        return model.forecast_of
+    return str(key or "")
+
+
+def window_key(key: "str | None") -> str:
+    """The model that trades the opening window before `key`'s forecast
+    (`AppleModel.window_of`), or "" for none."""
+    model = MODELS.get(key or "")
+    return model.window_of if model is not None else ""
+
+
+def parts(key: "str | None") -> "tuple[str, ...]":
+    """Every saved model a run on `key` reads: the model itself, or a combined
+    one's forecast and window models -- what a check on the files a result was
+    made from has to look at."""
+    model = MODELS.get(key or "")
+    if model is None or not (model.forecast_of or model.window_of):
+        return (str(key or ""),)
+    return tuple(k for k in (model.forecast_of, model.window_of) if k)

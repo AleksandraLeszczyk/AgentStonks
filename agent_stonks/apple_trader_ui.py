@@ -40,7 +40,8 @@ import streamlit as st
 
 from . import apple_models, base_configs, event_days
 from .apple_trader import (
-    AppleTraderConfig, dayrange_levels, default_config, min_win_for, shipped_config,
+    AppleTraderConfig, base_record, dayrange_levels, default_config, min_win_for,
+    shipped_config,
 )
 
 if TYPE_CHECKING:
@@ -133,7 +134,10 @@ def params(
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
     defaults = default_config(ticker, model_key)
-    copy = replace(copy, suffix=base_configs.key_suffix(model_key, ticker))
+    # The digest of the base the form opens on -- a combined model's own, or
+    # its forecast model's when it has none (`base_record`).
+    _, based_on = base_record(model_key, ticker)
+    copy = replace(copy, suffix=base_configs.key_suffix(based_on, ticker) if based_on else "")
     if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
         return momentum_params(defaults, model_key, ticker, copy)
     return dayrange_params(defaults, model_key, ticker, copy, seed)
@@ -260,8 +264,11 @@ def base_help(model_key: str, ticker: str) -> str:
     configuration (`base_configs`): when it was set, from what, and every field
     in which it differs from the shipped defaults -- the ones without a knob
     here included, since nothing else on the form shows them. Empty without one.
+    A combined model with no base of its own names its forecast model's, which
+    it opens on (`base_record`).
     """
-    found = base_configs.entry(model_key, ticker)
+    _, based_on = base_record(model_key, ticker)
+    found = base_configs.entry(based_on, ticker) if based_on else None
     if not found:
         return ""
     changed = config_changes(
@@ -269,9 +276,14 @@ def base_help(model_key: str, ticker: str) -> str:
     )
     source = found.get("source") or {}
     origin = f" from tuning job `{source['job_id']}`" if source.get("job_id") else ""
+    whose = (
+        "" if based_on == model_key
+        else f" — {apple_models.get(based_on).label}'s, whose rules this model trades after "
+        "the opening window"
+    )
     lines = [
-        f"**Base configuration.** Set {str(found.get('set_at', ''))[:10]}{origin}: this "
-        "form opens on it rather than on the shipped defaults."
+        f"**Base configuration{whose}.** Set {str(found.get('set_at', ''))[:10]}{origin}: "
+        "this form opens on it rather than on the shipped defaults."
     ]
     lines.append(
         "It differs from them in " + "; ".join(changed) + "." if changed
@@ -348,6 +360,7 @@ def dayrange_params(
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
     sell_k = repaired_sell(float(buy_k), float(sell_k))
     early = early_params(defaults, model_key, ticker, unit_label, copy, seed)
+    early.update(window_params(defaults, model_key, ticker, copy, seed))
     rules = rule_params(
         defaults, float(buy_k), float(sell_k), unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
@@ -428,6 +441,55 @@ def early_params(
         "use_3m": True,
         "buy_3m_k": float(buy_3m_k),
         "sell_3m_k": repaired_sell(float(buy_3m_k), float(sell_3m_k), "HighLow_3m window"),
+    }
+
+
+def window_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
+    seed: "AppleTraderConfig | None" = None,
+) -> dict:
+    """Fast&Furious's opening window (Fast&Furious + HighLow): the entry
+    threshold, the stop and the sell signal it trades the 09:30 to 09:34 bars
+    on. Drawn only for a model that trades that window.
+
+    Keyed by model and instrument like `momentum_params`' -- the same numbers
+    on Fast&Furious alone are a separate choice. The 30-minute clock is left
+    out: five bars never reach it. Read once, at ▶ Start, so a running agent's
+    configuration for the same pair (`seed`) reopens them on its values.
+    """
+    if apple_models.window_key(model_key) != apple_models.FASTFURIOUS_KEY:
+        return {}
+    section("Fast&Furious window (9:30–9:35)", copy.sections.get("ff_window"))
+    same_pair = (
+        seed is not None
+        and (seed.ticker or "").upper() == ticker
+        and seed.model_key == model_key
+    )
+    start = seed if same_pair else defaults
+    col_a, col_b = st.columns(2)
+    quantile = col_a.number_input(
+        "Entry threshold (quantile of the last 20 sessions)",
+        min_value=0.50, max_value=0.995, value=float(start.ff_entry_quantile), step=0.01,
+        format="%.3f", key=copy.key(f"ff_entry_quantile_{model_key}_{ticker}"),
+        help=copy.help.get("ff_window_entry_quantile") or copy.help.get("ff_entry_quantile"),
+    )
+    stop_k = col_b.number_input(
+        "Stop (× the forecast 2-hour drop, 0 = off)",
+        min_value=0.0, max_value=5.0, value=float(start.ff_stop_k), step=0.25, format="%.2f",
+        key=copy.key(f"ff_stop_k_{model_key}_{ticker}"),
+        help=copy.help.get("ff_window_stop_k") or copy.help.get("ff_stop_k"),
+    )
+    exit_on_sell = st.checkbox(
+        "Sell on a sell signal",
+        value=bool(start.ff_exit_on_sell_signal),
+        key=copy.key(f"ff_exit_on_sell_signal_{model_key}_{ticker}"),
+        help=copy.help.get("ff_window_exit_on_sell_signal")
+        or copy.help.get("ff_exit_on_sell_signal"),
+    )
+    return {
+        "ff_entry_quantile": float(quantile),
+        "ff_stop_k": float(stop_k),
+        "ff_exit_on_sell_signal": bool(exit_on_sell),
     }
 
 

@@ -235,7 +235,8 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="PyTorch, LightGBM, the HighLow bundle and Alpaca SIP minute history",
         tickers=apple_models.HIGHLOW_TICKERS,
-        models=(apple_models.HIGHLOW_KEY,),
+        # Fast&Furious + HighLow hangs its levels off this forecast from 9:35.
+        models=(apple_models.HIGHLOW_KEY, apple_models.FF_HIGHLOW_KEY),
     ),
     HIGHLOW2_RANGE_KEY: ModelOverlay(
         key=HIGHLOW2_RANGE_KEY,
@@ -287,7 +288,8 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="LightGBM, the Fast&Furious bundle, and Alpaca SIP and IEX minute bars",
         tickers=apple_models.FASTFURIOUS_TICKERS,
-        models=(apple_models.FASTFURIOUS_KEY,),
+        # Fast&Furious + HighLow buys on these signals before 9:35.
+        models=(apple_models.FASTFURIOUS_KEY, apple_models.FF_HIGHLOW_KEY),
     ),
     FASTFURIOUS_RANGE_KEY: ModelOverlay(
         key=FASTFURIOUS_RANGE_KEY,
@@ -700,7 +702,7 @@ def compute(
         return memo["fastfurious"]
 
     def trader_forecast() -> dict:
-        model_key = trader_model(trader_config, symbol)
+        model_key = apple_models.forecast_key(trader_model(trader_config, symbol))
         if model_key in _HIGHLOW_MODULES:
             return highlow_forecast(model_key)
         return day_range_forecast()
@@ -831,6 +833,8 @@ def session_forecast(
     overlay that draws this model's forecast, for its label and colour.
     """
     symbol = (ticker or "").upper()
+    # A combined model's levels hang off another model's forecast.
+    model_key = apple_models.forecast_key(model_key) or model_key
     overlay = _RANGE_OVERLAYS.get(model_key or "", DAY_RANGE_KEY)
     day, session, problem = _session_of(bars or [], session_date)
     if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
@@ -1357,11 +1361,12 @@ def _trader_levels_items(
     color = MODEL_OVERLAY_COLORS[TRADER_LEVELS_KEY]
     buys = [row["buy"] for row in levels]
     sells = [row["sell"] for row in levels]
+    forecast_of = apple_models.forecast_key(config.model_key)
     how = (
         f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
         + ("the predicted high" if config.level_source != "intraday"
            else "the intraday band's upper curve")
-        + (f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else "")
+        + (f" ({_HIGHLOW_NAMES[forecast_of]})" if forecast_of in _HIGHLOW_NAMES else "")
     )
     # A run that traded HighLow_3m's 9:33 window (`use_3m`) recorded those two
     # bars on that model's levels before its own: never one flat pair.
@@ -1429,7 +1434,8 @@ def _fastfurious_forecast(
     model's own tape (SIP to 15 minutes back, IEX since), so a past session is
     drawn with what the model said at each minute and a live one with what it
     has said so far. The threshold is the configured run's quantile when the
-    chart's configuration is a Fast&Furious one, the notebook's otherwise.
+    chart's configuration is a Fast&Furious one (or trades its opening window),
+    the notebook's otherwise.
 
     Returns `{"fc", "stamps", "horizon", "theta", "sessions", "quantile",
     "problem", "threshold_problem"}`: `stamps` are the bars each forecast was
@@ -1442,7 +1448,9 @@ def _fastfurious_forecast(
     from .config import APPLE_TRADER_FF_ENTRY_QUANTILE
 
     quantile = APPLE_TRADER_FF_ENTRY_QUANTILE
-    if config is not None and getattr(config, "model_key", None) == model_key:
+    named = getattr(config, "model_key", None) if config is not None else None
+    if named == model_key or apple_models.window_key(named) == model_key:
+        # A run on Fast&Furious, or one trading its opening window: that run's own.
         quantile = float(config.ff_entry_quantile)
     out = {"fc": None, "stamps": [], "horizon": 0, "theta": float("nan"), "sessions": 0,
            "quantile": quantile, "problem": "", "threshold_problem": ""}

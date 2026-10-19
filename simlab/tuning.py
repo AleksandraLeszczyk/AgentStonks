@@ -354,11 +354,30 @@ DEFAULT_AXES = {
 }
 
 
+# The Fast&Furious axes a day-range model trading Fast&Furious's opening window
+# (Fast&Furious + HighLow) reads beside its own -- not the 30-minute clock,
+# which five bars never reach.
+WINDOW_AXES: "tuple[str, ...]" = ("ff_entry_quantile", "ff_stop_k")
+
+
 def axes_for(model_key: "str | None", names) -> "list[str]":
     """`names`, narrowed to the axes the named model's rule set reads."""
     if apple_models.strategy(model_key) == STRATEGY_MOMENTUM:
         return [n for n in names if n in MOMENTUM_AXES]
-    return [n for n in names if not n.startswith("ff_")]
+    window = (
+        WINDOW_AXES
+        if apple_models.window_key(model_key) == apple_models.FASTFURIOUS_KEY else ()
+    )
+    return [n for n in names if not n.startswith("ff_") or n in window]
+
+
+def axes_family(model_key: "str | None") -> str:
+    """What the axis pickers are keyed by: the axes on offer differ per rule
+    set, and a model trading Fast&Furious's window offers two more."""
+    family = apple_models.strategy(model_key)
+    if apple_models.window_key(model_key):
+        family += "_window"
+    return family
 
 # Axes a stored grid may have but a new one is not offered: a field kept only
 # so old records replay.
@@ -768,8 +787,10 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
         # so the momentum confirmation's neutral band) is measured from.
         for prior in minute_momentum.prior_week_days(stamp):
             paths.append(sim_data.stored_bars_path(symbol, prior, feed))
-    bundle = apple_models.get(config.model_key).path(symbol)
-    paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
+    # Every saved model the run reads: one, or a combined model's two.
+    for part in apple_models.parts(config.model_key):
+        bundle = apple_models.get(part).path(symbol)
+        paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
     # HighLow_3m's 9:33 window forecasts from a second saved model.
     if config.use_3m:
         early = apple_models.get(apple_models.HIGHLOW3M_KEY).path(symbol)

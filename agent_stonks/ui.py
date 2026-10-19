@@ -2937,6 +2937,19 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "manage it as if it had been bought then.\n"
             "- A trade the window closes does not trip the circuit breaker."
         ),
+        "ff_window": (
+            "Fast&Furious + HighLow trades the **09:30 to 09:34 bars** on Fast&Furious's "
+            "forecast of the next 30 minutes' momentum, before HighLow's 9:35 forecast "
+            "exists.\n\n"
+            "- **Buy** — at market, when the forecast is at or above the threshold below.\n"
+            "- **Stop / sell signal** — Fast&Furious's own, inside the window only. After a "
+            "stop the next buy waits for the forecast to leave the buy zone; the run is not "
+            "stopped.\n"
+            "- **At 9:35** a position still open is handed to HighLow: its sell level, a stop "
+            "under the actual fill, the momentum take, the ladder and the flatten manage it "
+            "as if it had been bought then.\n"
+            "- A trade the window opens and closes does not trip the circuit breaker."
+        ),
         "dayrange_breaker": (
             "When to stop buying for the day. Two things end it:\n\n"
             "- **A stop** — the day has not gone the way the forecast said.\n"
@@ -3044,6 +3057,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "not this one.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP minute history: the first "
             "run fetches it (tens of seconds) and caches it under `data/highlow/`."
+        ),
+        "model_ff_highlow": (
+            "HighLow's day-range rules from 9:35, with the five minutes before them traded "
+            "on Fast&Furious's buy signal.\n\n"
+            "- Everything above the *Fast&Furious window* section is HighLow's, and opens on "
+            "HighLow's base configuration for this instrument until this model has one of "
+            "its own.\n"
+            "- Started before the open, it fetches Fast&Furious's ~200 days of minute bars and "
+            "its threshold in the background; HighLow's history is read at 9:35 as usual.\n"
+            "- Changing to or from this model mid-session needs ▶ Stop and ▶ Start."
         ),
         "skip_events": (
             "Checked when the opening window closes, before the forecast.\n\n"

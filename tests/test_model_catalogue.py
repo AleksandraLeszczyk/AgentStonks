@@ -423,9 +423,11 @@ def test_specs_cover_every_registered_model_and_ticker():
     of its own -- it is the day-range bundle read through the IntradayVolatility
     export -- so a third card would repeat two sets of metrics under a name no
     file carries. It is excluded by name rather than by a rule, so that a model
-    which really does have its own artifact still fails this.
+    which really does have its own artifact still fails this. So is
+    "Fast&Furious + HighLow", the HighLow and Fast&Furious bundles traded one
+    after the other.
     """
-    composed = {apple_models.DAYRANGE_INTRADAY_KEY}
+    composed = {apple_models.DAYRANGE_INTRADAY_KEY, apple_models.FF_HIGHLOW_KEY}
     expected = {
         (key, ticker)
         for key, model in apple_models.MODELS.items()
