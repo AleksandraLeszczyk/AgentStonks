@@ -232,3 +232,100 @@ class TestStall:
         assert len(marks) == 1 and marks[0].marker.symbol == "triangle-down"
         assert "Resistance stall</b> at 100.0" in marks[0].customdata[0]
         assert [t.showlegend for t in stall].count(False) == 1  # the line rides on the mark's entry
+
+
+# The zone scenario, u = $0.10, so the default 3u band is $0.30: a slide in
+# $0.20 steps, 25 bars with every close at 100.0-100.2 and the volume on the
+# flat 100.2 bars, then a slide out below and a rally back through.
+SLIDE_IN = [round(102.0 - 0.2 * k, 2) for k in range(8)]  # 102.0 .. 100.6
+ZONE = ([100.2, 100.2, 100.2, 100.0, 100.2] * 5)
+SLIDE_OUT = [99.8, 99.6, 99.4, 99.2]
+RALLY_BACK = [99.6, 100.0, 100.4, 100.6]
+
+
+def _zone_session(closes, start=OPEN):
+    """Bars through `closes`, heavy where a close repeats the one before:
+    the zone's flat 100.2 bars carry its volume."""
+    volumes = [5_000 if i and c == closes[i - 1] else 500 for i, c in enumerate(closes)]
+    return _session(closes, volumes, start=start)
+
+
+def _zones(bars, **kwargs):
+    kwargs.setdefault("minute_move", U)
+    return candle_patterns.compute([candle_patterns.ZONE_KEY], bars, **kwargs)
+
+
+class TestStallZone:
+    def test_a_band_left_below_is_resistance_at_its_volume_peak(self):
+        bars = _zone_session(SLIDE_IN + ZONE + SLIDE_OUT)
+        (zone,) = _zones(bars)
+        assert zone["kind"] == "zone" and zone["role"] == "resistance"
+        assert pd.Timestamp(zone["x0"]) == _bar(8)
+        assert pd.Timestamp(zone["x_end"]) == _bar(32)
+        assert pd.Timestamp(zone["left_at"]) == _bar(33)
+        assert (zone["y0"], zone["y1"]) == (100.0, 100.2)
+        # The peak of the zone's own profile, not the middle of its band.
+        assert abs(zone["level"] - 100.2) < 0.03
+        assert zone["bars"] == 25 and zone["broken"] is False
+        assert pd.Timestamp(zone["x1"]) == _bar(len(bars) - 1)
+
+    def test_a_close_back_through_the_level_ends_its_line(self):
+        bars = _zone_session(SLIDE_IN + ZONE + SLIDE_OUT + RALLY_BACK)
+        (zone,) = _zones(bars)
+        assert zone["broken"] is True
+        # The first close above the level + u: 100.4, the third rally bar.
+        assert pd.Timestamp(zone["x1"]) == _bar(len(SLIDE_IN + ZONE + SLIDE_OUT) + 2)
+
+    def test_the_mirror_is_support(self):
+        closes = [round(200.0 - c, 2) for c in SLIDE_IN + ZONE + SLIDE_OUT]
+        (zone,) = _zones(_zone_session(closes))
+        assert zone["role"] == "support"
+        assert abs(zone["level"] - 99.8) < 0.03
+
+    def test_a_band_price_is_still_in_is_forming(self):
+        bars = _zone_session(SLIDE_IN + ZONE)
+        (zone,) = _zones(bars)
+        assert zone["role"] == "forming" and zone["left_at"] is None
+        assert pd.Timestamp(zone["x1"]) == pd.Timestamp(zone["x_end"]) == _bar(len(bars) - 1)
+
+    def test_too_short_or_too_wide_is_no_zone(self):
+        bars = _zone_session(SLIDE_IN + ZONE + SLIDE_OUT)
+        assert _zones(bars, zone_min_bars=30) == []
+        # A band narrower than the zone's $0.20 of closes.
+        assert _zones(bars, zone_width=1.5) == []
+
+    def test_zones_do_not_overlap(self):
+        second = [round(c - 1.2, 2) for c in ZONE]  # 98.8-99.0 after the slide out
+        closes = SLIDE_IN + ZONE + SLIDE_OUT + second + [99.4, 99.8, 100.2]
+        first, later = _zones(_zone_session(closes))
+        assert pd.Timestamp(later["x0"]) > pd.Timestamp(first["x_end"])
+        assert first["role"] == "resistance" and later["role"] == "support"
+
+    def test_a_finished_zone_never_depends_on_later_bars(self):
+        rng = np.random.default_rng(11)
+        closes = list(np.round(100 + np.cumsum(rng.normal(0, U, 390)), 2))
+        volumes = list(rng.lognormal(8, 0.6, 390).round())
+        bars = _session(closes, volumes)
+        full = _zones(bars, zone_min_bars=10)
+        assert len(full) >= 3
+
+        def key(zone):
+            return zone["x0"], zone["x_end"], zone["role"], zone["level"]
+
+        for k in (150, 250, 350):
+            cutoff = pd.Timestamp(bars[k - 1]["t"])
+            done = [key(z) for z in full if z["left_at"] and pd.Timestamp(z["left_at"]) <= cutoff]
+            prefix = [key(z) for z in _zones(bars[:k], zone_min_bars=10) if z["role"] != "forming"]
+            assert prefix == done
+
+    def test_build_chart_draws_box_behind_the_candles_line_and_hover(self):
+        bars = _zone_session(SLIDE_IN + ZONE + SLIDE_OUT)
+        items = _zones(bars)
+        fig = build_chart(bars, [], [], "AAPL", OPEN - pd.Timedelta(minutes=10), candle_patterns=items)
+        zone = [t for t in fig.data if t.name == "Resistance zone"]
+        box = [t for t in zone if t.fill == "toself"]
+        assert len(box) == 1
+        assert fig.data[0] is box[0]  # behind the candles and everything else
+        assert [t.showlegend for t in zone].count(True) == 1
+        hover = [t for t in zone if t.mode == "markers"]
+        assert "Resistance zone</b> level 100.2" in hover[0].customdata[0]

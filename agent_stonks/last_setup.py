@@ -80,6 +80,8 @@ KEYS = frozenset({
     "fvg_hide_filled",
     "stall_approach",
     "stall_min_volume",
+    "zone_min_bars",
+    "zone_width",
     # News and Pre-Market tabs
     "news_impact_method_select",
     "news_llm_provider_select",

@@ -15,7 +15,7 @@ mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
 on validation and the bundle records it: AAPL and AVGO ship 0.5 LightGBM + 0.5
 N-BEATS, INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS,
 BE 0.75 N-BEATS + 0.25 N-HiTS, NVDA 0.5 LightGBM + 0.5 N-HiTS, QCOM and ORCL
-0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, META N-BEATS alone; every other
+0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, META and AMGN N-BEATS alone; every other
 candidate is in the bundle at weight 0 and is not loaded. On the 129-session
 test window AAPL scores 0.0050 mean absolute log error per extreme ($1.37)
 against TimeToChange3's 0.0077, INTC 0.0150 ($1.22) against 0.0216.
@@ -189,6 +189,20 @@ feed like SPY's; BE's stay on IEX (`peer_feed`). And ORCL's notebook keeps a
 session whose first SIP bar printed at 09:31 or 09:32 (`max_first_minute`,
 not in the sidecar: `NOTEBOOK_MAX_FIRST_MINUTE`) -- 13 quiet days of 2023-24,
 outside any live history window, but part of the mirror check.
+
+Thin peers (AMGN)
+-----------------
+AMGN's bundle (saved 2026-10-19, N-BEATS alone) is ORCL's recipe outside
+tech: SPY's opening range, the pre-market, the previous evening, the opening's
+trade count and its theme on SIP -- GILD (the lead), REGN and VRTX. Nothing
+new to mirror but the session thresholds. Before the round-lot reform of
+November 2025 a quiet minute of a $250-1,200 stock often printed no bar, so
+AMGN's notebook keeps its own sessions from 310 bars and each peer's from just
+under that peer's thinnest regular session: GILD 370, REGN 130 (a median 304
+bars a session, 169 of 2026's 189 under 385), VRTX 240. None is in the sidecar
+(`NOTEBOOK_MIN_BARS`); a peer's history is cleaned at its own entry
+(`peer_kept`), as `load_peers` reads each peer's own cleaned tape. At 385,
+REGN's history would lose most of its sessions and its 14-day ADR with them.
 """
 
 from __future__ import annotations
@@ -248,8 +262,14 @@ MIN_BARS_PER_SESSION = 385
 # Thresholds a notebook set (`config._TICKERS[...]["min_bars"]`) but its
 # sidecar does not record. AVGO's pre-split tape (to July 2024) lost odd-lot
 # minutes -- 184 sessions of 329-384 bars, each running 9:30 to the close --
-# so its notebook keeps sessions from 320 bars. The sidecar wins when it has one.
-NOTEBOOK_MIN_BARS: "dict[str, int]" = {"AVGO": 320}
+# so its notebook keeps sessions from 320 bars; AMGN's (until the round-lot
+# reform of November 2025) from 310. The sidecar wins when it has one.
+# A theme peer is read at its own entry, as `load_peers` reads the peer's tape
+# cleaned at the peer's settings: AMGN's GILD, REGN and VRTX each sit under the
+# peer's thinnest regular session (REGN printed a median 304 bars a session).
+NOTEBOOK_MIN_BARS: "dict[str, int]" = {
+    "AVGO": 320, "AMGN": 310, "GILD": 370, "REGN": 130, "VRTX": 240,
+}
 # The same for the first bar (`config._TICKERS[...]["max_first_minute"]`): on 13
 # quiet ORCL sessions of 2023-24 the opening auction printed in the 09:31 bar
 # (once 09:32) and SIP has no 09:30 bar, so its notebook keeps a session whose
@@ -1292,6 +1312,15 @@ def peer_feed(bundle: "dict | None" = None) -> str:
     return str((bundle or {}).get("peer_feed") or PEER_OPENING_FEED)
 
 
+def peer_kept(peer: str) -> dict:
+    """`history_frame`'s thresholds for a theme peer: the peer's own notebook
+    settings (385 bars and a 09:30 first bar unless `NOTEBOOK_MIN_BARS` or
+    `NOTEBOOK_MAX_FIRST_MINUTE` names it -- AMGN's REGN keeps 130)."""
+    peer = peer.upper()
+    return {"min_bars": NOTEBOOK_MIN_BARS.get(peer, MIN_BARS_PER_SESSION),
+            "max_first_minute": NOTEBOOK_MAX_FIRST_MINUTE.get(peer, 0)}
+
+
 def reads_microstructure(bundle: "dict | None" = None) -> bool:
     """Whether the blend reads the opening's trade counts and VWAP (QCOM, ORCL, META)."""
     return "microstructure" in groups(bundle)
@@ -1819,7 +1848,7 @@ def warm_history(
     each theme peer's and the market proxy's -- over the sessions before `before`."""
     _own_history(bundle, ticker, before, key, secret)
     for peer in peers(bundle):
-        history_frame(peer, before, key, secret, peer_feed(bundle))
+        history_frame(peer, before, key, secret, peer_feed(bundle), **peer_kept(peer))
     if market_proxy(bundle):
         history_frame(market_proxy(bundle), before, key, secret, OPENING_FEED_SIP)
 
@@ -1871,7 +1900,7 @@ def forecast_session(
         on = peer_feed(bundle)
         peer_data = {
             peer: (
-                history_frame(peer, session_date, key, secret, on),
+                history_frame(peer, session_date, key, secret, on, **peer_kept(peer)),
                 fetch_opening_window(peer, session_date, want,
                                      on if on != OPENING_FEED_SIP else released, key, secret),
             )

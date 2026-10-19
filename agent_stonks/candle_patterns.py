@@ -6,8 +6,8 @@ the candles with no model and no forecast. Keeping the two apart keeps the
 pickers honest: nothing on the "Model Predictions" list is a pattern, and
 nothing here claims to predict.
 
-Two patterns
-------------
+Three patterns
+--------------
 `fvg`   Fair value gap: three candles where candle 1's wick and candle 3's
         wick do not overlap, leaving a price zone candle 2 crossed without
         trading on both sides of it. Drawn as a box from candle 1 over the
@@ -19,6 +19,11 @@ Two patterns
         of volume already traded and its N-bar average momentum falls to
         about zero. Marked at the bar where that happens, with a dashed line
         at the node's price. See "The stall" below.
+`zone`  Stall-zone level: a stretch where price sat in a narrow band for a
+        while, boxed, with a line at the price that traded the most volume
+        inside it -- the peak of that stretch's own price profile. Read off
+        the volume at each price rather than the candles' shape. See "The
+        stall zone" below.
 
 Two filters, because the raw pattern is everywhere on 1-minute bars
 ------------------------------------------------------------------
@@ -87,6 +92,38 @@ within 30 bars, a 2u or 4u move back against the approach or on with it:
 - **The volume check did not help**: with it on, marks leaned towards price
   going on *through* the node, not back. Off by default.
 - The node was closed through within 30 bars after 60-70% of marks.
+
+The stall zone
+--------------
+A zone is a run of at least `min_bars` bars whose closes all lie within
+`width` x u of each other (u as for the stall, read at the bar the run
+reaches `min_bars`): price going nowhere for a while. Runs are found left to
+right, greedily -- a zone grows bar by bar until a close breaks the band, and
+the next search starts at that bar -- so zones never overlap.
+
+Its level is the peak of the zone's own volume-at-price profile
+(`prior_profile.profile_peaks` over the zone's bars, each bar's volume spread
+over its low-high): where the stalled trading actually piled up, which need
+not be the middle of the band. What the level is follows from how price left:
+
+- **resistance** -- the band broke downwards, so the level is overhead;
+- **support** -- it broke upwards;
+- **forming** -- price is still inside the band at the session's last bar
+  (live: the newest bar), so the zone and its level can still grow.
+
+The box covers the zone's bars and close band; the line runs from the zone's
+first bar until a close goes through the level by more than ZONE_NEAR x u from
+the side price left on, or to the session's last bar. The zone is known only
+from its bars, so it reads the same live and in a replay -- except that a
+forming zone's level moves as it grows.
+
+Counted on the same 267 sessions: with a 3u band, 15 / 20 / 30-bar zones
+come 7.4 / 4.0 / 1.3 a session (default 20: median 24 bars, about 106 minutes
+of a session inside one); a 2u band 3.3 / 1.3 / 0.2, a 4u band 9.5 / 6.1 /
+2.7. Almost none start before 10:00 -- the open moves several times last
+week's typical minute -- and about 70% of levels are closed through before
+the session ends. How often price turns at a level it comes back to is not
+measured yet.
 """
 
 from __future__ import annotations
@@ -105,6 +142,7 @@ from .technical_analysis import fair_value_gaps
 
 FVG_KEY = "fvg"
 STALL_KEY = "stall"
+ZONE_KEY = "zone"
 
 # The bars before candle 2 whose mean high-low range sizes a gap.
 FVG_RANGE_LOOKBACK = 14
@@ -129,6 +167,14 @@ STALL_VOLUME_LOOKBACK = 30
 STALL_LEVEL_SPAN_BARS = 30
 # The marker sits this many typical minute moves above (below) the bar.
 STALL_MARK_OFFSET = 0.6
+
+# A stall zone: at least this many bars with every close inside a band this
+# many typical minute moves wide.
+DEFAULT_ZONE_MIN_BARS = 20
+DEFAULT_ZONE_WIDTH = 3.0
+# A close this many typical minute moves past a zone's level, from the side
+# price left on, ends its line.
+ZONE_NEAR = 1.0
 
 
 @dataclass(frozen=True)
@@ -159,6 +205,17 @@ PATTERNS: "dict[str, CandlePattern]" = {
             "the node until price closes through it."
         ),
     ),
+    ZONE_KEY: CandlePattern(
+        key=ZONE_KEY,
+        label="Stall-zone levels",
+        summary=(
+            "Stretches where price stayed in a narrow band for a while, boxed, with a "
+            "line at the price that traded the most volume inside each (the peak of "
+            "its own price profile): orange when price left below it (resistance "
+            "overhead), blue when it left above (support), grey while still forming. "
+            "The line runs right until price closes through it."
+        ),
+    ),
 }
 
 
@@ -184,6 +241,8 @@ def compute(
     minute_move: "float | Mapping[date, float | None] | None" = None,
     stall_approach: float = DEFAULT_STALL_APPROACH,
     stall_min_volume: float = DEFAULT_STALL_MIN_VOLUME,
+    zone_min_bars: int = DEFAULT_ZONE_MIN_BARS,
+    zone_width: float = DEFAULT_ZONE_WIDTH,
 ) -> "list[dict]":
     """Draw instructions for the requested patterns over `bars`.
 
@@ -196,6 +255,8 @@ def compute(
     typical one-minute move in dollars: one number, or one per exchange-local
     day for a replay of several; a day without one is measured on its own
     bars. `stall_approach` and `stall_min_volume` are its conditions 2 and 4.
+    The stall zone reads the same `minute_move`, with `zone_min_bars` and
+    `zone_width` its length and band.
     """
     wanted = [k for k in (pattern_keys or []) if k in PATTERNS]
     if not wanted or not bars:
@@ -204,10 +265,12 @@ def compute(
     for session in _regular_sessions(bars):
         if FVG_KEY in wanted:
             items.extend(_fvg_items(session, min_size, hide_filled))
+        day = session[0]["_utc"].tz_convert(market_hours.MARKET_TZ).date()
+        move = minute_move.get(day) if isinstance(minute_move, Mapping) else minute_move
         if STALL_KEY in wanted:
-            day = session[0]["_utc"].tz_convert(market_hours.MARKET_TZ).date()
-            move = minute_move.get(day) if isinstance(minute_move, Mapping) else minute_move
             items.extend(_stall_items(session, int(stall_bars), move, stall_approach, stall_min_volume))
+        if ZONE_KEY in wanted:
+            items.extend(_zone_items(session, move, int(zone_min_bars), zone_width))
     return items
 
 
@@ -278,15 +341,13 @@ def _stall_items(
     high = np.array([float(b["h"]) for b in session])
     low = np.array([float(b["l"]) for b in session])
     volume = np.nan_to_num(np.array([float(b.get("v") or 0.0) for b in session]))
-    # Running mean |1-bar move| through each bar: the fallback unit.
-    own_unit = np.concatenate([[np.nan], np.cumsum(np.abs(np.diff(close))) / np.arange(1, count)])
-    fixed_unit = float(minute_move) if minute_move and minute_move > 0 else None
+    units = _units(close, minute_move)
 
     items: "list[dict]" = []
     last_node: "float | None" = None
     # The first bar whose approach starts after the profile's minimum bars.
     for t in range(STALL_MIN_PROFILE_BARS - 1 + 2 * n, count):
-        unit = fixed_unit or own_unit[t]
+        unit = units[t]
         if not unit > 0:
             continue
         if last_node is not None:
@@ -362,6 +423,95 @@ def _stall_items(
             "volume_ratio": None if ratio is None else round(ratio, 2),
         })
     return items
+
+
+def _units(close: np.ndarray, minute_move: "float | None") -> np.ndarray:
+    """The typical minute move as of each bar: `minute_move` throughout when
+    there is one, else the session's running mean |1-bar move| through that
+    bar (NaN at the first)."""
+    if minute_move and minute_move > 0:
+        return np.full(len(close), float(minute_move))
+    count = len(close)
+    return np.concatenate([[np.nan], np.cumsum(np.abs(np.diff(close))) / np.arange(1, count)])
+
+
+def _zone_items(
+    session: "list[dict]",
+    minute_move: "float | None",
+    min_bars: int,
+    width_k: float,
+) -> "list[dict]":
+    """The stall zones of one regular session; see "The stall zone" in the
+    module doc."""
+    count = len(session)
+    if min_bars < 2 or count < min_bars:
+        return []
+    close = np.array([float(b["c"]) for b in session])
+    volume = np.nan_to_num(np.array([float(b.get("v") or 0.0) for b in session]))
+    units = _units(close, minute_move)
+    cum_volume = np.cumsum(volume)
+
+    items: "list[dict]" = []
+    i = 0
+    while i + min_bars <= count:
+        unit = units[i + min_bars - 1]
+        if not unit > 0:
+            i += 1
+            continue
+        width = width_k * unit
+        lo = hi = close[i]
+        j = i
+        while j + 1 < count and max(hi, close[j + 1]) - min(lo, close[j + 1]) <= width:
+            j += 1
+            lo, hi = min(lo, close[j]), max(hi, close[j])
+        if j - i + 1 < min_bars:
+            i += 1
+            continue
+        found = profile_peaks(session[i:j + 1])
+        if found is not None:
+            items.append(_zone_item(session, close, volume, cum_volume, i, j, lo, hi, unit, found))
+        i = j + 1
+    return items
+
+
+def _zone_item(session, close, volume, cum_volume, i, j, lo, hi, unit, found) -> dict:
+    """The draw instruction for the zone over bars `i`..`j`."""
+    centers, _, peaks = found
+    level = float(centers[peaks[0]])
+    count = len(session)
+    near = ZONE_NEAR * unit
+    if j == count - 1:
+        role, end, broken_at = "forming", j, None
+    else:
+        role = "resistance" if close[j + 1] < lo else "support"
+        sign = 1.0 if role == "resistance" else -1.0
+        broken_at = next(
+            (k for k in range(j + 1, count) if sign * (close[k] - level) > near), None
+        )
+        end = count - 1 if broken_at is None else broken_at
+    zone_volume = float(volume[i:j + 1].sum())
+    return {
+        "kind": "zone",
+        "key": ZONE_KEY,
+        "role": role,
+        "level": round(level, 4),
+        # The box: the zone's bars and close band.
+        "x0": _iso(session[i]["_utc"]),
+        "x_end": _iso(session[j]["_utc"]),
+        "y0": round(float(lo), 4),
+        "y1": round(float(hi), 4),
+        # The line: from the zone's first bar to where a close went through the
+        # level, or the session's last bar.
+        "x1": _iso(session[end]["_utc"]),
+        "broken": broken_at is not None,
+        "left_at": None if role == "forming" else _iso(session[j + 1]["_utc"]),
+        "bars": j - i + 1,
+        "unit": round(float(unit), 4),
+        "near": round(float(near), 4),
+        "volume": round(zone_volume),
+        # The zone's share of everything the session traded up to its last bar.
+        "volume_share": round(zone_volume / cum_volume[j], 4) if cum_volume[j] > 0 else None,
+    }
 
 
 def _iso(stamp: pd.Timestamp) -> str:

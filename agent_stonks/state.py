@@ -423,6 +423,10 @@ class AppState:
         # minimum stall volume (x the bars before the move, 0 = off).
         self.stall_approach: float = 1.0
         self.stall_min_volume: float = 0.0
+        # Stall zones: the fewest bars, and the widest close band in typical
+        # minute moves.
+        self.zone_min_bars: int = 20
+        self.zone_width: float = 3.0
         self.vwap_style: str = "hide"
         self.show_candle_body: bool = True
         self.show_percentile_body: bool = False

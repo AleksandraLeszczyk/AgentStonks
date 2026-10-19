@@ -931,7 +931,8 @@ def _run_pattern_controls(
     The stall reads momentum over the run's Apple Trader confirmation period
     (`DEFAULT_STALL_BARS` for any other run, or one with it off) and each
     day's typical minute move as the run's trader saw it
-    (`SimMarket.abs_mean_minute_momentum`, last week on the run's feed).
+    (`SimMarket.abs_mean_minute_momentum`, last week on the run's feed); stall
+    zones size their band by the same move.
     """
     run_id = record.get("run_id") or "run"
     c1, c2, c3 = st.columns([2, 1.2, 0.8], vertical_alignment="bottom")
@@ -948,7 +949,10 @@ def _run_pattern_controls(
             "a price where a lot of volume already traded that day and its "
             "average momentum falling to about zero: orange ▼ under resistance, "
             "blue ▲ on support, a dashed line at the node until price closes "
-            "through it. Regular session only.",
+            "through it. A stall zone is a stretch where price sat in a narrow "
+            "band, boxed, with a line at the price that traded the most volume "
+            "inside it: orange when price left below (resistance), blue when it "
+            "left above (support). Regular session only.",
         )
     settings: dict = {}
     if candle_patterns.FVG_KEY in selected:
@@ -990,17 +994,37 @@ def _run_pattern_controls(
                 help="Only mark a stall whose bars average at least this many times "
                 "the volume of the 30 bars before the move; 0 turns the check off.",
             )
+        st.caption(
+            f":material/info: Stall look-back {settings['stall_bars']} bars "
+            + ("(the run's momentum confirmation period)." if look_back
+               else "(the run reads no N-bar momentum).")
+        )
+    if candle_patterns.ZONE_KEY in selected:
+        z1, z2 = st.columns(2, vertical_alignment="bottom")
+        with z1:
+            settings["zone_min_bars"] = st.slider(
+                "Min zone length (bars)",
+                min_value=5, max_value=60, step=5,
+                value=candle_patterns.DEFAULT_ZONE_MIN_BARS,
+                key=f"sim_zone_bars_{run_id}_{symbol}",
+                help="The fewest bars a stretch must stay in its band to count as a zone.",
+            )
+        with z2:
+            settings["zone_width"] = st.slider(
+                "Max zone band (× minute move)",
+                min_value=1.0, max_value=8.0, step=0.5,
+                value=candle_patterns.DEFAULT_ZONE_WIDTH,
+                key=f"sim_zone_width_{run_id}_{symbol}",
+                help="How far apart a zone's closes may be, in typical minute moves "
+                "(the week before each day's mean |1-minute move|).",
+            )
+    if candle_patterns.STALL_KEY in selected or candle_patterns.ZONE_KEY in selected:
         settings["minute_move"] = {
             day: market.abs_mean_minute_momentum(
                 symbol, datetime.combine(day, time(9, 30), tzinfo=MARKET_TZ)
             )
             for day in days
         }
-        st.caption(
-            f":material/info: Stall look-back {settings['stall_bars']} bars "
-            + ("(the run's momentum confirmation period)." if look_back
-               else "(the run reads no N-bar momentum).")
-        )
     return candle_patterns.compute(selected, bars, **settings)
 
 

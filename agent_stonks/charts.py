@@ -25,6 +25,8 @@ from .config import (
     PRIOR_PROFILE_COLOR,
     SESSION_MARKER_COLOR,
     STALL_COLORS,
+    ZONE_BOX_ALPHA,
+    ZONE_COLORS,
 )
 
 
@@ -2072,10 +2074,12 @@ def add_candle_patterns(
     row: Optional[int] = 1,
     col: Optional[int] = 1,
 ) -> None:
-    """Draw fair value gaps as boxes behind the candles and volume-node
-    stalls as marks over them, between `x0` and `x1`."""
+    """Draw fair value gaps and stall zones as boxes behind the candles, zone
+    levels as lines and volume-node stalls as marks over them, between `x0`
+    and `x1`."""
     items = patterns or []
     _add_fvg_boxes([p for p in items if p.get("kind") == "fvg"], fig, x0, x1, row, col)
+    _add_zone_levels([p for p in items if p.get("kind") == "zone"], fig, x0, x1, row, col)
     _add_stall_marks([p for p in items if p.get("kind") == "stall"], fig, x0, x1, row, col)
 
 
@@ -2256,6 +2260,118 @@ def _stall_hover(stall: dict) -> str:
         f"Closed through at {hhmm(stall['x1'])}" if stall.get("broken")
         else f"Not closed through by {hhmm(stall['x1'])}"
     )
+    return "<br>".join(lines)
+
+
+def _add_zone_levels(
+    zones: list[dict],
+    fig: go.Figure,
+    x0: pd.Timestamp,
+    x1: pd.Timestamp,
+    row: Optional[int],
+    col: Optional[int],
+) -> None:
+    """Stall zones: a faint box over each zone's bars and close band, and a
+    solid line at its profile peak from the zone's first bar until price
+    closed through it -- orange for resistance, blue for support, grey while
+    forming.
+
+    Per role one box polygon, one line trace and one invisible hover marker
+    per zone at the box's right edge on the line, sharing a legend entry. The
+    boxes go behind the candles as the gaps' do; boxes and lines are clipped
+    to `x0`/`x1`, and a zone whose hover point is outside them carries none.
+    """
+    if not zones:
+        return
+    x0, x1 = pd.Timestamp(x0), pd.Timestamp(x1)
+    first = len(fig.data)
+    hover: "dict[str, list]" = {}
+    for role in ("resistance", "support", "forming"):
+        color = ZONE_COLORS[role]
+        name = f"{role.capitalize()} zone"
+        group = f"zone_{role}"
+        bx: list = []
+        by: list = []
+        lx: list = []
+        ly: list = []
+        for zone in zones:
+            if zone["role"] != role:
+                continue
+            start = _as_tz_of(zone["x0"], x0)
+            zx0, zx_end = max(start, x0), min(_as_tz_of(zone["x_end"], x0), x1)
+            if zx_end > zx0:
+                bx += [zx0, zx_end, zx_end, zx0, zx0, None]
+                by += [zone["y0"], zone["y0"], zone["y1"], zone["y1"], zone["y0"], None]
+            lx1 = min(_as_tz_of(zone["x1"], x0), x1)
+            if lx1 > zx0:
+                lx += [zx0, lx1, None]
+                ly += [zone["level"], zone["level"], None]
+            end = _as_tz_of(zone["x_end"], x0)
+            if x0 <= end <= x1:
+                hover.setdefault(role, []).append((end, zone))
+        if bx:
+            fig.add_trace(
+                go.Scatter(
+                    x=bx, y=by, mode="lines", fill="toself",
+                    fillcolor=_rgba(color, ZONE_BOX_ALPHA), line=dict(width=0),
+                    name=name, legendgroup=group, showlegend=False, hoverinfo="skip",
+                ),
+                row=row, col=col,
+            )
+        if lx:
+            fig.add_trace(
+                go.Scatter(
+                    x=lx, y=ly, mode="lines", line=dict(color=color, width=1.5),
+                    name=name, legendgroup=group, showlegend=True, hoverinfo="skip",
+                ),
+                row=row, col=col,
+            )
+    boxes = [i for i in range(first, len(fig.data)) if fig.data[i].fill == "toself"]
+    if boxes:
+        rest = [i for i in range(len(fig.data)) if i not in boxes]
+        fig.data = tuple(fig.data[i] for i in boxes) + tuple(fig.data[i] for i in rest)
+
+    for role, points in hover.items():
+        fig.add_trace(
+            go.Scatter(
+                x=[p[0] for p in points],
+                y=[p[1]["level"] for p in points],
+                mode="markers",
+                marker=dict(size=12, opacity=0),
+                name=f"{role.capitalize()} zone",
+                legendgroup=f"zone_{role}",
+                showlegend=False,
+                customdata=[_zone_hover(p[1]) for p in points],
+                hovertemplate="%{customdata}<extra></extra>",
+            ),
+            row=row, col=col,
+        )
+
+
+def _zone_hover(zone: dict) -> str:
+    def hhmm(stamp) -> str:
+        return pd.Timestamp(stamp).tz_convert(market_hours.MARKET_TZ).strftime("%H:%M")
+
+    role = zone["role"]
+    title = {"resistance": "Resistance", "support": "Support", "forming": "Forming"}[role]
+    lines = [
+        f"<b>{title} zone</b> level {zone['level']:.2f} (its profile peak)",
+        f"{hhmm(zone['x0'])}–{hhmm(zone['x_end'])}, {zone['bars']} bars with closes "
+        f"within {zone['y0']:.2f}–{zone['y1']:.2f}",
+    ]
+    share = zone.get("volume_share")
+    lines.append(
+        f"Volume {zone['volume']:,.0f}"
+        + (f" ({share:.0%} of the session up to then)" if share is not None else "")
+    )
+    if role == "forming":
+        lines.append("Price is still inside the band")
+    else:
+        lines.append(f"Left {'below' if role == 'resistance' else 'above'} at {hhmm(zone['left_at'])}")
+        lines.append(
+            f"Closed through at {hhmm(zone['x1'])}" if zone.get("broken")
+            else f"Not closed through by {hhmm(zone['x1'])}"
+        )
     return "<br>".join(lines)
 
 

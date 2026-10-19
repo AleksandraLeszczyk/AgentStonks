@@ -942,6 +942,10 @@ STALL_COLORS: dict[str, str] = {
     "resistance": "#ffa726",
     "support": "#4fc3f7",
 }
+# A stall zone's box and level line: the stall's colours for the role price
+# left it in, grey while price is still inside it.
+ZONE_COLORS: dict[str, str] = {**STALL_COLORS, "forming": "#bdbdbd"}
+ZONE_BOX_ALPHA = 0.12
 
 MA_COLORS: dict[int, str] = {
     5:  "#60a5fa",  # blue

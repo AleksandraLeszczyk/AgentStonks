@@ -146,22 +146,42 @@ META_FORECASTS = {
     "2026-09-21": (707.8884532398749, 679.6, 18.84087142857143),
     "2026-10-02": (741.58, 720.4196161827942, 27.165607142857148),
 }
+# AMGN, saved 2026-10-19 on the same recipe (N-BEATS alone): SPY, the
+# pre-market, the previous evening, the opening's trade count and its SIP theme
+# peers GILD, REGN and VRTX. Sessions are kept from 310 bars, the peers' from
+# their own thresholds: 2024-10-21 follows AMGN's thinnest kept session (316
+# bars, 10-18), 2024-09-05 REGN's (138 bars, 09-04) -- both dropped at 385.
+# 2025-11-05, 2026-02-04 and 2026-08-05 are results mornings; 2026-09-08 reads
+# the 4 Sep evening's 7% drop across Labor Day.
+AMGN_FORECASTS = {
+    "2024-09-05": (331.86, 325.11373094174445, 4.8288499999999965),
+    "2024-10-21": (321.97269055474976, 317.9096534104838, 4.940292857142863),
+    "2025-11-05": (309.95, 298.69144100570924, 6.015100000000002),
+    "2026-02-04": (360.2299564416704, 342.38, 8.364528571428574),
+    "2026-03-02": (391.4282225849037, 383.6458576235964, 8.328142857142861),
+    "2026-08-05": (420.5371822116155, 391.0, 10.961035714285723),
+    "2026-09-08": (410.025, 396.0959384502541, 8.604992857142848),
+    "2026-09-14": (386.0359616234804, 379.45109656034737, 8.860778571428568),
+    "2026-09-21": (389.4237039651446, 381.9, 8.386135714285725),
+    "2026-10-02": (410.37488841594006, 403.6907271953926, 9.217857142857156),
+}
 NOTEBOOK_FORECASTS = {
     "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS, "BE": BE_FORECASTS,
     "AVGO": AVGO_FORECASTS, "NVDA": NVDA_FORECASTS, "QCOM": QCOM_FORECASTS,
-    "ORCL": ORCL_FORECASTS, "META": META_FORECASTS,
+    "ORCL": ORCL_FORECASTS, "META": META_FORECASTS, "AMGN": AMGN_FORECASTS,
 }
 # The candidates each bundle ships with non-zero weight.
 SHIPPED = {
     "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
     "BE": ["nbeats", "nhits"], "AVGO": ["lgbm", "nbeats"], "NVDA": ["lgbm", "nhits"],
     "QCOM": ["lgbm", "nbeats", "nhits"], "ORCL": ["lgbm", "nbeats", "nhits"], "META": ["nbeats"],
+    "AMGN": ["nbeats"],
 }
 # The tape each bundle reads the opening from.
 OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex", "AVGO": "sip", "NVDA": "sip",
-                 "QCOM": "sip", "ORCL": "sip", "META": "sip"}
+                 "QCOM": "sip", "ORCL": "sip", "META": "sip", "AMGN": "sip"}
 # The last session of each notebook's tape the mirror test reads.
-NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META")}
+NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META", "AMGN")}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -221,7 +241,7 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META"):
+        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
@@ -347,6 +367,33 @@ class TestThemePeers:
         assert list(out["peers"]) == ["VST", "PLUG", "XLU"]
         assert out["peers"]["VST"][0]["s"][0] == "VST" and out["peers"]["VST"][1]["w"][0] == "VST"
         H._forecast_cache.clear()
+
+    def test_each_peer_is_kept_at_its_own_notebooks_threshold(self, monkeypatch):
+        """AMGN's peers: `load_peers` reads each peer's tape as that peer's own
+        settings cleaned it -- REGN from 130 bars -- not at AMGN's 310 or at 385."""
+        H._forecast_cache.clear()
+        histories = []
+        monkeypatch.setattr(
+            H, "history_frame",
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False,
+            max_first_minute=0, **_: histories.append((symbol, min_bars, max_first_minute)) or pd.DataFrame(),
+        )
+        monkeypatch.setattr(H, "fetch_opening_window", lambda *a, **k: pd.DataFrame())
+        monkeypatch.setattr(H, "forecast_from", lambda *a, **k: {})
+        opening = H.minute_frame_from_bars(_tape(date(2026, 7, 1), date(2026, 7, 1))[date(2026, 7, 1)][:5])
+        bundle = {"min_bars": 310, "peers": ("GILD", "REGN", "VRTX", "MSFT"), "peer_feed": "sip",
+                  "path": "amgn"}
+        H.forecast_session(bundle, "AMGN", opening, date(2026, 7, 1))
+        assert histories == [("AMGN", 310, 0), ("GILD", 370, 0), ("REGN", 130, 0), ("VRTX", 240, 0),
+                             ("MSFT", 385, 0)]
+        H._forecast_cache.clear()
+
+    def test_amgn_keeps_its_notebooks_threshold(self):
+        bundle = H.load_bundle("AMGN")
+        if bundle is None:
+            pytest.skip("the HighLow AMGN bundle is not installed")
+        assert H.min_bars(bundle) == 310
+        assert H.peers(bundle) == ("GILD", "REGN", "VRTX") and H.peer_feed(bundle) == "sip"
 
     def test_a_bundle_reading_peers_refuses_without_them(self):
         bundle, raw, thin, history, *_ = notebook_inputs("BE")
@@ -811,9 +858,10 @@ def notebook_inputs(ticker: str):
     if proxy:
         m_raw = tape(sorted((NOTEBOOK / "data" / proxy / "raw").glob(f"{proxy}_20??.parquet")))
         extras["market"] = (H.session_rollups(m_raw)[0], m_raw)
-    # Each theme peer as the notebook's `load_peers` reads it: SIP rollups at 385
-    # bars, openings on the peer feed (BE's IEX, trimmed to the sessions SIP
-    # kept; ORCL's SIP, the kept sessions' own) -- and that feed's raw tape.
+    # Each theme peer as the notebook's `load_peers` reads it: SIP rollups at the
+    # peer's own threshold (385 bars, AMGN's REGN 130), openings on the peer feed
+    # (BE's IEX, trimmed to the sessions SIP kept; ORCL's SIP, the kept sessions'
+    # own) -- and that feed's raw tape.
     peer_tapes = {}
     for peer in H.peers(bundle):
         peer_raw = NOTEBOOK / "data" / peer / "raw"
@@ -821,7 +869,9 @@ def notebook_inputs(ticker: str):
         p_thin = None
         if H.peer_feed(bundle) != "sip":
             p_thin = tape(sorted(peer_raw.glob(f"{peer}_20??_{H.peer_feed(bundle)}.parquet")))
-        p_history, _ = H.session_rollups(p_sip, p_thin)
+        kept = H.peer_kept(peer)
+        p_history, _ = H.session_rollups(p_sip, p_thin, kept["min_bars"],
+                                         max_first_minute=kept["max_first_minute"])
         p_open = p_sip if p_thin is None else p_thin
         peer_tapes[peer] = (p_history, H.opening_minute_frame(p_open, p_history.index)[H.OHLCV], p_open)
     _NOTEBOOK_INPUTS[ticker] = (bundle, raw, thin, history, peer_tapes, extras)

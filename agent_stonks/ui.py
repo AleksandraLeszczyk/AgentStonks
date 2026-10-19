@@ -1330,6 +1330,8 @@ def _live_chart_controls() -> None:
     state.fvg_hide_filled = patterns["fvg_hide_filled"]
     state.stall_approach = patterns["stall_approach"]
     state.stall_min_volume = patterns["stall_min_volume"]
+    state.zone_min_bars = patterns["zone_min_bars"]
+    state.zone_width = patterns["zone_width"]
 
 
 
@@ -1522,12 +1524,12 @@ def _candle_pattern_controls() -> dict:
     """Which candle patterns the price chart draws, and their settings.
 
     Returns `{"keys", "fvg_min_size", "fvg_hide_filled", "stall_approach",
-    "stall_min_volume"}`. A pattern's settings only show once it is selected;
-    the defaults stand otherwise.
+    "stall_min_volume", "zone_min_bars", "zone_width"}`. A pattern's settings
+    only show once it is selected; the defaults stand otherwise.
     """
     st.markdown("**Candle Patterns**")
     with _help_row(
-        "Shapes read off the candles themselves — no model, no forecast.\n"
+        "Shapes read off the tape itself — no model, no forecast.\n"
         "- **Fair Value Gap (FVG)** — three candles where candle 1's wick and "
         "candle 3's wick don't overlap. The gap between them is boxed from "
         "candle 1: green for a gap up, red for a gap down, running right until "
@@ -1540,7 +1542,13 @@ def _candle_pattern_controls() -> dict:
         "rise stalled under resistance, blue ▲ where a fall stalled on support; "
         "the dashed line at the node runs until price closes through it. On "
         "267 stored sessions it did not reliably predict a turn: a visual cue, "
-        "not a signal."
+        "not a signal.\n"
+        "- **Stall-zone levels** — stretches where price sat in a narrow band "
+        "(every close within a few typical minute moves) for a while, boxed, with "
+        "a solid line at the price that traded the most volume inside the box: "
+        "that stretch's own price-profile peak. Orange when price left below it "
+        "(resistance overhead), blue when it left above (support), grey while "
+        "price is still inside. The line runs until price closes through it."
     ):
         selected = st.multiselect(
             "Candle patterns",
@@ -1554,6 +1562,8 @@ def _candle_pattern_controls() -> dict:
     hide_filled = False
     approach = candle_patterns.DEFAULT_STALL_APPROACH
     min_volume = candle_patterns.DEFAULT_STALL_MIN_VOLUME
+    zone_bars = candle_patterns.DEFAULT_ZONE_MIN_BARS
+    zone_width = candle_patterns.DEFAULT_ZONE_WIDTH
     if candle_patterns.FVG_KEY in selected:
         c1, c2 = st.columns(2, vertical_alignment="bottom")
         with c1:
@@ -1599,12 +1609,36 @@ def _candle_pattern_controls() -> dict:
                 "trading with no progress. 0 turns the check off. On stored "
                 "sessions it made a turn less likely, not more.",
             )
+    if candle_patterns.ZONE_KEY in selected:
+        c1, c2 = st.columns(2, vertical_alignment="bottom")
+        with c1:
+            zone_bars = st.slider(
+                "Min zone length (bars)",
+                min_value=5, max_value=60, step=5,
+                value=candle_patterns.DEFAULT_ZONE_MIN_BARS,
+                key="zone_min_bars",
+                help="The fewest bars a stretch must stay in its band to count "
+                "as a zone. On stored sessions, with a 3× band: 15 bars give "
+                "about seven zones a session, 20 about four, 30 about one.",
+            )
+        with c2:
+            zone_width = st.slider(
+                "Max zone band (× minute move)",
+                min_value=1.0, max_value=8.0, step=0.5,
+                value=candle_patterns.DEFAULT_ZONE_WIDTH,
+                key="zone_width",
+                help="How far apart a zone's closes may be, in typical minute "
+                "moves (last week's mean |1-minute move|). Narrower means "
+                "fewer, tighter zones.",
+            )
     return {
         "keys": selected,
         "fvg_min_size": float(min_size),
         "fvg_hide_filled": bool(hide_filled),
         "stall_approach": float(approach),
         "stall_min_volume": float(min_volume),
+        "zone_min_bars": int(zone_bars),
+        "zone_width": float(zone_width),
     }
 
 
@@ -1612,7 +1646,8 @@ def _live_candle_patterns(state: AppState, sym_state, bars: "list[dict]") -> "li
     """The selected candle patterns over one symbol's live bars. The stall
     reads momentum over the agent line's look-back and, on 1-minute bars,
     against last week's typical minute move; on coarser bars, or before that
-    is measured, against the session's own."""
+    is measured, against the session's own. Stall zones size their band by
+    the same move."""
     one_minute = TF_MINUTES.get(getattr(state, "timeframe", "1Min"), 1) == 1
     return candle_patterns.compute(
         state.candle_pattern_keys, bars,
@@ -1622,6 +1657,8 @@ def _live_candle_patterns(state: AppState, sym_state, bars: "list[dict]") -> "li
         # getattr: an AppState kept across a code save predates these.
         stall_approach=getattr(state, "stall_approach", candle_patterns.DEFAULT_STALL_APPROACH),
         stall_min_volume=getattr(state, "stall_min_volume", candle_patterns.DEFAULT_STALL_MIN_VOLUME),
+        zone_min_bars=getattr(state, "zone_min_bars", candle_patterns.DEFAULT_ZONE_MIN_BARS),
+        zone_width=getattr(state, "zone_width", candle_patterns.DEFAULT_ZONE_WIDTH),
     )
 
 

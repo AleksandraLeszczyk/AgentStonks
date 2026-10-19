@@ -118,12 +118,15 @@ DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 # previous evening, the opening's shape and the volatility regime), and QCOM,
 # ORCL and META (2026-10-13, NVDA's recipe; all three read the opening's trade
 # counts and VWAP, and ORCL also SPY and its SIP theme peers MSFT, AMZN and
-# GOOGL); GOOGL is in the notebook's config but has not been run through it.
+# GOOGL), and AMGN (2026-10-19, the same recipe outside tech: SPY, the
+# pre-market, the previous evening, the opening's trade counts and its biotech
+# peers GILD, REGN and VRTX, sessions kept from 310 bars); GOOGL is in the
+# notebook's config but has not been run through it.
 # Adding one is this tuple plus its files in `Code/Models` -- and a check that
 # the bundle's shipped candidates read only the base features and the custom
 # groups `highlow_model` mirrors (`GROUP_COLS`; `_build_bundle` refuses
 # anything else).
-HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META")
+HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN")
 
 # Which symbols HighLow2_5m has saved a bundle for (`highlow2_5m_<TICKER>.*`):
 # AAPL (saved 2026-10-04) and INTC (2026-10-06, AAPL's recipe with ten stocks
@@ -400,18 +403,20 @@ MODELS: "dict[str, AppleModel]" = {
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL and AVGO: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + "
             "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS; QCOM and "
-            "ORCL: LightGBM + N-BEATS + N-HiTS; META: N-BEATS alone), fitted on "
+            "ORCL: LightGBM + N-BEATS + N-HiTS; META and AMGN: N-BEATS alone), fitted on "
             "every session since 2023 with its first five minutes (MU's and BE's read "
             "from IEX, the only tape there is at 9:35 on a basic plan; BE's also with "
             "VST's opening move, its lead AI-power peer; NVDA's with SPY's opening, the "
             "pre-market to 9:19 and the previous evening's after-hours; QCOM's, ORCL's "
             "and META's also with the opening's trade counts and VWAP, and ORCL's with "
-            "SPY and its cloud peers MSFT, AMZN and GOOGL). On the "
+            "SPY and its cloud peers MSFT, AMZN and GOOGL; AMGN's with SPY, the "
+            "pre-market, the previous evening, the opening's trade counts and its "
+            "biotech peers GILD, REGN and VRTX). On the "
             "129-session test window its error is 35% below "
             "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
             "INTC; MU, BE and AVGO have no TimeToChange3 bundle, and beat that approach "
             "retrained on them by 25%, 33% and 34%, QCOM, ORCL and META by 43%, 31% "
-            "and 29%. "
+            "and 29%, AMGN by 34%. "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -419,9 +424,10 @@ MODELS: "dict[str, AppleModel]" = {
         requires=(
             "PyTorch, LightGBM, scikit-learn and joblib, the weighted network "
             "checkpoints, and Alpaca credentials for ~150 sessions of SIP minute history "
-            "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, on NVDA "
-            "and ORCL SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, and on "
-            "NVDA, QCOM, ORCL and META this morning's SIP pre-market)"
+            "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, on NVDA, "
+            "ORCL and AMGN SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, on "
+            "AMGN GILD, REGN and VRTX, and on NVDA, QCOM, ORCL, META and AMGN this "
+            "morning's SIP pre-market)"
         ),
         strategy=STRATEGY_DAYRANGE,
         tickers=HIGHLOW_TICKERS,
