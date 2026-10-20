@@ -48,7 +48,7 @@ from . import agent as agent_mod
 from . import state as state_mod
 from . import (
     apple_models, bar_history, base_configs, candle_patterns, clock, event_days, historical,
-    intraday_vol_model, market_hours, momentum_regime, rule_agent,
+    market_hours, momentum_regime, rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -100,9 +100,7 @@ from .config import (
     BREACH_POLICIES,
     BREACH_SHIFT,
     LEVELS_DAYRANGE,
-    LEVELS_INTRADAY,
     LEVEL_SOURCES,
-    LEVEL_SOURCE_LABELS,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
     LEVEL_UNIT_PHRASES,
@@ -454,11 +452,10 @@ class AppleTraderConfig:
     # Tested against the high as it stood when the bar opened, and after the
     # sell level, so a breach that also reaches the target logs as the target.
     breach_exit: bool = APPLE_TRADER_BREACH_EXIT
-    # Which number the two distances above are measured below -- one of
-    # `config.LEVEL_SOURCES`. "dayrange" is the predicted high itself;
-    # "intraday" is that forecast read through IntradayVolatility's
-    # time-of-day shape, so the reference moves with the clock. See
-    # `_set_levels`, and `config_error` for what it requires.
+    # Which number the two distances above are measured below: "dayrange", the
+    # predicted high itself. "intraday" (IntradayVolatility's time-of-day shape,
+    # removed 2026-10-20) is only ever a stored record's, which
+    # `level_source_error` refuses. See `config.LEVEL_SOURCES`.
     level_source: str = APPLE_TRADER_LEVEL_SOURCE
     # What one k is worth in dollars -- one of `config.LEVEL_UNITS`. "adr" is
     # the trailing 14-day average daily range, a fixed number for the session
@@ -683,17 +680,6 @@ class AppleTraderConfig:
                 f"level_source {self.level_source!r} is not one of "
                 f"{', '.join(LEVEL_SOURCES)}"
             )
-        # A model that names a reference decides it, because that is the whole
-        # difference between the two: "Day Range × Intraday Volatility" *is*
-        # the day-range forecast read through the intraday shape, so a config
-        # naming it and measuring below the flat high would be that model in
-        # name only. Applied after validation so an impossible value is still
-        # reported as one, and only for a model that declares a reference --
-        # which leaves a record written when this was a separate choice saying
-        # what it said. See `apple_models.AppleModel.level_source`.
-        named = apple_models.MODELS.get(self.model_key)
-        if named is not None and named.level_source != LEVELS_DAYRANGE:
-            self.level_source = named.level_source
         self.level_unit = str(self.level_unit or UNIT_ADR)
         if self.level_unit not in LEVEL_UNITS:
             raise ValueError(
@@ -769,8 +755,8 @@ class AppleTraderConfig:
 
         `buy_level` and `sell_level` are both `reference - k x unit` off the
         same reference, so the gap between them is this many units whatever the
-        reference does -- a breach moving the forecast, or an intraday curve
-        moving it every minute, move both levels together.
+        reference does -- a breach moving the forecast moves both levels
+        together.
 
         In *units* it is therefore a property of the configuration. In dollars
         it is only fixed while the unit is: under `level_unit = "adr"` all
@@ -1119,14 +1105,10 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # existed (which replays with none) keeps the signature it was filed under.
     if c.skip_events:
         breach += ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events)
-    # Written only when the reference is *not* the one this model implies. For
-    # "Day Range × Intraday Volatility" the model key already says it, and a
-    # second token would be the same fact twice; for a record written when the
-    # reference was a separate choice the model implies the flat high, so the
-    # token appears exactly as it did and the record keeps its filed identity.
-    implied = apple_models.MODELS.get(c.model_key)
-    implied = implied.level_source if implied is not None else LEVELS_DAYRANGE
-    levels = "" if c.level_source == implied else f",levels={c.level_source}"
+    # Written only when the reference is not the predicted high: a record from
+    # when it could be IntradayVolatility's curve keeps the identity it was
+    # filed under (and is refused, `level_source_error`).
+    levels = "" if c.level_source == LEVELS_DAYRANGE else f",levels={c.level_source}"
     # Fast&Furious's opening window (Fast&Furious + HighLow): its rules, as
     # Fast&Furious's own signature writes them. The model key already says the
     # window is there; these say how it was traded.
@@ -1224,32 +1206,23 @@ def config_error(config: AppleTraderConfig, bundle: "dict | None" = None) -> "st
 
 
 def level_source_error(config: AppleTraderConfig) -> "str | None":
-    """Why the chosen reference cannot be computed for this symbol, or None.
+    """Why a record measuring its levels below something other than the
+    predicted high cannot run, or None.
 
-    Only the intraday shape can fail: it is a *second* model on top of the
-    day-range bundle, fitted on its own set of symbols and shipped as its own
-    file, so a configuration can name a pairing that the day-range checks above
-    are perfectly happy with and this one is not. Checked before a run starts
-    rather than discovered at 9:35, when the answer would be an agent that
-    forecasts the day and then cannot say where to rest an order.
+    The only other reference there was is IntradayVolatility's time-of-day
+    curve stretched to the day-range forecast ("Day Range × Intraday
+    Volatility", removed 2026-10-20). A stored SimLab record made with it is
+    refused rather than replayed on the flat high, which would be a different
+    strategy filed beside the original as though it matched.
     """
-    if config.level_source != LEVELS_INTRADAY:
+    if config.level_source == LEVELS_DAYRANGE:
         return None
-    label = LEVEL_SOURCE_LABELS[LEVELS_INTRADAY]
-    if not intraday_vol_model.covers(config.ticker):
-        return (
-            f"'{label}' reads IntradayVolatility's time-of-day shape, which was fitted on "
-            f"{', '.join(intraday_vol_model.TICKERS)} only, so it cannot be used on "
-            f"{config.ticker}. Run the flat day-range model, or pick another instrument."
-        )
-    if intraday_vol_model.load(config.ticker) is None:
-        return (
-            f"'{label}' needs the IntradayVolatility export for {config.ticker} at "
-            f"{intraday_vol_model.model_path(config.ticker)}, which is missing or "
-            "unreadable. Write it with FinNotebooks/IntradayVolatility/scripts/"
-            "export_app_model.py, or run the flat day-range model."
-        )
-    return None
+    return (
+        f"levels measured below '{config.level_source}' are not something this app can "
+        "run: levels under IntradayVolatility's time-of-day curve were removed with the "
+        "Day Range × Intraday Volatility model (2026-10-20), and a run configured on them "
+        "is not replayed on the flat predicted high."
+    )
 
 
 def _dayrange():
@@ -1302,8 +1275,8 @@ def session_forecast(
     (`pred_high`, `pred_low`, `adr14_abs`, ...), and every level, exit and
     breach rule downstream reads those and nothing else.
 
-    `open_price` is the official opening print the day-range model is fed and
-    the intraday envelope is centred on. The HighLow models roll their daily
+    `open_price` is the official opening print the day-range model is fed. The
+    HighLow models roll their daily
     bars up from minute bars, so they read the first bar's open instead (IEX's,
     for HighLow2) and need no print; None then makes the plan
     fall back to the caller's first bar.
@@ -1322,9 +1295,8 @@ def session_forecast(
     history = dayrange.daily_frame_from_bars(
         historical.fetch_daily_ohlc_bars(ticker, days=dayrange.DAILY_HISTORY_DAYS)
     )
-    # Kept, not just passed on: under `intraday` the envelope is centred on the
-    # session's open, so the same print the forecast was built from is needed
-    # again on every bar of the day.
+    # Returned too, so the plan (and the record's seed) carries the print the
+    # forecast was built from.
     open_price = historical.fetch_session_open(ticker)
     forecast = dayrange.forecast_session(
         bundle, history, opening, today, open_price=open_price,
@@ -1623,21 +1595,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     back up to the sell level, repeat as often as the day allows, and flatten
     what is still open before the close.
 
-    Two settings make `H` less of a constant than the notebook's, and they are
-    separate because they say different things:
-
-    * `breach_update` -- a session that trades *through* the predicted high has
-      falsified it, and the levels hanging off it with it, so the breached side
-      moves. One-way: the forecast only ever widens (`_update_range`).
-    * `level_source` -- what `H` is in the first place. `dayrange` is the
-      predicted high itself. `intraday` reads the same forecast through
-      IntradayVolatility's time-of-day shape, so the reference is the upper
-      curve of the "predicted intraday range x day range" band at this minute:
-      widest at the open, pulled in at midday, widening into the close
-      (`_reference`). Not one-way -- that is the point of it, and the caveat.
-
-    With both at their defaults for `off` and `dayrange` this is the notebook's
-    rule exactly.
+    One setting makes `H` less of a constant than the notebook's:
+    `breach_update` -- a session that trades *through* the predicted high has
+    falsified it, and the levels hanging off it with it, so the breached side
+    moves. One-way: the forecast only ever widens (`_update_range`). With it
+    `off` this is the notebook's rule exactly.
 
     It is a mean-reversion bet, and the reason it is shaped that way is in the
     model's own results: what TimeToChange3 forecasts well is the *width* of
@@ -2011,11 +1973,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             "date": today,
             "opening_end": opening.index[-1],
             # The official print when there is one, else the 09:30 bar's open --
-            # the same fallback `model_overlays._session_open_price` makes, so
-            # the level and the band drawn behind it are centred alike. Only
-            # read under `intraday`.
+            # the same fallback `model_overlays._session_open_price` makes.
             "open_price": float(open_price or opening["open"].iloc[0]),
-            "vol_shape": self._vol_shape(state),
             **forecast,
         }
         # What the forecast started from, published with the record so the
@@ -2203,34 +2162,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     def _opening_window(self, state: AppState, frame, want: int):
         return fetch_opening_window(state, frame, want, ticker=self.ticker)
 
-    def _vol_shape(self, state: AppState) -> "dict | None":
-        """IntradayVolatility's export for this symbol, once per session, or None.
-
-        None whenever the reference does not read it, so a `dayrange` run never
-        touches the file. A run that does need it has already been refused at
-        launch if the file is missing (`level_source_error`); this reports the
-        case where it disappeared between the two, and the reference then falls
-        back to the flat predicted high rather than to nothing.
-        """
-        if self.config.level_source != LEVELS_INTRADAY:
-            return None
-        shape = intraday_vol_model.load(self.ticker)
-        if shape is None:
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": (
-                        f"The IntradayVolatility shape for {self.ticker} could not be "
-                        "loaded, so today's levels rest on the flat predicted high "
-                        "instead of following the time of day."
-                    ),
-                },
-            )
-        return shape
-
-    # --- the sidebar, and the record the chart draws ------------------------
-
     def _adopt_form_model(self, state: AppState, frame, today) -> bool:
         """Switch to the model the sidebar now names, if it changed.
 
@@ -2242,8 +2173,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         with it -- from the same opening window -- and rebuilds both levels.
         The distances come with it: the form re-seeds them with the new model's
         tuned pair, so the old model's numbers under the new forecast would be
-        a pair nobody picked. So does the reference the model implies (the flat
-        high, or the intraday curve). Everything else stays, as for a distance
+        a pair nobody picked. Everything else stays, as for a distance
         edit (`_adopt_form_levels`): the unit, the exits and the breach rules
         still need ▶ Start, and a form in another unit is refused.
 
@@ -2290,7 +2220,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         else:
             try:
                 new = replace(
-                    config, model_key=form.model_key, level_source=form.level_source,
+                    config, model_key=form.model_key,
                     buy_k=float(form.buy_k), sell_k=float(form.sell_k),
                 )
             except ValueError as exc:
@@ -2402,7 +2332,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         text = (
             f"{self.ticker} levels changed from the sidebar at {pd.Timestamp(ts):%H:%M}: "
             f"buy {old[0]:g} → {new[0]:g}, sell {old[1]:g} → {new[1]:g} × "
-            f"{config.unit_phrase} below {self._ref_name}."
+            f"{config.unit_phrase} below the predicted high."
         )
         if self.plan is not None:
             was = (float(self.plan["buy_level"]), float(self.plan["sell_level"]))
@@ -2523,73 +2453,15 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     # --- the levels, and the forecast they hang off ------------------------
 
     def _reference(self, ts) -> float:
-        """The number the two distances are measured below, on this bar.
-
-        Under `dayrange` it is the predicted high: one number, the same at 09:36
-        and at 15:50, and the notebook's rule.
-
-        Under `intraday` it is the upper curve of `intraday_vol_model.envelope`
-        -- the same forecast stretched by IntradayVolatility's time-of-day shape,
-        which is the "predicted intraday range x day range" overlay read as a
-        level instead of as a decoration. The shape peaks at the open, so the
-        reference *is* the predicted high at 09:30 and pulls in towards the
-        opening price through the morning, bottoming out around a fifth of that
-        distance at midday before opening back up into the close.
-
-        What that means for the strategy, stated plainly because it is a real
-        change and not a refinement:
-
-        * The whole ladder descends through the morning and rises again into
-          the last half hour. An entry needs a deeper dip to fill as the day
-          quiets -- and the *target* descends too, so a position opened in the
-          morning can be closed by a sell level that came down to it rather
-          than by a price that went up to it. That is the claim the model makes
-          (the day is no longer moving enough to reach the morning's target),
-          and it is the opposite of the one-way ratchet `_update_range`
-          applies, which is why the two are separate settings.
-        * The band is anchored on the session's **open**, not on the price. By
-          midday the reference sits within a fifth of the forecast distance
-          from the opening print, so a day that has trended well away from it
-          leaves the levels behind: a trending-down day keeps the buy level
-          above the price and re-arms the entry until the stop ends the
-          session's trading. That is the same dependence on the stop the breach
-          policies have, for a different reason.
-        * It also damps `breach_update`. A dollar added to the predicted high
-          moves this reference by the shape at that minute -- about a fifth of
-          a dollar midday -- so the two settings are much less than additive.
-
-        Neither of these has been swept, and the shipped buy/sell distances were
-        swept against a reference that does not move.
-
-        Falls back to the predicted high if the envelope cannot be built -- the
-        shape or the session's open missing. `config_error` refuses a run whose
-        symbol has no shape at all, so this covers the narrower case of a
-        session with no opening print, where the alternative would be no levels.
-        """
-        plan = self.plan
-        if self.config.level_source != LEVELS_INTRADAY:
-            return float(plan["pred_high"])
-        shape, open_price = plan.get("vol_shape"), plan.get("open_price")
-        if shape is None or not open_price:
-            return float(plan["pred_high"])
-        upper, _ = intraday_vol_model.envelope_at(
-            shape, open_price, plan["pred_high"], plan["pred_low"],
-            self._minutes_from_open(ts),
-        )
-        return upper
-
-    @property
-    def _ref_name(self) -> str:
-        """What the log calls the reference -- "H" is ambiguous once it moves."""
-        return (
-            "the predicted high"
-            if self.config.level_source != LEVELS_INTRADAY
-            else "the intraday range's upper curve"
-        )
+        """The number the two distances are measured below, on this bar: the
+        predicted high, as `_update_range` has left it -- one number, the same
+        at 09:36 and at 15:50 until the session breaches it, and the notebook's
+        rule."""
+        return float(self.plan["pred_high"])
 
     @staticmethod
     def _minutes_from_open(ts) -> float:
-        """Minutes from 09:30 to this bar, the index the shape is a function of."""
+        """Minutes from 09:30 to this bar."""
         stamp = pd.Timestamp(ts)
         open_ts = stamp.normalize() + pd.Timedelta(
             hours=market_hours.MARKET_OPEN.hour, minutes=market_hours.MARKET_OPEN.minute
@@ -2600,8 +2472,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         """Rebuild the two resting levels from the reference this bar has.
 
         Called when the plan is made, every time `_update_range` moves the
-        forecast, and -- because the reference can be a function of the clock --
-        once per closed bar. That is the whole of "the levels follow the
+        forecast, and once per closed bar. That is the whole of "the levels follow the
         forecast": they are never stored independently of it, so there is no way
         for the two to disagree.
 
@@ -2911,7 +2782,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 )
             text = (
                 f"{held} Next buy at ${plan['buy_level']:,.2f} ({rung_k:g} × "
-                f"{config.unit_phrase} under {self._ref_name}, {where}): ${cash:,.2f} "
+                f"{config.unit_phrase} under the predicted high, {where}): ${cash:,.2f} "
                 f"cash pays for {shares:g} more share(s).{stop}"
             )
         else:
@@ -2953,7 +2824,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         reasoning = (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
             f"${self.plan['buy_level']:,.2f} next buy level — {rung_k:g} × the "
-            f"{self.config.unit_phrase} below {self._ref_name}, {where}. Adding to the "
+            f"{self.config.unit_phrase} below the predicted high, {where}. Adding to the "
             f"{position:g} sh bought at an average ${float(before['price']):,.2f}."
         )
         if not self.buy(
@@ -3260,7 +3131,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             return position, (
                 f"Target: the bar traded up to ${high:,.2f}, at or through the "
                 f"${plan['sell_level']:,.2f} sell level "
-                f"({config.sell_k:g} × {config.unit_phrase} under {self._ref_name}, "
+                f"({config.sell_k:g} × {config.unit_phrase} under the predicted high, "
                 f"${plan['reference']:,.2f}). Selling at market ({pnl_pct:+.2f}%)."
             ), self.EXIT_TARGET
 
@@ -3608,7 +3479,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         return (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
             f"${plan['buy_level']:,.2f} buy level — {config.buy_k:g} × the "
-            f"{config.unit_phrase} (${plan['level_unit']:,.2f}) below {self._ref_name} at "
+            f"{config.unit_phrase} (${plan['level_unit']:,.2f}) below the predicted high at "
             f"${plan['reference']:,.2f}. Buying the dip below where "
             f"the day is expected to top out; the exit is {', '.join(exits)}, or the "
             "closing bell."
@@ -3738,16 +3609,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 "follow it."
             )
         )
-        if self.config.level_source == LEVELS_INTRADAY:
-            rests = (
-                f"The levels rest under the intraday range's upper curve — that forecast "
-                f"stretched by IntradayVolatility's time-of-day shape around the "
-                f"${plan['open_price']:,.2f} open — so they follow the clock: "
-                f"${plan['reference']:,.2f} now, pulling in towards the open through the "
-                "morning and widening again into the close."
-            )
-        else:
-            rests = "The levels rest under the predicted high, which is flat all session."
+        rests = "The levels rest under the predicted high, which is flat all session."
         # A forecast of the range after the opening window (HighLow2's rest
         # head) is not the session's, and says so; it also carries the whole
         # day's pair, which nothing here trades on.
@@ -3783,10 +3645,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 f"H ${plan['pred_high']:,.2f} / L ${plan['pred_low']:,.2f}, "
                 f"updated ×{updates}"
             )
-        if self.config.level_source == LEVELS_INTRADAY:
-            # The two levels above are this minute's, not the day's, and without
-            # the reference there is nothing in the line that says so.
-            parts.append(f"ref ${plan['reference']:,.2f} (intraday)")
         if self.config.momentum_confirmation_bars and frame is not None:
             read = self._momentum_read(frame)
             if read is not None:
@@ -3881,9 +3739,9 @@ def session_levels(
     the agent -- so this walks a real `DayRangeTrader` through the session and
     reads its plan, rather than re-deriving `reference - k x unit` somewhere the
     two could drift apart. Every setting that moves a level is therefore
-    accounted for by construction: the breach update ratchets the forecast, the
-    intraday source re-reads it each minute, and a change to either shows up in
-    the picture the same day it shows up in the trades.
+    accounted for by construction: the breach update ratchets the forecast, and
+    a change to it shows up in the picture the same day it shows up in the
+    trades.
 
     `forecast` is `dayrange_model.forecast_session`'s dict, `session` the day's
     minute bars and `opening_end` the last bar of the window the forecast was
@@ -3913,11 +3771,6 @@ def session_levels(
         "opening_end": opening_end,
         "open_price": float(
             open_price if open_price else session["open"].iloc[0]
-        ),
-        "vol_shape": (
-            intraday_vol_model.load(config.ticker)
-            if config.level_source == LEVELS_INTRADAY
-            else None
         ),
         **forecast,
     }
@@ -5446,14 +5299,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             f"({BREACH_LABELS[config.breach_update].lower()}) and both levels with it."
         )
     )
-    reference = (
-        "the predicted high"
-        if config.level_source != LEVELS_INTRADAY
-        else (
-            "the upper curve of that range stretched by IntradayVolatility's time-of-day "
-            "shape, so both levels move with the clock"
-        )
-    )
+    reference = "the predicted high"
     # When the forecast is made, and of what: the window the bundle reads, and
     # the whole day's extremes or (a HighLow2 bundle with a rest head) those
     # still to come after it.

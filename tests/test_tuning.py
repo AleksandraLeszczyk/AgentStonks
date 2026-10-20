@@ -212,9 +212,9 @@ class TestExpand:
     def test_a_numeric_and_a_rule_axis_mix(self):
         configs, _ = tu.expand(self.base(), [
             {"name": "stop_gain_fraction", "values": [0.0, 0.2]},
-            {"name": "level_source", "values": ["dayrange"]},
+            {"name": "take_trigger", "values": ["momentum"]},
         ])
-        assert all(c.level_source == "dayrange" for c in configs)
+        assert all(c.take_trigger == "momentum" for c in configs)
         assert sorted(c.stop_gain_fraction for c in configs) == [0.0, 0.2]
 
     def test_everything_the_axes_do_not_name_comes_from_the_base(self):
@@ -260,7 +260,7 @@ class TestExpand:
     def test_every_configuration_is_one_the_engine_would_accept(self):
         configs, _ = tu.expand(self.base(), [
             {"name": "buy_k", "values": tu.axis_values("buy_k", 0.3, 0.9, 0.1)},
-            {"name": "level_source", "values": list(tu.CHOICES["level_source"].options)},
+            {"name": "take_trigger", "values": list(tu.CHOICES["take_trigger"].options)},
         ])
         assert configs and all(isinstance(c, AppleTraderConfig) for c in configs)
         assert len({tu.config_signature(c) for c in configs}) == len(configs)

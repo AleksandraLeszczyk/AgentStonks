@@ -3180,17 +3180,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "extended hours included: the first run fetches it (tens of seconds) and "
             "caches it under `data/highlow2/`."
         ),
-        "model_dayrange_intraday": (
-            "The levels rest under the top of the intraday band.\n\n"
-            "- The band *is* the predicted high at 09:30, pulls in to about a fifth of "
-            "the distance to the open by midday, and opens back up into the last half hour.\n"
-            "- Both levels move with it, so an entry needs a deeper dip as the day quiets.\n"
-            "- **The target comes down too** — a morning position can be closed by a sell "
-            "level that fell to it. That is the model's claim, not a bug, but it is a "
-            "different strategy from the flat model and has not been swept.\n"
-            "- The band is anchored on the session's **open**, not the price: a day that "
-            "trends away from the open leaves the levels behind, so the stop matters more here."
-        ),
         "buy_k": (
             "How far under the predicted high the entry rests.\n\n"
             "- {ticker} starts at **{buy_k}** on this model — the most profitable cell of "

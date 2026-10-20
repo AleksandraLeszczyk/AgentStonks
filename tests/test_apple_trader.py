@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 import pandas as pd
 import pytest
 
-from agent_stonks import apple_models, intraday_vol_model
+from agent_stonks import apple_models
 from agent_stonks import apple_trader as at
 from agent_stonks import clock
 from agent_stonks import rule_agent
@@ -1097,69 +1097,33 @@ class TestIntradayRangeUpdate:
         assert trader.plan["range_updates"] == 1
 
 
-# A hand-made IntradayVolatility shape, so these pin the levels rather than the
-# fitted curve: vol(t) = 0.2 + 0.8 / (1.5 + t), which peaks at the open like the
-# real one and settles onto a floor, but is readable by hand. The real fit is
-# pinned in `tests/test_intraday_vol_model.py` against the exporter's own check
-# block; what matters here is what the trader does with whatever curve it gets.
-VOL_SHAPE = {
-    "shape": {
-        "params": {"a": 0.2, "b": 0.8, "alpha": 1.0, "c": 0.0, "kappa": 30.0},
-        "t_domain": [0.0, 389.5],
-    },
-    "day_range": {"coef": {"const": 0.0, "lr_d": 0.0, "lr_w": 0.0, "lr_m": 0.0,
-                           "abs_gap": 0.0}},
-}
-# The tape's 09:30 bar opens here, and `fetch_session_open` is stubbed to None,
-# so this is the price the envelope is centred on.
-SESSION_OPEN = 101.0
+class TestIntradayLevelsRemoved:
+    """Levels under IntradayVolatility's time-of-day curve -- the "Day Range ×
+    Intraday Volatility" model, and `level_source="intraday"` before it -- were
+    removed on 2026-10-20. A stored record made with either is refused, not
+    replayed on the flat predicted high under another signature."""
 
-
-def expected_reference(minute: float, high=FORECAST["pred_high"], low=FORECAST["pred_low"]):
-    """The upper envelope at one minute, straight from the model the chart uses."""
-    upper, _ = intraday_vol_model.envelope_at(VOL_SHAPE, SESSION_OPEN, high, low, minute)
-    return upper
-
-
-class TestDayRangeIntradayModel:
-    """The reference as a model rather than as a setting beside one.
-
-    "Day Range × Intraday Volatility" is the same forecast and the same rules
-    with the levels measured below the intraday curve, so it is one choice in
-    the model picker instead of two choices the reader had to pair correctly.
-    """
-
-    KEY = "dayrange_intraday"
-
-    def test_the_model_decides_what_the_levels_are_measured_below(self):
-        assert AppleTraderConfig(model_key=self.KEY).level_source == "intraday"
+    def test_the_default_is_the_flat_predicted_high(self):
+        assert AppleTraderConfig().level_source == "dayrange"
         assert AppleTraderConfig(model_key="dayrange").level_source == "dayrange"
 
-    def test_it_cannot_be_talked_out_of_its_own_reference(self):
-        """A config naming this model and the flat high would be this model in
-        name only -- the reference is the whole of what distinguishes it."""
-        config = AppleTraderConfig(model_key=self.KEY, level_source="dayrange")
-        assert config.level_source == "intraday"
-
-    def test_the_model_key_says_it_so_the_signature_does_not_say_it_twice(self):
-        sig = config_signature(AppleTraderConfig(model_key=self.KEY))
-        assert sig.startswith("dayrange_intraday_AAPL(")
-        assert "levels=" not in sig
-
-    def test_a_record_from_when_it_was_a_setting_keeps_its_signature(self):
-        """The pairing existed before this model did, as `dayrange` plus
-        `level_source=intraday`. Such a record has to replay as what it was and
-        file where it did -- rewriting it onto the new key would move it to a
-        different row in Results."""
+    def test_a_record_from_when_it_was_a_setting_keeps_its_signature_and_is_refused(self):
         from simlab.rule_agents import _apple_from_record
 
         old = _apple_from_record({
             "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
             "level_source": "intraday",
         })
-        assert old.model_key == "dayrange"
-        assert old.level_source == "intraday"
+        assert old.model_key == "dayrange" and old.level_source == "intraday"
         assert ",levels=intraday" in config_signature(old)
+        error = at.config_error(old)
+        assert error and "removed" in error and "flat predicted high" in error
+
+    def test_a_record_naming_the_model_is_refused(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({"model_key": "dayrange_intraday", "buy_k": 0.75})
+        assert "has been removed" in at.model_ticker_error(old)
 
     def test_a_record_with_no_reference_at_all_is_still_the_flat_model(self):
         from simlab.rule_agents import _apple_from_record
@@ -1167,42 +1131,11 @@ class TestDayRangeIntradayModel:
         old = _apple_from_record({"model_key": "dayrange", "buy_k": 0.75})
         assert old.level_source == "dayrange"
         assert "levels=" not in config_signature(old)
+        assert at.config_error(old) is None
 
-    def test_it_is_offered_only_where_both_files_were_fitted(self):
-        both = set(apple_models.DAYRANGE_TICKERS) & set(
-            at.intraday_vol_model.TICKERS
-        )
-        assert set(apple_models.get(self.KEY).tickers) == both
-        for symbol in both:
-            assert self.KEY in apple_models.keys_for(symbol)
-
-    def test_a_missing_shape_makes_the_model_unavailable_not_silently_flat(
-        self, monkeypatch
-    ):
-        """The one outcome worth failing for: without the shape it would run as
-        the flat model under this model's name."""
-        monkeypatch.setattr(
-            apple_models, "_load_dayrange", lambda ticker=TICKER: {"stub": True}
-        )
-        monkeypatch.setattr(
-            at.intraday_vol_model, "load", lambda *a, **k: None
-        )
-        assert apple_models.load(self.KEY, TICKER) is None
-        why = apple_models.unavailable_reason(self.KEY, TICKER)
-        assert "IntradayVolatility" in why and "missing" in why
-
-    def test_a_missing_day_range_bundle_says_so_instead(self, monkeypatch):
-        monkeypatch.setattr(
-            apple_models, "_load_dayrange", lambda ticker=TICKER: None
-        )
-        why = apple_models.unavailable_reason(self.KEY, TICKER)
-        assert "day-range bundle" in why
-
-    def test_both_models_drive_the_same_rule_set(self):
-        assert (
-            apple_models.get(self.KEY).strategy
-            == apple_models.get("dayrange").strategy
-        )
+    def test_an_unknown_level_source_is_refused(self):
+        with pytest.raises(ValueError, match="level_source"):
+            dayrange_config(level_source="vwap")
 
 
 class TestHighLowModel:
@@ -1494,203 +1427,6 @@ class TestDaysOff:
     def test_an_unknown_day_is_refused(self):
         with pytest.raises(ValueError, match="skip_events"):
             AppleTraderConfig(skip_events=("fomc",))
-
-
-class TestIntradayLevelSource:
-    """The levels resting under the intraday band rather than under a flat high.
-
-    Same forecast, read through IntradayVolatility's time-of-day shape: the
-    reference is the upper curve of the "predicted intraday range x day range"
-    overlay at the minute of the bar that just closed, so it is the predicted
-    high at 09:30 and pulls in towards the open as the day quiets.
-    """
-
-    def _trader(self, monkeypatch, **kwargs):
-        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: VOL_SHAPE)
-        return at.DayRangeTrader(dayrange_config(level_source="intraday", **kwargs))
-
-    def test_the_default_is_the_flat_predicted_high(self):
-        assert AppleTraderConfig().level_source == "dayrange"
-
-    def test_the_flat_source_rests_on_the_predicted_high_all_day(
-        self, state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        trader = at.DayRangeTrader(dayrange_config())
-        for offset in (65, 200):
-            tape.append(104.0, offset=offset)
-            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-            assert trader.plan["reference"] == FORECAST["pred_high"]
-            assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
-
-    def test_the_reference_is_the_overlay_curve_at_this_minute(
-        self, state, market_open, monkeypatch
-    ):
-        """Pinned against `intraday_vol_model` itself, not against a number
-        copied here: the level Apple Trader rests on and the band a reader sees
-        behind the candles have to be the same curve, or the chart is a lie."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        trader = self._trader(monkeypatch)
-
-        tape.append(104.0, offset=65)
-        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert trader.plan["reference"] == pytest.approx(expected_reference(65))
-
-    def test_the_levels_are_the_same_two_distances_under_that_reference(
-        self, state, market_open, monkeypatch
-    ):
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        trader = self._trader(monkeypatch)
-
-        tape.append(104.0, offset=65)
-        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        plan = trader.plan
-        assert plan["buy_level"] == pytest.approx(plan["reference"] - 0.75 * 10)
-        assert plan["sell_level"] == pytest.approx(plan["reference"] - 0.10 * 10)
-
-    def test_the_reference_pulls_in_from_the_predicted_high_as_the_day_quiets(
-        self, state, market_open, monkeypatch
-    ):
-        """At the open the shape is 1 and the reference *is* the predicted high;
-        by the afternoon it is a fraction of the way there."""
-        assert expected_reference(0) == pytest.approx(FORECAST["pred_high"])
-        seen = [expected_reference(m) for m in (0, 30, 120, 300)]
-        assert seen == sorted(seen, reverse=True)
-        assert seen[-1] < FORECAST["pred_high"]
-
-    def test_the_levels_move_between_bars_with_no_breach_at_all(
-        self, state, market_open, monkeypatch
-    ):
-        """The clock alone moves them, which is the whole difference from the
-        flat source -- and is why the levels are rebuilt every bar."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        trader = self._trader(monkeypatch, breach_update="off")
-
-        levels = []
-        for offset in (65, 150, 300):
-            tape.append(104.0, offset=offset)
-            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-            levels.append((trader.plan["buy_level"], trader.plan["sell_level"]))
-        assert len(set(levels)) == 3
-        assert [b for b, _ in levels] == sorted([b for b, _ in levels], reverse=True)
-        assert trader.plan.get("range_updates") is None
-
-    def test_the_sell_level_stays_above_the_buy_level_at_every_minute(
-        self, state, market_open, monkeypatch
-    ):
-        """Both distances come off the same reference, so however it moves the
-        pair cannot invert -- the failure that would buy and sell every bar."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        trader = self._trader(monkeypatch)
-        for offset in range(65, 389, 20):
-            tape.append(104.0, offset=offset)
-            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-            assert trader.plan["sell_level"] > trader.plan["buy_level"]
-
-    def test_a_descending_target_can_close_a_position_the_price_never_reached(
-        self, state, market_open, monkeypatch
-    ):
-        """The surprising half of this setting, pinned rather than discovered.
-
-        Under the flat high a sell only fires when the price rises to it. Here
-        the reference falls through the morning, so the target can come down to
-        a flat price instead -- the model saying the day is no longer moving
-        enough to reach the morning's number.
-        """
-        broker = FakeBroker(102.6)
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
-        tape = Tape(monkeypatch, broker)
-        trader = self._trader(monkeypatch, breach_update="off")
-
-        # 09:36, while the reference is still near the predicted high: a dip
-        # deep enough to fill, closing back at 102.60.
-        tape.append(102.6, low=97.2, high=102.6, offset=6)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
-        entry_sell = trader.plan["sell_level"]
-        assert entry_sell > 102.6    # the target was out of reach at the fill
-
-        # 13:30, on a bar that never trades above that fill: flat price, and the
-        # target has descended through it.
-        tape.append(102.6, low=102.6, high=102.6, offset=240)
-        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
-        assert trader.plan["sell_level"] < 102.6 < entry_sell
-        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
-
-    def test_a_breach_moves_the_forecast_and_the_band_is_rebuilt_from_it(
-        self, state, market_open, monkeypatch
-    ):
-        """The two settings compose: the breach update owns the forecast, the
-        level source owns how it is read."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(112.0))
-        tape = Tape(monkeypatch)
-        trader = self._trader(monkeypatch, breach_update="extreme")
-
-        tape.append(111.5, high=112.0, offset=65)
-        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert trader.plan["pred_high"] == pytest.approx(112.0)
-        assert trader.plan["reference"] == pytest.approx(expected_reference(65, high=112.0))
-
-    def test_a_missing_shape_falls_back_to_the_flat_high_and_says_so(
-        self, state, market_open, monkeypatch
-    ):
-        """`config_error` refuses a run whose symbol has no shape, so this is
-        the narrow case of one that vanished between the launch and 9:35 --
-        better a notebook-rule session than no levels at all."""
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
-        trader = at.DayRangeTrader(dayrange_config(level_source="intraday"))
-
-        tape.append(104.0, offset=65)
-        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert trader.plan["reference"] == FORECAST["pred_high"]
-        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
-        assert any(
-            "IntradayVolatility shape" in e.get("text", "")
-            for e in state.agent_log if e.get("type") == "error"
-        )
-
-    def test_the_flat_source_never_loads_the_shape(self, state, market_open, monkeypatch):
-        """A run that does not read it must not pay for the file."""
-        calls = []
-        monkeypatch.setattr(
-            at.intraday_vol_model, "load",
-            lambda *a, **k: calls.append(a) or VOL_SHAPE,
-        )
-        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
-        tape = Tape(monkeypatch)
-        trader = at.DayRangeTrader(dayrange_config())
-        tape.append(104.0, offset=65)
-        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert calls == []
-
-
-class TestIntradayLevelSourceAvailability:
-    """It is a second model, so it is a second thing that can be missing."""
-
-    def test_a_symbol_the_shape_was_never_fitted_on_is_refused(self, monkeypatch):
-        monkeypatch.setattr(at.apple_models, "covers", lambda *a, **k: True)
-        config = dayrange_config(ticker="MSFT", level_source="intraday")
-        error = at.config_error(config)
-        assert error is not None and "MSFT" in error and "IntradayVolatility" in error
-
-    def test_a_missing_export_is_refused_with_the_path_it_looked_for(self, monkeypatch):
-        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
-        error = at.config_error(dayrange_config(level_source="intraday"))
-        assert error is not None and "intravol_AAPL.json" in error
-
-    def test_the_flat_source_needs_none_of_it(self, monkeypatch):
-        monkeypatch.setattr(at.intraday_vol_model, "load", lambda *a, **k: None)
-        assert at.config_error(dayrange_config()) is None
-
-    def test_an_unknown_level_source_is_refused(self):
-        with pytest.raises(ValueError, match="level_source"):
-            dayrange_config(level_source="vwap")
 
 
 class TestMinimumWin:
@@ -2319,10 +2055,12 @@ class TestDayRangeLevelDefaults:
         assert at.dayrange_levels("AAPL", "dayrange") != at.dayrange_levels("AAPL", "highlow")
 
     def test_a_pair_never_tuned_falls_back_to_the_instruments_sweep(self):
-        untuned = apple_models.DAYRANGE_INTRADAY_KEY
-        for ticker in apple_models.MODELS[untuned].tickers:
-            assert (untuned, ticker) not in at.APPLE_TRADER_TUNED_LEVELS
-            assert at.dayrange_levels(ticker, untuned) == at.APPLE_TRADER_DAYRANGE_LEVELS[ticker]
+        # HighLow2 on INTC has no tuning pick.
+        assert ("highlow2", "INTC") not in at.APPLE_TRADER_TUNED_LEVELS
+        assert (
+            at.dayrange_levels("INTC", "highlow2", use_base=False)
+            == at.APPLE_TRADER_DAYRANGE_LEVELS["INTC"]
+        )
 
     def test_every_ticker_the_model_is_wired_up_for_has_a_pair(self):
         assert set(apple_models.DAYRANGE_TICKERS) <= set(at.APPLE_TRADER_DAYRANGE_LEVELS)
@@ -2908,16 +2646,11 @@ class TestInstrument:
         # Fast&Furious and GoodMoments on AAPL alone, so Fast&Furious +
         # HighLow exists on AAPL alone too.
         assert apple_models.keys_for(TICKER) == [
-            "dayrange", "dayrange_intraday", "highlow", "highlow2", "fastfurious",
-            "goodmoments", "ff_highlow",
+            "dayrange", "highlow", "highlow2", "fastfurious", "goodmoments", "ff_highlow",
         ]
-        assert apple_models.keys_for("INTC") == [
-            "dayrange", "dayrange_intraday", "highlow", "highlow2",
-        ]
+        assert apple_models.keys_for("INTC") == ["dayrange", "highlow", "highlow2"]
         for symbol in (NON_AAPL,):
-            assert apple_models.keys_for(symbol) == [
-                "dayrange", "dayrange_intraday",
-            ]
+            assert apple_models.keys_for(symbol) == ["dayrange"]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(

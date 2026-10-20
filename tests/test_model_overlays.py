@@ -457,53 +457,6 @@ class TestIntradayRangeOverlay:
         assert "09:30 open" in result["notes"][0]
 
 
-class TestIntradayDayRangeOverlay:
-    """The same curve, stretched to TimeToChange3's predicted high and low."""
-
-    def stub(self, monkeypatch, high=210.0, low=198.0):
-        pytest.importorskip("agent_stonks.dayrange_model")
-        stub_intravol(monkeypatch)
-        TestDayRangeOverlay().stub_forecast(monkeypatch, high=high, low=low)
-
-    def test_it_tops_out_at_the_predicted_high_and_bottoms_out_at_the_low(
-        self, monkeypatch
-    ):
-        self.stub(monkeypatch)
-        items = mo.compute([mo.INTRADAY_DAYRANGE_KEY], "AAPL", minute_bars(),
-                           daily_bars=[], session_date=SESSION)["items"]
-        band = the_band(items)
-        assert max(band["upper"]) == pytest.approx(210.0)
-        assert min(band["lower"]) == pytest.approx(198.0)
-        width = np.array(band["upper"]) - np.array(band["lower"])
-        assert int(np.argmax(width)) == 0 and width[180] < width[0]
-
-    def test_selecting_both_day_range_overlays_forecasts_once(self, monkeypatch):
-        import agent_stonks.dayrange_model as dr
-
-        self.stub(monkeypatch)
-        calls = []
-        forecast = dr.forecast_session
-        monkeypatch.setattr(
-            dr, "forecast_session", lambda *a, **k: calls.append(1) or forecast(*a, **k)
-        )
-        items = mo.compute([mo.DAY_RANGE_KEY, mo.INTRADAY_DAYRANGE_KEY], "AAPL",
-                           minute_bars(), daily_bars=[], session_date=SESSION)["items"]
-        assert len(calls) == 1
-        # The tape trades under the 198.00 predicted low, so the day-range
-        # overlay is a band rather than a span plus two levels.
-        assert {i["kind"] for i in items} == {"band"}
-
-    def test_no_forecast_is_a_note_naming_this_overlay(self, monkeypatch):
-        self.stub(monkeypatch)
-        monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)
-        result = mo.compute([mo.INTRADAY_DAYRANGE_KEY], "AAPL", minute_bars(),
-                            daily_bars=[], session_date=SESSION)
-        assert result["items"] == []
-        assert result["notes"][0].startswith(
-            "Predicted intraday range × day range (IntradayVolatility × TimeToChange3):"
-        )
-
-
 class TestTraderLevelsOverlay:
     """Apple Trader's resting orders, drawn from a configuration.
 
@@ -616,26 +569,6 @@ class TestTraderLevelsOverlay:
         close = pd.Timestamp(buy["x1"]).tz_convert("America/New_York")
         assert (start.hour, start.minute) == (9, 34)
         assert (close.hour, close.minute) == (16, 0)
-
-    def test_a_reference_that_moves_is_drawn_as_a_band(self, monkeypatch):
-        """Under the intraday source the levels follow the clock, and two flat
-        lines would be a picture of a strategy the run is not using."""
-        monkeypatch.setattr(
-            mo.intraday_vol_model, "load",
-            lambda *a, **k: {
-                "shape": {"params": {"a": 0.2, "b": 0.8, "alpha": 1.0, "c": 0.0,
-                                     "kappa": 30.0},
-                          "t_domain": [0.0, 389.5]},
-                "day_range": {"coef": {}},
-            },
-        )
-        items = self.items(monkeypatch, self.config(level_source="intraday"))["items"]
-        band = next(i for i in items if i["kind"] == "band")
-        assert not [i for i in items if i["kind"] == "level"]
-        assert len(band["t"]) == len(band["lower"]) == len(band["upper"])
-        # Buy under sell at every minute, and the pair pulls in through the day.
-        assert all(lo < up for lo, up in zip(band["lower"], band["upper"]))
-        assert band["lower"][-1] < band["lower"][0]
 
     def test_a_breach_moves_the_levels_and_switches_it_to_a_band(self, monkeypatch):
         """The same settings that move the agent's orders move the drawing --
@@ -1257,7 +1190,7 @@ class TestLiveOverlays:
     def test_the_opening_print_is_only_used_for_todays_session(self, monkeypatch):
         calls = self.capture_compute(monkeypatch)
         bars = minute_bars(n=40)  # SESSION is in the past
-        mo.live_overlays(self.make_state(bars), bars, [mo.INTRADAY_DAYRANGE_KEY])
+        mo.live_overlays(self.make_state(bars), bars, [mo.DAY_RANGE_KEY])
         assert calls[0]["open_price"] is None
 
     def test_overlays_without_the_forecast_do_not_fetch_it(self, monkeypatch):

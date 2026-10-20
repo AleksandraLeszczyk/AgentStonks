@@ -79,8 +79,6 @@ from agent_stonks.config import (
     BREACH_LABELS,
     BREACH_OFFERED,
     BREACH_POLICIES,
-    LEVEL_SOURCES,
-    LEVEL_SOURCE_LABELS,
     TAKE_TRIGGERS,
     TAKE_TRIGGER_LABELS,
 )
@@ -315,10 +313,6 @@ CHOICES: "dict[str, Choice]" = {
     c.name: c
     for c in (
         Choice(
-            "level_source", "Levels measured below",
-            tuple(LEVEL_SOURCES), dict(LEVEL_SOURCE_LABELS), short="Level source",
-        ),
-        Choice(
             "breach_update", "If the session trades outside the forecast",
             tuple(BREACH_POLICIES), dict(BREACH_LABELS), short="Forecast breach",
             offered=tuple(BREACH_OFFERED),
@@ -341,7 +335,6 @@ CHOICES: "dict[str, Choice]" = {
 SWEEPABLE: "tuple[str, ...]" = (
     "buy_k",
     "sell_k",
-    "level_source",
     "breach_update",
     "stop_gain_fraction",
     "momentum_confirmation_bars",

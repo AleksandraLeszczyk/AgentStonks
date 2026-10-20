@@ -282,7 +282,7 @@ APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
 # (buy_k, sell_k) per instrument -- see the day-range block above. Since
 # 2026-09-26 only the fallback for a (model, instrument) pair with no SimLab
-# tuning pick below: today that is the Day Range × Intraday Volatility model.
+# tuning pick below: today that is HighLow2 on INTC.
 APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
     "AAPL": (0.40, 0.25),
     "GOOGL": (0.65, 0.05),
@@ -638,32 +638,17 @@ APPLE_TRADER_KEEP_WIDTH = True
 APPLE_TRADER_BREACH_EXIT = True
 
 # What the two levels hang off -- the reference `buy_k` and `sell_k` are
-# measured below (`apple_trader.DayRangeTrader._set_levels`). Here for the same
-# reason the breach policies are: naming one must not cost an import of torch.
+# measured below (`apple_trader.DayRangeTrader._set_levels`): the model's
+# predicted high, one number for the session.
 #
-#   "dayrange"  TimeToChange3's predicted high, one number for the session.
-#   "intraday"  the upper curve of that forecast stretched by IntradayVolatility's
-#               time-of-day shape -- the "predicted intraday range x day range"
-#               overlay, as a level rather than as a decoration. It is the same
-#               forecast, re-read minute by minute: at the 09:30 peak it IS the
-#               predicted high, by midday it has pulled in to roughly a fifth of
-#               the distance from the open, and it opens back up into the close.
-#
-# The second needs an IntradayVolatility export for the symbol on top of the
-# day-range bundle (`intraday_vol_model`), which `apple_trader.config_error`
-# checks before a run starts.
+# "intraday" -- that forecast read through IntradayVolatility's time-of-day
+# shape, the "Day Range × Intraday Volatility" model -- was removed on
+# 2026-10-20. It stays a value a stored record can carry, so that such a record
+# is refused (`apple_trader.level_source_error`) rather than replayed on the
+# flat high and filed in Results beside runs it never matched.
 LEVELS_DAYRANGE = "dayrange"
 LEVELS_INTRADAY = "intraday"
 LEVEL_SOURCES = (LEVELS_DAYRANGE, LEVELS_INTRADAY)
-LEVEL_SOURCE_LABELS = {
-    LEVELS_DAYRANGE: "Predicted high (flat all session)",
-    LEVELS_INTRADAY: "Predicted range × intraday volatility",
-}
-# Unchanged from the notebook, unlike APPLE_TRADER_BREACH_UPDATE above: the
-# intraday shape is a second model's claim rather than arithmetic on the tape,
-# it is not available for every symbol, and it changes what the strategy *is*
-# (a level that moves with the clock, and can therefore walk a target down
-# towards an open position). Opt in and measure it in SimLab.
 APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
 
 # What one "k" is worth in dollars -- the yardstick `buy_k` and `sell_k` are
@@ -765,9 +750,9 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # bar that reaches a rung under the stop is stopped out first. At each pair's
 # default stop (APPLE_TRADER_TUNED_STOP) and a fill at the buy level the first
 # rung (0.1 units down) is above it on most model/ticker pairs, but not on
-# HighLow AVGO (stop 0.015 units under the fill), HighLow2 AAPL (0.10, level
-# with the rung) or Day Range x Intraday Volatility for AAPL (0.075) -- those
-# never add -- and a fill under the level leaves less room. An add also has to close under the last
+# HighLow AVGO (stop 0.015 units under the fill) or HighLow2 AAPL (0.10, level
+# with the rung) -- those never add -- and a fill under the level leaves less
+# room. An add also has to close under the last
 # fill (since 2026-09-28), so a first buy made under the next rung is not
 # added to at once at no better a price. Not swept.
 # A SimLab record written before the setting existed replays with it off
@@ -944,10 +929,8 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     "day_range":     "#22d3ee",  # cyan, as the ML predicted profile curve
     "profile_range": "#a78bfa",  # violet
     "profile_poc":   "#f472b6",  # pink -- one number inside the violet band
-    # The two time-of-day envelopes: yellow for IntradayVolatility alone, teal
-    # for its shape stretched to the day-range forecast (a sibling of that cyan).
+    # IntradayVolatility's time-of-day envelope.
     "intraday_range":    "#facc15",
-    "intraday_dayrange": "#2dd4bf",
     # HighLow's forecast of the same two numbers as "day_range": a sibling of
     # that cyan, bluer, so the two ranges can be drawn together and told apart.
     "highlow_range": "#60a5fa",

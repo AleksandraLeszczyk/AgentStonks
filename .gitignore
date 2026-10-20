@@ -229,7 +229,7 @@ tests/__pycache__/*
 data/simlab/
 data/highlow/
 data/highlow2/
-data/highlow3m/
+data/option_positioning/
 data/fastfurious/
 data/goodmoments/
 data/event_days/

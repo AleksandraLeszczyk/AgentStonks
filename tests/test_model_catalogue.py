@@ -372,15 +372,13 @@ def test_specs_cover_every_registered_model_and_ticker():
     catalogue entry would silently vanish from the tab.
 
     The exception is a model that is a *pairing* of saved files the tab already
-    lists one card each for. "Day Range × Intraday Volatility" trains nothing
-    of its own -- it is the day-range bundle read through the IntradayVolatility
-    export -- so a third card would repeat two sets of metrics under a name no
-    file carries. It is excluded by name rather than by a rule, so that a model
-    which really does have its own artifact still fails this. So is
-    "Fast&Furious + HighLow", the HighLow and Fast&Furious bundles traded one
-    after the other.
+    lists one card each for: "Fast&Furious + HighLow", the HighLow and
+    Fast&Furious bundles traded one after the other, trains nothing of its own,
+    so a third card would repeat two sets of metrics under a name no file
+    carries. It is excluded by name rather than by a rule, so that a model which
+    really does have its own artifact still fails this.
     """
-    composed = {apple_models.DAYRANGE_INTRADAY_KEY, apple_models.FF_HIGHLOW_KEY}
+    composed = {apple_models.FF_HIGHLOW_KEY}
     expected = {
         (key, ticker)
         for key, model in apple_models.MODELS.items()

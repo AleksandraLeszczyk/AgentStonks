@@ -28,9 +28,6 @@ Ten overlays
                      price envelope around the open, scaled to that model's own
                      daily-bar forecast of the day's range. See
                      `intraday_vol_model`, including why that forecast is weak.
-`intraday_dayrange`  the same curve stretched so its peak is TimeToChange3's
-                     predicted high and its trough the predicted low. The one
-                     forecast is shared with `day_range` within a call.
 `highlow_range`      HighLow's forecast of the same two numbers, drawn exactly
                      like `day_range` (flat, or stepped once the session
                      breaks it). See `highlow_model`.
@@ -128,7 +125,6 @@ from .config import MODEL_OVERLAY_COLORS
 DAY_RANGE_KEY = "day_range"
 PROFILE_RANGE_KEY = "profile_range"
 INTRADAY_RANGE_KEY = "intraday_range"
-INTRADAY_DAYRANGE_KEY = "intraday_dayrange"
 TRADER_LEVELS_KEY = "trader_levels"
 HIGHLOW_RANGE_KEY = "highlow_range"
 HIGHLOW2_RANGE_KEY = "highlow2_range"
@@ -184,9 +180,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="PyTorch, LightGBM and the day-range bundle",
         tickers=apple_models.DAYRANGE_TICKERS,
-        # Both models forecast the day range; the pairing then reads it through
-        # the intraday shape, which is the other overlay below.
-        models=(apple_models.DAYRANGE_KEY, apple_models.DAYRANGE_INTRADAY_KEY),
+        models=(apple_models.DAYRANGE_KEY,),
     ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
@@ -212,22 +206,6 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="the IntradayVolatility export (intravol_<TICKER>.json)",
         tickers=intraday_vol_model.TICKERS,
-    ),
-    INTRADAY_DAYRANGE_KEY: ModelOverlay(
-        key=INTRADAY_DAYRANGE_KEY,
-        label="Predicted intraday range × day range (IntradayVolatility × TimeToChange3)",
-        name="IntradayVolatility × TimeToChange3",
-        summary=(
-            "The same time-of-day curve, stretched so it tops out at TimeToChange3's "
-            "predicted high and bottoms out at its predicted low. Made at 09:35."
-        ),
-        requires=(
-            "the IntradayVolatility export plus PyTorch, LightGBM and the day-range bundle"
-        ),
-        tickers=apple_models.DAYRANGE_INTRADAY_TICKERS,
-        # This curve *is* what "Day Range × Intraday Volatility" measures its
-        # levels below, so a run on that model opens showing it.
-        models=(apple_models.DAYRANGE_INTRADAY_KEY,),
     ),
     HIGHLOW_RANGE_KEY: ModelOverlay(
         key=HIGHLOW_RANGE_KEY,
@@ -768,9 +746,6 @@ def compute(
         INTRADAY_RANGE_KEY: lambda: _intraday_range_items(
             symbol, session, daily_bars or [], day, open_price
         ),
-        INTRADAY_DAYRANGE_KEY: lambda: _intraday_dayrange_items(
-            symbol, session, day, open_price, day_range_forecast()
-        ),
         HIGHLOW_RANGE_KEY: lambda: range_items(HIGHLOW_RANGE_KEY, highlow_forecast),
         HIGHLOW2_RANGE_KEY: lambda: range_items(
             HIGHLOW2_RANGE_KEY, lambda: highlow_forecast(apple_models.HIGHLOW2_KEY)
@@ -1251,35 +1226,6 @@ def _intraday_range_items(
     ], ""
 
 
-def _intraday_dayrange_items(
-    symbol: str,
-    session: pd.DataFrame,
-    day: pd.Timestamp,
-    open_price: "float | None",
-    result: dict,
-) -> "tuple[list[dict], str]":
-    """The time-of-day curve stretched to TimeToChange3's high and low."""
-    overlay = OVERLAYS[INTRADAY_DAYRANGE_KEY]
-    model, why = _intraday_model(symbol, overlay.label)
-    if model is None:
-        return [], why
-    forecast = result["forecast"]
-    if forecast is None:
-        return [], f"{overlay.label}: {result['problem']}"
-    open_px, why = _session_open_price(session, open_price)
-    if open_px is None:
-        return [], f"{overlay.label}: {why}"
-    high, low = forecast["pred_high"], forecast["pred_low"]
-    note = (
-        f"between the predicted high {high:.2f} and low {low:.2f} "
-        f"(forecast at {pd.Timestamp(result['made_at']):%H:%M})"
-    )
-    return [
-        _session_band(INTRADAY_DAYRANGE_KEY, "Pred. intraday × day range", model, day,
-                      open_px, high, low, note)
-    ], ""
-
-
 # --- Apple Trader's resting orders ------------------------------------------
 
 
@@ -1378,8 +1324,7 @@ def _trader_levels_items(
     forecast_of = apple_models.forecast_key(config.model_key)
     how = (
         f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
-        + ("the predicted high" if config.level_source != "intraday"
-           else "the intraday band's upper curve")
+        + "the predicted high"
         + (f" ({_HIGHLOW_NAMES[forecast_of]})" if forecast_of in _HIGHLOW_NAMES else "")
     )
     # Only while a position is open: the stop hangs under the actual fill, so
@@ -1920,7 +1865,7 @@ def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
 
 
 # The overlays that run TimeToChange3's forecast, and so need its inputs.
-_DAYRANGE_DRIVEN = (DAY_RANGE_KEY, INTRADAY_DAYRANGE_KEY)
+_DAYRANGE_DRIVEN = (DAY_RANGE_KEY,)
 
 
 def _live_dayrange_inputs(

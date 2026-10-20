@@ -108,9 +108,9 @@ MODE_LABELS = {
 # The fields every racer must share. Orchestra is one rule set over several
 # instruments, not several rule sets: the pair (ticker, model) and the numbers
 # tuned per pair -- the two distances and the circuit breaker -- are the racer's
-# own, and everything else is Orchestra's. `level_source` follows the model.
+# own, and everything else is Orchestra's.
 PER_RACER_FIELDS = (
-    "ticker", "model_key", "buy_k", "sell_k", "min_win_k", "level_source",
+    "ticker", "model_key", "buy_k", "sell_k", "min_win_k",
 )
 
 
@@ -130,7 +130,6 @@ def split_key(key: str) -> "tuple[str, str]":
 # to repeat on every log line and board row.
 SHORT_MODEL_NAMES = {
     "dayrange": "Day Range",
-    "dayrange_intraday": "Day Range × IV",
     "highlow": "HighLow",
     "highlow2": "HighLow2",
     "fastfurious": "Fast&Furious",
@@ -292,7 +291,6 @@ def build_orchestra_config(
         racers.append(replace(
             base, ticker=ticker, model_key=model_key,
             buy_k=float(buy_k), sell_k=float(sell_k), min_win_k=float(min_win_k),
-            level_source=apple_models.get(model_key).level_source,
         ))
     return OrchestraConfig(racers, selection=selection, mode=mode, budget_pct=budget_pct or {})
 

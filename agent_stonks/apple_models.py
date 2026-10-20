@@ -2,8 +2,8 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are eight: seven
-saved models, the first five of which share a rule set, and one made of two of
+named X" and never branch on which one they got. Today there are six: five
+saved models, the first three of which share a rule set, and one made of two of
 them:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
@@ -12,10 +12,6 @@ them:
                      30% of a 14-day rolling baseline's error removed over 129
                      test sessions. The levels rest under the predicted high,
                      flat all day.
-`dayrange_intraday`  the same forecast read through IntradayVolatility's
-                     time-of-day shape, so the reference the levels hang off
-                     moves with the clock. Two saved files rather than one, and
-                     unavailable wherever either is missing.
 `highlow`            HighLow_5m's forecast of the same two numbers, anchored on
                      the 9:35 price and fitted on every session since 2023 (35%
                      less error than TimeToChange3 on the same test window).
@@ -62,15 +58,9 @@ them:
                      HighLow.
                      Available only where both bundles load.
 
-That second entry is why `AppleModel` carries `level_source`: what the levels
-are measured below used to be a separate setting beside the model picker, which
-asked the reader to pair two choices that only make sense in two combinations.
-It is a property of the model now, and `apple_trader.AppleTraderConfig` reads it
-from here. A record written while it was a separate choice still carries its own
-`level_source` and replays on that, keeping the signature it was filed under.
-
 The persistence classifier, the N-BEATS persistence forecaster and the
-delta-momentum regressor used to sit beside it and have been removed. Their
+delta-momentum regressor used to sit beside them and have been removed, and so
+have HighLow_3m and Day Range × Intraday Volatility (2026-10-20). Their
 bundles may still be in `Code/Models`, but nothing here reads them, and a
 stored SimLab record naming one is refused rather than replayed on another
 model (`apple_trader.model_ticker_error`).
@@ -111,7 +101,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .config import APPLE_TRADER_MODEL, LEVELS_DAYRANGE, LEVELS_INTRADAY
+from .config import APPLE_TRADER_MODEL
 
 
 # The rule sets a model can drive.
@@ -208,11 +198,6 @@ class AppleModel:
     # unavailable and the reader has to be told which one, so this overrides
     # `unavailable_reason`'s default sentence when it is set.
     unavailable: "Callable[[str], str] | None" = None
-    # What the two levels are measured below, for a model that decides it.
-    # `apple_trader.AppleTraderConfig` reads this rather than offering the
-    # reference as a separate choice: which curve the levels hang off is what
-    # distinguishes these two models, so it is the model picker's answer.
-    level_source: str = LEVELS_DAYRANGE
     # For a model made of two others: the model whose morning forecast the
     # levels hang off -- and whose tuned numbers and base configuration a pair
     # of this one falls back to (`apple_trader.dayrange_levels`) -- and the
@@ -248,53 +233,6 @@ def _dayrange_path(ticker: str = DEFAULT_TICKER) -> Path:
     except ImportError:
         return Path(f"timetochange3_dayrange_{(ticker or DEFAULT_TICKER).upper()}.joblib")
     return dayrange_model.model_path(ticker)
-
-
-def _intraday():
-    """IntradayVolatility's loader, imported late like the day-range one.
-
-    Cheap by comparison -- a JSON file and no ML stack -- but kept lazy so that
-    listing the model names still imports nothing but this module.
-    """
-    from . import intraday_vol_model
-
-    return intraday_vol_model
-
-
-def _load_dayrange_intraday(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The day-range bundle, but only when the shape that reads it is there too.
-
-    Returns the *day-range* bundle because that is what the rules forecast
-    from; the shape is loaded where it is used (`apple_trader._reference`).
-    What this adds is the refusal: a configuration naming this model with no
-    shape on disk would otherwise run as the flat model under this model's
-    name, which is the one outcome worth failing for.
-    """
-    bundle = _load_dayrange(ticker)
-    if bundle is None or _intraday().load(ticker) is None:
-        return None
-    return bundle
-
-
-def _intraday_path(ticker: str = DEFAULT_TICKER) -> Path:
-    return _intraday().model_path(ticker)
-
-
-def _dayrange_intraday_unavailable(ticker: str = DEFAULT_TICKER) -> str:
-    """Which of the two files is missing, rather than a guess at one of them."""
-    symbol = (ticker or DEFAULT_TICKER).upper()
-    if _load_dayrange(symbol) is None:
-        return (
-            f"No day-range bundle at {_dayrange_path(symbol)} (or PyTorch, LightGBM, "
-            "scikit-learn and joblib are not installed). This model reads that "
-            "forecast before it reads the intraday shape."
-        )
-    return (
-        f"The day-range bundle for {symbol} loaded, but the IntradayVolatility export "
-        f"at {_intraday_path(symbol)} is missing or unreadable — write it with "
-        "FinNotebooks/IntradayVolatility/scripts/export_app_model.py, or run the "
-        "flat day-range model instead."
-    )
 
 
 def _load_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
@@ -382,9 +320,9 @@ def _load_ff_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
 
     HighLow's because that is the forecast the levels hang off from 9:35 on
     (`apple_trader.session_forecast` dispatches on its `kind`); Fast&Furious's
-    is loaded where the opening window reads it. The refusal is the point, as
-    for the intraday pairing: without the second bundle a run would trade as
-    plain HighLow under this model's name.
+    is loaded where the opening window reads it. The refusal is the point:
+    without the second bundle a run would trade as plain HighLow under this
+    model's name.
     """
     bundle = _load_highlow(ticker)
     if bundle is None or _load_fastfurious(ticker) is None:
@@ -409,17 +347,11 @@ def _ff_highlow_unavailable(ticker: str = DEFAULT_TICKER) -> str:
 
 
 DAYRANGE_KEY = "dayrange"
-DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 FASTFURIOUS_KEY = "fastfurious"
 GOODMOMENTS_KEY = "goodmoments"
 FF_HIGHLOW_KEY = "ff_highlow"
-# Both saved models have to exist for the pairing, so the symbols it covers are
-# the symbols both were fitted on.
-DAYRANGE_INTRADAY_TICKERS = tuple(
-    t for t in DAYRANGE_TICKERS if t in _intraday().TICKERS
-)
 
 MODELS: "dict[str, AppleModel]" = {
     DAYRANGE_KEY: AppleModel(
@@ -439,34 +371,6 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=DAYRANGE_TICKERS,
         load=_load_dayrange,
         path=_dayrange_path,
-    ),
-    DAYRANGE_INTRADAY_KEY: AppleModel(
-        key=DAYRANGE_INTRADAY_KEY,
-        label="Day Range × Intraday Volatility",
-        summary=(
-            "The same 9:35 day-range forecast, read through IntradayVolatility's "
-            "time-of-day shape instead of flat. The predicted high and low are "
-            "stretched by a curve that peaks at the open, decays to a flat midday and "
-            "opens back up into the close, and the levels are measured below that "
-            "curve's upper edge at each minute — so they answer \"how far is this "
-            "stock reaching *right now*\" rather than \"how far will it reach today\". "
-            "Two saved models rather than one, and the shape is a second claim on top "
-            "of the forecast: opt in and measure it in SimLab rather than assuming it "
-            "improves on the flat high."
-        ),
-        requires=(
-            "PyTorch, LightGBM, scikit-learn and joblib, plus both .pt checkpoints "
-            "and the IntradayVolatility export"
-        ),
-        strategy=STRATEGY_DAYRANGE,
-        # Both files have to exist, so this is the intersection rather than
-        # either model's own list -- a symbol with a day-range bundle and no
-        # shape is not a symbol this model was fitted on.
-        tickers=DAYRANGE_INTRADAY_TICKERS,
-        load=_load_dayrange_intraday,
-        path=_intraday_path,
-        unavailable=_dayrange_intraday_unavailable,
-        level_source=LEVELS_INTRADAY,
     ),
     HIGHLOW_KEY: AppleModel(
         key=HIGHLOW_KEY,
