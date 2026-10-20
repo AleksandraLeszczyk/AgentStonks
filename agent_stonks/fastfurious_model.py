@@ -46,10 +46,11 @@ in the same order.
 
 The option inputs of the stop's range model (the 1-day implied move, the 7-day
 put wall, the put gamma wall) come from last night's positioning table, which
-`highlow3m_model` already rebuilds from Alpaca's option bars -- the two
-notebooks' tables are identical on all 686 closes both cover (same contracts,
-same open-interest calibration, same dividend yield), so the rows are shared
-and cached once under `data/highlow3m/`.
+`option_positioning` rebuilds from Alpaca's option bars -- this notebook's
+tables and that module's (HighLow_3m's notebook) are identical on all 686
+closes both cover (same contracts, same open-interest calibration, same
+dividend yield), so the rows are read from there, cached under
+`data/option_positioning/`.
 
 What the live path has to supply
 --------------------------------
@@ -93,7 +94,7 @@ except ImportError:
     pass
 
 from . import market_hours, model_store  # noqa: E402
-from .highlow3m_model import NYSE_HOLIDAYS  # noqa: E402
+from .option_positioning import NYSE_HOLIDAYS  # noqa: E402
 from .model_store import RTH_END, RTH_START, ModelStore  # noqa: E402
 from .newsimpact_model import early_close  # noqa: E402
 
@@ -868,7 +869,7 @@ def raw_history(symbol: str, first: date, before: date,
                 key: "str | None" = None, secret: "str | None" = None) -> "dict[str, pd.DataFrame]":
     """Both feeds' regular-session bars for the calendar days in [first, before).
 
-    `highlow3m_model.history_inputs`' scheme: the cache remembers which calendar
+    `highlow2_model.history_inputs`' scheme: the cache remembers which calendar
     days it has looked at, and only the days outside that stretch are fetched --
     so a live session fetches one day each morning and a replay inside the
     stretch fetches nothing. Unlike that one's, the stretch only ever grows,
@@ -949,7 +950,7 @@ def _bar_time(day: date, minute: int) -> datetime:
 
 
 # Live, IEX's bar t is asked for the moment the caller's bar t has closed, and
-# Alpaca can publish it a moment later (`highlow3m_model.fetch_opening`'s retry).
+# Alpaca can publish it a moment later (`highlow2_model.fetch_morning`'s retry).
 _LIVE_RETRIES = 2
 _LIVE_RETRY_SEC = 1.5
 _LIVE_FRESH_SEC = 45
@@ -1119,16 +1120,16 @@ _POSITIONING_RETRY_SEC = 300.0
 
 
 def _positioning(ctx_day: _Day, symbol: str, key, secret) -> None:
-    """Last night's option positioning row, from HighLow_3m's tables (shared)."""
+    """Last night's option positioning row (`option_positioning`, shared)."""
     if ctx_day.positioning is not None:
         return
     if ctx_day.positioning_problem and time.monotonic() - ctx_day.positioning_tried < _POSITIONING_RETRY_SEC:
         return
-    from . import highlow3m_model
+    from . import option_positioning
 
     try:
-        rows = highlow3m_model.positioning_rows(symbol, [ctx_day.prev_close], key, secret)
-        table, _ = highlow3m_model.positioning_frames(rows)
+        rows = option_positioning.positioning_rows(symbol, [ctx_day.prev_close], key, secret)
+        table, _ = option_positioning.positioning_frames(rows)
         if not len(table):
             raise ValueError(f"no option positioning for the {ctx_day.prev_close.date()} close.")
         table.index = pd.DatetimeIndex(table.index, name="date").as_unit("ns")

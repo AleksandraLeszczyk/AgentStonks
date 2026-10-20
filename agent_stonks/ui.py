@@ -2979,19 +2979,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "is built for an ordinary day, and on these the news sets the range — "
             "HighLow2 was fitted with most of them left out."
         ),
-        "dayrange_3m": (
-            "HighLow forecasts at 9:35. HighLow_3m forecasts the rest of the session two "
-            "minutes earlier, at 9:33, so the **09:33 and 09:34 bars** can be traded on "
-            "its levels before HighLow's exist.\n\n"
-            "- **Buy / sell** — rest under HighLow_3m's own predicted high, in the same "
-            "unit as the levels above (under *Predicted Range*, its own predicted range).\n"
-            "- **No stop, no momentum confirmation, no take** — two bars is too short for "
-            "any of them.\n"
-            "- **At 9:35** a position still open is handed to HighLow: its sell level, a "
-            "stop under the actual fill, the momentum take, the ladder and the flatten "
-            "manage it as if it had been bought then.\n"
-            "- A trade the window closes does not trip the circuit breaker."
-        ),
         "ff_window": (
             "Fast&Furious + HighLow trades the **09:30 to 09:34 bars** on Fast&Furious's "
             "forecast of the next 30 minutes' momentum, before HighLow's 9:35 forecast "
@@ -3047,8 +3034,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "minutes ago and IEX since** — fetched from Alpaca every minute, whatever the "
             "stream's feed.\n"
             "- The stop is sized by a second model's forecast of the next two hours' low, "
-            "which reads last night's option table (HighLow_3m's, shared, under "
-            "`data/highlow3m/`).\n"
+            "which reads last night's option table (shared, under "
+            "`data/option_positioning/`).\n"
             "- At ▶ Start it needs ~200 days of SIP and IEX minute bars (cached under "
             "`data/fastfurious/`, tens of seconds the first time) and forecasts the last 20 "
             "sessions to set today's threshold — in the background when the agent is "
@@ -3095,8 +3082,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "and IEX since** (IEX volume scaled to SIP's), fetched from Alpaca every minute "
             "whatever the stream's feed. The notebook read SIP to the minute, so the forecasts "
             "differ a little — most in the 15-minute relative volume.\n"
-            "- It also reads last night's option table (rebuilt from HighLow_3m's shared option "
-            "cache under `data/highlow3m/`, priced the notebook's way, cached under "
+            "- It also reads last night's option table (rebuilt from the shared option "
+            "cache under `data/option_positioning/`, priced the notebook's way, cached under "
             "`data/goodmoments/`) and Yahoo's analyst price targets (refreshed hourly).\n"
             "- At ▶ Start it needs ~130 days of SIP and IEX minute bars (shared with "
             "Fast&Furious under `data/fastfurious/`) — fetched in the background when the "
@@ -3141,29 +3128,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "model_dayrange": (
             "The levels hang off the predicted high — one number for the whole session. "
             "The notebook's rule, and what the buy and sell distances were swept against."
-        ),
-        "use_3m": (
-            "Trade the two minutes before HighLow's 9:35 forecast on HighLow_3m's 9:33 "
-            "one.\n\n"
-            "- A bar whose low reaches the HighLow_3m buy level buys (a limit at the "
-            "level); a bar whose high reaches its sell level sells everything.\n"
-            "- No stop, no momentum confirmation, no take until 9:35; then HighLow's "
-            "rules take over the position.\n"
-            "- Needs HighLow_3m's model and caches (`data/highlow3m/`); with the agent "
-            "running before 9:33 they are fetched in the background.\n"
-            "- Off: nothing is bought before 9:35, as before."
-        ),
-        "buy_3m_k": (
-            "Where the window's buy rests below HighLow_3m's predicted high.\n\n"
-            "- Starts at **{buy_3m_k}** on {ticker}: the pair a HighLow_3m run starts "
-            "from. Never swept for this window — measure it on SimLab's Tuning tab."
-        ),
-        "sell_3m_k": (
-            "Where the window's sell rests below the same high — the smaller number, "
-            "the higher price.\n\n"
-            "- Starts at **{sell_3m_k}** on {ticker}.\n"
-            "- Only two bars to reach it: a position that does not is handed to HighLow "
-            "at 9:35 rather than sold."
         ),
         "model_highlow": (
             "The day-range rules, unchanged, on HighLow's predicted high and predicted "
@@ -3215,24 +3179,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- At 9:35 it needs ~150 sessions of Alpaca SIP and IEX minute history, "
             "extended hours included: the first run fetches it (tens of seconds) and "
             "caches it under `data/highlow2/`."
-        ),
-        "model_highlow3m": (
-            "The day-range rules, unchanged, on HighLow_3m's predicted high and predicted "
-            "range.\n\n"
-            "- Its range is the one **after 9:33**, not the whole day's: forecast at 9:33 "
-            "from IEX's first three minutes, so the first trade can come two minutes "
-            "earlier. A breach is read on the bars after 9:33 — the first three minutes "
-            "can sit outside the range without moving it.\n"
-            "- It reads last night's **option positioning** (walls, dealer gamma, the "
-            "implied move, put/call volume), rebuilt from Alpaca's daily option bars.\n"
-            "- No buy/sell distances were ever swept on it: it starts from the pair "
-            "TimeToChange3's notebook 05 swept for the instrument. Sweep them on "
-            "SimLab's Tuning tab. (The notebook's own X/Y, 0.30/0.15, hang off the "
-            "predicted *low* and do not transfer.)\n"
-            "- Its caches live under `data/highlow3m/`. The first run fetches ~150 "
-            "sessions of SIP and IEX minute history and ~4 months of daily option bars "
-            "(about a minute); later mornings fetch the last session, in the background "
-            "from ▶ Start if the agent is running before 9:33."
         ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band.\n\n"

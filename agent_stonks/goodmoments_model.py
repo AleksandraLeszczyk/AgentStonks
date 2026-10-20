@@ -52,8 +52,8 @@ What the live path has to supply
   `data/fastfurious/`): 61 sessions for the 60-session momentum, 20 for the
   same-minute norms, and the option contracts' 120-day windows.
 * Last night's option positioning (put/call volume, the 30-day implied move,
-  dealer gamma on a price grid), built from HighLow_3m's cached contract list and
-  daily option bars (`highlow3m_model.option_history`) with this notebook's own
+  dealer gamma on a price grid), built from the shared cached contract list and
+  daily option bars (`option_positioning.option_history`) with this notebook's own
   recipe (open interest = cumulative volume, a flat 4.5% rate), cached per day.
 * Yahoo's analyst price targets (`yfinance`), cached and refreshed hourly live.
 * This session's SIP bars through t-15 and IEX bars through t.
@@ -833,13 +833,13 @@ def option_bars(symbol: str, prev: pd.Timestamp, closes: pd.Series,
                 key: "str | None", secret: "str | None") -> pd.DataFrame:
     """Every contract's daily bars through `prev` that a row for the session
     after it reads: the contracts expiring within 120 days of `prev`, over
-    their last 120 days, from HighLow_3m's shared option cache, kept to this
-    notebook's strike band and its standard 100-share contracts."""
+    their last 120 days, from the shared option cache (`option_positioning`),
+    kept to this notebook's strike band and its standard 100-share contracts."""
     import re
 
-    from . import highlow3m_model
+    from . import option_positioning
 
-    contracts, bars = highlow3m_model.option_history(
+    contracts, bars = option_positioning.option_history(
         symbol, prev, prev + pd.Timedelta(days=OPTION_HISTORY_DAYS), closes, prev, key, secret
     )
     if not len(contracts) or not len(bars):
@@ -961,7 +961,7 @@ def is_half_day(session_date) -> bool:
 
 def is_session(session_date) -> bool:
     """A weekday that is not an NYSE holiday."""
-    from .highlow3m_model import NYSE_HOLIDAYS
+    from .option_positioning import NYSE_HOLIDAYS
 
     day = _normal_day(session_date)
     return day.dayofweek < 5 and f"{day:%Y-%m-%d}" not in set(NYSE_HOLIDAYS)

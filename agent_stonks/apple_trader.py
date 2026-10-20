@@ -169,9 +169,8 @@ def base_record(model_key: "str | None", ticker: str) -> "tuple[dict | None, str
     (`apple_models.forecast_key` -- Fast&Furious + HighLow) starts from the base
     of the model whose rules it trades after the opening window, re-keyed to
     itself: from 9:35 on it *is* that model, so the levels, the stop and every
-    rule set up for it there are the ones it should open on. HighLow_3m's
-    window is dropped on the way, since a run that trades another window
-    refuses it (`early_window_error`). `(None, "")` without either.
+    rule set up for it there are the ones it should open on. `(None, "")`
+    without either.
     """
     model_key = str(model_key or APPLE_TRADER_MODEL)
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
@@ -184,7 +183,7 @@ def base_record(model_key: "str | None", ticker: str) -> "tuple[dict | None, str
     record = base_configs.stored(parent, symbol)
     if record is None:
         return None, ""
-    record.update(model_key=model_key, use_3m=False)
+    record.update(model_key=model_key)
     return record, parent
 
 
@@ -298,12 +297,10 @@ def shipped_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
     """The pair's configuration as the code ships it, whatever base is stored."""
     model_key = str(model_key or APPLE_TRADER_MODEL)
     buy_k, sell_k = dayrange_levels(ticker, model_key, use_base=False)
-    buy_3m_k, sell_3m_k = dayrange_levels(ticker, apple_models.HIGHLOW3M_KEY, use_base=False)
     return AppleTraderConfig(
         model_key=model_key, ticker=ticker, buy_k=buy_k, sell_k=sell_k,
         stop_gain_fraction=stop_for(ticker, model_key, use_base=False),
         min_win_k=min_win_for(ticker, model_key, use_base=False),
-        buy_3m_k=buy_3m_k, sell_3m_k=sell_3m_k,
     )
 
 
@@ -524,22 +521,6 @@ class AppleTraderConfig:
     # (`DayRangeTrader._sit_out`). Empty, what every record made before
     # 2026-10-04 replays as, trades every session.
     skip_events: "tuple[str, ...]" = APPLE_TRADER_SKIP_EVENTS
-    # HighLow_3m's early window (2026-10-06). The run's own model forecasts at
-    # 9:35; HighLow_3m forecasts the rest of the session at 9:33, so the two
-    # bars in between (09:33 and 09:34) are traded on its levels: a buy
-    # `buy_3m_k` and a sell `sell_3m_k` level units under its predicted high,
-    # with no stop, no momentum confirmation and no take -- two minutes is too
-    # short for any of them. A position still open when the 9:35 forecast
-    # lands is handed to it, and from then on exits like any other
-    # (`DayRangeTrader._hand_over`). False, what every record made before it
-    # replays as, trades nothing before 9:35. See `early_window_error`.
-    use_3m: bool = False
-    # The window's two distances, in the run's `level_unit` -- under
-    # HighLow_3m's own predicted range when that is "pred_range". None -> the
-    # pair a HighLow_3m run on this instrument starts from
-    # (`dayrange_levels(ticker, "highlow3m")`), filled in by `__post_init__`.
-    buy_3m_k: Optional[float] = None
-    sell_3m_k: Optional[float] = None
     # Fast&Furious's rules (`FastFuriousTrader`, the momentum strategy), read by
     # no other model. Every day-range field above is ignored under it, and
     # these are ignored under the day-range models. See the block in `config`.
@@ -735,29 +716,7 @@ class AppleTraderConfig:
                 f"below buy_k {self.buy_k!r} — both are distances *below* the predicted "
                 "high, so the smaller number is the higher price"
             )
-        # The early window's pair, resolved and checked the same way whether or
-        # not the window is on, so a typo is reported where it is made.
-        early_buy, early_sell = dayrange_levels(self.ticker, apple_models.HIGHLOW3M_KEY)
-        if self.buy_3m_k is None:
-            self.buy_3m_k = early_buy
-        if self.sell_3m_k is None:
-            self.sell_3m_k = early_sell
-        self.use_3m = bool(self.use_3m)
-        for name in ("buy_3m_k", "sell_3m_k"):
-            setattr(self, name, float(getattr(self, name)))
-            if getattr(self, name) < 0:
-                raise ValueError(
-                    f"{name} {getattr(self, name)!r} is a distance below HighLow_3m's "
-                    "predicted high and cannot be negative"
-                )
-        if self.sell_3m_k >= self.buy_3m_k:
-            raise ValueError(
-                f"sell_3m_k {self.sell_3m_k!r} must sit above the HighLow_3m buy level, "
-                f"i.e. strictly below buy_3m_k {self.buy_3m_k!r} — both are distances "
-                "*below* HighLow_3m's predicted high, so the smaller number is the higher "
-                "price"
-            )
-        # Fast&Furious's rules, checked whatever the model, like the window's.
+        # Fast&Furious's rules, checked whatever the model.
         self.ff_entry_quantile = float(self.ff_entry_quantile)
         if not 0.0 < self.ff_entry_quantile < 1.0:
             raise ValueError(
@@ -1168,11 +1127,6 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     implied = apple_models.MODELS.get(c.model_key)
     implied = implied.level_source if implied is not None else LEVELS_DAYRANGE
     levels = "" if c.level_source == implied else f",levels={c.level_source}"
-    # HighLow_3m's 9:33 window, beside the levels it trades before them. Only
-    # while on, so every record written before it existed keeps the signature
-    # it was filed under; "H" there is HighLow_3m's predicted high.
-    if c.use_3m:
-        levels += f",3m=H-{c.buy_3m_k:g}{unit}/H-{c.sell_3m_k:g}{unit}"
     # Fast&Furious's opening window (Fast&Furious + HighLow): its rules, as
     # Fast&Furious's own signature writes them. The model key already says the
     # window is there; these say how it was traded.
@@ -1266,47 +1220,7 @@ def config_error(config: AppleTraderConfig, bundle: "dict | None" = None) -> "st
     """
     return (
         model_ticker_error(config) or level_source_error(config)
-        or early_window_error(config)
     )
-
-
-def early_window_error(config: AppleTraderConfig) -> "str | None":
-    """Why HighLow_3m's 9:33 window (`use_3m`) cannot run here, or None.
-
-    The window is a second model on top of the run's own, so it can be asked
-    for where it does not exist: HighLow_3m was fitted on a few symbols only,
-    its file can be missing, and a run *on* HighLow_3m already forecasts at
-    9:33 and has no window before its own forecast. Checked before a run
-    starts rather than discovered at 9:33.
-    """
-    if not config.use_3m:
-        return None
-    model = apple_models.get(apple_models.HIGHLOW3M_KEY)
-    if config.model_key == apple_models.HIGHLOW3M_KEY:
-        return (
-            f"'Use {model.label}' trades the minutes between its 9:33 forecast and a "
-            f"9:35 one, and this run is on {model.label} itself, which forecasts at "
-            "9:33. Switch it off, or run HighLow."
-        )
-    window = apple_models.window_key(config.model_key)
-    if window:
-        return (
-            f"'Use {model.label}' trades the minutes before the 9:35 forecast, and "
-            f"{apple_models.get(config.model_key).label} trades them on "
-            f"{apple_models.get(window).label}'s signal already. Switch it off."
-        )
-    if not model.covers(config.ticker):
-        return (
-            f"'Use {model.label}' needs HighLow_3m's forecast, which was fitted on "
-            f"{', '.join(model.tickers)} only, so it cannot be used on {config.ticker}. "
-            "Switch it off, or pick another instrument."
-        )
-    if apple_models.load(apple_models.HIGHLOW3M_KEY, config.ticker) is None:
-        return (
-            f"'Use {model.label}' cannot run: "
-            f"{apple_models.unavailable_reason(apple_models.HIGHLOW3M_KEY, config.ticker)}"
-        )
-    return None
 
 
 def level_source_error(config: AppleTraderConfig) -> "str | None":
@@ -1366,13 +1280,6 @@ def _highlow2():
     return highlow2_model
 
 
-def _highlow3m():
-    """`agent_stonks.highlow3m_model`, imported on first use (LightGBM)."""
-    from . import highlow3m_model
-
-    return highlow3m_model
-
-
 def _fastfurious():
     """`agent_stonks.fastfurious_model`, imported on first use (LightGBM)."""
     from . import fastfurious_model
@@ -1398,7 +1305,7 @@ def session_forecast(
     `open_price` is the official opening print the day-range model is fed and
     the intraday envelope is centred on. The HighLow models roll their daily
     bars up from minute bars, so they read the first bar's open instead (IEX's,
-    for HighLow2 and HighLow_3m) and need no print; None then makes the plan
+    for HighLow2) and need no print; None then makes the plan
     fall back to the caller's first bar.
     """
     if bundle.get("kind") == "highlow":
@@ -1409,11 +1316,6 @@ def session_forecast(
     if bundle.get("kind") == "highlow2":
         return (
             _highlow2().forecast_session(bundle, ticker, opening, today, key, secret),
-            None,
-        )
-    if bundle.get("kind") == "highlow3m":
-        return (
-            _highlow3m().forecast_session(bundle, ticker, opening, today, key, secret),
             None,
         )
     dayrange = _dayrange()
@@ -1760,14 +1662,12 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     it sits above that stop. Switched off it is the
     notebook's one buy per position.
 
-    Nor is HighLow_3m's early window (`use_3m`): a run whose forecast lands at
-    9:35 can also trade the 09:33 and 09:34 bars on HighLow_3m's 9:33 forecast
-    of the rest of the session -- its own buy and sell distances under that
-    model's predicted high, and nothing else: no stop, no momentum
-    confirmation, no take (`_early_cycle`). A position the window leaves open
-    is handed to the 9:35 forecast, whose sell level, stop, take, ladder and
-    flatten manage it from then on as though it had been bought at 9:35
-    (`_hand_over`).
+    Nor is an opening window (`_early_cycle`): the day-range rules trade
+    nothing before their forecast, but a subclass can trade the bars before it
+    on another model's signal (`FastFuriousHighLowTrader`). A position the
+    window leaves open is handed to the 9:35 forecast, whose sell level, stop,
+    take, ladder and flatten manage it from then on as though it had been
+    bought at 9:35 (`_hand_over`).
 
     Against the notebook
     --------------------
@@ -1856,9 +1756,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # The close and the time of the last bar this trader read, for whoever
         # watches several traders at once (`orchestra`'s board).
         self.last_close: "float | None" = None
-        # HighLow_3m's 9:33 forecast and the two levels of the early window
-        # built on it (`use_3m`), or `{"date", "failed"}` when it could not be
-        # made; None before 9:33 and on a run without the window.
+        # The session state of the opening window a subclass trades before
+        # the forecast (`_early_cycle`), or `{"date", "failed"}` when it could
+        # not be had; None before the window and on a run without one.
         self.early: "dict | None" = None
 
     def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
@@ -1891,8 +1791,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         self._roll_session(today)
 
         frame = momentum_regime.minute_frame(sym_state)
-        if self.plan is None and self.blocked is None:
-            self._prewarm(self._bundle or bundle, state, today, len(frame))
         if not len(frame):
             _log(
                 state,
@@ -1914,9 +1812,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             if self.blocked is not None:
                 self._drop_early(state, tracker)
                 return "no_data"
-            # HighLow_3m's window, while this run's own forecast is still to
-            # come. First, because the bar the 9:35 forecast is built on (09:34)
-            # is the window's last, and is traded on the window's levels.
+            # The opening window a subclass trades, while this run's own
+            # forecast is still to come. First, because the bar the 9:35
+            # forecast is built on (09:34) is the window's last, and is traded
+            # in the window.
             early = self._early_cycle(state, tracker, frame, today, want)
             if self.blocked is not None:  # the window found a day to sit out
                 return "no_data"
@@ -1998,7 +1897,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # exist before it -- the notebook's `start_after`. The bar the plan was
         # built on is the last bar *of* that window, so it is never traded.
         if ts <= self.plan["opening_end"]:
-            # On the bar the forecast was made on, what HighLow_3m's window did
+            # On the bar the forecast was made on, what the opening window did
             # with it is this cycle's outcome.
             return early or "warming_up"
 
@@ -2145,9 +2044,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         else:
             self._record_levels(state, opening.index[-1])
 
-        # A HighLow bundle fitted on IEX openings (MU, every HighLow2 and
-        # HighLow_3m one) fetched its own IEX window and was fitted on IEX
-        # volume, so the IEX caveat does not describe it.
+        # A HighLow bundle fitted on IEX openings (MU, every HighLow2 one)
+        # fetched its own IEX window and was fitted on IEX volume, so the IEX
+        # caveat does not describe it.
         warning = (
             None if (bundle.get("opening_feed") or "sip") != "sip"
             else _dayrange().volume_scale_warning(tape)
@@ -2212,248 +2111,24 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 },
             )
 
-    def _prewarm(self, bundle: dict, state: AppState, today, bars_in: int) -> None:
-        """Start filling the forecast's caches while the opening window is
-        still open, once per session.
+    # --- an opening window before the forecast -------------------------------
 
-        HighLow_3m's 9:33 forecast reads last night's option tables, built from
-        a few months of daily bars per listed expiration: tens of seconds each
-        morning, over a minute the first time. Fetched in the background from
-        the first cycle before the forecast, so 9:33 reads a warm cache rather
-        than holding the first trade for it. Live only: a replay forecasts on
-        the spot, from caches its own clock decides. A failure here is not
-        reported -- the forecast makes the same fetches and reports its own.
-
-        A run on another model that trades HighLow_3m's early window
-        (`use_3m`) needs the same forecast at the same minute, so it warms the
-        same caches.
-        """
-        if (bundle or {}).get("kind") != "highlow3m":
-            bundle = (
-                apple_models.load(apple_models.HIGHLOW3M_KEY, self.ticker)
-                if self.config.use_3m else None
-            )
-            if bundle is None:
-                return
-        if bars_in >= _dayrange().opening_minutes(bundle):
-            return  # the forecast is due now, and fetches what it needs itself
-        if getattr(state, "bar_tape_override", "") or getattr(self, "_prewarmed", None) == today:
-            return
-        self._prewarmed = today
-        module, ticker = _highlow3m(), self.ticker
-        key, secret = state.api_key, state.api_secret
-
-        def work() -> None:
-            try:
-                module.warm_history(bundle, ticker, today, key, secret)
-            except Exception:  # noqa: BLE001 -- the 9:33 forecast retries and reports
-                pass
-
-        threading.Thread(target=clock.inherit(work), name=f"highlow3m-warm-{ticker}", daemon=True).start()
-        _log(state, {"type": "status", "text": (
-            f"Fetching {ticker}'s minute history and last night's option tables in the "
-            "background for the 9:33 HighLow_3m forecast."
-        )})
-
-    # --- HighLow_3m's early window (`use_3m`) -------------------------------
-
-    #: Which rule closed a position inside the window -- carried on the log
-    #: entry like the exits below.
-    EXIT_EARLY_TARGET = "highlow3m_target"
-    EXIT_EARLY_DROPPED = "highlow3m_no_forecast"
-    #: What the hand-over and the drop call the window a position came from
-    #: (`FastFuriousHighLowTrader` trades another one).
-    WINDOW_NAME = "HighLow_3m's window"
+    #: What the hand-over and the drop call the window a position came from,
+    #: and the exit a dropped one is logged under. A subclass that trades a
+    #: window (`FastFuriousHighLowTrader`) names its own.
+    WINDOW_NAME = "the opening window"
+    EXIT_EARLY_DROPPED = "window_no_forecast"
 
     def _early_cycle(
         self, state: AppState, tracker: DecisionTracker, frame, today, want: int
     ) -> "str | None":
-        """One cycle of HighLow_3m's window, or None outside it.
-
-        The window runs from the bar HighLow_3m's 9:33 forecast is built on
-        (09:32) to the last bar of this run's own opening window (09:34 for a
-        9:35 forecast), by the bar's clock rather than by how many bars the
-        buffer holds, so a run started later has simply missed it. On 09:32 the
-        forecast is made and nothing is traded, as on the 9:35 forecast's own
-        bar. On 09:33 and 09:34 it is the day-range rule on HighLow_3m's levels
-        and nothing more: a buy when a bar's low reaches the buy level, a sale
-        of the whole position when a bar's high reaches the sell level, never
-        both on one bar. No stop, no momentum confirmation, no take, no ladder
-        -- two bars is too short for any of them. What it leaves open is
-        handed to the 9:35 forecast (`_hand_over`).
-
-        A session the run sits out is sat out from here, and a forecast that
-        cannot be made is reported once and costs only the window.
-        """
-        if not self.config.use_3m or not len(frame):
-            return None
-        bundle = apple_models.load(apple_models.HIGHLOW3M_KEY, self.ticker)
-        early_want = _dayrange().opening_minutes(bundle) if bundle is not None else 3
-        ts = frame.index[-1]
-        minute = self._minutes_from_open(ts)
-        if early_want >= want or not early_want - 1 <= minute <= want - 1:
-            return None
-        if self.early is None:
-            if self._sit_out(state, frame, today, early_want):
-                return None
-            self._plan_early(state, bundle, frame, today, early_want, want)
-        early = self.early
-        if early.get("failed"):
-            return None
-        if ts <= early["opening_end"]:
-            return "warming_up"
-        if ts == self.last_bar_ts:
-            return "hold"
-        self.last_bar_ts = ts
-
-        last = frame.iloc[-1]
-        self.last_close = float(last["close"])
-        position = tracker.position_for(self.ticker)
-        if position > 0 and self.entry is None:
-            # A position this run does not remember (restarted inside the
-            # window onto a ledger that holds one): adopted at this bar, as the
-            # 9:35 rules adopt one, and handed to them with the rest.
-            close = float(last["close"])
-            self.entry = {
-                "price": close, "bars": 0, "ts": ts, "early": True,
-                "fills": 1, "last_fill": close,
-            }
-        if position <= 0:
-            self.entry = None
-        if self.entry is not None:
-            self.entry["bars"] += 1
-        self._record_early_levels(state, ts)
-        if not self.quiet_read:
-            _log(state, {"type": "analysis", "text": self._early_read(last, ts, position)})
-
-        if position > 0:
-            if (self.entry or {}).get("early") and float(last["high"]) >= early["sell_level"]:
-                return "sold" if self._early_sell(state, tracker, last, position) else "hold"
-            return "hold"
-        if float(last["low"]) <= early["buy_level"]:
-            if self.entry_refused(state, ts):
-                return "hold"
-            return "bought" if self._early_buy(state, tracker, last) else "hold"
-        return "hold"
-
-    def _plan_early(
-        self, state: AppState, bundle: "dict | None", frame, today, want: int,
-        until: int,
-    ) -> None:
-        """HighLow_3m's 9:33 forecast and the window's two levels, into
-        `self.early` -- or, when it cannot be made, `{"date", "failed"}` and one
-        line saying so.
-
-        The levels are the run's own rule on this forecast: `buy_3m_k` and
-        `sell_3m_k` level units under its predicted high, the unit read off
-        this forecast (`level_unit`) -- its own predicted range under
-        "pred_range", the 14-day ADR under "adr". Fixed for the window: a
-        breach of a forecast two bars old has nothing left to move.
-        """
-        config = self.config
-        model = apple_models.get(apple_models.HIGHLOW3M_KEY)
-        reason = None
-        if bundle is None:
-            reason = apple_models.unavailable_reason(apple_models.HIGHLOW3M_KEY, self.ticker)
-        else:
-            try:
-                opening, _tape = self._opening_window(state, frame, want)
-                # The same placeholder-key rule as the 9:35 forecast's.
-                replayed = bool(getattr(state, "bar_tape_override", ""))
-                forecast, _ = session_forecast(
-                    bundle, self.ticker, opening, today,
-                    key=None if replayed else state.api_key,
-                    secret=None if replayed else state.api_secret,
-                )
-            except Exception as exc:
-                reason = str(exc)
-        if reason is not None:
-            self.early = {"date": today, "failed": reason}
-            _log(state, {"type": "error", "text": (
-                f"{model.label} could not forecast {self.ticker}'s range at 9:33, so "
-                f"nothing is traded before the 9:{30 + until:02d} forecast: {reason}"
-            )})
-            return
-
-        early = {"date": today, "opening_end": opening.index[-1], **forecast}
-        unit = level_unit(config, early)
-        reference = float(early["pred_high"])
-        early.update({
-            "level_unit": unit,
-            "reference": reference,
-            "buy_level": reference - float(config.buy_3m_k) * unit,
-            "sell_level": reference - float(config.sell_3m_k) * unit,
-            "until": until,
-        })
-        self.early = early
-        self._record_early_levels(state, early["opening_end"])
-        run_on = apple_models.get(config.model_key).label
-        _log(state, {"type": "analysis", "text": (
-            f"{self.ticker} {model.label} forecast for the rest of the session after "
-            f"{early['opening_end']:%H:%M}: high ${reference:,.2f}, low "
-            f"${float(early['pred_low']):,.2f} (14-day average range "
-            f"${float(early['adr14_abs']):,.2f}). Until {run_on}'s 9:{30 + until:02d} "
-            f"forecast it buys at ${early['buy_level']:,.2f} (H − {config.buy_3m_k:g} × "
-            f"{config.unit_phrase}) and sells at ${early['sell_level']:,.2f} (H − "
-            f"{config.sell_3m_k:g} × {config.unit_phrase}), with no stop, no momentum "
-            f"confirmation and no take; a position still open then is handed to {run_on}'s "
-            "levels and exits."
-        )})
-
-    def _early_buy(self, state: AppState, tracker: DecisionTracker, bar) -> bool:
-        """Buy at the window's buy level: a limit at it under `limit_entry`, as
-        the 9:35 rules buy."""
-        early, config = self.early, self.config
-        run_on = apple_models.get(config.model_key).label
-        reasoning = (
-            f"HighLow_3m window: the bar traded down to ${float(bar['low']):,.2f}, at or "
-            f"through the ${early['buy_level']:,.2f} buy level — {config.buy_3m_k:g} × the "
-            f"{config.unit_phrase} (${early['level_unit']:,.2f}) below HighLow_3m's 9:33 "
-            f"predicted high of ${early['reference']:,.2f}. Buying before {run_on}'s "
-            f"9:{30 + int(early['until']):02d} forecast; until then the only exit is a "
-            f"resting sell at ${early['sell_level']:,.2f} — no stop, no momentum "
-            "confirmation — and a position still open then is handed to that forecast's "
-            "levels, stop and take."
-        )
-        bought = self.buy(
-            state, tracker, float(bar["close"]), reasoning,
-            limit_price=float(early["buy_level"]) if config.limit_entry else None,
-        )
-        if not bought:
-            self._note_limit_miss(state, "HighLow_3m buy level")
-            return False
-        self.entry.update({
-            "ts": bar.name, "early": True, "fills": 1,
-            "last_fill": float(self.entry["price"]),
-        })
-        return True
-
-    def _early_sell(
-        self, state: AppState, tracker: DecisionTracker, bar, position: float
-    ) -> bool:
-        """Sell the whole position at the window's sell level. Not judged by
-        the circuit breaker: that is a rule about the 9:35 levels, which the
-        window's trade was not made on."""
-        early, config = self.early, self.config
-        entry = self.entry or {}
-        entry_price = float(entry.get("price") or 0.0)
-        price = float(bar["close"])
-        pnl_pct = (price / entry_price - 1) * 100 if entry_price else 0.0
-        reasoning = (
-            f"Target (HighLow_3m window): the bar traded up to ${float(bar['high']):,.2f}, at "
-            f"or through the ${early['sell_level']:,.2f} sell level ({config.sell_3m_k:g} × "
-            f"{config.unit_phrase} under HighLow_3m's ${early['reference']:,.2f} predicted "
-            f"high). Selling at market ({pnl_pct:+.2f}%)."
-        )
-        decision = self.sell(
-            state, tracker, position, reasoning, log_extra={"exit": self.EXIT_EARLY_TARGET}
-        )
-        if decision.status != "filled":
-            return False
-        if self.entry is None and tracker.position_for(self.ticker) > 0:
-            # A partial fill: what is left is still the window's position.
-            self.entry = entry
-        return True
+        """One cycle of an opening window traded before this run's own
+        forecast, or None outside it. The day-range rules trade no window; a
+        subclass that does (`FastFuriousHighLowTrader`) keeps its session state
+        in `self.early` and marks the entries it opens `early`, which
+        `_hand_over` gives to the forecast once it is made and `_drop_early`
+        sells when there is none."""
+        return None
 
     def _hand_over(self, state: AppState, tracker: DecisionTracker, frame) -> None:
         """Give a position the window left open to the forecast just made.
@@ -2524,61 +2199,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             ),
             log_extra={"exit": self.EXIT_EARLY_DROPPED},
         )
-
-    def _record_early_levels(self, state: AppState, ts) -> None:
-        """Add the window's levels on this bar to the session's record, and
-        publish it -- the record `_record_levels` continues from 9:35, so the
-        chart draws the window's buy and sell before the run's own."""
-        early = self.early
-        row = {
-            "t": ts,
-            "model_key": apple_models.HIGHLOW3M_KEY,
-            "buy": float(early["buy_level"]),
-            "sell": float(early["sell_level"]),
-            "stop": None,
-            "reference": float(early["reference"]),
-            "pred_high": float(early["pred_high"]),
-            "pred_low": float(early["pred_low"]),
-        }
-        if "history" not in early:
-            prior = self.slot.levels(state) or {}
-            same_day = (
-                prior.get("rows")
-                and prior.get("ticker") == self.ticker
-                and pd.Timestamp(prior.get("date")) == pd.Timestamp(early["date"])
-            )
-            early["history"] = list(prior["rows"]) if same_day else []
-        history = early["history"]
-        if history and history[-1]["t"] == row["t"]:
-            history[-1] = row
-        elif not history or pd.Timestamp(history[-1]["t"]) < pd.Timestamp(ts):
-            history.append(row)
-        self.slot.publish(state, {
-            "ticker": self.ticker,
-            "date": early["date"],
-            "config": self.config,
-            "rows": history,
-            "memory": self.memory(),
-            "seed": None,
-        })
-
-    def _early_read(self, bar, ts, position: float) -> str:
-        """The window's per-bar line, `_read_summary`'s counterpart."""
-        early = self.early
-        price = float(bar["close"])
-        parts = [
-            f"{self.ticker} {ts:%H:%M} ${price:,.2f}",
-            f"HighLow_3m buy ${early['buy_level']:,.2f} ({price - early['buy_level']:+.2f})",
-            f"sell ${early['sell_level']:,.2f} ({price - early['sell_level']:+.2f})",
-        ]
-        if position > 0 and self.entry:
-            entry_price = float(self.entry["price"])
-            pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
-            parts.append(
-                f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%), no stop until "
-                f"9:{30 + int(early['until']):02d}"
-            )
-        return " · ".join(parts)
 
     def _opening_window(self, state: AppState, frame, want: int):
         return fetch_opening_window(state, frame, want, ticker=self.ticker)
@@ -2845,8 +2465,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     def publish_memory(self, state: AppState) -> None:
         """Refresh `memory` on the published levels after a cycle -- an order
         placed after this cycle's levels were recorded would otherwise reach the
-        session file only a cycle later. Before 9:35 the record is HighLow_3m's
-        window's (`_record_early_levels`), when there is one."""
+        session file only a cycle later. Before 9:35 the record is the opening
+        window's (`FastFuriousHighLowTrader._publish_window`), when there is
+        one."""
         levels = self.slot.levels(state)
         day = (self.plan or self.early or {}).get("date")
         if (
@@ -3428,8 +3049,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         )
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
-        # A forecast of the range *after* the opening window (HighLow_3m's)
-        # says nothing about the window itself, so its own extremes are not a
+        # A forecast of the range *after* the opening window (HighLow2's rest
+        # head) says nothing about the window itself, so its own extremes are not a
         # breach of it: the tape is read from the first bar after the window.
         # Every other forecast covers the whole session and is clipped to
         # contain the window -- the window *as the forecast read it*, which is
@@ -4127,9 +3748,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             )
         else:
             rests = "The levels rest under the predicted high, which is flat all session."
-        # A forecast of the range after the opening window (HighLow_3m's, or
-        # HighLow2's rest head) is not the session's, and says so; HighLow2's
-        # also carries the whole day's pair, which nothing here trades on.
+        # A forecast of the range after the opening window (HighLow2's rest
+        # head) is not the session's, and says so; it also carries the whole
+        # day's pair, which nothing here trades on.
         span = "the session"
         if plan.get("range_after_opening"):
             span = f"the rest of the session after {plan['opening_end']:%H:%M}"
@@ -4839,8 +4460,8 @@ class FastFuriousHighLowTrader(DayRangeTrader):
     forecast -- sat out at 9:35, or one that failed -- sells what the window
     bought (`_drop_early`).
 
-    What the window does not take from the day-range rules, as in HighLow_3m's
-    (`use_3m`): a trade it opens and closes is not judged by the circuit
+    What the window does not take from the day-range rules: a trade it opens
+    and closes is not judged by the circuit
     breaker -- the levels that rule is about do not exist yet -- and a window
     stop does not stop the run, which is Fast&Furious's own rule (a stop under
     HighLow's levels still does). Nor does the window read the momentum
@@ -5168,8 +4789,8 @@ class FastFuriousHighLowTrader(DayRangeTrader):
         self, state: AppState, tracker: DecisionTracker, quantity: float, kind: str,
         reasoning: str,
     ) -> None:
-        """Sell inside the window. Not judged by the circuit breaker, like
-        HighLow_3m's window trades: that rule is about the 9:35 levels."""
+        """Sell inside the window. Not judged by the circuit breaker: that rule
+        is about the 9:35 levels."""
         entry = dict(self.entry or {})
         decision = self.sell(state, tracker, quantity, reasoning, log_extra={"exit": kind})
         if (
@@ -5763,9 +5384,8 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     metadata = bundle.get("metadata") or {}
     # TimeToChange3 files its held-out score as `test_metrics_ensemble`, HighLow
     # and HighLow2 as `test_metrics`; the dollar error is `mae_usd_mean` in all.
-    # HighLow_3m files it as `scores.test.mae_usd`.
     scores = metadata.get("test_metrics_ensemble") or metadata.get("test_metrics") or {}
-    mae = scores.get("mae_usd_mean") or ((metadata.get("scores") or {}).get("test") or {}).get("mae_usd")
+    mae = scores.get("mae_usd_mean")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
     exits = []
     if config.has_stop:
@@ -5835,22 +5455,15 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
         )
     )
     # When the forecast is made, and of what: the window the bundle reads, and
-    # the whole day's extremes or (HighLow_3m, a HighLow2 bundle with a rest
-    # head) those still to come after it.
+    # the whole day's extremes or (a HighLow2 bundle with a rest head) those
+    # still to come after it.
     made = 30 + _dayrange().opening_minutes(bundle)
     extremes = (
         f"the rest of today's {config.ticker} high and low"
-        if bundle.get("kind") == "highlow3m" or bundle.get("rest_head")
+        if bundle.get("rest_head")
         else f"today's {config.ticker} high and low"
     )
-    early = (
-        f" Before that, from 9:33 it trades HighLow_3m's 9:33 forecast of the rest of the "
-        f"session: a buy {config.buy_3m_k:g} × and a sell {config.sell_3m_k:g} × the "
-        f"{config.unit_phrase} below its predicted high, with no stop, no momentum "
-        f"confirmation and no take; a position still open at 9:{made:02d} is handed to "
-        "that forecast's levels and exits."
-        if config.use_3m else ""
-    )
+    early = ""
     window = apple_models.window_key(config.model_key)
     if window:
         exits = []

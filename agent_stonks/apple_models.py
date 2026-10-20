@@ -29,17 +29,9 @@ them:
                      slightly ahead. Its bundle carries `kind="highlow2"` and
                      the forecast comes from `highlow2_model`. INTC's bundle
                      also forecasts the high and low *after* 9:35, and that
-                     pair is the one the trader gets -- marked, like
-                     HighLow_3m's, as starting after the opening window.
-`highlow3m`          HighLow_3m's forecast of a different pair of numbers: the
-                     high and low of the rest of the session *after* 9:33,
-                     called at 9:33 from IEX's first three minutes, the daily
-                     history and last night's option positioning (walls,
-                     dealer gamma, the implied move). Its bundle carries
-                     `kind="highlow3m"` and the forecast comes from
-                     `highlow3m_model`; the range is marked as starting after
-                     the opening window, so the trader measures breaches on
-                     the bars after it.
+                     pair is the one the trader gets -- marked as starting
+                     after the opening window, so the trader measures
+                     breaches on the bars after it.
 `fastfurious`        Fast&Furious's forecast of a different kind of number:
                      the average momentum of the next 30 minutes, made at the
                      close of every minute from 09:31 to 15:30, with a forecast
@@ -170,20 +162,12 @@ HIGHLOW_TICKERS = (
 # pre-market groups.
 HIGHLOW2_TICKERS = (DEFAULT_TICKER, "INTC")
 
-# Which symbols HighLow_3m has saved a bundle for (`highlow3m_<TICKER>.*`):
-# AAPL (saved 2026-10-05). GOOGL, MSFT, AMZN, META and NVDA are processed as its
-# training pool, with their own option tables, but have no model. Adding one is
-# this tuple plus its two files in `Code/Models` and, if its blend reads the
-# option group, the notebook's per-ticker option settings in
-# `highlow3m_model.NOTEBOOK_OPTIONS` (`_build_bundle` refuses it without them).
-HIGHLOW3M_TICKERS = (DEFAULT_TICKER,)
-
 # Which symbols Fast&Furious has saved a bundle for (`fastfurious_<TICKER>.*`):
 # AAPL (fitted through 2026-09-04, saved 2026-10-12). GOOGL, MSFT, AMZN, META
 # and NVDA were processed as a training pool and made the model worse, so none
 # has a model. Adding one is this tuple plus its two files in `Code/Models`,
 # and -- since the stop's range model reads the option tables -- the ticker's
-# entry in `highlow3m_model.NOTEBOOK_OPTIONS`.
+# entry in `option_positioning.NOTEBOOK_OPTIONS`.
 FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
 
 # Which symbols GoodMoments has saved a bundle for (`goodmoments_<TICKER>.*`,
@@ -349,24 +333,6 @@ def _highlow2_path(ticker: str = DEFAULT_TICKER) -> Path:
     return highlow2_model.model_path(ticker)
 
 
-def _load_highlow3m(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The HighLow_3m bundle for one ticker, imported late (LightGBM, and
-    SciPy for the option pricing)."""
-    try:
-        from . import highlow3m_model
-    except ImportError:
-        return None
-    return highlow3m_model.load_bundle(ticker)
-
-
-def _highlow3m_path(ticker: str = DEFAULT_TICKER) -> Path:
-    try:
-        from . import highlow3m_model
-    except ImportError:
-        return Path(f"highlow3m_{(ticker or DEFAULT_TICKER).upper()}.joblib")
-    return highlow3m_model.model_path(ticker)
-
-
 def _load_fastfurious(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """The Fast&Furious bundle for one ticker, imported late (LightGBM)."""
     try:
@@ -446,7 +412,6 @@ DAYRANGE_KEY = "dayrange"
 DAYRANGE_INTRADAY_KEY = "dayrange_intraday"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
-HIGHLOW3M_KEY = "highlow3m"
 FASTFURIOUS_KEY = "fastfurious"
 GOODMOMENTS_KEY = "goodmoments"
 FF_HIGHLOW_KEY = "ff_highlow"
@@ -576,34 +541,6 @@ MODELS: "dict[str, AppleModel]" = {
         load=_load_highlow2,
         path=_highlow2_path,
     ),
-    HIGHLOW3M_KEY: AppleModel(
-        key=HIGHLOW3M_KEY,
-        label="HighLow_3m model",
-        summary=(
-            "FinNotebooks' HighLow_3m forecast of how high and how low the price will "
-            "trade from 9:33 to the close -- the part of the day a 9:33 order can still "
-            "reach, not the whole session's extremes (on about half of AAPL's sessions "
-            "one of those prints in the first three minutes). Called once at 9:33 from "
-            "IEX's first three minutes, the SIP daily history and last night's option "
-            "positioning: the near-term call and put walls, the call gamma wall, dealer "
-            "gamma re-read at the 9:33 price, the options market's implied move and "
-            "put/call volume, with open interest rebuilt from Alpaca's daily option bars. "
-            "LightGBM (three seeds) 0.8 + a linear median regression 0.2, the five other "
-            "mega-caps pooled in. On its 2026 holdout it misses each extreme by 30% of a "
-            "typical day's range, 8.7% less than a 14-day baseline in every month. Only "
-            "the forecast changes: the levels, exits and breach rules are the day-range "
-            "strategy's, and a breach is measured on the bars after 9:33."
-        ),
-        requires=(
-            "LightGBM, SciPy and joblib, and Alpaca credentials for ~150 sessions of SIP "
-            "and IEX minute history, the option contract list and ~4 months of daily "
-            "option bars, plus Yahoo's 13-week T-bill yield"
-        ),
-        strategy=STRATEGY_DAYRANGE,
-        tickers=HIGHLOW3M_TICKERS,
-        load=_load_highlow3m,
-        path=_highlow3m_path,
-    ),
     FASTFURIOUS_KEY: AppleModel(
         key=FASTFURIOUS_KEY,
         label="Fast&Furious model",
@@ -626,7 +563,7 @@ MODELS: "dict[str, AppleModel]" = {
         ),
         requires=(
             "LightGBM, SciPy and joblib, Alpaca credentials for ~200 days of SIP and IEX "
-            "minute bars and today's live ones, and (for the stop) HighLow_3m's option "
+            "minute bars and today's live ones, and (for the stop) last night's option "
             "tables: the contract list, ~4 months of daily option bars and Yahoo's ^IRX"
         ),
         strategy=STRATEGY_MOMENTUM,
@@ -657,7 +594,7 @@ MODELS: "dict[str, AppleModel]" = {
         requires=(
             "LightGBM, SciPy and joblib, the saved model and its time-and-volatility twin, "
             "Alpaca credentials for ~130 days of SIP and IEX minute bars and today's live ones, "
-            "HighLow_3m's option cache (the contract list and daily option bars) and Yahoo's "
+            "the shared option cache (the contract list and daily option bars) and Yahoo's "
             "analyst price targets"
         ),
         strategy=STRATEGY_PROBABILITY,
@@ -684,7 +621,7 @@ MODELS: "dict[str, AppleModel]" = {
         ),
         requires=(
             "everything HighLow and Fast&Furious each require: both bundles, PyTorch, LightGBM, "
-            "SciPy and joblib, Alpaca SIP and IEX minute history, and HighLow_3m's option tables "
+            "SciPy and joblib, Alpaca SIP and IEX minute history, and last night's option tables "
             "for Fast&Furious's stop"
         ),
         strategy=STRATEGY_DAYRANGE,
