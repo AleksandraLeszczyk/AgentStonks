@@ -134,7 +134,6 @@ SHORT_MODEL_NAMES = {
     "highlow2": "HighLow2",
     "fastfurious": "Fast&Furious",
     "goodmoments": "GoodMoments",
-    "ff_highlow": "F&F + HighLow",
 }
 
 
@@ -153,16 +152,13 @@ def racer_label(config_or_key) -> str:
 def all_pairs() -> "list[str]":
     """Every (ticker, model) pair Orchestra can be given, as racer keys: each
     symbol some model covers, with each day-range model it has, in picker
-    order. Fast&Furious drives its own rules (a per-minute signal, no levels),
-    which neither the race nor the 09:34 selection is written for -- and so
-    does Fast&Furious + HighLow before 9:35, whose window would buy ahead of
-    the selection."""
+    order. Fast&Furious and GoodMoments drive their own rules (a per-minute
+    signal, no levels), which neither the race nor the 09:34 selection is
+    written for."""
     return [
         f"{ticker}:{key}"
         for ticker in apple_models.tickers()
-        for key in apple_models.keys_for_strategy(
-            ticker, apple_models.STRATEGY_DAYRANGE, windows=False
-        )
+        for key in apple_models.keys_for_strategy(ticker, apple_models.STRATEGY_DAYRANGE)
     ]
 
 
@@ -210,13 +206,6 @@ class OrchestraConfig:
             raise ValueError(
                 f"Orchestra races the day-range rules, and {racer_label(other[0])} runs its "
                 "own: run it as Apple Trader"
-            )
-        windowed = [r for r in self.racers if apple_models.window_key(r.model_key)]
-        if windowed:
-            raise ValueError(
-                f"Orchestra does not trade an opening window, and {racer_label(windowed[0])} "
-                "buys before 9:35: its pairs are picked at 09:34 and race from their own "
-                "forecasts. Run it as Apple Trader"
             )
         keys = [racer_key(r) for r in self.racers]
         twice = sorted({k for k in keys if keys.count(k) > 1})

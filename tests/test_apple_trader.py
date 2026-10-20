@@ -1138,6 +1138,18 @@ class TestIntradayLevelsRemoved:
             dayrange_config(level_source="vwap")
 
 
+class TestFastFuriousHighLowRemoved:
+    """Fast&Furious + HighLow (Fast&Furious's signal for the opening window,
+    HighLow's levels after it) was removed on 2026-10-20: a stored record naming
+    it is refused, not replayed as HighLow alone."""
+
+    def test_a_record_naming_the_model_is_refused(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record({"model_key": "ff_highlow", "ff_entry_quantile": 0.95})
+        assert "has been removed" in at.model_ticker_error(old)
+
+
 class TestHighLowModel:
     """HighLow changes the forecast and nothing else: the same state machine,
     the same levels arithmetic, fed HighLow's predicted high and range."""
@@ -2643,10 +2655,9 @@ class TestPredictedRangeUnit:
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
         # HighLow_5m and HighLow2_5m have been run on AAPL and INTC, not GOOGL;
-        # Fast&Furious and GoodMoments on AAPL alone, so Fast&Furious +
-        # HighLow exists on AAPL alone too.
+        # Fast&Furious and GoodMoments on AAPL alone.
         assert apple_models.keys_for(TICKER) == [
-            "dayrange", "highlow", "highlow2", "fastfurious", "goodmoments", "ff_highlow",
+            "dayrange", "highlow", "highlow2", "fastfurious", "goodmoments",
         ]
         assert apple_models.keys_for("INTC") == ["dayrange", "highlow", "highlow2"]
         for symbol in (NON_AAPL,):

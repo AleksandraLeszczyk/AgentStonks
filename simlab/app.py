@@ -1811,16 +1811,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Sessions the replay does not trade: no forecast, no order. In the signature as "
             "`skip=...`; a record from before the rule replays with none."
         ),
-        "ff_window": (
-            "The 09:30 to 09:34 bars, traded on Fast&Furious's per-minute forecast before "
-            "HighLow's 9:35 one exists.\n\n"
-            "- A buy at market at or above the entry threshold; Fast&Furious's stop and sell "
-            "signal inside the window only.\n"
-            "- A position still open at 9:35 is handed to HighLow's levels and exits; a trade "
-            "the window closes does not trip the circuit breaker.\n"
-            "- In the signature as `ff=[q=0.95,stop=1.5dn,hold=30m,sellexit]`; the threshold "
-            "and the stop are Tuning-tab axes on this model."
-        ),
         "dayrange_breaker": (
             "When to stop for the day.\n\n"
             "- Its own axis on the Tuning tab, and worth one: it changes how many trades "
@@ -1891,15 +1881,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the Tuning tab.\n\n"
             "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY "
             "/ ALPACA_SECRET), cached under `data/highlow/` — the first replay fetches it."
-        ),
-        "model_ff_highlow": (
-            "HighLow's day-range rules from 9:35, the five minutes before them traded on "
-            "Fast&Furious's buy signal. Compare it against HighLow alone on the same "
-            "datasets: that difference is the window's.\n\n"
-            "- Opens on HighLow's base configuration for the instrument until this model has "
-            "one of its own (Set as base configuration on a tuning job of it).\n"
-            "- Reads both models' inputs from Alpaca as their own runs do (ALPACA_API_KEY / "
-            "ALPACA_SECRET), cached under `data/highlow/` and `data/fastfurious/`."
         ),
         "skip_events": (
             "What a replay can know of each, as of that morning:\n\n"
@@ -4803,10 +4784,10 @@ def _tuning_forecasts(job: dict, chosen: "dict | None" = None) -> dict:
     spec = job["spec"]
     symbol = spec["base"]["ticker"]
     shown = chosen if chosen is not None else (job.get("best") or {}).get("overrides") or {}
-    # The model whose forecast the levels hang off -- HighLow's for Fast&Furious
-    # + HighLow -- which is also whose saved file the cache key reads.
-    model_key = apple_models.forecast_key(
-        model_overlays.trader_model(sim_tuning.make_config(spec["base"], shown), symbol)
+    # The model whose forecast the levels hang off, which is also whose saved
+    # file the cache key reads.
+    model_key = model_overlays.trader_model(
+        sim_tuning.make_config(spec["base"], shown), symbol
     )
     out = {"days": {}, "overlay": None, "notes": []}
     missing: dict[str, str] = {}

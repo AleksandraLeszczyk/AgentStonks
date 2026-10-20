@@ -435,7 +435,6 @@ def dayrange_params(
     )
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
     sell_k = repaired_sell(float(buy_k), float(sell_k))
-    early = window_params(defaults, model_key, ticker, copy, seed)
     rules = rule_params(
         defaults, float(buy_k), float(sell_k), unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
@@ -453,58 +452,8 @@ def dayrange_params(
         level_unit=level_unit,
         min_win_k=min_win_k,
         **sizing,
-        **early,
         **rules,
     )
-
-
-def window_params(
-    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
-    seed: "AppleTraderConfig | None" = None,
-) -> dict:
-    """Fast&Furious's opening window (Fast&Furious + HighLow): the entry
-    threshold, the stop and the sell signal it trades the 09:30 to 09:34 bars
-    on. Drawn only for a model that trades that window.
-
-    Keyed by model and instrument like `momentum_params`' -- the same numbers
-    on Fast&Furious alone are a separate choice. The 30-minute clock is left
-    out: five bars never reach it. Read once, at ▶ Start, so a running agent's
-    configuration for the same pair (`seed`) reopens them on its values.
-    """
-    if apple_models.window_key(model_key) != apple_models.FASTFURIOUS_KEY:
-        return {}
-    section("Fast&Furious window (9:30–9:35)", copy.sections.get("ff_window"))
-    same_pair = (
-        seed is not None
-        and (seed.ticker or "").upper() == ticker
-        and seed.model_key == model_key
-    )
-    start = seed if same_pair else defaults
-    col_a, col_b = st.columns(2)
-    quantile = col_a.number_input(
-        "Entry threshold (quantile of the last 20 sessions)",
-        min_value=0.50, max_value=0.995, value=float(start.ff_entry_quantile), step=0.01,
-        format="%.3f", key=copy.key(f"ff_entry_quantile_{model_key}_{ticker}"),
-        help=copy.help.get("ff_window_entry_quantile") or copy.help.get("ff_entry_quantile"),
-    )
-    stop_k = col_b.number_input(
-        "Stop (× the forecast 2-hour drop, 0 = off)",
-        min_value=0.0, max_value=5.0, value=float(start.ff_stop_k), step=0.25, format="%.2f",
-        key=copy.key(f"ff_stop_k_{model_key}_{ticker}"),
-        help=copy.help.get("ff_window_stop_k") or copy.help.get("ff_stop_k"),
-    )
-    exit_on_sell = st.checkbox(
-        "Sell on a sell signal",
-        value=bool(start.ff_exit_on_sell_signal),
-        key=copy.key(f"ff_exit_on_sell_signal_{model_key}_{ticker}"),
-        help=copy.help.get("ff_window_exit_on_sell_signal")
-        or copy.help.get("ff_exit_on_sell_signal"),
-    )
-    return {
-        "ff_entry_quantile": float(quantile),
-        "ff_stop_k": float(stop_k),
-        "ff_exit_on_sell_signal": bool(exit_on_sell),
-    }
 
 
 def position_params(
