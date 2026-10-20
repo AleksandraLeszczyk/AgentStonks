@@ -41,8 +41,8 @@ On its held-out window (8-18 Sep 2026, 9 sessions) it misses each extreme by
 slightly ahead (the notebook's README: parity with a small edge, not a clear
 win).
 
-**The rest of the session** (INTC's bundle, saved 2026-10-06; AAPL's has no
-such head). A second LightGBM pair, same features, forecasts the high and low
+**The rest of the session** (a bundle may carry it: INTC's, saved 2026-10-06,
+did, and was wired up until 2026-10-20; AAPL's has no such head). A second LightGBM pair, same features, forecasts the high and low
 from the 9:35 bar to the close -- what is still there to trade once the
 forecast exists:
 
@@ -775,7 +775,7 @@ def _build_bundle(path: Path) -> "dict | None":
     those to a `.pt` beside the joblib, so the joblib does not hold them), a
     candidate reading a feature group other than base and pre-market, or a
     target this module cannot decode. A rest-of-session head (`rest` in the
-    joblib, INTC's since 2026-10-06) is held to the same rules: a bundle whose
+    joblib) is held to the same rules: a bundle whose
     rest head cannot be mirrored is refused whole rather than run on its day
     head, since the trader's levels hang off the rest head when there is one.
     """

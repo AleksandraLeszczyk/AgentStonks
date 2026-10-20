@@ -326,9 +326,9 @@ class TestHighLow2Spec:
         assert "MAE (% of ADR)" not in spec.metrics
 
     def test_a_rest_head_is_what_it_describes(self, tmp_path, monkeypatch):
-        """INTC's bundle: its headline is the rest head's (what the trader
-        trades on), said to be that and not comparable with the day rows; the
-        day head's score sits beside it."""
+        """A rest-head bundle (INTC's was one): its headline is the rest head's
+        (what the trader trades on), said to be that and not comparable with
+        the day rows; the day head's score sits beside it."""
         meta = {
             **HIGHLOW2_SIDECAR, "test_metrics": {**HIGHLOW2_SIDECAR["test_metrics"], "mae_adr_mean": 33.79},
             "test_metrics_day": {"mae_adr_mean": 29.53, "mae_usd_mean": 1.18},

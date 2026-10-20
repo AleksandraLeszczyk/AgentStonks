@@ -827,7 +827,7 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         metrics = {"MAE (% of ADR)": error_pct, **metrics}
     for window, change in (meta.get("walk_forward_vs_highlow5m") or {}).items():
         metrics[f"walk-forward vs HighLow_5m · {window}"] = change
-    # A bundle with a rest-of-session head (INTC's) hands the trader that head's
+    # A bundle with a rest-of-session head hands the trader that head's
     # forecast, so its `test_metrics` are the rest head's, against the extremes
     # after 9:35; the day head's sit beside them.
     rest = bool(meta.get("rest_head"))

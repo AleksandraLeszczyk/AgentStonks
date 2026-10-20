@@ -282,7 +282,7 @@ APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
 # (buy_k, sell_k) per instrument -- see the day-range block above. Since
 # 2026-09-26 only the fallback for a (model, instrument) pair with no SimLab
-# tuning pick below: today that is HighLow2 on INTC.
+# tuning pick below; no shipped pair falls back to it today.
 APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
     "AAPL": (0.40, 0.25),
     "GOOGL": (0.65, 0.05),

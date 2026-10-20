@@ -1273,7 +1273,7 @@ class TestHighLow2Model(TestHighLowModel):
 
 
 class TestHighLow2RestHead:
-    """A HighLow2 bundle with a rest-of-session head (INTC's) hands the trader
+    """A HighLow2 bundle with a rest-of-session head (INTC's had one) hands the trader
     the range after 9:35 as `pred_high` / `pred_low`: the reference high and
     the predicted-range unit are that range's, and the window's own extremes
     are not a breach of it."""
@@ -1336,9 +1336,9 @@ class TestHighLow2RestHead:
         plan = next(e["text"] for e in state.agent_log if "forecast for" in (e.get("text") or ""))
         assert "forecast for the rest of the session after 09:34" in plan
         assert "high $110.00, low $106.00; the whole day's: high $112.00, low $104.00" in plan
-        armed = at._armed_summary(AppleTraderConfig(ticker="INTC", model_key="highlow2"),
+        armed = at._armed_summary(AppleTraderConfig(model_key="highlow2"),
                                   apple_models.get("highlow2"), self.BUNDLE)
-        assert "at 9:35 it forecasts where the rest of today's INTC high and low" in armed
+        assert "at 9:35 it forecasts where the rest of today's AAPL high and low" in armed
 
     def test_a_day_only_bundle_logs_the_session(self, state, market_open, monkeypatch):
         day = {k: v for k, v in self.FORECAST.items()
@@ -2066,13 +2066,15 @@ class TestDayRangeLevelDefaults:
         """The same distance is a different price under a different forecast."""
         assert at.dayrange_levels("AAPL", "dayrange") != at.dayrange_levels("AAPL", "highlow")
 
-    def test_a_pair_never_tuned_falls_back_to_the_instruments_sweep(self):
-        # HighLow2 on INTC has no tuning pick.
-        assert ("highlow2", "INTC") not in at.APPLE_TRADER_TUNED_LEVELS
-        assert (
-            at.dayrange_levels("INTC", "highlow2", use_base=False)
-            == at.APPLE_TRADER_DAYRANGE_LEVELS["INTC"]
-        )
+    def test_a_pair_never_tuned_falls_back_to_the_instruments_sweep(self, monkeypatch):
+        # Every shipped pair on a swept instrument has a tuning pick today, so
+        # the picks are taken away to see what an untuned one starts from.
+        monkeypatch.setattr(at, "APPLE_TRADER_TUNED_LEVELS", {})
+        for ticker in apple_models.DAYRANGE_TICKERS:
+            assert (
+                at.dayrange_levels(ticker, "dayrange", use_base=False)
+                == at.APPLE_TRADER_DAYRANGE_LEVELS[ticker]
+            )
 
     def test_every_ticker_the_model_is_wired_up_for_has_a_pair(self):
         assert set(apple_models.DAYRANGE_TICKERS) <= set(at.APPLE_TRADER_DAYRANGE_LEVELS)
@@ -2654,12 +2656,12 @@ class TestPredictedRangeUnit:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        # HighLow_5m and HighLow2_5m have been run on AAPL and INTC, not GOOGL;
-        # Fast&Furious and GoodMoments on AAPL alone.
+        # HighLow_5m has been run on AAPL and INTC, not GOOGL; HighLow2_5m (its
+        # INTC bundle removed 2026-10-20), Fast&Furious and GoodMoments on AAPL alone.
         assert apple_models.keys_for(TICKER) == [
             "dayrange", "highlow", "highlow2", "fastfurious", "goodmoments",
         ]
-        assert apple_models.keys_for("INTC") == ["dayrange", "highlow", "highlow2"]
+        assert apple_models.keys_for("INTC") == ["dayrange", "highlow"]
         for symbol in (NON_AAPL,):
             assert apple_models.keys_for(symbol) == ["dayrange"]
         assert apple_models.keys_for(UNMODELLED) == []

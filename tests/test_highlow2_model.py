@@ -204,7 +204,9 @@ def _bundle(path="synthetic"):
 class TestRegistry:
     def test_highlow2_is_offered_where_a_bundle_was_saved(self):
         assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("AAPL")
-        assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("INTC")
+        # INTC's bundle (the one with a rest head) is unwired since 2026-10-20;
+        # its files stay, and the mirror tests below still load it directly.
+        assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("INTC")
         assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("MU")
 
     def test_it_drives_the_day_range_rules(self):

@@ -829,7 +829,7 @@ def highlow2_training_from_metadata(meta: dict) -> dict:
         f"the {str(window[0])[:10]} – {str(window[-1])[:10]} test window, shock days left out"
         if len(window) == 2 else "the held-out test window"
     )
-    # With a rest-of-session head (INTC's) `test_metrics` are that head's --
+    # With a rest-of-session head `test_metrics` are that head's --
     # the forecast Drift scores -- against the extremes from the 9:35 bar on.
     against = (
         "against the SIP minute bars' extremes from 9:35 on (the rest-of-session head)"
@@ -1274,9 +1274,7 @@ MODELS: "dict[str, DriftModel]" = {
             "every stored session with its opening minutes — scored like the two models above. "
             "Fitted through the session before its test window, so every session from that "
             "window on is one it never saw. Shock days are scored too, though it was fitted "
-            "without them: expect its worst sessions to be the day after earnings. On INTC "
-            "the forecast is its rest-of-session head's (the one Apple Trader trades on), "
-            "scored against the session's high and low from 9:35 on."
+            "without them: expect its worst sessions to be the day after earnings."
         ),
         tickers=apple_models.HIGHLOW2_TICKERS,
         needs_minute_bars=True,
@@ -1287,8 +1285,8 @@ MODELS: "dict[str, DriftModel]" = {
         catalogue_metric=(
             "MAE (% of ADR) — the same quantity the ML Models tab reports, each session's "
             "dollar miss over its own average daily range; on later sessions instead of the "
-            "test window, against the stored daily bar rather than the SIP minute extremes "
-            "(on INTC, the stored session's extremes from 9:35 on), and with shock days in"
+            "test window, against the stored daily bar rather than the SIP minute extremes, "
+            "and with shock days in"
         ),
     ),
     "intraday_vol": DriftModel(

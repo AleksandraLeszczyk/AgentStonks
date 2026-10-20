@@ -3141,10 +3141,6 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "model_highlow2": (
             "The day-range rules, unchanged, on HighLow2's predicted high and predicted "
             "range.\n\n"
-            "- On **INTC** those are its forecast of the high and low **after 9:35** (the "
-            "9:35 bar to the close), not the whole day's: the first five minutes' extremes "
-            "are out of reach by then, so a breach is read on the bars after 9:35. AAPL's "
-            "bundle has no such head and forecasts the day.\n"
             "- It reads this morning from **IEX** — the first five minutes and the open "
             "— plus the pre-market (SIP to 09:19, IEX to 09:29) and last evening's "
             "after-hours, so the stream's feed does not change its forecast.\n"

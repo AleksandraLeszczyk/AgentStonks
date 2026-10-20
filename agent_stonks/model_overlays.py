@@ -228,10 +228,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         summary=(
             "HighLow2's forecast of the session's high and low, made once at 9:35 from "
             "IEX's first five minutes and the pre-market. Drawn like the other ranges: "
-            "flat while the session stays inside it, stepped once it trades outside. "
-            "On INTC it is the forecast of the high and low *after* 9:35 -- the pair "
-            "Apple Trader's levels hang off there -- so the first five minutes can sit "
-            "outside it and are not a breach of it."
+            "flat while the session stays inside it, stepped once it trades outside."
         ),
         requires=(
             "LightGBM, the HighLow2 bundle and Alpaca SIP and IEX minute history "

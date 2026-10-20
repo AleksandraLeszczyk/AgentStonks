@@ -206,7 +206,7 @@ class TestHighLow2Training:
         assert dr.highlow2_training_from_metadata({}) == {"cutoffs": [], "references": []}
 
     def test_a_rest_heads_references_say_what_they_were_scored_against(self):
-        """INTC's `test_metrics` are its rest head's, against the extremes after 9:35."""
+        """A rest head's `test_metrics` are its own, against the extremes after 9:35."""
         rest = dr.highlow2_training_from_metadata({**HIGHLOW2_META, "rest_head": {"models": []}})
         assert all("from 9:35 on" in r.note for r in rest["references"])
         day = dr.highlow2_training_from_metadata(HIGHLOW2_META)
@@ -428,7 +428,7 @@ class TestHighLow2:
         assert result["rows"] == [] and "HighLow2" in result["notes"][0]
 
     def test_a_rest_head_is_scored_against_the_session_after_935(self, store, stubbed, monkeypatch):
-        """INTC's forecast is the rest of the session's: the stored bars from
+        """A rest head's forecast is the rest of the session's: the stored bars from
         the 9:35 bar on (highs to 101.26, lows to 100.76), not the daily bar's."""
         monkeypatch.setattr(
             dr.apple_models, "load",

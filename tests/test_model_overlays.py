@@ -1007,12 +1007,12 @@ class TestHighLow2Overlay:
 
     def test_a_highlow2_run_opens_showing_its_range(self):
         assert mo.for_models([apple_models.HIGHLOW2_KEY], "AAPL")["keys"] == [mo.HIGHLOW2_RANGE_KEY]
-        assert mo.for_models([apple_models.HIGHLOW2_KEY], "INTC")["keys"] == [mo.HIGHLOW2_RANGE_KEY]
         assert mo.HIGHLOW2_RANGE_KEY not in mo.keys_for("MU")
 
     def test_a_rest_of_session_forecast_is_drawn_as_one(self, monkeypatch, stubbed):
-        """INTC's bundle hands over the range after 9:35: the same two levels,
-        labelled as what they are, and the agent's levels under its high."""
+        """A bundle with a rest head (INTC's had one) hands over the range after
+        9:35: the same two levels, labelled as what they are, and the agent's
+        levels under its high."""
         hl2 = pytest.importorskip("agent_stonks.highlow2_model")
         base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 205.0, "or_low": 199.0}
         monkeypatch.setattr(hl2, "forecast_session", lambda *a, **k: {
@@ -1023,10 +1023,10 @@ class TestHighLow2Overlay:
         from agent_stonks.config import UNIT_ADR
 
         config = AppleTraderConfig(
-            ticker="INTC", model_key="highlow2", buy_k=0.75, sell_k=0.10, breach_update="off",
+            ticker="AAPL", model_key="highlow2", buy_k=0.75, sell_k=0.10, breach_update="off",
             level_unit=UNIT_ADR, contain_range=False,
         )
-        items = mo.compute([mo.HIGHLOW2_RANGE_KEY, mo.TRADER_LEVELS_KEY], "INTC", minute_bars(),
+        items = mo.compute([mo.HIGHLOW2_RANGE_KEY, mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION, trader_config=config)["items"]
         mine = [i for i in items if i["key"] == mo.HIGHLOW2_RANGE_KEY]
         levels = {i["label"]: i for i in mine if i["kind"] == "level"}

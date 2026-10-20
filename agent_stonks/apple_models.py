@@ -22,11 +22,11 @@ models, the first three of which share a rule set:
                      pre-market as an input, shock days out of training, five
                      mega-caps pooled in. Level with HighLow on its test window,
                      slightly ahead. Its bundle carries `kind="highlow2"` and
-                     the forecast comes from `highlow2_model`. INTC's bundle
-                     also forecasts the high and low *after* 9:35, and that
-                     pair is the one the trader gets -- marked as starting
-                     after the opening window, so the trader measures
-                     breaches on the bars after it.
+                     the forecast comes from `highlow2_model`. A bundle with
+                     a rest-of-session head (INTC's had one; none ships now)
+                     hands the trader the high and low *after* 9:35 instead,
+                     marked as starting after the opening window, so the
+                     trader measures breaches on the bars after it.
 `fastfurious`        Fast&Furious's forecast of a different kind of number:
                      the average momentum of the next 30 minutes, made at the
                      close of every minute from 09:31 to 15:30, with a forecast
@@ -127,16 +127,16 @@ HIGHLOW_TICKERS = (
     DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO",
 )
 
-# Which symbols HighLow2_5m has saved a bundle for (`highlow2_5m_<TICKER>.*`):
-# AAPL (saved 2026-10-04) and INTC (2026-10-06, AAPL's recipe with ten stocks
-# pooled in, plus a rest-of-session head: the high and low from 9:35 to the
-# close, which `highlow2_model.forecast_from` hands the trader in place of the
-# day's). The notebook has processed GOOGL, MSFT, AMZN, META, NVDA, AMD, MU,
-# AVGO and QCOM as training pools, but fitted no model of their own. Adding one
-# is this tuple plus its two files in `Code/Models` -- `_build_bundle` refuses a
-# bundle whose shipped blend (either head) reads anything but the base and
-# pre-market groups.
-HIGHLOW2_TICKERS = (DEFAULT_TICKER, "INTC")
+# Which symbols HighLow2_5m is wired up for (`highlow2_5m_<TICKER>.*`): AAPL
+# (saved 2026-10-04). INTC's bundle (2026-10-06, with a rest-of-session head:
+# the high and low from 9:35 to the close, which `highlow2_model.forecast_from`
+# hands the trader in place of the day's) was wired up until 2026-10-20 and
+# removed at the user's request; its files stay in `Code/Models`. The notebook
+# has processed GOOGL, MSFT, AMZN, META, NVDA, AMD, MU, AVGO and QCOM as training
+# pools, but fitted no model of their own. Adding one is this tuple plus its two
+# files in `Code/Models` -- `_build_bundle` refuses a bundle whose shipped blend
+# (either head) reads anything but the base and pre-market groups.
+HIGHLOW2_TICKERS = (DEFAULT_TICKER,)
 
 # Which symbols Fast&Furious has saved a bundle for (`fastfurious_<TICKER>.*`):
 # AAPL (fitted through 2026-09-04, saved 2026-10-12). GOOGL, MSFT, AMZN, META
@@ -368,16 +368,11 @@ MODELS: "dict[str, AppleModel]" = {
             "from IEX, the only live tape at 9:35 on a basic plan; the pre-market as an "
             "input (SIP to 09:19, IEX to 09:29, last evening's after-hours); shock days "
             "(the day after earnings, jobs reports, geopolitical shocks) left out of "
-            "training; and similar stocks pooled in as training rows (five mega-caps for "
-            "AAPL, those plus AAPL and four chip stocks for INTC). LightGBM alone, three "
-            "seeds. On AAPL's 9-session test window it misses each extreme by $1.17 "
-            "(15.8% of the 14-day range), level with HighLow and slightly ahead. INTC's "
-            "bundle also forecasts the high and low still to come from 9:35 to the close "
-            "(on about a quarter of INTC's sessions one of the day's extremes is already "
-            "in by then), and on INTC that is the pair the levels are built on: the "
-            "reference high and the predicted range are the rest of the session's, and a "
-            "breach is read on the bars after 9:35. Only the forecast changes: the "
-            "levels, exits and breach rules are the day-range strategy's."
+            "training; and five similar mega-caps pooled in as training rows. LightGBM "
+            "alone, three seeds. On AAPL's 9-session test window it misses each extreme by "
+            "$1.17 (15.8% of the 14-day range), level with HighLow and slightly ahead. "
+            "Only the forecast changes: the levels, exits and breach rules are the "
+            "day-range strategy's."
         ),
         requires=(
             "LightGBM and joblib, and Alpaca credentials for ~150 sessions of SIP and IEX "
