@@ -61,6 +61,10 @@ session's own SIP and IEX minute bars are read whole from its cache
 back and IEX through the bar -- the live view of that minute -- so a replay of
 any dataset forecasts from the tape the model was fitted on, not the dataset's.
 Only a session that is today on the real clock is fetched live.
+``goodmoments_model`` reads the same two tapes the same way (sharing that
+cache), last night's option table from HighLow_3m's option cache, cut at the
+previous close, and Yahoo's analyst table filtered to the notes stamped before
+each bar's close.
 
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead

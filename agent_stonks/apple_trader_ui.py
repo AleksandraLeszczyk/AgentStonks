@@ -143,7 +143,80 @@ def params(
     copy = replace(copy, suffix=base_configs.key_suffix(based_on, ticker) if based_on else "")
     if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
         return momentum_params(defaults, model_key, ticker, copy)
+    if apple_models.strategy(model_key) == apple_models.STRATEGY_PROBABILITY:
+        return probability_params(defaults, model_key, ticker, copy)
     return dayrange_params(defaults, model_key, ticker, copy, seed)
+
+
+def probability_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
+) -> AppleTraderConfig:
+    """GoodMoments' rules: the edge a buy needs, the take and the stop in ADRs,
+    and the optional sale on a fading edge -- notebook 4's pick by default.
+
+    Keyed by model and instrument like Fast&Furious's, and read once, at
+    ▶ Start. The size is the day-range form's own widget, so one number is the
+    position size whichever model is picked.
+    """
+    section("Signal", copy.sections.get("probability"))
+    col_a, col_b = st.columns(2)
+    enter = col_a.number_input(
+        "Entry: edge at least",
+        min_value=-0.20, max_value=0.30, value=float(defaults.gm_enter), step=0.01, format="%.3f",
+        key=copy.key(f"gm_enter_{model_key}_{ticker}"),
+        help=copy.help.get("gm_enter"),
+    )
+    position_pct = col_b.number_input(
+        "Position size (% of cash)",
+        min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
+        key=copy.key("dayrange_size"),
+        help=copy.help.get("position_pct"),
+    )
+    take_k = col_a.number_input(
+        "Take-profit (ADR over the fill, 0 = off)",
+        min_value=0.0, max_value=2.0, value=float(defaults.gm_take_k), step=0.05, format="%.2f",
+        key=copy.key(f"gm_take_k_{model_key}_{ticker}"),
+        help=copy.help.get("gm_take_k"),
+    )
+    stop_k = col_b.number_input(
+        "Stop (ADR under the fill, 0 = off)",
+        min_value=0.0, max_value=3.0, value=float(defaults.gm_stop_k), step=0.05, format="%.2f",
+        key=copy.key(f"gm_stop_k_{model_key}_{ticker}"),
+        help=copy.help.get("gm_stop_k"),
+    )
+    exit_on = col_a.checkbox(
+        "Sell when the edge fades",
+        value=defaults.gm_exit is not None,
+        key=copy.key(f"gm_exit_on_{model_key}_{ticker}"),
+        help=copy.help.get("gm_exit"),
+    )
+    exit_value = col_b.number_input(
+        "…under this edge",
+        min_value=-0.30, max_value=0.30,
+        value=float(defaults.gm_exit if defaults.gm_exit is not None else 0.0),
+        step=0.01, format="%.3f", disabled=not exit_on,
+        key=copy.key(f"gm_exit_{model_key}_{ticker}"),
+        help=copy.help.get("gm_exit"),
+    )
+    gm_exit = float(exit_value) if exit_on else None
+    if gm_exit is not None and gm_exit >= float(enter):
+        st.warning(
+            f"The exit ({gm_exit:+.3f}) has to sit below the entry ({float(enter):+.3f}), or every "
+            "buy would be sold on the next bar: the sale on a fading edge is off until it does."
+        )
+        gm_exit = None
+    skip_events = skip_param(defaults, copy)
+    return replace(
+        defaults,
+        model_key=model_key,
+        ticker=ticker,
+        position_pct=float(position_pct),
+        gm_enter=float(enter),
+        gm_exit=gm_exit,
+        gm_take_k=float(take_k),
+        gm_stop_k=float(stop_k),
+        skip_events=skip_events,
+    )
 
 
 def momentum_params(

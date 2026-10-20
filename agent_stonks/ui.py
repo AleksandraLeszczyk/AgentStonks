@@ -1018,8 +1018,9 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
             running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
             config = running.get("config") or getattr(state, "apple_trader_config", None)
         name = _personality_label(personality).split(" (")[0]
-        # Fast&Furious reads its own forecast, not the tape's N-bar momentum.
-        day_range = getattr(config, "strategy", None) != apple_models.STRATEGY_MOMENTUM
+        # Fast&Furious and GoodMoments read their own forecasts, not the tape's
+        # N-bar momentum.
+        day_range = getattr(config, "strategy", None) == apple_models.STRATEGY_DAYRANGE
         confirm = int(getattr(config, "momentum_confirmation_bars", 0) or 0) if day_range else 0
         if confirm:
             return confirm, name
@@ -3025,6 +3026,19 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "$10,000 a trade after 1 bp a side — and in the notebook's own words, no edge "
             "out of sample that luck does not also produce."
         ),
+        "probability": (
+            "At the close of every bar the model says how likely it is that a later bar today "
+            "trades **0.2 ADR above** this one's close, and the same trees say it again from the "
+            "clock and today's volatility alone. The rules trade the difference, the **edge** — "
+            "no levels.\n\n"
+            "- **Buy** — at market when the edge is at least the entry below, until 15:30.\n"
+            "- **Sell** — at the take-profit, at the stop (then no entry for 15 minutes), on a "
+            "fading edge if that is switched on, or at the closing flatten.\n\n"
+            "Notebook 4's chosen system. Its record at $10,000 a trade after 1 bp a side: "
+            "+$1,443 on July–December 2025 (where it was chosen), +$496 on 2026 to 16 October "
+            "(349 trades, 68% winners) — inside the placebo spread, and holding AAPL made almost "
+            "four times as much."
+        ),
     },
     help={
         "model_fastfurious": (
@@ -3074,6 +3088,55 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "this ledger only holds longs, so it closes).\n"
             "- **Off** is its long-only variant: a long leaves only on the clock, the stop "
             "or the flatten."
+        ),
+        "model_goodmoments": (
+            "A different strategy from the range models: no levels, a forecast every minute.\n\n"
+            "- It reads today's session as the basic plan shows it: **SIP up to 15 minutes ago "
+            "and IEX since** (IEX volume scaled to SIP's), fetched from Alpaca every minute "
+            "whatever the stream's feed. The notebook read SIP to the minute, so the forecasts "
+            "differ a little — most in the 15-minute relative volume.\n"
+            "- It also reads last night's option table (rebuilt from HighLow_3m's shared option "
+            "cache under `data/highlow3m/`, priced the notebook's way, cached under "
+            "`data/goodmoments/`) and Yahoo's analyst price targets (refreshed hourly).\n"
+            "- At ▶ Start it needs ~130 days of SIP and IEX minute bars (shared with "
+            "Fast&Furious under `data/fastfurious/`) — fetched in the background when the "
+            "agent is started before the open.\n"
+            "- A stop does **not** end the day: entries pause for 15 minutes, as in the "
+            "notebook.\n"
+            "- The edge is measured against a time-and-volatility model the notebook did not "
+            "save; it was refitted with the notebook's exact recipe "
+            "(`GoodMoments/scripts/export_timevol.py`)."
+        ),
+        "gm_enter": (
+            "How much likelier than the clock and volatility alone the model has to see the "
+            "+0.2 ADR rise before buying, in probability points.\n\n"
+            "- **0.02** (the notebook's pick) — chosen on July–December 2025 among 0.02–0.10; "
+            "it buys about one and a half times a day.\n"
+            "- Higher trades less often; the notebook found the result did not hang on this "
+            "corner of its grid."
+        ),
+        "gm_take_k": (
+            "Sell when a bar reaches this far over the fill, in ADRs (today's 14-session mean "
+            "range).\n\n"
+            "- **0.2** is the model's own question — two thirds of the notebook's test trades "
+            "ended here, most within half an hour.\n"
+            "- Checked on each closed bar's high and sold at market after it, so expect a "
+            "slightly worse fill than the notebook's resting order.\n"
+            "- **0** switches it off."
+        ),
+        "gm_stop_k": (
+            "Sell when a bar reaches this far under the fill, in ADRs.\n\n"
+            "- **0.75** is the notebook's pick (among 0.2, 0.3, 0.5 and 0.75). Tight stops "
+            "(0.2–0.5) sat in the noise; from 0.75 on the result barely changed, and what the "
+            "stop bought was a smaller worst drawdown.\n"
+            "- After a stop no new entry for 15 minutes.\n"
+            "- **0** switches it off."
+        ),
+        "gm_exit": (
+            "Also sell when the edge falls under this number.\n\n"
+            "- **Off** is the notebook's pick: what neither the take nor the stop closes is "
+            "held to the close.\n"
+            "- It has to sit below the entry."
         ),
         "model_dayrange": (
             "The levels hang off the predicted high — one number for the whole session. "
@@ -3486,8 +3549,10 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
         config = apple_trader_ui.params(symbols, _APPLE_TRADER_COPY, seed=seed)
         if running.get("config") is not None:
             st.caption(
-                "Every setting takes effect on ▶ Start: a Fast&Furious run reads its rules once."
-                if getattr(running["config"], "strategy", None) == apple_models.STRATEGY_MOMENTUM
+                f"Every setting takes effect on ▶ Start: a "
+                f"{apple_models.get(running['config'].model_key).label.replace(' model', '')} run "
+                "reads its rules once."
+                if getattr(running["config"], "strategy", None) != apple_models.STRATEGY_DAYRANGE
                 else "The running agent picks up a change to the model or to the buy or "
                 "sell distance at its next bar. Every other setting takes effect on "
                 "▶ Start."

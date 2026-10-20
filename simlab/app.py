@@ -342,6 +342,8 @@ def _render_apple_rules() -> None:
                     continue
                 if bundle.get("kind") == "fastfurious":
                     _render_fastfurious_bundle(bundle)
+                elif bundle.get("kind") == "goodmoments":
+                    _render_goodmoments_bundle(bundle)
                 else:
                     _render_dayrange_bundle(bundle)
 
@@ -363,6 +365,26 @@ def _render_fastfurious_bundle(bundle: dict) -> None:
     )
     st.json({"walk_forward_scores": scores, "momentum_features": metadata.get("momentum_features"),
              "range_features": metadata.get("range_features")}, expanded=False)
+
+
+def _render_goodmoments_bundle(bundle: dict) -> None:
+    """GoodMoments' provenance: classification scores on its test window -- it
+    forecasts a probability, not a price."""
+    metadata = bundle.get("metadata") or {}
+    scores = metadata.get("test_scores") or {}
+    cols = st.columns(4)
+    cols[0].metric("Fitted through", str((metadata.get("fit_window") or ["?"])[-1]))
+    cols[1].metric("Test AUC", f"{scores.get('auc', float('nan')):.3f}")
+    cols[2].metric("AUC within 30 min", f"{scores.get('auc_30min', float('nan')):.3f}")
+    cols[3].metric("Test log loss", f"{scores.get('logloss', float('nan')):.4f}")
+    st.caption(
+        "Walk-forward on 1 Jan – 16 Oct 2026 (199 sessions). AUC within 30 min is the mean AUC "
+        "inside each half hour: the skill beyond the time of day. The rules trade the edge over "
+        "the time-and-volatility twin (`" + Path(str(bundle.get("path", ""))).stem + "_timevol`), "
+        f"which reads {', '.join(bundle.get('timevol_features') or [])}."
+    )
+    st.json({"test_scores": scores, "features": bundle.get("features"),
+             "params": metadata.get("params")}, expanded=False)
 
 
 def _render_dayrange_bundle(bundle: dict) -> None:
@@ -1834,6 +1856,17 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "made +$116 on 2026 to 4 September and +$191 on the test month at $10,000 a "
             "trade — inside what luck alone makes, by the notebook's placebo."
         ),
+        "probability": (
+            "GoodMoments' rules: at every bar the chance of a +0.2 ADR rise before the close, "
+            "against the same trees' chance on the clock and volatility alone — bought when "
+            "the difference (the edge) is large enough.\n\n"
+            "- **Entry** — the edge a buy needs; **take** / **stop** — in ADRs over and under "
+            "the fill; **sell when the edge fades** — off in the notebook's pick.\n"
+            "- In the signature as `enter=+0.02,exit=off,take=0.2A,stop=0.75A`; the day-range "
+            "fields are not, since nothing reads them under this model.\n"
+            "- The defaults are notebook 4's design 2, chosen on July–December 2025: +$496 on "
+            "199 test sessions at $10,000 a trade, inside the placebo spread."
+        ),
     },
     help={
         "model_fastfurious": (
@@ -1850,6 +1883,20 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "tape: on a yfinance dataset a stop is checked on yfinance's lows.\n"
             "- A stop does not end the session: the next buy waits until the forecast has "
             "left the buy zone, as in the notebook."
+        ),
+        "model_goodmoments": (
+            "Its own rules, not the day-range levels: a buy when the model's probability of a "
+            "+0.2 ADR rise before the close is at least 2 points over the time-and-volatility "
+            "model's, a take at +0.2 ADR, a stop at −0.75 ADR, otherwise held to the close.\n\n"
+            "- Reads every input from Alpaca, whatever the dataset's tape: ~130 days of SIP and "
+            "IEX minute bars before each replayed day and the day's own, cut at each minute to "
+            "SIP 15 minutes back and IEX since (ALPACA_API_KEY / ALPACA_SECRET), cached under "
+            "`data/fastfurious/` (shared with Fast&Furious); last night's option table from "
+            "HighLow_3m's option cache, priced the notebook's way (`data/goodmoments/`); "
+            "Yahoo's analyst price targets as stamped before each bar.\n"
+            "- The trades are the dataset's tape and fills, the forecast the model's own tape: "
+            "on a yfinance dataset the take and the stop are checked on yfinance's bars.\n"
+            "- A stop does not end the session: entries pause 15 minutes, as in the notebook."
         ),
         "model_dayrange": (
             "The predicted high, flat for the session — what the shipped buy/sell "

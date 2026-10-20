@@ -854,6 +854,37 @@ APPLE_TRADER_FF_ENTRY_QUANTILE = 0.95
 APPLE_TRADER_FF_STOP_K = 1.5
 APPLE_TRADER_FF_HOLD_MINUTES = 30
 APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL = True
+# GoodMoments (`apple_models.GOODMOMENTS_KEY`, `apple_trader.GoodMomentsTrader`):
+# at the close of every bar, the model's probability that a later bar of the
+# session trades 0.2 ADR above this close, beside the same trees' probability on
+# the clock and today's volatility alone. Notebook 4's chosen system ("design
+# 2") trades the difference, the *edge* -- picked on July-December 2025 as the
+# best Sharpe of daily P&L among 160 candidates with at least 100 trades:
+#
+#   * enter at market when the edge is at least ENTER, up to the 15:30 bar
+#     (LAST_ENTRY_MINUTE), never within COOLDOWN_BARS bars of a stop;
+#   * a take-profit TAKE_K x ADR over the fill (the question's own +0.2 ADR)
+#     and a stop STOP_K x ADR under it, from the fill on (a bar touching both
+#     is a stop);
+#   * no exit on the signal (EXIT None: an edge below it would sell);
+#     otherwise held to the closing flatten.
+#
+# Notebook 4, $10,000 a trade, 1 bp a side:
+#
+#   window                        trades  win   net bps/trade  net P&L
+#   Jul-Dec 2025 (chosen on)        189   71%        7.6        +1,443
+#   1 Jan - 16 Oct 2026 (test)      349   68%        1.4          +496
+#
+# Its verdict: out of sample the timing beats two thirds of placebos and no
+# more, and holding AAPL every session made almost four times as much. Its
+# first design (a threshold on the probability itself) lost on the test. Not
+# tuned on this app's tape.
+APPLE_TRADER_GM_ENTER = 0.02
+APPLE_TRADER_GM_EXIT = None
+APPLE_TRADER_GM_TAKE_K = 0.2
+APPLE_TRADER_GM_STOP_K = 0.75
+APPLE_TRADER_GM_LAST_ENTRY_MINUTE = 360
+APPLE_TRADER_GM_COOLDOWN_BARS = 15
 # Flatten this many minutes before the close: the day-range forecast is a
 # statement about one session, and the momentum regime does not survive the
 # overnight gap either.
@@ -939,6 +970,10 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     # Its momentum forecast line, drawn over the momentum panel's green and red
     # bars, so neither: yellow.
     "fastfurious_forecast": "#facc15",
+    # GoodMoments' edge line, its entry threshold and its buy markers: lime,
+    # away from the day-range blues, Fast&Furious's green and yellow and the
+    # fuchsia of yesterday's profile lines.
+    "goodmoments": "#bef264",
 }
 
 # Alpha for the semi-transparent backgrounds overlays paint behind the candles.

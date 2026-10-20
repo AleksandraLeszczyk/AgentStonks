@@ -165,23 +165,44 @@ AMGN_FORECASTS = {
     "2026-09-21": (389.4237039651446, 381.9, 8.386135714285725),
     "2026-10-02": (410.37488841594006, 403.6907271953926, 9.217857142857156),
 }
+# TMO, saved 2026-10-20 on the same recipe (0.25 LightGBM + 0.25 N-BEATS +
+# 0.5 N-HiTS), reading only its theme on SIP peers DHR (lead), A and WAT.
+# Sessions are kept from 260 bars: 2024-08-26 is the thinnest (263) and 08-27
+# reads it as yesterday. The peers' NYSE auctions can print after 09:34 (WAT's
+# on 2024-08-05 at 09:37): that session keeps its daily row, so 08-06 reads it
+# as WAT's yesterday. 2023-07-10 is the panel's first row; 2025-10-22,
+# 2026-04-23 and 2026-07-23 are results mornings (reported before the open).
+TMO_FORECASTS = {
+    "2023-07-10": (515.9247098736593, 509.2242493520411, 10.40127857142858),
+    "2024-08-06": (606.1987423648346, 595.7892143400339, 15.9255),
+    "2024-08-26": (607.8336931248272, 601.9634828133708, 9.442828571428581),
+    "2024-08-27": (608.3425212510404, 601.1190234907945, 8.61335000000001),
+    "2025-10-22": (574.6594936647664, 550.88, 11.847228571428591),
+    "2026-03-02": (514.9038163612771, 504.9742927873308, 13.426421428571416),
+    "2026-04-23": (475.1709291777068, 459.25549181218827, 13.658707142857148),
+    "2026-07-23": (590.8243512193881, 568.8913223750274, 13.425657142857144),
+    "2026-09-14": (617.5145838256564, 606.4214474304824, 14.356228571428558),
+    "2026-09-21": (658.8603410108667, 646.4136942616676, 14.400178571428578),
+    "2026-10-02": (663.7256226528925, 650.2052585223648, 15.90640000000002),
+}
 NOTEBOOK_FORECASTS = {
     "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS, "BE": BE_FORECASTS,
     "AVGO": AVGO_FORECASTS, "NVDA": NVDA_FORECASTS, "QCOM": QCOM_FORECASTS,
     "ORCL": ORCL_FORECASTS, "META": META_FORECASTS, "AMGN": AMGN_FORECASTS,
+    "TMO": TMO_FORECASTS,
 }
 # The candidates each bundle ships with non-zero weight.
 SHIPPED = {
     "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
     "BE": ["nbeats", "nhits"], "AVGO": ["lgbm", "nbeats"], "NVDA": ["lgbm", "nhits"],
     "QCOM": ["lgbm", "nbeats", "nhits"], "ORCL": ["lgbm", "nbeats", "nhits"], "META": ["nbeats"],
-    "AMGN": ["nbeats"],
+    "AMGN": ["nbeats"], "TMO": ["lgbm", "nbeats", "nhits"],
 }
 # The tape each bundle reads the opening from.
 OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex", "AVGO": "sip", "NVDA": "sip",
-                 "QCOM": "sip", "ORCL": "sip", "META": "sip", "AMGN": "sip"}
+                 "QCOM": "sip", "ORCL": "sip", "META": "sip", "AMGN": "sip", "TMO": "sip"}
 # The last session of each notebook's tape the mirror test reads.
-NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META", "AMGN")}
+NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO")}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -241,7 +262,7 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN"):
+        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
@@ -387,6 +408,53 @@ class TestThemePeers:
         assert histories == [("AMGN", 310, 0), ("GILD", 370, 0), ("REGN", 130, 0), ("VRTX", 240, 0),
                              ("MSFT", 385, 0)]
         H._forecast_cache.clear()
+
+    def test_tmos_peers_keep_a_late_first_bar(self, monkeypatch):
+        """TMO's NYSE peers: DHR from 340 bars and a first bar up to 09:36, A 270
+        and 09:35, WAT 100 and 09:37 -- each at its own notebook entry."""
+        H._forecast_cache.clear()
+        histories = []
+        monkeypatch.setattr(
+            H, "history_frame",
+            lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385, extended=False,
+            max_first_minute=0, **_: histories.append((symbol, min_bars, max_first_minute)) or pd.DataFrame(),
+        )
+        monkeypatch.setattr(H, "fetch_opening_window", lambda *a, **k: pd.DataFrame())
+        monkeypatch.setattr(H, "forecast_from", lambda *a, **k: {})
+        opening = H.minute_frame_from_bars(_tape(date(2026, 7, 1), date(2026, 7, 1))[date(2026, 7, 1)][:5])
+        bundle = {"min_bars": 260, "max_first_minute": 1, "peers": ("DHR", "A", "WAT"),
+                  "peer_feed": "sip", "path": "tmo"}
+        H.forecast_session(bundle, "TMO", opening, date(2026, 7, 1))
+        assert histories == [("TMO", 260, 1), ("DHR", 340, 6), ("A", 270, 5), ("WAT", 100, 7)]
+        H._forecast_cache.clear()
+
+    def test_a_session_kept_with_its_first_bar_after_the_window_keeps_its_daily_row(self):
+        """The notebook reads a peer's daily candles apart from its openings: a
+        session whose auction printed at 09:37 still sets the next gap and the
+        ADR, and only its opening summary is missing."""
+        tape = _tape(date(2026, 3, 2), date(2026, 3, 4))
+        late = tape[date(2026, 3, 3)][7:]                       # first bar 09:37
+        bars = tape[date(2026, 3, 2)] + late + tape[date(2026, 3, 4)]
+        rollups, dropped = H.session_rollups(H.minute_frame_from_bars(bars), min_bars=100,
+                                             max_first_minute=7)
+        assert len(rollups) == 3 and not dropped
+        assert np.isnan(rollups.loc["2026-03-03", "open5"])
+        assert rollups.loc["2026-03-03", "open"] == pytest.approx(late[0]["o"])
+        assert not rollups.loc[["2026-03-02", "2026-03-04"], "open5"].isna().any()
+
+    def test_a_peer_that_had_not_opened_by_9_35_has_no_gap_that_morning(self):
+        """WAT's 2024-04-10 auction printed at 09:35. The notebook counts its gap
+        from that open in `theme_gap`; at 9:35 it has not printed, so the mirror
+        reads the group without it -- the one place TMO's forecast is not the
+        notebook's, and by under a cent."""
+        bundle, raw, thin, history, peer_tapes, extras = notebook_inputs("TMO")
+        stamp = pd.Timestamp("2024-04-10")
+        peer_data = _peer_data(peer_tapes, stamp)
+        assert peer_data["WAT"][1].empty and stamp in peer_data["WAT"][0].index
+        out = H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp, None, peer_data)
+        high, low = 580.0539016862726, 573.1150669494203        # the notebook's
+        miss = max(abs(out["pred_high"] - high), abs(out["pred_low"] - low))
+        assert 1e-5 < miss < 0.01
 
     def test_amgn_keeps_its_notebooks_threshold(self):
         bundle = H.load_bundle("AMGN")

@@ -354,6 +354,16 @@ def test_highlow3m_path_mirrors_the_real_one():
     assert by_role["metadata"] == highlow3m.metadata_path(real)
 
 
+def test_goodmoments_paths_mirror_the_real_ones():
+    goodmoments = pytest.importorskip("agent_stonks.goodmoments_model")
+    spec = mc.spec(apple_models.GOODMOMENTS_KEY, "AAPL")
+    by_role = {f.role: f.path for f in spec.files}
+    real = goodmoments.model_path("AAPL")
+    assert by_role["bundle"] == real
+    assert by_role["metadata"] == goodmoments.metadata_path(real)
+    assert by_role["time-and-volatility twin"] == goodmoments.timevol_path(real)
+
+
 HIGHLOW3M_SIDECAR = {
     "ticker": "AAPL",
     "created": "2026-10-05T20:24:36",

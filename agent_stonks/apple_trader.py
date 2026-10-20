@@ -12,7 +12,10 @@ Two rule sets. The range models drive TimeToChange3's day-range rules
 will land, then two resting levels derived from it and nothing more asked of
 the model all day. Fast&Furious drives the momentum rules (`FastFuriousTrader`):
 a forecast of the next 30 minutes' momentum at every bar, bought when it is
-extreme. Fast&Furious + HighLow runs the day-range rules on HighLow's forecast
+extreme. GoodMoments drives the probability rules (`GoodMomentsTrader`): at
+every bar the chance of a +0.2 ADR rise before the close, bought when the model
+sees it likelier than the clock and volatility alone do, sold at +0.2 ADR, a
+stop or the close. Fast&Furious + HighLow runs the day-range rules on HighLow's forecast
 with Fast&Furious's signal trading the five minutes before it
 (`FastFuriousHighLowTrader`). `AppleTraderConfig.model_key` names the model and
 `build_trader` turns it into a state machine -- see `agent_stonks.apple_models`,
@@ -64,6 +67,12 @@ from .config import (
     APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL,
     APPLE_TRADER_FF_HOLD_MINUTES,
     APPLE_TRADER_FF_STOP_K,
+    APPLE_TRADER_GM_COOLDOWN_BARS,
+    APPLE_TRADER_GM_ENTER,
+    APPLE_TRADER_GM_EXIT,
+    APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
+    APPLE_TRADER_GM_STOP_K,
+    APPLE_TRADER_GM_TAKE_K,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_HOLD_MIN_GAIN_K,
     APPLE_TRADER_LEVEL_SOURCE,
@@ -549,6 +558,20 @@ class AppleTraderConfig:
     # notebook system's reversal into a short, which this long-only ledger
     # reads as a close. Off is its long-only variant.
     ff_exit_on_sell_signal: bool = APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL
+    # GoodMoments' rules (`GoodMomentsTrader`, the probability strategy), read
+    # by no other model -- notebook 4's design 2 by default. See the block in
+    # `config`.
+    #
+    # The entry: the model's probability of a +0.2 ADR rise before the close
+    # minus the time-and-volatility model's, at or above this.
+    gm_enter: float = APPLE_TRADER_GM_ENTER
+    # Sell when the edge falls under this; None (the notebook's pick) never
+    # sells on the signal.
+    gm_exit: Optional[float] = APPLE_TRADER_GM_EXIT
+    # The take-profit over the fill and the stop under it, in ADRs (today's
+    # 14-session mean log range). 0 switches either off.
+    gm_take_k: float = APPLE_TRADER_GM_TAKE_K
+    gm_stop_k: float = APPLE_TRADER_GM_STOP_K
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -754,6 +777,27 @@ class AppleTraderConfig:
             )
         self.ff_hold_minutes = int(self.ff_hold_minutes)
         self.ff_exit_on_sell_signal = bool(self.ff_exit_on_sell_signal)
+        # GoodMoments' rules, checked whatever the model, like Fast&Furious's.
+        self.gm_enter = float(self.gm_enter)
+        if not -1.0 < self.gm_enter < 1.0:
+            raise ValueError(
+                f"gm_enter {self.gm_enter!r} is a difference of two probabilities and must be "
+                "between -1 and 1"
+            )
+        if self.gm_exit is not None:
+            self.gm_exit = float(self.gm_exit)
+            if self.gm_exit >= self.gm_enter:
+                raise ValueError(
+                    f"gm_exit {self.gm_exit!r} must sit below the entry gm_enter "
+                    f"{self.gm_enter!r}, or every buy would be sold on the next bar"
+                )
+        for name in ("gm_take_k", "gm_stop_k"):
+            setattr(self, name, float(getattr(self, name)))
+            if getattr(self, name) < 0:
+                raise ValueError(
+                    f"{name} {getattr(self, name)!r} is a distance from the fill in ADRs and "
+                    "cannot be negative (0 switches it off)"
+                )
 
     @property
     def strategy(self) -> str:
@@ -1017,6 +1061,8 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     c = config or AppleTraderConfig()
     if c.strategy == apple_models.STRATEGY_MOMENTUM:
         return _momentum_signature(c)
+    if c.strategy == apple_models.STRATEGY_PROBABILITY:
+        return _probability_signature(c)
     # "A" for the ADR, "R" for the predicted range. The token rides on every k
     # in the signature rather than appearing once at the end, so that a run is
     # never read as the same strategy at a different size -- the same 0.4 is a
@@ -1151,6 +1197,22 @@ def _momentum_signature(c: AppleTraderConfig) -> str:
     """
     skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
     return f"{c.model_key}_{c.ticker}({_ff_rules(c)},size={c.position_pct:g}%{skip})"
+
+
+def _probability_signature(c: AppleTraderConfig) -> str:
+    """`config_signature` for GoodMoments' rules: only the fields they read.
+
+    `enter=+0.02` is the edge a buy needs, `exit` the edge under which a long
+    is sold (`off` without one), `take` and `stop` the two distances from the
+    fill in **A**DRs (`off` at 0)."""
+    exit_ = f"{c.gm_exit:+g}" if c.gm_exit is not None else "off"
+    take = f"{c.gm_take_k:g}A" if c.gm_take_k else "off"
+    stop = f"{c.gm_stop_k:g}A" if c.gm_stop_k else "off"
+    skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
+    return (
+        f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop},"
+        f"size={c.position_pct:g}%{skip})"
+    )
 
 
 def _ff_rules(c: AppleTraderConfig) -> str:
@@ -5187,6 +5249,429 @@ class FastFuriousHighLowTrader(DayRangeTrader):
         return " · ".join(parts)
 
 
+# --- GoodMoments' rules ------------------------------------------------------
+
+
+def _goodmoments():
+    """`agent_stonks.goodmoments_model`, imported on first use (LightGBM, SciPy)."""
+    from . import goodmoments_model
+
+    return goodmoments_model
+
+
+def gm_exits(config: AppleTraderConfig, fill: float, adr: "float | None") -> dict:
+    """The take and the stop over and under a fill, in prices: `gm_take_k` and
+    `gm_stop_k` ADRs in log terms, as the notebook rests them. None for one
+    switched off, or with no ADR to size it."""
+    usable = adr is not None and math.isfinite(adr) and adr > 0
+    return {
+        "take": float(fill * math.exp(config.gm_take_k * adr)) if usable and config.gm_take_k else None,
+        "stop": float(fill * math.exp(-config.gm_stop_k * adr)) if usable and config.gm_stop_k else None,
+    }
+
+
+class GoodMomentsTrader(_SitsOut, BaseTrader):
+    """GoodMoments' rules: the chance of a +0.2 ADR rise, at every bar.
+
+    At the close of every bar the model says how likely it is that a later bar
+    of the session trades 0.2 ADR above this one's close (`p`), and the same
+    trees on the clock and today's volatility alone say it too (`p_tv`).
+    Notebook 4's chosen system acts on the difference -- the edge -- because a
+    high probability on its own mostly means "early in a volatile session",
+    where a fall of 0.2 ADR is as likely as the rise:
+
+    * **enter** at market when the edge is at least `gm_enter` (0.02), up to the
+      15:30 bar and never within 15 bars of a stop;
+    * **take** `gm_take_k` (0.2) ADR over the fill -- the question's own target
+      -- and **stop** `gm_stop_k` (0.75) ADR under it, both resting from the
+      fill on and checked against every bar after it (a bar touching both is a
+      stop);
+    * **sell on the signal** when the edge falls under `gm_exit` -- off in the
+      notebook's pick, which holds what neither level closes to the close.
+
+    In that order on every bar, as the notebook's `trading._session` does: the
+    stop and the take against the bar, then the bar's own forecast. After a
+    take the same bar's forecast can buy again, as in the notebook.
+
+    Against the notebook
+    --------------------
+    * **The tape.** The notebook reads SIP at the bar's close; a basic plan
+      has SIP 15 minutes late, so the session so far is SIP to 15 bars back and
+      IEX since (`goodmoments_model`), and the forecasts differ a little.
+    * **Fills.** The notebook buys or sells on a signal at the next bar's open,
+      and fills a take or a stop at its level (or a worse open); here every
+      order is a market order sent once the bar has closed, so a take fills
+      wherever the price is after the bar that touched it -- usually worse --
+      and so does a stop.
+    * **The flatten** closes `flatten_before_close_min` before the bell rather
+      than at the 15:59 close.
+    * **No stand-down.** A stop pauses entries for 15 bars, as the notebook's
+      rules do, rather than ending the run as the day-range rules' stop does.
+    """
+
+    ENTRY_TRIGGER_TEXT = "Edge at the entry threshold"
+
+    #: Which rule closed a position -- carried on the log entry.
+    EXIT_STOP = "stop"
+    EXIT_TAKE = "take"
+    EXIT_SIGNAL = "signal"
+    EXIT_FLATTEN = "flatten"
+
+    def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
+        super().__init__(config or AppleTraderConfig(model_key=apple_models.GOODMOMENTS_KEY))
+        # The session's ADR, the bar entries wait for after a stop, and the
+        # chart's record of what was read each bar; None before the first bar.
+        self.session: "dict | None" = None
+        # The newest bar's forecast (`goodmoments_model.forecast_at`), or None.
+        self.forecast: "dict | None" = None
+        self._sit_out_noted: "dict" = {}
+        # Never set: a stop is not a reason to stop (see the docstring). Kept
+        # because the live loop reads it off every trader.
+        self.halt: "str | None" = None
+        self.slot: TraderSlot = SINGLE_SLOT
+        self.quiet_read = False
+        self.last_close: "float | None" = None
+        # The last forecast failure reported, so a feed that is down is said
+        # once rather than every minute.
+        self._forecast_note: "str | None" = None
+        self._prewarmed = None
+
+    def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
+        if outcome != rule_agent.CLOSED and (self.blocked or {}).get("sit_out"):
+            labels = ", ".join(event_days.LABELS[c] for c in self.blocked["sit_out"])
+            return rule_agent.WAITING, f"Agent sits today out ({labels})"
+        if outcome == rule_agent.WARMING_UP and self.session is None and self.blocked is None:
+            return rule_agent.WAITING, "Agent waiting for the first forecast"
+        return super().activity(outcome, tracker)
+
+    # --- one cycle --------------------------------------------------------
+
+    def run_cycle(self, bundle: dict, state: AppState, tracker: DecisionTracker) -> str:
+        """Read the newest closed bar's forecast and act on it."""
+        self._prewarm(bundle, state)
+        sym_state, refused = self.preflight(state)
+        if refused is not None:
+            return refused
+        today = pd.Timestamp(clock.now().astimezone(market_hours.MARKET_TZ).date())
+        self._roll_session(today)
+
+        frame = momentum_regime.minute_frame(sym_state)
+        if not len(frame):
+            _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
+            return rule_agent.NO_DATA
+        if self.blocked is not None:
+            return rule_agent.NO_DATA
+        if self.session is None:
+            if self._sit_out(state, frame, today, 1):
+                return rule_agent.NO_DATA if self.blocked is not None else rule_agent.WARMING_UP
+            if not self._plan_session(bundle, state, today):
+                return rule_agent.NO_DATA
+
+        last = frame.iloc[-1]
+        ts = frame.index[-1]
+        self.last_close = float(last["close"])
+        minute = int(round(float(last["minutes_from_open"])))
+        position = tracker.position_for(self.ticker)
+        if position > 0 and self.entry is None:
+            # A position without a remembered entry (a restart onto an existing
+            # ledger): adopted at this bar, its take and stop measured from it.
+            close = float(last["close"])
+            self.entry = {"price": close, "bars": 0, "ts": ts,
+                          **gm_exits(self.config, close, self.session["adr"])}
+        if position <= 0:
+            self.entry = None
+        if ts == self.last_bar_ts:
+            return rule_agent.HOLD
+        self.last_bar_ts = ts
+        if self.entry is not None:
+            self.entry["bars"] = int(self.entry.get("bars") or 0) + 1
+
+        self.forecast = self._forecast_for(bundle, state, today, minute)
+        self._record(state, ts, last)
+        if not self.quiet_read:
+            _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, minute)})
+
+        # 1. The stop and the take, against this bar: both rested from the fill
+        # on, and a bar that touched both is a stop.
+        took = False
+        if position > 0:
+            stop, take = self.entry.get("stop"), self.entry.get("take")
+            if stop is not None and float(last["low"]) <= float(stop):
+                self._sell(state, tracker, position, self.EXIT_STOP, (
+                    f"The {ts:%H:%M} bar traded down to ${float(last['low']):,.2f}, through the "
+                    f"${float(stop):,.2f} stop ({self.config.gm_stop_k:g} ADR under the fill). "
+                    f"No new entry for {APPLE_TRADER_GM_COOLDOWN_BARS} bars."
+                ))
+                self.session["cool_until"] = minute + APPLE_TRADER_GM_COOLDOWN_BARS
+                return rule_agent.SOLD
+            if take is not None and float(last["high"]) >= float(take):
+                self._sell(state, tracker, position, self.EXIT_TAKE, (
+                    f"The {ts:%H:%M} bar traded up to ${float(last['high']):,.2f}, through the "
+                    f"${float(take):,.2f} take ({self.config.gm_take_k:g} ADR over the fill) — "
+                    "the rise the model was asked about happened."
+                ))
+                took = True
+                position = tracker.position_for(self.ticker)
+                if position > 0:
+                    return rule_agent.SOLD
+        sold = rule_agent.SOLD if took else rule_agent.HOLD
+        # 2. The flatten: nothing is held into the close, and nothing bought.
+        if self.closing_soon():
+            if position > 0:
+                self._sell(state, tracker, position, self.EXIT_FLATTEN, (
+                    f"Inside the last {self.config.flatten_before_close_min} min of the "
+                    "session: flattening before the close."
+                ))
+                return rule_agent.SOLD
+            return sold
+        fc = self.forecast
+        # 3. The bar's own forecast (`trading._session`'s close-of-bar step).
+        if position > 0:
+            if self.config.gm_exit is not None and fc is not None and fc["edge"] < self.config.gm_exit:
+                self._sell(state, tracker, position, self.EXIT_SIGNAL, (
+                    f"The edge fell to {fc['edge']:+.3f}, under the {self.config.gm_exit:+g} exit: "
+                    "the model no longer sees the rise as likelier than the clock and volatility do."
+                ))
+                return rule_agent.SOLD
+            return rule_agent.HOLD
+        if fc is None or fc["edge"] < self.config.gm_enter:
+            return sold
+        if minute > APPLE_TRADER_GM_LAST_ENTRY_MINUTE:
+            return sold
+        if minute < int(self.session.get("cool_until") or 0):
+            return sold
+        if self.entry_refused(state, ts):
+            return sold
+        return rule_agent.BOUGHT if self._buy(state, tracker, last, ts) else sold
+
+    # --- the session ------------------------------------------------------
+
+    def _roll_session(self, today) -> None:
+        if self.session is not None and self.session["date"] != today:
+            self.session = None
+            self.entry = None
+            self.last_bar_ts = None
+            self.forecast = None
+            self._forecast_note = None
+        if self.blocked is not None and self.blocked["date"] != today:
+            self.blocked = None
+
+    def _credentials(self, state: AppState) -> "tuple[str | None, str | None]":
+        return ff_credentials(state)
+
+    def _prewarm(self, bundle: dict, state: AppState) -> None:
+        """Fill the first forecast's caches in the background, once a session:
+        ~130 days of SIP and IEX minute bars, last night's option table and the
+        analyst table -- tens of seconds cold, which would otherwise hold the
+        09:31 forecast. Live only; a failure is not reported, the first
+        forecast makes the same reads and reports its own."""
+        if getattr(state, "bar_tape_override", ""):
+            return
+        today = pd.Timestamp(clock.now().astimezone(market_hours.MARKET_TZ).date())
+        if self._prewarmed == today or not _goodmoments().is_session(today):
+            return
+        self._prewarmed = today
+        module, ticker = _goodmoments(), self.ticker
+        key, secret = self._credentials(state)
+
+        def work() -> None:
+            try:
+                module.warm(bundle, ticker, today, key, secret)
+            except Exception:  # noqa: BLE001 -- the first forecast retries and reports
+                pass
+
+        threading.Thread(target=clock.inherit(work), name=f"goodmoments-warm-{ticker}", daemon=True).start()
+
+    def _plan_session(self, bundle: dict, state: AppState, today) -> bool:
+        """The session's ADR, once. False -- and the session blocked, reported
+        once -- when there is none to be had."""
+        module = _goodmoments()
+        key, secret = self._credentials(state)
+        try:
+            if module.is_half_day(today):
+                raise ValueError(
+                    "today closes at 13:00, and the model was fitted on full sessions only"
+                )
+            adr = module.session_adr(bundle, self.ticker, today, key, secret)
+            if not (math.isfinite(adr) and adr > 0):
+                raise ValueError("the history gives no ADR for today")
+        except Exception as exc:  # noqa: BLE001 -- fatal for the session, not the run
+            self.blocked = {"date": today, "reason": str(exc)}
+            _log(state, {"type": "error", "text": (
+                f"Apple Trader cannot read GoodMoments' forecasts for {self.ticker} today, so it "
+                f"will not trade this session: {exc}"
+            )})
+            return False
+        self.session = {"date": today, "adr": float(adr), "cool_until": 0, "history": []}
+        prior = self.slot.levels(state) or {}
+        if (
+            prior.get("rows")
+            and prior.get("ticker") == self.ticker
+            and pd.Timestamp(prior.get("date")) == pd.Timestamp(today)
+            and _record_strategy(prior) == self.config.strategy
+        ):
+            # A restart mid-session: the earlier run's record stays on the
+            # chart, and its open position's take and stop are taken back.
+            self.session["history"] = list(prior["rows"])
+            self._resume(state, prior.get("memory"))
+        exits = []
+        if self.config.gm_take_k:
+            exits.append(f"a take {self.config.gm_take_k:g} ADR "
+                         f"({math.exp(self.config.gm_take_k * adr) - 1:.2%}) over the fill")
+        if self.config.gm_stop_k:
+            exits.append(f"a stop {self.config.gm_stop_k:g} ADR "
+                         f"({1 - math.exp(-self.config.gm_stop_k * adr):.2%}) under it")
+        _log(state, {"type": "analysis", "text": (
+            f"{self.ticker} today: ADR {adr:.2%} (the 14-session mean high-to-low range), so the "
+            f"question is a rise of {math.exp(_goodmoments().TARGET_ADR * adr) - 1:.2%} before the close. Buy "
+            f"when the model's probability of it is at least {self.config.gm_enter:+g} over the "
+            "time-and-volatility model's"
+            + (f"; {', '.join(exits)}" if exits else "")
+            + (f"; sell when the edge falls under {self.config.gm_exit:+g}"
+               if self.config.gm_exit is not None else "")
+            + "."
+        )})
+        return True
+
+    def _forecast_for(self, bundle: dict, state: AppState, today, minute: int) -> "dict | None":
+        """This bar's forecast, or None (after 15:58, or when it cannot be made
+        -- said once per distinct reason)."""
+        if minute > _goodmoments().LAST_FORECAST:
+            return None
+        key, secret = self._credentials(state)
+        try:
+            found = _goodmoments().forecast_at(bundle, self.ticker, today, minute, key, secret)
+        except Exception as exc:  # noqa: BLE001 -- one bar without a forecast is not the day
+            note = str(exc)
+            if note != self._forecast_note:
+                self._forecast_note = note
+                _log(state, {"type": "error", "text": (
+                    f"No GoodMoments forecast for {self.ticker} at bar {minute}: {note}"
+                )})
+            return None
+        self._forecast_note = None
+        return found
+
+    # --- orders -----------------------------------------------------------
+
+    def _buy(self, state: AppState, tracker: DecisionTracker, bar, ts) -> bool:
+        fc = self.forecast
+        adr = self.session["adr"]
+        exits = []
+        if self.config.gm_take_k:
+            exits.append(f"a take {self.config.gm_take_k:g} ADR over the fill")
+        if self.config.gm_stop_k:
+            exits.append(f"a stop {self.config.gm_stop_k:g} ADR under it")
+        if self.config.gm_exit is not None:
+            exits.append(f"a sale once the edge is under {self.config.gm_exit:+g}")
+        reasoning = (
+            f"The model puts the chance of a {math.exp(_goodmoments().TARGET_ADR * adr) - 1:.2%} rise before the "
+            f"close at {fc['p']:.1%}, against {fc['p_tv']:.1%} from the clock and today's volatility "
+            f"alone: an edge of {fc['edge']:+.3f}, at or above the {self.config.gm_enter:+g} entry. "
+            f"Buying; {', '.join(exits + ['the closing flatten'])}."
+        )
+        bought = self.buy(state, tracker, float(bar["close"]), reasoning)
+        if bought:
+            fill = float(self.entry["price"])
+            self.entry.update({"ts": ts, "edge": float(fc["edge"]), **gm_exits(self.config, fill, adr)})
+            self._record(state, ts, bar)
+        return bought
+
+    def _sell(self, state: AppState, tracker: DecisionTracker, quantity: float, kind: str,
+              reasoning: str) -> None:
+        entry = dict(self.entry or {})
+        decision = self.sell(state, tracker, quantity, reasoning, log_extra={"exit": kind})
+        if decision.status == "filled" and self.entry is None and tracker.position_for(self.ticker) > 0:
+            # Partly filled: what is left is the same position, same levels.
+            self.entry = entry
+
+    def _resume(self, state: AppState, memory: "dict | None") -> None:
+        """Take back an earlier run's open position (its take and stop) and its
+        pause after a stop, on a restart the same day. The entry is only a
+        candidate: `run_cycle` drops it if the ledger is flat."""
+        if not memory:
+            return
+        self.session["cool_until"] = int(memory.get("cool_until") or 0)
+        entry = memory.get("entry")
+        if entry and self.entry is None:
+            self.entry = dict(entry)
+            levels = [f"{name} ${float(entry[name]):,.2f}" for name in ("take", "stop") if entry.get(name)]
+            _log(state, {"type": "status", "text": (
+                f"{self.ticker}: continuing today's earlier run's position"
+                + (f" — {', '.join(levels)}" if levels else "") + "."
+            )})
+
+    # --- the record and the log -------------------------------------------
+
+    def memory(self) -> dict:
+        return {
+            "entry": dict(self.entry) if self.entry is not None else None,
+            "cool_until": int((self.session or {}).get("cool_until") or 0),
+        }
+
+    def publish_memory(self, state: AppState) -> None:
+        levels = self.slot.levels(state)
+        if (
+            not levels
+            or self.session is None
+            or levels.get("ticker") != self.ticker
+            or pd.Timestamp(levels.get("date")) != pd.Timestamp(self.session["date"])
+        ):
+            return
+        self.slot.publish(state, {**levels, "memory": self.memory()})
+
+    def _record(self, state: AppState, ts, bar) -> None:
+        """This bar's forecast and the position's take and stop, added to the
+        session's record and published: what the chart draws while the run is
+        live."""
+        fc = self.forecast or {}
+        row = {
+            "t": ts,
+            "model_key": self.config.model_key,
+            "price": float(bar["close"]),
+            "p": fc.get("p"),
+            "p_tv": fc.get("p_tv"),
+            "edge": fc.get("edge"),
+            "take": (self.entry or {}).get("take"),
+            "stop": (self.entry or {}).get("stop"),
+        }
+        history = self.session.setdefault("history", [])
+        if history and history[-1]["t"] == row["t"]:
+            history[-1] = row
+        else:
+            history.append(row)
+        self.slot.publish(state, {
+            "ticker": self.ticker,
+            "date": self.session["date"],
+            "config": self.config,
+            "rows": history,
+            "memory": self.memory(),
+            "seed": None,
+        })
+
+    def _read_summary(self, bar, ts, position: float, minute: int) -> str:
+        price = float(bar["close"])
+        parts = [f"{self.ticker} {ts:%H:%M} ${price:,.2f}"]
+        fc = self.forecast
+        if fc is not None:
+            parts.append(
+                f"P(+{_goodmoments().TARGET_ADR:g} ADR by the close) {fc['p']:.1%} vs {fc['p_tv']:.1%} on time and volatility "
+                f"(edge {fc['edge']:+.3f}, entry {self.config.gm_enter:+g})"
+            )
+        else:
+            parts.append("no forecast")
+        if position > 0 and self.entry:
+            entry_price = float(self.entry["price"])
+            pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
+            parts.append(f"long {position:g} sh @ ${entry_price:,.2f} ({pnl:+.2f}%)")
+            for name in ("take", "stop"):
+                if self.entry.get(name):
+                    parts.append(f"{name} ${float(self.entry[name]):,.2f}")
+        elif self.session and minute < int(self.session.get("cool_until") or 0):
+            parts.append("stopped out — no entry until the pause is over")
+        return " · ".join(parts)
+
+
 def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """The state machine this configuration's model calls for.
 
@@ -5198,6 +5683,8 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """
     if config.strategy == apple_models.STRATEGY_MOMENTUM:
         return FastFuriousTrader(config)
+    if config.strategy == apple_models.STRATEGY_PROBABILITY:
+        return GoodMomentsTrader(config)
     if apple_models.window_key(config.model_key) == apple_models.FASTFURIOUS_KEY:
         return FastFuriousHighLowTrader(config)
     return DayRangeTrader(config)
@@ -5238,10 +5725,41 @@ def _momentum_armed_summary(config: AppleTraderConfig, model, bundle: dict) -> s
     )
 
 
+def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
+    """`_armed_summary` for GoodMoments' rules."""
+    scores = (bundle.get("metadata") or {}).get("test_scores") or {}
+    quality = (
+        f", test AUC {scores['auc']:.3f} ({scores['auc_30min']:.3f} within the half hour)"
+        if scores.get("auc") and scores.get("auc_30min") else ""
+    )
+    exits = []
+    if config.gm_take_k:
+        exits.append(f"at a take {config.gm_take_k:g} ADR over the fill")
+    if config.gm_stop_k:
+        exits.append(
+            f"at a stop {config.gm_stop_k:g} ADR under it, after which it buys nothing for "
+            f"{APPLE_TRADER_GM_COOLDOWN_BARS} bars"
+        )
+    if config.gm_exit is not None:
+        exits.append(f"once the edge is under {config.gm_exit:+g}")
+    exits.append("at the closing flatten")
+    target = _goodmoments().TARGET_ADR
+    return (
+        f"Apple Trader armed on {model.label} (fitted {bundle.get('trained_at') or 'unknown'}"
+        f"{quality}): at the close of every bar it forecasts the chance that {config.ticker} trades "
+        f"{target:g} ADR above that bar's close before the session ends, beside the same trees' "
+        "chance on the clock and today's volatility alone, and buys when the first is at least "
+        f"{config.gm_enter:+g} over the second (no new entry after 15:30). It sells "
+        + (f"{', '.join(exits[:-1])}, or {exits[-1]}." if len(exits) > 1 else f"{exits[0]}.")
+    )
+
+
 def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     """The one line the log opens a run with: which model, and what it will do."""
     if config.strategy == apple_models.STRATEGY_MOMENTUM:
         return _momentum_armed_summary(config, model, bundle)
+    if config.strategy == apple_models.STRATEGY_PROBABILITY:
+        return _probability_armed_summary(config, model, bundle)
     metadata = bundle.get("metadata") or {}
     # TimeToChange3 files its held-out score as `test_metrics_ensemble`, HighLow
     # and HighLow2 as `test_metrics`; the dollar error is `mae_usd_mean` in all.

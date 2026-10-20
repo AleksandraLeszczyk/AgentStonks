@@ -1532,6 +1532,16 @@ def _bars_path(symbol: str, expiration: pd.Timestamp) -> Path:
     return _options_dir(symbol) / "bars" / f"{expiration:%Y-%m-%d}.parquet"
 
 
+def _read_bars(path: Path) -> "pd.DataFrame | None":
+    """An expiration's cached bars, or None when the file is missing or unreadable."""
+    if not path.exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except (OSError, ValueError):
+        return None
+
+
 def _ensure_option_bars(symbol: str, index: dict, contracts: pd.DataFrame, closes: pd.Series,
                         through: pd.Timestamp, key: str, secret: str) -> pd.DataFrame:
     """Every listed expiration's daily bars over its last 120 days, up to
@@ -1549,6 +1559,7 @@ def _ensure_option_bars(symbol: str, index: dict, contracts: pd.DataFrame, close
     lo, hi = OPTION_STRIKE_BAND
     jobs: "dict[tuple[pd.Timestamp, pd.Timestamp], list[str]]" = {}
     plans: "dict[pd.Timestamp, dict]" = {}
+    olds: "dict[pd.Timestamp, pd.DataFrame | None]" = {}
     for expiration, group in contracts.groupby("expiration"):
         start, end = bar_window(expiration, through)
         path_px = closes.loc[start:end]
@@ -1556,6 +1567,13 @@ def _ensure_option_bars(symbol: str, index: dict, contracts: pd.DataFrame, close
             continue
         band = set(group.loc[group["strike"].between(lo * path_px.min(), hi * path_px.max()), "symbol"])
         entry = index["expirations"].get(f"{expiration:%Y-%m-%d}") or {}
+        olds[expiration] = _read_bars(_bars_path(symbol, expiration))
+        if olds[expiration] is None:
+            # The index remembers bars the file no longer holds (missing, or
+            # unreadable): fetched again over the whole window, rather than
+            # extended -- an extension alone would leave the file the newest
+            # days only (the 2026-10-09 expiry, found 2026-10-20).
+            entry = {}
         have = set(entry.get("symbols") or [])
         upto = pd.Timestamp(entry["through"]) if entry.get("through") else None
         new = sorted(band - have) if upto is not None else sorted(band)
@@ -1586,18 +1604,18 @@ def _ensure_option_bars(symbol: str, index: dict, contracts: pd.DataFrame, close
     frames = []
     for expiration, plan in plans.items():
         path = _bars_path(symbol, expiration)
-        old = None
-        if path.exists():
-            try:
-                old = pd.read_parquet(path)
-            except (OSError, ValueError):
-                old = None
+        old = olds.get(expiration)
         add = got_by_exp.get(expiration)
         if add is not None and len(add):
             both = add if old is None else pd.concat([old, add], ignore_index=True)
             both = both.drop_duplicates(["symbol", "date"], keep="last").sort_values(["symbol", "date"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            both[_BAR_COLUMNS].reset_index(drop=True).to_parquet(path)
+            # Written aside and moved into place: SimLab and the live app share
+            # this cache, and a reader catching a half-written file would take
+            # it for a missing one.
+            tmp = path.with_suffix(".tmp")
+            both[_BAR_COLUMNS].reset_index(drop=True).to_parquet(tmp)
+            tmp.replace(path)
             old = both
         index["expirations"][f"{expiration:%Y-%m-%d}"] = {
             "symbols": plan["symbols"], "through": f"{plan['through']:%Y-%m-%d}",
@@ -1834,6 +1852,32 @@ def _build_rows(symbol: str, lo: pd.Timestamp, hi: pd.Timestamp, settings: dict,
         f"{d:%Y-%m-%d}": (_row_payload(table, profile, d), last_rate >= d)
         for d in days
     }
+
+
+def option_history(
+    symbol: str,
+    first_expiry: pd.Timestamp,
+    last_expiry: pd.Timestamp,
+    closes: pd.Series,
+    through: pd.Timestamp,
+    key: "str | None" = None,
+    secret: "str | None" = None,
+) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    """The contracts expiring in [first_expiry, last_expiry] and their daily
+    bars up to `through`, from this module's option cache (fetched where it
+    falls short) -- for another model that prices the same chain its own way
+    (`goodmoments_model`). `closes` are SIP session closes over the contracts'
+    windows: they decide which strikes are fetched (`_ensure_option_bars`)."""
+    symbol = symbol.upper()
+    key, secret = _credentials(key, secret)
+    with _options_lock:
+        index = _options_index(symbol)
+        contracts = _contracts(symbol, index, pd.Timestamp(first_expiry), pd.Timestamp(last_expiry),
+                               pd.Timestamp(through), key, secret)
+        if not len(contracts):
+            return contracts, pd.DataFrame(columns=_BAR_COLUMNS)
+        bars = _ensure_option_bars(symbol, index, contracts, closes, pd.Timestamp(through), key, secret)
+    return contracts, bars
 
 
 def previous_close(history: History, day) -> pd.Timestamp:

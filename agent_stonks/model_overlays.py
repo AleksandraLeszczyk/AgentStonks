@@ -8,8 +8,8 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Nine overlays
--------------
+Ten overlays
+------------
 `day_range`          TimeToChange3's forecast of where the session's high and
                      low will land, made once from the first five minutes -- the
                      model's claim about the *width* of the day. Two price levels
@@ -49,13 +49,22 @@ Nine overlays
                      bar's price, as a band: the second model in the bundle,
                      which only sizes the stop. Its own key so that it is off
                      unless asked for.
+`goodmoments_signal` GoodMoments' edge, read at the close of every bar: its
+                     probability that a later bar of the session trades 0.2 ADR
+                     above this bar's close, less the same trees' probability
+                     on the clock and volatility alone -- a line in percentage
+                     points on the momentum panel with the entry threshold,
+                     and a ▲ on the candles where it first reaches it. Drawn
+                     at the bar it was made at: its horizon is the close. See
+                     `goodmoments_model`.
 `trader_levels`      where Apple Trader would rest its buy and its sell, from
                      the forecast of the model its configuration names. The odd one out: every other overlay
                      draws what a *model* said, this one draws what an *agent*
                      would do about it, so it takes a configuration and asks
                      `apple_trader.session_levels` rather than deriving the
                      levels itself. Under Fast&Furious, which rests no levels,
-                     it is the running agent's stop.
+                     it is the running agent's stop; under GoodMoments its take
+                     and its stop.
 
 Both envelopes are widest at 09:30, narrow to roughly a fifth of that by
 midday and open again into the close. They are a picture of *how far the day
@@ -129,6 +138,7 @@ HIGHLOW2_RANGE_KEY = "highlow2_range"
 HIGHLOW3M_RANGE_KEY = "highlow3m_range"
 FASTFURIOUS_SIGNAL_KEY = "fastfurious_signal"
 FASTFURIOUS_RANGE_KEY = "fastfurious_range"
+GOODMOMENTS_SIGNAL_KEY = "goodmoments_signal"
 
 
 @dataclass(frozen=True)
@@ -309,6 +319,24 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         # what a run's model said, and drawn by default this band reads as the
         # model's forecast when it is only the stop's input.
         models=(),
+    ),
+    GOODMOMENTS_SIGNAL_KEY: ModelOverlay(
+        key=GOODMOMENTS_SIGNAL_KEY,
+        label="GoodMoments edge (+0.2 ADR before the close; buy signals)",
+        name="GoodMoments",
+        summary=(
+            "GoodMoments' probability, made at the close of every bar, that a later bar of the "
+            "session trades 0.2 ADR above that bar's close, less the same trees' probability on "
+            "the clock and today's volatility alone: the edge, in percentage points, as a lime "
+            "line on the momentum panel (right axis) with the entry threshold, and a ▲ on the "
+            "candles at the bar where it first reaches it. The hover shows both probabilities."
+        ),
+        requires=(
+            "LightGBM, SciPy, the GoodMoments bundle and its time-and-volatility twin, Alpaca SIP "
+            "and IEX minute bars, HighLow_3m's option cache and Yahoo's analyst targets"
+        ),
+        tickers=apple_models.GOODMOMENTS_TICKERS,
+        models=(apple_models.GOODMOMENTS_KEY,),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -701,6 +729,13 @@ def compute(
             )
         return memo["fastfurious"]
 
+    def goodmoments_forecast() -> dict:
+        if "goodmoments" not in memo:
+            memo["goodmoments"] = _goodmoments_forecast(
+                symbol, session, day, credentials, trader_config
+            )
+        return memo["goodmoments"]
+
     def trader_forecast() -> dict:
         model_key = apple_models.forecast_key(trader_model(trader_config, symbol))
         if model_key in _HIGHLOW_MODULES:
@@ -725,13 +760,15 @@ def compute(
         )
 
     def trader_items() -> "tuple[list[dict], str]":
-        if apple_models.strategy(trader_model(trader_config, symbol)) == apple_models.STRATEGY_MOMENTUM:
-            # Only a record Fast&Furious wrote: a day-range run's earlier today
-            # is not this configuration's stop.
+        model_key = trader_model(trader_config, symbol)
+        rules = apple_models.strategy(model_key)
+        if rules != apple_models.STRATEGY_DAYRANGE:
+            # Only a record the same rules wrote: a day-range run's earlier
+            # today is not this configuration's stop.
             own = recorded is not None and apple_models.strategy(
                 getattr(recorded[1], "model_key", None)
-            ) == apple_models.STRATEGY_MOMENTUM
-            return _momentum_trader_items(symbol, recorded if own else None)
+            ) == rules
+            return _signal_trader_items(symbol, recorded if own else None, model_key)
         if recorded is not None:
             rows, config = recorded
             return _trader_levels_items(
@@ -765,6 +802,7 @@ def compute(
         ),
         FASTFURIOUS_SIGNAL_KEY: lambda: _fastfurious_signal_items(fastfurious_forecast()),
         FASTFURIOUS_RANGE_KEY: lambda: _fastfurious_range_items(fastfurious_forecast()),
+        GOODMOMENTS_SIGNAL_KEY: lambda: _goodmoments_signal_items(goodmoments_forecast()),
         TRADER_LEVELS_KEY: trader_items,
     }
 
@@ -837,14 +875,18 @@ def session_forecast(
     model_key = apple_models.forecast_key(model_key) or model_key
     overlay = _RANGE_OVERLAYS.get(model_key or "", DAY_RANGE_KEY)
     day, session, problem = _session_of(bars or [], session_date)
-    if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
+    if apple_models.strategy(model_key) != apple_models.STRATEGY_DAYRANGE:
         # Its forecast is made every minute and is not a range of the day.
         label = apple_models.get(model_key).label
+        what = (
+            "the next 30 minutes" if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM
+            else "the chance of a +0.2 ADR rise before the close"
+        )
         result = {"forecast": None, "made_at": None, "problem": (
-            f"{label} makes no morning forecast of the day's range: it forecasts the next 30 "
-            "minutes at every bar."
+            f"{label} makes no morning forecast of the day's range: it forecasts {what} at "
+            "every bar."
         )}
-        overlay = FASTFURIOUS_SIGNAL_KEY
+        overlay = _SIGNAL_OVERLAYS.get(model_key, FASTFURIOUS_SIGNAL_KEY)
     elif session is None:
         result = {"forecast": None, "made_at": None, "problem": problem}
     elif overlay == DAY_RANGE_KEY:
@@ -1588,30 +1630,161 @@ def _fastfurious_range_items(result: dict) -> "tuple[list[dict], str]":
     )], ""
 
 
-def _momentum_trader_items(
-    symbol: str, recorded: "tuple[list[dict], object] | None"
+# The overlay that draws each per-minute model's signals.
+_SIGNAL_OVERLAYS = {
+    apple_models.FASTFURIOUS_KEY: FASTFURIOUS_SIGNAL_KEY,
+    apple_models.GOODMOMENTS_KEY: GOODMOMENTS_SIGNAL_KEY,
+}
+
+
+def _signal_trader_items(
+    symbol: str, recorded: "tuple[list[dict], object] | None", model_key: str,
 ) -> "tuple[list[dict], str]":
-    """`trader_levels` under Fast&Furious: the running agent's stop while it
-    holds a position. It rests no buy or sell -- its entries are the signals
-    `fastfurious_signal` draws."""
+    """`trader_levels` under a per-minute model (Fast&Furious, GoodMoments):
+    the running agent's stop -- and GoodMoments' take -- while it holds a
+    position. It rests no buy or sell; its entries are the signals its own
+    overlay draws."""
     overlay = OVERLAYS[TRADER_LEVELS_KEY]
+    model = apple_models.get(model_key)
     if recorded is None:
+        signals = OVERLAYS[_SIGNAL_OVERLAYS.get(model.key, FASTFURIOUS_SIGNAL_KEY)].name
+        drawn = "take and stop are" if model.key == apple_models.GOODMOMENTS_KEY else "stop is"
         return [], (
-            f"{overlay.label}: Fast&Furious rests no levels — its buys and sells are signals "
-            "(the Fast&Furious overlay); a running agent's stop is drawn here."
+            f"{overlay.label}: {model.label.replace(' model', '')} rests no levels — its buys "
+            f"are signals (the {signals} overlay); a running agent's {drawn} drawn here."
         )
     rows, config = recorded
-    stops = [row.get("stop") for row in rows]
-    if not any(v is not None for v in stops):
-        return [], ""
-    return [_path(
-        TRADER_LEVELS_KEY, "Stop level", [row["t"] for row in rows], stops,
-        MODEL_OVERLAY_COLORS["trader_stop"], step=True,
-        note=(
+    stamps = [row["t"] for row in rows]
+    items = []
+    if model.key == apple_models.GOODMOMENTS_KEY:
+        takes = [row.get("take") for row in rows]
+        if any(v is not None for v in takes):
+            items.append(_path(
+                TRADER_LEVELS_KEY, "Take-profit", stamps, takes,
+                MODEL_OVERLAY_COLORS["trader_levels"], step=True,
+                note=f"Apple Trader's take, {getattr(config, 'gm_take_k', 0):g} ADR over the fill",
+            ))
+        stop_note = f"Apple Trader's stop, {getattr(config, 'gm_stop_k', 0):g} ADR under the fill"
+    else:
+        stop_note = (
             f"Apple Trader's stop, {getattr(config, 'ff_stop_k', 0):g} × the forecast 2-hour "
-            "drop under the fill, while a position is open"
+            "drop under the fill"
+        )
+    stops = [row.get("stop") for row in rows]
+    if any(v is not None for v in stops):
+        items.append(_path(
+            TRADER_LEVELS_KEY, "Stop level", stamps, stops,
+            MODEL_OVERLAY_COLORS["trader_stop"], step=True,
+            note=f"{stop_note}, while a position is open",
+        ))
+    return items, ""
+
+
+# --- GoodMoments ------------------------------------------------------------
+
+
+def _goodmoments_forecast(
+    symbol: str,
+    session: pd.DataFrame,
+    day: pd.Timestamp,
+    credentials: "tuple[str, str] | None",
+    config=None,
+) -> dict:
+    """Every minute's GoodMoments forecast of the session so far.
+
+    Each minute's is the one made at that bar's close from the model's own tape
+    (SIP to 15 minutes back, IEX since), so a past session is drawn with what
+    the model said at each minute and a live one with what it has said so far.
+    The thresholds are the configured run's when the chart's configuration is
+    a GoodMoments one, the notebook's otherwise.
+
+    Returns `{"fc", "stamps", "enter", "exit", "problem"}`.
+    """
+    from .config import APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT
+
+    model_key = apple_models.GOODMOMENTS_KEY
+    enter, exit_ = APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT
+    if config is not None and getattr(config, "model_key", None) == model_key:
+        enter, exit_ = float(config.gm_enter), config.gm_exit
+    out = {"fc": None, "stamps": [], "enter": enter, "exit": exit_, "problem": ""}
+    try:
+        bundle = apple_models.load(model_key, symbol)
+        if bundle is None:
+            return {**out, "problem": apple_models.unavailable_reason(model_key, symbol)}
+        module = importlib.import_module(".goodmoments_model", __package__)
+        # Closed bars only: a live buffer's newest row can be the minute still
+        # trading, whose forecast does not exist yet.
+        closed = session[session.index + pd.Timedelta(minutes=1) <= pd.Timestamp(clock.now())]
+        if not len(closed):
+            return {**out, "problem": "no bar of the session has closed yet."}
+        last = int(round(float(closed["minutes_from_open"].iloc[-1])))
+        key, secret = credentials or (None, None)
+        fc = module.session_forecasts(bundle, symbol, day, last, key, secret, wait=False)
+    except Exception as exc:  # a decoration must never take the chart down
+        return {**out, "problem": str(exc)}
+    if not len(fc):
+        return {**out, "problem": "no forecast yet — IEX has not printed this session."}
+    open_ts = pd.Timestamp(day).tz_localize(market_hours.MARKET_TZ) + pd.Timedelta(
+        hours=market_hours.MARKET_OPEN.hour, minutes=market_hours.MARKET_OPEN.minute
+    )
+    return {**out, "fc": fc, "stamps": [open_ts + pd.Timedelta(minutes=int(m)) for m in fc.index]}
+
+
+def _goodmoments_signal_items(result: dict) -> "tuple[list[dict], str]":
+    """The edge the trades are made on, and its buy signals.
+
+    The edge is drawn in percentage points on the momentum panel at the bar it
+    was made at -- its horizon is the close, so there is no later moment it
+    belongs to -- with the entry threshold (and the exit, when one is set).
+    A ▲ marks the first bar of each run at or over the entry up to 15:30, the
+    last bar the rules buy on."""
+    from .config import APPLE_TRADER_GM_LAST_ENTRY_MINUTE
+
+    overlay = OVERLAYS[GOODMOMENTS_SIGNAL_KEY]
+    if result["problem"]:
+        return [], f"{overlay.label}: {result['problem']}"
+    fc, stamps = result["fc"], result["stamps"]
+    enter, exit_ = result["enter"], result["exit"]
+    color = MODEL_OVERLAY_COLORS["goodmoments"]
+    text = [
+        f"made at the {stamp:%H:%M} bar · P(+0.2 ADR by the close) {p:.1%} vs {tv:.1%} on time "
+        "and volatility"
+        for stamp, p, tv in zip(stamps, fc["p"], fc["p_tv"])
+    ]
+    items: "list[dict]" = [
+        _series(
+            GOODMOMENTS_SIGNAL_KEY, "Edge over time & volatility", stamps, (fc["edge"] * 100).tolist(),
+            color, unit="pts",
+            note="the model's probability of a +0.2 ADR rise before the close, less the "
+                 "time-and-volatility model's, in percentage points",
+            text=text,
         ),
-    )], ""
+        _series(
+            GOODMOMENTS_SIGNAL_KEY, "Entry threshold", stamps, [enter * 100] * len(stamps), color,
+            unit="pts", dash="dash", width=1.0, note=f"buy at an edge of {enter:+g} or more",
+        ),
+    ]
+    if exit_ is not None:
+        items.append(_series(
+            GOODMOMENTS_SIGNAL_KEY, "Exit threshold", stamps, [exit_ * 100] * len(stamps),
+            MODEL_OVERLAY_COLORS["trader_stop"], unit="pts", dash="dash", width=1.0,
+            note=f"sell a long once the edge is under {exit_:+g}",
+        ))
+    on = (fc["edge"] >= enter).to_numpy() & (fc.index.to_numpy() <= APPLE_TRADER_GM_LAST_ENTRY_MINUTE)
+    before = np.r_[False, on[:-1]]
+    for stamp, (minute, row), now, was in zip(stamps, fc.iterrows(), on, before):
+        if not now or was:
+            continue
+        items.append(_event(
+            GOODMOMENTS_SIGNAL_KEY,
+            f"Buy signal: edge {row['edge']:+.3f}",
+            stamp, color, icon="▲", price=float(row["price"]), line=False,
+            note=(
+                f"P(+0.2 ADR by the close) {row['p']:.1%} against {row['p_tv']:.1%} on time and "
+                f"volatility — at or over the {enter:+g} entry"
+            ),
+        ))
+    return items, ""
 
 
 # --- predicted profile range (LevelsML) -------------------------------------

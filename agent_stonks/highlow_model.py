@@ -266,15 +266,22 @@ MIN_BARS_PER_SESSION = 385
 # reform of November 2025) from 310. The sidecar wins when it has one.
 # A theme peer is read at its own entry, as `load_peers` reads the peer's tape
 # cleaned at the peer's settings: AMGN's GILD, REGN and VRTX each sit under the
-# peer's thinnest regular session (REGN printed a median 304 bars a session).
+# peer's thinnest regular session (REGN printed a median 304 bars a session);
+# TMO (260, 571 of 933 sessions under 385 before the round-lot reform) and its
+# DHR, A and WAT likewise (WAT a median 230-270 bars a session before 2026).
 NOTEBOOK_MIN_BARS: "dict[str, int]" = {
     "AVGO": 320, "AMGN": 310, "GILD": 370, "REGN": 130, "VRTX": 240,
+    "TMO": 260, "DHR": 340, "A": 270, "WAT": 100,
 }
 # The same for the first bar (`config._TICKERS[...]["max_first_minute"]`): on 13
 # quiet ORCL sessions of 2023-24 the opening auction printed in the 09:31 bar
 # (once 09:32) and SIP has no 09:30 bar, so its notebook keeps a session whose
-# first bar is up to two minutes late. Everywhere else it must be 09:30's.
-NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {"ORCL": 2}
+# first bar is up to two minutes late; TMO's on two 2023 sessions (09:31). Its
+# NYSE peers' auctions print later still -- DHR's up to 09:36, A's 09:35, WAT's
+# 09:37 -- and those sessions are kept too: with no bar in the opening window
+# the peer has no opening summary that day and the theme group reads the
+# others (`theme_from`). Everywhere else the first bar must be 09:30's.
+NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {"ORCL": 2, "TMO": 1, "DHR": 6, "A": 5, "WAT": 7}
 
 # Prior sessions the feature row needs: 126-day momentum and volatility read
 # `mid.shift(126)` of a series that is itself shifted a day.
@@ -903,7 +910,13 @@ def session_rollups(
 
     `opening_raw` is another feed's bars for the same stretch (an IEX-opening
     bundle's): the opening summaries are then read from it, and a kept session it
-    printed nothing in has NaN there rather than no row.
+    printed nothing in has NaN there rather than no row. The same holds on SIP:
+    a session kept with its first bar after the window (TMO's peers' late NYSE
+    auctions: DHR to 09:36, WAT to 09:37) has NaN opening columns, not no row --
+    the notebook reads a peer's daily candles (`daily.parquet`) apart from its
+    openings, so the session still sets the peer's next gap, its ADR and its
+    beta. The panel drops it as the notebook's inner join does (`forecast_from`
+    reads openings where `open5` is set).
 
     `all_hours` is the same SIP stretch with its extended hours: given, each
     row also carries `extended_summaries`.
@@ -919,7 +932,7 @@ def session_rollups(
     daily = daily_bars(minute)
     if opening_raw is None:
         opening = opening_features(minute)[_OPENING_COLS].join(microstructure_summary(minute))
-        rollups = daily.join(opening, how="inner")
+        rollups = daily.join(opening, how="left")
     else:
         thin = opening_minute_frame(opening_raw, daily.index)
         opening = (

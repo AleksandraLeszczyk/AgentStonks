@@ -139,6 +139,7 @@ SHORT_MODEL_NAMES = {
     "highlow2": "HighLow2",
     "highlow3m": "HighLow_3m",
     "fastfurious": "Fast&Furious",
+    "goodmoments": "GoodMoments",
     "ff_highlow": "F&F + HighLow",
 }
 

@@ -2,7 +2,7 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are seven: six
+named X" and never branch on which one they got. Today there are eight: seven
 saved models, the first five of which share a rule set, and one made of two of
 them:
 
@@ -49,6 +49,16 @@ them:
                      stop under the forecast low, out 30 minutes after the
                      last signal. Its bundle carries `kind="fastfurious"` and
                      the forecasts come from `fastfurious_model`.
+`goodmoments`        GoodMoments' forecast of another kind of number again: at
+                     the close of every minute, the probability that a later
+                     bar of the session trades 0.2 ADR above this one's close,
+                     beside the same trees' probability on the clock and
+                     today's volatility alone. It drives its own rule set
+                     (`STRATEGY_PROBABILITY`): buy when the model's *edge*
+                     over that baseline is 2 points or more, a take-profit at
+                     +0.2 ADR, a stop at -0.75 ADR, otherwise held to the
+                     close. Its bundle carries `kind="goodmoments"` and the
+                     forecasts come from `goodmoments_model`.
 `ff_highlow`         no saved model of its own: Fast&Furious's buy signal for
                      the first five minutes, HighLow's day-range rules after
                      them. Its bundle *is* HighLow's -- the levels hang off that
@@ -90,8 +100,10 @@ is trained in `FinNotebooks/Models` and is one entry away.
 `AppleModel.strategy` names which rule set a model drives, and
 `apple_trader.build_trader` turns it into a state machine: the five range
 models drive the day-range rules (two resting levels), Fast&Furious the
-momentum rules (a per-minute signal), and Fast&Furious + HighLow the day-range
-rules with Fast&Furious's signal trading the opening window before them. A
+momentum rules (a per-minute signal), GoodMoments the probability rules (a
+per-minute edge, a take and a stop in ADRs), and Fast&Furious + HighLow the
+day-range rules with Fast&Furious's signal trading the opening window before
+them. A
 caller written for one of them -- Orchestra, the day-range levels on the chart,
 a tuning axis -- asks `strategy(key)` rather than assuming, and one that reads
 *the forecast* asks `forecast_key(key)`.
@@ -113,6 +125,7 @@ from .config import APPLE_TRADER_MODEL, LEVELS_DAYRANGE, LEVELS_INTRADAY
 # The rule sets a model can drive.
 STRATEGY_DAYRANGE = "dayrange"
 STRATEGY_MOMENTUM = "momentum"
+STRATEGY_PROBABILITY = "probability"
 
 # The symbol everything here defaults to, and what a config or a stored record
 # arriving without one means.
@@ -133,13 +146,18 @@ DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 # counts and VWAP, and ORCL also SPY and its SIP theme peers MSFT, AMZN and
 # GOOGL), and AMGN (2026-10-19, the same recipe outside tech: SPY, the
 # pre-market, the previous evening, the opening's trade counts and its biotech
-# peers GILD, REGN and VRTX, sessions kept from 310 bars); GOOGL is in the
-# notebook's config but has not been run through it.
+# peers GILD, REGN and VRTX, sessions kept from 310 bars), and TMO (2026-10-20,
+# the same recipe, of which the blend kept only its life-science tools peers
+# DHR, A and WAT; sessions kept from 260 bars, the peers' with first bars as
+# late as 09:37); GOOGL is in the notebook's config but has not been run
+# through it.
 # Adding one is this tuple plus its files in `Code/Models` -- and a check that
 # the bundle's shipped candidates read only the base features and the custom
 # groups `highlow_model` mirrors (`GROUP_COLS`; `_build_bundle` refuses
 # anything else).
-HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN")
+HIGHLOW_TICKERS = (
+    DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO",
+)
 
 # Which symbols HighLow2_5m has saved a bundle for (`highlow2_5m_<TICKER>.*`):
 # AAPL (saved 2026-10-04) and INTC (2026-10-06, AAPL's recipe with ten stocks
@@ -167,6 +185,13 @@ HIGHLOW3M_TICKERS = (DEFAULT_TICKER,)
 # and -- since the stop's range model reads the option tables -- the ticker's
 # entry in `highlow3m_model.NOTEBOOK_OPTIONS`.
 FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
+
+# Which symbols GoodMoments has saved a bundle for (`goodmoments_<TICKER>.*`,
+# plus the `_timevol` twin its rules read the edge against): AAPL (fitted
+# through 2026-10-16, saved 2026-10-19; the twin written 2026-10-20 by
+# `GoodMoments/scripts/export_timevol.py`). The notebook is AAPL-only. Adding
+# one is this tuple plus its four files in `Code/Models`.
+GOODMOMENTS_TICKERS = (DEFAULT_TICKER,)
 
 # Fast&Furious + HighLow reads both bundles, so it exists where both were fitted.
 FF_HIGHLOW_TICKERS = tuple(t for t in FASTFURIOUS_TICKERS if t in HIGHLOW_TICKERS)
@@ -359,6 +384,33 @@ def _fastfurious_path(ticker: str = DEFAULT_TICKER) -> Path:
     return fastfurious_model.model_path(ticker)
 
 
+def _load_goodmoments(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The GoodMoments bundle for one ticker (the saved model and its
+    time-and-volatility twin), imported late (LightGBM, SciPy)."""
+    try:
+        from . import goodmoments_model
+    except ImportError:
+        return None
+    return goodmoments_model.load_bundle(ticker)
+
+
+def _goodmoments_path(ticker: str = DEFAULT_TICKER) -> Path:
+    try:
+        from . import goodmoments_model
+    except ImportError:
+        return Path(f"goodmoments_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return goodmoments_model.model_path(ticker)
+
+
+def _goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
+    """Which of the two files is missing -- the twin has its own fix."""
+    try:
+        from . import goodmoments_model
+    except ImportError:
+        return "GoodMoments needs LightGBM, SciPy and joblib, which are not installed."
+    return goodmoments_model.unavailable_reason(ticker)
+
+
 def _load_ff_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """HighLow's bundle, but only when Fast&Furious's loads too.
 
@@ -396,6 +448,7 @@ HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 HIGHLOW3M_KEY = "highlow3m"
 FASTFURIOUS_KEY = "fastfurious"
+GOODMOMENTS_KEY = "goodmoments"
 FF_HIGHLOW_KEY = "ff_highlow"
 # Both saved models have to exist for the pairing, so the symbols it covers are
 # the symbols both were fitted on.
@@ -458,8 +511,8 @@ MODELS: "dict[str, AppleModel]" = {
             "will land, made once at 9:35 -- measured from the 9:35 price in units "
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL and AVGO: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + "
-            "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS; QCOM and "
-            "ORCL: LightGBM + N-BEATS + N-HiTS; META and AMGN: N-BEATS alone), fitted on "
+            "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS; QCOM, "
+            "ORCL and TMO: LightGBM + N-BEATS + N-HiTS; META and AMGN: N-BEATS alone), fitted on "
             "every session since 2023 with its first five minutes (MU's and BE's read "
             "from IEX, the only tape there is at 9:35 on a basic plan; BE's also with "
             "VST's opening move, its lead AI-power peer; NVDA's with SPY's opening, the "
@@ -467,12 +520,13 @@ MODELS: "dict[str, AppleModel]" = {
             "and META's also with the opening's trade counts and VWAP, and ORCL's with "
             "SPY and its cloud peers MSFT, AMZN and GOOGL; AMGN's with SPY, the "
             "pre-market, the previous evening, the opening's trade counts and its "
-            "biotech peers GILD, REGN and VRTX). On the "
+            "biotech peers GILD, REGN and VRTX; TMO's with its life-science tools peers "
+            "DHR, A and WAT). On the "
             "129-session test window its error is 35% below "
             "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
             "INTC; MU, BE and AVGO have no TimeToChange3 bundle, and beat that approach "
             "retrained on them by 25%, 33% and 34%, QCOM, ORCL and META by 43%, 31% "
-            "and 29%, AMGN by 34%. "
+            "and 29%, AMGN by 34%, TMO by 42%. "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -482,7 +536,8 @@ MODELS: "dict[str, AppleModel]" = {
             "checkpoints, and Alpaca credentials for ~150 sessions of SIP minute history "
             "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, on NVDA, "
             "ORCL and AMGN SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, on "
-            "AMGN GILD, REGN and VRTX, and on NVDA, QCOM, ORCL, META and AMGN this "
+            "AMGN GILD, REGN and VRTX, on TMO DHR, A and WAT, and on NVDA, QCOM, ORCL, "
+            "META and AMGN this "
             "morning's SIP pre-market)"
         ),
         strategy=STRATEGY_DAYRANGE,
@@ -578,6 +633,38 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=FASTFURIOUS_TICKERS,
         load=_load_fastfurious,
         path=_fastfurious_path,
+    ),
+    GOODMOMENTS_KEY: AppleModel(
+        key=GOODMOMENTS_KEY,
+        label="GoodMoments model",
+        summary=(
+            "FinNotebooks' GoodMoments forecast, made at the close of every minute: the "
+            "probability that a later bar of the session trades at least 0.2 ADR above this "
+            "bar's close. LightGBM on 27 features -- the clock and the variance still to come, "
+            "where the price sits against today's high, low, VWAP and open, yesterday's candle, "
+            "the 7- to 28-day averages and three volume-profile POCs, the session's order flow "
+            "(signed-volume and close-location proxies), last night's put/call volume, implied "
+            "move and dealer gamma, and the analysts' mean price target. On its 2026 test it "
+            "ranks rises at an AUC of 0.685 (0.585 within the same half hour), ahead of every "
+            "baseline, by a little. The same trees on the clock and today's volatility alone "
+            "give a second probability, and the rules trade the difference -- the edge: buy when "
+            "the model sees a rise 2 points likelier than time and volatility do, take +0.2 ADR, "
+            "stop -0.75 ADR, otherwise hold to the close (notebook 4's design 2; its first "
+            "design, on the probability itself, lost out of sample). The notebook's verdict on "
+            "those rules: +$496 on 199 test sessions at $10,000 a trade, inside the placebo "
+            "spread and below holding AAPL -- no edge that luck does not also produce."
+        ),
+        requires=(
+            "LightGBM, SciPy and joblib, the saved model and its time-and-volatility twin, "
+            "Alpaca credentials for ~130 days of SIP and IEX minute bars and today's live ones, "
+            "HighLow_3m's option cache (the contract list and daily option bars) and Yahoo's "
+            "analyst price targets"
+        ),
+        strategy=STRATEGY_PROBABILITY,
+        tickers=GOODMOMENTS_TICKERS,
+        load=_load_goodmoments,
+        path=_goodmoments_path,
+        unavailable=_goodmoments_unavailable,
     ),
     FF_HIGHLOW_KEY: AppleModel(
         key=FF_HIGHLOW_KEY,

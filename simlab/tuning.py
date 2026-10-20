@@ -85,7 +85,7 @@ from agent_stonks.config import (
     TAKE_TRIGGER_LABELS,
 )
 from agent_stonks import apple_models, minute_momentum
-from agent_stonks.apple_models import STRATEGY_DAYRANGE, STRATEGY_MOMENTUM
+from agent_stonks.apple_models import STRATEGY_DAYRANGE, STRATEGY_MOMENTUM, STRATEGY_PROBABILITY
 from agent_stonks.market_hours import MARKET_TZ
 
 TUNING_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab" / "tuning"
@@ -263,6 +263,22 @@ TUNABLES: "dict[str, Tunable]" = {
             "ff_hold_minutes", "Hold after the last buy signal (min)", 1, 120, 1,
             (15, 60, 15), "%d", integer=True,
         ),
+        # GoodMoments' rules (the probability strategy), the same way: only a
+        # grid on that model offers them. The notebook's own grid was entry
+        # 0.02-0.10 x stop 0.2-0.75 x take 0.2 or none (`gm_exit` is not an
+        # axis: "off" is not a number on a grid).
+        Tunable(
+            "gm_enter", "Entry: edge at least", -0.20, 0.30, 0.005,
+            (0.0, 0.10, 0.02), "%.3f",
+        ),
+        Tunable(
+            "gm_take_k", "Take-profit (ADR over the fill)", 0.0, 2.0, 0.05,
+            (0.10, 0.40, 0.10),
+        ),
+        Tunable(
+            "gm_stop_k", "Stop (ADR under the fill)", 0.0, 3.0, 0.05,
+            (0.25, 1.0, 0.25),
+        ),
     )
 }
 
@@ -352,6 +368,9 @@ SWEEPABLE: "tuple[str, ...]" = (
     "ff_entry_quantile",
     "ff_stop_k",
     "ff_hold_minutes",
+    "gm_enter",
+    "gm_take_k",
+    "gm_stop_k",
 )
 
 
@@ -366,10 +385,13 @@ AXES: "tuple[str, ...]" = tuple(TUNABLES) + tuple(CHOICES)
 MOMENTUM_AXES: "tuple[str, ...]" = (
     "ff_entry_quantile", "ff_stop_k", "ff_hold_minutes", "position_pct",
 )
+# GoodMoments' fields, for the same reason.
+PROBABILITY_AXES: "tuple[str, ...]" = ("gm_enter", "gm_take_k", "gm_stop_k", "position_pct")
 # What a new grid on each rule set starts from.
 DEFAULT_AXES = {
     STRATEGY_DAYRANGE: ("buy_k", "sell_k"),
     STRATEGY_MOMENTUM: ("ff_entry_quantile", "ff_stop_k"),
+    STRATEGY_PROBABILITY: ("gm_enter", "gm_stop_k"),
 }
 
 
@@ -383,11 +405,13 @@ def axes_for(model_key: "str | None", names) -> "list[str]":
     """`names`, narrowed to the axes the named model's rule set reads."""
     if apple_models.strategy(model_key) == STRATEGY_MOMENTUM:
         return [n for n in names if n in MOMENTUM_AXES]
+    if apple_models.strategy(model_key) == STRATEGY_PROBABILITY:
+        return [n for n in names if n in PROBABILITY_AXES]
     window = (
         WINDOW_AXES
         if apple_models.window_key(model_key) == apple_models.FASTFURIOUS_KEY else ()
     )
-    return [n for n in names if not n.startswith("ff_") or n in window]
+    return [n for n in names if not n.startswith(("ff_", "gm_")) or n in window]
 
 
 def axes_family(model_key: "str | None") -> str:

@@ -1144,12 +1144,91 @@ def _fastfurious_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _goodmoments_spec(ticker: str) -> ModelSpec:
+    path = _saved_path("APPLE_GOODMOMENTS_MODEL", "goodmoments_{ticker}.joblib", ticker)
+    twin = path.with_name(f"{path.stem}_timevol.joblib")
+    files = (
+        ModelFile("bundle", path),
+        ModelFile("metadata", path.with_suffix(".json")),
+        ModelFile("time-and-volatility twin", twin),
+    )
+    available, reason = _availability(files, "lightgbm", "scipy", "joblib")
+    meta = _read_json(path.with_suffix(".json"))
+    scores = meta.get("test_scores") or {}
+    metrics: "dict[str, object]" = {f"test · {name}": value for name, value in scores.items()}
+    params = meta.get("params") or {}
+    window = meta.get("fit_window") or []
+    model = apple_models.get(apple_models.GOODMOMENTS_KEY)
+    return ModelSpec(
+        key=apple_models.GOODMOMENTS_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note="",
+        project="GoodMoments, mirrors `goodmoments`",
+        predicts=(
+            "At the close of every bar of the regular session, the **probability that a later "
+            "bar of the same session trades at least 0.2 ADR above this bar's close** (ADR: the "
+            "mean log high-to-low range of the previous 14 sessions). Beside it, the same trees "
+            "on the clock and today's volatility alone; the trader buys on the difference."
+        ),
+        target=str(meta.get("target") or "y = 1 if max(high[t+1 .. close]) >= close[t] * exp(0.2 ADR)"),
+        algorithm=(
+            f"LightGBM, binary log loss, {params.get('num_leaves', '?')} leaves, "
+            f"{meta.get('n_trees', '?')} trees, leaves of at least "
+            f"{params.get('min_child_samples', '?')} rows, learning rate "
+            f"{params.get('learning_rate', '?')}; the time-and-volatility twin is the same recipe "
+            "on `frac_left` and `p_reach`"
+        ),
+        family="LightGBM classifier + time/vol twin",
+        consumers=(
+            "Apple Trader — probability strategy (GoodMoments rules)",
+            "Chart overlay — GoodMoments edge and buy signals",
+        ),
+        features=tuple(meta.get("features") or []),
+        inputs=(
+            "Today's session as the basic plan shows it at each bar's close — SIP to 15 minutes "
+            "back, IEX since (IEX volume scaled to SIP's) — plus ~130 days of SIP minute bars "
+            "(yesterday's candle, the 7- to 60-session averages and momentum, the 14-day range, "
+            "three volume-profile POCs, same-minute volume and variance norms over 20 sessions); "
+            "last night's option positioning (put/call volume, 30-day implied vol, dealer gamma "
+            "re-read at the live price), from Alpaca's daily option bars; Yahoo's analyst price "
+            "targets stamped before the bar"
+        ),
+        metrics=metrics,
+        headline=(
+            ("AUC within 30 min, test", f"{float(scores['auc_30min']):.3f}")
+            if scores.get("auc_30min") is not None else None
+        ),
+        files=files,
+        trained_at=str(window[-1]) if window else "",
+        data_note=(
+            f"Fitted {' – '.join(window)} · tested walk-forward 1 Jan – 16 Oct 2026 "
+            "(199 sessions, 77,411 bars)"
+            if window else ""
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            "A thin edge that holds out of sample: test AUC 0.685 against 0.672 for the clock "
+            "alone, 0.585 within the same half hour — most of what can be known is the time of "
+            "day and the volatility. Traded on its edge over the time-and-volatility twin it "
+            "made +$496 on the 199 test sessions at $10,000 a trade, beating two thirds of "
+            "placebos; holding AAPL made almost four times as much."
+        ),
+    )
+
+
 _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.HIGHLOW_KEY: _highlow_spec,
     apple_models.HIGHLOW2_KEY: _highlow2_spec,
     apple_models.HIGHLOW3M_KEY: _highlow3m_spec,
     apple_models.FASTFURIOUS_KEY: _fastfurious_spec,
+    apple_models.GOODMOMENTS_KEY: _goodmoments_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,
 }
 
