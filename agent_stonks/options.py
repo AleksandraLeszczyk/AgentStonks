@@ -346,11 +346,12 @@ def gamma_flip(data: dict, near: "float | None" = None) -> "float | None":
     no IVs.
 
     The price where the live chart's net gamma panel changes colour, and how
-    HighLow_3m's `gamma_flip` feature reads its own chains. Not the Put/Call
-    Walls tab's Gamma Flip (`technical_analysis.get_put_call_walls_and_gamma`):
-    that is the strike where per-strike gamma at today's spot, summed from the
-    lowest strike up, turns positive, which on a near expiry can sit on the
-    other side of the price from this one, or not exist.
+    the option tables' `gamma_flip` (`option_positioning`) reads its own
+    chains. Not the Put/Call Walls tab's Gamma Flip
+    (`technical_analysis.get_put_call_walls_and_gamma`): that is the strike
+    where per-strike gamma at today's spot, summed from the lowest strike up,
+    turns positive, which on a near expiry can sit on the other side of the
+    price from this one, or not exist.
     """
     if not data or not data.get("strikes"):
         return None

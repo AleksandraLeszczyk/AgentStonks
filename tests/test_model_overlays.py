@@ -856,22 +856,6 @@ class TestRecordedTraderLevels:
         stamp = pd.Timestamp(high["x0"]).tz_convert("America/New_York")
         assert (stamp.hour, stamp.minute) == (9, 36)
 
-    def test_highlow3ms_window_opens_the_band_before_the_runs_own_levels(self, monkeypatch):
-        """A HighLow run that traded HighLow_3m's 9:33 window recorded those
-        bars on that model's levels: a step into its own, never one flat pair,
-        and the note says what the first step was."""
-        from dataclasses import replace
-
-        history = self.history([207.0] * 4, model_key="highlow")
-        history["config"] = replace(history["config"], use_3m=True, buy_3m_k=0.4,
-                                    sell_3m_k=0.25)
-        for row in history["rows"][:2]:
-            row["model_key"] = "highlow3m"
-        items = self.compute([mo.TRADER_LEVELS_KEY], history, monkeypatch)
-        band = next(i for i in items if i["kind"] == "band")
-        assert band["lower"] == [207.0] * 4
-        assert "HighLow_3m's 9:33 window: buy 0.4 × and sell 0.25 ×" in band["note"]
-
     def test_levels_that_never_moved_are_still_two_flat_lines(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY], self.history([207.0] * 3), monkeypatch)
         levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
@@ -1118,55 +1102,6 @@ class TestHighLow2Overlay:
         assert "session" not in levels["Pred. low"]["note"]
         buy = next(i for i in items if i["label"] == "Buy level")
         assert buy["value"] == pytest.approx(203.0 - 0.75 * 3.0)
-
-
-class TestHighLow3mOverlay:
-    """HighLow_3m's range is drawn like the others, under its own key, and an
-    agent configured on it has its levels drawn under HighLow_3m's high."""
-
-    @pytest.fixture()
-    def stubbed(self, monkeypatch):
-        pytest.importorskip("agent_stonks.highlow_model")
-        hl3 = pytest.importorskip("agent_stonks.highlow3m_model")
-        seen = TestHighLowOverlay().stub_both(monkeypatch, highlow_high=206.0)
-        base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0,
-                "range_after_opening": True}
-
-        def highlow3m(bundle, ticker, opening, day, key=None, secret=None):
-            seen.append(("highlow3m", len(opening), key, secret))
-            return {**base, "pred_high": 203.0, "pred_low": 193.0}
-
-        monkeypatch.setattr(hl3, "forecast_session", highlow3m)
-        return seen
-
-    def test_the_highlow3m_range_is_two_levels_under_its_own_key(self, stubbed):
-        result = mo.compute([mo.HIGHLOW3M_RANGE_KEY], "AAPL", minute_bars(),
-                            daily_bars=[], session_date=SESSION, credentials=("k", "s"))
-        levels = {i["label"]: i["value"] for i in result["items"] if i["kind"] == "level"}
-        assert levels == {"Pred. high": 203.0, "Pred. low": 193.0}
-        assert {i["key"] for i in result["items"]} == {mo.HIGHLOW3M_RANGE_KEY}
-        # Three minutes, not five; HighLow was never asked.
-        assert stubbed == [("highlow3m", 3, "k", "s")]
-
-    def test_the_agents_levels_follow_highlow3m(self, stubbed):
-        items = mo.compute(
-            [mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[], session_date=SESSION,
-            trader_config=TestHighLowOverlay().config(model_key="highlow3m"),
-        )["items"]
-        buy = next(i for i in items if i["label"] == "Buy level")
-        assert buy["value"] == pytest.approx(203.0 - 0.75 * 3.0)
-        assert "(HighLow_3m)" in buy["note"]
-
-    def test_a_highlow3m_run_opens_showing_its_range(self):
-        assert mo.for_models([apple_models.HIGHLOW3M_KEY], "AAPL")["keys"] == [mo.HIGHLOW3M_RANGE_KEY]
-        assert mo.HIGHLOW3M_RANGE_KEY not in mo.keys_for("INTC")
-
-    def test_the_tuning_chart_names_its_overlay(self, stubbed):
-        result = mo.session_forecast(apple_models.HIGHLOW3M_KEY, "AAPL", minute_bars(),
-                                     session_date=SESSION)
-        assert result["overlay"] == mo.HIGHLOW3M_RANGE_KEY
-        assert result["forecast"]["pred_high"] == 203.0
-        assert f"{result['made_at']:%H:%M}" == "09:32"
 
 
 class TestFastFuriousOverlay:

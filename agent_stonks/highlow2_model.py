@@ -63,7 +63,7 @@ Apple Trader uses it only for the forecast, as it uses HighLow:
 and `apple_trader.DayRangeTrader` runs on them unchanged. With a rest head,
 those keys carry the rest forecast -- the trader's reference high and its
 predicted range are the rest of the session's -- and say so
-(`range_after_opening`, HighLow_3m's flag), so a breach is read on the bars
+(`range_after_opening`), so a breach is read on the bars
 after the opening window; the day head's pair rides along as `day_high` /
 `day_low`.
 

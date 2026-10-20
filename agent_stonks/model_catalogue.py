@@ -938,128 +938,6 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
     )
 
 
-# HighLow_3m's sidecar scores four windows (`scores`); what each is called here.
-_HIGHLOW3M_WINDOWS = (
-    ("holdout_2026", "2026 holdout"),
-    ("test", "test window"),
-    ("baseline_test", "14-day baseline, test window"),
-    ("selection_2025", "2025 selection"),
-)
-_HIGHLOW3M_SCORES = ("mae_pct_adr", "mae_usd", "mae", "range_corr", "high_inside", "low_inside", "n")
-
-
-def _highlow3m_spec(ticker: str) -> ModelSpec:
-    path = _saved_path("APPLE_HIGHLOW3M_MODEL", "highlow3m_{ticker}.joblib", ticker)
-    files = (
-        ModelFile("bundle", path),
-        ModelFile("metadata", path.with_suffix(".json")),
-    )
-    available, reason = _availability(files, "lightgbm", "scipy", "joblib")
-    meta = _read_json(path.with_suffix(".json"))
-    scores = meta.get("scores") or {}
-    # The headline is the 2026 holdout, not the 9-session test window: walk-forward
-    # months refitted on everything before them, every one out of sample -- the
-    # notebook README's "honest number". The test window is the shipped model's own
-    # score, on nine sessions.
-    holdout = scores.get("holdout_2026") or {}
-    test = scores.get("test") or {}
-    error_pct = holdout.get("mae_pct_adr")
-    metrics: "dict[str, object]" = {}
-    if error_pct is not None:
-        metrics["MAE (% of ADR)"] = error_pct
-    for window, label in _HIGHLOW3M_WINDOWS:
-        for name in _HIGHLOW3M_SCORES:
-            value = (scores.get(window) or {}).get(name)
-            if value is not None:
-                metrics[f"{label} · {name}"] = value
-    weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
-    data = meta.get("data") or {}
-    recipe = meta.get("recipe") or {}
-    windows = meta.get("windows") or {}
-    test_window = " – ".join(windows.get("test") or []) or "?"
-    model = apple_models.get(apple_models.HIGHLOW3M_KEY)
-    blend = " + ".join(f"{k} {w:g}" for k, w in weights.items()) or "?"
-    return ModelSpec(
-        key=apple_models.HIGHLOW3M_KEY,
-        label=model.label,
-        summary=model.summary,
-        ticker=ticker,
-        ticker_note=(
-            f"Trained on {ticker} with {', '.join(data['pool'])} pooled in, each in its "
-            "own 14-day-range units"
-            if data.get("pool") else ""
-        ),
-        project="HighLow_3m, mirrors `highlow3m`",
-        predicts=(
-            "How high and how low the price trades **from 9:33 to the close** — not the whole "
-            "session's extremes, which print in the first three minutes on about half of "
-            "AAPL's sessions — called once at 9:33 from IEX's first three minutes, the SIP "
-            "daily history and last night's option positioning, measured from the 9:33 "
-            "price (IEX's 9:32 close) in 14-day average ranges. Not clipped to the opening "
-            "range."
-        ),
-        target="up = log(rest_high / close3) / adr14, down = log(close3 / rest_low) / adr14",
-        algorithm=(
-            f"Blend {blend}: LightGBM, L1 loss, {recipe.get('lgbm_params', {}).get('num_leaves', '?')} "
-            f"leaves, averaged over seeds {', '.join(str(x) for x in recipe.get('seeds') or []) or '?'}; "
-            f"linear median (quantile) regression on standardised features, alpha "
-            f"{recipe.get('linear_alpha', '?')}"
-        ),
-        family="LightGBM (3 seeds) + linear median",
-        consumers=(
-            "Apple Trader — day-range strategy",
-            "Chart overlay — predicted rest-of-day range (HighLow_3m)",
-        ),
-        features=tuple(meta.get("feature_cols") or []),
-        inputs=(
-            "~127 sessions of SIP minute bars rolled up to daily, the SIP extremes after 9:33 "
-            "of the last 14 and the IEX openings of the last 14; today's first 3 minutes from "
-            "IEX; last night's option positioning, rebuilt from the contract list and every "
-            "expiration's daily bars over its last 120 days (open interest as the running sum "
-            "of size-weighted volume), priced with Yahoo's 13-week T-bill yield"
-        ),
-        metrics=metrics,
-        headline=(
-            ("MAE (% of ADR)", f"{float(error_pct):.1f}%")
-            if error_pct is not None
-            else ("MAE (log units)", format_metric(test.get("mae")))
-        ),
-        files=files,
-        trained_at=str(meta.get("created") or ""),
-        data_note=(
-            f"Fitted through {data.get('fit_through', '?')} on {data.get('training_rows', '?')} "
-            f"sessions ({data.get('aapl_rows', '?')} {ticker}) from {data.get('history_start', '?')} · "
-            f"tested {test_window} · traded {' – '.join(windows.get('traded_week') or []) or '?'}"
-            if meta
-            else ""
-        ),
-        versions={},
-        threshold=None,
-        requires=model.requires,
-        available=available,
-        unavailable_reason=reason,
-        caveat=(
-            (
-                f"Misses each extreme by about {float(error_pct):.0f}% of a typical day's range "
-                f"over the {holdout.get('n', '?')}-session 2026 holdout"
-                + (
-                    f" ({float(test['mae_pct_adr']):.0f}% on the {test.get('n', '?')}-session "
-                    f"test window, {test_window})"
-                    if test.get("mae_pct_adr") is not None
-                    else ""
-                )
-                + ". "
-                if error_pct is not None
-                else ""
-            )
-            + "Not comparable with the other day-range rows: its target is the range after "
-            "9:33, which no opening-range clip can help. 8.7% better than a 14-day baseline "
-            "in every 2026 month — a forecast of width, not direction. The shipped trading "
-            "distances were never swept on it."
-        ),
-    )
-
-
 def _fastfurious_spec(ticker: str) -> ModelSpec:
     path = _saved_path("APPLE_FASTFURIOUS_MODEL", "fastfurious_{ticker}.joblib", ticker)
     files = (
@@ -1226,7 +1104,6 @@ _BUILDERS = {
     apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.HIGHLOW_KEY: _highlow_spec,
     apple_models.HIGHLOW2_KEY: _highlow2_spec,
-    apple_models.HIGHLOW3M_KEY: _highlow3m_spec,
     apple_models.FASTFURIOUS_KEY: _fastfurious_spec,
     apple_models.GOODMOMENTS_KEY: _goodmoments_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,

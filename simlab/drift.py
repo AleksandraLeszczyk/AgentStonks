@@ -22,11 +22,6 @@ What each model is scored on
                 the history, IEX's opening and the pre-market -- from its own
                 cache of Alpaca's tapes (`highlow2_model`), so the stored tape
                 only decides which sessions are scored.
-`highlow3m`     HighLow_3m's 9:33 forecast of the range *after* 9:33, scored
-                against the stored minute session's extremes from 9:33 on
-                rather than the daily bar -- its own question. Every input
-                comes from its own caches (`highlow3m_model`): the minute
-                history, IEX's opening and the option tables.
 `intraday_vol`  IntradayVolatility's daily-bar forecast of the log day range
                 against the day's ln(high/low) -- daily bars only, so the whole
                 stored daily history -- plus how well each session's 5-minute
@@ -858,55 +853,6 @@ def highlow2_training(ticker: str) -> dict:
     return highlow2_training_from_metadata(_read_json(path))
 
 
-def highlow3m_training_from_metadata(meta: dict) -> dict:
-    """Cutoffs and references out of a HighLow_3m bundle's JSON sidecar.
-
-    One cutoff: the shipped model is fitted through `data.fit_through`, the
-    session before its test window. Two kinds of reference: the 2026 holdout
-    (walk-forward months, each refitted on everything before it -- every
-    session out of sample, 170 of them) and the shipped model's own 9-session
-    test window. Both against the SIP extremes after 9:33.
-    """
-    cutoffs: "list[Cutoff]" = []
-    references: "list[Reference]" = []
-    if not meta:
-        return {"cutoffs": cutoffs, "references": references}
-    data = meta.get("data") or {}
-    if data.get("fit_through"):
-        cutoffs.append(Cutoff(
-            str(data["fit_through"])[:10], "Trained through",
-            f"{data.get('training_rows', '?')} sessions from "
-            f"{str(data.get('history_start') or '?')[:10]}, "
-            f"{', '.join(data.get('pool') or []) or 'no other tickers'} pooled in",
-        ))
-    scores = meta.get("scores") or {}
-    windows = meta.get("windows") or {}
-    for key, label in (("holdout_2026", "2026 holdout (walk-forward)"), ("test", "Held-out test window")):
-        score = scores.get(key) or {}
-        span = windows.get("holdout" if key == "holdout_2026" else key) or []
-        where = (
-            f"{str(span[0])[:10]} – {str(span[-1])[:10]}, {score.get('n', '?')} sessions"
-            if len(span) == 2 else f"{score.get('n', '?')} sessions"
-        )
-        for metric, field in (
-            ("mae_pct_adr", "mae_pct_adr"), ("mae", "mae"), ("mae_usd", "mae_usd"),
-            ("abs_err_high", "mae_high"), ("abs_err_low", "mae_low"),
-            ("bias_high", "bias_high"), ("bias_low", "bias_low"),
-        ):
-            if score.get(field) is not None:
-                references.append(Reference(
-                    metric, float(score[field]), label,
-                    f"{where}, against the SIP minute extremes after 9:33",
-                ))
-    return {"cutoffs": cutoffs, "references": references}
-
-
-def highlow3m_training(ticker: str) -> dict:
-    spec = model_catalogue.spec(apple_models.HIGHLOW3M_KEY, ticker)
-    path = next((f.path for f in spec.files if f.role == "metadata"), None) if spec else None
-    return highlow3m_training_from_metadata(_read_json(path))
-
-
 def highlow_training(ticker: str) -> dict:
     spec = model_catalogue.spec(apple_models.HIGHLOW_KEY, ticker)
     path = next((f.path for f in spec.files if f.role == "metadata"), None) if spec else None
@@ -941,23 +887,15 @@ def evaluate_highlow2(ticker: str, feed: str) -> dict:
     return _evaluate_highlow_family(apple_models.HIGHLOW2_KEY, highlow2_model, ticker, feed)
 
 
-def evaluate_highlow3m(ticker: str, feed: str) -> dict:
-    """HighLow_3m's 9:33 forecast of every stored minute session, graded on
-    its own question: against the stored session's high and low from 9:33 on."""
-    from agent_stonks import highlow3m_model  # LightGBM, only once needed
-
-    return _evaluate_highlow_family(apple_models.HIGHLOW3M_KEY, highlow3m_model, ticker, feed)
-
-
 def _evaluate_highlow_family(model_key: str, module, ticker: str, feed: str) -> dict:
     """`evaluate_highlow`'s body, for any HighLow model: `module` is the one
-    behind `model_key` (`highlow_model`, `highlow2_model` or `highlow3m_model`,
-    which expose the same `opening_feed` / `warm_history` / `forecast_session`).
+    behind `model_key` (`highlow_model` or `highlow2_model`, which expose the
+    same `opening_feed` / `warm_history` / `forecast_session`).
 
     A forecast of the range after the opening window (`range_after_opening`,
-    HighLow_3m's) is scored against the stored session's extremes after that
-    window instead of the daily bar's: the first minutes are not what it
-    claims anything about."""
+    HighLow2's rest head) is scored against the stored session's extremes
+    after that window instead of the daily bar's: the first minutes are not
+    what it claims anything about."""
     symbol = ticker.upper()
     bundle = apple_models.load(model_key, symbol)
     if bundle is None:
@@ -978,13 +916,6 @@ def _evaluate_highlow_family(model_key: str, module, ticker: str, feed: str) -> 
                 if bundle.get("rest_head") else ""
             )
         )
-    elif bundle.get("kind") == "highlow3m":
-        notes.append(
-            "This model reads its opening minutes from Alpaca's IEX tape and last night's "
-            "option tables from Alpaca's option bars, whatever the stored tape. It is scored "
-            f"against the stored {feed.upper()} session's high and low from 9:33 on -- the "
-            "range it forecasts -- where its notebook used SIP's."
-        )
     elif opening_feed != "sip":
         notes.append(
             f"This model reads the opening minutes from {opening_feed.upper()} whatever the "
@@ -1000,12 +931,8 @@ def _evaluate_highlow_family(model_key: str, module, ticker: str, feed: str) -> 
     # over every day in between, so a missing key or a failed fetch is one note
     # rather than one per session.
     try:
-        if hasattr(module, "warm_span") and days:
-            # Every close the sessions read, in one build (HighLow_3m's option tables).
-            module.warm_span(bundle, symbol, days[0], days[-1])
-        else:
-            for day in (days[:1] + days[-1:]):
-                module.warm_history(bundle, symbol, day)
+        for day in (days[:1] + days[-1:]):
+            module.warm_history(bundle, symbol, day)
     except Exception as exc:  # noqa: BLE001 -- a network error is a note here
         return {"rows": [], "notes": notes + [
             f"No minute history for the {apple_models.get(model_key).label} forecast — "
@@ -1362,27 +1289,6 @@ MODELS: "dict[str, DriftModel]" = {
             "dollar miss over its own average daily range; on later sessions instead of the "
             "test window, against the stored daily bar rather than the SIP minute extremes "
             "(on INTC, the stored session's extremes from 9:35 on), and with shock days in"
-        ),
-    ),
-    apple_models.HIGHLOW3M_KEY: DriftModel(
-        key=apple_models.HIGHLOW3M_KEY,
-        label=apple_models.get(apple_models.HIGHLOW3M_KEY).label,
-        summary=(
-            "The 9:33 forecast of the high and low *after 9:33* against what the stored "
-            "session then did from 9:33 on — its own question, not the day's extremes. "
-            "Fitted through the session before its test window, so every session from that "
-            "window on is one it never saw."
-        ),
-        tickers=apple_models.HIGHLOW3M_TICKERS,
-        needs_minute_bars=True,
-        metrics=HIGHLOW_METRICS,
-        evaluate=evaluate_highlow3m,
-        training=highlow3m_training,
-        headline="mae_pct_adr",
-        catalogue_metric=(
-            "MAE (% of ADR) — the same quantity the ML Models tab reports (its 2026 "
-            "holdout), each session's dollar miss over its own average daily range; on later "
-            "sessions, against the stored tape's extremes after 9:33 rather than SIP's"
         ),
     ),
     "intraday_vol": DriftModel(

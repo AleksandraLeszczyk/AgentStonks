@@ -6,7 +6,7 @@ uses (a $10 ADR under a $110 predicted high: buy $102.50, sell $109.00) and a
 scripted Fast&Furious forecast per minute -- so these pin the RULES: what the
 window buys on, how it gets out inside the window, what is handed to the 9:35
 levels, and how the model is kept apart from what it cannot do (Orchestra,
-HighLow_3m's window, a mid-run model switch).
+a mid-run model switch).
 """
 
 import math
@@ -390,7 +390,10 @@ class TestConfig:
     HIGHLOW_BASE = {
         "model_key": "highlow", "ticker": TICKER, "buy_k": 0.85, "sell_k": 0.1,
         "stop_gain_fraction": 0.8, "level_unit": "pred_range", "breach_update": "brownian",
-        "use_3m": True, "min_win_k": 0.1,
+        "min_win_k": 0.1,
+        # A field since removed (HighLow_3m's window, 2026-10-20): a stored
+        # base still carrying it opens all the same.
+        "use_3m": True,
     }
 
     def _bases(self, monkeypatch, pairs: dict) -> None:
@@ -405,12 +408,12 @@ class TestConfig:
         assert config.model_key == KEY
         assert (config.buy_k, config.sell_k, config.stop_gain_fraction) == (0.85, 0.1, 0.8)
         assert config.breach_update == "brownian" and config.level_unit == "pred_range"
-        assert config.use_3m is False  # HighLow_3m's window is refused on it
+        assert not hasattr(config, "use_3m")
         assert at.config_error(config) is None
         assert at.base_record(KEY, TICKER)[1] == "highlow"
 
     def test_its_own_base_wins(self, monkeypatch):
-        own = {**self.HIGHLOW_BASE, "model_key": KEY, "buy_k": 0.6, "use_3m": False}
+        own = {**self.HIGHLOW_BASE, "model_key": KEY, "buy_k": 0.6}
         self._bases(monkeypatch, {"highlow": self.HIGHLOW_BASE, KEY: own})
         assert at.default_config(TICKER, KEY).buy_k == 0.6
         assert at.base_record(KEY, TICKER)[1] == KEY
@@ -425,10 +428,6 @@ class TestConfig:
         assert on.startswith(f"{KEY}_{TICKER}(")
         assert ",ff=[q=0.95,stop=1.5dn,hold=30m,sellexit]," in on
         assert "ff=" not in config_signature(replace(ffhl_config(), model_key="highlow"))
-
-    def test_highlow_3ms_window_is_refused_on_it(self):
-        error = at.config_error(ffhl_config(use_3m=True))
-        assert error and "Switch it off" in error
 
     def test_the_armed_line_says_what_the_window_does(self):
         line = at._armed_summary(ffhl_config(), apple_models.get(KEY), DAYRANGE_BUNDLE)
@@ -510,7 +509,6 @@ class TestForm:
         )
         quantile = app.number_input(key=f"t_ff_entry_quantile_{KEY}_AAPL")
         assert quantile.value == pytest.approx(0.95)
-        assert not [w for w in app.checkbox if w.key.startswith("t_use_3m")]
         quantile.set_value(0.98).run()
         out = app.session_state["out"]
         assert out.model_key == KEY and out.ff_entry_quantile == pytest.approx(0.98)

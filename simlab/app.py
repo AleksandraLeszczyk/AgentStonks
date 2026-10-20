@@ -1819,15 +1819,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Sessions the replay does not trade: no forecast, no order. In the signature as "
             "`skip=...`; a record from before the rule replays with none."
         ),
-        "dayrange_3m": (
-            "The 09:33 and 09:34 bars, traded on HighLow_3m's 9:33 forecast before "
-            "HighLow's 9:35 one exists.\n\n"
-            "- Its own buy and sell under HighLow_3m's predicted high, in the run's unit; "
-            "no stop, no momentum confirmation, no take.\n"
-            "- A position still open at 9:35 is handed to HighLow's levels and exits.\n"
-            "- In the signature as `3m=H-0.4R/H-0.25R` while on; both distances are "
-            "Tuning-tab axes. A record from before it replays with it off."
-        ),
         "ff_window": (
             "The 09:30 to 09:34 bars, traded on Fast&Furious's per-minute forecast before "
             "HighLow's 9:35 one exists.\n\n"
@@ -1877,8 +1868,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- Reads every input from Alpaca, whatever the dataset's tape: ~200 days of SIP "
             "and IEX minute bars before each replayed day and the day's own, cut at each "
             "minute to SIP 15 minutes back and IEX since (ALPACA_API_KEY / ALPACA_SECRET), "
-            "cached under `data/fastfurious/`; the stop's option table is HighLow_3m's "
-            "(`data/highlow3m/`). A cold first replay fetches for about two minutes.\n"
+            "cached under `data/fastfurious/`; the stop's option table is the shared one "
+            "(`data/option_positioning/`). A cold first replay fetches for about two minutes.\n"
             "- The trades are the dataset's tape and fills, the forecast the model's own "
             "tape: on a yfinance dataset a stop is checked on yfinance's lows.\n"
             "- A stop does not end the session: the next buy waits until the forecast has "
@@ -1892,7 +1883,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "IEX minute bars before each replayed day and the day's own, cut at each minute to "
             "SIP 15 minutes back and IEX since (ALPACA_API_KEY / ALPACA_SECRET), cached under "
             "`data/fastfurious/` (shared with Fast&Furious); last night's option table from "
-            "HighLow_3m's option cache, priced the notebook's way (`data/goodmoments/`); "
+            "the shared option cache, priced the notebook's way (`data/goodmoments/`); "
             "Yahoo's analyst price targets as stamped before each bar.\n"
             "- The trades are the dataset's tape and fills, the forecast the model's own tape: "
             "on a yfinance dataset the take and the stop are checked on yfinance's bars.\n"
@@ -1901,22 +1892,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         "model_dayrange": (
             "The predicted high, flat for the session — what the shipped buy/sell "
             "distances were swept against, and what every stored record replays as."
-        ),
-        "use_3m": (
-            "Trade 09:33–09:35 on HighLow_3m's 9:33 forecast, then hand any open "
-            "position to HighLow at 9:35.\n\n"
-            "- Reads HighLow_3m's inputs from Alpaca as a HighLow_3m run does "
-            "(ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow3m/` — a cold "
-            "week takes about two minutes.\n"
-            "- A trade the window closes does not trip the circuit breaker."
-        ),
-        "buy_3m_k": (
-            "Starts at **{buy_3m_k}** on {ticker} — HighLow_3m's own starting pair, never "
-            "swept for this window. Sweepable."
-        ),
-        "sell_3m_k": (
-            "Starts at **{sell_3m_k}** on {ticker}. Only two bars to reach it; a "
-            "position that does not is handed to HighLow at 9:35. Sweepable."
         ),
         "model_highlow": (
             "The day-range rules on HighLow's predicted high and range. The shipped "
@@ -1954,16 +1929,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the first replay fetches it.\n"
             "- Fitted without shock days, so a replay through earnings scores a forecast "
             "of an ordinary day."
-        ),
-        "model_highlow3m": (
-            "The day-range rules on HighLow_3m's predicted high and range — the range "
-            "*after 9:33*, forecast at 9:33, so breaches are read on the bars after it. "
-            "No distances were ever swept on it, so sweep them on the Tuning tab.\n\n"
-            "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
-            "minute history before each replayed day, that morning's IEX opening, and the "
-            "option chain's daily bars up to the previous close, plus Yahoo's ^IRX "
-            "(ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow3m/` — the first "
-            "replay fetches it (about a minute)."
         ),
         "model_dayrange_intraday": (
             "The levels rest under the top of the intraday band, so the whole ladder "

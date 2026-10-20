@@ -380,13 +380,13 @@ class TestOrchestraConfig:
     def test_takes_racers_of_the_class_before_a_module_reload(self):
         # Saving a file makes Streamlit unload the app's modules, so a race
         # started before the save keeps publishing configs of the old class --
-        # here one that has not gained `use_3m` yet and still has a field since
+        # here one that has not gained `take_trigger` yet and still has a field since
         # removed. Rebuilding the running race from them raised TypeError.
         aapl, intc = racer("AAPL"), racer("INTC")
         old_class = make_dataclass(
             "AppleTraderConfig",
             [(f.name, object, field(default=None))
-             for f in fields(at.AppleTraderConfig) if f.name != "use_3m"]
+             for f in fields(at.AppleTraderConfig) if f.name != "take_trigger"]
             + [("removed_since", object, field(default=None))],
         )
         stale = [

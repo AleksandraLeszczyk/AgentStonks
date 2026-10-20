@@ -345,15 +345,6 @@ class TestHighLow2Spec:
         assert "whole session" in day.predicts and "rest" not in day.target
 
 
-def test_highlow3m_path_mirrors_the_real_one():
-    highlow3m = pytest.importorskip("agent_stonks.highlow3m_model")
-    spec = mc.spec(apple_models.HIGHLOW3M_KEY, "AAPL")
-    by_role = {f.role: f.path for f in spec.files}
-    real = highlow3m.model_path("AAPL")
-    assert by_role["bundle"] == real
-    assert by_role["metadata"] == highlow3m.metadata_path(real)
-
-
 def test_goodmoments_paths_mirror_the_real_ones():
     goodmoments = pytest.importorskip("agent_stonks.goodmoments_model")
     spec = mc.spec(apple_models.GOODMOMENTS_KEY, "AAPL")
@@ -362,54 +353,6 @@ def test_goodmoments_paths_mirror_the_real_ones():
     assert by_role["bundle"] == real
     assert by_role["metadata"] == goodmoments.metadata_path(real)
     assert by_role["time-and-volatility twin"] == goodmoments.timevol_path(real)
-
-
-HIGHLOW3M_SIDECAR = {
-    "ticker": "AAPL",
-    "created": "2026-10-05T20:24:36",
-    "feature_cols": ["or_down", "iv1d_move"],
-    "weights": {"lgbm": 0.8, "linear": 0.2},
-    "data": {"history_start": "2024-01-01", "fit_through": "2026-09-04", "aapl_rows": 637,
-             "training_rows": 3822, "pool": ["GOOGL", "MSFT"]},
-    "recipe": {"seeds": [7, 11, 23], "linear_alpha": 0.02, "lgbm_params": {"num_leaves": 7}},
-    "scores": {
-        "holdout_2026": {"n": 170, "mae": 0.00636, "mae_usd": 1.81, "mae_pct_adr": 30.34},
-        "test": {"n": 9, "mae": 0.00596, "mae_usd": 1.95, "mae_pct_adr": 26.31},
-        "baseline_test": {"n": 9, "mae_pct_adr": 30.53},
-    },
-    "windows": {"test": ["2026-09-07", "2026-09-20"], "traded_week": ["2026-09-21", "2026-09-25"]},
-}
-
-
-def _highlow3m_spec_from(meta, tmp_path, monkeypatch):
-    bundle = tmp_path / "highlow3m_AAPL.joblib"
-    bundle.with_suffix(".json").write_text(json.dumps(meta))
-    monkeypatch.setenv("APPLE_HIGHLOW3M_MODEL_AAPL", str(bundle))
-    return mc.spec(apple_models.HIGHLOW3M_KEY, "AAPL")
-
-
-class TestHighLow3mSpec:
-    """The headline is the 2026 holdout -- every session out of sample -- and
-    the row says its number is about a different range from the others'."""
-
-    def test_the_headline_is_the_holdouts_share_of_adr(self, tmp_path, monkeypatch):
-        spec = _highlow3m_spec_from(HIGHLOW3M_SIDECAR, tmp_path, monkeypatch)
-        assert spec.headline == ("MAE (% of ADR)", "30.3%")
-        assert next(iter(spec.metrics)) == "MAE (% of ADR)"
-        assert spec.metrics["test window · mae_pct_adr"] == 26.31
-        assert spec.metrics["14-day baseline, test window · mae_pct_adr"] == 30.53
-        assert "170-session 2026 holdout" in spec.caveat and "9-session" in spec.caveat
-        assert "Not comparable" in spec.caveat
-        assert "GOOGL, MSFT pooled in" in spec.ticker_note
-        assert "3822 sessions (637 AAPL)" in spec.data_note
-        assert "lgbm 0.8 + linear 0.2" in spec.algorithm
-        assert spec.features == ("or_down", "iv1d_move")
-
-    def test_a_sidecar_without_scores_invents_nothing(self, tmp_path, monkeypatch):
-        meta = {k: v for k, v in HIGHLOW3M_SIDECAR.items() if k != "scores"}
-        spec = _highlow3m_spec_from(meta, tmp_path, monkeypatch)
-        assert spec.headline == ("MAE (log units)", "—")
-        assert "MAE (% of ADR)" not in spec.metrics
 
 
 def test_missing_file_is_a_reason_not_an_exception(tmp_path, monkeypatch):

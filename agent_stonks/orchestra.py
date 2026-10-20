@@ -109,12 +109,8 @@ MODE_LABELS = {
 # instruments, not several rule sets: the pair (ticker, model) and the numbers
 # tuned per pair -- the two distances and the circuit breaker -- are the racer's
 # own, and everything else is Orchestra's. `level_source` follows the model.
-# HighLow_3m's window distances default per instrument like the levels, so a
-# racer decoded from a record carries its own; Orchestra never trades the
-# window (`OrchestraConfig` refuses `use_3m`), so they change nothing.
 PER_RACER_FIELDS = (
     "ticker", "model_key", "buy_k", "sell_k", "min_win_k", "level_source",
-    "buy_3m_k", "sell_3m_k",
 )
 
 
@@ -137,7 +133,6 @@ SHORT_MODEL_NAMES = {
     "dayrange_intraday": "Day Range × IV",
     "highlow": "HighLow",
     "highlow2": "HighLow2",
-    "highlow3m": "HighLow_3m",
     "fastfurious": "Fast&Furious",
     "goodmoments": "GoodMoments",
     "ff_highlow": "F&F + HighLow",
@@ -216,13 +211,6 @@ class OrchestraConfig:
             raise ValueError(
                 f"Orchestra races the day-range rules, and {racer_label(other[0])} runs its "
                 "own: run it as Apple Trader"
-            )
-        # Its candidates are picked at 09:34, after the window's first trade
-        # could have been made, and its signature has no place for it.
-        if any(r.use_3m for r in self.racers):
-            raise ValueError(
-                "Orchestra does not trade HighLow_3m's 9:33 window (use_3m): its pairs "
-                "are picked at 09:34 and race from their own forecasts"
             )
         windowed = [r for r in self.racers if apple_models.window_key(r.model_key)]
         if windowed:
@@ -740,8 +728,7 @@ class Orchestra:
             if not self._restore_selection(state, today):
                 if not self._selection_due(state):
                     # Before 09:34 there is nothing to read: which racers will
-                    # forecast is not decided (a HighLow_3m racer, whose window
-                    # closes at 9:33, forecasts from it once picked).
+                    # forecast is not decided.
                     self._publish(state)
                     return rule_agent.WARMING_UP
                 self._select(state, today)
