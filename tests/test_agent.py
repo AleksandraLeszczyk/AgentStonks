@@ -28,6 +28,7 @@ from agent_stonks.agent import (
     _wait_for_next_cycle,
     run_agent_cycle,
     sell_everything_and_stop,
+    stop_agent_and_wait,
 )
 from agent_stonks.broker import Broker
 from agent_stonks.config import AGENT_FINALIZE_ITERS, AGENT_RETRY_SEC, AGENT_WAKE_MAX_MINUTES
@@ -1268,6 +1269,65 @@ class TestSellEverythingAndStop:
         assert [d.symbol for d in decisions] == ["MSFT"]
         assert len(errors) == 1 and "AAPL" in errors[0]
         assert tracker.position_for("MSFT") == 0.0
+
+
+class TestStopAgentAndWait:
+    def _running(self, app):
+        """A loop started the way every launcher starts one -- its stop event in
+        its thread's args -- that winds down once `release` is set."""
+        stop_event, release = threading.Event(), threading.Event()
+        app.agent_stop_event = stop_event
+        app.agent_running = True
+
+        def loop(state, stop_event):
+            stop_event.wait()
+            release.wait(5)
+            state.agent_running = False  # what every loop's wind-down does
+            state.agent_log.append({"type": "status", "text": "wound down"})
+
+        thread = threading.Thread(target=loop, args=(app, stop_event), daemon=True)
+        thread.start()
+        return thread, release
+
+    def test_waits_for_the_loop_to_wind_down(self):
+        app, _ = _app()
+        thread, release = self._running(app)
+        threading.Timer(0.1, release.set).start()
+        assert stop_agent_and_wait(app, timeout=5)
+        assert not thread.is_alive()
+        assert app.agent_log[-1]["text"] == "wound down"
+
+    def test_a_loop_that_does_not_finish_in_time_is_reported(self):
+        app, _ = _app()
+        thread, release = self._running(app)
+        try:
+            assert not stop_agent_and_wait(app, timeout=0.1)
+            assert app.agent_stop_event.is_set() and not app.agent_running
+        finally:
+            release.set()
+            thread.join(5)
+
+    def test_the_ledger_takes_no_buys_while_the_loop_winds_down(self):
+        app, _ = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0), trade_cost=0.0)
+        app.decision_tracker = tracker
+        thread, release = self._running(app)
+        try:
+            stop_agent_and_wait(app, timeout=0.05)
+            late = tracker.record_trade("AAPL", "buy", 3, "late cycle", "k", "s")
+            assert late.status == "rejected" and "not placed" in late.reasoning
+        finally:
+            release.set()
+            thread.join(5)
+
+    def test_with_no_loop_alive_it_only_stops(self):
+        app, _ = _app()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(100.0), trade_cost=0.0)
+        app.decision_tracker = tracker
+        app.agent_stop_event = threading.Event()
+        assert stop_agent_and_wait(app, timeout=5)
+        assert app.agent_stop_event.is_set()
+        assert tracker.buys_halted is None
 
 
 def _stop_tactics(stop: float, symbol: str = "AAPL", target: "float | None" = None) -> dict:

@@ -38,6 +38,7 @@ from .agent import (
     selectable_personalities,
     sell_everything_and_stop,
     stop_agent,
+    stop_agent_and_wait,
 )
 from .apple_trader import (
     APPLE_TRADER_AVATAR,
@@ -3635,6 +3636,52 @@ def _execution_controls() -> str:
     return mode
 
 
+# How long ▶ Start Agent / 🔄 Refresh Agent wait for a running agent's cycle to
+# finish before giving up on starting the new run (`stop_agent_and_wait`). A
+# rule agent's cycle takes seconds; an LLM cycle that is mid-conversation can
+# take most of a minute.
+HANDOVER_WAIT_SEC = 60.0
+
+
+def _start_refusal(
+    syms: "list[str]",
+    personality: str,
+    provider: str,
+    apple_config: "AppleTraderConfig | OrchestraConfig | None",
+) -> "str | None":
+    """Why the setup on screen cannot start `personality`, or None when it can.
+    Checked by ▶ Start Agent, and by 🔄 Refresh Agent before it stops the run
+    it would replace."""
+    is_rule_agent = personality in RULE_AGENT_KEYS
+    is_orchestra = personality == ORCHESTRA_KEY
+    # The symbols a rule agent trades: Apple Trader's one, or every pair's
+    # under Orchestra. They have to be streamed, or there are no bars to read
+    # and the agent would idle all session.
+    rule_tickers = [APPLE_TRADER_TICKER]
+    if is_orchestra and isinstance(apple_config, OrchestraConfig):
+        rule_tickers = apple_config.tickers
+    elif personality == APPLE_TRADER_KEY and apple_config is not None:
+        rule_tickers = [apple_config.ticker]
+    unstreamed = [t for t in rule_tickers if t not in syms]
+    env_var = ENV_KEYS[provider]
+    if not syms:
+        return "Enter at least one symbol in the sidebar first."
+    if is_orchestra and not isinstance(apple_config, OrchestraConfig):
+        return (
+            "Orchestra's rules are not complete: pick at least one (ticker, model) pair, "
+            "and fix what the Orchestra rules panel flags."
+        )
+    if is_rule_agent and unstreamed:
+        return (
+            f"{_personality_label(personality)} is configured to trade "
+            f"{', '.join(rule_tickers)}; add {', '.join(unstreamed)} to the symbols in "
+            "the sidebar."
+        )
+    if not os.getenv(env_var, "") and not is_rule_agent:
+        return f"{env_var} is not set; the agent needs an LLM key to reason about decisions."
+    return None
+
+
 def _start_agent(
     state: AppState,
     syms: "list[str]",
@@ -3659,40 +3706,18 @@ def _start_agent(
 
     Shared by the button and by `_resume_after_restart`, which starts again
     the run a restart interrupted from what `state.run_spec` recorded of it."""
-    env_var = ENV_KEYS[provider]
-    llm_key = os.getenv(env_var, "")
+    llm_key = os.getenv(ENV_KEYS[provider], "")
     is_apple_trader = personality == APPLE_TRADER_KEY
     is_rule_agent = personality in RULE_AGENT_KEYS
     is_orchestra = personality == ORCHESTRA_KEY
-    # The symbols a rule agent trades: Apple Trader's one, or every pair's
-    # under Orchestra. They have to be streamed, or there are no bars to read
-    # and the agent would idle all session.
-    rule_tickers = [APPLE_TRADER_TICKER]
-    if is_orchestra and isinstance(apple_config, OrchestraConfig):
-        rule_tickers = apple_config.tickers
-    elif is_apple_trader and apple_config is not None:
-        rule_tickers = [apple_config.ticker]
-    unstreamed = [t for t in rule_tickers if t not in syms]
     stream_ready = False
     # Dummy data: the replay is the stream, its broker the venue, and this
     # click is what sets its clock running.
     replaying = _replaying()
     session = replay.session_of(state) if replaying else None
-    if not syms:
-        st.error("Enter at least one symbol in the sidebar first.")
-    elif is_orchestra and not isinstance(apple_config, OrchestraConfig):
-        st.error(
-            "Orchestra's rules are not complete: pick at least one (ticker, model) pair, "
-            "and fix what the Orchestra rules panel flags."
-        )
-    elif is_rule_agent and unstreamed:
-        st.error(
-            f"{_personality_label(personality)} is configured to trade "
-            f"{', '.join(rule_tickers)}; add {', '.join(unstreamed)} to the symbols in "
-            "the sidebar."
-        )
-    elif not llm_key and not is_rule_agent:
-        st.error(f"{env_var} is not set; the agent needs an LLM key to reason about decisions.")
+    refusal = _start_refusal(syms, personality, provider, apple_config)
+    if refusal:
+        st.error(refusal)
     elif replaying:
         # A replay not loaded yet, stopped, or for other symbols is loaded
         # here, as the live branch below starts the stream.
@@ -3759,6 +3784,19 @@ def _start_agent(
                     "trading the stale tape."
                 )
             )})
+        # A run already going (▶ Start while running, 🔄 Refresh Agent) is
+        # stopped and its loop allowed to finish before the ledger it trades
+        # is carried over: see `stop_agent_and_wait`.
+        with st.spinner("Waiting for the running agent to finish its cycle…"):
+            handed_over = stop_agent_and_wait(state, HANDOVER_WAIT_SEC)
+        if not handed_over:
+            st.error(
+                f"The running agent was stopped, but its current cycle had not "
+                f"finished after {HANDOVER_WAIT_SEC:.0f} s, so no new run was started. "
+                "Press ▶ Start Agent once the log says it has stopped."
+            )
+            session_store.save(state)
+            return False
         # Resolve the venue before anything starts. Every refusal inside
         # resolve_broker degrades to local simulation and says so, so a
         # misconfigured or blocked account can never silently become a
@@ -3938,6 +3976,87 @@ def _start_agent(
     return stream_ready
 
 
+def _refresh_agent(state: AppState, syms: "list[str]", **start) -> bool:
+    """What 🔄 Refresh Agent does: start the running agent again on the
+    settings on screen now -- the Order execution venue (local, paper or
+    live), the personality and its model, Apple Trader's or Orchestra's rules,
+    the symbols -- without selling anything. `start` is `_start_agent`'s
+    keywords but `continue_today`. True when the new run started.
+
+    It is ▶ Start Agent on a running agent, with three differences. Today's
+    ledger always carries on, whatever the Continue box says: a refresh is not
+    a fresh start. Settings that cannot start leave the old run trading rather
+    than stopping it. And it does not walk away from an Alpaca account with
+    open positions: a different venue opens its own ledger, so whatever the
+    old one holds would be left with no stop under it."""
+    if not state.agent_running:
+        st.info("The agent is not running — ▶ Start Agent starts it on these settings.")
+        return False
+    refusal = _start_refusal(
+        syms, start["personality"], start["provider"], start["apple_config"]
+    )
+    if refusal:
+        st.error(f"{refusal} The agent goes on as it was.")
+        return False
+    tracker = state.decision_tracker
+    venue = start["trading_mode_choice"]
+    if venue != state.trading_mode and tracker is not None and not tracker.broker.is_simulated:
+        held = {s: q for s, q in tracker.snapshot()["positions"].items() if q}
+        if held:
+            st.error(
+                f"Not refreshed: moving to {_venue_badge(venue)} would leave "
+                + ", ".join(f"{s} {q:g}" for s, q in held.items())
+                + f" on {_venue_badge(state.trading_mode)} with no agent managing it. "
+                "Sell it first (Sell everything and stop), or set Order execution "
+                f"back to {_venue_badge(state.trading_mode)}. The agent goes on as it was."
+            )
+            return False
+    before, venue_before = dict(state.run_spec or {}), state.trading_mode
+    if not _start_agent(state, syms, continue_today=True, **start):
+        return False
+    changes = _refresh_changes(before, state.run_spec or {}, venue_before, state.trading_mode)
+    summary = "; ".join(changes) if changes else "the settings were the ones it was already on"
+    append_agent_log(state, {"type": "status", "text": f"🔄 Agent refreshed: {summary}."})
+    session_store.save(state)
+    st.success(f"Agent refreshed: {summary}.")
+    return True
+
+
+def _refresh_changes(before: dict, after: dict, venue_before: str, venue_after: str) -> "list[str]":
+    """What a refresh changed, one phrase each, from the two runs' `run_spec`s
+    and the venues they actually got."""
+    changes = []
+    if venue_before != venue_after:
+        changes.append(f"venue {_venue_badge(venue_before)} → {_venue_badge(venue_after)}")
+    personality = after.get("personality", "")
+    if before.get("personality") != personality:
+        changes.append(
+            f"agent {_personality_label(before.get('personality', ''))} → "
+            f"{_personality_label(personality)}"
+        )
+    elif personality not in RULE_AGENT_KEYS:
+        old = f"{before.get('provider')} {before.get('model') or 'default'}"
+        new = f"{after.get('provider')} {after.get('model') or 'default'}"
+        if old != new:
+            changes.append(f"model {old} → {new}")
+    if before.get("symbols") != after.get("symbols"):
+        changes.append(
+            f"symbols {', '.join(before.get('symbols') or [])} → "
+            f"{', '.join(after.get('symbols') or [])}"
+        )
+    old_rules, new_rules = before.get("apple_config") or {}, after.get("apple_config") or {}
+    if before.get("personality") == personality and new_rules and old_rules != new_rules:
+        if "racers" in new_rules:
+            changes.append("Orchestra's pairs and rules")
+        else:
+            changed = [k for k in new_rules if old_rules.get(k) != new_rules[k]]
+            shown = [f"{k} {old_rules.get(k)} → {new_rules[k]}" for k in changed[:4]]
+            if len(changed) > 4:
+                shown.append(f"{len(changed) - 4} more")
+            changes.append("rules " + ", ".join(shown))
+    return changes
+
+
 def _agent_panel(
     symbols: list[str],
     alpaca_key: str = "",
@@ -3946,12 +4065,13 @@ def _agent_panel(
     data_source: str = DEFAULT_DATA_SOURCE,
     finnhub_token: str = "",
     history_feed: str = DEFAULT_HISTORY_FEED,
-    clicks: "tuple[bool, bool, bool]" = (False, False, False),
+    clicks: "tuple[bool, bool, bool, bool]" = (False, False, False, False),
     feedback=None,
 ) -> None:
-    """The Agent tab. `clicks` are the sidebar's ▶ Start Agent, ⏹ Stop Agent
-    and Sell everything and stop (`_agent_buttons`) for this run, and
-    `feedback` the sidebar container under them that their messages go to."""
+    """The Agent tab. `clicks` are the sidebar's ▶ Start Agent, ⏹ Stop Agent,
+    🔄 Refresh Agent and Sell everything and stop (`_agent_buttons`) for this
+    run, and `feedback` the sidebar container under them that their messages
+    go to."""
     feedback = feedback if feedback is not None else nullcontext()
     state = _get_state()
     st.caption(
@@ -4084,30 +4204,37 @@ def _agent_panel(
         )
     # The sidebar's buttons (`_agent_buttons`), handled here, where the
     # agent's own settings are; what they report goes under them.
-    start_clicked, stop_clicked, sell_all_clicked = clicks
+    start_clicked, stop_clicked, refresh_clicked, sell_all_clicked = clicks
+    start_settings = dict(
+        personality=personality,
+        provider=provider,
+        model=model,
+        apple_config=apple_config,
+        trading_mode_choice=trading_mode_choice,
+        starting_budget=starting_budget,
+        alpaca_key=alpaca_key,
+        alpaca_secret=alpaca_secret,
+        feed=feed,
+        data_source=data_source,
+        finnhub_token=finnhub_token,
+        history_feed=history_feed,
+    )
     if start_clicked:
         with feedback:
             _start_agent(
                 state,
                 list(symbols or state.symbols),
-                personality=personality,
-                provider=provider,
-                model=model,
-                apple_config=apple_config,
-                trading_mode_choice=trading_mode_choice,
-                starting_budget=starting_budget,
                 continue_today=continue_today,
-                alpaca_key=alpaca_key,
-                alpaca_secret=alpaca_secret,
-                feed=feed,
-                data_source=data_source,
-                finnhub_token=finnhub_token,
-                history_feed=history_feed,
+                **start_settings,
             )
         if _get_state() is not state:
             # ▶ Start Agent loaded a new replay (Dummy data): its state has not
             # had this page's settings drawn onto it yet, so draw it again.
             st.rerun()
+
+    if refresh_clicked:
+        with feedback:
+            _refresh_agent(state, list(symbols or state.symbols), **start_settings)
 
     if stop_clicked:
         stop_agent(state)
@@ -4778,13 +4905,27 @@ def _trade_sound_control(state: AppState) -> None:
     )
 
 
-def _agent_buttons(state: AppState) -> "tuple[bool, bool, bool]":
-    """▶ Start Agent, ⏹ Stop Agent and Sell everything and stop, in the
-    sidebar: whether each was clicked this run. The Agent tab acts on them
-    (`_agent_panel`), since starting needs the agent settings drawn there."""
+def _agent_buttons(state: AppState) -> "tuple[bool, bool, bool, bool]":
+    """▶ Start Agent, ⏹ Stop Agent, 🔄 Refresh Agent and Sell everything and
+    stop, in the sidebar: whether each was clicked this run. The Agent tab acts
+    on them (`_agent_panel`), since starting needs the agent settings drawn there."""
     c1, c2 = st.columns(2)
     start = c1.button("▶ Start Agent", type="primary", width="stretch", key="agent_start")
     stop = c2.button("⏹ Stop Agent", width="stretch", key="agent_stop")
+    # Never drawn disabled: the sidebar is drawn before the Agent tab acts on
+    # ▶ Start, and Apple Trader's rules are edited in a fragment that does not
+    # redraw it, so "not running" here can be one start out of date.
+    refresh = st.button(
+        "🔄 Refresh Agent",
+        width="stretch",
+        key="agent_refresh",
+        help="Starts the running agent again on the settings on screen now: the "
+        "Order execution account (local, paper or live), the personality and its "
+        "model, Apple Trader's or Orchestra's rules, the symbols. Nothing is sold "
+        "and today's ledger carries on; a different account opens its own. Moving "
+        "off an Alpaca account that still holds positions is refused, so they are "
+        "not left without the agent's stop.",
+    )
     sell_all = st.button(
         "Sell everything and stop",
         width="stretch",
@@ -4794,7 +4935,7 @@ def _agent_buttons(state: AppState) -> "tuple[bool, bool, bool]":
         "Alpaca account that is everything the account holds, not only what this "
         "session bought.",
     )
-    return start, stop, sell_all
+    return start, stop, refresh, sell_all
 
 
 def _session_checkboxes(state: AppState) -> None:

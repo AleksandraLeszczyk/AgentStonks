@@ -1585,6 +1585,43 @@ def stop_agent(state: "AppState") -> None:
     obs.flush()
 
 
+def _loop_thread(stop_event: "threading.Event | None") -> "threading.Thread | None":
+    """The live thread of the agent loop `stop_event` stops, if any.
+
+    Found by the stop event every launcher passes in its thread's args rather
+    than by a handle kept at launch, so that a loop started by an earlier
+    generation of these modules -- which a code save leaves running -- is
+    found too. (CPython keeps a thread's `_args` until its target returns.)"""
+    if stop_event is None:
+        return None
+    for thread in threading.enumerate():
+        if any(arg is stop_event for arg in getattr(thread, "_args", None) or ()):
+            return thread
+    return None
+
+
+def stop_agent_and_wait(state: "AppState", timeout: float) -> bool:
+    """`stop_agent`, then wait up to `timeout` seconds for the loop to wind
+    down. True once it has, or when no loop was alive.
+
+    `stop_agent` only asks: a loop in the middle of a cycle finishes that cycle
+    first, and its wind-down then clears `agent_running` and journals
+    `state.scorecard` -- whichever run they belong to by then. A run started
+    before that point would be shown idle while it trades, its scorecard
+    closed under it, and a fill from the old cycle would land on a ledger
+    that has already been carried over. Buys are halted on the old ledger
+    while it winds down: a run that is being replaced must not open a
+    position on its way out, least of all on a venue it is leaving."""
+    thread = _loop_thread(state.agent_stop_event)
+    if thread is not None and state.decision_tracker is not None:
+        state.decision_tracker.halt_buys("the agent was stopped to start again")
+    stop_agent(state)
+    if thread is None:
+        return True
+    thread.join(timeout)
+    return not thread.is_alive()
+
+
 def sell_everything_and_stop(state: "AppState") -> "tuple[list, list[str]]":
     """Stop the agent, then sell every open position at market.
 
