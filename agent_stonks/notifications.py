@@ -68,6 +68,10 @@ class Settings:
     on_transaction: bool = False
     every_n_minutes: bool = False
     interval_minutes: int = 30
+    # Obey a "stop" email from `email_to` (`email_stop`), and since when (UTC
+    # ISO): a stop received before it was switched on is not one.
+    stop_by_email: bool = False
+    stop_armed_at: str = ""
 
     @property
     def email_on(self) -> bool:

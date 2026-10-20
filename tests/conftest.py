@@ -106,6 +106,8 @@ def _base_configs_in_tmp(monkeypatch, tmp_path):
 def _notification_settings_in_tmp(monkeypatch, tmp_path):
     """Keep the email settings out of the real data/notifications.json, so no
     test that fills a trade can email whoever is set there."""
-    from agent_stonks import notifications
+    from agent_stonks import email_stop, notifications
 
     monkeypatch.setattr(notifications, "SETTINGS_PATH", tmp_path / "notifications.json")
+    # Nor the stops already obeyed: a test's must not hide a real one.
+    monkeypatch.setattr(email_stop, "HANDLED_PATH", tmp_path / "email_stop.json")

@@ -10,11 +10,11 @@ the next run.
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import streamlit as st
 
-from . import notifications
+from . import email_stop, notifications
 from .market_hours import MARKET_TZ
 
 # Widget key -> Settings field.
@@ -23,6 +23,7 @@ _FIELDS = {
     "notify_on_transaction": "on_transaction",
     "notify_every_n": "every_n_minutes",
     "notify_interval_min": "interval_minutes",
+    "notify_stop_by_email": "stop_by_email",
 }
 # The file's settings as this session last saw (or wrote) them.
 _SEEN_KEY = "notify_seen_settings"
@@ -45,6 +46,9 @@ def _write(key: str) -> None:
     value = st.session_state[key]
     if key == "notify_email_to":
         value = value.strip()
+    if key == "notify_stop_by_email" and value:
+        # A stop sent before it was switched on is not one.
+        settings.stop_armed_at = datetime.now(timezone.utc).isoformat()
     setattr(settings, _FIELDS[key], value)
     notifications.save_settings(settings)
     st.session_state[_SEEN_KEY] = asdict(settings)
@@ -148,5 +152,57 @@ def notifications_panel(state) -> None:
             else:
                 st.success(f"Sent to {to}.")
 
+    _stop_by_email_box(state, to)
+
     st.markdown("**Sent**")
     _sent_log(state)
+
+
+@st.fragment(run_every=10)
+def _stop_watch_status(state) -> None:
+    if not st.session_state.get("notify_stop_by_email"):
+        return
+    seen = email_stop.status(state)
+    if seen is None:
+        st.caption("Not looked at the mailbox yet.")
+        return
+    at = datetime.fromtimestamp(seen["checked_at"], MARKET_TZ).strftime("%H:%M:%S ET")
+    if seen["error"]:
+        st.caption(f":red[✗] {at} — the mailbox could not be read: {seen['error']}. "
+                   f"Trying again every {email_stop.RETRY_SEC:.0f} s.")
+    else:
+        st.caption(f":green[✓] Mailbox checked {at}, every {email_stop.POLL_SEC:.0f} s.")
+
+
+def _stop_by_email_box(state, to: str) -> None:
+    imap = email_stop.ImapConfig.from_env()
+    with st.container(border=True):
+        st.markdown("**Stop by email**")
+        st.checkbox(
+            "Stop the agent by email",
+            key="notify_stop_by_email",
+            on_change=_write,
+            args=("notify_stop_by_email",),
+            help="An email whose body is just \"stop\" (any case, spaces and line "
+            "breaks round it) sells every open position at market and stops the "
+            "agent — the sidebar's Sell all — and the app answers with what it "
+            "sold. Only from the Send to address, and only when its mail server "
+            "signed it (DKIM/DMARC), so a forged sender is refused. Each stop "
+            "counts once, on the day it is sent, and only after this box was "
+            "ticked; one that arrives while the app is down is obeyed when it is "
+            "back. A signature or quoted text under the word makes it not a stop.",
+        )
+        if imap.missing():
+            st.warning(
+                f"The mailbox can't be read yet: set {' and '.join(imap.missing())} in "
+                ".env — the same account the emails are sent from.",
+                icon=":material/mail_lock:",
+            )
+        elif not to:
+            st.caption("Set **Send to** above: only emails from that address are obeyed.")
+        else:
+            st.caption(
+                f"Email **stop** to {imap.user} from {to}. Read from "
+                f"{imap.host}:{imap.port} with the sending account's password."
+            )
+        _stop_watch_status(state)

@@ -20,6 +20,7 @@ from . import (
     candidates,
     candle_patterns,
     clock,
+    email_stop,
     last_setup,
     market_hours,
     model_overlays,
@@ -363,6 +364,7 @@ def _get_state() -> AppState:
     state = st.session_state["app_state"]
     session_store.start_autosave(state)
     notifications.start_watch(state)
+    email_stop.start_watch(state)
     # Streamlit's dev-mode autoreload reruns this script on every save but keeps
     # the same AppState instance alive in session_state. If a field was added to
     # AppState after this instance was constructed, the instance's __class__ (and
