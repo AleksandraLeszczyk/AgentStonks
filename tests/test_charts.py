@@ -530,6 +530,32 @@ class TestMomentumPanel:
         assert tr.customdata[0] == "SIP · $2.5M traded"
         assert tr.customdata[-1].startswith("IEX")
 
+    def test_the_iex_reading_is_a_shadow_behind_the_sip_bars(self):
+        bars = self.rth_bars(60)
+        agg = self.aggressiveness(bars, settled_upto=44)
+        agg["iex"] = [0.5 if i < 44 else None for i in range(60)]
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START, show_momentum=True,
+                          aggressiveness=agg)
+        shadow, bar = self.trace(fig, "IEX before SIP"), self.trace(fig, "Aggressiveness")
+        assert shadow.yaxis == bar.yaxis
+        assert list(shadow.y) == [0.5] * 44
+        assert list(shadow.x) == list(bar.x[:44])
+        # The chart stacks bars (the price profile): a base of its own draws
+        # the shadow from zero, not under the SIP bar's end -- and an offset
+        # of its own keeps it out of any grouping, centred on the bar.
+        assert fig.layout.barmode == "stack"
+        assert shadow.base == 0 and bar.base is None
+        assert shadow.offset == pytest.approx(-shadow.width / 2)
+        assert shadow.width > bar.width
+        # Behind the bar.
+        assert (shadow.zorder or 0) < (bar.zorder or 0)
+
+    def test_no_shadow_without_iex_readings(self):
+        bars = self.rth_bars(60)
+        fig = build_chart(bars, [], [], "AAPL", SESSION_START,
+                          aggressiveness=self.aggressiveness(bars))
+        assert "IEX before SIP" not in [tr.name for tr in fig.data]
+
     def test_aggressiveness_label_is_a_ratio_not_dollars(self):
         bars = self.rth_bars(60)
         fig = build_chart(bars, [], [], "AAPL", SESSION_START,

@@ -1234,6 +1234,7 @@ def _live_chart_controls() -> None:
                 "out. Trades and quotes come from Alpaca REST: the consolidated "
                 f"tape (SIP) for minutes over {SIP_DELAY_MIN} minutes old, IEX "
                 "for the ones since — paler bars, replaced by SIP as they age. "
+                "The black shadow behind a SIP bar is what IEX had read for it. "
                 "Regular session only. Fetched in the background only while the "
                 "panel is shown — after a mid-day start a few minutes to fill "
                 "the morning in, newest first — and kept per minute, across a "

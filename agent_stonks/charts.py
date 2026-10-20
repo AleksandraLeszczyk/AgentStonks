@@ -1278,6 +1278,12 @@ def _add_net_gamma_panel(df: pd.DataFrame, fig: go.Figure, row: int, net_gamma: 
 
 # How opaque an aggressiveness bar is once settled on SIP, and before.
 AGGRESSIVENESS_OPACITY = {True: 0.8, False: 0.35}
+# What IEX read for a bar SIP has since replaced, behind it: near-black like
+# the usual-minute-move band, and a little wider than the bar, so it shows
+# round the bar's sides even where SIP reads further from zero -- but not the
+# whole bar's slot, where neighbouring shadows would run into one silhouette.
+IEX_SHADOW = "rgba(0, 0, 0, 0.7)"
+IEX_SHADOW_WIDTH = 1.15
 
 
 def _add_aggressiveness_panel(
@@ -1285,15 +1291,42 @@ def _add_aggressiveness_panel(
 ) -> None:
     """Each bar's transaction aggressiveness, -1 to +1: green where more of
     the value traded closer to the ask, red closer to the bid, paler while
-    the bar is on IEX. See `build_chart`'s `aggressiveness`."""
+    the bar is on IEX, with what IEX had read for it as a shadow behind once
+    SIP replaces it. See `build_chart`'s `aggressiveness`."""
     stamps = pd.to_datetime(pd.Series(aggressiveness.get("t") or [], dtype=object), utc=True)
     index = pd.DatetimeIndex(stamps)
     values = pd.Series(aggressiveness.get("value") or [], index=index, dtype=float)
     settled = pd.Series(aggressiveness.get("settled") or [True] * len(values), index=index)
     traded = pd.Series(aggressiveness.get("traded") or [0.0] * len(values), index=index)
+    iex = pd.Series(aggressiveness.get("iex") or [None] * len(values), index=index, dtype=float)
     # Only over the candles drawn.
     shown = values.index >= df["t"].iloc[0] if len(values) else []
-    values, settled, traded = values[shown], settled[shown], traded[shown]
+    values, settled, traded, iex = values[shown], settled[shown], traded[shown], iex[shown]
+    iex = iex.dropna()
+    if len(iex):
+        width = _bar_width_ms(df) * IEX_SHADOW_WIDTH
+        fig.add_trace(
+            go.Bar(
+                x=iex.index.tz_convert("UTC"),
+                y=iex,
+                marker_color=IEX_SHADOW,
+                marker_line_width=0,
+                width=width,
+                # A base and an offset of its own take it out of plotly's
+                # stacking and grouping of bars -- the chart stacks them, for
+                # the price profile, and the SIP bar would sit on its end --
+                # so it is drawn overlaid from zero, centred where the bar is.
+                # Behind the bar by `zorder`, not by trace order.
+                base=0,
+                offset=-width / 2,
+                zorder=-1,
+                name="IEX before SIP",
+                showlegend=False,
+                hovertemplate="IEX read %{y:+.2f} before SIP replaced it<extra></extra>",
+            ),
+            row=row,
+            col=1,
+        )
     tape = ["SIP" if s else "IEX until SIP replaces it" for s in settled]
     _add_bar_by_bar_panel(
         df, fig, row, values,
@@ -2477,10 +2510,12 @@ def build_chart(
 
     `aggressiveness` adds a panel under the momentum panels (or under the
     volume without them) with each bar's transaction aggressiveness --
-    `{"t": [...], "value": [...], "settled": [...], "traded": [...], "note":
-    str}` from `aggressiveness.series`, values from -1 to +1. A bar not yet
-    `settled` is drawn paler: its minutes are on IEX until SIP replaces them.
-    Empty values draw the panel with `note` in it; None draws no panel.
+    `{"t": [...], "value": [...], "settled": [...], "traded": [...], "iex":
+    [...], "note": str}` from `aggressiveness.series`, values from -1 to +1.
+    A bar not yet `settled` is drawn paler: its minutes are on IEX until SIP
+    replaces them. Where SIP has, the bar's `iex` value -- what IEX had read
+    -- is drawn behind it as a black shadow. Empty values draw the panel with
+    `note` in it; None draws no panel.
 
     `net_gamma` adds a panel at the bottom -- under the momentum and
     aggressiveness panels when they are shown -- with the options chain's net

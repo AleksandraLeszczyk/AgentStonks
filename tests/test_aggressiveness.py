@@ -108,6 +108,18 @@ def ts(text):
 class TestPlan:
     REAL_NOW = datetime(2026, 10, 19, 18, 0, tzinfo=timezone.utc)
 
+    def test_sip_minutes_with_no_iex_reading_are_due_newest_first(self):
+        kept = {
+            "2026-10-19T17:30:00+00:00": [1, 0, 1, 1, "sip"],
+            "2026-10-19T17:31:00+00:00": [1, 0, 1, 1, "sip"],         # read from IEX
+            "2026-10-19T17:32:00+00:00": [1, 0, 1, 1, "sip"],
+            "2026-10-19T17:50:00+00:00": [1, 0, 1, 1, "iex-final"],   # still IEX itself
+        }
+        iex_kept = {"2026-10-19T17:31:00+00:00": [1, 0, 1, 1]}
+        minutes = [ts(t) for t in kept] + [ts("2026-10-19T17:33:00Z")]   # not fetched yet
+        assert ag._iex_due(minutes, kept, iex_kept) == [
+            ts("2026-10-19T17:32:00Z"), ts("2026-10-19T17:30:00Z")]
+
     def test_sip_once_old_enough_iex_before(self):
         minutes = [ts("2026-10-19T17:40:00Z"), ts("2026-10-19T17:43:00Z"),
                    ts("2026-10-19T17:44:00Z"), ts("2026-10-19T17:59:00Z")]
@@ -157,7 +169,7 @@ def store(tmp_path, monkeypatch):
     """A clean store on a scratch disk, no pauses, and the worker run inline."""
     monkeypatch.setattr(ag, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(ag, "REQUEST_GAP_SEC", 0.0)
-    for name in ("_kept", "_wanted", "_iex_at", "_retry_at", "_errors"):
+    for name in ("_kept", "_iex_kept", "_wanted", "_iex_at", "_retry_at", "_errors"):
         monkeypatch.setattr(ag, name, {})
     monkeypatch.setattr(ag, "_running", set())
 
@@ -180,10 +192,12 @@ def bars_from(start, n, step_min=1):
 
 class FakeTape:
     """Alpaca REST stand-in: per minute one buy at the ask of $ (minute + 1) x
-    100 and one sell at the bid of $100, every quote 100.00 / 100.02."""
+    100 and one sell at the bid of $100 -- $100 x `iex_sale` on IEX -- every
+    quote 100.00 / 100.02."""
 
-    def __init__(self):
+    def __init__(self, iex_sale=1):
         self.calls = []
+        self.iex_sale = iex_sale
 
     def __call__(self, kind, symbol, start, end, key, secret, feed):
         self.calls.append((kind, feed, start, end))
@@ -196,7 +210,8 @@ class FakeTape:
             elif m >= start:
                 buy = (m.minute + 1) * 100 / 100.02
                 out.append(tr((m + pd.Timedelta(seconds=10)).isoformat(), 100.02, s=buy))
-                out.append(tr((m + pd.Timedelta(seconds=20)).isoformat(), 100.00, s=1))
+                sale = self.iex_sale if feed == "iex" else 1
+                out.append(tr((m + pd.Timedelta(seconds=20)).isoformat(), 100.00, s=sale))
             m += pd.Timedelta(minutes=1)
         return out
 
@@ -219,9 +234,13 @@ class TestSeries:
         assert out["value"][1] == pytest.approx((3200.0 - 100.0) / 3300.0)
         # Older than SIP_DELAY_MIN against the real clock, which is long past.
         assert all(out["settled"])
-        assert {feed for _, feed, _, _ in tape.calls} == {"sip"}
+        # The SIP bars first, then the IEX readings behind them.
+        feeds = [feed for _, feed, _, _ in tape.calls]
+        assert set(feeds) == {"sip", "iex"}
+        assert feeds == sorted(feeds, key=["sip", "iex"].index)
         kept = json.loads((store / "AAPL_2026-10-19.json").read_text())
         assert len(kept) == 31
+        assert len(json.loads((store / "AAPL_2026-10-19_iex.json").read_text())) == 31
 
         # A reload draws them from disk, without a fetch.
         monkeypatch.setattr(ag, "_kept", {})
@@ -245,6 +264,53 @@ class TestSeries:
         # Only the settled minutes on disk.
         kept = json.loads((store / "AAPL_2026-10-19.json").read_text())
         assert max(kept) == "2026-10-19T13:53:00+00:00"
+
+    def test_the_iex_reading_stays_behind_the_sip_bar(self, store, monkeypatch):
+        """Read from IEX while recent, then replaced by SIP: the IEX reading
+        is kept for the shadow, and not fetched again."""
+        tape = FakeTape(iex_sale=31)
+        monkeypatch.setattr(ag, "fetch_ticks", tape)
+        at = {"now": datetime(2026, 10, 19, 13, 45, 30, tzinfo=timezone.utc)}   # 09:45:30 ET
+        monkeypatch.setattr(ag, "_wall_now", lambda: at["now"])
+        monkeypatch.setattr(ag.clock, "now", lambda: at["now"])
+        bars = bars_from("2026-10-19T13:30:00Z", 16)   # 09:30 .. 09:45 ET
+        ag.series("AAPL", "1Min", bars, "k", "s", now=at["now"])
+        live = ag.series("AAPL", "1Min", bars, "k", "s", now=at["now"])
+        assert not any(live["settled"]) and set(live["iex"]) == {None}
+
+        at["now"] = datetime(2026, 10, 19, 14, 1, 30, tzinfo=timezone.utc)
+        tape.calls.clear()
+        ag.series("AAPL", "1Min", bars, "k", "s", now=at["now"])
+        out = ag.series("AAPL", "1Min", bars, "k", "s", now=at["now"])
+        assert {feed for _, feed, _, _ in tape.calls} == {"sip"}
+        # 09:31 on SIP: a $3,200 buy against a $100 sale; on IEX against $3,100.
+        assert out["settled"][1] is True
+        assert out["value"][1] == pytest.approx((3200.0 - 100.0) / 3300.0)
+        assert out["iex"][1] == pytest.approx((3200.0 - 3100.0) / 6300.0)
+        # 09:45 is still on IEX: nothing behind it.
+        assert out["settled"][-1] is False and out["iex"][-1] is None
+        kept = json.loads((store / "AAPL_2026-10-19_iex.json").read_text())
+        assert min(kept) == "2026-10-19T13:30:00+00:00" and len(kept) == 15
+
+        # Across a reload too.
+        monkeypatch.setattr(ag, "_kept", {})
+        monkeypatch.setattr(ag, "_iex_kept", {})
+        assert ag.series("AAPL", "1Min", bars, "k", "s", now=at["now"])["iex"][:15] == out["iex"][:15]
+
+    def test_a_bar_part_sip_part_iex_reads_iex_for_all_of_it(self, store):
+        now = datetime(2026, 10, 19, 14, 10, 30, tzinfo=timezone.utc)
+        day = ("AAPL", "2026-10-19")
+        sip = {f"2026-10-19T13:5{i}:00+00:00": [3.0, 1.0, 4.0, 2, "sip"] for i in range(4)}
+        ag._kept[day] = {**sip, "2026-10-19T13:54:00+00:00": [2.0, 0.0, 2.0, 1, "iex-final"]}
+        ag._iex_kept[day] = {t: [1.0, 3.0, 4.0, 2] for t in sip}
+        bars = bars_from("2026-10-19T13:50:00Z", 1, step_min=5)
+        out = ag.series("AAPL", "5Min", bars, "", "", now=now)
+        assert out["value"] == [pytest.approx((14.0 - 4.0) / 18.0)]
+        # The four SIP minutes' IEX readings and the IEX minute itself.
+        assert out["iex"] == [pytest.approx((6.0 - 12.0) / 18.0)]
+        # Without every minute's IEX reading, none.
+        del ag._iex_kept[day]["2026-10-19T13:52:00+00:00"]
+        assert ag.series("AAPL", "5Min", bars, "", "", now=now)["iex"] == [None]
 
     def test_five_minute_bars_sum_their_minutes(self, store, monkeypatch):
         monkeypatch.setattr(ag, "fetch_ticks", FakeTape())

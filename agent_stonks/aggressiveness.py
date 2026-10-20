@@ -30,7 +30,12 @@ a balanced bar -- or one that traded at the midpoint.
 - **Kept per minute,** as the three sums, so a bar of any size is the sum of
   its minutes. The SIP minutes are written under ``data/aggressiveness/`` (one
   file per symbol and ET day): a reload or a restart draws them again without
-  a fetch. IEX minutes are only held in memory -- they are replaced anyway.
+  a fetch. A forming IEX minute is only held in memory.
+- **The IEX reading stays** once SIP replaces it: each IEX minute fetched once
+  it was over is kept apart from the drawn minutes (``<symbol>_<day>_iex.json``
+  on disk), and the panel draws it as a shadow behind the SIP bar -- how far
+  the early read was off. A SIP minute that never had one, a mid-day start's
+  morning, is fetched from IEX as well, after every SIP minute is in.
 - **Regular session only,** like the momentum panels it sits under, and only
   the latest bar's ET day.
 - **Fetched only while the panel is drawn,** in the background: `series` reads
@@ -105,6 +110,9 @@ RETRY_SEC = 60
 _lock = threading.Lock()
 # (symbol, ET date) -> {minute start, UTC ISO: [ask $, bid $, total $, trades, tape]}.
 _kept: dict[tuple[str, str], dict[str, list]] = {}
+# (symbol, ET date) -> {minute start, UTC ISO: [ask $, bid $, total $, trades]}
+# of the minutes read from IEX once over, kept after SIP replaces them.
+_iex_kept: dict[tuple[str, str], dict[str, list]] = {}
 # (symbol, ET date) -> the regular-session minutes the chart draws, newest last.
 _wanted: dict[tuple[str, str], list[pd.Timestamp]] = {}
 _running: set[str] = set()
@@ -199,40 +207,52 @@ def _path(symbol: str, day: str) -> Path:
     return CACHE_DIR / f"{symbol}_{day}.json"
 
 
-def _load(symbol: str, day: str) -> dict[str, list]:
-    path = _path(symbol, day)
+def _iex_path(symbol: str, day: str) -> Path:
+    return CACHE_DIR / f"{symbol}_{day}_iex.json"
+
+
+def _read(path: Path) -> dict[str, list]:
+    """{minute: [ask, bid, total, trades]} as written at `path`, {} without."""
     if not path.exists():
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        return {str(t): [float(a), float(b), float(v), int(n), "sip"] for t, (a, b, v, n) in raw.items()}
+        return {str(t): [float(a), float(b), float(v), int(n)] for t, (a, b, v, n) in raw.items()}
     except (OSError, ValueError, TypeError) as exc:
         logger.warning("Kept aggressiveness %s not read: %s", path, exc)
         return {}
 
 
-def _save(symbol: str, day: str, kept: dict[str, list]) -> None:
-    settled = {t: s[:4] for t, s in kept.items() if s[4] == "sip"}
-    path = _path(symbol, day)
+def _write(path: Path, sums: dict[str, list]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(settled), encoding="utf-8")
+        tmp.write_text(json.dumps(sums), encoding="utf-8")
         os.replace(tmp, path)
     except OSError as exc:  # the panel still draws from memory
         logger.warning("Kept aggressiveness %s not written: %s", path, exc)
 
 
+def _load(symbol: str, day: str) -> dict[str, list]:
+    return {t: [*s, "sip"] for t, s in _read(_path(symbol, day)).items()}
+
+
+def _save(symbol: str, day: str, kept: dict[str, list]) -> None:
+    _write(_path(symbol, day), {t: s[:4] for t, s in kept.items() if s[4] == "sip"})
+
+
 def _store(symbol: str, day: str) -> dict[str, list]:
-    """The day's kept minutes, loaded from disk on first use. Caller holds
-    `_lock`."""
+    """The day's kept minutes, loaded from disk on first use, with their IEX
+    readings (`_iex_kept`). Caller holds `_lock`."""
     key = (symbol, day)
     kept = _kept.get(key)
     if kept is None:
         # A new day: the symbol's earlier days are not drawn any more.
         for old in [k for k in _kept if k[0] == symbol]:
             del _kept[old]
+            _iex_kept.pop(old, None)
         kept = _kept[key] = _load(symbol, day)
+        _iex_kept[key] = _read(_iex_path(symbol, day))
     return kept
 
 
@@ -275,6 +295,19 @@ def _plan(
     return iex, sorted(sip, reverse=True)
 
 
+def _iex_due(
+    minutes: "list[pd.Timestamp]", kept: dict[str, list], iex_kept: dict[str, list],
+) -> "list[pd.Timestamp]":
+    """The chart's SIP minutes with no IEX reading kept to draw behind them,
+    newest first: minutes that went straight to SIP."""
+    due = []
+    for m in minutes:
+        entry = kept.get(m.isoformat())
+        if entry is not None and entry[4] == "sip" and m.isoformat() not in iex_kept:
+            due.append(m)
+    return sorted(due, reverse=True)
+
+
 def _chunks(minutes: "list[pd.Timestamp]") -> "list[list[pd.Timestamp]]":
     """Newest-first minutes as runs of consecutive minutes, at most CHUNK_MIN
     each, newest run first."""
@@ -307,28 +340,36 @@ def _fetch(symbol: str, minutes: "list[pd.Timestamp]", feed: str, key: str, secr
 def _work(symbol: str, day: str, key: str, secret: str) -> None:
     """Fetch what the chart is missing until nothing is due: the IEX minutes
     whenever REFRESH_SEC has passed, the SIP minutes a chunk at a time between
-    them. Re-reads the chart's minutes after every fetch, so minutes that
-    appear meanwhile are picked up."""
+    them, and last the IEX readings of SIP minutes that never had one.
+    Re-reads the chart's minutes after every fetch, so minutes that appear
+    meanwhile are picked up."""
     try:
         while True:
             now = clock.now()
             real_now = _wall_now()
             with _lock:
                 kept = _kept.get((symbol, day))
-                if kept is None:
+                iex_kept = _iex_kept.get((symbol, day))
+                if kept is None or iex_kept is None:
                     return  # the chart has moved on to another day
                 minutes = list(_wanted.get((symbol, day), []))
                 iex, sip = _plan(minutes, kept, now, real_now)
                 iex_due = bool(iex) and time.monotonic() - _iex_at.get(symbol, -1e9) >= REFRESH_SEC
+                behind = _iex_due(minutes, kept, iex_kept)
             if iex_due:
                 sums = _fetch(symbol, iex, "iex", key, secret, now)
                 done = _utc(now) - pd.Timedelta(minutes=1, seconds=SETTLE_SEC)
                 with _lock:
+                    final = {t: s for t, s in sums.items() if _utc(t) <= done}
                     for t, s in sums.items():
                         # A minute fetched before it was over is fetched again.
-                        kept[t] = [*s, "iex-final" if _utc(t) <= done else "iex"]
+                        kept[t] = [*s, "iex-final" if t in final else "iex"]
+                    iex_kept.update(final)
                     _iex_at[symbol] = time.monotonic()
                     _errors.pop(symbol, None)
+                    snapshot = dict(iex_kept) if final else {}
+                if final:
+                    _write(_iex_path(symbol, day), snapshot)
             elif sip:
                 sums = _fetch(symbol, _chunks(sip)[0], "sip", key, secret, now)
                 with _lock:
@@ -337,6 +378,13 @@ def _work(symbol: str, day: str, key: str, secret: str) -> None:
                     _errors.pop(symbol, None)
                     snapshot = dict(kept)
                 _save(symbol, day, snapshot)
+            elif behind:
+                sums = _fetch(symbol, _chunks(behind)[0], "iex", key, secret, now)
+                with _lock:
+                    iex_kept.update(sums)
+                    _errors.pop(symbol, None)
+                    snapshot = dict(iex_kept)
+                _write(_iex_path(symbol, day), snapshot)
             else:
                 return
             time.sleep(REQUEST_GAP_SEC)
@@ -372,14 +420,17 @@ def series(
     now: "datetime | None" = None,
 ) -> dict:
     """The aggressiveness panel for `bars`: ``{"t", "value", "settled",
-    "traded", "note"}`` -- per regular-session bar of the latest bar's ET day
-    with anything traded, its aggressiveness, whether every minute of it is
-    on the settled SIP tape, and the dollar value it is measured over.
+    "traded", "iex", "note"}`` -- per regular-session bar of the latest bar's
+    ET day with anything traded, its aggressiveness, whether every minute of
+    it is on the settled SIP tape, the dollar value it is measured over, and
+    what IEX read for it where SIP has replaced any of its minutes (None
+    elsewhere, and while a minute's IEX reading is not in yet).
 
     Starts the background fetch of the minutes not kept yet; `note` says why
     the panel is empty while nothing is."""
     if not bars:
-        return {"t": [], "value": [], "settled": [], "traded": [], "note": "No bars yet"}
+        return {"t": [], "value": [], "settled": [], "traded": [], "iex": [],
+                "note": "No bars yet"}
     now = now or clock.now()
     period = pd.Timedelta(minutes=TF_MINUTES.get(timeframe, 1))
     stamps = [_utc(b["t"]) for b in bars]
@@ -389,9 +440,10 @@ def series(
 
     with _lock:
         kept = _store(symbol, day)
+        iex_kept = _iex_kept.setdefault((symbol, day), {})
         _wanted[(symbol, day)] = minutes
         iex, sip = _plan(minutes, kept, now, _wall_now())
-        due = bool(sip) or (
+        due = bool(sip) or bool(_iex_due(minutes, kept, iex_kept)) or (
             bool(iex) and time.monotonic() - _iex_at.get(symbol, -1e9) >= REFRESH_SEC
         )
         start = (
@@ -409,7 +461,18 @@ def series(
                 continue
             # Every minute of it in, from the consolidated tape: it won't change.
             settled = len(sums) == len(covered) and all(s[4] == "sip" for s in sums)
-            rows.append((stamp.isoformat(), value, settled, sum(s[2] for s in sums)))
+            # What IEX read for the same minutes, once SIP has replaced any:
+            # each minute's kept IEX reading, or the minute itself while on IEX.
+            read = None
+            if any(s[4] == "sip" for s in sums):
+                iex_sums = [
+                    iex_kept[m] if m in iex_kept
+                    else kept[m] if m in kept and kept[m][4] != "sip" else None
+                    for m in covered
+                ]
+                if all(s is not None for s in iex_sums):
+                    read = bar_value(iex_sums)
+            rows.append((stamp.isoformat(), value, settled, sum(s[2] for s in sums), read))
         error = _errors.get(symbol)
         fetching = symbol in _running
 
@@ -436,5 +499,6 @@ def series(
         "value": [r[1] for r in rows],
         "settled": [r[2] for r in rows],
         "traded": [r[3] for r in rows],
+        "iex": [r[4] for r in rows],
         "note": note,
     }
