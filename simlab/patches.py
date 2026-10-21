@@ -76,6 +76,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Iterator
 
+import numpy as np
 import pandas as pd
 
 from agent_stonks import agent as agent_mod
@@ -179,25 +180,47 @@ def patch_table(market: SimMarket, original=getattr) -> "list[tuple[object, str,
     # sliced to the bars completed by the pinned clock, which is exactly what
     # the engine's buffer holds (a stored day is ~960 bars, under SIM_MAX_BARS).
     # Pinned row for row against the original by `tests/test_tuning.py`.
+    # On a tiered (`live`) feed the frame is the settled day's prefix up to the
+    # settle cut followed by the young tape's rows after it, the same split the
+    # engine's buffer has (`SimMarket.completed_bars`); `bar_of_day` is then
+    # renumbered, since it counts the rows of the session the frame holds.
     original_minute_frame = original(momentum_regime, "minute_frame")
-    day_frames: "dict[str, dict]" = {}
+    day_frames: "dict[str, tuple[dict, dict]]" = {}
+
+    def _by_day(bars):
+        full = momentum_regime.frame_from_bars(bars)
+        return {day: frame for day, frame in full.groupby(full.index.date)} if len(full) else {}
 
     def fast_minute_frame(sym_state):
         symbol = str(getattr(sym_state, "symbol", "") or "").upper()
         series = market.series.get(symbol)
         if series is None:
             return original_minute_frame(sym_state)
-        by_day = day_frames.get(symbol)
-        if by_day is None:
-            full = momentum_regime.frame_from_bars(series.minute_bars)
-            by_day = {day: frame for day, frame in full.groupby(full.index.date)} if len(full) else {}
-            day_frames[symbol] = by_day
+        frames = day_frames.get(symbol)
+        if frames is None:
+            frames = (_by_day(series.minute_bars), _by_day(series.recent_bars))
+            day_frames[symbol] = frames
         now = clock.now()
-        frame = by_day.get(now.astimezone(MARKET_TZ).date())
+        day = now.astimezone(MARKET_TZ).date()
+        frame = frames[0].get(day)
         if frame is None:
             return original_minute_frame(sym_state)
         cutoff = pd.Timestamp(now - timedelta(seconds=BAR_SEC))
-        return frame.iloc[: frame.index.searchsorted(cutoff, side="right")].copy()
+        if series.settle_after is None:
+            return frame.iloc[: frame.index.searchsorted(cutoff, side="right")].copy()
+        cut = cutoff - series.settle_after
+        head = frame.iloc[: frame.index.searchsorted(cut, side="right")]
+        recent = frames[1].get(day)
+        if recent is None:
+            return head.copy()
+        tail = recent.iloc[
+            recent.index.searchsorted(cut, side="right"): recent.index.searchsorted(cutoff, side="right")
+        ]
+        if not len(tail):
+            return head.copy()
+        out = pd.concat([head, tail])
+        out["bar_of_day"] = np.arange(len(out), dtype=head["bar_of_day"].dtype)
+        return out
 
     def kept_earnings_stamps(ticker, day):
         from .session_context import earnings_dates

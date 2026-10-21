@@ -94,19 +94,33 @@ MARKET_INDICATOR_SYMBOLS = {"spy": "SPY", "vix": "^VIX", "vix3m": "^VIX3M"}
 
 # The tapes a dataset's bars can come from.
 #
-# `yfinance` is the default and the source of every newly downloaded minute
-# bar: consolidated-tape OHLCV, free, no Alpaca subscription, and the same
-# source the live volume tools read (agent_stonks.historical), so a simulated
-# volume ratio is like-for-like with the live one. Its cost is reach -- Yahoo
-# serves 1-minute history for the last 30 days only (see YF_MINUTE_WINDOW_DAYS)
-# and publishes no per-bar VWAP, so bars carry no `vw` field.
+# `yfinance` is the store functions' default tape: consolidated-tape OHLCV,
+# free, no Alpaca subscription, and the same source the live volume tools read
+# (agent_stonks.historical). Its cost is reach -- Yahoo serves 1-minute history
+# for the last 30 days only (see YF_MINUTE_WINDOW_DAYS) and publishes no
+# per-bar VWAP, so bars carry no `vw` field. New datasets default to `live`
+# (the SimLab form lists FEEDS in order).
 #
-# `iex` and `sip` are Alpaca's tapes, kept so every dataset downloaded before
-# this still loads and can still be re-run. `iex` is the free single-venue feed
-# and what every day stored before the feed was tracked contains. `sip` is
-# Alpaca's consolidated tape and needs a paid data subscription; without one
-# Alpaca rejects the request rather than quietly downgrading.
-FEEDS = ("yfinance", "iex", "sip")
+# `iex` and `sip` are Alpaca's tapes. `iex` is the free single-venue feed and
+# what every day stored before the feed was tracked contains. `sip` is Alpaca's
+# consolidated tape; a free plan serves its history to within 15 minutes of
+# now, which is all a dataset of finished days needs.
+#
+# `live` is not a tape of its own but the live app's tiering of two of them
+# (`bar_history.fetch_live_bars`): SIP for every bar that ended at least
+# SETTLED_BAR_AGE_MIN minutes ago, and a single-venue tape for the newest ones
+# -- the live buffer's are the Finnhub socket's candles, which are Cboe BZX
+# round lots only (~4% of consolidated volume, measured 2026-10-21) and cannot
+# be fetched after the fact, so IEX, the same size of tape, stands in for them.
+# A `live` dataset stores its SIP and IEX days as ordinary `sip`/`iex` files
+# and reads its daily history from `yfinance`, where the live app's models read
+# theirs (`historical.fetch_daily_ohlc_bars`). `SimMarket` composes the view.
+LIVE_FEED = "live"
+LIVE_SETTLED_TAPE = "sip"
+LIVE_RECENT_TAPE = "iex"
+LIVE_DAILY_TAPE = "yfinance"
+TAPES = ("yfinance", "iex", "sip")
+FEEDS = (LIVE_FEED, *TAPES)
 DEFAULT_FEED = "yfinance"
 
 # The feed to assume where none was recorded: the pre-feed store layout and
@@ -156,8 +170,23 @@ def _write_gz(path: Path, payload: object) -> None:
     tmp.replace(path)
 
 
+def minute_tapes(feed: str) -> "tuple[str, ...]":
+    """The stored tapes a feed's minute bars come from, the settled one first."""
+    return (LIVE_SETTLED_TAPE, LIVE_RECENT_TAPE) if feed == LIVE_FEED else (feed,)
+
+
+def settled_tape(feed: str) -> str:
+    """The tape that holds a feed's whole day: every bar once it has settled."""
+    return minute_tapes(feed)[0]
+
+
+def daily_tape(feed: str) -> str:
+    """The tape a feed's daily history is stored on."""
+    return LIVE_DAILY_TAPE if feed == LIVE_FEED else feed
+
+
 def bars_path(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Path:
-    """Where a freshly downloaded day is written."""
+    """Where a freshly downloaded day is written (`feed` is a tape)."""
     return STORE_DIR / "bars" / feed / symbol.upper() / f"{day.isoformat()}.json.gz"
 
 
@@ -189,7 +218,11 @@ def stored_bars_path(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Path:
     old flat layout. Falling back to it (for `iex` only) keeps those datasets
     working without a re-download, and cannot mislabel anything: `sip` and
     `yfinance` never resolve to a file that was fetched as `iex`.
+
+    The `live` feed resolves to its settled tape, the one holding the whole
+    day; `stored_bars_paths` lists every file it reads.
     """
+    feed = settled_tape(feed)
     path = bars_path(symbol, day, feed)
     if not path.exists() and feed == LEGACY_FEED:
         legacy = _legacy_bars_path(symbol, day)
@@ -198,7 +231,13 @@ def stored_bars_path(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Path:
     return path
 
 
+def stored_bars_paths(symbol: str, day: date, feed: str = DEFAULT_FEED) -> "list[Path]":
+    """Every stored file a replay of (symbol, day) on `feed` reads."""
+    return [stored_bars_path(symbol, day, tape) for tape in minute_tapes(feed)]
+
+
 def stored_daily_path(symbol: str, feed: str = DEFAULT_FEED) -> Path:
+    feed = daily_tape(feed)
     path = daily_path(symbol, feed)
     if not path.exists() and feed == LEGACY_FEED:
         legacy = _legacy_daily_path(symbol)
@@ -209,7 +248,8 @@ def stored_daily_path(symbol: str, feed: str = DEFAULT_FEED) -> Path:
 
 def load_day_bars(symbol: str, day: date, feed: str = DEFAULT_FEED) -> list[dict]:
     """Stored 1-minute bars for one (symbol, day, feed); [] when the day has no
-    session (holiday) or hasn't been downloaded on that feed."""
+    session (holiday) or hasn't been downloaded on that feed. The `live` feed
+    reads its settled (SIP) tape here -- the whole day, as it ends up."""
     path = stored_bars_path(symbol, day, feed)
     if not path.exists():
         return []
@@ -290,7 +330,14 @@ def _premature(written: datetime) -> str:
 
 def incomplete_reason(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Optional[str]:
     """Why the stored (symbol, day, feed) is not the whole day, or None when it
-    is -- or is not stored at all, which `stored_bars_path(...).exists()` says."""
+    is -- or is not stored at all, which `stored_bars_path(...).exists()` says.
+    On the `live` feed, the first of its tapes that is not whole."""
+    if feed == LIVE_FEED:
+        for tape in minute_tapes(feed):
+            reason = incomplete_reason(symbol, day, tape)
+            if reason:
+                return f"{tape}: {reason}"
+        return None
     path = stored_bars_path(symbol, day, feed)
     written = written_at(path)
     if written is None:
@@ -308,7 +355,7 @@ def incomplete_reason(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Optio
 def stored_day_complete(symbol: str, day: date, feed: str = DEFAULT_FEED) -> bool:
     """Whether (symbol, day, feed) is stored and holds the whole day."""
     return (
-        stored_bars_path(symbol, day, feed).exists()
+        all(path.exists() for path in stored_bars_paths(symbol, day, feed))
         and incomplete_reason(symbol, day, feed) is None
     )
 
@@ -658,7 +705,8 @@ def coverage(
     """{day -> {symbol -> already stored on this feed}} for every weekday."""
     return {
         day.isoformat(): {
-            sym: stored_bars_path(sym, day, feed).exists() for sym in symbols
+            sym: all(path.exists() for path in stored_bars_paths(sym, day, feed))
+            for sym in symbols
         }
         for day in weekdays(start, end)
     }
@@ -796,15 +844,21 @@ def download_days(
     past session (`agent_stonks.replay`) reads the same store, and has no
     business adding a dataset to SimLab's list every time it is started.
     Arguments are taken as validated (`create_dataset` checks them).
+
+    The `live` feed downloads each of its tapes (`minute_tapes`) for every
+    session, its daily history on `daily_tape`, and the week before on its
+    settled tape only -- the one `abs_mean_minute_momentum` is measured from.
     """
+    tapes = minute_tapes(feed)
     # Daily bars first: they double as the trading-day calendar for the range.
     daily_start = start - timedelta(days=DAILY_LOOKBACK_DAYS)
+    daily_feed = daily_tape(feed)
     for sym in symbols:
-        if _daily_covers(sym, start, end, feed):
-            progress(f"daily bars {sym} [{feed}]: already stored")
+        if _daily_covers(sym, start, end, daily_feed):
+            progress(f"daily bars {sym} [{daily_feed}]: already stored")
             continue
-        progress(f"daily bars {sym} [{feed}]: downloading {daily_start} … {end}")
-        _store_daily(sym, daily_start, end, key, secret, feed, progress)
+        progress(f"daily bars {sym} [{daily_feed}]: downloading {daily_start} … {end}")
+        _store_daily(sym, daily_start, end, key, secret, daily_feed, progress)
 
     if _market_covers(start, end):
         progress("market indicators (SPY/VIX/VIX3M): already stored")
@@ -816,13 +870,14 @@ def download_days(
     # `abs_mean_minute_momentum` from (`SimMarket.abs_mean_minute_momentum`),
     # so the dataset's first days are read like the rest. Not part of the
     # dataset's days, and a failure costs only that measure, never the dataset.
+    warm = tapes[0]
     for day in minute_momentum.prior_week_days(start):
         for sym in symbols:
-            if not _needs_download(sym, day, feed, progress):
+            if not _needs_download(sym, day, warm, progress):
                 continue
-            progress(f"minute bars {sym} {day} [{feed}]: downloading (the week before)")
+            progress(f"minute bars {sym} {day} [{warm}]: downloading (the week before)")
             try:
-                _store_day_bars(sym, day, feed, fetch_minute_bars_day(sym, day, key, secret, feed), progress)
+                _store_day_bars(sym, day, warm, fetch_minute_bars_day(sym, day, key, secret, warm), progress)
             except Exception as exc:
                 progress(f"minute bars {sym} {day}: failed ({exc}); skipped")
 
@@ -830,18 +885,22 @@ def download_days(
     for day in weekdays(start, end):
         day_has_bars = False
         for sym in symbols:
-            # The *resolved* path, so a day already held in the pre-feed layout
-            # counts as stored instead of being downloaded a second time -- and
-            # only when it is the whole day (`incomplete_reason`).
-            downloaded = _needs_download(sym, day, feed, progress)
-            if downloaded:
-                progress(f"minute bars {sym} {day} [{feed}]: downloading")
-                bars = _store_day_bars(
-                    sym, day, feed, fetch_minute_bars_day(sym, day, key, secret, feed), progress
-                )
-                day_has_bars = day_has_bars or bool(bars)
-            else:
-                day_has_bars = day_has_bars or bool(load_day_bars(sym, day, feed))
+            downloaded = False
+            for tape in tapes:
+                # The *resolved* path, so a day already held in the pre-feed
+                # layout counts as stored instead of being downloaded a second
+                # time -- and only when it is the whole day (`incomplete_reason`).
+                # Whether the day is a session is the settled tape's answer.
+                if _needs_download(sym, day, tape, progress):
+                    downloaded = True
+                    progress(f"minute bars {sym} {day} [{tape}]: downloading")
+                    bars = _store_day_bars(
+                        sym, day, tape, fetch_minute_bars_day(sym, day, key, secret, tape), progress
+                    )
+                    if tape == warm:
+                        day_has_bars = day_has_bars or bool(bars)
+                elif tape == warm:
+                    day_has_bars = day_has_bars or bool(load_day_bars(sym, day, tape))
             if (downloaded and not news_path(sym, day).exists()) or _news_incomplete(sym, day):
                 _store_news(sym, day, key, secret, progress)
         if not day_has_bars:
@@ -889,7 +948,7 @@ def create_dataset(
             progress(
                 f"warning: yfinance serves 1-minute bars only back to {horizon} "
                 f"({YF_MINUTE_WINDOW_DAYS} days); days before that will store empty. "
-                "Use the 'sip' feed (paid Alpaca data) for an older window."
+                "Use the 'live' or 'sip' feed (Alpaca) for an older window."
             )
 
     session_days = download_days(symbols, start, end, key, secret, feed, progress)
@@ -937,7 +996,8 @@ class IncompleteFile:
 
 
 def _stored_bar_days(feed: Optional[str] = None) -> "set[tuple[str, str, date]]":
-    """(feed, symbol, day) for every stored minute-bar file, in both layouts."""
+    """(tape, symbol, day) for every stored minute-bar file, in both layouts --
+    narrowed to the tapes `feed` reads when given."""
     root = STORE_DIR / "bars"
     found: "set[tuple[str, str, date]]" = set()
     if not root.exists():
@@ -945,12 +1005,12 @@ def _stored_bar_days(feed: Optional[str] = None) -> "set[tuple[str, str, date]]"
     for top in root.iterdir():
         if not top.is_dir():
             continue
-        if top.name in FEEDS:
+        if top.name in TAPES:
             dirs = [(top.name, sub) for sub in top.iterdir() if sub.is_dir()]
         else:  # the pre-feed flat layout, bars/{SYMBOL}/ -- all IEX
             dirs = [(LEGACY_FEED, top)]
         for tape, sym_dir in dirs:
-            if feed and tape != feed:
+            if feed and tape not in minute_tapes(feed):
                 continue
             for path in sym_dir.glob("*.json.gz"):
                 try:
@@ -1005,11 +1065,11 @@ def incomplete_files(
                 ))
 
     daily_root = STORE_DIR / "daily"
-    daily_files = [(tape, p) for tape in FEEDS for p in sorted((daily_root / tape).glob("*.json.gz"))]
+    daily_files = [(tape, p) for tape in TAPES for p in sorted((daily_root / tape).glob("*.json.gz"))]
     daily_files += [(LEGACY_FEED, p) for p in sorted(daily_root.glob("*.json.gz"))]
     for tape, path in daily_files:
         symbol = path.name[: -len(".json.gz")].upper()
-        if (feed and tape != feed) or (want_symbols is not None and symbol not in want_symbols):
+        if (feed and tape != daily_tape(feed)) or (want_symbols is not None and symbol not in want_symbols):
             continue
         if path != stored_daily_path(symbol, tape):
             continue  # a pre-feed file shadowed by a feed-scoped one

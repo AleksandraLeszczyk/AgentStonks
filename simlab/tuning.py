@@ -792,7 +792,7 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
     paths = [sim_data.market_path(), sim_data.stored_daily_path(symbol, feed)]
     for day in days or ():
         stamp = date.fromisoformat(str(day)[:10])
-        paths.append(sim_data.stored_bars_path(symbol, stamp, feed))
+        paths.extend(sim_data.stored_bars_paths(symbol, stamp, feed))
         paths.append(sim_data.news_path(symbol, stamp))
         # The week before each session, which `abs_mean_minute_momentum` (and
         # so the momentum confirmation's neutral band) is measured from.

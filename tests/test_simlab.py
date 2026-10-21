@@ -222,6 +222,201 @@ class TestMinuteMoveInReplay:
         assert sim_data.stored_bars_path("AAPL", self.FRIDAY, sim_data.DEFAULT_FEED) in paths
 
 
+def _store_live_day(day: date = DAY, minutes: int = 60, iex_gap=(20,), sip_gap=(40,)):
+    """One session on both of the `live` feed's tapes: SIP at volume 1000, IEX a
+    cent higher at volume 40 (one venue's share), each missing the minutes given."""
+    open_utc = OPEN_UTC + timedelta(days=(day - DAY).days)
+    sip = [_bar(open_utc + timedelta(minutes=i), 100.0 + 0.1 * i) for i in range(minutes) if i not in sip_gap]
+    iex = [_bar(open_utc + timedelta(minutes=i), 100.01 + 0.1 * i, volume=40.0)
+           for i in range(minutes) if i not in iex_gap]
+    sim_data._write_gz(sim_data.bars_path("TEST", day, "sip"), sip)
+    sim_data._write_gz(sim_data.bars_path("TEST", day, "iex"), iex)
+
+
+class TestLiveFeed:
+    """The `live` feed replays the live app's tiers: a bar that ended 15 or more
+    minutes before the simulated moment is SIP's, a younger one IEX's."""
+
+    def _tape(self, bars):
+        return ["iex" if b["v"] == 40.0 else "sip" for b in bars]
+
+    def test_the_newest_fifteen_minutes_are_iex_and_the_rest_sip(self, store):
+        _store_live_day()
+        market = SimMarket(["TEST"], [DAY], sim_data.LIVE_FEED)
+        t = OPEN_UTC + timedelta(minutes=35)  # bars 0..34 completed
+        bars = market.completed_bars("TEST", t)
+        assert len(bars) == 35
+        # Bars 0-19 ended by 13:50, 15+ minutes before 14:05: settled.
+        assert self._tape(bars[:20]) == ["sip"] * 20
+        # 20 has no IEX bar: SIP's stands in, as live fills the hole.
+        assert self._tape(bars[20:]) == ["sip"] + ["iex"] * 14
+        assert market.price_at("TEST", t) == pytest.approx(100.01 + 0.1 * 34)
+
+    def test_a_bar_turns_sip_when_it_is_fifteen_minutes_old(self, store):
+        _store_live_day()
+        market = SimMarket(["TEST"], [DAY], sim_data.LIVE_FEED)
+        # Bar 0 ended 13:31; at 13:45 it is 14 minutes old, at 13:46 fifteen.
+        assert self._tape(market.completed_bars("TEST", OPEN_UTC + timedelta(minutes=15)))[0] == "iex"
+        assert self._tape(market.completed_bars("TEST", OPEN_UTC + timedelta(minutes=16)))[0] == "sip"
+
+    def test_a_minute_sip_lacks_keeps_its_iex_bar_once_settled(self, store):
+        _store_live_day()
+        market = SimMarket(["TEST"], [DAY], sim_data.LIVE_FEED)
+        bars = market.completed_bars("TEST", OPEN_UTC + timedelta(minutes=60))
+        assert len(bars) == 60
+        assert self._tape(bars)[40] == "iex"
+
+    def test_whole_day_reads_stay_on_the_settled_tape(self, store):
+        """The day's running volume and range, the volume tools and the charts
+        read `minute_bars`: SIP, the tape the day ends up on."""
+        _store_live_day()
+        market = SimMarket(["TEST"], [DAY], sim_data.LIVE_FEED)
+        assert market.day_volume("TEST", OPEN_UTC + timedelta(minutes=60)) == pytest.approx(59 * 1000.0 + 40.0)
+        assert sim_data.load_day_bars("TEST", DAY, sim_data.LIVE_FEED) == sim_data.load_day_bars("TEST", DAY, "sip")
+        # ...and the daily history is yfinance's, as the live models read it.
+        assert market.series["TEST"].daily_bars == sim_data.load_daily_bars("TEST", "yfinance")
+
+    def test_the_engine_buffer_is_the_live_view_at_every_step(self, store):
+        _store_live_day()
+        market = SimMarket(["TEST"], [DAY], sim_data.LIVE_FEED)
+        engine = SimulationEngine(market, SimulationConfig(
+            personality="momentum", provider="openai", model="m", api_key="",
+            symbols=["TEST"], days=[DAY], feed=sim_data.LIVE_FEED,
+        ))
+        ss = engine.app.sym("TEST")
+        try:
+            for t in market.step_times(DAY):
+                engine._apply_step(t)
+                assert list(ss.bars) == market.completed_bars("TEST", t)
+                assert ss.previous_minute_close == market.price_at("TEST", t)
+        finally:
+            clock.clear()
+
+    def _engine_at(self, t):
+        market = SimMarket(["TEST"], [DAY], sim_data.LIVE_FEED)
+        engine = SimulationEngine(market, SimulationConfig(
+            personality="momentum", provider="openai", model="m", api_key="",
+            symbols=["TEST"], days=[DAY], feed=sim_data.LIVE_FEED,
+        ))
+        for step in market.step_times(DAY):
+            if step <= t:
+                engine._apply_step(step)
+        return market, engine
+
+    def test_orders_fill_at_sips_price_while_the_agent_sees_iexs(self, store):
+        """The agent and its models read the young IEX bar; the market an order
+        meets is the whole tape, so the fill is SIP's close of that minute."""
+        _store_live_day()
+        t = OPEN_UTC + timedelta(minutes=35)
+        try:
+            market, engine = self._engine_at(t)
+            assert engine.app.sym("TEST").last_price == pytest.approx(100.01 + 0.1 * 34)
+            assert market.fill_price("TEST", t) == pytest.approx(100.0 + 0.1 * 34)
+            decision = engine.tracker.record_trade("TEST", "buy", 10, "test", "k", "s")
+        finally:
+            clock.clear()
+        assert decision.status == "filled"
+        assert decision.price == pytest.approx(100.0 + 0.1 * 34)
+
+    def test_a_limit_is_held_against_the_fill_price(self, store):
+        """A buy limited between SIP's close and IEX's fills: the order meets
+        SIP's price, which is under it, not the IEX close the agent saw."""
+        _store_live_day()
+        t = OPEN_UTC + timedelta(minutes=35)
+        sip_close = 100.0 + 0.1 * 34
+        try:
+            _, engine = self._engine_at(t)
+            decision = engine.tracker.record_trade(
+                "TEST", "buy", 10, "test", "k", "s", limit_price=sip_close + 0.005
+            )
+        finally:
+            clock.clear()
+        assert decision.status == "filled" and not decision.limit_missed
+
+    def test_the_equity_curve_is_valued_at_the_fill_price(self, store):
+        _store_live_day()
+        t = OPEN_UTC + timedelta(minutes=35)
+        try:
+            market, engine = self._engine_at(t)
+            engine.tracker.record_trade("TEST", "buy", 10, "test", "k", "s")
+            later = t + timedelta(minutes=5)
+            engine._apply_step(later)
+        finally:
+            clock.clear()
+        cash = engine.tracker.snapshot()["cash"]
+        assert engine.equity[-1]["value"] == pytest.approx(cash + 10 * market.fill_price("TEST", later))
+        # ...while the agent's own mark is on the prices it sees.
+        assert engine.app.portfolio_value == pytest.approx(cash + 10 * market.price_at("TEST", later))
+
+    def test_on_a_single_tape_feed_the_fill_price_is_the_tape_price(self, store):
+        market = SimMarket(["TEST"], [DAY])
+        for t in [OPEN_UTC, *market.step_times(DAY)]:
+            assert market.fill_price("TEST", t) == market.price_at("TEST", t)
+
+    def test_a_single_tape_feed_reads_as_before(self, store):
+        market = SimMarket(["TEST"], [DAY])
+        series = market.series["TEST"]
+        assert series.settle_after is None and series.recent_bars == []
+        t = OPEN_UTC + timedelta(minutes=30)
+        assert market.completed_bars("TEST", t) == series.minute_bars[:30]
+
+    def test_a_live_dataset_downloads_both_tapes_and_yfinance_daily(self, store, monkeypatch):
+        minute_calls, daily_calls = [], []
+
+        def fake_minute(symbol, day, key="", secret="", feed=sim_data.DEFAULT_FEED):
+            minute_calls.append((day, feed))
+            return _session(day, 30)
+
+        def fake_daily(symbol, start, end, key="", secret="", feed=sim_data.DEFAULT_FEED):
+            daily_calls.append(feed)
+            return [_bar(OPEN_UTC, 99.0)]
+
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", fake_minute)
+        monkeypatch.setattr(sim_data, "fetch_daily_bars_range", fake_daily)
+        monkeypatch.setattr(sim_data, "fetch_news_day", lambda *a, **k: [])
+        monkeypatch.setattr(
+            sim_data, "fetch_market_indicator_closes",
+            lambda *a, **k: {"spy": [], "vix": [], "vix3m": []},
+        )
+        day = date(2026, 6, 16)
+
+        ds = sim_data.create_dataset("lv", ["NEW"], day, day, "k", "s", feed=sim_data.LIVE_FEED)
+
+        assert ds.feed == "live" and ds.days == ["2026-06-16"]
+        assert daily_calls == ["yfinance"]
+        # The week before on the settled tape only (what the minute-move
+        # measure reads), then the session on both tapes.
+        before = minute_momentum.prior_week_days(day)
+        assert minute_calls == [*((d, "sip") for d in before), (day, "sip"), (day, "iex")]
+        assert sim_data.coverage(["NEW"], day, day, sim_data.LIVE_FEED) == {"2026-06-16": {"NEW": True}}
+
+    def test_a_live_dataset_needs_alpaca_credentials(self, store, monkeypatch):
+        monkeypatch.setattr(
+            sim_data, "fetch_minute_bars_day",
+            lambda *a, **k: pytest.fail("must not download without credentials"),
+        )
+        with pytest.raises(ValueError, match="Alpaca credentials"):
+            sim_data.create_dataset("d", ["TEST"], DAY, DAY, feed=sim_data.LIVE_FEED)
+
+    def test_a_live_day_is_whole_only_when_both_tapes_are(self, store):
+        _store_live_day()
+        for tape in ("sip", "iex"):
+            _written(sim_data.bars_path("TEST", DAY, tape), datetime(2026, 6, 16, 9, 0, tzinfo=timezone.utc))
+        assert sim_data.stored_day_complete("TEST", DAY, sim_data.LIVE_FEED)
+        _written(sim_data.bars_path("TEST", DAY, "iex"), datetime(2026, 6, 15, 14, 29, tzinfo=timezone.utc))
+        assert not sim_data.stored_day_complete("TEST", DAY, sim_data.LIVE_FEED)
+        assert sim_data.incomplete_reason("TEST", DAY, sim_data.LIVE_FEED).startswith("iex: ")
+        assert {f.feed for f in sim_data.incomplete_files(feed=sim_data.LIVE_FEED)} == {"iex"}
+
+    def test_a_tuning_replay_reads_both_tapes(self, store):
+        paths = sim_tuning._replay_inputs(
+            AppleTraderConfig(model_key="dayrange"), [DAY.isoformat()], sim_data.LIVE_FEED,
+        )
+        assert sim_data.bars_path("AAPL", DAY, "sip") in paths
+        assert sim_data.bars_path("AAPL", DAY, "iex") in paths
+        assert sim_data.daily_path("AAPL", "yfinance") in paths
+
+
 class TestDatasetStore:
     def test_create_dataset_downloads_only_missing_days(self, store, monkeypatch):
         calls = []

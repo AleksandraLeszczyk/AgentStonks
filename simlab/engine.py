@@ -107,13 +107,15 @@ class SimulationResult:
 
 
 class SimBroker(Broker):
-    """Fills at the stored tape price at the pinned simulated moment."""
+    """Fills at the stored tape price at the pinned simulated moment -- the
+    consolidated (settled) tape's (`SimMarket.fill_price`), whatever tape the
+    agent is shown."""
 
     def __init__(self, market: SimMarket) -> None:
         self.market = market
 
     def get_current_price(self, symbol: str, key: str, secret: str, feed: str = "iex") -> float:
-        price = self.market.price_at(symbol.upper(), clock.now())
+        price = self.market.fill_price(symbol.upper(), clock.now())
         if price is None:
             raise RuntimeError(f"no simulated tape price for {symbol} at {clock.now().isoformat()}")
         return price
@@ -149,6 +151,10 @@ class SimulationEngine:
         self.equity: list[dict] = []
         self.cycles_run = 0
         self._cursors: dict[str, int] = {sym: 0 for sym in self.app.symbols}
+        # A tiered (`live`) feed's buffer bookkeeping: how many young bars sit
+        # on top of the buffer, and the newest bar's time (`_fold_tiered_bars`).
+        self._young_held: dict[str, int] = {}
+        self._newest_ts: dict[str, datetime] = {}
         self._last_step: Optional[datetime] = None
         self._stop_requested = False
 
@@ -249,17 +255,13 @@ class SimulationEngine:
         clock.set_simulated(t)
         for ss in self.app.iter_symbol_states():
             series = self.market.series[ss.symbol]
-            cursor = self._cursors[ss.symbol]
-            fresh: list[dict] = []
-            while cursor < len(series.minute_ts) and series.minute_ts[cursor] + timedelta(seconds=BAR_SEC) <= t:
-                fresh.append(series.minute_bars[cursor])
-                cursor += 1
-            self._cursors[ss.symbol] = cursor
+            if series.settle_after is None:
+                fresh = self._fold_bars(ss, series, t)
+            else:
+                fresh = self._fold_tiered_bars(ss, series, t)
             if not fresh and ss.last_price is not None:
                 continue
             with ss.lock:
-                for bar in fresh:
-                    ss.bars.append(bar)
                 if fresh:
                     last = fresh[-1]
                     close = float(last["c"])
@@ -284,10 +286,71 @@ class SimulationEngine:
             if prev is not None:
                 ss.prev_close = prev
             ss.news = self.market.news_at(ss.symbol, t)
-        value = self.app.mark_to_market()
-        if value is not None:
-            self.equity.append({"ts": t.isoformat(), "value": value})
+        # The app's own mark (what the agent reads as its portfolio value) is on
+        # the prices it sees; the recorded equity is the account's, valued at
+        # the prices it would trade at -- as a live venue reports its own.
+        if self.app.mark_to_market() is not None:
+            self.equity.append({"ts": t.isoformat(), "value": self._account_value(t)})
         self._last_step = t
+
+    def _account_value(self, t: datetime) -> float:
+        """Cash plus every position at its fill price at `t`
+        (`SimMarket.fill_price`), the agent's mark where there is none."""
+        snap = self.tracker.snapshot()
+        value = float(snap["cash"])
+        for symbol, position in snap["positions"].items():
+            if not position:
+                continue
+            price = self.market.fill_price(symbol, t)
+            if price is None:
+                price = self.app.mark_price(symbol)
+            if price is None:
+                continue
+            value += position * price
+        return value
+
+    def _fold_bars(self, ss, series, t: datetime) -> "list[dict]":
+        """Append the bars completed by `t` to the buffer; return them."""
+        cursor = self._cursors[ss.symbol]
+        fresh: list[dict] = []
+        while cursor < len(series.minute_ts) and series.minute_ts[cursor] + timedelta(seconds=BAR_SEC) <= t:
+            fresh.append(series.minute_bars[cursor])
+            cursor += 1
+        self._cursors[ss.symbol] = cursor
+        if fresh:
+            with ss.lock:
+                ss.bars.extend(fresh)
+        return fresh
+
+    def _fold_tiered_bars(self, ss, series, t: datetime) -> "list[dict]":
+        """Make the buffer the live view at `t` (`SimMarket.completed_bars`):
+        the young tail it held is taken off, the bars that have settled since go
+        on from the settled tape, and the young window goes back on top. Returns
+        the newest bar when it is a newer minute than the last step's, else [].
+
+        Done in place rather than rebuilt, so a step costs the ~15 young bars,
+        not the whole buffer; the deque's `maxlen` drops from the left exactly
+        as a rebuild truncated to it would.
+        """
+        i, j0, j1 = series.view(t)
+        symbol = ss.symbol
+        cursor = self._cursors[symbol]
+        with ss.lock:
+            for _ in range(self._young_held.get(symbol, 0)):
+                ss.bars.pop()
+            ss.bars.extend(series.minute_bars[cursor:i])
+            ss.bars.extend(series.recent_bars[j0:j1])
+        self._cursors[symbol] = max(cursor, i)
+        self._young_held[symbol] = j1 - j0
+        if j1 > j0:
+            newest, newest_ts = series.recent_bars[j1 - 1], series.recent_ts[j1 - 1]
+        elif i:
+            newest, newest_ts = series.minute_bars[i - 1], series.minute_ts[i - 1]
+        else:
+            return []
+        seen = self._newest_ts.get(symbol)
+        self._newest_ts[symbol] = newest_ts
+        return [newest] if seen is None or newest_ts > seen else []
 
     def _day_volume(self, symbol: str, t: datetime) -> float:
         # A bisection over the market's per-day running totals. The scan this

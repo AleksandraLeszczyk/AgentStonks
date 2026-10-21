@@ -9,6 +9,18 @@ Time convention: a minute bar stamped T covers [T, T+60) -- true of both
 sources the store holds, Alpaca and yfinance. It is *completed* -- and
 therefore visible to the agent -- once t >= T + 60. The engine steps the clock
 to exactly those completion moments.
+
+The `live` feed (`simlab.data.LIVE_FEED`) is the live app's view of the tape
+rather than one tape: at t, a bar that ended at least SETTLED_BAR_AGE_MIN
+minutes before t is SIP's, and a younger one IEX's -- as the live buffer swaps
+its young single-venue candles for settled SIP bars on every backfill
+(`bar_history.fetch_live_bars`). Each series keeps the two tapes side by side:
+`minute_bars` is the settled one (SIP, IEX where SIP has no bar -- the live
+buffer keeps a young bar nothing replaces) and `recent_bars` the young one
+(IEX, SIP for a regular-session minute IEX has no bar in -- live fills those
+holes from yfinance, the consolidated tape). The newest bar, the price and
+every read of the bar buffer are the young tape's; whole-day reads (the day's
+running volume and range, the volume tools, charts) stay on the settled one.
 """
 from __future__ import annotations
 
@@ -17,15 +29,49 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from agent_stonks import clock, minute_momentum
+from agent_stonks.config import SETTLED_BAR_AGE_MIN
 from agent_stonks.market_hours import MARKET_CLOSE, MARKET_OPEN, MARKET_TZ
 
 from . import data
 
 BAR_SEC = 60.0
+SETTLE_AFTER = timedelta(minutes=SETTLED_BAR_AGE_MIN)
 
 
 def parse_ts(raw: object) -> Optional[datetime]:
     return clock.parse_iso(raw)
+
+
+def _parsed(bars: "list[dict]") -> "tuple[list[dict], list[datetime]]":
+    """The bars that carry a timestamp, and those timestamps."""
+    kept: "list[dict]" = []
+    stamps: "list[datetime]" = []
+    for bar in bars:
+        ts = parse_ts(bar.get("t"))
+        if ts is not None:
+            kept.append(bar)
+            stamps.append(ts)
+    return kept, stamps
+
+
+def _in_regular_session(ts: datetime) -> bool:
+    local = ts.astimezone(MARKET_TZ).time()
+    return MARKET_OPEN <= local < MARKET_CLOSE
+
+
+def _merged(
+    primary: "list[dict]", fallback: "list[dict]", regular_only: bool = False
+) -> "tuple[list[dict], list[datetime]]":
+    """`primary`'s bars, plus `fallback`'s for the minutes `primary` has none
+    in (only regular-session ones when `regular_only`), in time order."""
+    by_ts: "dict[datetime, dict]" = {}
+    for bar, ts in zip(*_parsed(fallback)):
+        if not regular_only or _in_regular_session(ts):
+            by_ts[ts] = bar
+    bars, stamps = _parsed(primary)
+    by_ts.update(zip(stamps, bars))
+    stamps = sorted(by_ts)
+    return [by_ts[ts] for ts in stamps], stamps
 
 
 class _SymbolSeries:
@@ -34,17 +80,22 @@ class _SymbolSeries:
     def __init__(self, symbol: str, days: list[date], feed: str = data.DEFAULT_FEED) -> None:
         self.symbol = symbol
         self.feed = feed
-        self.minute_bars: list[dict] = []
-        for day in days:
-            self.minute_bars.extend(data.load_day_bars(symbol, day, feed))
-        self.minute_ts: list[datetime] = []
-        bars_clean: list[dict] = []
-        for bar in self.minute_bars:
-            ts = parse_ts(bar.get("t"))
-            if ts is not None:
-                bars_clean.append(bar)
-                self.minute_ts.append(ts)
-        self.minute_bars = bars_clean
+        tapes = [
+            [bar for day in days for bar in data.load_day_bars(symbol, day, tape)]
+            for tape in data.minute_tapes(feed)
+        ]
+        # The young tape and how old a bar must be to leave it: None, and no
+        # young tape at all, on a single-tape feed.
+        self.settle_after: Optional[timedelta] = None
+        self.recent_bars: list[dict] = []
+        self.recent_ts: list[datetime] = []
+        if len(tapes) == 2:
+            settled, recent = tapes
+            self.minute_bars, self.minute_ts = _merged(settled, recent)
+            self.recent_bars, self.recent_ts = _merged(recent, settled, regular_only=True)
+            self.settle_after = SETTLE_AFTER
+        else:
+            self.minute_bars, self.minute_ts = _parsed(tapes[0])
 
         self.daily_bars: list[dict] = data.load_daily_bars(symbol, feed)
         self.news: list[dict] = []
@@ -88,6 +139,21 @@ class _SymbolSeries:
         if entry is None:
             return None, 0
         return entry, bisect_right(entry["ts"], t - timedelta(seconds=BAR_SEC))
+
+    def view(self, t: datetime) -> "tuple[int, int, int]":
+        """Where the bar buffer at `t` is cut, as `(i, j0, j1)`: it is
+        `minute_bars[:i] + recent_bars[j0:j1]`, the settled bars and then the
+        young ones -- every bar completed by `t`, from the tape its age calls for.
+        """
+        end = t - timedelta(seconds=BAR_SEC)
+        if self.settle_after is None:
+            return bisect_right(self.minute_ts, end), 0, 0
+        cut = end - self.settle_after
+        return (
+            bisect_right(self.minute_ts, cut),
+            bisect_right(self.recent_ts, cut),
+            bisect_right(self.recent_ts, end),
+        )
 
     def prior_daily(self, today: str) -> "list[dict]":
         """Stored daily bars dated strictly before `today` (ISO), cached per date.
@@ -196,21 +262,50 @@ class SimMarket:
         return self.series.get(str(symbol).upper())
 
     def completed_bars(self, symbol: str, t: datetime) -> list[dict]:
-        """Minute bars completed by `t`, oldest first (the SymbolState buffer)."""
+        """Minute bars completed by `t`, oldest first (the SymbolState buffer),
+        each from the tape its age at `t` calls for (`_SymbolSeries.view`)."""
         series = self._series(symbol)
         if series is None:
             return []
-        cutoff = t - timedelta(seconds=BAR_SEC)
-        idx = bisect_right(series.minute_ts, cutoff)
-        return series.minute_bars[:idx]
+        i, j0, j1 = series.view(t)
+        return series.minute_bars[:i] + series.recent_bars[j0:j1]
 
     def price_at(self, symbol: str, t: datetime) -> Optional[float]:
         """Close of the last bar completed by `t` -- the simulated tape price."""
-        bars = self.completed_bars(symbol, t)
-        if not bars:
+        series = self._series(symbol)
+        if series is None:
+            return None
+        i, j0, j1 = series.view(t)
+        if j1 > j0:
+            bar = series.recent_bars[j1 - 1]
+        elif i:
+            bar = series.minute_bars[i - 1]
+        else:
             return None
         try:
-            return float(bars[-1]["c"])
+            return float(bar["c"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def fill_price(self, symbol: str, t: datetime) -> Optional[float]:
+        """The price an order placed at `t` trades at: the close of the settled
+        tape's bar completed by `t`.
+
+        Not `price_at`, which is what the agent *sees*. On the `live` feed that
+        is the young IEX bar -- one venue, a few cents off the market -- while
+        an order fills against the whole market, which SIP is; SIP's bar for
+        the minute that just ended is in the dataset even though the agent is
+        not shown it for another 15 minutes. On a single-tape feed the two are
+        the same number.
+        """
+        series = self._series(symbol)
+        if series is None:
+            return None
+        i = bisect_right(series.minute_ts, t - timedelta(seconds=BAR_SEC))
+        if not i:
+            return None
+        try:
+            return float(series.minute_bars[i - 1]["c"])
         except (KeyError, TypeError, ValueError):
             return None
 

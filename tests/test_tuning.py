@@ -1921,7 +1921,24 @@ class TestReplaySpeedups:
 
     def test_the_replay_minute_frame_is_the_buffers_frame(self, store):
         """At every step the engine takes, row for row and column for column."""
-        market = self.market()
+        self._assert_fast_frame_is_the_buffers(self.market())
+
+    def test_the_replay_minute_frame_is_the_buffers_frame_on_the_live_feed(self, store):
+        """The same with the buffer re-tiered at every step -- SIP up to the
+        settle cut, IEX after it -- and holes in both tapes."""
+        for day in (TUNE_DAY, TEST_DAY):
+            sip = sim_data._read_gz(sim_data.bars_path(TICKER, day))
+            sim_data._write_gz(
+                sim_data.bars_path(TICKER, day, "sip"), [b for i, b in enumerate(sip) if i != 25]
+            )
+            sim_data._write_gz(sim_data.bars_path(TICKER, day, "iex"), [
+                dict(b, c=b["c"] + 0.01, v=40.0) for i, b in enumerate(sip) if i not in (3, 18)
+            ])
+        market = SimMarket([TICKER], [TUNE_DAY, TEST_DAY], sim_data.LIVE_FEED)
+        assert market.series[TICKER].settle_after is not None
+        self._assert_fast_frame_is_the_buffers(market)
+
+    def _assert_fast_frame_is_the_buffers(self, market):
         original = momentum_regime.minute_frame
         engine = SimulationEngine(market, SimulationConfig(
             personality=APPLE_TRADER_KEY, provider="rules", model="x", api_key="",

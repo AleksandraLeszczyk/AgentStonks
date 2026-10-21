@@ -487,11 +487,13 @@ def render_datasets_tab() -> None:
     )
     st.info(
         ":material/info: **The feed is part of the data, not a download setting.** "
-        "`yfinance` (the default) is the consolidated tape — every venue — free, and the "
-        "same source the live volume tools read. `iex` is one venue, roughly 4% of "
-        "consolidated volume on a large cap, so its bars carry different closes, far "
-        "smaller volumes and occasionally an extra or missing minute; any agent whose "
-        "rules are thresholds over those bars can trade a different day on each tape. "
+        "`live` (the default) replays what the live app sees: bars that ended 15 or more "
+        "minutes ago are SIP (the consolidated tape), the newest 15 are IEX — one venue, "
+        "roughly 4% of the volume, standing in for the live app's single-venue Finnhub "
+        "candles, which cannot be downloaded after the fact. Its daily history is "
+        "yfinance's, where the live models read theirs. `yfinance` and `sip` are the "
+        "consolidated tape for every bar, `iex` the one venue for every bar; any agent "
+        "whose rules are thresholds over the bars can trade a different day on each tape. "
         "The same day on two feeds is stored twice, on purpose."
     )
     st.warning(
@@ -499,8 +501,8 @@ def render_datasets_tab() -> None:
         "Yahoo serves 1-minute history for the last "
         f"{sim_data.YF_MINUTE_WINDOW_DAYS} days only, so a yfinance dataset cannot start "
         f"before **{date.today() - timedelta(days=sim_data.YF_MINUTE_WINDOW_DAYS)}** — "
-        "earlier days download empty. Use `sip` (needs a paid Alpaca data subscription) "
-        "for an older window. yfinance bars also carry no per-bar VWAP."
+        "earlier days download empty. Use `live` or `sip` (Alpaca) for an older window. "
+        "yfinance bars also carry no per-bar VWAP."
     )
     with st.form("dataset_form"):
         name = st.text_input("Dataset name", placeholder="e.g. nvda-earnings-week")
@@ -516,8 +518,8 @@ def render_datasets_tab() -> None:
         st.caption(
             "Alpaca credentials come from `ALPACA_API_KEY` / `ALPACA_SECRET` in the "
             f"environment ({'set' if api_key and api_secret else '**not set**'}). They are "
-            "required for the `iex`/`sip` feeds. On `yfinance` they are optional and fetch "
-            "news only — without them the dataset has no news."
+            "required for the `live`, `iex` and `sip` feeds. On `yfinance` they are optional "
+            "and fetch news only — without them the dataset has no news."
         )
         submitted = st.form_submit_button("Download dataset", icon=":material/download:", type="primary")
 
@@ -567,7 +569,7 @@ def render_datasets_tab() -> None:
         reach = set(sim_data.weekdays(lo, hi)) | set(minute_momentum.prior_week_days(lo))
         partial = [
             f for f in incomplete
-            if f.feed == ds.feed and f.symbol in ds.symbols and f.day in reach
+            if f.feed in sim_data.minute_tapes(ds.feed) and f.symbol in ds.symbols and f.day in reach
         ]
         if partial:
             groups: "dict[tuple[str, str], list[date]]" = {}

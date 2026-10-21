@@ -173,9 +173,11 @@ def _minute_files(symbol: str, feed: str) -> "dict[date, Path]":
     """Every stored minute-bar file for one symbol on one tape, by day.
 
     `iex` also reads the pre-feed flat layout, as `simlab.data` does; a
-    feed-scoped file wins over a legacy one for the same day.
+    feed-scoped file wins over a legacy one for the same day. The `live` feed
+    reads its settled tape (`simlab.data.settled_tape`), the whole day.
     """
     symbol = symbol.upper()
+    feed = sim_data.settled_tape(feed)
     anchor = date(2000, 1, 3)
     dirs = [sim_data.bars_path(symbol, anchor, feed).parent]
     if feed == sim_data.LEGACY_FEED:
@@ -202,14 +204,15 @@ def stored_symbols(feed: str) -> "list[str]":
     """Symbols with minute or daily bars stored on this tape."""
     store = sim_data.STORE_DIR
     found: "set[str]" = set()
-    bars_dir, daily_dir = store / "bars" / feed, store / "daily" / feed
+    bars_dir = store / "bars" / sim_data.settled_tape(feed)
+    daily_dir = store / "daily" / sim_data.daily_tape(feed)
     if bars_dir.exists():
         found |= {p.name.upper() for p in bars_dir.iterdir() if p.is_dir()}
     if daily_dir.exists():
         found |= {p.name.split(".")[0].upper() for p in daily_dir.glob("*.json.gz")}
     if feed == sim_data.LEGACY_FEED:
         for p in (store / "bars").iterdir() if (store / "bars").exists() else ():
-            if p.is_dir() and p.name not in sim_data.FEEDS:
+            if p.is_dir() and p.name not in sim_data.TAPES:
                 found.add(p.name.upper())
         for p in (store / "daily").glob("*.json.gz") if (store / "daily").exists() else ():
             found.add(p.name.split(".")[0].upper())
