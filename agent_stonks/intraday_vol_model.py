@@ -128,6 +128,23 @@ def volatility_shape(model: dict, minutes=None) -> np.ndarray:
     return relative_volatility(model, grid if minutes is None else minutes) / peak
 
 
+def volatility_scale(model: dict, minutes=None) -> np.ndarray:
+    """Where each minute's volatility sits between the session's quietest
+    minute (0) and its most volatile (1).
+
+    The same curve as `volatility_shape`, stretched so its trough is 0 rather
+    than about a fifth: two numbers, one for each end, then define anything
+    that should follow the time of day's volatility (GoodMoments' adaptive
+    take, `apple_trader.gm_take_k_at`). One value per one-minute bar of the
+    session, the 09:30 bar first, when `minutes` is None.
+    """
+    grid = np.arange(SESSION_MINUTES)
+    curve = relative_volatility(model, grid)
+    low, high = float(curve.min()), float(curve.max())
+    values = curve if minutes is None else relative_volatility(model, minutes)
+    return (values - low) / (high - low)
+
+
 # --- the day's range --------------------------------------------------------
 
 

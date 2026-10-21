@@ -1556,10 +1556,19 @@ def _signal_trader_items(
     if model.key == apple_models.GOODMOMENTS_KEY:
         takes = [row.get("take") for row in rows]
         if any(v is not None for v in takes):
+            take_k = getattr(config, "gm_take_k", 0)
+            take_min_k = getattr(config, "gm_take_min_k", None)
+            take_note = (
+                f"Apple Trader's take, {take_k:g} ADR over the fill at the session's most "
+                f"volatile minute to {take_min_k:g} at its quietest, moved every bar with the "
+                "intraday volatility curve"
+                if take_min_k is not None
+                else f"Apple Trader's take, {take_k:g} ADR over the fill"
+            )
             items.append(_path(
                 TRADER_LEVELS_KEY, "Take-profit", stamps, takes,
                 MODEL_OVERLAY_COLORS["trader_levels"], step=True,
-                note=f"Apple Trader's take, {getattr(config, 'gm_take_k', 0):g} ADR over the fill",
+                note=take_note,
             ))
         stop_note = f"Apple Trader's stop, {getattr(config, 'gm_stop_k', 0):g} ADR under the fill"
     else:

@@ -3100,7 +3100,21 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "ended here, most within half an hour.\n"
             "- Checked on each closed bar's high and sold at market after it, so expect a "
             "slightly worse fill than the notebook's resting order.\n"
-            "- **0** switches it off."
+            "- **0** switches it off.\n"
+            "- With **Take follows intraday volatility** on, this is the take at the "
+            "session's most volatile minute (09:30)."
+        ),
+        "gm_take_min_k": (
+            "Let the take shrink as the session quietens: the take-profit above at the "
+            "session's most volatile minute (the open), this at its quietest, and in between "
+            "in proportion to IntradayVolatility's fitted time-of-day curve.\n\n"
+            "- Moved every bar and measured from the fill, so a position bought at the open "
+            "asks less of the price by midday. On AAPL's curve the take is ~40% of the way "
+            "from this number to the take-profit at 09:45, ~16% at 10:30, ~8% at 11:30, at "
+            "this number around 15:05, and ~30% back up by 15:59.\n"
+            "- The curve is the same every day (fitted on 2023 – Sep 2026), so it does not "
+            "know today is busier than usual; the ADR still scales both ends.\n"
+            "- Off keeps one take all day (the notebook's rule)."
         ),
         "gm_stop_k": (
             "Sell when a bar reaches this far under the fill, in ADRs.\n\n"

@@ -260,8 +260,15 @@ TUNABLES: "dict[str, Tunable]" = {
             (0.0, 0.10, 0.02), "%.3f",
         ),
         Tunable(
-            "gm_take_k", "Take-profit (ADR over the fill)", 0.0, 2.0, 0.05,
-            (0.10, 0.40, 0.10),
+            "gm_take_k", "Take-profit (ADR over the fill; at peak volatility if adaptive)",
+            0.0, 2.0, 0.05, (0.10, 0.40, 0.10),
+        ),
+        # A number here makes the take follow the intraday volatility curve,
+        # from `gm_take_k` at its peak to this at its trough; a cell above the
+        # take-profit is an invalid hole.
+        Tunable(
+            "gm_take_min_k", "Take-profit at the quietest minute (ADR, follows volatility)",
+            0.0, 2.0, 0.05, (0.05, 0.20, 0.05),
         ),
         Tunable(
             "gm_stop_k", "Stop (ADR under the fill)", 0.0, 3.0, 0.05,
@@ -351,6 +358,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "ff_hold_minutes",
     "gm_enter",
     "gm_take_k",
+    "gm_take_min_k",
     "gm_stop_k",
 )
 
@@ -367,7 +375,9 @@ MOMENTUM_AXES: "tuple[str, ...]" = (
     "ff_entry_quantile", "ff_stop_k", "ff_hold_minutes", "position_pct",
 )
 # GoodMoments' fields, for the same reason.
-PROBABILITY_AXES: "tuple[str, ...]" = ("gm_enter", "gm_take_k", "gm_stop_k", "position_pct")
+PROBABILITY_AXES: "tuple[str, ...]" = (
+    "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "position_pct",
+)
 # What a new grid on each rule set starts from.
 DEFAULT_AXES = {
     STRATEGY_DAYRANGE: ("buy_k", "sell_k"),

@@ -46,7 +46,7 @@ from . import agent as agent_mod
 from . import state as state_mod
 from . import (
     apple_models, bar_history, base_configs, candle_patterns, clock, event_days, historical,
-    market_hours, momentum_regime, rule_agent,
+    intraday_vol_model, market_hours, momentum_regime, rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -71,6 +71,7 @@ from .config import (
     APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
     APPLE_TRADER_GM_STOP_K,
     APPLE_TRADER_GM_TAKE_K,
+    APPLE_TRADER_GM_TAKE_MIN_K,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_HOLD_MIN_GAIN_K,
     APPLE_TRADER_LEVEL_SOURCE,
@@ -529,6 +530,11 @@ class AppleTraderConfig:
     # 14-session mean log range). 0 switches either off.
     gm_take_k: float = APPLE_TRADER_GM_TAKE_K
     gm_stop_k: float = APPLE_TRADER_GM_STOP_K
+    # With a number here the take follows the intraday volatility curve:
+    # `gm_take_k` at the session's most volatile minute, this at its quietest,
+    # in proportion between, moved every bar (`gm_take_k_at`). None (the
+    # notebook's rule) keeps `gm_take_k` all day.
+    gm_take_min_k: Optional[float] = APPLE_TRADER_GM_TAKE_MIN_K
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -721,6 +727,14 @@ class AppleTraderConfig:
                 raise ValueError(
                     f"{name} {getattr(self, name)!r} is a distance from the fill in ADRs and "
                     "cannot be negative (0 switches it off)"
+                )
+        if self.gm_take_min_k is not None:
+            self.gm_take_min_k = float(self.gm_take_min_k)
+            if not 0 <= self.gm_take_min_k <= self.gm_take_k:
+                raise ValueError(
+                    f"gm_take_min_k {self.gm_take_min_k!r} is the take at the session's quietest "
+                    "minute and must sit between 0 and the take at its most volatile, gm_take_k "
+                    f"{self.gm_take_k!r}"
                 )
 
     @property
@@ -1114,9 +1128,14 @@ def _probability_signature(c: AppleTraderConfig) -> str:
 
     `enter=+0.02` is the edge a buy needs, `exit` the edge under which a long
     is sold (`off` without one), `take` and `stop` the two distances from the
-    fill in **A**DRs (`off` at 0)."""
+    fill in **A**DRs (`off` at 0). A take that follows the intraday volatility
+    curve signs as `take=0.4..0.1A@vol` -- at the most volatile minute, then at
+    the quietest; one that does not keeps the form every record before it was
+    filed under."""
     exit_ = f"{c.gm_exit:+g}" if c.gm_exit is not None else "off"
     take = f"{c.gm_take_k:g}A" if c.gm_take_k else "off"
+    if c.gm_take_k and c.gm_take_min_k is not None:
+        take = f"{c.gm_take_k:g}..{c.gm_take_min_k:g}A@vol"
     stop = f"{c.gm_stop_k:g}A" if c.gm_stop_k else "off"
     skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
     return (
@@ -4129,15 +4148,35 @@ def _goodmoments():
     return goodmoments_model
 
 
-def gm_exits(config: AppleTraderConfig, fill: float, adr: "float | None") -> dict:
-    """The take and the stop over and under a fill, in prices: `gm_take_k` and
-    `gm_stop_k` ADRs in log terms, as the notebook rests them. None for one
-    switched off, or with no ADR to size it."""
+def gm_take_k_at(config: AppleTraderConfig, scale: "float | None") -> float:
+    """The take's distance from the fill in ADRs at a minute whose volatility
+    sits `scale` of the way from the session's quietest minute (0) to its most
+    volatile (1) -- `intraday_vol_model.volatility_scale`: `gm_take_k` at the
+    peak, `gm_take_min_k` at the trough, in proportion between. `gm_take_k`
+    itself when the take does not follow the curve."""
+    if config.gm_take_min_k is None or scale is None:
+        return config.gm_take_k
+    return config.gm_take_min_k + (config.gm_take_k - config.gm_take_min_k) * float(scale)
+
+
+def gm_exits(config: AppleTraderConfig, fill: float, adr: "float | None",
+             scale: "float | None" = None) -> dict:
+    """The take and the stop over and under a fill, in prices: the take's
+    distance at this minute (`gm_take_k_at`) and `gm_stop_k` ADRs in log terms,
+    as the notebook rests them. None for one switched off, or with no ADR to
+    size it."""
     usable = adr is not None and math.isfinite(adr) and adr > 0
+    take_k = gm_take_k_at(config, scale)
     return {
-        "take": float(fill * math.exp(config.gm_take_k * adr)) if usable and config.gm_take_k else None,
+        "take": float(fill * math.exp(take_k * adr)) if usable and config.gm_take_k else None,
         "stop": float(fill * math.exp(-config.gm_stop_k * adr)) if usable and config.gm_stop_k else None,
     }
+
+
+def _session_clock(minute: int) -> str:
+    """Minute `minute` of the regular session as an ET wall clock, "15:05"."""
+    total = 9 * 60 + 30 + int(minute)
+    return f"{total // 60:02d}:{total % 60:02d}"
 
 
 class GoodMomentsTrader(_SitsOut, BaseTrader):
@@ -4155,7 +4194,12 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
     * **take** `gm_take_k` (0.2) ADR over the fill -- the question's own target
       -- and **stop** `gm_stop_k` (0.75) ADR under it, both resting from the
       fill on and checked against every bar after it (a bar touching both is a
-      stop);
+      stop). With `gm_take_min_k` set the take follows the time of day's
+      volatility instead (IntradayVolatility's fitted curve): `gm_take_k` at
+      the session's most volatile minute, `gm_take_min_k` at its quietest, and
+      moved to the bar's own minute before each check -- still measured from
+      the fill, so a position bought at the open asks less of the price as the
+      session quietens;
     * **sell on the signal** when the edge falls under `gm_exit` -- off in the
       notebook's pick, which holds what neither level closes to the close.
 
@@ -4246,8 +4290,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             # A position without a remembered entry (a restart onto an existing
             # ledger): adopted at this bar, its take and stop measured from it.
             close = float(last["close"])
-            self.entry = {"price": close, "bars": 0, "ts": ts,
-                          **gm_exits(self.config, close, self.session["adr"])}
+            self.entry = {"price": close, "bars": 0, "ts": ts, **self._exits(close, minute)}
         if position <= 0:
             self.entry = None
         if ts == self.last_bar_ts:
@@ -4255,6 +4298,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         self.last_bar_ts = ts
         if self.entry is not None:
             self.entry["bars"] = int(self.entry.get("bars") or 0) + 1
+            self._move_take(minute)
 
         self.forecast = self._forecast_for(bundle, state, today, minute)
         self._record(state, ts, last)
@@ -4277,8 +4321,10 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             if take is not None and float(last["high"]) >= float(take):
                 self._sell(state, tracker, position, self.EXIT_TAKE, (
                     f"The {ts:%H:%M} bar traded up to ${float(last['high']):,.2f}, through the "
-                    f"${float(take):,.2f} take ({self.config.gm_take_k:g} ADR over the fill) — "
-                    "the rise the model was asked about happened."
+                    f"${float(take):,.2f} take ({self._take_phrase(minute)}) — "
+                    + ("the rise the model was asked about happened."
+                       if self.config.gm_take_min_k is None
+                       else "as far as this time of day's volatility asks for.")
                 ))
                 took = True
                 position = tracker.position_for(self.ticker)
@@ -4312,7 +4358,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             return sold
         if self.entry_refused(state, ts):
             return sold
-        return rule_agent.BOUGHT if self._buy(state, tracker, last, ts) else sold
+        return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else sold
 
     # --- the session ------------------------------------------------------
 
@@ -4365,6 +4411,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             adr = module.session_adr(bundle, self.ticker, today, key, secret)
             if not (math.isfinite(adr) and adr > 0):
                 raise ValueError("the history gives no ADR for today")
+            vol_scale = self._vol_scale_curve()
         except Exception as exc:  # noqa: BLE001 -- fatal for the session, not the run
             self.blocked = {"date": today, "reason": str(exc)}
             _log(state, {"type": "error", "text": (
@@ -4372,7 +4419,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
                 f"will not trade this session: {exc}"
             )})
             return False
-        self.session = {"date": today, "adr": float(adr), "cool_until": 0, "history": []}
+        self.session = {"date": today, "adr": float(adr), "cool_until": 0, "history": [],
+                        "vol_scale": vol_scale}
         prior = self.slot.levels(state) or {}
         if (
             prior.get("rows")
@@ -4385,7 +4433,16 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             self.session["history"] = list(prior["rows"])
             self._resume(state, prior.get("memory"))
         exits = []
-        if self.config.gm_take_k:
+        if self.config.gm_take_k and vol_scale is not None:
+            peak, trough = int(vol_scale.argmax()), int(vol_scale.argmin())
+            exits.append(
+                f"a take over the fill that follows the intraday volatility curve, "
+                f"{self.config.gm_take_k:g} ADR ({math.exp(self.config.gm_take_k * adr) - 1:.2%}) at "
+                f"its most volatile minute ({_session_clock(peak)}) and "
+                f"{self.config.gm_take_min_k:g} ADR ({math.exp(self.config.gm_take_min_k * adr) - 1:.2%}) "
+                f"at its quietest ({_session_clock(trough)}), moved every bar"
+            )
+        elif self.config.gm_take_k:
             exits.append(f"a take {self.config.gm_take_k:g} ADR "
                          f"({math.exp(self.config.gm_take_k * adr) - 1:.2%}) over the fill")
         if self.config.gm_stop_k:
@@ -4402,6 +4459,53 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             + "."
         )})
         return True
+
+    def _vol_scale_curve(self):
+        """The session's volatility scale, one value per bar (09:30 first,
+        `intraday_vol_model.volatility_scale`), when the take follows it; None
+        with a flat take. Raises when the take should follow a curve this
+        symbol has none of -- trading a flat take instead would be a rule
+        nobody chose."""
+        if self.config.gm_take_min_k is None or not self.config.gm_take_k:
+            return None
+        curve = intraday_vol_model.load(self.ticker)
+        if curve is None:
+            raise ValueError(
+                f"the take is set to follow the intraday volatility curve, and there is none "
+                f"for {self.ticker} ({intraday_vol_model.model_path(self.ticker)})"
+            )
+        return intraday_vol_model.volatility_scale(curve)
+
+    def _scale_at(self, minute: int) -> "float | None":
+        """This bar's place on the session's volatility scale, or None with a
+        flat take."""
+        scale = (self.session or {}).get("vol_scale")
+        if scale is None:
+            return None
+        return float(scale[min(max(int(minute), 0), len(scale) - 1)])
+
+    def _exits(self, fill: float, minute: int) -> dict:
+        """The take and the stop for a fill, as they stand at this minute."""
+        return gm_exits(self.config, fill, self.session["adr"], self._scale_at(minute))
+
+    def _move_take(self, minute: int) -> None:
+        """The volatility-following take, moved to this bar's minute before it
+        is checked: the same distance from the fill this time of day's
+        volatility gives any new position. The stop does not move."""
+        if self.entry is None or self._scale_at(minute) is None or not self.entry.get("price"):
+            return
+        self.entry["take"] = self._exits(float(self.entry["price"]), minute)["take"]
+
+    def _take_phrase(self, minute: int) -> str:
+        """How far over the fill the take is at this minute, in words."""
+        take_k = gm_take_k_at(self.config, self._scale_at(minute))
+        if self._scale_at(minute) is None:
+            return f"{take_k:g} ADR over the fill"
+        return (
+            f"{take_k:.2f} ADR over the fill at {_session_clock(minute)}'s volatility — "
+            f"{self.config.gm_take_k:g} at the session's most volatile minute, "
+            f"{self.config.gm_take_min_k:g} at its quietest"
+        )
 
     def _forecast_for(self, bundle: dict, state: AppState, today, minute: int) -> "dict | None":
         """This bar's forecast, or None (after 15:58, or when it cannot be made
@@ -4424,12 +4528,13 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
 
     # --- orders -----------------------------------------------------------
 
-    def _buy(self, state: AppState, tracker: DecisionTracker, bar, ts) -> bool:
+    def _buy(self, state: AppState, tracker: DecisionTracker, bar, ts, minute: int) -> bool:
         fc = self.forecast
         adr = self.session["adr"]
         exits = []
         if self.config.gm_take_k:
-            exits.append(f"a take {self.config.gm_take_k:g} ADR over the fill")
+            exits.append(f"a take {self._take_phrase(minute)}"
+                         + (", moved every bar" if self._scale_at(minute) is not None else ""))
         if self.config.gm_stop_k:
             exits.append(f"a stop {self.config.gm_stop_k:g} ADR under it")
         if self.config.gm_exit is not None:
@@ -4443,7 +4548,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         bought = self.buy(state, tracker, float(bar["close"]), reasoning)
         if bought:
             fill = float(self.entry["price"])
-            self.entry.update({"ts": ts, "edge": float(fc["edge"]), **gm_exits(self.config, fill, adr)})
+            self.entry.update({"ts": ts, "edge": float(fc["edge"]), **self._exits(fill, minute)})
             self._record(state, ts, bar)
         return bought
 
@@ -4601,7 +4706,13 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         if scores.get("auc") and scores.get("auc_30min") else ""
     )
     exits = []
-    if config.gm_take_k:
+    if config.gm_take_k and config.gm_take_min_k is not None:
+        exits.append(
+            f"at a take over the fill that follows the intraday volatility curve — "
+            f"{config.gm_take_k:g} ADR at the session's most volatile minute, "
+            f"{config.gm_take_min_k:g} ADR at its quietest, moved every bar"
+        )
+    elif config.gm_take_k:
         exits.append(f"at a take {config.gm_take_k:g} ADR over the fill")
     if config.gm_stop_k:
         exits.append(

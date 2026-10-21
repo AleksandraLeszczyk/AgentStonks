@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from . import apple_models, base_configs, event_days
+from . import apple_models, base_configs, event_days, intraday_vol_model
 from .apple_trader import (
     AppleTraderConfig, base_record, dayrange_levels, default_config, min_win_for,
     shipped_config,
@@ -152,7 +152,8 @@ def probability_params(
     defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
 ) -> AppleTraderConfig:
     """GoodMoments' rules: the edge a buy needs, the take and the stop in ADRs,
-    and the optional sale on a fading edge -- notebook 4's pick by default.
+    the take's optional fall with the intraday volatility curve, and the
+    optional sale on a fading edge -- notebook 4's pick by default.
 
     Keyed by model and instrument like Fast&Furious's, and read once, at
     ▶ Start. The size is the day-range form's own widget, so one number is the
@@ -184,6 +185,33 @@ def probability_params(
         key=copy.key(f"gm_stop_k_{model_key}_{ticker}"),
         help=copy.help.get("gm_stop_k"),
     )
+    # Only with a fitted curve for the symbol (`intraday_vol_model.TICKERS`).
+    has_curve = intraday_vol_model.load(ticker) is not None
+    adaptive_on = col_a.checkbox(
+        "Take follows intraday volatility",
+        value=defaults.gm_take_min_k is not None and has_curve,
+        disabled=not has_curve,
+        key=copy.key(f"gm_take_adaptive_{model_key}_{ticker}"),
+        help=(copy.help.get("gm_take_min_k") or "") + (
+            "" if has_curve else f"\n\nNo intraday volatility curve for {ticker}."
+        ),
+    )
+    take_min_value = col_b.number_input(
+        "…down to, at the quietest minute (ADR)",
+        min_value=0.0, max_value=2.0,
+        value=float(defaults.gm_take_min_k if defaults.gm_take_min_k is not None else 0.1),
+        step=0.05, format="%.2f", disabled=not adaptive_on,
+        key=copy.key(f"gm_take_min_k_{model_key}_{ticker}"),
+        help=copy.help.get("gm_take_min_k"),
+    )
+    gm_take_min_k = float(take_min_value) if adaptive_on and float(take_k) > 0 else None
+    if gm_take_min_k is not None and gm_take_min_k > float(take_k):
+        st.warning(
+            f"The take at the quietest minute ({gm_take_min_k:.2f} ADR) has to be at most the "
+            f"take-profit above ({float(take_k):.2f}), its value at the most volatile minute: "
+            "the take is flat until it is."
+        )
+        gm_take_min_k = None
     exit_on = col_a.checkbox(
         "Sell when the edge fades",
         value=defaults.gm_exit is not None,
@@ -214,6 +242,7 @@ def probability_params(
         gm_enter=float(enter),
         gm_exit=gm_exit,
         gm_take_k=float(take_k),
+        gm_take_min_k=gm_take_min_k,
         gm_stop_k=float(stop_k),
         skip_events=skip_events,
     )

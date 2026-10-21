@@ -867,6 +867,12 @@ APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL = True
 APPLE_TRADER_GM_ENTER = 0.02
 APPLE_TRADER_GM_EXIT = None
 APPLE_TRADER_GM_TAKE_K = 0.2
+# The take can follow the time of day's volatility (IntradayVolatility's fitted
+# curve, `intraday_vol_model.volatility_scale`): GM_TAKE_K at the session's most
+# volatile minute (the open), this at its quietest (15:05 on AAPL's curve), in
+# proportion to the curve between, moved every bar. None keeps one take all
+# day -- the notebook's rule, and every record's from before it existed.
+APPLE_TRADER_GM_TAKE_MIN_K = None
 APPLE_TRADER_GM_STOP_K = 0.75
 APPLE_TRADER_GM_LAST_ENTRY_MINUTE = 360
 APPLE_TRADER_GM_COOLDOWN_BARS = 15

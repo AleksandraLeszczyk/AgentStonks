@@ -87,6 +87,25 @@ class TestShape:
         assert w[0] == w[1] == w[2]
 
 
+class TestScale:
+    def test_one_value_per_bar_from_one_at_the_peak_to_zero_at_the_trough(self):
+        s = ivm.volatility_scale(MODEL)
+        assert len(s) == ivm.SESSION_MINUTES
+        assert s.max() == pytest.approx(1.0) and s.min() == pytest.approx(0.0, abs=1e-15)
+        assert s[0] == pytest.approx(1.0)
+        assert 0 < s.argmin() < ivm.SESSION_MINUTES - 1      # a midday trough, a close ramp
+
+    def test_it_is_the_shape_stretched(self):
+        """The same curve as `volatility_shape`, only with its trough pinned
+        to 0: an affine map of it."""
+        s, w = ivm.volatility_scale(MODEL), ivm.volatility_shape(MODEL)[:-1]
+        np.testing.assert_allclose(s, (w - w.min()) / (w.max() - w.min()), rtol=0, atol=1e-12)
+
+    def test_given_minutes_are_read_off_the_session_curve(self):
+        s = ivm.volatility_scale(MODEL)
+        np.testing.assert_allclose(ivm.volatility_scale(MODEL, [0, 60, 300]), s[[0, 60, 300]])
+
+
 class TestEnvelope:
     def test_the_upper_edge_tops_out_at_the_high_and_the_lower_at_the_low(self):
         upper, lower = ivm.envelope(MODEL, 200.0, 206.0, 197.0)

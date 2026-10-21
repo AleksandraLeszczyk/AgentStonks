@@ -259,6 +259,11 @@ _APPLE_LEGACY = {
     # or a shock (before 2026-10-04). Empty is that rule, and it is left out of
     # the signature.
     "skip_events": (),
+    # And GoodMoments' take was one distance all day, whatever the time of
+    # day's volatility (before 2026-10-21). None is that rule, also today's
+    # default, kept here so it means the same if the default moves; a flat take
+    # signs as it always did.
+    "gm_take_min_k": None,
 }
 
 

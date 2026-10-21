@@ -361,3 +361,196 @@ class TestKeptApart:
             [pd.Timestamp("2026-07-21 10:30", tz="America/New_York")]))
         assert trader._adopt_form_model(state, frame, pd.Timestamp("2026-07-21")) is False
         assert trader.config.model_key == "dayrange"
+
+
+# A plausible time-of-day curve (09:30 ~3x midday, a short close ramp), so the
+# adaptive take is pinned without the exported file.
+CURVE = {
+    "shape": {
+        "params": {"a": 0.6, "b": 3.0, "alpha": 0.45, "c": 0.5, "kappa": 12.0},
+        "t_domain": [2.5, 387.5],
+    },
+}
+TAKE_MAX, TAKE_MIN = 0.4, 0.1
+
+
+def adaptive_take(fill: float, minute: int) -> float:
+    scale = at.intraday_vol_model.volatility_scale(CURVE)[minute]
+    return fill * math.exp((TAKE_MIN + (TAKE_MAX - TAKE_MIN) * scale) * ADR)
+
+
+class TestAdaptiveTake:
+    """The take that follows the intraday volatility curve: `gm_take_k` at the
+    session's most volatile minute, `gm_take_min_k` at its quietest, moved to
+    each bar's minute and measured from the fill."""
+
+    @pytest.fixture(autouse=True)
+    def curve(self, monkeypatch):
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda ticker: CURVE)
+
+    def _bought(self, monkeypatch, state, minute=None, **config):
+        config = {"gm_take_k": TAKE_MAX, "gm_take_min_k": TAKE_MIN, **config}
+        trader, tracker, tape = _setup(monkeypatch, state, **config)
+        tape.append(100.0, edge=ENTER, minute=minute)
+        assert cycle(trader, state, tracker) == "bought"
+        return trader, tracker, tape
+
+    def test_the_take_runs_from_the_peak_take_to_the_trough_take(self):
+        config = gm_config(gm_take_k=TAKE_MAX, gm_take_min_k=TAKE_MIN)
+        assert at.gm_take_k_at(config, 1.0) == pytest.approx(TAKE_MAX)
+        assert at.gm_take_k_at(config, 0.0) == pytest.approx(TAKE_MIN)
+        assert at.gm_take_k_at(config, 0.5) == pytest.approx(0.25)
+        assert at.gm_take_k_at(gm_config(), 0.5) == 0.2       # flat: the scale is not read
+
+    def test_a_buy_at_the_open_rests_the_peak_take(self, monkeypatch, state):
+        trader, tracker, tape = self._bought(monkeypatch, state, minute=0)
+        assert trader.entry["take"] == pytest.approx(100.0 * math.exp(TAKE_MAX * ADR))
+        assert trader.entry["stop"] == pytest.approx(STOP)
+
+    def test_a_buy_at_the_quietest_minute_rests_the_trough_take(self, monkeypatch, state):
+        trough = int(at.intraday_vol_model.volatility_scale(CURVE).argmin())
+        trader, tracker, tape = self._bought(monkeypatch, state, minute=trough)
+        assert trader.entry["take"] == pytest.approx(100.0 * math.exp(TAKE_MIN * ADR))
+
+    def test_the_take_moves_every_bar_from_the_fill_and_the_stop_does_not(self, monkeypatch, state):
+        trader, tracker, tape = self._bought(monkeypatch, state)            # bar 60
+        assert trader.entry["take"] == pytest.approx(adaptive_take(100.0, 60))
+        takes = []
+        for minute in (61, 62, 63):
+            tape.append(100.05)
+            assert cycle(trader, state, tracker) == "hold"
+            assert trader.entry["take"] == pytest.approx(adaptive_take(100.0, minute))
+            assert trader.entry["stop"] == pytest.approx(STOP)
+            takes.append(trader.entry["take"])
+        assert takes == sorted(takes, reverse=True) and takes[0] > takes[-1]
+
+    def test_a_bar_reaching_the_shrunken_take_sells(self, monkeypatch, state):
+        """Bought at the open with 0.4 ADR asked; by 11:30 a smaller rise is
+        enough -- one the flat 0.2 ADR take would not have sold on."""
+        trader, tracker, tape = self._bought(monkeypatch, state, minute=0)
+        later, flat = adaptive_take(100.0, 120), 100.0 * math.exp(0.2 * ADR)
+        assert later < flat
+        tape.append(100.0, high=(later + flat) / 2, minute=120)
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == [at.GoodMomentsTrader.EXIT_TAKE]
+        sold = [e for e in state.agent_log if e.get("type") == "decision" and e.get("action") == "sell"]
+        assert "at 11:30's volatility" in sold[-1]["reasoning"]
+
+    def test_the_same_bar_early_does_not(self, monkeypatch, state):
+        trader, tracker, tape = self._bought(monkeypatch, state, minute=0)
+        tape.append(100.0, high=(adaptive_take(100.0, 120) + 100.0 * math.exp(0.2 * ADR)) / 2, minute=1)
+        assert cycle(trader, state, tracker) == "hold"
+
+    def test_the_record_carries_the_moving_take(self, monkeypatch, state):
+        trader, tracker, tape = self._bought(monkeypatch, state)
+        tape.append(100.05)
+        cycle(trader, state, tracker)
+        rows = state.apple_trader_levels["rows"]
+        assert [r["take"] for r in rows] == pytest.approx([adaptive_take(100.0, 60), adaptive_take(100.0, 61)])
+
+    def test_the_chart_draws_the_take_as_it_moved(self, monkeypatch, state):
+        from agent_stonks import model_overlays
+
+        trader, tracker, tape = self._bought(monkeypatch, state)
+        tape.append(100.05)
+        cycle(trader, state, tracker)
+        record = state.apple_trader_levels
+        items, problem = model_overlays._signal_trader_items(
+            TICKER, (record["rows"], record["config"]), apple_models.GOODMOMENTS_KEY,
+        )
+        take = next(i for i in items if i["label"] == "Take-profit")
+        assert not problem and take["step"]
+        assert take["values"] == pytest.approx([adaptive_take(100.0, 60), adaptive_take(100.0, 61)])
+        assert "0.4 ADR" in take["note"] and "0.1 at its quietest" in take["note"]
+
+    def test_a_restart_moves_the_resumed_take_to_the_bar(self, monkeypatch, state):
+        trader, tracker, tape = self._bought(monkeypatch, state, minute=0)
+        again = at.build_trader(gm_config(gm_take_k=TAKE_MAX, gm_take_min_k=TAKE_MIN), BUNDLE)
+        tape.append(100.05, minute=90)
+        assert cycle(again, state, tracker) == "hold"
+        assert again.entry["take"] == pytest.approx(adaptive_take(100.0, 90))
+
+    def test_without_a_curve_the_session_is_not_traded(self, monkeypatch, state):
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda ticker: None)
+        trader, tracker, tape = _setup(monkeypatch, state, gm_take_k=TAKE_MAX, gm_take_min_k=TAKE_MIN)
+        tape.append(100.0, edge=0.2)
+        assert cycle(trader, state, tracker) == "no_data"
+        assert trader.blocked is not None and tracker.position_for(TICKER) == 0
+        errors = [e["text"] for e in state.agent_log if e.get("type") == "error"]
+        assert errors and "intraday volatility curve" in errors[0]
+
+    def test_with_the_take_off_no_curve_is_needed(self, monkeypatch, state):
+        monkeypatch.setattr(at.intraday_vol_model, "load", lambda ticker: None)
+        trader, tracker, tape = self._bought(monkeypatch, state, gm_take_k=0.0, gm_take_min_k=0.0)
+        assert trader.entry["take"] is None
+
+    def test_its_signature_and_its_checks(self):
+        assert gm_config().gm_take_min_k is None
+        assert config_signature(gm_config(gm_take_k=TAKE_MAX, gm_take_min_k=TAKE_MIN)) == (
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.4..0.1A@vol,stop=0.75A,size=95%)"
+        )
+        assert config_signature(gm_config(gm_take_k=0.0, gm_take_min_k=0.0)) == (
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=off,stop=0.75A,size=95%)"
+        )
+        for bad in (dict(gm_take_min_k=0.3), dict(gm_take_min_k=-0.05)):    # gm_take_k is 0.2
+            with pytest.raises(ValueError, match="gm_take_min_k"):
+                gm_config(**bad)
+
+    def test_a_grid_cell_above_the_take_is_a_hole(self):
+        from dataclasses import asdict
+
+        from simlab import tuning
+
+        assert "gm_take_min_k" in tuning.axes_for("goodmoments", tuning.SWEEPABLE)
+        configs, refused = tuning.expand(
+            gm_config(), [{"name": "gm_take_min_k", "values": [0.1, 0.3]}],
+        )
+        assert [c.gm_take_min_k for c in configs] == [0.1]
+        assert [o for o, _ in refused] == [{"gm_take_min_k": 0.3}]
+        old = {k: v for k, v in asdict(gm_config()).items() if k != "gm_take_min_k"}
+        assert tuning.make_config(old, {}).gm_take_min_k is None
+
+
+class TestForm:
+    """The sidebar's knob for the adaptive take, in the form both apps render."""
+
+    @staticmethod
+    def _form() -> None:
+        import streamlit as st
+
+        from agent_stonks import apple_trader_ui
+
+        copy = apple_trader_ui.FormCopy(
+            prefix="t", unavailable_suffix="", instrument_help="", model_help=""
+        )
+        st.session_state["out"] = apple_trader_ui.params(["AAPL"], copy)
+
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        monkeypatch.setattr(apple_models, "load", lambda *a, **k: {"model": "stub"})
+        app = AppTest.from_function(self._form, default_timeout=30)
+        app.run()
+        app.selectbox(key="t_model_AAPL").select(apple_models.GOODMOMENTS_KEY).run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_off_by_default_and_the_take_is_flat(self, app):
+        assert app.checkbox(key="t_gm_take_adaptive_goodmoments_AAPL").value is False
+        assert app.number_input(key="t_gm_take_min_k_goodmoments_AAPL").disabled
+        assert app.session_state["out"].gm_take_min_k is None
+
+    def test_ticked_the_take_follows_volatility(self, app):
+        app.checkbox(key="t_gm_take_adaptive_goodmoments_AAPL").check().run()
+        app.number_input(key="t_gm_take_k_goodmoments_AAPL").set_value(0.4).run()
+        app.number_input(key="t_gm_take_min_k_goodmoments_AAPL").set_value(0.15).run()
+        out = app.session_state["out"]
+        assert (out.gm_take_k, out.gm_take_min_k) == pytest.approx((0.4, 0.15))
+        assert not app.warning
+
+    def test_a_trough_take_above_the_peak_take_is_refused(self, app):
+        app.checkbox(key="t_gm_take_adaptive_goodmoments_AAPL").check().run()
+        app.number_input(key="t_gm_take_min_k_goodmoments_AAPL").set_value(0.5).run()
+        assert app.session_state["out"].gm_take_min_k is None
+        assert "at most the take-profit" in app.warning[0].value
