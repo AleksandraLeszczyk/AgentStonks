@@ -510,16 +510,19 @@ def render_datasets_tab() -> None:
         col_start, col_end, col_feed = st.columns(3)
         start = col_start.date_input("Start", value=date.today() - timedelta(days=7))
         end = col_end.date_input("End", value=date.today() - timedelta(days=1))
-        feed = col_feed.selectbox("Feed", list(sim_data.FEEDS))
         # Read from the environment only, never drawn: a password field still
         # sends its value to the browser.
         api_key = os.getenv("ALPACA_API_KEY", "")
         api_secret = os.getenv("ALPACA_SECRET", "")
-        st.caption(
-            "Alpaca credentials come from `ALPACA_API_KEY` / `ALPACA_SECRET` in the "
-            f"environment ({'set' if api_key and api_secret else '**not set**'}). They are "
-            "required for the `live`, `iex` and `sip` feeds. On `yfinance` they are optional "
-            "and fetch news only — without them the dataset has no news."
+        feed = col_feed.selectbox(
+            "Feed",
+            list(sim_data.FEEDS),
+            help=(
+                "Alpaca credentials come from `ALPACA_API_KEY` / `ALPACA_SECRET` in the "
+                f"environment ({'set' if api_key and api_secret else '**not set**'}). They are "
+                "required for the `live`, `iex` and `sip` feeds. On `yfinance` they are optional "
+                "and fetch news only — without them the dataset has no news."
+            ),
         )
         submitted = st.form_submit_button("Download dataset", icon=":material/download:", type="primary")
 
