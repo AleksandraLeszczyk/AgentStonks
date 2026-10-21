@@ -3448,7 +3448,8 @@ _ORCHESTRA_COPY = dc_replace(
         ),
         "pair_min_win_k": (
             "Per pair: a trade that closes for no more than this many units a share "
-            "stands that pair down for the rest of the day. 0 is off."
+            "stands that pair down for the rest of the day. Untick the box beside it "
+            "to switch it off for that pair."
         ),
         "select_on": (
             "Off, Orchestra races every pair all day. On, it picks the day's "

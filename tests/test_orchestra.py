@@ -1046,3 +1046,70 @@ class TestSplitConfig:
         legacy = agent.to_record(race)
         del legacy["mode"], legacy["budget_pct"]
         assert agent.from_record(legacy) == race
+
+
+# --- the pair table's min win box ---------------------------------------------
+
+
+def _orchestra_form() -> None:
+    import streamlit as st
+
+    from agent_stonks import apple_trader_ui
+
+    copy = apple_trader_ui.FormCopy(
+        prefix="o", unavailable_suffix="", instrument_help="", model_help=""
+    )
+    st.session_state["out"] = apple_trader_ui.orchestra_params(None, copy)
+
+
+class TestPairMinWinBox:
+    """Each pair's circuit breaker is switched off by its own box, like Apple
+    Trader's; the threshold is kept, greyed out."""
+
+    PAIRS = ["AAPL:dayrange", "INTC:dayrange"]
+    KEY, BOX = "o_min_win_k_dayrange_INTC", "o_min_win_on_dayrange_INTC"
+
+    def _run(self, **state):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_orchestra_form, default_timeout=30)
+        app.session_state["o_pairs"] = self.PAIRS
+        for key, value in state.items():
+            app.session_state[key] = value
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    @staticmethod
+    def _min_wins(app) -> "dict[str, float]":
+        return {r.ticker: r.min_win_k for r in app.session_state["out"].racers}
+
+    def test_every_pair_is_on_by_default(self):
+        app = self._run()
+        assert app.checkbox(key=self.BOX).value is True
+        assert not app.number_input(key=self.KEY).disabled
+        assert self._min_wins(app) == {
+            "AAPL": pytest.approx(at.min_win_for("AAPL", "dayrange")),
+            "INTC": pytest.approx(at.min_win_for("INTC", "dayrange")),
+        }
+
+    def test_unticking_one_pair_leaves_the_other_on(self):
+        app = self._run()
+        app.number_input(key=self.KEY).set_value(0.07).run()
+        app.checkbox(key=self.BOX).uncheck().run()
+        assert app.number_input(key=self.KEY).disabled
+        wins = self._min_wins(app)
+        assert wins["INTC"] == 0.0
+        assert wins["AAPL"] == pytest.approx(at.min_win_for("AAPL", "dayrange"))
+        sig = ar.orchestra_signature(app.session_state["out"])
+        assert "dayrange_AAPL@" in sig and "/mw" in sig.split("dayrange_INTC@")[0]
+        assert "/mw" not in sig.split("dayrange_INTC@")[1].split(",")[0]
+        app.checkbox(key=self.BOX).check().run()
+        assert self._min_wins(app)["INTC"] == pytest.approx(0.07)
+
+    def test_a_kept_zero_opens_it_unticked(self):
+        """A 0 remembered from before the box (`last_setup`) meant "off"."""
+        app = self._run(**{self.KEY: 0.0})
+        assert app.checkbox(key=self.BOX).value is False
+        assert app.number_input(key=self.KEY).value == pytest.approx(at.min_win_for("INTC"))
+        assert self._min_wins(app)["INTC"] == 0.0

@@ -2310,6 +2310,11 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "session's first bar, so it compounds day to day. A split of one pair at "
             "100% replays exactly as Apple Trader."
         ),
+        "pair_min_win_k": (
+            "Per pair: a trade that closes for no more than this many units a share "
+            "stands that pair down for the rest of the session. Untick the box beside "
+            "it to replay the pair with no circuit breaker."
+        ),
         "pair_budget_pct": (
             "Split only: this pair's share of each session's budget, in percent. "
             "Together at most 100; the rest stays in cash. Position size is then a "

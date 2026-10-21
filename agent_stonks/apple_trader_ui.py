@@ -619,20 +619,15 @@ def min_win_param(
     `default` is the pair's own (its base configuration's), else the symbol's.
 
     Switched off by its box, not by a 0: the threshold stays on screen, greyed
-    out, so ticking the box again comes back to a number rather than to 0. A 0
-    kept from before the box existed (or a base saved with the breaker off)
-    opens the box unticked and the field on the symbol's own default.
+    out, so ticking the box again comes back to a number rather than to 0
+    (`breaker_opens_on` reads an old 0 as the box off).
     """
     section("Circuit breaker", copy.sections.get("dayrange_breaker"))
     default = min_win_for(ticker) if default is None else float(default)
     number_key = copy.key(f"min_win_k_{ticker}")
-    kept = st.session_state.get(number_key)
-    was_on = bool(default if kept is None else kept)
-    if kept is not None and not kept:
-        st.session_state[number_key] = min_win_for(ticker)
     on = st.checkbox(
         "Stand down after a weak trade",
-        value=was_on,
+        value=breaker_opens_on(number_key, default, ticker),
         key=copy.key(f"min_win_on_{ticker}"),
         help=copy.help.get("min_win_on"),
     )
@@ -655,6 +650,20 @@ def min_win_param(
             icon=":material/warning:",
         )
     return min_win_k
+
+
+def breaker_opens_on(number_key: str, default: float, ticker: str) -> bool:
+    """Whether a circuit breaker's box opens ticked, read before its threshold.
+
+    A 0 in the threshold -- kept from before the box existed, or a base saved
+    with the breaker off -- meant "off": the box opens unticked and the field
+    is moved to the symbol's own default, since 0 is no longer a threshold it
+    takes.
+    """
+    kept = st.session_state.get(number_key)
+    if kept is not None and not kept:
+        st.session_state[number_key] = min_win_for(ticker)
+    return bool(default if kept is None else kept)
 
 
 # What the two number inputs call the unit in their own labels. Shorter than
@@ -996,14 +1005,17 @@ def orchestra_params(
         racer_key(r): r for r in (seed.racers if seed is not None else [])
         if r.level_unit == level_unit
     }
-    widths = [2.2, 1, 1, 1, 1] if split else [2.2, 1, 1, 1]
+    # The min win's on/off box gets its own narrow column (columns cannot be
+    # nested in the sidebar, where the live app draws this), taken out of the
+    # pair's name so the numbers keep their width.
+    widths = [1.9, 1, 1, 0.3, 1, 1] if split else [1.9, 1, 1, 0.3, 1]
     head = st.columns(widths)
     head[0].caption("Pair")
     head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
     head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
-    head[3].caption("Min win", help=copy.help.get("pair_min_win_k"))
+    head[4].caption("Min win", help=copy.help.get("pair_min_win_k"))
     if split:
-        head[4].caption("Budget %", help=copy.help.get("pair_budget_pct"))
+        head[5].caption("Budget %", help=copy.help.get("pair_budget_pct"))
     # An even split, rounded down to a tenth so it never adds up past 100.
     even = math.floor(1000.0 / len(pairs)) / 10.0
     levels: dict = {}
@@ -1029,14 +1041,23 @@ def orchestra_params(
             format="%.2f", key=copy.key(f"sell_k_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
-        min_win_k = row[3].number_input(
-            f"{key} min win", min_value=0.0, max_value=3.0,
-            value=min_win_for(ticker, model_key),
-            step=0.05, format="%.2f", key=copy.key(f"min_win_k_{model_key}_{ticker}{suffix}"),
+        min_win_default = min_win_for(ticker, model_key)
+        min_win_key = copy.key(f"min_win_k_{model_key}_{ticker}{suffix}")
+        min_win_on = row[3].checkbox(
+            f"{key} min win on",
+            value=breaker_opens_on(min_win_key, min_win_default, ticker),
+            key=copy.key(f"min_win_on_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
+        min_win_k = row[4].number_input(
+            f"{key} min win", min_value=0.01, max_value=3.0,
+            value=min_win_default or min_win_for(ticker),
+            step=0.05, format="%.2f", key=min_win_key, disabled=not min_win_on,
+            label_visibility="collapsed",
+        )
+        min_win_k = float(min_win_k) if min_win_on else 0.0
         if split:
-            budget_pct[key] = float(row[4].number_input(
+            budget_pct[key] = float(row[5].number_input(
                 f"{key} budget %", min_value=0.5, max_value=100.0, value=even, step=5.0,
                 format="%.1f", key=copy.key(f"budget_pct_{model_key}_{ticker}"),
                 label_visibility="collapsed",
@@ -1049,7 +1070,7 @@ def orchestra_params(
                 "down — one trade a day for this pair.",
                 icon=":material/warning:",
             )
-        levels[key] = (float(buy_k), float(sell_k), float(min_win_k))
+        levels[key] = (float(buy_k), float(sell_k), min_win_k)
     if split:
         total = sum(budget_pct.values())
         if total <= 100.0 + 1e-6:
