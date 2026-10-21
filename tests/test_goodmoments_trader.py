@@ -549,8 +549,160 @@ class TestForm:
         assert (out.gm_take_k, out.gm_take_min_k) == pytest.approx((0.4, 0.15))
         assert not app.warning
 
+    def test_the_momentum_confirmation_knob(self, app):
+        knob = app.number_input(key="t_gm_confirm_bars_goodmoments_AAPL")
+        assert knob.value == 0 and app.session_state["out"].gm_confirm_bars == 0
+        knob.set_value(3).run()
+        assert app.session_state["out"].gm_confirm_bars == 3
+
     def test_a_trough_take_above_the_peak_take_is_refused(self, app):
         app.checkbox(key="t_gm_take_adaptive_goodmoments_AAPL").check().run()
         app.number_input(key="t_gm_take_min_k_goodmoments_AAPL").set_value(0.5).run()
         assert app.session_state["out"].gm_take_min_k is None
         assert "at most the take-profit" in app.warning[0].value
+
+
+class TestMomentumConfirmation:
+    """HighLow's behaviour table on GoodMoments' rules (`gm_confirm_bars`): no
+    entry the table does not allow, and a reached take held while momentum is
+    positive -- sold on the first bar it is not, wherever the price is."""
+
+    N = 3
+    MINUTE_MOVE = 0.10                      # neutral band ±0.01 $/bar
+
+    def _setup(self, monkeypatch, state, **config):
+        trader, tracker, tape = _setup(monkeypatch, state, gm_confirm_bars=self.N, **config)
+        state.sym(TICKER).abs_mean_minute_momentum = self.MINUTE_MOVE
+        return trader, tracker, tape
+
+    @staticmethod
+    def _run(trader, state, tracker, tape, closes, edge=0.0) -> str:
+        """One bar per close, the edge only on the last; the last outcome."""
+        for i, close in enumerate(closes):
+            tape.append(close, edge=edge if i == len(closes) - 1 else 0.0)
+            outcome = cycle(trader, state, tracker)
+        return outcome
+
+    def _bought_rising(self, monkeypatch, state, **config):
+        trader, tracker, tape = self._setup(monkeypatch, state, **config)
+        assert self._run(trader, state, tracker, tape, [100.0, 100.1, 100.2, 100.3, 100.4], ENTER) == "bought"
+        return trader, tracker, tape
+
+    @staticmethod
+    def _statuses(state) -> "list[str]":
+        return [e["text"] for e in state.agent_log if e.get("type") == "status"]
+
+    def test_negative_momentum_does_not_buy_and_says_so_once(self, monkeypatch, state):
+        trader, tracker, tape = self._setup(monkeypatch, state)
+        assert self._run(trader, state, tracker, tape, [100.5, 100.4, 100.3, 100.2, 100.1], ENTER) == "hold"
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        refusals = [t for t in self._statuses(state) if "Not buying yet" in t]
+        assert len(refusals) == 1 and "(negative)" in refusals[0]
+
+    def test_positive_or_flat_momentum_buys(self, monkeypatch, state):
+        self._bought_rising(monkeypatch, state)
+        trader, tracker, tape = self._setup(monkeypatch, state)
+        assert self._run(trader, state, tracker, tape, [100.0] * 5, ENTER) == "bought"
+
+    def test_the_falling_stretch_ends_in_a_buy_once_momentum_turns(self, monkeypatch, state):
+        trader, tracker, tape = self._setup(monkeypatch, state)
+        self._run(trader, state, tracker, tape, [100.5, 100.4, 100.3, 100.2, 100.1], ENTER)
+        assert self._run(trader, state, tracker, tape, [100.2, 100.3, 100.4], ENTER) == "bought"
+
+    def test_before_the_look_back_it_does_not_buy(self, monkeypatch, state):
+        trader, tracker, tape = self._setup(monkeypatch, state)
+        assert self._run(trader, state, tracker, tape, [100.0, 100.1, 100.2], ENTER) == "hold"
+        assert any("needs 5 bars" in t for t in self._statuses(state))
+
+    def test_without_last_weeks_minute_move_it_does_not_buy(self, monkeypatch, state):
+        trader, tracker, tape = self._setup(monkeypatch, state)
+        state.sym(TICKER).abs_mean_minute_momentum = None
+        assert self._run(trader, state, tracker, tape, [100.0, 100.1, 100.2, 100.3, 100.4], ENTER) == "hold"
+        assert any("not known yet" in t for t in self._statuses(state))
+
+    def test_a_reached_take_is_held_while_momentum_rises_then_sold(self, monkeypatch, state):
+        trader, tracker, tape = self._bought_rising(monkeypatch, state)
+        take = trader.entry["take"]
+        tape.append(100.85, high=take + 0.1)                       # through the take, still rising
+        assert cycle(trader, state, tracker) == "hold"
+        assert trader.entry["take_reached"] and tracker.position_for(TICKER) > 0
+        tape.append(100.95)
+        assert cycle(trader, state, tracker) == "hold"
+        assert len([t for t in self._statuses(state) if "Holding on" in t]) == 1
+        tape.append(100.90)
+        tape.append(100.80)                                        # under the take, momentum turned
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == [at.GoodMomentsTrader.EXIT_TAKE]
+        assert tracker.position_for(TICKER) == 0
+
+    def test_a_take_reached_on_fading_momentum_sells_at_once(self, monkeypatch, state):
+        trader, tracker, tape = self._bought_rising(monkeypatch, state)
+        take = trader.entry["take"]
+        for close in (100.4, 100.4, 100.4):
+            tape.append(close)
+            cycle(trader, state, tracker)
+        tape.append(100.4, high=take + 0.01)                       # a spike on a flat tape
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == [at.GoodMomentsTrader.EXIT_TAKE]
+
+    def test_no_read_holds_the_take(self, monkeypatch, state):
+        trader, tracker, tape = self._bought_rising(monkeypatch, state)
+        state.sym(TICKER).abs_mean_minute_momentum = None
+        tape.append(100.4, high=trader.entry["take"] + 0.01)
+        assert cycle(trader, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) > 0
+
+    def test_the_stop_is_never_held(self, monkeypatch, state):
+        trader, tracker, tape = self._bought_rising(monkeypatch, state)
+        tape.append(100.85, high=trader.entry["take"] + 0.1)
+        assert cycle(trader, state, tracker) == "hold"
+        tape.append(98.0, low=100.4 * math.exp(-0.75 * ADR) - 0.01)
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == [at.GoodMomentsTrader.EXIT_STOP]
+
+    def test_the_flatten_is_never_held(self, monkeypatch, state):
+        trader, tracker, tape = self._bought_rising(monkeypatch, state)
+        tape.append(100.85, high=trader.entry["take"] + 0.1)
+        monkeypatch.setattr(at.GoodMomentsTrader, "closing_soon", lambda self: True)
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == [at.GoodMomentsTrader.EXIT_FLATTEN]
+
+    def test_a_held_take_survives_a_restart(self, monkeypatch, state):
+        trader, tracker, tape = self._bought_rising(monkeypatch, state)
+        tape.append(100.85, high=trader.entry["take"] + 0.1)
+        cycle(trader, state, tracker)
+        again = at.build_trader(gm_config(gm_confirm_bars=self.N), BUNDLE)
+        tape.append(100.20)                                        # under the take, turned down
+        assert cycle(again, state, tracker) == "sold"
+        assert _exits(state) == [at.GoodMomentsTrader.EXIT_TAKE]
+
+    def test_off_it_is_the_notebooks_rule(self, monkeypatch, state):
+        trader, tracker, tape = _setup(monkeypatch, state)
+        state.sym(TICKER).abs_mean_minute_momentum = None
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+
+    def test_its_signature_checks_and_legacy(self):
+        from dataclasses import asdict
+
+        from simlab import tuning
+
+        assert gm_config().gm_confirm_bars == 0
+        assert config_signature(gm_config(gm_confirm_bars=3)) == (
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,confirm=3b,size=95%)"
+        )
+        for bad in (-1, 1.5):
+            with pytest.raises(ValueError, match="gm_confirm_bars"):
+                gm_config(gm_confirm_bars=bad)
+        assert "gm_confirm_bars" in tuning.axes_for("goodmoments", tuning.SWEEPABLE)
+        old = {k: v for k, v in asdict(gm_config()).items() if k != "gm_confirm_bars"}
+        assert tuning.make_config(old, {}).gm_confirm_bars == 0
+
+    def test_the_live_chart_draws_its_look_back(self, state):
+        from agent_stonks import ui
+
+        state.llm_personality = at.APPLE_TRADER_KEY
+        state.apple_trader_config = gm_config(gm_confirm_bars=4)
+        assert ui._agent_momentum(state, state.sym(TICKER))[0] == 4

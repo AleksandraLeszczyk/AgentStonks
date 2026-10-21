@@ -1025,6 +1025,9 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
         # N-bar momentum.
         day_range = getattr(config, "strategy", None) == apple_models.STRATEGY_DAYRANGE
         confirm = int(getattr(config, "momentum_confirmation_bars", 0) or 0) if day_range else 0
+        if getattr(config, "strategy", None) == apple_models.STRATEGY_PROBABILITY:
+            # GoodMoments' own confirmation, when it is on.
+            confirm = int(getattr(config, "gm_confirm_bars", 0) or 0)
         if confirm:
             return confirm, name
         if day_range and config is not None and (config.has_take or getattr(config, "max_fall_k", 0) > 0):
@@ -3115,6 +3118,22 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- The curve is the same every day (fitted on 2023 – Sep 2026), so it does not "
             "know today is busier than usual; the ADR still scales both ends.\n"
             "- Off keeps one take all day (the notebook's rule)."
+        ),
+        "gm_confirm_bars": (
+            "HighLow's momentum confirmation on GoodMoments' rules: the same behaviour table "
+            "over this many bars.\n\n"
+            "- **Buy** only when the edge calls for it *and* momentum allows: positive, or "
+            "neutral with a change that is not negative. Negative momentum (or flat and "
+            "turning down) waits.\n"
+            "- **At the take**, hold on while momentum is still positive; sell on the first "
+            "bar it is not — wherever the price is by then, even back under the take.\n"
+            "- **Momentum** is `(close − close N bars ago) / N`, its **change** the average "
+            "change of the 1-bar momentum; each is neutral inside ±0.1 × the ticker's mean "
+            "one-minute move over last week.\n"
+            "- Never gates the stop, the sale on a fading edge or the closing flatten.\n"
+            "- Until it can be read (the first N + 2 bars, or before last week's mean move is "
+            "known) it neither buys nor sells at the take.\n"
+            "- **0** switches it off (the notebook's rule)."
         ),
         "gm_stop_k": (
             "Sell when a bar reaches this far under the fill, in ADRs.\n\n"

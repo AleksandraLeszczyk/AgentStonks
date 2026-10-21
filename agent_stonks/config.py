@@ -874,6 +874,13 @@ APPLE_TRADER_GM_TAKE_K = 0.2
 # day -- the notebook's rule, and every record's from before it existed.
 APPLE_TRADER_GM_TAKE_MIN_K = None
 APPLE_TRADER_GM_STOP_K = 0.75
+# HighLow's momentum confirmation, on GoodMoments' rules: the look-back in bars
+# of the same behaviour table (`apple_trader.MOMENTUM_TABLE`). A buy the edge
+# calls for waits for the table's "buy"; a take that is reached is held while
+# momentum stays positive and sold on the first bar it is not. 0 is the
+# notebook's rule -- sell at the take, buy on the edge alone -- and every
+# record's from before it existed.
+APPLE_TRADER_GM_CONFIRM_BARS = 0
 APPLE_TRADER_GM_LAST_ENTRY_MINUTE = 360
 APPLE_TRADER_GM_COOLDOWN_BARS = 15
 # Flatten this many minutes before the close: the day-range forecast is a

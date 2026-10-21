@@ -152,8 +152,9 @@ def probability_params(
     defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
 ) -> AppleTraderConfig:
     """GoodMoments' rules: the edge a buy needs, the take and the stop in ADRs,
-    the take's optional fall with the intraday volatility curve, and the
-    optional sale on a fading edge -- notebook 4's pick by default.
+    the take's optional fall with the intraday volatility curve, the optional
+    momentum confirmation of the buy and the take, and the optional sale on a
+    fading edge -- notebook 4's pick by default.
 
     Keyed by model and instrument like Fast&Furious's, and read once, at
     ▶ Start. The size is the day-range form's own widget, so one number is the
@@ -227,6 +228,13 @@ def probability_params(
         help=copy.help.get("gm_exit"),
     )
     gm_exit = float(exit_value) if exit_on else None
+    # Both sides of HighLow's behaviour table: the entry and the take.
+    confirm_bars = col_a.number_input(
+        "Momentum confirmation period (bars, 0 = off)",
+        min_value=0, max_value=60, value=int(defaults.gm_confirm_bars), step=1,
+        key=copy.key(f"gm_confirm_bars_{model_key}_{ticker}"),
+        help=copy.help.get("gm_confirm_bars"),
+    )
     if gm_exit is not None and gm_exit >= float(enter):
         st.warning(
             f"The exit ({gm_exit:+.3f}) has to sit below the entry ({float(enter):+.3f}), or every "
@@ -244,6 +252,7 @@ def probability_params(
         gm_take_k=float(take_k),
         gm_take_min_k=gm_take_min_k,
         gm_stop_k=float(stop_k),
+        gm_confirm_bars=int(confirm_bars),
         skip_events=skip_events,
     )
 

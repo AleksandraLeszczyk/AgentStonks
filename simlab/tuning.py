@@ -274,6 +274,10 @@ TUNABLES: "dict[str, Tunable]" = {
             "gm_stop_k", "Stop (ADR under the fill)", 0.0, 3.0, 0.05,
             (0.25, 1.0, 0.25),
         ),
+        Tunable(
+            "gm_confirm_bars", "Momentum confirmation period (bars, GoodMoments)", 0, 60, 1,
+            (0, 6, 1), "%d", integer=True,
+        ),
     )
 }
 
@@ -360,6 +364,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "gm_take_k",
     "gm_take_min_k",
     "gm_stop_k",
+    "gm_confirm_bars",
 )
 
 
@@ -376,7 +381,7 @@ MOMENTUM_AXES: "tuple[str, ...]" = (
 )
 # GoodMoments' fields, for the same reason.
 PROBABILITY_AXES: "tuple[str, ...]" = (
-    "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "position_pct",
+    "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "gm_confirm_bars", "position_pct",
 )
 # What a new grid on each rule set starts from.
 DEFAULT_AXES = {

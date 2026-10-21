@@ -66,6 +66,7 @@ from .config import (
     APPLE_TRADER_FF_HOLD_MINUTES,
     APPLE_TRADER_FF_STOP_K,
     APPLE_TRADER_GM_COOLDOWN_BARS,
+    APPLE_TRADER_GM_CONFIRM_BARS,
     APPLE_TRADER_GM_ENTER,
     APPLE_TRADER_GM_EXIT,
     APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
@@ -535,6 +536,15 @@ class AppleTraderConfig:
     # in proportion between, moved every bar (`gm_take_k_at`). None (the
     # notebook's rule) keeps `gm_take_k` all day.
     gm_take_min_k: Optional[float] = APPLE_TRADER_GM_TAKE_MIN_K
+    # The momentum confirmation on GoodMoments' rules: the look-back, in bars,
+    # of the day-range rules' behaviour table (`MOMENTUM_TABLE`, the same
+    # neutral band). An entry needs the table's "buy"; a reached take sells
+    # only once momentum is no longer positive -- until then it is held, and
+    # sold on the first bar that is, wherever the price is. Never the stop, the
+    # edge exit or the flatten. 0 (the notebook's rule) switches it off. Its
+    # own field rather than `momentum_confirmation_bars`, which every stored
+    # GoodMoments record carries at the day-range default.
+    gm_confirm_bars: int = APPLE_TRADER_GM_CONFIRM_BARS
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -728,6 +738,12 @@ class AppleTraderConfig:
                     f"{name} {getattr(self, name)!r} is a distance from the fill in ADRs and "
                     "cannot be negative (0 switches it off)"
                 )
+        if float(self.gm_confirm_bars) != int(self.gm_confirm_bars) or int(self.gm_confirm_bars) < 0:
+            raise ValueError(
+                f"gm_confirm_bars {self.gm_confirm_bars!r} is a whole number of bars, 0 or "
+                "more (0 switches the confirmation off)"
+            )
+        self.gm_confirm_bars = int(self.gm_confirm_bars)
         if self.gm_take_min_k is not None:
             self.gm_take_min_k = float(self.gm_take_min_k)
             if not 0 <= self.gm_take_min_k <= self.gm_take_k:
@@ -1131,16 +1147,18 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     fill in **A**DRs (`off` at 0). A take that follows the intraday volatility
     curve signs as `take=0.4..0.1A@vol` -- at the most volatile minute, then at
     the quietest; one that does not keeps the form every record before it was
-    filed under."""
+    filed under. The momentum confirmation signs as `confirm=3b`, only while
+    it is on."""
     exit_ = f"{c.gm_exit:+g}" if c.gm_exit is not None else "off"
     take = f"{c.gm_take_k:g}A" if c.gm_take_k else "off"
     if c.gm_take_k and c.gm_take_min_k is not None:
         take = f"{c.gm_take_k:g}..{c.gm_take_min_k:g}A@vol"
     stop = f"{c.gm_stop_k:g}A" if c.gm_stop_k else "off"
+    confirm = f",confirm={c.gm_confirm_bars}b" if c.gm_confirm_bars else ""
     skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
     return (
-        f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop},"
-        f"size={c.position_pct:g}%{skip})"
+        f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop}"
+        f"{confirm},size={c.position_pct:g}%{skip})"
     )
 
 
@@ -1500,6 +1518,17 @@ def momentum_read(closes, n: int, minute_move: "float | None") -> "dict | None":
         "n": n, "mom": mom, "change": change, "band": band,
         "mom_class": key[0], "change_class": key[1], "row": MOMENTUM_TABLE[key],
     }
+
+
+def momentum_unknown(ticker: str, n: int, minute_move: "float | None", bars: int) -> str:
+    """Why `momentum_read` cannot read this bar -- for the log line that says
+    a rule wanted to act and the confirmation held it."""
+    if minute_move is None or not float(minute_move) > 0:
+        return (
+            f"{ticker}'s mean one-minute move over last week is not known yet, "
+            "so momentum has no neutral band to be read against"
+        )
+    return f"momentum over {n} bars needs {n + 2} bars of the session and there are {bars}"
 
 
 def momentum_words(read: dict) -> str:
@@ -2446,15 +2475,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     def _momentum_unknown(self, frame) -> str:
         """Why the confirmation cannot read this bar -- for the log line that
         says a level was reached and nothing was done about it."""
-        n = int(self.config.momentum_confirmation_bars)
-        if self.minute_move is None or not float(self.minute_move) > 0:
-            return (
-                f"{self.ticker}'s mean one-minute move over last week is not known yet, "
-                "so momentum has no neutral band to be read against"
-            )
-        return (
-            f"momentum over {n} bars needs {n + 2} bars of the session and there "
-            f"are {len(frame)}"
+        return momentum_unknown(
+            self.ticker, int(self.config.momentum_confirmation_bars), self.minute_move, len(frame)
         )
 
     def _refuse_entry(self, state: AppState, frame, ts) -> bool:
@@ -4201,7 +4223,14 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
       the fill, so a position bought at the open asks less of the price as the
       session quietens;
     * **sell on the signal** when the edge falls under `gm_exit` -- off in the
-      notebook's pick, which holds what neither level closes to the close.
+      notebook's pick, which holds what neither level closes to the close;
+    * **confirm on momentum** with `gm_confirm_bars` -- the day-range rules'
+      behaviour table over that many bars (`MOMENTUM_TABLE`): an entry the
+      edge calls for also needs the table's "buy" (momentum not negative, and
+      not flat with a falling change), and a take that is reached is held
+      while momentum is still positive, then sold on the first bar it is not,
+      wherever the price is by then. Until the table can be read (N + 2 bars,
+      last week's mean minute move) neither happens. Off in the notebook.
 
     In that order on every bar, as the notebook's `trading._session` does: the
     stop and the take against the bar, then the bar's own forecast. After a
@@ -4249,6 +4278,12 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         # once rather than every minute.
         self._forecast_note: "str | None" = None
         self._prewarmed = None
+        # The ticker's `abs_mean_minute_momentum`, read off its state each
+        # cycle: what the momentum confirmation's neutral band is a share of.
+        self.minute_move: "float | None" = None
+        # The last reason the confirmation refused an entry, so a stretch of
+        # refused bars is logged once.
+        self._momentum_note: "str | None" = None
 
     def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
         if outcome != rule_agent.CLOSED and (self.blocked or {}).get("sit_out"):
@@ -4273,6 +4308,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         if not len(frame):
             _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
             return rule_agent.NO_DATA
+        self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
         if self.blocked is not None:
             return rule_agent.NO_DATA
         if self.session is None:
@@ -4303,10 +4339,12 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         self.forecast = self._forecast_for(bundle, state, today, minute)
         self._record(state, ts, last)
         if not self.quiet_read:
-            _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, minute)})
+            _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, minute, frame)})
 
         # 1. The stop and the take, against this bar: both rested from the fill
-        # on, and a bar that touched both is a stop.
+        # on, and a bar that touched both is a stop. With the confirmation on, a
+        # take reached on this bar or an earlier one sells only once momentum
+        # is no longer positive.
         took = False
         if position > 0:
             stop, take = self.entry.get("stop"), self.entry.get("take")
@@ -4318,14 +4356,38 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
                 ))
                 self.session["cool_until"] = minute + APPLE_TRADER_GM_COOLDOWN_BARS
                 return rule_agent.SOLD
-            if take is not None and float(last["high"]) >= float(take):
-                self._sell(state, tracker, position, self.EXIT_TAKE, (
-                    f"The {ts:%H:%M} bar traded up to ${float(last['high']):,.2f}, through the "
-                    f"${float(take):,.2f} take ({self._take_phrase(minute)}) — "
-                    + ("the rise the model was asked about happened."
-                       if self.config.gm_take_min_k is None
-                       else "as far as this time of day's volatility asks for.")
-                ))
+            reached_before = bool(self.entry.get("take_reached"))
+            reached = take is not None and (reached_before or float(last["high"]) >= float(take))
+            held = self._hold_past_take(frame) if reached else None
+            if held is not None and not reached_before:
+                # Held, not sold: the flatten and the edge exit below still apply.
+                self.entry["take_reached"] = True
+                _log(state, {"type": "status", "text": (
+                    f"The {ts:%H:%M} bar traded up to ${float(last['high']):,.2f}, through "
+                    f"the ${float(take):,.2f} take, but {held}. Holding on; sold on the "
+                    "first bar momentum is no longer positive."
+                )})
+            if reached and held is None:
+                if reached_before:
+                    # No read only when a restart brought a held take onto a
+                    # run with the confirmation off.
+                    read = self._momentum_read(frame)
+                    reason = (
+                        f"The take was reached earlier and held while momentum rose; now "
+                        f"{momentum_words(read) if read is not None else 'the confirmation is off'}. "
+                        f"Selling at ${float(last['close']):,.2f}."
+                    )
+                else:
+                    reason = (
+                        f"The {ts:%H:%M} bar traded up to ${float(last['high']):,.2f}, through the "
+                        f"${float(take):,.2f} take ({self._take_phrase(minute)}) — "
+                        + ("the rise the model was asked about happened."
+                           if self.config.gm_take_min_k is None
+                           else "as far as this time of day's volatility asks for.")
+                    )
+                    if self.config.gm_confirm_bars:
+                        reason += f" Momentum does not hold it: {momentum_words(self._momentum_read(frame))}."
+                self._sell(state, tracker, position, self.EXIT_TAKE, reason)
                 took = True
                 position = tracker.position_for(self.ticker)
                 if position > 0:
@@ -4356,9 +4418,52 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             return sold
         if minute < int(self.session.get("cool_until") or 0):
             return sold
+        if self._refuse_on_momentum(state, frame, ts):
+            return sold
         if self.entry_refused(state, ts):
             return sold
         return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else sold
+
+    # --- the momentum confirmation ------------------------------------------
+
+    def _momentum_read(self, frame) -> "dict | None":
+        """This bar's read of the behaviour table (`momentum_read`), or None."""
+        return momentum_read(frame["close"], self.config.gm_confirm_bars, self.minute_move)
+
+    def _hold_past_take(self, frame) -> "str | None":
+        """Why a reached take is not sold on this bar, or None to sell it: with
+        the confirmation on, momentum still positive -- the rise has not ended
+        -- or no read at all."""
+        if not self.config.gm_confirm_bars:
+            return None
+        read = self._momentum_read(frame)
+        if read is None:
+            return momentum_unknown(self.ticker, self.config.gm_confirm_bars, self.minute_move, len(frame))
+        return None if read["row"].sell_target else momentum_words(read)
+
+    def _refuse_on_momentum(self, state: AppState, frame, ts) -> bool:
+        """Whether the confirmation refuses an entry the edge calls for: the
+        table's "buy" needs positive momentum, or neutral momentum whose change
+        is not negative. Said once per stretch of refusals for one reason; the
+        next bar is judged again."""
+        if not self.config.gm_confirm_bars:
+            return False
+        read = self._momentum_read(frame)
+        if read is not None and read["row"].buy:
+            self._momentum_note = None
+            return False
+        if read is None:
+            why = momentum_unknown(self.ticker, self.config.gm_confirm_bars, self.minute_move, len(frame))
+            key = "unknown"
+        else:
+            why, key = momentum_words(read), f"{read['mom_class']}/{read['change_class']}"
+        if key != self._momentum_note:
+            self._momentum_note = key
+            _log(state, {"type": "status", "text": (
+                f"The edge calls for a buy at {ts:%H:%M}, but {why}. Not buying yet; each "
+                "bar is judged again."
+            )})
+        return True
 
     # --- the session ------------------------------------------------------
 
@@ -4457,6 +4562,10 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             + (f"; sell when the edge falls under {self.config.gm_exit:+g}"
                if self.config.gm_exit is not None else "")
             + "."
+            + (f" Momentum over the last {self.config.gm_confirm_bars} bars confirms both: no buy "
+               "while it is negative (or flat and turning down), and a reached take is held "
+               "while it is still positive."
+               if self.config.gm_confirm_bars else "")
         )})
         return True
 
@@ -4624,7 +4733,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             "seed": None,
         })
 
-    def _read_summary(self, bar, ts, position: float, minute: int) -> str:
+    def _read_summary(self, bar, ts, position: float, minute: int, frame=None) -> str:
         price = float(bar["close"])
         parts = [f"{self.ticker} {ts:%H:%M} ${price:,.2f}"]
         fc = self.forecast
@@ -4635,6 +4744,12 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             )
         else:
             parts.append("no forecast")
+        read = self._momentum_read(frame) if frame is not None and self.config.gm_confirm_bars else None
+        if read is not None:
+            parts.append(
+                f"{read['n']}-bar momentum {read['mom']:+.3f} $/bar ({read['mom_class']}), "
+                f"change {read['change_class']}"
+            )
         if position > 0 and self.entry:
             entry_price = float(self.entry["price"])
             pnl = (price / entry_price - 1) * 100 if entry_price else 0.0
@@ -4642,6 +4757,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             for name in ("take", "stop"):
                 if self.entry.get(name):
                     parts.append(f"{name} ${float(self.entry[name]):,.2f}")
+            if self.entry.get("take_reached"):
+                parts.append("past the take — held while momentum stays positive")
         elif self.session and minute < int(self.session.get("cool_until") or 0):
             parts.append("stopped out — no entry until the pause is over")
         return " · ".join(parts)
@@ -4723,6 +4840,12 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         exits.append(f"once the edge is under {config.gm_exit:+g}")
     exits.append("at the closing flatten")
     target = _goodmoments().TARGET_ADR
+    confirm = (
+        f" Momentum over the last {config.gm_confirm_bars} bars confirms both sides: no buy while "
+        "it is negative or flat and turning down, and a reached take is held while it is still "
+        "positive, sold on the first bar it is not."
+        if config.gm_confirm_bars else ""
+    )
     return (
         f"Apple Trader armed on {model.label} (fitted {bundle.get('trained_at') or 'unknown'}"
         f"{quality}): at the close of every bar it forecasts the chance that {config.ticker} trades "
@@ -4730,6 +4853,7 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         "chance on the clock and today's volatility alone, and buys when the first is at least "
         f"{config.gm_enter:+g} over the second (no new entry after 15:30). It sells "
         + (f"{', '.join(exits[:-1])}, or {exits[-1]}." if len(exits) > 1 else f"{exits[0]}.")
+        + confirm
     )
 
 

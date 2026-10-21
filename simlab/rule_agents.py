@@ -264,6 +264,10 @@ _APPLE_LEGACY = {
     # default, kept here so it means the same if the default moves; a flat take
     # signs as it always did.
     "gm_take_min_k": None,
+    # And its take sold at once and its entries read the edge alone, whatever
+    # the tape's momentum (before 2026-10-21). 0 is that rule, also today's
+    # default, and it is left out of the signature.
+    "gm_confirm_bars": 0,
 }
 
 
