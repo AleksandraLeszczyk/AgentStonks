@@ -893,6 +893,11 @@ def _ensure_option_bars(symbol: str, index: dict, contracts: pd.DataFrame, close
         for (start, end), symbols in sorted(jobs.items()):
             if start <= end:
                 fetched.append(_download_option_bars(symbols, start, end, key, secret))
+        # Only the jobs that returned bars: an empty answer is typed object, and
+        # pandas 3 lets it make every column of the concatenation object too --
+        # which the tables' arithmetic then refuses (GoodMoments' AMD row for
+        # 2026-10-20, built the morning its bars were first fetched).
+        fetched = [frame for frame in fetched if len(frame)]
         got = pd.concat(fetched, ignore_index=True) if fetched else pd.DataFrame(columns=_BAR_COLUMNS)
         log_fetch("option daily bars (option tables)", "Alpaca REST", symbol=symbol,
                   detail=f"{len(got)} bars of {sum(len(s) for s in jobs.values())} contracts "

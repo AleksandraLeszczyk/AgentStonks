@@ -812,33 +812,46 @@ APPLE_TRADER_BRIEFING_WAIT_BARS = 10
 APPLE_TRADER_MAX_FALL_K = 0.10
 # Fast&Furious (`apple_models.FASTFURIOUS_KEY`, `apple_trader.FastFuriousTrader`):
 # a forecast of the next 30 minutes' average momentum at the close of every
-# bar, and notebook 06's rules for it -- picked on 2025 as the best Sharpe of
-# daily P&L among 64 candidates with at least 50 trades:
+# bar, and the rules the amended re-run picked for AAPL's model
+# (`fastfurious_AAPL_amended`, since 2026-10-21; `experiments/selection/
+# evaluate_amended.py`) -- the best Sharpe of daily P&L over April-December
+# 2025 among the same 64 candidates with at least 50 trades:
 #
 #   * enter when the forecast is at or above the ENTRY_QUANTILE of |forecast|
 #     over the previous 20 sessions' every minute (the threshold adapts to the
 #     scale of the model's output);
 #   * a stop STOP_K x the forecast 2-hour adverse excursion under the fill;
 #   * out HOLD_MINUTES after the last signal (a fresh one restarts the clock),
-#     at once on a signal the other way (EXIT_ON_SELL_SIGNAL), at the close at
-#     the latest.
+#     at the close at the latest; long only, so a sell signal does not close
+#     the long (EXIT_ON_SELL_SIGNAL off).
 #
-# The notebook trades both sides; this ledger is long-only, so these are that
-# system's long trades exactly (its reversal into a short is a close here).
-# Notebook 06's long trades, $10,000 a trade, 1 bp a side:
+# Long only is this ledger's own side, so these are the notebook's trades
+# exactly. $10,000 a trade, 1 bp a side:
 #
-#   window            trades  win   net bps/trade  net P&L
-#   2025 (chosen on)    249   56%        8.4        +2,092
-#   2026 to 4 Sep       111   50%        1.1          +116
-#   8 Sep - 9 Oct        21   48%        9.1          +191
+#   window                 trades  win   net bps/trade  net P&L   beats placebos
+#   Apr-Dec 2025 (chosen)    110   69%       13.0       +1,426        94.5%
+#   2026 to 4 Sep            120   53%        2.8         +334        43.5%
+#   8 Sep - 9 Oct             14   57%       19.5         +273        91.5%
 #
-# The notebook's own verdict on the whole system: out of sample no edge that
-# luck does not also produce (it beats 57% of placebos on 2026), and holding
-# AAPL through every session made more. Not tuned here.
-APPLE_TRADER_FF_ENTRY_QUANTILE = 0.95
-APPLE_TRADER_FF_STOP_K = 1.5
+# The notebook's verdict on the re-run: it "rescues nothing" -- the momentum
+# IC fell to -0.002 on 2026 (the original recipe's held 0.030), the 2026 P&L
+# beats fewer than half of the placebos, and holding AAPL through every session
+# made more (+999 on 2026, +572 on the test month). 2026 and the test month had
+# been seen before the re-run, so they are a second look, not a clean test.
+#
+# The original recipe's rules (`fastfurious_AAPL`, notebook 06, chosen on all
+# of 2025, trading both sides -- a sell signal closed a long): q 0.95, stop
+# 1.5, sell-signal exit on; long trades +2,092 / +116 / +191 on the same three
+# windows (249 / 111 / 21 trades). Not tuned here.
+#
+# Which saved recipe a ticker runs when not the notebook's own
+# `fastfurious_<TICKER>` (`fastfurious_model.BUNDLE_NAMES`; here so the model
+# catalogue can name the file without importing LightGBM).
+FASTFURIOUS_BUNDLE_NAMES = {"AAPL": "fastfurious_AAPL_amended.joblib"}
+APPLE_TRADER_FF_ENTRY_QUANTILE = 0.90
+APPLE_TRADER_FF_STOP_K = 2.0
 APPLE_TRADER_FF_HOLD_MINUTES = 30
-APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL = True
+APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL = False
 # GoodMoments (`apple_models.GOODMOMENTS_KEY`, `apple_trader.GoodMomentsTrader`):
 # at the close of every bar, the model's probability that a later bar of the
 # session trades 0.2 ADR above this close, beside the same trees' probability on
@@ -874,6 +887,14 @@ APPLE_TRADER_GM_TAKE_K = 0.2
 # day -- the notebook's rule, and every record's from before it existed.
 APPLE_TRADER_GM_TAKE_MIN_K = None
 APPLE_TRADER_GM_STOP_K = 0.75
+# Where a ticker's notebook 4 picked another stop. AMD's grid (same 160
+# candidates, same rule) chose enter +0.02, take 0.2 ADR, no signal exit and a
+# 0.5 ADR stop -- on a validation half where only 11% of candidates made money
+# (+$440, Sharpe 0.5). On the test: 270 trades, 63% winners, +5.0 bps a trade,
+# +$1,342, beating 56% of placebos; holding AMD made +$6,465. Notebook 3 had
+# found AMD's model adds next to nothing to time and volatility (AUC 0.712 vs
+# 0.710), so the edge it trades carries no known information.
+APPLE_TRADER_GM_STOP_K_BY_TICKER = {"AMD": 0.5}
 # HighLow's momentum confirmation, on GoodMoments' rules: the look-back in bars
 # of the same behaviour table (`apple_trader.MOMENTUM_TABLE`). A buy the edge
 # calls for waits for the table's "buy"; a take that is reached is held while

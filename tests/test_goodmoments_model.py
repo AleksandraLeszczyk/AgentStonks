@@ -84,8 +84,8 @@ class TestLiveSeam:
             tape = G.Tape(joined("open"), joined("high"), joined("low"), joined("close"),
                           joined("volume", self.K), joined("vwap"))
             ref = G.session_stats(tape, None, self.K, self.SIGMA, seam=0)
-            for name in ("c", "s_open", "hi", "lo", "vwap", "cum_var", "vol_15",
-                         "bvc_sess", "clv_sess", "dev_poc"):
+            for name in ("c", "s_open", "hi", "lo", "ref_1h", "vwap", "cum_vol", "cum_var", "vol_15",
+                         "bvc_1h", "bvc_sess", "clv_sess", "dev_poc"):
                 assert live[name][t] == pytest.approx(ref[name][t], rel=1e-12, abs=1e-15), (name, t)
 
     def test_before_bar_15_the_session_is_iexs_alone(self):
@@ -160,78 +160,115 @@ class TestBundle:
 
 # --- against the notebook ----------------------------------------------------------
 
-needs_notebook = pytest.mark.skipif(
-    not (NOTEBOOK / "panel.parquet").exists(), reason="the GoodMoments notebook's data is not on this machine"
-)
+
+def _notebook_dir(ticker: str) -> Path:
+    """`goodmoments.config.DATA_DIR`: AAPL keeps the original cache, every
+    other ticker its own folder under it."""
+    return NOTEBOOK if ticker == "AAPL" else NOTEBOOK / ticker
 
 
-@pytest.fixture(scope="module")
-def notebook():
-    minutes = pd.read_parquet(NOTEBOOK / "minutes.parquet")
-    return {
-        "minutes": minutes,
-        "sessions": pd.read_parquet(NOTEBOOK / "sessions.parquet"),
-        "daily": G.daily_candles(minutes),
-        "positioning": pd.read_parquet(NOTEBOOK / "options" / "positioning.parquet"),
-        "events": G.analyst_events(pd.read_parquet(NOTEBOOK / "analysts_raw.parquet")),
-        "panel": pd.read_parquet(NOTEBOOK / "panel.parquet"),
-    }
+_NOTEBOOKS: dict = {}
+
+
+def notebook(ticker: str) -> dict:
+    """One ticker's notebook data, read once per run (AMD's panel is 90 MB)."""
+    if ticker not in _NOTEBOOKS:
+        folder = _notebook_dir(ticker)
+        if not (folder / "panel.parquet").exists():
+            pytest.skip(f"the GoodMoments notebook's {ticker} data is not on this machine")
+        minutes = pd.read_parquet(folder / "minutes.parquet")
+        _NOTEBOOKS[ticker] = {
+            "folder": folder,
+            "minutes": minutes,
+            "sessions": pd.read_parquet(folder / "sessions.parquet"),
+            "daily": G.daily_candles(minutes),
+            "positioning": pd.read_parquet(folder / "options" / "positioning.parquet"),
+            "events": G.analyst_events(pd.read_parquet(folder / "analysts_raw.parquet")),
+            "panel": pd.read_parquet(folder / "panel.parquet"),
+        }
+    return _NOTEBOOKS[ticker]
 
 
 def _position_row(pos: pd.DataFrame, day: pd.Timestamp) -> dict:
     p = pos.loc[day]
-    return {"spot": p["spot"], "iv_30d": p["iv_30d"], "pc_volume": p["pc_volume"],
-            "gex": [p[f"gex_{k}"] for k in range(len(G.GEX_GRID))]}
+    return {"spot": p["spot"], "call_wall": p["call_wall"], "iv_30d": p["iv_30d"],
+            "pc_volume": p["pc_volume"], "gex": [p[f"gex_{k}"] for k in range(len(G.GEX_GRID))]}
 
 
-@needs_notebook
+# Per ticker: AAPL's original six; AMD's first modelled month, results mornings
+# (2025-02-05, 2025-11-05, 2026-08-05 -- reported the evening before), a Monday
+# and the last session of the fit.
+DAYS = {
+    "AAPL": ["2024-06-03", "2025-03-14", "2025-11-20", "2026-04-07", "2026-09-30", "2026-10-16"],
+    "AMD": ["2024-03-15", "2025-02-05", "2025-11-05", "2026-04-06", "2026-08-05", "2026-10-16"],
+}
+OPTION_DAYS = {
+    "AAPL": ["2024-09-16", "2025-06-02", "2026-03-10", "2026-08-14"],
+    "AMD": ["2024-09-16", "2025-06-02", "2026-03-10", "2026-10-16"],
+}
+
+
 class TestAgainstTheNotebook:
-    DAYS = ["2024-06-03", "2025-03-14", "2025-11-20", "2026-04-07", "2026-09-30", "2026-10-16"]
-
-    def test_the_cleaning_and_the_daily_candles_are_the_notebooks(self, notebook):
-        raw = pd.concat([pd.read_parquet(f) for f in sorted(glob.glob(str(NOTEBOOK / "raw" / "AAPL_*.parquet")))])
+    @pytest.mark.parametrize("ticker", sorted(DAYS))
+    def test_the_cleaning_and_the_daily_candles_are_the_notebooks(self, ticker):
+        nb = notebook(ticker)
+        raw = pd.concat([pd.read_parquet(f) for f in sorted(glob.glob(str(nb["folder"] / "raw" / f"{ticker}_*.parquet")))])
         grid, report = G.clean_sessions(raw.sort_index()[G.BAR_COLS])
         cols = ["date", "minute", *G.BAR_COLS]
-        assert np.array_equal(grid[cols[2:]].to_numpy(float), notebook["minutes"][cols[2:]].to_numpy(float))
-        assert report["kept"].equals(notebook["sessions"]["kept"])
-        daily = pd.read_parquet(NOTEBOOK / "daily.parquet")
-        assert np.array_equal(notebook["daily"].to_numpy(), daily[notebook["daily"].columns].to_numpy(),
+        assert np.array_equal(grid[cols[2:]].to_numpy(float), nb["minutes"][cols[2:]].to_numpy(float))
+        assert report["kept"].equals(nb["sessions"]["kept"])
+        daily = pd.read_parquet(nb["folder"] / "daily.parquet")
+        assert np.array_equal(nb["daily"].to_numpy(), daily[nb["daily"].columns].to_numpy(),
                               equal_nan=True)
 
-    @pytest.mark.parametrize("day", DAYS)
-    def test_every_feature_and_forecast_is_the_notebooks(self, notebook, day):
-        bundle = G.load_bundle("AAPL")
+    @pytest.mark.parametrize("ticker,day", [(t, d) for t, days in DAYS.items() for d in days])
+    def test_every_feature_and_forecast_is_the_notebooks(self, ticker, day):
+        bundle = G.load_bundle(ticker)
         if bundle is None:
-            pytest.skip("the GoodMoments bundle is not installed")
+            pytest.skip(f"the GoodMoments {ticker} bundle is not installed")
+        nb = notebook(ticker)
         d = pd.Timestamp(day)
-        drow, norms = G.day_inputs(notebook["minutes"], notebook["sessions"], notebook["daily"], d)
+        drow, norms = G.day_inputs(nb["minutes"], nb["sessions"], nb["daily"], d)
         f = G.session_features(
-            G._tape_of(notebook["minutes"], d), None, d, drow, norms,
-            _position_row(notebook["positioning"], d), notebook["events"], seam=0,
+            G._tape_of(nb["minutes"], d), None, d, drow, norms,
+            _position_row(nb["positioning"], d), nb["events"], seam=0,
         )
-        ref = notebook["panel"][notebook["panel"]["date"] == d].set_index("minute")
+        ref = nb["panel"][nb["panel"]["date"] == d].set_index("minute")
         mine = f.loc[ref.index]
         for col in G.FEATURE_COLS:
             np.testing.assert_array_equal(mine[col].to_numpy(float), ref[col].to_numpy(float), err_msg=col)
-        np.testing.assert_array_equal(
-            bundle["model"].predict(mine[bundle["features"]]), bundle["model"].predict(ref[bundle["features"]])
-        )
+        for model, cols in (("model", "features"), ("timevol", "timevol_features")):
+            np.testing.assert_array_equal(
+                bundle[model].predict(mine[bundle[cols]]), bundle[model].predict(ref[bundle[cols]])
+            )
 
-    @pytest.mark.parametrize("day", ["2024-09-16", "2025-06-02", "2026-03-10", "2026-08-14"])
-    def test_the_option_row_is_the_notebooks(self, notebook, day):
+    @pytest.mark.parametrize("ticker,day", [(t, d) for t, days in OPTION_DAYS.items() for d in days])
+    def test_the_option_row_is_the_notebooks(self, ticker, day):
         """`options.positioning` on the notebook's own option bars."""
-        options = NOTEBOOK / "options"
+        nb = notebook(ticker)
+        options = nb["folder"] / "options"
         contracts = pd.read_parquet(options / "contracts.parquet")
-        bars = pd.concat([pd.read_parquet(f) for f in sorted(glob.glob(str(options / "bars" / "*.parquet")))],
-                         ignore_index=True)
+        # AMD's notebook saved two expiries with no bars at all, typed object:
+        # in pandas 3 they would turn the whole volume column into objects.
+        frames = [pd.read_parquet(f) for f in sorted(glob.glob(str(options / "bars" / "*.parquet")))]
+        bars = pd.concat([f for f in frames if len(f)], ignore_index=True)
         bars = bars.merge(contracts[["symbol", "type", "strike", "expiry"]], on="symbol")
         d = pd.Timestamp(day)
-        sessions = pd.DatetimeIndex(notebook["daily"].index)
+        sessions = pd.DatetimeIndex(nb["daily"].index)
         prev = sessions[sessions < d].max()
-        row = G.positioning_row(bars[bars["date"] <= prev], notebook["daily"], sessions, prev, d)
-        ref = notebook["positioning"].loc[d]
+        row = G.positioning_row(bars[bars["date"] <= prev], nb["daily"], sessions, prev, d)
+        ref = nb["positioning"].loc[d]
         assert row["spot"] == ref["spot"]
+        assert row["call_wall"] == ref["call_wall"]
         assert row["iv_30d"] == ref["iv_30d"]
         assert row["pc_volume"] == ref["pc_volume"]
         gex = np.array([ref[f"gex_{k}"] for k in range(len(G.GEX_GRID))])
         np.testing.assert_allclose(row["gex"], gex, rtol=1e-10)
+
+    def test_amd_reads_the_call_wall_and_the_hour(self):
+        bundle = G.load_bundle("AMD")
+        if bundle is None:
+            pytest.skip("the GoodMoments AMD bundle is not installed")
+        assert bundle["ticker"] == "AMD" and bundle["reads_walls"]
+        assert {"d_call_wall", "mom_1h", "bvc_1h", "rel_vol", "vol_regime"} <= set(bundle["features"])
+        assert bundle["timevol_features"] == ["frac_left", "p_reach"]

@@ -56,6 +56,14 @@ def test_dayrange_sidecar_paths_mirror_the_real_ones():
     assert by_role["metadata"] == dayrange.metadata_path(real)
 
 
+@pytest.mark.parametrize("ticker", ["AAPL", "NVDA"])
+def test_fastfurious_path_mirrors_the_real_one(ticker):
+    """AAPL's card names the amended re-run's file, as the module reads it."""
+    fastfurious = pytest.importorskip("agent_stonks.fastfurious_model")
+    spec = mc.spec(apple_models.FASTFURIOUS_KEY, ticker)
+    assert {f.role: f.path for f in spec.files}["bundle"] == fastfurious.model_path(ticker)
+
+
 def test_per_ticker_env_override_does_not_answer_for_other_symbols(monkeypatch, tmp_path):
     """The distinction each model module is careful about: the bare env var names
     one file, so it can only mean the default ticker's."""

@@ -7,7 +7,8 @@ answers one question:
     ADR = mean log(high / low) over the previous 14 sessions
     y_t = 1  if a later bar of the session trades at close[t] * exp(0.2 ADR)
 
-    p      the saved LightGBM's probability of y_t (27 features)
+    p      the saved LightGBM's probability of y_t (AAPL's 27 features,
+           AMD's 23 -- each notebook run picks its own from the same 55)
     p_tv   the same trees on the clock and volatility alone (`frac_left`,
            `p_reach`) -- notebook 3's "time and volatility" baseline
     edge   p - p_tv: what the references, the order flow, the options and the
@@ -113,6 +114,7 @@ LAST_FORECAST = SESSION_MINUTES - 2
 
 OPTION_MAX_DTE = 60               # expiries used for dealer gamma
 OPTION_HISTORY_DAYS = 120         # each contract's bars, over its last 120 days
+WALL_BAND = 0.15                  # the call wall: most open interest within +-15% of spot
 OPTIONS_START = "2024-02-01"
 RISK_FREE = 0.045                 # flat rate; gamma barely depends on it
 DIV_YIELD = 0.004
@@ -144,28 +146,30 @@ ANALYSTS_LAYOUT = 1
 # Live, the analyst table is fetched again when older than this.
 ANALYST_REFRESH_SEC = 3600.0
 
-# --- the shipped model's features -------------------------------------------------
+# --- the shipped models' features -------------------------------------------------
 #
-# Cut: every feature the saved model and the time-and-volatility model do not
-# read -- weekday, gap, range so far, position in the range, the 1- to 120-minute
-# momentum, the 20-session momentum, the volatility regime, the 7-day close and
-# 14/28-day open averages, session relative volume and realised volatility as
-# features, the walls and the gamma flip, the analyst counts, the 5- to 60-minute
-# signed-flow proxies.
+# What AAPL's (27) and AMD's (23) saved models and their time-and-volatility
+# twins read -- AMD's adds the weekday, the range so far, the 1-hour, the
+# 20-session momentum, the volatility regime, the 14-day open average, session
+# relative volume, the call wall and the 1-hour signed flow.
+# Cut: every feature neither reads -- gap, position in the range, the 1- to
+# 15-minute and 2-hour momentum, the 7-day close and 28-day open averages,
+# realised volatility as a feature, the put wall and the gamma flip, the analyst
+# counts, the 5- and 15-minute signed-flow proxies.
 
 FEATURE_COLS = [
-    "frac_left", "p_reach",
-    "d_high", "d_low", "d_vwap", "mom_today",
-    "mom_1d", "mom_60d", "y_range", "y_rv",
+    "frac_left", "p_reach", "dow",
+    "d_high", "d_low", "d_vwap", "range_sofar", "mom_today", "mom_1h",
+    "mom_1d", "mom_20d", "mom_60d", "y_range", "y_rv", "vol_regime",
     "d_y_open", "d_y_close", "d_y_high", "d_y_low",
-    "d_sma_c14", "d_sma_c28", "d_sma_o7",
-    "rel_vol_15m",
+    "d_sma_c14", "d_sma_c28", "d_sma_o7", "d_sma_o14",
+    "rel_vol", "rel_vol_15m",
     "d_poc", "d_poc_y", "d_poc_5d",
-    "gex", "iv_adr", "pc_volume",
+    "d_call_wall", "gex", "iv_adr", "pc_volume",
     "pt_gap",
-    "bvc_sess", "clv_sess",
+    "bvc_1h", "bvc_sess", "clv_sess",
 ]
-OPTION_COLS = {"gex", "iv_adr", "pc_volume"}
+OPTION_COLS = {"d_call_wall", "gex", "iv_adr", "pc_volume"}
 ANALYST_COLS = {"pt_gap"}
 
 
@@ -242,6 +246,7 @@ def _build_bundle(path: Path) -> "dict | None":
         "timevol_features": tv_cols,
         "metadata": meta,
         "reads_options": bool(set(cols) & OPTION_COLS),
+        "reads_walls": "d_call_wall" in cols,
         "reads_analysts": bool(set(cols) & ANALYST_COLS),
         "trained_at": f"through {window[-1]}" if window else None,
         "path": str(path),
@@ -436,20 +441,23 @@ def daily_features(daily: pd.DataFrame, day_poc: pd.DataFrame) -> pd.DataFrame:
     rv_norm = d["rv"].rolling(NORM_SESSIONS).mean().shift(1)
     out = pd.DataFrame(index=d.index)
     out["adr"] = adr
+    out["vol_regime"] = adr / lr.rolling(60).mean().shift(1)
     out["y_range"] = lr.shift(1) / adr
     out["y_rv"] = d["rv"].shift(1) / d["rv"].rolling(NORM_SESSIONS).mean().shift(2)
     out["mom_1d"] = np.log(d["close"] / d["close"].shift(1)).shift(1) / adr
-    n = 60
-    out["mom_60d"] = np.log(d["close"].shift(1) / d["close"].shift(n + 1)) / (adr * np.sqrt(n))
+    for n in (20, 60):
+        out[f"mom_{n}d"] = np.log(d["close"].shift(1) / d["close"].shift(n + 1)) / (adr * np.sqrt(n))
     for col in ("open", "close", "high", "low"):
         out[f"y_{col}"] = d[col].shift(1)
     for n in (14, 28):
         out[f"sma_c{n}"] = d["close"].rolling(n).mean().shift(1)
-    out["sma_o7"] = d["open"].rolling(7).mean().shift(1)
+    for n in (7, 14):
+        out[f"sma_o{n}"] = d["open"].rolling(n).mean().shift(1)
     out["poc_y"] = d["poc"].shift(1)
     out["poc_5d"] = d["poc_5d_prior"]
     out["rv_norm"] = rv_norm
     out["adv_dollar"] = (d["volume"] * d["vwap"]).rolling(NORM_SESSIONS).mean().shift(1)
+    out["dow"] = d.index.dayofweek
     return out
 
 
@@ -457,6 +465,7 @@ def _session_sums(t: Tape) -> "dict[str, np.ndarray]":
     """The per-minute quantities the same-minute norms average, on one session."""
     r = t.ret
     return {
+        "cum_vol": _gsum(t.volume),
         "vol_15": _window_sum(t.volume, 15),
         "cum_rv": np.sqrt(_gsum(r**2)),
         "cum_var": _gsum(r**2),
@@ -467,7 +476,7 @@ def minute_norms(minutes: pd.DataFrame, report: pd.DataFrame, day: pd.Timestamp)
     """Each norm's row for `day`: the mean of the same minute over the 20 kept
     sessions before it (fewer than 10: NaN) -- `_norm_by_minute` for a kept day."""
     kept = [d for d in report.index[report["kept"]] if d < day]
-    rows: "dict[str, list]" = {"vol_15": [], "cum_rv": [], "cum_var": []}
+    rows: "dict[str, list]" = {"cum_vol": [], "vol_15": [], "cum_rv": [], "cum_var": []}
     for d in kept:
         for name, a in _session_sums(_tape_of(minutes, d)).items():
             rows[name].append(a)
@@ -523,18 +532,24 @@ def session_stats(sip: Tape, iex: "Tape | None", k: float, sigma: float, seam: i
         wide = t.high > t.low
         return v * np.where(wide, (2 * t.close - t.high - t.low) / np.where(wide, t.high - t.low, 1.0), 0.0)
 
-    b_s, cl_s = _gsum(bvc_term(r_s, v_s)), _gsum(clv_term(sip, v_s))
+    bvc_s = bvc_term(r_s, v_s)
+    b_s, cl_s = _gsum(bvc_s), _gsum(clv_term(sip, v_s))
     base_s, a_s = _session_profile(sip.low, sip.high, v_s)
     if seam <= 0:
         with np.errstate(invalid="ignore", divide="ignore"):
             vol_sess = pd.Series(vol_s).replace(0, np.nan).to_numpy()
+            vol_1h = pd.Series(_window_sum(v_s, 60)).replace(0, np.nan).to_numpy()
             return {
                 "c": c_s, "s_open": np.full(n, sip.open[0]), "hi": hi_s, "lo": lo_s,
+                "ref_1h": pd.Series(c_s).shift(60).fillna(sip.open[0]).to_numpy(),
                 "vwap": pd.Series(pv_s / vol_s).fillna(pd.Series(c_s)).to_numpy(),
-                "cum_var": r2_s, "vol_15": _window_sum(v_s, 15),
+                "cum_vol": vol_s, "cum_var": r2_s, "vol_15": _window_sum(v_s, 15),
+                "bvc_1h": _window_sum(bvc_s, 60) / vol_1h,
                 "bvc_sess": b_s / vol_sess, "clv_sess": cl_s / vol_sess,
                 "dev_poc": _bin_price(base_s + np.cumsum(a_s, axis=0).argmax(axis=1)),
             }
+    if seam > 60:
+        raise ValueError("the hour-long windows below assume the seam lies inside the hour")
 
     t = np.arange(n)
     j = t - seam                      # the last SIP bar; < 0 before bar `seam`
@@ -575,6 +590,13 @@ def session_stats(sip: Tape, iex: "Tape | None", k: float, sigma: float, seam: i
     sip_15 = np.where(j >= t - 14, vol_s[jj] - _at(vol_s, t - 15), 0.0)
     vol_15 = sip_15 + cs_v - _at(cs_v, np.maximum(j, t - 15))
 
+    # The hour: with the seam inside it, bar t-60 is SIP's, so the hour's
+    # sums are the joined running sums less SIP's own through t-60, and its
+    # first close is SIP's (the session's open before an hour has passed).
+    ref_1h = np.where(t >= 60, c_s[np.maximum(t - 60, 0)], s_open)
+    vol_1h = vol - _at(vol_s, t - 60)
+    bvc_1h = bvc - _at(b_s, t - 60)
+
     # The developing POC: SIP's profile through j plus IEX's (x k) after it, on
     # bins covering both tapes.
     base_i, a_i = _session_profile(iex.low, iex.high, v_i)
@@ -589,8 +611,10 @@ def session_stats(sip: Tape, iex: "Tape | None", k: float, sigma: float, seam: i
     with np.errstate(invalid="ignore", divide="ignore"):
         per = np.where(vol > 0, vol, np.nan)
         return {
-            "c": c, "s_open": s_open, "hi": hi, "lo": lo, "vwap": vwap, "cum_var": cum_var,
-            "vol_15": vol_15, "bvc_sess": bvc / per, "clv_sess": clv / per, "dev_poc": dev,
+            "c": c, "s_open": s_open, "hi": hi, "lo": lo, "ref_1h": ref_1h, "vwap": vwap,
+            "cum_vol": vol, "cum_var": cum_var, "vol_15": vol_15,
+            "bvc_1h": bvc_1h / np.where(vol_1h > 0, vol_1h, np.nan),
+            "bvc_sess": bvc / per, "clv_sess": clv / per, "dev_poc": dev,
         }
 
 
@@ -664,17 +688,21 @@ def session_features(
     f["price"] = c
     f["adr"] = adr
     f["frac_left"] = (SESSION_MINUTES - 1 - minute) / SESSION_MINUTES
+    f["dow"] = int(drow["dow"])
     f["d_high"], f["d_low"] = dist(s["hi"]), dist(s["lo"])
+    f["range_sofar"] = np.log(s["hi"] / s["lo"]) / adr
     f["d_vwap"] = dist(s["vwap"])
+    f["mom_1h"] = np.log(c / s["ref_1h"]) / (adr * np.sqrt(60 / SESSION_MINUTES))
     f["mom_today"] = dist(s["s_open"])
-    for col in ("mom_1d", "mom_60d", "y_range", "y_rv"):
+    for col in ("mom_1d", "mom_20d", "mom_60d", "y_range", "y_rv", "vol_regime"):
         f[col] = float(drow[col])
     for col in ("open", "close", "high", "low"):
         f[f"d_y_{col}"] = dist(float(drow[f"y_{col}"]))
     f["d_sma_c14"], f["d_sma_c28"] = dist(float(drow["sma_c14"])), dist(float(drow["sma_c28"]))
-    f["d_sma_o7"] = dist(float(drow["sma_o7"]))
+    f["d_sma_o7"], f["d_sma_o14"] = dist(float(drow["sma_o7"])), dist(float(drow["sma_o14"]))
 
     cum_rv = np.sqrt(s["cum_var"])
+    f["rel_vol"] = s["cum_vol"] / norms["cum_vol"]
     f["rel_vol_15m"] = s["vol_15"] / norms["vol_15"]
     rv_sofar = pd.Series(cum_rv / norms["cum_rv"], index=f.index)
     var_done = pd.Series(norms["cum_var"], index=f.index)
@@ -686,6 +714,7 @@ def session_features(
     f["d_poc_y"], f["d_poc_5d"] = dist(float(drow["poc_y"])), dist(float(drow["poc_5d"]))
 
     if position is not None:
+        f["d_call_wall"] = dist(float(position.get("call_wall", np.nan)))
         grid = np.asarray(position["gex"], dtype=float)
         g0, dg = GEX_GRID[0], GEX_GRID[1] - GEX_GRID[0]
         x = np.clip((np.log(c / position["spot"]) - g0) / dg, 0, len(GEX_GRID) - 1 - 1e-9)
@@ -695,10 +724,10 @@ def session_features(
         f["iv_adr"] = position["iv_30d"] / np.sqrt(252) / adr
         f["pc_volume"] = np.log(position["pc_volume"])
     else:
-        f["gex"] = f["iv_adr"] = f["pc_volume"] = np.nan
+        f["d_call_wall"] = f["gex"] = f["iv_adr"] = f["pc_volume"] = np.nan
 
     f["pt_gap"] = pt_gap(bar_close_times(day, minute), c, events) if events is not None and len(events) else np.nan
-    f["bvc_sess"], f["clv_sess"] = s["bvc_sess"], s["clv_sess"]
+    f["bvc_1h"], f["bvc_sess"], f["clv_sess"] = s["bvc_1h"], s["bvc_sess"], s["clv_sess"]
     return f.replace([np.inf, -np.inf], np.nan)
 
 
@@ -764,8 +793,9 @@ def in_band(bars: pd.DataFrame, closes: pd.Series, through: pd.Timestamp) -> pd.
 def positioning_row(bars: pd.DataFrame, daily: pd.DataFrame, sessions: pd.DatetimeIndex,
                     prev: pd.Timestamp, day: pd.Timestamp) -> "dict | None":
     """`options.positioning`'s row for `day` as of `prev`'s close: spot, the
-    30-day implied vol, put/call volume and dealer gamma on GEX_GRID. None
-    when no contract alive over the next 60 days has open interest.
+    call wall, the 30-day implied vol, put/call volume and dealer gamma on
+    GEX_GRID. None when no contract alive over the next 60 days has open
+    interest.
 
     `bars` are daily option bars with each contract's `type`, `strike` and
     `expiry`, through `prev`; `sessions` every session over their span."""
@@ -786,6 +816,9 @@ def positioning_row(bars: pd.DataFrame, daily: pd.DataFrame, sessions: pd.Dateti
     c = c[(c["oi"] > 0) & c["strike"].between(spot * STRIKE_BAND[0], spot * STRIKE_BAND[1])]
     if c.empty:
         return None
+    band = c[c["strike"].between(spot * (1 - WALL_BAND), spot * (1 + WALL_BAND))]
+    by_strike = band.groupby(["type", "strike"])["oi"].sum()
+    call_wall = by_strike.loc["call"].idxmax() if "call" in by_strike.index.get_level_values(0) else np.nan
     v = vols[vols["date"] == prev].set_index("expiry")["iv"]
     sigma = c["expiry"].map(v).fillna(v.median() if len(v) else 0.3).to_numpy()
     T = (((c["expiry"] - day).dt.days + 0.25) / 365.0).to_numpy()
@@ -798,6 +831,7 @@ def positioning_row(bars: pd.DataFrame, daily: pd.DataFrame, sessions: pd.Dateti
     has = prev in day_vol.index and {"put", "call"} <= set(day_vol.columns)
     return {
         "spot": float(spot),
+        "call_wall": float(call_wall),
         "iv_30d": float(np.interp(30, dte[dte >= 1], near.to_numpy())) if len(near) else float("nan"),
         "pc_volume": float(day_vol.at[prev, "put"] / day_vol.at[prev, "call"]) if has else float("nan"),
         "gex": [float(x) for x in gex],
@@ -854,18 +888,20 @@ def option_bars(symbol: str, prev: pd.Timestamp, closes: pd.Series,
 
 def positioning(symbol: str, prev: pd.Timestamp, day: pd.Timestamp, daily: pd.DataFrame,
                 sessions: pd.DatetimeIndex, key: "str | None" = None,
-                secret: "str | None" = None) -> dict:
+                secret: "str | None" = None, walls: bool = False) -> dict:
     """Last night's option row for `day` (from `prev`'s close), from the cache
     or built. Raises ValueError when there is none. Built only once `prev` is
     over: Alpaca's daily option bars of a session still trading are not its
-    close."""
+    close. A row cached before the call wall was kept (AAPL's, to 2026-10-21)
+    is built again only for a model that reads the wall (`walls`)."""
     iso = f"{pd.Timestamp(day):%Y-%m-%d}"
     with _positioning_lock:
         cache = _read_json(_positioning_path(symbol)) or {}
         if cache.get("layout") != POSITIONING_LAYOUT:
             cache = {"layout": POSITIONING_LAYOUT, "rows": {}}
         found = cache["rows"].get(iso)
-        if found is not None and found.get("prev") == f"{prev:%Y-%m-%d}":
+        if (found is not None and found.get("prev") == f"{prev:%Y-%m-%d}"
+                and (not walls or "call_wall" in found)):
             return found
         if pd.Timestamp(prev) >= pd.Timestamp(_today_et()):
             raise ValueError(f"the option bars of {prev.date()} are not final until that session is over.")
@@ -1048,14 +1084,15 @@ def _session_day(bundle: dict, symbol: str, day: pd.Timestamp,
         return _days[memo]
 
 
-def _positioning(ctx: _Day, symbol: str, key, secret) -> None:
+def _positioning(ctx: _Day, bundle: dict, symbol: str, key, secret) -> None:
     if ctx.position is not None:
         return
     if ctx.position_problem and time.monotonic() - ctx.position_tried < _POSITIONING_RETRY_SEC:
         return
     sessions = pd.DatetimeIndex(ctx.daily.index)
     try:
-        ctx.position = positioning(symbol, ctx.prev, ctx.day, ctx.daily, sessions, key, secret)
+        ctx.position = positioning(symbol, ctx.prev, ctx.day, ctx.daily, sessions, key, secret,
+                                   walls=bool(bundle.get("reads_walls")))
         ctx.position_problem = ""
     except Exception as exc:  # noqa: BLE001 -- reported with the forecast that needed it
         ctx.position_problem = str(exc)
@@ -1113,7 +1150,7 @@ def session_forecasts(
 
     ctx = _session_day(bundle, symbol, day, key, secret)
     if bundle.get("reads_options", True):
-        _positioning(ctx, symbol, key, secret)
+        _positioning(ctx, bundle, symbol, key, secret)
         if ctx.position is None:
             raise ValueError(f"no option positioning for the {ctx.prev.date()} close: {ctx.position_problem}")
     events = None
@@ -1187,7 +1224,7 @@ def warm(bundle: dict, ticker: str, session_date,
     day = _normal_day(session_date)
     ctx = _session_day(bundle, symbol, day, key, secret)
     if bundle.get("reads_options", True):
-        _positioning(ctx, symbol, key, secret)
+        _positioning(ctx, bundle, symbol, key, secret)
     if bundle.get("reads_analysts", True):
         analysts(symbol, pd.Timestamp(day).tz_localize(TZ) + pd.Timedelta(hours=16), day.date() >= _today_et())
 

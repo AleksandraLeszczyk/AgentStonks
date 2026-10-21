@@ -60,7 +60,10 @@ session's own SIP and IEX minute bars are read whole from its cache
 (``data/fastfurious/``) or Alpaca and cut, minute by minute, at SIP 15 bars
 back and IEX through the bar -- the live view of that minute -- so a replay of
 any dataset forecasts from the tape the model was fitted on, not the dataset's.
-Only a session that is today on the real clock is fetched live.
+Only a session that is today on the real clock is fetched live. Its option
+tables come from the shared option cache, each cut at the close before the
+session it serves, and Yahoo's analyst notes are filtered to those stamped
+before each bar's close, as for ``goodmoments_model`` below.
 ``goodmoments_model`` reads the same two tapes the same way (sharing that
 cache), last night's option table from the shared option cache, cut at the
 previous close, and Yahoo's analyst table filtered to the notes stamped before

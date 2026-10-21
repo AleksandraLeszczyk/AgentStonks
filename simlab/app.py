@@ -357,7 +357,8 @@ def _render_fastfurious_bundle(bundle: dict) -> None:
     st.caption(
         "IC is the rank correlation between the forecast and the next 30 minutes' return over "
         "every minute of a year, from monthly walk-forward refits; on the 24-session test "
-        "month (8 Sep – 9 Oct 2026) it was -0.03."
+        "month (8 Sep – 9 Oct 2026) it was -0.03 for the original recipe and +0.02 for the "
+        "amended re-run (`fastfurious_AAPL_amended`, chosen on April – December 2025)."
     )
     st.json({"walk_forward_scores": scores, "momentum_features": metadata.get("momentum_features"),
              "range_features": metadata.get("range_features")}, expanded=False)
@@ -1880,14 +1881,18 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
         "model_fastfurious": (
             "Its own rules, not the day-range levels: a buy when the 30-minute momentum "
-            "forecast is in the top 5% of the last 20 sessions', out 30 minutes after the "
-            "last signal, on a sell signal or at a stop sized by its 2-hour range "
-            "forecast.\n\n"
+            "forecast is in the top 10% of the last 20 sessions', out 30 minutes after the "
+            "last signal or at a stop sized by its 2-hour range forecast (and on a sell "
+            "signal, if switched on).\n\n"
             "- Reads every input from Alpaca, whatever the dataset's tape: ~200 days of SIP "
             "and IEX minute bars before each replayed day and the day's own, cut at each "
             "minute to SIP 15 minutes back and IEX since (ALPACA_API_KEY / ALPACA_SECRET), "
-            "cached under `data/fastfurious/`; the stop's option table is the shared one "
-            "(`data/option_positioning/`). A cold first replay fetches for about two minutes.\n"
+            "cached under `data/fastfurious/`; the option tables are the shared ones "
+            "(`data/option_positioning/`, the 21 nights before each day); Yahoo's analyst "
+            "notes, filtered to those stamped before each minute. A cold first replay "
+            "fetches for a few minutes.\n"
+            "- AAPL runs the amended re-run (`fastfurious_AAPL_amended`, since 21 Oct 2026); "
+            "a result stored before then was traded on the original recipe's forecasts.\n"
             "- The trades are the dataset's tape and fills, the forecast the model's own "
             "tape: on a yfinance dataset a stop is checked on yfinance's lows.\n"
             "- A stop does not end the session: the next buy waits until the forecast has "

@@ -44,13 +44,28 @@ IEX volume scale, last month's volume curve, the daily statistics) are
 `context`, and the session's own statistics are `features`. Same arithmetic,
 in the same order.
 
-The option inputs of the stop's range model (the 1-day implied move, the 7-day
-put wall, the put gamma wall) come from last night's positioning table, which
+Two saved recipes
+-----------------
+`fastfurious_<TICKER>` is the selection's own (notebook 5): 16 momentum
+features, all of today's session and the clock. AAPL runs
+`fastfurious_AAPL_amended` instead (`BUNDLE_NAMES`, since 2026-10-21): the
+disclosed re-run of the selection with the pruning ranked by real gain
+(`experiments/selection/rules.md`), whose 20 momentum features are led by the
+option table (11 columns) and two analyst columns. The notebook keeps reading
+`fastfurious_AAPL` as its baseline, so the app names the variant's file
+rather than copying it over. Both bundles load here; the columns a bundle
+reads decide what is fetched.
+
+The option inputs (walls, dealer gamma and its profile, implied vols, the
+put/call volume) come from last night's positioning table, which
 `option_positioning` rebuilds from Alpaca's option bars -- this notebook's
 tables and that module's (HighLow_3m's notebook) are identical on all 686
 closes both cover (same contracts, same open-interest calibration, same
-dividend yield), so the rows are read from there, cached under
-`data/option_positioning/`.
+dividend yield; the gamma, the volumes and the profile checked again on the 49
+closes from 31 July to 8 October 2026), so the rows are read from there,
+cached under `data/option_positioning/`. The analyst inputs are Yahoo's
+rating and price-target notes (`yfinance`), cached beside the tapes and
+filtered to the notes stamped before each minute.
 
 What the live path has to supply
 --------------------------------
@@ -60,7 +75,9 @@ What the live path has to supply
   needs the same minute's outcomes of the 20 before it, and each of those the
   60-session variance profile before that.
 * This session's SIP bars through t-15 and IEX bars through t.
-* Last night's option positioning row, for the stop.
+* Last night's option positioning row -- for the stop, and for the amended
+  recipe's momentum forecast, the rows of the threshold's 20 sessions too.
+* Yahoo's analyst notes, when the bundle reads them (the amended recipe).
 
 History is read strictly before the session being forecast, from the session
 date the caller names rather than the wall clock, so a SimLab replay reads what
@@ -94,6 +111,7 @@ except ImportError:
     pass
 
 from . import market_hours, model_store  # noqa: E402
+from .config import FASTFURIOUS_BUNDLE_NAMES  # noqa: E402
 from .option_positioning import NYSE_HOLIDAYS  # noqa: E402
 from .model_store import RTH_END, RTH_START, ModelStore  # noqa: E402
 from .newsimpact_model import early_close  # noqa: E402
@@ -101,6 +119,9 @@ from .newsimpact_model import early_close  # noqa: E402
 MODEL_PATH_ENV = "APPLE_FASTFURIOUS_MODEL"
 DEFAULT_TICKER = model_store.DEFAULT_TICKER
 # Which symbols have a bundle: `apple_models.FASTFURIOUS_TICKERS`.
+# A ticker that runs another saved recipe than the notebook's own
+# `fastfurious_<TICKER>` (see the module docstring).
+BUNDLE_NAMES = FASTFURIOUS_BUNDLE_NAMES
 
 # --- the question (fastfurious.config) ------------------------------------------
 
@@ -298,23 +319,33 @@ def variance_share(sip: Grid, window: int = 60) -> np.ndarray:
 
 # --- features (mirrors fastfurious.features) ------------------------------------------
 #
-# Cut: every group the shipped model does not read -- recent bars (but `rvx_15`,
+# Cut: every group neither saved recipe reads -- recent bars (but `rvx_15`,
 # which the range model reads), yesterday (but `prev_rv`), the 7/14/28-day
 # averages, long-term momentum (but `d_high126`), the point of control, the
-# options group (but the three columns below), analysts, market, events.
+# analysts (but the two columns below), market, events. The options group is
+# whole.
 
 EPS = 1e-12
 
+# The momentum model's columns: the selection's own recipe, and the amended
+# re-run's (`fastfurious_AAPL_amended`), in the order each was saved with.
 MOMENTUM_COLS = [
     "minute", "dow", "win_share", "y_hist20", "sess_ret", "gap", "sess_hi", "sess_lo",
     "sess_pos", "sess_rngx", "sess_rvx", "vwap_dist", "rvol_sess", "sess_ofi", "or_hi", "or_lo",
+]
+AMENDED_MOMENTUM_COLS = [
+    "cw7_dist", "gap", "minute", "iv_rv", "iv_term", "or_lo", "pcr", "gex_close", "or_hi",
+    "pgw_dist", "an_days_chg", "pw_dist", "gex_now", "y_hist20", "gex_adv", "iv1d_u", "sess_rvx",
+    "pw7_dist", "rvol_sess", "an_target_dist",
 ]
 RANGE_COLS = [
     "minute", "win_share120", "sess_rvx", "sess_rngx", "rvx_15", "rvol_sess", "or_hi", "iv1d_u",
     "prev_rv", "pw7_dist", "pgw_dist", "d_high126",
 ]
-FEATURE_COLS = list(dict.fromkeys(MOMENTUM_COLS + RANGE_COLS))
-OPTION_COLS = {"iv1d_u", "pw7_dist", "pgw_dist"}
+OPTION_COLS = {"cw_dist", "pw_dist", "cw7_dist", "pw7_dist", "cgw_dist", "pgw_dist", "flip_dist", "gex_now",
+               "gex_close", "gex_adv", "gex_neg", "iv1d_u", "iv_rv", "iv_term", "pcr"}
+ANALYST_COLS = {"an_days_chg", "an_target_dist"}
+FEATURE_COLS = list(dict.fromkeys(MOMENTUM_COLS + AMENDED_MOMENTUM_COLS + RANGE_COLS + sorted(OPTION_COLS)))
 # A row of the notebook's panel needs these (`build_panel`'s `need`): the
 # anchors, the targets and four weeks of daily history.
 NEED = ["c0", "p", "s30", "y", "up", "down", "d_ma28"]
@@ -340,6 +371,12 @@ def previous_row(table: pd.DataFrame, days: pd.DatetimeIndex) -> pd.DataFrame:
     left = pd.DataFrame({"day": days})
     right = table.sort_index().rename_axis("asof").reset_index()
     return pd.merge_asof(left, right, left_on="day", right_on="asof", allow_exact_matches=False).set_index("day")
+
+
+def origin_times(days: pd.DatetimeIndex) -> np.ndarray:
+    """Close of bar t (09:31 for t=0) as int64 ns, D x 390."""
+    base = (days.as_unit("ns") + pd.Timedelta(9 * 60 + 31, "min")).tz_localize(market_hours.MARKET_TZ).asi8
+    return base[:, None] + np.arange(M)[None, :] * 60_000_000_000
 
 
 def window_share(cshare: np.ndarray, h: int) -> "tuple[np.ndarray, np.ndarray]":
@@ -428,11 +465,116 @@ def _grid_rows(g: Grid, rows: slice) -> Grid:
     return Grid(g.days[rows], *(getattr(g, f)[rows] for f in (*FIELDS, "close_ff", "ret")))
 
 
+def _gex_at(profile: pd.DataFrame, asof: pd.Series, m: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+    """Net and gross dealer gamma from each day's `asof` profile, read at log-moves m (D x 390)."""
+    net, gross = np.full(m.shape, np.nan), np.full(m.shape, np.nan)
+    if profile is None or profile.empty:
+        return net, gross
+    pn = profile.pivot(index="date", columns="m", values="net_gex")
+    pg = profile.pivot(index="date", columns="m", values="gross_gex")
+    grid = pn.columns.to_numpy(float)
+    for d, r in enumerate(pn.index.get_indexer(pd.DatetimeIndex(asof))):
+        if r >= 0:
+            x = np.clip(m[d], grid[0], grid[-1])
+            net[d] = np.interp(x, grid, pn.iloc[r].to_numpy())
+            gross[d] = np.interp(x, grid, pg.iloc[r].to_numpy())
+    return net, gross
+
+
+def options_group(pos, profile, p, u, ds, days) -> dict:
+    """Last night's walls and gamma measured from the live price; gamma re-read at it."""
+    r = previous_row(pos, days)
+    f = {}
+    for name, col, side in (("cw", "call_wall", 1), ("pw", "put_wall", -1), ("cw7", "call_wall_7d", 1),
+                            ("pw7", "put_wall_7d", -1), ("cgw", "call_gamma_wall", 1), ("pgw", "put_gamma_wall", -1)):
+        f[f"{name}_dist"] = side * _log(_col(r[col]), p) / u
+    f["flip_dist"] = _log(p, _col(r["gamma_flip"])) / u
+    net, gross = _gex_at(profile, r["asof"], _log(p, _col(r["spot"])))
+    f["gex_now"] = _div(net, gross)
+    f["gex_close"] = _col(_div(r["net_gex"].to_numpy(), r["gross_gex"].to_numpy()))
+    f["gex_adv"] = net / _col(ds["dollar_adv20"])
+    f["gex_neg"] = np.where(np.isnan(net), np.nan, (net < 0).astype(float))
+    f["iv1d_u"] = _col(r["iv_1d"] / np.sqrt(252)) / u
+    f["iv_rv"] = _col(r["iv_30d"] / (ds["ccvol28"] * np.sqrt(252)))
+    f["iv_term"] = _col(np.log(r["iv_1d"] / r["iv_30d"]))
+    f["pcr"] = _col(np.log((r["put_volume"] + 1) / (r["call_volume"] + 1)))
+    return f
+
+
+def analyst_group(actions: pd.DataFrame, days: pd.DatetimeIndex, T: np.ndarray, p: np.ndarray) -> dict:
+    """Notes stamped before each minute: the days since the last up- or
+    downgrade, and the consensus target at the open against the price. (Cut:
+    the counts since last night's close and over 5 and 20 sessions.)"""
+    a = actions.sort_index()
+    ts = a.index.asi8
+    up, down = (a["action"] == "up").to_numpy(float), (a["action"] == "down").to_numpy(float)
+    f = {}
+    changes = np.r_[ts[(up + down) > 0], np.iinfo(np.int64).max]
+    j = np.searchsorted(changes, T, side="left") - 1
+    last = np.where(j >= 0, changes[np.maximum(j, 0)], T)
+    f["an_days_chg"] = np.where(j >= 0, (T - last) / 86_400e9, 250.0).clip(max=250.0)
+    opens = (days + pd.Timedelta(9.5, "h")).tz_localize(market_hours.MARKET_TZ)
+    f["an_target_dist"] = _log(_col(consensus_before(a, opens).to_numpy()), p)
+    return f
+
+
+# --- the analyst notes (mirrors fastfurious.analysts) --------------------------------
+#
+# Cut: the notebook's window. Its start (400 days before its first minute) is
+# further back than anything the two columns read -- a year of targets, 250
+# days since a change -- and its end is the notebook's last day.
+
+ANALYST_RENAME = {"Firm": "firm", "ToGrade": "to_grade", "FromGrade": "from_grade", "Action": "action",
+                  "priceTargetAction": "pt_action", "currentPriceTarget": "target", "priorPriceTarget": "prior_target"}
+
+
+def clean_analysts(raw: pd.DataFrame) -> pd.DataFrame:
+    """In New York time, without duplicates. `target_chg` is new / old target - 1
+    where both exist and differ. Stamped in nanoseconds whatever Yahoo sends
+    (it sends seconds now; the notebook's copy and `analyst_group` read ns)."""
+    out = raw.rename(columns=ANALYST_RENAME)[list(ANALYST_RENAME.values())].copy()
+    stamps = pd.DatetimeIndex(raw.index)
+    stamps = stamps.tz_localize("UTC") if stamps.tz is None else stamps
+    out.index = pd.DatetimeIndex(stamps.tz_convert(market_hours.MARKET_TZ), name="ts").as_unit("ns")
+    out = out.sort_index()
+
+    for col in ("firm", "to_grade", "from_grade", "action", "pt_action"):
+        out[col] = out[col].fillna("").astype(str).str.strip()
+    out["action"] = out["action"].str.lower()
+    for col in ("target", "prior_target"):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    out = out.reset_index()
+    out["day"] = out["ts"].dt.date
+    out = out.drop_duplicates(["firm", "day", "action", "to_grade", "target"]).drop(columns="day")
+    moved = (out["target"] > 0) & (out["prior_target"] > 0) & (out["target"] != out["prior_target"])
+    out["target_chg"] = (out["target"] / out["prior_target"] - 1).where(moved)
+    return out.set_index("ts")
+
+
+def consensus_before(actions: pd.DataFrame, stamps: pd.DatetimeIndex, days: int = 365) -> pd.Series:
+    """Median of each firm's latest price target set within `days` before each stamp."""
+    priced = actions[actions["target"] > 0].sort_index()
+    t = priced.index.asi8
+    span = pd.Timedelta(days, "D").value
+    out = []
+    for s in pd.DatetimeIndex(stamps).asi8:
+        lo, hi = np.searchsorted(t, [s - span, s], side="left")
+        latest = priced.iloc[lo:hi].groupby("firm")["target"].last()
+        out.append(latest.median() if len(latest) else np.nan)
+    return pd.Series(out, index=stamps)
+
+
 def features(sip: Grid, iex: Grid, ds: pd.DataFrame, ctx: Context,
-             positioning: "pd.DataFrame | None" = None, targets: bool = False) -> "dict[str, np.ndarray]":
+             positioning: "pd.DataFrame | None" = None, targets: bool = False,
+             profile: "pd.DataFrame | None" = None,
+             actions: "pd.DataFrame | None" = None) -> "dict[str, np.ndarray]":
     """`build_panel`'s per-session half, D x 390 per column: the anchors and
     scales, the shipped models' features, and (`targets`) the outcomes a
-    panel row needs to exist. `ds` and `ctx` are the rows of the same days."""
+    panel row needs to exist. `ds` and `ctx` are the rows of the same days;
+    `positioning` and `profile` the option table and its gamma profile, one
+    row per close before them (None: the option columns are NaN), `actions`
+    the cleaned analyst notes (None: the analyst columns are NaN)."""
     days = sip.days
     D = len(days)
     t = np.broadcast_to(np.arange(M)[None, :], (D, M))
@@ -494,12 +636,16 @@ def features(sip: Grid, iex: Grid, ds: pd.DataFrame, ctx: Context,
 
     # --- options: last night's table, measured from the live price ----------------------
     if positioning is not None and len(positioning):
-        r = previous_row(positioning, days)
-        for name, col, side in (("pw7", "put_wall_7d", -1), ("pgw", "put_gamma_wall", -1)):
-            f[f"{name}_dist"] = side * _log(_col(r[col]), p) / u
-        f["iv1d_u"] = _col(r["iv_1d"] / np.sqrt(252)) / u
+        f.update(options_group(positioning, profile, p, u, ds, days))
     else:
         for name in OPTION_COLS:
+            f[name] = np.full((D, M), np.nan)
+
+    # --- analysts: the notes stamped before the minute -----------------------------------
+    if actions is not None:
+        f.update(analyst_group(actions, days, origin_times(days), p))
+    else:
+        for name in ANALYST_COLS:
             f[name] = np.full((D, M), np.nan)
 
     out = {}
@@ -601,6 +747,7 @@ _STORE = ModelStore(
     env_key=MODEL_PATH_ENV,
     filename="fastfurious_{ticker}.joblib",
     build=lambda path: _build_bundle(path),
+    names=BUNDLE_NAMES,
 )
 
 model_path = _STORE.path
@@ -644,7 +791,11 @@ def _build_bundle(path: Path) -> "dict | None":
         "kind": "fastfurious",
         "model": model,
         "metadata": meta,
+        # The stop's range model reads last night's option row; the amended
+        # recipe's momentum model reads it too, and the analyst notes.
         "reads_options": bool(set(ranges.cols) & OPTION_COLS),
+        "momentum_reads_options": bool(set(momentum.cols) & OPTION_COLS),
+        "reads_analysts": bool((set(momentum.cols) | set(ranges.cols)) & ANALYST_COLS),
         "trained_at": f"through {meta['fit_end']}" if meta.get("fit_end") else None,
         "path": str(path),
         "ticker": str(meta.get("ticker") or "").upper() or None,
@@ -987,6 +1138,11 @@ def live_tapes(symbol: str, day: date, through: int,
 # --- one session's forecasts ---------------------------------------------------------
 
 
+class InputsPending(ValueError):
+    """An input fetched from elsewhere -- the option table, Yahoo's analyst
+    notes -- could not be had just now; a later try may get it."""
+
+
 @dataclass
 class _Day:
     """What a session's forecasts read from before it, built once per session."""
@@ -995,7 +1151,8 @@ class _Day:
     history: Tapes
     daily: pd.DataFrame          # every session's candle before the day, plus a row for it
     prev_close: pd.Timestamp     # the last session before it: last night's option table
-    positioning: "pd.DataFrame | None" = None
+    positioning: "pd.DataFrame | None" = None   # one row per close (`_positioning_closes`)
+    profile: "pd.DataFrame | None" = None       # their gamma profiles, long
     positioning_problem: str = ""
     positioning_tried: float = 0.0          # monotonic time of the last failed attempt
     theta_abs: "np.ndarray | None" = None   # |y_hat| over the threshold's sessions
@@ -1075,15 +1232,18 @@ def _frame(feats: "dict[str, np.ndarray]", row: int, minutes: np.ndarray) -> pd.
     return pd.DataFrame(out, index=pd.Index(minutes, name="minute"))
 
 
-def _threshold_inputs(bundle: dict, ctx_day: _Day) -> None:
+def _threshold_inputs(bundle: dict, ctx_day: _Day, actions: "pd.DataFrame | None") -> None:
     """|y_hat| over every panel row of the 20 kept sessions before the day --
-    what `trading.thresholds` takes its quantile of."""
+    what `trading.thresholds` takes its quantile of. A session whose forecast
+    is one constant is left out (the amended rules' threshold reads sessions
+    with a live forecast only); the saved models have none."""
     if ctx_day.theta_abs is not None:
         return
     hist = ctx_day.history
     gs, gi, ds, ctx = _panel_inputs(hist, ctx_day.daily.iloc[:-1], None, None, None)
     rows = slice(max(0, len(gs.days) - THRESHOLD_SESSIONS), len(gs.days))
-    feats = features(_grid_rows(gs, rows), _grid_rows(gi, rows), ds.iloc[rows], _rows(ctx, rows), targets=True)
+    feats = features(_grid_rows(gs, rows), _grid_rows(gi, rows), ds.iloc[rows], _rows(ctx, rows),
+                     ctx_day.positioning, targets=True, profile=ctx_day.profile, actions=actions)
     minutes = np.arange(LAST_ORIGIN + 1)
     parts, sessions = [], 0
     for r in range(feats["p"].shape[0]):
@@ -1091,8 +1251,11 @@ def _threshold_inputs(bundle: dict, ctx_day: _Day) -> None:
         frame = frame.dropna(subset=NEED)
         if not len(frame):
             continue
+        y_hat = bundle["model"].momentum.predict(frame)
+        if len(np.unique(y_hat)) < 2:
+            continue
         sessions += 1
-        parts.append(np.abs(bundle["model"].momentum.predict(frame)))
+        parts.append(np.abs(y_hat))
     ctx_day.theta_abs = np.concatenate(parts) if parts else np.array([])
     ctx_day.theta_sessions = sessions
 
@@ -1105,10 +1268,14 @@ def threshold(bundle: dict, ticker: str, session_date, q: float,
 
     The notebook's test window read the walk-forward models' forecasts of the
     sessions before it; live there is one model, so these are the saved model's
-    own -- out of sample for every session after its fit (4 Sep 2026)."""
+    own -- out of sample for every session after its fit (4 Sep 2026).
+    InputsPending when the momentum model reads an input not to be had yet."""
     symbol = str(ticker).upper()
-    ctx_day = _session_day(bundle, symbol, _normal_day(session_date), key, secret)
-    _threshold_inputs(bundle, ctx_day)
+    day = _normal_day(session_date)
+    ctx_day = _session_day(bundle, symbol, day, key, secret)
+    if ctx_day.theta_abs is None:
+        _momentum_options(bundle, ctx_day, symbol, key, secret)
+        _threshold_inputs(bundle, ctx_day, _actions(bundle, symbol, day))
     if ctx_day.theta_sessions < THRESHOLD_MIN_SESSIONS:
         return float("nan"), ctx_day.theta_sessions
     return float(np.quantile(ctx_day.theta_abs, q)), ctx_day.theta_sessions
@@ -1119,8 +1286,24 @@ def threshold(bundle: dict, ticker: str, session_date, q: float,
 _POSITIONING_RETRY_SEC = 300.0
 
 
-def _positioning(ctx_day: _Day, symbol: str, key, secret) -> None:
-    """Last night's option positioning row (`option_positioning`, shared)."""
+def _positioning_closes(bundle: dict, ctx_day: _Day) -> "list[pd.Timestamp]":
+    """The closes whose option rows the session reads: last night's, and when
+    the momentum model reads the table, the night before each of the
+    threshold's sessions and every close since (so each session's row is the
+    one strictly before it, half days included, as in the notebook's table)."""
+    if not bundle.get("momentum_reads_options"):
+        return [ctx_day.prev_close]
+    closes = ctx_day.history.daily.index
+    kept = ctx_day.history.kept
+    first = kept[max(0, len(kept) - THRESHOLD_SESSIONS)]
+    before = closes[closes < first]
+    start = before[-1] if len(before) else first
+    return list(closes[closes >= start])
+
+
+def _positioning(bundle: dict, ctx_day: _Day, symbol: str, key, secret) -> None:
+    """The option positioning rows the session reads (`option_positioning`,
+    shared), with their gamma profiles."""
     if ctx_day.positioning is not None:
         return
     if ctx_day.positioning_problem and time.monotonic() - ctx_day.positioning_tried < _POSITIONING_RETRY_SEC:
@@ -1128,16 +1311,112 @@ def _positioning(ctx_day: _Day, symbol: str, key, secret) -> None:
     from . import option_positioning
 
     try:
-        rows = option_positioning.positioning_rows(symbol, [ctx_day.prev_close], key, secret)
-        table, _ = option_positioning.positioning_frames(rows)
-        if not len(table):
+        rows = option_positioning.positioning_rows(symbol, _positioning_closes(bundle, ctx_day), key, secret)
+        table, profile = option_positioning.positioning_frames(rows)
+        if ctx_day.prev_close.strftime("%Y-%m-%d") not in rows:
             raise ValueError(f"no option positioning for the {ctx_day.prev_close.date()} close.")
         table.index = pd.DatetimeIndex(table.index, name="date").as_unit("ns")
-        ctx_day.positioning = table
+        profile["date"] = pd.DatetimeIndex(profile["date"]).as_unit("ns")
+        ctx_day.positioning, ctx_day.profile = table, profile
         ctx_day.positioning_problem = ""
-    except Exception as exc:  # noqa: BLE001 -- the momentum forecast stands without it
+    except Exception as exc:  # noqa: BLE001 -- the original recipe's momentum forecast stands without it
         ctx_day.positioning_problem = str(exc)
         ctx_day.positioning_tried = time.monotonic()
+
+
+def _momentum_options(bundle: dict, ctx_day: _Day, symbol: str, key, secret) -> None:
+    """The option rows, read when the bundle reads any; InputsPending when the
+    momentum model reads them and they are not to be had."""
+    if bundle.get("reads_options", True) or bundle.get("momentum_reads_options"):
+        _positioning(bundle, ctx_day, symbol, key, secret)
+    if bundle.get("momentum_reads_options") and ctx_day.positioning is None:
+        raise InputsPending(
+            f"the momentum forecast reads the option table and there is none for the "
+            f"{ctx_day.prev_close.date()} close yet ({ctx_day.positioning_problem or 'not built'})."
+        )
+
+
+# --- Yahoo's analyst notes ---------------------------------------------------------------
+
+ANALYSTS_LAYOUT = 1
+# Live, the notes are fetched again when the cached copy is older than this
+# (GoodMoments' hour); a replayed session reads any copy fetched after its close.
+ANALYST_REFRESH_SEC = 3600.0
+# After a failed fetch the cached copy stands in for this long before Yahoo is
+# asked again (not every minute).
+_ANALYST_RETRY_SEC = 300.0
+_analyst_lock = threading.Lock()
+_analyst_memo: "dict[str, tuple[float, pd.DataFrame]]" = {}
+_analyst_failed: "dict[str, float]" = {}
+
+
+def _analysts_path(symbol: str) -> Path:
+    return HISTORY_DIR / f"{symbol.upper()}_analysts.parquet"
+
+
+def _download_analysts(symbol: str) -> pd.DataFrame:
+    import yfinance as yf
+
+    raw = yf.Ticker(symbol).upgrades_downgrades
+    if raw is None or not len(raw) or "currentPriceTarget" not in raw:
+        raise ValueError(f"Yahoo returned no analyst actions for {symbol}.")
+    return raw
+
+
+def analyst_actions(symbol: str, as_of: pd.Timestamp, live: bool) -> pd.DataFrame:
+    """Yahoo's notes, cleaned (`clean_analysts`): live from a copy at most
+    ANALYST_REFRESH_SEC old, a replayed session from one fetched after `as_of`
+    (its close). A failed fetch falls back to the cached copy; only a missing
+    one raises (InputsPending)."""
+    symbol = symbol.upper()
+    path = _analysts_path(symbol)
+    meta_path = path.with_suffix(".json")
+    with _analyst_lock:
+        memo = _analyst_memo.get(symbol)
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            meta = {}
+        fetched = float(meta.get("fetched", 0.0)) if meta.get("layout") == ANALYSTS_LAYOUT else 0.0
+        fresh = (time.time() - fetched < ANALYST_REFRESH_SEC) if live else fetched >= as_of.timestamp()
+        if memo is not None and memo[0] == fetched and (
+            fresh or time.monotonic() - _analyst_failed.get(symbol, -_ANALYST_RETRY_SEC) < _ANALYST_RETRY_SEC
+        ):
+            return memo[1]
+        raw = None
+        if fresh and path.exists():
+            try:
+                raw = pd.read_parquet(path)
+            except (OSError, ValueError):
+                raw = None
+        if raw is None:
+            try:
+                raw = _download_analysts(symbol)
+                HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+                raw.to_parquet(path)
+                fetched = time.time()
+                meta_path.write_text(json.dumps({"layout": ANALYSTS_LAYOUT, "fetched": fetched}))
+                _analyst_failed.pop(symbol, None)
+                from .datalog import log_fetch
+
+                log_fetch("analyst actions (Fast&Furious)", "Yahoo Finance (yfinance)", symbol=symbol,
+                          detail=f"{len(raw)} rating and price-target actions")
+            except Exception as exc:  # noqa: BLE001 -- the cached copy stands in
+                _analyst_failed[symbol] = time.monotonic()
+                if not path.exists():
+                    raise InputsPending(f"no analyst notes for {symbol} (Yahoo: {exc}).") from exc
+                raw = pd.read_parquet(path)
+        actions = clean_analysts(raw)
+        _analyst_memo[symbol] = (fetched, actions)
+        return actions
+
+
+def _actions(bundle: dict, symbol: str, day: pd.Timestamp) -> "pd.DataFrame | None":
+    """The analyst notes when the bundle reads them, else None."""
+    if not bundle.get("reads_analysts"):
+        return None
+    close = (day + pd.Timedelta(hours=16)).tz_localize(market_hours.MARKET_TZ)
+    return analyst_actions(symbol, close, day.date() >= _today_et())
 
 
 def _predict(bundle: dict, frame: pd.DataFrame, with_range: bool) -> pd.DataFrame:
@@ -1184,7 +1463,8 @@ def session_forecasts(
     `pred_high` / `pred_low` (those as prices off `p`). Rows the notebook's
     panel would not have -- no IEX print yet, too little daily history -- are
     left out. `attrs["range_problem"]` says why the range columns are NaN when
-    last night's option table could not be read.
+    last night's option table could not be read; a momentum model that reads
+    the table (or Yahoo's analyst notes) raises InputsPending instead.
 
     A finished session is read whole from the history cache and memoised, so a
     SimLab grid replaying it pays once; today's is fetched live, SIP through
@@ -1229,12 +1509,12 @@ def session_forecasts(
                 f"({report['reason'].iloc[0].replace('_', ' ')}), so there is no forecast for it."
             )
     reads_options = bundle.get("reads_options", True)
-    if reads_options:
-        _positioning(ctx_day, symbol, key, secret)
+    _momentum_options(bundle, ctx_day, symbol, key, secret)
+    actions = _actions(bundle, symbol, day)
     gs, gi, ds, ctx = _panel_inputs(ctx_day.history, ctx_day.daily, sip_today, iex_today, day)
     row = slice(len(gs.days) - 1, len(gs.days))
     feats = features(_grid_rows(gs, row), _grid_rows(gi, row), ds.iloc[row], _rows(ctx, row),
-                     ctx_day.positioning)
+                     ctx_day.positioning, profile=ctx_day.profile, actions=actions)
     minutes = np.arange(last + 1 if live else LAST_ORIGIN + 1)
     frame = _frame(feats, 0, minutes)
     # The panel's own rows: a minute the notebook keeps needs the live price,
@@ -1304,13 +1584,9 @@ def forecast_at(
 def warm(bundle: dict, ticker: str, session_date,
          key: "str | None" = None, secret: "str | None" = None) -> None:
     """Fill what the session's first forecast reads, ahead of it: the minute
-    history, the threshold's forecasts and last night's option table."""
-    symbol = str(ticker).upper()
-    day = _normal_day(session_date)
-    ctx_day = _session_day(bundle, symbol, day, key, secret)
-    _threshold_inputs(bundle, ctx_day)
-    if bundle.get("reads_options", True):
-        _positioning(ctx_day, symbol, key, secret)
+    history, the option tables, the analyst notes and the threshold's
+    forecasts."""
+    threshold(bundle, ticker, session_date, 0.5, key, secret)
 
 
 def reset_caches() -> None:
@@ -1318,3 +1594,6 @@ def reset_caches() -> None:
     with _day_lock:
         _days.clear()
     _forecast_memo.clear()
+    with _analyst_lock:
+        _analyst_memo.clear()
+        _analyst_failed.clear()

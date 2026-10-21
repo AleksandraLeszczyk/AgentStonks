@@ -51,6 +51,7 @@ from importlib.util import find_spec
 from pathlib import Path
 
 from . import apple_models, intraday_vol_model, model_store
+from .config import FASTFURIOUS_BUNDLE_NAMES
 
 # The shared store beside the AgentStonks checkout, where every model family
 # resolves its files from (see `model_store.ModelStore`).
@@ -941,7 +942,12 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
 
 
 def _fastfurious_spec(ticker: str) -> ModelSpec:
-    path = _saved_path("APPLE_FASTFURIOUS_MODEL", "fastfurious_{ticker}.joblib", ticker)
+    # A ticker may run a variant saved under its own name
+    # (`fastfurious_model.BUNDLE_NAMES`, AAPL's amended re-run).
+    symbol = (ticker or apple_models.DEFAULT_TICKER).upper()
+    pattern = FASTFURIOUS_BUNDLE_NAMES.get(symbol, "fastfurious_{ticker}.joblib")
+    path = _saved_path("APPLE_FASTFURIOUS_MODEL", pattern, ticker)
+    amended = path.stem.endswith("_amended")
     files = (
         ModelFile("bundle", path),
         ModelFile("metadata", path.with_suffix(".json")),
@@ -995,8 +1001,9 @@ def _fastfurious_spec(ticker: str) -> ModelSpec:
             "Today's session as the basic plan shows it at each bar's close — SIP to 15 minutes "
             "back, IEX since — plus 60 sessions' time-of-day variance profile, 20 sessions' "
             "outcomes at the same minute and volume curve, the 14-day range and the 126-day "
-            "high from ~200 days of SIP minute bars; last night's option positioning (the "
-            "range pair only)"
+            "high from ~200 days of SIP minute bars; last night's option positioning"
+            + (" and Yahoo's analyst notes (the amended re-run's momentum model reads both)"
+               if amended else " (the range pair only)")
         ),
         metrics=metrics,
         headline=(
@@ -1016,6 +1023,13 @@ def _fastfurious_spec(ticker: str) -> ModelSpec:
         available=available,
         unavailable_reason=reason,
         caveat=(
+            "The amended re-run of the feature selection, a disclosed deviation: chosen on "
+            "April-December 2025 (rank correlation 0.047 with the next half hour), it fell to "
+            "-0.002 on 2026 -- where the original recipe held 0.030 -- and was +0.02 on the "
+            "24-session test month, which had been seen before the re-run. Traded by its "
+            "re-chosen rules it made +$334 on 2026 and beat only 43.5% of placebo runs; "
+            "holding the stock made more. The notebook's verdict: it rescues nothing."
+            if amended else
             "A weak ranking edge: the forecast's rank correlation with the next half hour is "
             "0.03 on 2025 and on 2026, with lower 95% bounds just under zero, and -0.03 on "
             "the 24-session test month. Traded by notebook 06's rules it broke even on 2026 "

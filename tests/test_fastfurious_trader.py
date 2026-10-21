@@ -32,6 +32,10 @@ DOWN = 0.4                      # the stop: 1.5 x 0.4 x 0.005 = 0.3% under the f
 BUNDLE = {"kind": "fastfurious", "path": "stub"}
 
 
+class InputsPending(ValueError):
+    """The stub module's `fastfurious_model.InputsPending`."""
+
+
 class FakeBroker(Broker):
     def __init__(self, price: float = 100.0):
         self.price = price
@@ -98,6 +102,7 @@ class Tape:
             forecast_at=forecast_at, threshold=threshold, LAST_ORIGIN=359,
             THRESHOLD_MIN_SESSIONS=5, is_half_day=lambda day: False,
             nyse_sessions=lambda days: list(days), warm=lambda *a, **k: None,
+            InputsPending=InputsPending,
         )
         monkeypatch.setattr(at, "_fastfurious", lambda: fake)
         monkeypatch.setattr(at.momentum_regime, "minute_frame", lambda *a, **k: self.frame())
@@ -121,8 +126,13 @@ class Tape:
 
 
 def ff_config(**kwargs) -> AppleTraderConfig:
-    """Notebook 06's rules; no days off, so the calendar decides nothing here."""
+    """Notebook 06's rules (the original recipe's, pinned here so the round
+    numbers below hold whatever the defaults); no days off, so the calendar
+    decides nothing here."""
     kwargs.setdefault("skip_events", ())
+    kwargs.setdefault("ff_entry_quantile", 0.95)
+    kwargs.setdefault("ff_stop_k", 1.5)
+    kwargs.setdefault("ff_exit_on_sell_signal", True)
     return AppleTraderConfig(model_key=apple_models.FASTFURIOUS_KEY, ticker=TICKER, **kwargs)
 
 
@@ -351,6 +361,27 @@ class TestKeptApart:
         )
         dayrange = AppleTraderConfig(model_key="dayrange")
         assert config_signature(replace(dayrange, ff_entry_quantile=0.9)) == config_signature(dayrange)
+
+    def test_the_defaults_are_the_amended_rerun_rules(self):
+        """q 0.9, stop 2 x the forecast drop, no target, long only -- the
+        amended re-run's pick for AAPL's amended model."""
+        c = AppleTraderConfig(model_key=apple_models.FASTFURIOUS_KEY, ticker=TICKER)
+        assert (c.ff_entry_quantile, c.ff_stop_k, c.ff_hold_minutes, c.ff_exit_on_sell_signal) == (
+            0.9, 2.0, 30, False)
+        assert config_signature(replace(c, position_pct=95.0, skip_events=())).startswith(
+            "fastfurious_AAPL(q=0.9,stop=2dn,hold=30m,size=")
+
+    def test_a_pending_input_waits_rather_than_ending_the_day(self, monkeypatch, state):
+        """No option table yet for the amended model: no threshold this bar,
+        asked again on the next -- not the session-ending refusal."""
+        trader, tracker, tape = _setup(monkeypatch, state)
+        tape.threshold = InputsPending("no option table yet")
+        tape.append(100.0, y=THETA)
+        assert cycle(trader, state, tracker) == "no_data"
+        assert trader.blocked is None and trader.session is None
+        tape.threshold = (THETA, 20)
+        tape.append(100.1, y=THETA)
+        assert cycle(trader, state, tracker) == "bought"
 
     def test_its_rules_are_checked(self):
         for bad in (dict(ff_entry_quantile=1.0), dict(ff_stop_k=-0.5), dict(ff_hold_minutes=0)):

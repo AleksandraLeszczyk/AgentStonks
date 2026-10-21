@@ -71,6 +71,7 @@ from .config import (
     APPLE_TRADER_GM_EXIT,
     APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
     APPLE_TRADER_GM_STOP_K,
+    APPLE_TRADER_GM_STOP_K_BY_TICKER,
     APPLE_TRADER_GM_TAKE_K,
     APPLE_TRADER_GM_TAKE_MIN_K,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
@@ -232,6 +233,15 @@ def stop_for(ticker: str, model_key: "str | None" = None, use_base: bool = True)
             return stop
     tuned = _tuned(APPLE_TRADER_TUNED_STOP, model_key, symbol)
     return APPLE_TRADER_STOP_GAIN_FRACTION if tuned is None else tuned
+
+
+def gm_stop_for(ticker: str) -> float:
+    """GoodMoments' stop, in ADRs under the fill, a run on this symbol starts
+    from: its notebook 4's pick (`config.APPLE_TRADER_GM_STOP_K_BY_TICKER`,
+    AMD's 0.5), else AAPL's 0.75. A pair's base configuration, when SimLab set
+    one, carries its own and is read before this (`default_config`)."""
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    return APPLE_TRADER_GM_STOP_K_BY_TICKER.get(symbol, APPLE_TRADER_GM_STOP_K)
 
 
 def min_win_for(
@@ -556,7 +566,9 @@ class AppleTraderConfig:
     # The take-profit over the fill and the stop under it, in ADRs (today's
     # 14-session mean log range). 0 switches either off.
     gm_take_k: float = APPLE_TRADER_GM_TAKE_K
-    gm_stop_k: float = APPLE_TRADER_GM_STOP_K
+    # None -> the ticker's own notebook pick (`gm_stop_for`: AMD's 0.5, else
+    # 0.75), filled in by `__post_init__`, so after construction it is a float.
+    gm_stop_k: Optional[float] = None
     # With a number here the take follows the intraday volatility curve:
     # `gm_take_k` at the session's most volatile minute, this at its quietest,
     # in proportion between, moved every bar (`gm_take_k_at`). None (the
@@ -757,6 +769,8 @@ class AppleTraderConfig:
                     f"gm_exit {self.gm_exit!r} must sit below the entry gm_enter "
                     f"{self.gm_enter!r}, or every buy would be sold on the next bar"
                 )
+        if self.gm_stop_k is None:
+            self.gm_stop_k = gm_stop_for(self.ticker)
         for name in ("gm_take_k", "gm_stop_k"):
             setattr(self, name, float(getattr(self, name)))
             if getattr(self, name) < 0:
@@ -3767,30 +3781,32 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
 
     The model answers one question at the close of every bar from 09:31 to
     15:30 -- what will the average 1-minute momentum be over the next 30
-    minutes? -- and notebook 06's rules act on the answer directly:
+    minutes? -- and the notebook's rules act on the answer directly (the
+    amended re-run's for AAPL's amended model, see `config`):
 
     * **enter** when the forecast `y_hat` is at or above the threshold: the
-      `ff_entry_quantile` (0.95) of |y_hat| over every minute of the previous
+      `ff_entry_quantile` (0.90) of |y_hat| over every minute of the previous
       20 sessions. A threshold rather than a number because the model's output
       is shrunk toward zero and only its rank carries information, so "the top
-      5% of what it has been saying" is the claim;
-    * **stop**: `ff_stop_k` (1.5) x the forecast 2-hour drop from the signal
+      10% of what it has been saying" is the claim;
+    * **stop**: `ff_stop_k` (2.0) x the forecast 2-hour drop from the signal
       bar's price (`down_hat` x `s120`), hung under the fill. After a stop the
       next buy waits for the forecast to leave the buy zone first, so a stop is
       not undone by buying the next minute;
     * **out** `ff_hold_minutes` (30) after the last buy signal -- a fresh one
-      restarts the clock -- at once on a sell signal (a forecast at or under
-      minus the threshold, `ff_exit_on_sell_signal`), at the flatten at the
-      latest.
+      restarts the clock -- at the flatten at the latest; with
+      `ff_exit_on_sell_signal` (off: the amended rules are long only) also at
+      once on a sell signal (a forecast at or under minus the threshold).
 
     In that order on every bar, as the notebook's `trading._session` does: the
     stop against the bar, then the bar's own signal.
 
     Against the notebook
     --------------------
-    * **Long only.** The notebook's chosen rules trade both sides; this ledger
-      holds longs, so a sell signal closes rather than reverses. Its long
-      trades are these trades exactly, on the same forecasts and fills.
+    * **Long only.** The amended rules are long only, as this ledger is. The
+      original recipe's traded both sides; there a sell signal closes rather
+      than reverses (`ff_exit_on_sell_signal` on), so its long trades are
+      these trades exactly, on the same forecasts and fills.
     * **The threshold** reads the saved model's own forecasts of the previous
       20 sessions. The notebook's test month read the walk-forward models'
       for the sessions before it; for every session from 2 October 2026 on the
@@ -4008,6 +4024,16 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
                     f"only {sessions} earlier sessions have forecasts; the entry threshold "
                     f"needs at least {module.THRESHOLD_MIN_SESSIONS}"
                 )
+        except module.InputsPending as exc:
+            # The option table or the analyst notes the forecast reads: asked
+            # for again on a later bar (the option build itself waits 5 min).
+            note = str(exc)
+            if note != self._forecast_note:
+                self._forecast_note = note
+                _log(state, {"type": "error", "text": (
+                    f"No Fast&Furious threshold for {self.ticker} yet, trying again: {note}"
+                )})
+            return False
         except Exception as exc:  # noqa: BLE001 -- fatal for the session, not the run
             self.blocked = {"date": today, "reason": str(exc)}
             _log(state, {"type": "error", "text": (
@@ -4259,7 +4285,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
     * **enter** at market when the edge is at least `gm_enter` (0.02), up to the
       15:30 bar and never within 15 bars of a stop;
     * **take** `gm_take_k` (0.2) ADR over the fill -- the question's own target
-      -- and **stop** `gm_stop_k` (0.75) ADR under it, both resting from the
+      -- and **stop** `gm_stop_k` (0.75; AMD's 0.5) ADR under it, both resting from the
       fill on and checked against every bar after it (a bar touching both is a
       stop). With `gm_take_min_k` set the take follows the time of day's
       volatility instead (IntradayVolatility's fitted curve): `gm_take_k` at

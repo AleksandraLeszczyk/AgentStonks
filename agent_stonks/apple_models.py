@@ -33,7 +33,7 @@ them:
                      close of every minute from 09:31 to 15:30, with a forecast
                      of the next two hours' high and low beside it. It drives
                      its own rule set (`STRATEGY_MOMENTUM`): buy when the
-                     forecast is in the top 5% of the last 20 sessions', a
+                     forecast is in the top 10% of the last 20 sessions', a
                      stop under the forecast low, out 30 minutes after the
                      last signal. Its bundle carries `kind="fastfurious"` and
                      the forecasts come from `fastfurious_model`.
@@ -150,19 +150,24 @@ HIGHLOW_TICKERS = (
 HIGHLOW2_TICKERS = (DEFAULT_TICKER,)
 
 # Which symbols Fast&Furious has saved a bundle for (`fastfurious_<TICKER>.*`):
-# AAPL (fitted through 2026-09-04, saved 2026-10-12). GOOGL, MSFT, AMZN, META
-# and NVDA were processed as a training pool and made the model worse, so none
-# has a model. Adding one is this tuple plus its two files in `Code/Models`,
-# and -- since the stop's range model reads the option tables -- the ticker's
-# entry in `option_positioning.NOTEBOOK_OPTIONS`.
+# AAPL (fitted through 2026-09-04; the app reads the amended re-run,
+# `fastfurious_AAPL_amended`, saved 2026-10-21 -- `fastfurious_model.BUNDLE_NAMES`).
+# GOOGL, MSFT, AMZN, META were processed as a training pool and made the model
+# worse; NVDA has a bundle (2026-10-14) that is not wired up. Adding one is
+# this tuple plus its two files in `Code/Models`, and -- since the option
+# tables are read -- the ticker's entry in `option_positioning.NOTEBOOK_OPTIONS`.
 FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
 
 # Which symbols GoodMoments has saved a bundle for (`goodmoments_<TICKER>.*`,
 # plus the `_timevol` twin its rules read the edge against): AAPL (fitted
 # through 2026-10-16, saved 2026-10-19; the twin written 2026-10-20 by
-# `GoodMoments/scripts/export_timevol.py`). The notebook is AAPL-only. Adding
-# one is this tuple plus its four files in `Code/Models`.
-GOODMOMENTS_TICKERS = (DEFAULT_TICKER,)
+# `GoodMoments/scripts/export_timevol.py`) and AMD (same window and recipe,
+# saved 2026-10-21 with its twin; 23 features of its own choosing, nine of
+# them not AAPL's, and a 0.5 ADR stop -- `config.APPLE_TRADER_GM_STOP_K_BY_TICKER`).
+# Adding one is this tuple plus its four files in `Code/Models` -- and a check
+# that every feature it reads is in `goodmoments_model.FEATURE_COLS`
+# (`_build_bundle` refuses one that is not).
+GOODMOMENTS_TICKERS = (DEFAULT_TICKER, "AMD")
 
 # HighLow2 + GoodMoments: wherever both are fitted.
 HIGHLOW2_GOODMOMENTS_TICKERS = tuple(t for t in GOODMOMENTS_TICKERS if t in HIGHLOW2_TICKERS)
@@ -437,24 +442,28 @@ MODELS: "dict[str, AppleModel]" = {
         summary=(
             "FinNotebooks' Fast&Furious forecast of the average momentum of the next 30 "
             "minutes, made at the close of every minute from 09:31 to 15:30 -- not a range "
-            "made once in the morning. It reads only today's session as a live trader on a "
-            "basic plan sees it (SIP to 15 minutes ago, IEX since): the return since the "
-            "open, the gap, the distance to the session's high, low and VWAP, the opening "
-            "range, realised volatility and volume against their norms, the signed-volume "
-            "share, the time of day and this minute's recent history. LightGBM, Huber loss, "
-            "three seeds; a second LightGBM pair forecasts the next two hours' high and low "
-            "(with last night's option walls and implied move) for the stop. Its ranking "
-            "edge is small -- a rank correlation of 0.03 with the next half hour on 2025 and "
-            "on 2026, and -0.03 on its 24-session test month. It drives its own rules: buy "
-            "when the forecast is in the top 5% of the last 20 sessions', a stop 1.5 × the "
-            "forecast 2-hour drop under the fill, out 30 minutes after the last signal or "
-            "at once on a sell signal. The notebook's verdict on those rules: out of sample "
-            "no edge that luck does not also produce."
+            "made once in the morning. AAPL runs the amended re-run of its feature selection "
+            "(since 21 Oct 2026): last night's option table measured from the live price "
+            "(call and put walls, dealer gamma there and at the close, the 1-day and 30-day "
+            "implied vol, the put/call volume), the analysts' consensus target and the days "
+            "since the last up- or downgrade, and today's session as a live trader on a "
+            "basic plan sees it (SIP to 15 minutes ago, IEX since): the gap, the opening "
+            "range, realised volatility and volume against their norms, the time of day and "
+            "this minute's recent history. LightGBM, Huber loss, three seeds; a second "
+            "LightGBM pair forecasts the next two hours' high and low for the stop. Its "
+            "ranking edge is small and did not hold -- a rank correlation of 0.047 with the "
+            "next half hour on April-December 2025, where its features were chosen, -0.002 "
+            "on 2026 and +0.02 on its 24-session test month. It drives its own rules: buy "
+            "when the forecast is in the top 10% of the last 20 sessions', a stop 2 × the "
+            "forecast 2-hour drop under the fill, out 30 minutes after the last signal. The "
+            "notebook's verdict on the re-run: it rescues nothing -- on 2026 it beat fewer "
+            "than half of its placebos, and holding AAPL made more."
         ),
         requires=(
             "LightGBM, SciPy and joblib, Alpaca credentials for ~200 days of SIP and IEX "
-            "minute bars and today's live ones, and (for the stop) last night's option "
-            "tables: the contract list, ~4 months of daily option bars and Yahoo's ^IRX"
+            "minute bars and today's live ones, last night's option tables (the contract "
+            "list, ~4 months of daily option bars and Yahoo's ^IRX), and Yahoo's analyst "
+            "notes (yfinance)"
         ),
         strategy=STRATEGY_MOMENTUM,
         tickers=FASTFURIOUS_TICKERS,
@@ -479,7 +488,12 @@ MODELS: "dict[str, AppleModel]" = {
             "stop -0.75 ADR, otherwise hold to the close (notebook 4's design 2; its first "
             "design, on the probability itself, lost out of sample). The notebook's verdict on "
             "those rules: +$496 on 199 test sessions at $10,000 a trade, inside the placebo "
-            "spread and below holding AAPL -- no edge that luck does not also produce."
+            "spread and below holding AAPL -- no edge that luck does not also produce. AMD's "
+            "model picks its own 23 features (adding the call wall, the hour's momentum and "
+            "signed flow, the session's relative volume and the volatility regime) and ranks "
+            "at an AUC of 0.712 -- 0.710 on time and volatility alone, so it adds next to "
+            "nothing to them; its rules are AAPL's with a 0.5 ADR stop, +$1,342 on the same "
+            "199 sessions (beating 56% of placebos), against +$6,465 for holding AMD."
         ),
         requires=(
             "LightGBM, SciPy and joblib, the saved model and its time-and-volatility twin, "

@@ -341,6 +341,20 @@ class TestKeptApart:
             with pytest.raises(ValueError):
                 gm_config(**bad)
 
+    def test_each_ticker_starts_from_its_notebooks_stop(self, monkeypatch):
+        """AMD's notebook 4 picked a 0.5 ADR stop, AAPL's 0.75; a stored or
+        typed stop is kept whatever the ticker."""
+        monkeypatch.setattr(at.base_configs, "stored", lambda *a, **k: None)
+        amd = at.default_config("AMD", apple_models.GOODMOMENTS_KEY)
+        assert amd.gm_stop_k == 0.5 and amd.gm_enter == 0.02 and amd.gm_take_k == 0.2
+        assert at.default_config("AAPL", apple_models.GOODMOMENTS_KEY).gm_stop_k == 0.75
+        assert AppleTraderConfig(model_key=apple_models.GOODMOMENTS_KEY, ticker="AMD", gm_stop_k=0.75).gm_stop_k == 0.75
+        assert "stop=0.5A" in config_signature(amd)
+
+    def test_amd_is_offered(self):
+        assert apple_models.GOODMOMENTS_KEY in apple_models.keys_for("AMD")
+        assert apple_models.HIGHLOW2_GOODMOMENTS_KEY not in apple_models.keys_for("AMD")
+
     def test_orchestra_neither_offers_nor_takes_it(self):
         assert not [p for p in orchestra.all_pairs() if p.endswith(":goodmoments")]
         with pytest.raises(ValueError, match="day-range"):

@@ -61,6 +61,11 @@ class ModelStore:
     ``"timetochange3_dayrange_{ticker}.joblib"``. It deliberately mirrors
     the name the notebook saves under -- the two stores agreeing is what makes
     a retrain visible to the app with no further step.
+
+    `names` maps a ticker to another file in the same folder, for a ticker
+    whose app model is a variant the notebook saved under its own name beside
+    the canonical one (which the notebook goes on reading as its baseline, so
+    copying the variant over it is not an option).
     """
 
     def __init__(
@@ -71,9 +76,11 @@ class ModelStore:
         *,
         model_dir: "Path | None" = None,
         default_ticker: str = DEFAULT_TICKER,
+        names: "dict[str, str] | None" = None,
     ) -> None:
         self.env_key = env_key
         self.filename = filename
+        self.names = {k.upper(): v for k, v in (names or {}).items()}
         self.default_ticker = default_ticker
         self.model_dir = model_dir or MODEL_DIR
         self._build = build
@@ -103,7 +110,8 @@ class ModelStore:
         override = os.environ.get(f"{self.env_key}_{symbol}")
         if not override and symbol == self.default_ticker:
             override = os.environ.get(self.env_key)
-        return Path(override or self.model_dir / self.filename.format(ticker=symbol))
+        name = self.names.get(symbol) or self.filename.format(ticker=symbol)
+        return Path(override or self.model_dir / name)
 
     def metadata_path(self, path: "Path | None" = None) -> Path:
         """The readable JSON sidecar the save step writes beside the model."""

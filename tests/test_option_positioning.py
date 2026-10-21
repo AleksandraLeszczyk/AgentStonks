@@ -225,6 +225,25 @@ class TestSessionCloses:
 # --- the option tables --------------------------------------------------------------
 
 class TestOptionTables:
+    def test_a_window_with_no_bars_leaves_the_rest_typed(self, chain, monkeypatch):
+        """A job Alpaca answers with no bars is an empty frame typed object; in
+        pandas 3 it would make the whole fetch object, and the tables built off
+        it fail (GoodMoments' AMD row for 2026-10-20)."""
+        asks = []
+
+        def download(symbols, start, end, key, secret):
+            asks.append(start)
+            if len(asks) == 1:
+                return pd.DataFrame(columns=P._BAR_COLUMNS)
+            return chain.download_bars(symbols, start, end, key, secret)
+
+        monkeypatch.setattr(P, "_download_option_bars", download)
+        through = pd.Timestamp("2026-09-17")
+        _, bars = P.option_history("SYN", through, through + pd.Timedelta(120, "D"),
+                                   chain.closes[chain.closes.index <= through], through)
+        assert len(asks) > 1 and len(bars)
+        assert bars["volume"].dtype.kind in "iu" and bars["close"].dtype.kind == "f"
+
     def test_a_close_still_trading_is_refused(self, chain, monkeypatch):
         monkeypatch.setattr(P, "_today_et", lambda: date(2026, 9, 18))
         with pytest.raises(ValueError, match="not final"):

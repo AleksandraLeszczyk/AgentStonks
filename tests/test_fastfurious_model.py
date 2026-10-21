@@ -188,18 +188,43 @@ class TestHistoryCache:
         assert window["sip"]["close"].iloc[0] == pytest.approx(50.0)
 
 
+@lru_cache(maxsize=None)
+def _recipe(name: str) -> "dict | None":
+    """A saved recipe's bundle: "amended" (what AAPL runs) or "original"
+    (the notebook's own `fastfurious_AAPL`, which the app no longer reads)."""
+    if name == "amended":
+        return F.load_bundle("AAPL")
+    return F._build_bundle(F.model_store.MODEL_DIR / "fastfurious_AAPL.joblib")
+
+
 class TestBundle:
+    def test_aapl_runs_the_amended_rerun_by_name(self, monkeypatch):
+        monkeypatch.delenv("APPLE_FASTFURIOUS_MODEL", raising=False)
+        monkeypatch.delenv("APPLE_FASTFURIOUS_MODEL_AAPL", raising=False)
+        assert F.model_path("AAPL").name == "fastfurious_AAPL_amended.joblib"
+        assert F.model_path("NVDA").name == "fastfurious_NVDA.joblib"
+        monkeypatch.setenv("APPLE_FASTFURIOUS_MODEL_AAPL", "/elsewhere/ff.joblib")
+        assert str(F.model_path("AAPL")) == "/elsewhere/ff.joblib"
+
     def test_the_shipped_bundle_reads_only_mirrored_columns(self):
-        bundle = F.load_bundle("AAPL")
+        bundle = _recipe("amended")
         if bundle is None:
             pytest.skip("no Fast&Furious bundle on this machine")
         model = bundle["model"]
         assert bundle["kind"] == "fastfurious"
-        assert set(model.momentum.cols) <= set(F.FEATURE_COLS)
+        assert set(model.momentum.cols) <= set(F.FEATURE_COLS) | F.ANALYST_COLS
         assert set(model.range.cols) <= set(F.FEATURE_COLS)
-        assert bundle["reads_options"]
-        assert model.momentum.cols == F.MOMENTUM_COLS
+        assert bundle["reads_options"] and bundle["momentum_reads_options"] and bundle["reads_analysts"]
+        assert model.momentum.cols == F.AMENDED_MOMENTUM_COLS
         assert model.range.cols == F.RANGE_COLS
+
+    def test_the_original_recipe_still_loads(self):
+        bundle = _recipe("original")
+        if bundle is None:
+            pytest.skip("no original Fast&Furious bundle on this machine")
+        assert bundle["model"].momentum.cols == F.MOMENTUM_COLS
+        assert bundle["reads_options"]
+        assert not bundle["momentum_reads_options"] and not bundle["reads_analysts"]
 
     def test_a_half_day_has_no_forecast(self):
         bundle = F.load_bundle("AAPL") or {"path": "x", "model": None}
@@ -207,11 +232,115 @@ class TestBundle:
             F.session_forecasts(bundle, "AAPL", "2026-11-27")
 
 
+class TestOptionCloses:
+    """Which nights' option rows a session asks for."""
+
+    def _day(self):
+        kept = pd.DatetimeIndex(pd.bdate_range("2026-06-01", "2026-07-31"))
+        report = pd.DataFrame({"kept": True}, index=kept)
+        report.loc[pd.Timestamp("2026-07-15"), "kept"] = False  # a short session: a close, not kept
+        daily = pd.DataFrame(index=kept)
+        hist = F.Tapes(sip=None, iex=None, daily=daily, report=report)
+        return F._Day(day=pd.Timestamp("2026-08-03"), history=hist, daily=daily, prev_close=kept[-1])
+
+    def test_a_range_only_reader_asks_for_last_night_only(self):
+        ctx_day = self._day()
+        assert F._positioning_closes({"momentum_reads_options": False}, ctx_day) == [ctx_day.prev_close]
+
+    def test_a_momentum_reader_asks_for_the_night_before_each_threshold_session(self):
+        ctx_day = self._day()
+        closes = F._positioning_closes({"momentum_reads_options": True}, ctx_day)
+        kept = ctx_day.history.kept
+        first = kept[-F.THRESHOLD_SESSIONS]
+        assert closes[0] == ctx_day.daily.index[ctx_day.daily.index < first][-1]
+        assert closes[-1] == ctx_day.prev_close
+        assert pd.Timestamp("2026-07-15") in closes  # every close, the dropped sessions' too
+
+    def test_a_momentum_reader_without_the_table_waits(self, monkeypatch):
+        ctx_day = self._day()
+
+        def failed(bundle, ctx, symbol, key, secret):
+            ctx.positioning_problem = "Alpaca is down"
+
+        monkeypatch.setattr(F, "_positioning", failed)
+        with pytest.raises(F.InputsPending, match="Alpaca is down"):
+            F._momentum_options({"momentum_reads_options": True}, ctx_day, "AAPL", None, None)
+        # The original recipe forecasts without it (only its stop needs it).
+        F._momentum_options({"reads_options": True, "momentum_reads_options": False}, ctx_day, "AAPL", None, None)
+
+
+class TestAnalysts:
+    RAW = pd.DataFrame(
+        {"Firm": ["A", "B", "A", "C"], "ToGrade": ["Buy", "Hold", "Buy", "Sell"],
+         "FromGrade": ["Hold", "Buy", "Buy", "Hold"], "Action": ["up", "down", "main", "down"],
+         "priceTargetAction": ["Raises", "Lowers", "Raises", "Lowers"],
+         "currentPriceTarget": [300.0, 250.0, 320.0, 0.0], "priorPriceTarget": [280.0, 260.0, 300.0, 0.0]},
+        # Yahoo's stamps: naive UTC, in seconds since 2026.
+        index=pd.DatetimeIndex(["2026-07-01 12:00:00", "2026-07-10 13:00:00", "2026-07-15 14:00:00",
+                                "2026-07-21 14:00:00"], name="GradeDate").as_unit("s"),
+    )
+
+    def test_cleaning_stamps_in_ns_new_york_time(self):
+        a = F.clean_analysts(self.RAW)
+        assert a.index.unit == "ns" and str(a.index.tz) == TZ
+        assert a.index[0] == pd.Timestamp("2026-07-01 08:00", tz=TZ)
+        assert a["target_chg"].iloc[0] == pytest.approx(300 / 280 - 1)
+
+    def test_days_since_a_change_and_the_consensus_read_only_notes_before(self):
+        a = F.clean_analysts(self.RAW)
+        days = pd.DatetimeIndex(["2026-07-21"]).as_unit("ns")
+        T = F.origin_times(days)
+        f = F.analyst_group(a, days, T, np.full((1, F.M), 300.0))
+        # C's downgrade is stamped 10:00:00: the forecast made at 10:00 (t=29)
+        # counts only notes stamped strictly before it, the one at 10:01 sees it.
+        b_down = pd.Timestamp("2026-07-10 09:00", tz=TZ).value
+        assert f["an_days_chg"][0, 29] == pytest.approx((T[0, 29] - b_down) / 86_400e9)
+        assert f["an_days_chg"][0, 30] == pytest.approx(1 / 1440)
+        # The consensus at 09:30: A's latest 320 and B's 250 (C priced nothing), median 285.
+        assert f["an_target_dist"][0, 0] == pytest.approx(np.log(285 / 300))
+
+    def test_live_refreshes_hourly_and_a_replay_reads_a_later_copy(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(F, "HISTORY_DIR", tmp_path)
+        F.reset_caches()
+        calls = []
+
+        def download(symbol):
+            calls.append(symbol)
+            return self.RAW
+
+        monkeypatch.setattr(F, "_download_analysts", download)
+        close = pd.Timestamp("2026-07-21 16:00", tz=TZ)
+        F.analyst_actions("AAPL", close, live=False)
+        F.analyst_actions("AAPL", close, live=False)
+        F.analyst_actions("AAPL", close, live=True)
+        assert calls == ["AAPL"]
+        monkeypatch.setattr(F, "ANALYST_REFRESH_SEC", -1.0)  # an hour has passed
+        F.analyst_actions("AAPL", close, live=True)
+        assert calls == ["AAPL", "AAPL"]
+        F.reset_caches()
+
+    def test_a_failed_fetch_keeps_the_cached_copy_and_none_waits(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(F, "HISTORY_DIR", tmp_path)
+        F.reset_caches()
+
+        def down(symbol):
+            raise OSError("Yahoo is down")
+
+        monkeypatch.setattr(F, "_download_analysts", down)
+        with pytest.raises(F.InputsPending, match="Yahoo is down"):
+            F.analyst_actions("AAPL", pd.Timestamp("2026-07-21 16:00", tz=TZ), live=True)
+        self.RAW.to_parquet(tmp_path / "AAPL_analysts.parquet")
+        F.reset_caches()
+        assert len(F.analyst_actions("AAPL", pd.Timestamp("2026-07-21 16:00", tz=TZ), live=True)) == 4
+        F.reset_caches()
+
+
 # --- against the notebook ----------------------------------------------------------
 
 needs_notebook = pytest.mark.skipif(
-    not (NOTEBOOK / "panel_all.parquet").exists() or F.load_bundle("AAPL") is None,
-    reason="the Fast&Furious notebook data or bundle is not on this machine",
+    not (NOTEBOOK / "panel_all.parquet").exists() or _recipe("amended") is None
+    or _recipe("original") is None,
+    reason="the Fast&Furious notebook data or bundles are not on this machine",
 )
 
 
@@ -234,19 +363,24 @@ def _slice(first, before) -> "dict[str, pd.DataFrame]":
 
 @pytest.fixture
 def notebook_tapes(monkeypatch):
-    """The module reading the notebook's raw minute files and option table
-    instead of Alpaca, with today after the notebook's last session."""
+    """The module reading the notebook's raw minute files, option table, gamma
+    profile and analyst notes instead of Alpaca and Yahoo, with today after
+    the notebook's last session."""
     monkeypatch.setattr(F, "raw_history", lambda symbol, first, before, key=None, secret=None: _slice(first, before))
     positioning = pd.read_parquet(NOTEBOOK / "options/positioning.parquet")
     positioning.index = pd.DatetimeIndex(positioning.index, name="date").as_unit("ns")
+    profile = pd.read_parquet(NOTEBOOK / "options/gex_profile.parquet")
 
-    def options(ctx_day, symbol, key, secret):
+    def options(bundle, ctx_day, symbol, key, secret):
         ctx_day.positioning = positioning[positioning.index <= ctx_day.prev_close]
+        ctx_day.profile = profile[profile["date"] <= ctx_day.prev_close]
 
     monkeypatch.setattr(F, "_positioning", options)
+    actions = F.clean_analysts(pd.read_parquet(NOTEBOOK / "analysts_raw.parquet"))
+    monkeypatch.setattr(F, "analyst_actions", lambda symbol, as_of, live: actions)
     monkeypatch.setattr(F, "_today_et", lambda: date(2026, 10, 13))
     F.reset_caches()
-    yield
+    yield actions
     F.reset_caches()
 
 
@@ -264,34 +398,41 @@ SESSIONS = ["2025-03-03", "2025-07-07", "2025-12-01", "2026-03-02", "2026-09-08"
 @needs_notebook
 class TestAgainstTheNotebook:
     @pytest.mark.parametrize("day", SESSIONS)
-    def test_every_feature_and_forecast_is_the_notebooks(self, notebook_tapes, day):
-        bundle = F.load_bundle("AAPL")
+    def test_every_feature_is_the_notebooks(self, notebook_tapes, day):
+        bundle = _recipe("amended")
         stamp = F._normal_day(day)
         ctx_day = F._session_day(bundle, "AAPL", stamp, None, None)
         today = _slice(stamp, stamp + pd.Timedelta(days=1))
-        F._positioning(ctx_day, "AAPL", None, None)
+        F._positioning(bundle, ctx_day, "AAPL", None, None)
         gs, gi, ds, ctx = F._panel_inputs(
             ctx_day.history, ctx_day.daily, F.clean(today["sip"]), F.clean(today["iex"]), stamp
         )
         row = slice(len(gs.days) - 1, len(gs.days))
         feats = F.features(F._grid_rows(gs, row), F._grid_rows(gi, row), ds.iloc[row],
-                           F._rows(ctx, row), ctx_day.positioning)
+                           F._rows(ctx, row), ctx_day.positioning, profile=ctx_day.profile,
+                           actions=notebook_tapes)
         mine = F._frame(feats, 0, np.arange(F.LAST_ORIGIN + 1)).dropna(subset=["p", "s30", "d_ma28"])
         ref = _panel()[_panel()["date"] == stamp].set_index("minute", drop=False)
         assert list(mine.index) == list(ref.index)
-        for col in F.FEATURE_COLS:
+        for col in F.FEATURE_COLS + sorted(F.ANALYST_COLS):
             np.testing.assert_array_equal(mine[col].to_numpy(float), ref[col].to_numpy(float), err_msg=col)
         np.testing.assert_allclose(mine["s30"], ref["s30"], rtol=1e-14, atol=0)
 
+    @pytest.mark.parametrize("recipe", ["amended", "original"])
+    @pytest.mark.parametrize("day", SESSIONS)
+    def test_every_forecast_is_the_notebooks(self, notebook_tapes, recipe, day):
+        bundle = _recipe(recipe)
+        ref = _panel()[_panel()["date"] == F._normal_day(day)].set_index("minute", drop=False)
         forecast = F.session_forecasts(bundle, "AAPL", day)
         expected = F._predict(bundle, ref, True)
         np.testing.assert_array_equal(forecast["y_hat"].to_numpy(), expected["y_hat"].to_numpy())
         np.testing.assert_array_equal(forecast["down_hat"].to_numpy(), expected["down_hat"].to_numpy())
 
-    def test_a_minute_forecast_live_is_the_replays(self, notebook_tapes, monkeypatch):
+    @pytest.mark.parametrize("recipe", ["amended", "original"])
+    def test_a_minute_forecast_live_is_the_replays(self, notebook_tapes, monkeypatch, recipe):
         """The same session forecast whole and forecast at cut-off minutes from
         tapes cut at SIP t-15 and IEX t -- the 15-minute seam included."""
-        bundle = F.load_bundle("AAPL")
+        bundle = _recipe(recipe)
         day = "2026-10-08"
         whole = F.session_forecasts(bundle, "AAPL", day)
 
@@ -310,10 +451,29 @@ class TestAgainstTheNotebook:
                 whole.loc[whole.index <= t, ["y_hat", "down_hat", "up_hat"]].to_numpy(),
             )
 
+    def test_the_amended_threshold_is_the_notebooks_rule(self, notebook_tapes):
+        """`evaluate_amended.py`'s threshold on 9 Oct 2026: the q-quantile of
+        |y_hat| over the 20 sessions before it (11 Sep - 8 Oct, all in the test
+        window, where the notebook read the saved model's own forecasts),
+        here with each session's own option rows and analyst notes."""
+        bundle = _recipe("amended")
+        days = np.sort(_panel()["date"].unique())
+        i = list(days).index(np.datetime64("2026-10-09"))
+        rows = _panel()[_panel()["date"].isin(days[i - 20:i])]
+        reference = np.abs(bundle["model"].momentum.predict(rows))
+        for q in (0.9, 0.95):
+            theta, sessions = F.threshold(bundle, "AAPL", "2026-10-09", q)
+            assert sessions == 20
+            assert theta == np.quantile(reference, q)
+        assert F.threshold(bundle, "AAPL", "2026-10-09", 0.9)[0] == pytest.approx(0.034119, abs=5e-7)
+        reading = F.forecast_at(bundle, "AAPL", "2026-10-09", 359, 0.9)
+        assert reading["y_hat"] == pytest.approx(-0.045383, abs=5e-7)
+        assert reading["signal"] == -1 and reading["range_problem"] == ""
+
     def test_the_threshold_and_a_reading_are_notebook_6s(self, notebook_tapes):
-        """Notebook 06 section 6.8: 9 Oct 2026 at 15:30, -0.0148 bps a minute,
-        |y_hat| 0.0099 against a threshold of 0.0425."""
-        bundle = F.load_bundle("AAPL")
+        """Notebook 06 section 6.8, the original recipe: 9 Oct 2026 at 15:30,
+        -0.0148 bps a minute, |y_hat| 0.0099 against a threshold of 0.0425."""
+        bundle = _recipe("original")
         theta, sessions = F.threshold(bundle, "AAPL", "2026-10-09", 0.95)
         assert sessions == 20
         assert theta == pytest.approx(0.0425, abs=5e-5)
