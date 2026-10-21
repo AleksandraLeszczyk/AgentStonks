@@ -336,6 +336,10 @@ def _render_apple_rules() -> None:
                     _render_fastfurious_bundle(bundle)
                 elif bundle.get("kind") == "goodmoments":
                     _render_goodmoments_bundle(bundle)
+                    # A hybrid's levels model rides along under its key.
+                    if model.levels_of and bundle.get(model.levels_of):
+                        st.markdown(f"*{apple_models.get(model.levels_of).label}*")
+                        _render_dayrange_bundle(bundle[model.levels_of])
                 else:
                     _render_dayrange_bundle(bundle)
 
@@ -1851,8 +1855,29 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- The defaults are notebook 4's design 2, chosen on July–December 2025: +$496 on "
             "199 test sessions at $10,000 a trade, inside the placebo spread."
         ),
+        "hybrid_levels": (
+            "The second vote: from 09:35 a GoodMoments buy also needs the bar to close at or "
+            "under HighLow2's buy level, this far under its predicted high, moved through a "
+            "breach under the rule below. It only votes — every exit is GoodMoments'.\n\n"
+            "- In the signature as `buy<=H-0.6R` (plus `breach=…`, `keep_width`) after "
+            "GoodMoments' own tokens."
+        ),
     },
     help={
+        "hybrid_buy_k": (
+            "{model}'s buy distance on {ticker}, **{buy_k}** unless the hybrid has a base of "
+            "its own: a GoodMoments buy after 09:35 needs the close at or under it.\n\n"
+            "- A grid axis on the Tuning tab (`buy_k`), beside GoodMoments' entry."
+        ),
+        "model_highlow2_goodmoments": (
+            "GoodMoments' rules, with HighLow2 voting on every buy after the opening window: "
+            "09:30–09:34 the edge alone buys, from 09:35 the bar also has to close at or under "
+            "HighLow2's buy level. Every exit is GoodMoments'.\n\n"
+            "- Reads both models' inputs (see each one's note): GoodMoments' from Alpaca at "
+            "every minute, HighLow2's at 09:35 from the IEX opening and pre-market.\n"
+            "- With no base configuration of its own it starts from GoodMoments' pair (its "
+            "base, if set) and HighLow2's buy distance."
+        ),
         "model_fastfurious": (
             "Its own rules, not the day-range levels: a buy when the 30-minute momentum "
             "forecast is in the top 5% of the last 20 sessions', out 30 minutes after the "
@@ -3882,7 +3907,7 @@ def _render_tuning_form() -> None:
         sim_tuning.axes_for(
             base.model_key, [a for a in sim_tuning.AXES if a not in sim_tuning.LEGACY_AXES]
         ),
-        default=list(sim_tuning.DEFAULT_AXES[base.strategy]),
+        default=list(sim_tuning.default_axes(base.model_key)),
         max_selections=sim_tuning.MAX_AXES,
         # Per rule set (and window): each offers different parameters.
         format_func=sim_tuning.sweep_label,

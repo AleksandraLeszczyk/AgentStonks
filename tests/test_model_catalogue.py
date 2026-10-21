@@ -369,11 +369,13 @@ def test_specs_cover_every_registered_model_and_ticker():
     """One spec per (model, instrument) that exists, plus the transferring pack.
 
     `apple_models.MODELS` is the registry; a model added there without a
-    catalogue entry would silently vanish from the tab.
+    catalogue entry would silently vanish from the tab. A hybrid has no file
+    of its own and is described by its two models' cards.
     """
     expected = {
         (key, ticker)
         for key, model in apple_models.MODELS.items()
+        if model.levels_of is None
         for ticker in model.tickers
     } | {
         # Not a registry model -- it drives only the chart overlays -- but it is

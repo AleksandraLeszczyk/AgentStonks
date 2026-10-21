@@ -137,10 +137,18 @@ def params(
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
     defaults = default_config(ticker, model_key)
-    # The digest of the base the form opens on -- a combined model's own, or
-    # its forecast model's when it has none (`base_record`).
+    # The digest of the base the form opens on (`base_record`) -- for a hybrid
+    # with none of its own, its two models' (`default_config` opens it on
+    # theirs), so the size and the days off its signal model's base set are
+    # not overridden by whatever another model's form left in the same widgets.
     _, based_on = base_record(model_key, ticker)
-    copy = replace(copy, suffix=base_configs.key_suffix(based_on, ticker) if based_on else "")
+    suffix = base_configs.key_suffix(based_on, ticker) if based_on else ""
+    if not based_on and apple_models.levels_of(model_key) is not None:
+        suffix = "".join(
+            base_configs.key_suffix(part, ticker)
+            for part in (apple_models.signal_of(model_key), apple_models.levels_of(model_key))
+        )
+    copy = replace(copy, suffix=suffix)
     if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
         return momentum_params(defaults, model_key, ticker, copy)
     if apple_models.strategy(model_key) == apple_models.STRATEGY_PROBABILITY:
@@ -241,6 +249,10 @@ def probability_params(
             "buy would be sold on the next bar: the sale on a fading edge is off until it does."
         )
         gm_exit = None
+    levels = (
+        hybrid_levels_params(defaults, model_key, ticker, copy)
+        if apple_models.levels_of(model_key) is not None else {}
+    )
     skip_events = skip_param(defaults, copy)
     return replace(
         defaults,
@@ -254,7 +266,30 @@ def probability_params(
         gm_stop_k=float(stop_k),
         gm_confirm_bars=int(confirm_bars),
         skip_events=skip_events,
+        **levels,
     )
+
+
+def hybrid_levels_params(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
+) -> dict:
+    """A hybrid's second vote: the buy level its levels model would rest, which
+    a buy after the opening window has to close at or under -- its distance
+    under the predicted high and what a breach does to it. The unit, the kept
+    width and the containment come from the levels model's configuration
+    (`apple_trader.default_config`); the sell is 0, since nothing sells there."""
+    parent = apple_models.get(apple_models.levels_of(model_key)).label.replace(" model", "")
+    section(f"{parent} buy level", copy.sections.get("hybrid_levels"))
+    unit_label = UNIT_FORM_LABELS[defaults.level_unit]
+    buy_k = st.number_input(
+        f"Buy at or under (× {unit_label} below {parent}'s predicted high)",
+        min_value=0.05, max_value=3.0, value=float(defaults.buy_k), step=0.05, format="%.2f",
+        key=copy.key(f"buy_k_{model_key}_{ticker}"),
+        help=(copy.help.get("hybrid_buy_k") or "").format(
+            ticker=ticker, buy_k=f"{float(defaults.buy_k):g}", model=parent,
+        ) or None,
+    )
+    return {"buy_k": float(buy_k), "sell_k": 0.0, "breach_update": breach_param(defaults, copy)}
 
 
 def momentum_params(

@@ -2657,9 +2657,11 @@ class TestPredictedRangeUnit:
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
         # HighLow_5m has been run on AAPL and INTC, not GOOGL; HighLow2_5m (its
-        # INTC bundle removed 2026-10-20), Fast&Furious and GoodMoments on AAPL alone.
+        # INTC bundle removed 2026-10-20), Fast&Furious and GoodMoments on AAPL alone,
+        # and so their hybrid.
         assert apple_models.keys_for(TICKER) == [
             "dayrange", "highlow", "highlow2", "fastfurious", "goodmoments",
+            "highlow2_goodmoments",
         ]
         assert apple_models.keys_for("INTC") == ["dayrange", "highlow"]
         for symbol in (NON_AAPL,):

@@ -235,7 +235,8 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
             "(extended hours)"
         ),
         tickers=apple_models.HIGHLOW2_TICKERS,
-        models=(apple_models.HIGHLOW2_KEY,),
+        # The hybrid's buy level hangs off this forecast too.
+        models=(apple_models.HIGHLOW2_KEY, apple_models.HIGHLOW2_GOODMOMENTS_KEY),
     ),
     FASTFURIOUS_SIGNAL_KEY: ModelOverlay(
         key=FASTFURIOUS_SIGNAL_KEY,
@@ -287,7 +288,7 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
             "and IEX minute bars, the shared option cache and Yahoo's analyst targets"
         ),
         tickers=apple_models.GOODMOMENTS_TICKERS,
-        models=(apple_models.GOODMOMENTS_KEY,),
+        models=(apple_models.GOODMOMENTS_KEY, apple_models.HIGHLOW2_GOODMOMENTS_KEY),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -698,9 +699,12 @@ def compute(
     def range_items(key: str, forecast) -> "tuple[list[dict], str]":
         # Only the minutes the run spent on this overlay's model: a run switched
         # from one model to another mid-session drew each range for its part.
+        # And only rows with a forecast in them: a hybrid records its bars
+        # from 09:30, before its levels model has made one.
         own = [] if recorded is None else [
             row for row in recorded[0]
             if OVERLAYS[key].draws(row.get("model_key") or recorded[1].model_key)
+            and row.get("pred_high") is not None
         ]
         if own and OVERLAYS[key].draws(recorded[1].model_key):
             walked = own + _after_record(own, trader_history, session, recorded[1])
@@ -719,7 +723,15 @@ def compute(
             own = recorded is not None and apple_models.strategy(
                 getattr(recorded[1], "model_key", None)
             ) == rules
-            return _signal_trader_items(symbol, recorded if own else None, model_key)
+            parent = apple_models.levels_of(model_key)
+            walked = None
+            if parent is not None and not own:
+                # A hybrid with no run to read: its buy level as its
+                # configuration would walk it.
+                walked = _hybrid_buy_walk(
+                    symbol, session, highlow_forecast(parent), trader_config, model_key
+                )
+            return _signal_trader_items(symbol, recorded if own else None, model_key, walked)
         if recorded is not None:
             rows, config = recorded
             return _trader_levels_items(
@@ -812,9 +824,11 @@ def session_forecast(
     numbers themselves -- SimLab's Tuning tab draws one per session over daily
     candles. Returns `{"forecast", "made_at", "problem", "overlay"}`: the first
     three as `_day_range_forecast` returns them, `overlay` the key of the range
-    overlay that draws this model's forecast, for its label and colour.
+    overlay that draws this model's forecast, for its label and colour. A
+    hybrid's is its levels model's, which its buy level hangs off.
     """
     symbol = (ticker or "").upper()
+    model_key = apple_models.levels_of(model_key) or model_key
     overlay = _RANGE_OVERLAYS.get(model_key or "", DAY_RANGE_KEY)
     day, session, problem = _session_of(bars or [], session_date)
     if apple_models.strategy(model_key) != apple_models.STRATEGY_DAYRANGE:
@@ -1534,26 +1548,78 @@ _SIGNAL_OVERLAYS = {
 }
 
 
+def _hybrid_buy_walk(
+    symbol: str, session: pd.DataFrame, result: dict, config, model_key: str,
+) -> "list[dict] | str":
+    """A hybrid's buy level bar by bar (`session_levels` under its
+    configuration, off its levels model's forecast `result`), or why there is
+    none. The chart's configuration when it is this hybrid's on this symbol,
+    the pair's defaults otherwise."""
+    from .apple_trader import default_config, session_levels  # heavy-ish, and only here
+
+    if result["forecast"] is None:
+        return result["problem"]
+    if (
+        config is None
+        or (getattr(config, "ticker", "") or "").upper() != symbol
+        or getattr(config, "model_key", None) != model_key
+    ):
+        config = default_config(symbol, model_key)
+    return session_levels(config, result["forecast"], session, result["made_at"])
+
+
+def _hybrid_buy_items(model, rows: "list[dict] | str | None") -> "list[dict] | str":
+    """A hybrid's buy level as a path, from rows carrying `buy` (a run's
+    record, or `_hybrid_buy_walk`'s), or why there is none when `rows` is that
+    reason. [] for a model with no second vote, or rows with no level yet."""
+    if model.levels_of is None or rows is None:
+        return []
+    parent = OVERLAYS[_RANGE_OVERLAYS.get(model.levels_of, DAY_RANGE_KEY)].name
+    if isinstance(rows, str):
+        return f"no {parent} buy level — {rows}"
+    buys = [row.get("buy") for row in rows]
+    if not any(v is not None for v in buys):
+        return []
+    return [_path(
+        TRADER_LEVELS_KEY, f"{parent} buy level", [row["t"] for row in rows], buys,
+        MODEL_OVERLAY_COLORS[TRADER_LEVELS_KEY], dash="dash", step=True,
+        note=(
+            f"where a buy after {parent}'s opening window has to close at or under — the buy "
+            f"a {parent} run would rest under its predicted high"
+        ),
+    )]
+
+
 def _signal_trader_items(
     symbol: str, recorded: "tuple[list[dict], object] | None", model_key: str,
+    walked: "list[dict] | str | None" = None,
 ) -> "tuple[list[dict], str]":
     """`trader_levels` under a per-minute model (Fast&Furious, GoodMoments):
     the running agent's stop -- and GoodMoments' take -- while it holds a
     position. It rests no buy or sell; its entries are the signals its own
-    overlay draws."""
+    overlay draws.
+
+    A hybrid (`apple_models.levels_of`) also draws the buy level a buy after
+    its levels model's opening window has to close at or under: the run's own
+    from its record, else `walked` -- the walk under the chart's
+    configuration (`_hybrid_buy_walk`), or why there is none."""
     overlay = OVERLAYS[TRADER_LEVELS_KEY]
     model = apple_models.get(model_key)
+    gm_rules = model.strategy == apple_models.STRATEGY_PROBABILITY
+    vote = _hybrid_buy_items(model, recorded[0] if recorded is not None else walked)
     if recorded is None:
-        signals = OVERLAYS[_SIGNAL_OVERLAYS.get(model.key, FASTFURIOUS_SIGNAL_KEY)].name
-        drawn = "take and stop are" if model.key == apple_models.GOODMOMENTS_KEY else "stop is"
-        return [], (
+        if isinstance(vote, str):
+            return [], f"{overlay.label}: {vote}"
+        signals = OVERLAYS[_SIGNAL_OVERLAYS.get(model.signal_of or model.key, FASTFURIOUS_SIGNAL_KEY)].name
+        drawn = "take and stop are" if gm_rules else "stop is"
+        return vote, "" if vote else (
             f"{overlay.label}: {model.label.replace(' model', '')} rests no levels — its buys "
             f"are signals (the {signals} overlay); a running agent's {drawn} drawn here."
         )
     rows, config = recorded
     stamps = [row["t"] for row in rows]
-    items = []
-    if model.key == apple_models.GOODMOMENTS_KEY:
+    items = [] if isinstance(vote, str) else list(vote)
+    if gm_rules:
         takes = [row.get("take") for row in rows]
         if any(v is not None for v in takes):
             take_k = getattr(config, "gm_take_k", 0)
@@ -1610,7 +1676,9 @@ def _goodmoments_forecast(
 
     model_key = apple_models.GOODMOMENTS_KEY
     enter, exit_ = APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT
-    if config is not None and getattr(config, "model_key", None) == model_key:
+    named = getattr(config, "model_key", None) if config is not None else None
+    if named == model_key or (named and apple_models.signal_of(named) == model_key):
+        # A run on GoodMoments' rules, alone or in a hybrid: that run's own.
         enter, exit_ = float(config.gm_enter), config.gm_exit
     out = {"fc": None, "stamps": [], "enter": enter, "exit": exit_, "problem": ""}
     try:

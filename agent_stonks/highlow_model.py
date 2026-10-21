@@ -14,8 +14,9 @@ asked of a much larger dataset and anchored differently. FinNotebooks'
 mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
 on validation and the bundle records it: AAPL and AVGO ship 0.5 LightGBM + 0.5
 N-BEATS, INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS,
-BE 0.75 N-BEATS + 0.25 N-HiTS, NVDA 0.5 LightGBM + 0.5 N-HiTS, QCOM and ORCL
-0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, META and AMGN N-BEATS alone; every other
+BE 0.75 N-BEATS + 0.25 N-HiTS, NVDA 0.5 LightGBM + 0.5 N-HiTS, QCOM, ORCL and
+TMO 0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, AMD 0.5 LightGBM + 0.25 N-BEATS +
+0.25 N-HiTS, META and AMGN N-BEATS alone; every other
 candidate is in the bundle at weight 0 and is not loaded. On the 129-session
 test window AAPL scores 0.0050 mean absolute log error per extreme ($1.37)
 against TimeToChange3's 0.0077, INTC 0.0150 ($1.22) against 0.0216.
@@ -269,6 +270,8 @@ MIN_BARS_PER_SESSION = 385
 # peer's thinnest regular session (REGN printed a median 304 bars a session);
 # TMO (260, 571 of 933 sessions under 385 before the round-lot reform) and its
 # DHR, A and WAT likewise (WAT a median 230-270 bars a session before 2026).
+# AMD's peer AVGO keeps its 320 too: at 385 its 14-day ADR in 2023-24 moves
+# AMD's `theme_range` and the forecast with it (up to $0.18, 2024-05-31).
 NOTEBOOK_MIN_BARS: "dict[str, int]" = {
     "AVGO": 320, "AMGN": 310, "GILD": 370, "REGN": 130, "VRTX": 240,
     "TMO": 260, "DHR": 340, "A": 270, "WAT": 100,

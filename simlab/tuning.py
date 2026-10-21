@@ -383,12 +383,16 @@ MOMENTUM_AXES: "tuple[str, ...]" = (
 PROBABILITY_AXES: "tuple[str, ...]" = (
     "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "gm_confirm_bars", "position_pct",
 )
+# A hybrid on GoodMoments' rules (`apple_models.levels_of`) reads those, plus
+# the buy level its second vote is made at and how a breach moves it.
+HYBRID_LEVEL_AXES: "tuple[str, ...]" = ("buy_k", "breach_update")
 # What a new grid on each rule set starts from.
 DEFAULT_AXES = {
     STRATEGY_DAYRANGE: ("buy_k", "sell_k"),
     STRATEGY_MOMENTUM: ("ff_entry_quantile", "ff_stop_k"),
     STRATEGY_PROBABILITY: ("gm_enter", "gm_stop_k"),
 }
+HYBRID_DEFAULT_AXES = ("gm_enter", "buy_k")
 
 
 def axes_for(model_key: "str | None", names) -> "list[str]":
@@ -396,14 +400,23 @@ def axes_for(model_key: "str | None", names) -> "list[str]":
     if apple_models.strategy(model_key) == STRATEGY_MOMENTUM:
         return [n for n in names if n in MOMENTUM_AXES]
     if apple_models.strategy(model_key) == STRATEGY_PROBABILITY:
-        return [n for n in names if n in PROBABILITY_AXES]
+        hybrid = HYBRID_LEVEL_AXES if apple_models.levels_of(model_key) else ()
+        return [n for n in names if n in PROBABILITY_AXES or n in hybrid]
     return [n for n in names if not n.startswith(("ff_", "gm_"))]
+
+
+def default_axes(model_key: "str | None") -> "tuple[str, ...]":
+    """What a new grid on the named model starts from."""
+    if apple_models.levels_of(model_key):
+        return HYBRID_DEFAULT_AXES
+    return DEFAULT_AXES[apple_models.strategy(model_key)]
 
 
 def axes_family(model_key: "str | None") -> str:
     """What the axis pickers are keyed by: the axes on offer differ per rule
-    set."""
-    return apple_models.strategy(model_key)
+    set, and a hybrid's from its rule set's."""
+    family = apple_models.strategy(model_key)
+    return f"{family}+levels" if apple_models.levels_of(model_key) else family
 
 # Axes a stored grid may have but a new one is not offered: a field kept only
 # so old records replay.

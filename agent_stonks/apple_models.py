@@ -3,7 +3,8 @@
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
 named X" and never branch on which one they got. Today there are five saved
-models, the first three of which share a rule set:
+models, the first three of which share a rule set, and one hybrid of two of
+them:
 
 `dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
                      an opening ridge, forecasting where the *whole session's*
@@ -46,6 +47,14 @@ models, the first three of which share a rule set:
                      +0.2 ADR, a stop at -0.75 ADR, otherwise held to the
                      close. Its bundle carries `kind="goodmoments"` and the
                      forecasts come from `goodmoments_model`.
+`highlow2_goodmoments`
+                     A hybrid of the two (2026-10-21): GoodMoments' rules,
+                     the edge alone buying in the opening window, and from
+                     09:35 a buy also needing the bar's close at or under
+                     HighLow2's buy level (`AppleModel.levels_of`). Its
+                     bundle is GoodMoments' with HighLow2's under
+                     `HIGHLOW2_KEY`; `apple_trader.HighLow2GoodMomentsTrader`
+                     trades it.
 
 The persistence classifier, the N-BEATS persistence forecaster and the
 delta-momentum regressor used to sit beside them and have been removed, and so
@@ -117,14 +126,16 @@ DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
 # peers GILD, REGN and VRTX, sessions kept from 310 bars), and TMO (2026-10-20,
 # the same recipe, of which the blend kept only its life-science tools peers
 # DHR, A and WAT; sessions kept from 260 bars, the peers' with first bars as
-# late as 09:37); GOOGL is in the notebook's config but has not been run
-# through it.
+# late as 09:37), and AMD (2026-10-21, the same recipe: SPY, the previous
+# evening, the opening's shape, the volatility regime and its chip peers NVDA,
+# INTC and AVGO -- AVGO's history cleaned at AVGO's own 320 bars); GOOGL is
+# in the notebook's config but has not been run through it.
 # Adding one is this tuple plus its files in `Code/Models` -- and a check that
 # the bundle's shipped candidates read only the base features and the custom
 # groups `highlow_model` mirrors (`GROUP_COLS`; `_build_bundle` refuses
 # anything else).
 HIGHLOW_TICKERS = (
-    DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO",
+    DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO", "AMD",
 )
 
 # Which symbols HighLow2_5m is wired up for (`highlow2_5m_<TICKER>.*`): AAPL
@@ -152,6 +163,9 @@ FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
 # `GoodMoments/scripts/export_timevol.py`). The notebook is AAPL-only. Adding
 # one is this tuple plus its four files in `Code/Models`.
 GOODMOMENTS_TICKERS = (DEFAULT_TICKER,)
+
+# HighLow2 + GoodMoments: wherever both are fitted.
+HIGHLOW2_GOODMOMENTS_TICKERS = tuple(t for t in GOODMOMENTS_TICKERS if t in HIGHLOW2_TICKERS)
 
 
 @dataclass(frozen=True)
@@ -181,6 +195,15 @@ class AppleModel:
     # unavailable and the reader has to be told which one, so this overrides
     # `unavailable_reason`'s default sentence when it is set.
     unavailable: "Callable[[str], str] | None" = None
+    # For a hybrid of two models: `signal_of` is the model whose per-minute
+    # signal and exits it trades (its rule set is that model's), `levels_of`
+    # the day-range model whose buy level its entries also have to be under
+    # once that model's opening window has closed. A hybrid with no base
+    # configuration of its own starts from both (`apple_trader.default_config`),
+    # and its bundle is the signal model's with the levels model's under
+    # `levels_of`'s key. None for every model that is its own forecast.
+    signal_of: "str | None" = None
+    levels_of: "str | None" = None
 
     def covers(self, ticker: "str | None") -> bool:
         return (ticker or DEFAULT_TICKER).upper() in self.tickers
@@ -290,11 +313,34 @@ def _goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
     return goodmoments_model.unavailable_reason(ticker)
 
 
+def _load_highlow2_goodmoments(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """GoodMoments' bundle with HighLow2's beside it under `HIGHLOW2_KEY`, or
+    None when either cannot be assembled. GoodMoments' own keys are left as
+    they are -- its forecasts, caches and provenance read them -- so the
+    hybrid shares GoodMoments' memoised sessions."""
+    goodmoments = _load_goodmoments(ticker)
+    highlow2 = _load_highlow2(ticker)
+    if goodmoments is None or highlow2 is None:
+        return None
+    return {**goodmoments, HIGHLOW2_KEY: highlow2}
+
+
+def _highlow2_goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
+    """Which half of the hybrid is missing, in that model's own words."""
+    missing = [
+        unavailable_reason(key, ticker)
+        for key, load_part in ((GOODMOMENTS_KEY, _load_goodmoments), (HIGHLOW2_KEY, _load_highlow2))
+        if load_part(ticker) is None
+    ]
+    return " ".join(missing) or "Both halves loaded; try again."
+
+
 DAYRANGE_KEY = "dayrange"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 FASTFURIOUS_KEY = "fastfurious"
 GOODMOMENTS_KEY = "goodmoments"
+HIGHLOW2_GOODMOMENTS_KEY = "highlow2_goodmoments"
 
 MODELS: "dict[str, AppleModel]" = {
     DAYRANGE_KEY: AppleModel(
@@ -324,7 +370,7 @@ MODELS: "dict[str, AppleModel]" = {
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL and AVGO: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + "
             "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS; QCOM, "
-            "ORCL and TMO: LightGBM + N-BEATS + N-HiTS; META and AMGN: N-BEATS alone), fitted on "
+            "ORCL, TMO and AMD: LightGBM + N-BEATS + N-HiTS; META and AMGN: N-BEATS alone), fitted on "
             "every session since 2023 with its first five minutes (MU's and BE's read "
             "from IEX, the only tape there is at 9:35 on a basic plan; BE's also with "
             "VST's opening move, its lead AI-power peer; NVDA's with SPY's opening, the "
@@ -333,12 +379,13 @@ MODELS: "dict[str, AppleModel]" = {
             "SPY and its cloud peers MSFT, AMZN and GOOGL; AMGN's with SPY, the "
             "pre-market, the previous evening, the opening's trade counts and its "
             "biotech peers GILD, REGN and VRTX; TMO's with its life-science tools peers "
-            "DHR, A and WAT). On the "
+            "DHR, A and WAT; AMD's with SPY, the previous evening and its chip peers "
+            "NVDA, INTC and AVGO). On the "
             "129-session test window its error is 35% below "
             "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
             "INTC; MU, BE and AVGO have no TimeToChange3 bundle, and beat that approach "
             "retrained on them by 25%, 33% and 34%, QCOM, ORCL and META by 43%, 31% "
-            "and 29%, AMGN by 34%, TMO by 42%. "
+            "and 29%, AMGN by 34%, TMO by 42% (AMD's notebook ran no such comparison). "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -347,8 +394,9 @@ MODELS: "dict[str, AppleModel]" = {
             "PyTorch, LightGBM, scikit-learn and joblib, the weighted network "
             "checkpoints, and Alpaca credentials for ~150 sessions of SIP minute history "
             "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, on NVDA, "
-            "ORCL and AMGN SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, on "
-            "AMGN GILD, REGN and VRTX, on TMO DHR, A and WAT, and on NVDA, QCOM, ORCL, "
+            "ORCL, AMGN and AMD SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, on "
+            "AMGN GILD, REGN and VRTX, on TMO DHR, A and WAT, on AMD NVDA, INTC and "
+            "AVGO, and on NVDA, QCOM, ORCL, "
             "META and AMGN this "
             "morning's SIP pre-market)"
         ),
@@ -445,6 +493,34 @@ MODELS: "dict[str, AppleModel]" = {
         path=_goodmoments_path,
         unavailable=_goodmoments_unavailable,
     ),
+    HIGHLOW2_GOODMOMENTS_KEY: AppleModel(
+        key=HIGHLOW2_GOODMOMENTS_KEY,
+        label="HighLow2 + GoodMoments",
+        summary=(
+            "GoodMoments' rules with HighLow2 as a second vote on every buy after the opening "
+            "window. In the session's first five minutes -- the bars HighLow2's forecast is made "
+            "from, before it exists -- a buy is GoodMoments' alone: its edge over the "
+            "time-and-volatility model at the entry threshold. From the 09:35 bar on a buy needs "
+            "both: the edge, and the bar's close at or under the buy level HighLow2's day-range "
+            "rules would rest under its predicted high, moved with that forecast whenever the "
+            "session trades outside it. Every exit is GoodMoments': the take and the stop in "
+            "ADRs from the fill, the pause after a stop, the optional sale on a fading edge, the "
+            "closing flatten. Never measured as a pair: each model's own record is in its card."
+        ),
+        requires=(
+            "everything GoodMoments needs (LightGBM, SciPy, both its saved files, ~130 days of "
+            "Alpaca SIP and IEX minute bars, the option cache, Yahoo's analyst targets) and "
+            "everything HighLow2 needs (its bundle, ~150 sessions of SIP and IEX history with "
+            "extended hours)"
+        ),
+        strategy=STRATEGY_PROBABILITY,
+        tickers=HIGHLOW2_GOODMOMENTS_TICKERS,
+        load=_load_highlow2_goodmoments,
+        path=_goodmoments_path,
+        unavailable=_highlow2_goodmoments_unavailable,
+        signal_of=GOODMOMENTS_KEY,
+        levels_of=HIGHLOW2_KEY,
+    ),
 }
 
 DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else DAYRANGE_KEY
@@ -532,6 +608,19 @@ def unavailable_reason(key: "str | None", ticker: "str | None" = None) -> str:
 def strategy(key: "str | None") -> str:
     """Which rule set the named model drives."""
     return get(key).strategy
+
+
+def levels_of(key: "str | None") -> "str | None":
+    """The day-range model whose buy level the named hybrid's entries also
+    need (`AppleModel.levels_of`), or None for a model that is its own
+    forecast."""
+    return get(key).levels_of
+
+
+def signal_of(key: "str | None") -> "str | None":
+    """The model whose signal and exits the named hybrid trades
+    (`AppleModel.signal_of`), or None for a model that is its own forecast."""
+    return get(key).signal_of
 
 
 def keys_for_strategy(ticker: "str | None", rule_set: str) -> "list[str]":

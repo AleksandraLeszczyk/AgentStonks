@@ -185,24 +185,43 @@ TMO_FORECASTS = {
     "2026-09-21": (658.8603410108667, 646.4136942616676, 14.400178571428578),
     "2026-10-02": (663.7256226528925, 650.2052585223648, 15.90640000000002),
 }
+# AMD, saved 2026-10-21 on the same recipe (0.5 LightGBM + 0.25 N-BEATS +
+# 0.25 N-HiTS): SPY, the previous evening, the opening's shape, the regime and
+# `theme_range` on SIP peers NVDA (lead), INTC and AVGO. AVGO's history is
+# cleaned at its own 320 bars: at 385, 2024-05-31's low moves $0.18. 2024-07-05
+# reads the 2 Jul evening (3 Jul was a half day); 2025-11-05, 2026-02-04,
+# 2026-05-06 and 2026-08-05 are the mornings after results evenings.
+AMD_FORECASTS = {
+    "2023-07-10": (113.71276511359254, 110.71156154198533, 4.065099999999999),
+    "2024-05-31": (168.701743452214, 163.10653283633513, 6.309971428571428),
+    "2024-07-05": (171.1749645049293, 165.47932019356384, 5.67226428571429),
+    "2025-11-05": (252.00321535925457, 241.3490350396367, 9.455814285714286),
+    "2026-02-04": (218.58, 204.73771305169902, 11.48354285714285),
+    "2026-03-02": (198.94537839562062, 190.0, 8.193735714285708),
+    "2026-05-06": (436.8279134776712, 405.63, 16.42154285714286),
+    "2026-08-05": (507.8722416956448, 476.9460159712599, 33.90529285714286),
+    "2026-09-14": (491.83, 475.9110578175116, 16.0048857142857),
+    "2026-09-21": (597.2305497450348, 575.8652508515241, 17.738742857142828),
+    "2026-10-02": (645.1264286419882, 625.8618001952129, 21.23724285714283),
+}
 NOTEBOOK_FORECASTS = {
     "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS, "BE": BE_FORECASTS,
     "AVGO": AVGO_FORECASTS, "NVDA": NVDA_FORECASTS, "QCOM": QCOM_FORECASTS,
     "ORCL": ORCL_FORECASTS, "META": META_FORECASTS, "AMGN": AMGN_FORECASTS,
-    "TMO": TMO_FORECASTS,
+    "TMO": TMO_FORECASTS, "AMD": AMD_FORECASTS,
 }
 # The candidates each bundle ships with non-zero weight.
 SHIPPED = {
     "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
     "BE": ["nbeats", "nhits"], "AVGO": ["lgbm", "nbeats"], "NVDA": ["lgbm", "nhits"],
     "QCOM": ["lgbm", "nbeats", "nhits"], "ORCL": ["lgbm", "nbeats", "nhits"], "META": ["nbeats"],
-    "AMGN": ["nbeats"], "TMO": ["lgbm", "nbeats", "nhits"],
+    "AMGN": ["nbeats"], "TMO": ["lgbm", "nbeats", "nhits"], "AMD": ["lgbm", "nbeats", "nhits"],
 }
 # The tape each bundle reads the opening from.
 OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex", "AVGO": "sip", "NVDA": "sip",
-                 "QCOM": "sip", "ORCL": "sip", "META": "sip", "AMGN": "sip", "TMO": "sip"}
+                 "QCOM": "sip", "ORCL": "sip", "META": "sip", "AMGN": "sip", "TMO": "sip", "AMD": "sip"}
 # The last session of each notebook's tape the mirror test reads.
-NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO")}
+NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO", "AMD")}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -262,7 +281,8 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO"):
+        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO",
+                       "AMD"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
 
@@ -455,6 +475,16 @@ class TestThemePeers:
         high, low = 580.0539016862726, 573.1150669494203        # the notebook's
         miss = max(abs(out["pred_high"] - high), abs(out["pred_low"] - low))
         assert 1e-5 < miss < 0.01
+
+    def test_amds_peer_avgo_keeps_avgos_threshold(self):
+        """AMD itself is cleaned at 385 bars; its peer AVGO at AVGO's own 320."""
+        bundle = H.load_bundle("AMD")
+        if bundle is None:
+            pytest.skip("the HighLow AMD bundle is not installed")
+        assert H.min_bars(bundle) == 385 and H.max_first_minute(bundle) == 0
+        assert H.peers(bundle) == ("NVDA", "INTC", "AVGO") and H.peer_feed(bundle) == "sip"
+        assert [H.peer_kept(p)["min_bars"] for p in H.peers(bundle)] == [385, 385, 320]
+        assert H.groups(bundle) == ("market", "theme", "afterhours", "opening_shape", "regime")
 
     def test_amgn_keeps_its_notebooks_threshold(self):
         bundle = H.load_bundle("AMGN")

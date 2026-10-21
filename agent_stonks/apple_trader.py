@@ -196,9 +196,10 @@ def dayrange_levels(
     (`config.APPLE_TRADER_TUNED_LEVELS`, with how far each deserves trust).
     A pair never tuned falls back to the instrument's notebook-05 sweep
     (`config.APPLE_TRADER_DAYRANGE_LEVELS`), and a symbol never swept at all
-    to the notebook's specified pair. A combined model with no base or tuning
-    of its own reads its forecast model's at each step (`base_record`,
-    `_tuned`).
+    to the notebook's specified pair. A hybrid with no base of its own takes
+    its levels model's buy distance (`apple_models.levels_of`) and a sell of 0:
+    it rests no sell -- its exits are its signal model's -- and 0 sits under
+    every buy distance a form or a grid can reach.
     """
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
     if use_base:
@@ -206,6 +207,9 @@ def dayrange_levels(
         sell_k = _base_number(model_key, symbol, "sell_k")
         if buy_k is not None and sell_k is not None:
             return buy_k, sell_k
+    parent = apple_models.levels_of(model_key)
+    if parent is not None:
+        return dayrange_levels(symbol, parent, use_base)[0], 0.0
     tuned = _tuned(APPLE_TRADER_TUNED_LEVELS, model_key, symbol)
     if tuned is not None:
         return tuned
@@ -285,9 +289,9 @@ def shipped_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
 
 def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderConfig":
     """What a new run of this model on this symbol starts from: the pair's base
-    configuration (`base_record` -- for a combined model, its forecast model's
-    when it has none of its own) when one is stored, the shipped defaults
-    otherwise.
+    configuration (`base_record`) when one is stored, the shipped defaults
+    otherwise -- and for a hybrid with no base of its own, each half's
+    (`_hybrid_default`).
 
     A stored base today's config refuses -- a field since narrowed, a model
     since removed -- is logged and passed over rather than taking a form down.
@@ -295,6 +299,8 @@ def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
     model_key = str(model_key or APPLE_TRADER_MODEL)
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
     record, _ = base_record(model_key, symbol)
+    if record is None and apple_models.levels_of(model_key) is not None:
+        return _hybrid_default(symbol, model_key)
     if record is not None:
         known = {f.name for f in fields(AppleTraderConfig)}
         try:
@@ -304,6 +310,26 @@ def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
                 "The base configuration of %s/%s is refused: %s", model_key, symbol, exc
             )
     return AppleTraderConfig(ticker=symbol, model_key=model_key)
+
+
+# What a hybrid's buy level is made of, and so what it takes from its levels
+# model when it has no base of its own: the distance, its unit, and how a
+# breach moves the forecast it hangs off.
+_HYBRID_LEVEL_FIELDS = ("buy_k", "level_unit", "breach_update", "keep_width", "contain_range")
+
+
+def _hybrid_default(symbol: str, model_key: str) -> "AppleTraderConfig":
+    """A hybrid's starting point when it has no base of its own: its signal
+    model's configuration as that pair would start (thresholds, exits, size,
+    days off -- its base, if SimLab set one) with its levels model's buy level
+    in place, so "follow GoodMoments, and HighLow2 agrees" opens on the rules
+    each half is run on today. The sell is 0, as `dayrange_levels` says."""
+    signal = default_config(symbol, apple_models.signal_of(model_key))
+    levels = default_config(symbol, apple_models.levels_of(model_key))
+    return replace(
+        signal, model_key=model_key, sell_k=0.0,
+        **{name: getattr(levels, name) for name in _HYBRID_LEVEL_FIELDS},
+    )
 
 
 @dataclass
@@ -1148,7 +1174,9 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     curve signs as `take=0.4..0.1A@vol` -- at the most volatile minute, then at
     the quietest; one that does not keeps the form every record before it was
     filed under. The momentum confirmation signs as `confirm=3b`, only while
-    it is on."""
+    it is on. A hybrid adds the buy level its entries also need after the
+    opening window, in the day-range signature's tokens: `buy<=H-0.6R` and how
+    a breach moves it (`_hybrid_levels_signature`)."""
     exit_ = f"{c.gm_exit:+g}" if c.gm_exit is not None else "off"
     take = f"{c.gm_take_k:g}A" if c.gm_take_k else "off"
     if c.gm_take_k and c.gm_take_min_k is not None:
@@ -1156,10 +1184,27 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     stop = f"{c.gm_stop_k:g}A" if c.gm_stop_k else "off"
     confirm = f",confirm={c.gm_confirm_bars}b" if c.gm_confirm_bars else ""
     skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
+    levels = _hybrid_levels_signature(c) if apple_models.levels_of(c.model_key) else ""
     return (
         f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop}"
-        f"{confirm},size={c.position_pct:g}%{skip})"
+        f"{confirm}{levels},size={c.position_pct:g}%{skip})"
     )
+
+
+def _hybrid_levels_signature(c: AppleTraderConfig) -> str:
+    """A hybrid's buy level in signature form: its distance under the
+    predicted high and, each only while it can move the level, the breach
+    policy, the kept width and the containment -- the tokens the day-range
+    signature writes for them."""
+    unit = LEVEL_UNIT_TOKENS[c.level_unit]
+    out = f",buy<=H-{c.buy_k:g}{unit}"
+    if c.breach_update != BREACH_OFF:
+        out += f",breach={c.breach_update}"
+    if c.keep_width and c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+        out += ",keep_width"
+    if c.contain_range:
+        out += ",contain"
+    return out
 
 
 def _ff_rules(c: AppleTraderConfig) -> str:
@@ -4337,6 +4382,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             self._move_take(minute)
 
         self.forecast = self._forecast_for(bundle, state, today, minute)
+        self._after_forecast(bundle, state, frame, today, ts)
         self._record(state, ts, last)
         if not self.quiet_read:
             _log(state, {"type": "analysis", "text": self._read_summary(last, ts, position, minute, frame)})
@@ -4418,11 +4464,29 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             return sold
         if minute < int(self.session.get("cool_until") or 0):
             return sold
+        if self._refuse_on_levels(state, frame, ts, last, minute):
+            return sold
         if self._refuse_on_momentum(state, frame, ts):
             return sold
         if self.entry_refused(state, ts):
             return sold
         return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else sold
+
+    # --- what a hybrid adds (`HighLow2GoodMomentsTrader`) ---------------------
+
+    def _after_forecast(self, bundle: dict, state: AppState, frame, today, ts) -> None:
+        """What else a new bar is read for once its forecast is in, before it
+        is recorded. Nothing, on GoodMoments alone."""
+
+    def _refuse_on_levels(self, state: AppState, frame, ts, bar, minute: int) -> bool:
+        """Whether a second model refuses an entry the edge calls for. Never,
+        on GoodMoments alone."""
+        return False
+
+    def _entry_note(self, bar, minute: int) -> str:
+        """What a buy's reasoning says about a second model, as a sentence
+        ending in a space. Nothing, on GoodMoments alone."""
+        return ""
 
     # --- the momentum confirmation ------------------------------------------
 
@@ -4652,6 +4716,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             f"The model puts the chance of a {math.exp(_goodmoments().TARGET_ADR * adr) - 1:.2%} rise before the "
             f"close at {fc['p']:.1%}, against {fc['p_tv']:.1%} from the clock and today's volatility "
             f"alone: an edge of {fc['edge']:+.3f}, at or above the {self.config.gm_enter:+g} entry. "
+            f"{self._entry_note(bar, minute)}"
             f"Buying; {', '.join(exits + ['the closing flatten'])}."
         )
         bought = self.buy(state, tracker, float(bar["close"]), reasoning)
@@ -4708,17 +4773,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         """This bar's forecast and the position's take and stop, added to the
         session's record and published: what the chart draws while the run is
         live."""
-        fc = self.forecast or {}
-        row = {
-            "t": ts,
-            "model_key": self.config.model_key,
-            "price": float(bar["close"]),
-            "p": fc.get("p"),
-            "p_tv": fc.get("p_tv"),
-            "edge": fc.get("edge"),
-            "take": (self.entry or {}).get("take"),
-            "stop": (self.entry or {}).get("stop"),
-        }
+        row = self._row(ts, bar)
         history = self.session.setdefault("history", [])
         if history and history[-1]["t"] == row["t"]:
             history[-1] = row
@@ -4732,6 +4787,21 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             "memory": self.memory(),
             "seed": None,
         })
+
+    def _row(self, ts, bar) -> dict:
+        """One bar of the record: the forecast, and the open position's take
+        and stop."""
+        fc = self.forecast or {}
+        return {
+            "t": ts,
+            "model_key": self.config.model_key,
+            "price": float(bar["close"]),
+            "p": fc.get("p"),
+            "p_tv": fc.get("p_tv"),
+            "edge": fc.get("edge"),
+            "take": (self.entry or {}).get("take"),
+            "stop": (self.entry or {}).get("stop"),
+        }
 
     def _read_summary(self, bar, ts, position: float, minute: int, frame=None) -> str:
         price = float(bar["close"])
@@ -4764,6 +4834,231 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         return " · ".join(parts)
 
 
+# --- HighLow2 + GoodMoments --------------------------------------------------
+
+
+class HighLow2GoodMomentsTrader(GoodMomentsTrader):
+    """GoodMoments' rules, with HighLow2's buy level as a second vote.
+
+    The user's design (2026-10-21):
+
+    * **the opening window** (09:30-09:34, the bars HighLow2's forecast is made
+      from, before it exists): a buy is GoodMoments' alone -- the edge at the
+      entry, as `GoodMomentsTrader` buys;
+    * **from the 09:35 bar on**: a buy needs both -- the edge at the entry *and*
+      the bar's close at or under HighLow2's buy level, `H - buy_k x unit`
+      under its predicted high, the price a HighLow2 run would rest its buy
+      at. The close rather than the bar's low because the order here is sent
+      once the bar has closed, at the market, and HighLow2's own buy is a limit
+      at its level: a bar that dipped to the level and closed back above it
+      would not have filled HighLow2 either;
+    * **every exit is GoodMoments'**: the take and the stop in ADRs from the
+      fill (and the take's fall with the intraday volatility curve), the pause
+      after a stop, the optional sale on a fading edge and the momentum hold,
+      the flatten.
+
+    HighLow2's level is the one a HighLow2 run would rest, walked by the same
+    code: a `DayRangeTrader` whose plan is made from the same opening window by
+    `session_forecast`, moved through a breach under this configuration's
+    `breach_update`, `keep_width` and `contain_range` (`_move_range`). It only
+    votes. It rests nothing, and nothing of HighLow2's exit applies -- the sell
+    level, its stop, the momentum take, the breaker and the ladder are the
+    day-range rules', not HighLow2's model, and this trades GoodMoments'.
+
+    A session HighLow2 cannot forecast is traded on GoodMoments alone through
+    the opening window and buys nothing after it -- there is no second vote to
+    agree -- which is logged once; a position held then keeps its exits.
+    """
+
+    def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
+        super().__init__(
+            config or AppleTraderConfig(model_key=apple_models.HIGHLOW2_GOODMOMENTS_KEY)
+        )
+        # HighLow2's levels as a HighLow2 run would rest them, the plan set at
+        # the close of the opening window; None before it, or with no forecast.
+        self.levels: "DayRangeTrader | None" = None
+        # Why HighLow2 has no forecast today, once it is known.
+        self.levels_problem: "str | None" = None
+        self._levels_day = None
+        # How many bars the opening window is: read off HighLow2's bundle at
+        # the first bar, the 5 every HighLow2 bundle carries until then.
+        self.window_minutes = 5
+        # The bar the vote last refused a buy on, so a run of refusals is
+        # logged once.
+        self._levels_refused_at = None
+
+    # --- HighLow2's levels -------------------------------------------------
+
+    def _after_forecast(self, bundle: dict, state: AppState, frame, today, ts) -> None:
+        """Make HighLow2's forecast once its window has closed, and move its
+        levels with every bar after it."""
+        part = bundle.get(apple_models.HIGHLOW2_KEY)
+        self.window_minutes = _dayrange().opening_minutes(part)
+        if self._levels_day != today:
+            self.levels, self.levels_problem, self._levels_day = None, None, today
+        if self.levels is None:
+            if self.levels_problem is None and len(frame) >= self.window_minutes:
+                self._plan_levels(part, state, frame, today)
+            return
+        if ts > self.levels.plan["opening_end"]:
+            self._move_levels(state, frame, ts)
+
+    def _plan_levels(self, part: "dict | None", state: AppState, frame, today) -> None:
+        """HighLow2's 9:35 forecast and its buy level, walked on through every
+        bar since -- a run started late reads the session as one up since
+        9:35 would have. A failure is the day's: logged once, and every buy
+        after the window refused (`_refuse_on_levels`)."""
+        try:
+            if part is None:
+                raise ValueError("the bundle carries no HighLow2 model")
+            opening, _tape = fetch_opening_window(state, frame, self.window_minutes, ticker=self.ticker)
+            # A replay's state carries placeholder keys, as `DayRangeTrader` says.
+            replayed = bool(getattr(state, "bar_tape_override", ""))
+            forecast, open_price = session_forecast(
+                part, self.ticker, opening, today,
+                key=None if replayed else state.api_key,
+                secret=None if replayed else state.api_secret,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the day's second vote, not the run
+            self.levels_problem = str(exc)
+            _log(state, {"type": "error", "text": (
+                f"HighLow2 cannot forecast today's {self.ticker} range ({exc}), so after the "
+                "opening window nothing is bought — the two models have to agree there. "
+                "Positions keep GoodMoments' exits."
+            )})
+            return
+        walker = DayRangeTrader(self.config)
+        opening_end = opening.index[-1]
+        walker.plan = {
+            "date": today,
+            "opening_end": opening_end,
+            "open_price": float(open_price or opening["open"].iloc[0]),
+            **forecast,
+        }
+        walker._set_levels(opening_end)
+        for ts in frame.index:
+            if ts > opening_end:
+                walker._move_range(frame[frame.index <= ts], ts)
+                walker._set_levels(ts)
+        self.levels = walker
+        plan = walker.plan
+        _log(state, {"type": "analysis", "text": (
+            f"HighLow2's forecast for {self.ticker} at the {opening_end:%H:%M} bar: high "
+            f"${float(plan['pred_high']):,.2f}, low ${float(plan['pred_low']):,.2f}"
+            + (f" (moved since: buy level now ${plan['buy_level']:,.2f})"
+               if plan.get("range_updates") else "")
+            + f". From the bar after it a buy also needs the close at or under its buy level, "
+            f"{self.config.buy_k:g} × the {self.config.unit_phrase} under the predicted high: "
+            f"${plan['buy_level']:,.2f} now"
+            + ("" if self.config.breach_update == BREACH_OFF
+               else ", moved with the forecast whenever the session trades outside it")
+            + "."
+        )})
+
+    def _move_levels(self, state: AppState, frame, ts) -> None:
+        """This bar's breach, if it made one: the forecast and the buy level
+        moved as a HighLow2 run would move them, said in one line."""
+        before = self.levels._move_range(frame, ts)
+        self.levels._set_levels(ts)
+        if before is None:
+            return
+        plan = self.levels.plan
+        _log(state, {"type": "analysis", "text": (
+            f"HighLow2's forecast for {self.ticker} moved at {ts:%H:%M}, the session having "
+            f"traded outside it: range now ${float(plan['pred_low']):,.2f} – "
+            f"${float(plan['pred_high']):,.2f}, buy level ${plan['buy_level']:,.2f} "
+            f"(was ${before['buy_level']:,.2f})."
+        )})
+
+    def _buy_level(self) -> "float | None":
+        plan = self.levels.plan if self.levels is not None else None
+        return float(plan["buy_level"]) if plan else None
+
+    # --- the vote ------------------------------------------------------------
+
+    def _refuse_on_levels(self, state: AppState, frame, ts, bar, minute: int) -> bool:
+        """Whether HighLow2 refuses the buy the edge calls for: never inside
+        the opening window; after it, unless the bar closed at or under its buy
+        level. Said once per run of refused bars; the next bar is judged
+        again."""
+        if minute < self.window_minutes:
+            return False
+        level, close = self._buy_level(), float(bar["close"])
+        if level is not None and close <= level:
+            self._levels_refused_at = None
+            return False
+        if level is None:
+            why = (
+                f"HighLow2 has no forecast today ({self.levels_problem})"
+                if self.levels_problem else
+                f"HighLow2's forecast is not made yet (it needs the first {self.window_minutes} "
+                "bars of the session)"
+            )
+        else:
+            plan = self.levels.plan
+            why = (
+                f"${close:,.2f} is above HighLow2's ${level:,.2f} buy level "
+                f"({self.config.buy_k:g} × the {self.config.unit_phrase} under its predicted high "
+                f"${float(plan['pred_high']):,.2f})"
+            )
+        previous = frame.index[-2] if len(frame) > 1 else None
+        if self._levels_refused_at is None or self._levels_refused_at != previous:
+            _log(state, {"type": "status", "text": (
+                f"The edge calls for a buy at {ts:%H:%M}, but {why}. Not buying: after the "
+                "opening window both models have to agree; each bar is judged again."
+            )})
+        self._levels_refused_at = ts
+        return True
+
+    def _entry_note(self, bar, minute: int) -> str:
+        if minute < self.window_minutes:
+            return (
+                "Inside the opening window, before HighLow2's forecast: GoodMoments' "
+                "signal alone. "
+            )
+        return (
+            f"HighLow2 agrees: the ${float(bar['close']):,.2f} close is at or under its "
+            f"${self._buy_level():,.2f} buy level. "
+        )
+
+    # --- the session, the record and the log -------------------------------
+
+    def _plan_session(self, bundle: dict, state: AppState, today) -> bool:
+        planned = super()._plan_session(bundle, state, today)
+        if planned:
+            _log(state, {"type": "analysis", "text": (
+                f"Hybrid with HighLow2: through the opening window (its first "
+                f"{self.window_minutes} bars) a buy is GoodMoments' alone; from the bar after "
+                f"it, it also needs the close at or under HighLow2's buy level, "
+                f"{self.config.buy_k:g} × the {self.config.unit_phrase} under its predicted "
+                "high. Every exit is GoodMoments'."
+            )})
+        return planned
+
+    def _row(self, ts, bar) -> dict:
+        """GoodMoments' row, with HighLow2's levels from the bar after its
+        window: what the chart draws the buy level from."""
+        row = super()._row(ts, bar)
+        plan = self.levels.plan if self.levels is not None else None
+        after = plan is not None and ts > plan["opening_end"]
+        row.update({
+            "buy": float(plan["buy_level"]) if after else None,
+            "pred_high": float(plan["pred_high"]) if after else None,
+            "pred_low": float(plan["pred_low"]) if after else None,
+        })
+        return row
+
+    def _read_summary(self, bar, ts, position: float, minute: int, frame=None) -> str:
+        text = super()._read_summary(bar, ts, position, minute, frame)
+        level = self._buy_level()
+        if minute < self.window_minutes:
+            return text + " · HighLow2: opening window, GoodMoments alone"
+        if level is None:
+            return text + " · no HighLow2 buy level"
+        side = "at or under" if float(bar["close"]) <= level else "above"
+        return text + f" · HighLow2 buy ${level:,.2f} (close {side})"
+
+
 def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """The state machine this configuration's model calls for.
 
@@ -4775,6 +5070,8 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """
     if config.strategy == apple_models.STRATEGY_MOMENTUM:
         return FastFuriousTrader(config)
+    if config.model_key == apple_models.HIGHLOW2_GOODMOMENTS_KEY:
+        return HighLow2GoodMomentsTrader(config)
     if config.strategy == apple_models.STRATEGY_PROBABILITY:
         return GoodMomentsTrader(config)
     return DayRangeTrader(config)
@@ -4846,6 +5143,16 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         "positive, sold on the first bar it is not."
         if config.gm_confirm_bars else ""
     )
+    levels_model = apple_models.levels_of(config.model_key)
+    if levels_model is not None:
+        part = bundle.get(levels_model) or {}
+        made = 30 + _dayrange().opening_minutes(part)
+        confirm += (
+            f" From 9:{made:02d}, when {apple_models.get(levels_model).label} forecasts today's "
+            f"high and low, a buy also needs the bar's close at or under its buy level, "
+            f"{config.buy_k:g} × the {config.unit_phrase} under the predicted high; before "
+            "then the edge alone buys."
+        )
     return (
         f"Apple Trader armed on {model.label} (fitted {bundle.get('trained_at') or 'unknown'}"
         f"{quality}): at the close of every bar it forecasts the chance that {config.ticker} trades "

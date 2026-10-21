@@ -883,6 +883,8 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         family="LightGBM (3 seeds)",
         consumers=(
             "Apple Trader — day-range strategy",
+            "Apple Trader — HighLow2 + GoodMoments (its buy level votes on GoodMoments' buys "
+            "after 9:35)",
             "Chart overlay — predicted range after 9:35 (HighLow2)" if rest
             else "Chart overlay — predicted day range (HighLow2)",
         ),
@@ -1061,6 +1063,8 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
         family="LightGBM classifier + time/vol twin",
         consumers=(
             "Apple Trader — probability strategy (GoodMoments rules)",
+            "Apple Trader — HighLow2 + GoodMoments (GoodMoments' rules, HighLow2 voting on "
+            "buys after 9:35)",
             "Chart overlay — GoodMoments edge and buy signals",
         ),
         features=tuple(meta.get("features") or []),
@@ -1130,6 +1134,10 @@ def specs() -> "list[ModelSpec]":
     """
     out: "list[ModelSpec]" = []
     for key, model in apple_models.MODELS.items():
+        if model.levels_of is not None:
+            # A hybrid has no file of its own: its two models' cards are its
+            # description, and each names it among its consumers.
+            continue
         for ticker in model.tickers:
             found = spec(key, ticker)
             if found is not None:

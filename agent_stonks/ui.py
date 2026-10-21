@@ -3020,8 +3020,40 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "(349 trades, 68% winners) — inside the placebo spread, and holding AAPL made almost "
             "four times as much."
         ),
+        "hybrid_levels": (
+            "The second vote. From 09:35 a GoodMoments buy also needs the bar to close at or "
+            "under the buy level HighLow2's rules would rest — this far under its predicted "
+            "high. Before 09:35 HighLow2 has no forecast yet, and the edge alone buys.\n\n"
+            "- It only votes: HighLow2's sell, stop, take and breaker do not apply — every "
+            "exit is GoodMoments'.\n"
+            "- The level moves through a breach under the rule below, as a HighLow2 run's "
+            "would."
+        ),
     },
     help={
+        "hybrid_buy_k": (
+            "How far under {model}'s predicted high the price has to be for {model} to agree "
+            "with a GoodMoments buy after 09:35.\n\n"
+            "- Starts at **{buy_k}**, {model}'s own buy distance on {ticker} — the level a "
+            "{model} run would rest its buy at.\n"
+            "- Deeper (bigger) agrees on fewer bars, at better prices; shallower lets more of "
+            "GoodMoments' signals through.\n"
+            "- Never swept on the hybrid: sweep it on SimLab's Tuning tab."
+        ),
+        "model_highlow2_goodmoments": (
+            "GoodMoments' rules with HighLow2 as a second vote on every buy after the opening "
+            "window.\n\n"
+            "- **09:30–09:34**: a buy on GoodMoments' edge alone (HighLow2's forecast is made "
+            "from these bars).\n"
+            "- **From 09:35**: a buy needs the edge *and* the bar's close at or under HighLow2's "
+            "buy level.\n"
+            "- **Selling** is GoodMoments' throughout: take, stop (then 15 minutes without "
+            "entries), the optional sale on a fading edge and momentum hold, the closing "
+            "flatten.\n"
+            "- With no base configuration of its own it opens on GoodMoments' settings and "
+            "HighLow2's buy distance. If HighLow2 cannot forecast the day, nothing is bought "
+            "after 09:35."
+        ),
         "model_fastfurious": (
             "A different strategy from the range models: no levels, a signal every minute.\n\n"
             "- It reads today's session only, as the basic plan shows it: **SIP up to 15 "
