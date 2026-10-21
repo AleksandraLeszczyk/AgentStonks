@@ -2093,6 +2093,10 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "different experiment (one trade a day).\n"
             "- In the signature while it is on, and sweepable."
         ),
+        "min_win_on": (
+            "Unticked, the run is replayed with no circuit breaker: the levels re-arm after "
+            "every trade, and only a stop stands the session down."
+        ),
     },
 )
 

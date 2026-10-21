@@ -617,17 +617,35 @@ def min_win_param(
     instrument because it only means something against that symbol's own pair,
     so switching symbol must re-seed it rather than carry the last one across.
     `default` is the pair's own (its base configuration's), else the symbol's.
+
+    Switched off by its box, not by a 0: the threshold stays on screen, greyed
+    out, so ticking the box again comes back to a number rather than to 0. A 0
+    kept from before the box existed (or a base saved with the breaker off)
+    opens the box unticked and the field on the symbol's own default.
     """
     section("Circuit breaker", copy.sections.get("dayrange_breaker"))
     default = min_win_for(ticker) if default is None else float(default)
+    number_key = copy.key(f"min_win_k_{ticker}")
+    kept = st.session_state.get(number_key)
+    was_on = bool(default if kept is None else kept)
+    if kept is not None and not kept:
+        st.session_state[number_key] = min_win_for(ticker)
+    on = st.checkbox(
+        "Stand down after a weak trade",
+        value=was_on,
+        key=copy.key(f"min_win_on_{ticker}"),
+        help=copy.help.get("min_win_on"),
+    )
     min_win_k = st.number_input(
         f"Stand down after a trade under (× {unit_label} a share)",
-        min_value=0.0, max_value=3.0, value=default, step=0.05, format="%.2f",
-        key=copy.key(f"min_win_k_{ticker}"),
+        min_value=0.01, max_value=3.0, value=default or min_win_for(ticker),
+        step=0.05, format="%.2f",
+        key=number_key, disabled=not on,
         help=copy.help.get("min_win_k", "").format(
             ticker=ticker, min_win_k=f"{default:g}", unit=unit_label
         ),
     )
+    min_win_k = float(min_win_k) if on else 0.0
     target_gain = buy_k - sell_k
     if min_win_k and min_win_k >= target_gain:
         st.warning(
@@ -636,7 +654,7 @@ def min_win_param(
             "only after weak trades.",
             icon=":material/warning:",
         )
-    return float(min_win_k)
+    return min_win_k
 
 
 # What the two number inputs call the unit in their own labels. Shorter than

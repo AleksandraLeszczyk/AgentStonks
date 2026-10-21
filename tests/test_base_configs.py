@@ -220,3 +220,44 @@ class TestForm:
         assert "20261014-x" in text
         assert "`limit_entry` False (shipped True)" in text
         assert "`buy_k` 0.85" in text
+
+
+class TestCircuitBreakerBox:
+    """The breaker is switched off by its box; the threshold is kept, greyed out."""
+
+    KEY, BOX = "t_min_win_k_AAPL", "t_min_win_on_AAPL"
+
+    def test_on_by_default_at_the_symbols_threshold(self, form):
+        app = form()
+        assert app.checkbox(key=self.BOX).value is True
+        assert not app.number_input(key=self.KEY).disabled
+        assert app.session_state["out"].min_win_k == pytest.approx(at.min_win_for("AAPL"))
+
+    def test_unticked_it_is_off_and_the_threshold_waits(self, form):
+        app = form()
+        app.number_input(key=self.KEY).set_value(0.07).run()
+        app.checkbox(key=self.BOX).uncheck().run()
+        assert app.session_state["out"].min_win_k == 0.0
+        assert app.number_input(key=self.KEY).disabled
+        assert not app.warning
+        app.checkbox(key=self.BOX).check().run()
+        assert app.session_state["out"].min_win_k == pytest.approx(0.07)
+
+    def test_a_kept_zero_opens_it_unticked(self, form):
+        """A 0 remembered from before the box (`last_setup`) meant "off"."""
+        form()  # for its stubbed bundle; a fresh AppTest is falsy, so seed our own
+        app = AppTest.from_function(_form, default_timeout=30)
+        app.session_state[self.KEY] = 0.0
+        app.run()
+        assert not app.exception, app.exception
+        assert app.checkbox(key=self.BOX).value is False
+        assert app.number_input(key=self.KEY).value == pytest.approx(at.min_win_for("AAPL"))
+        assert app.session_state["out"].min_win_k == 0.0
+
+    def test_a_base_without_a_breaker_opens_it_unticked(self, form):
+        base_configs.set_base(asdict(_base(min_win_k=0.0)))
+        app = form()
+        app.selectbox(key="t_model_AAPL").select("highlow").run()
+        suffix = base_configs.key_suffix("highlow", "AAPL")
+        assert app.checkbox(key=f"{self.BOX}{suffix}").value is False
+        assert app.session_state["out"] == _base(min_win_k=0.0)

@@ -3383,7 +3383,12 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "including a runner sold back at the fill.\n"
             "- At or above `buy − sell`, every trade stands the session down — a "
             "one-trade-a-day rule.\n"
-            "- 0 switches it off and lets the levels re-arm all day."
+            "- Greyed out while the box above is unticked."
+        ),
+        "min_win_on": (
+            "Unticked, a trade that barely paid does not end the day: the levels re-arm "
+            "after every trade, and only a stop stands the session down.\n\n"
+            "- The threshold below is kept for when it is ticked again."
         ),
     },
 )
