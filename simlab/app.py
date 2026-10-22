@@ -3730,7 +3730,12 @@ def _derived_discriminators(jobs: list[dict]) -> dict[str, str]:
     return text
 
 
-def _tuning_job_label(job: dict, markdown: bool = True, detail: str = "") -> str:
+def _tuning_job_label(
+    job: dict, markdown: bool = True, detail: str = "", best: bool = True
+) -> str:
+    """One job as a line: what it sweeps, the most a combination of it made a
+    session (`best`, `tuning.best_daily_profit`), and when it started. Sorted
+    on without `best`, so jobs of one grid stay in the order they started."""
     spec = job["spec"]
     params = " × ".join(_tuning_param_label(a["name"]) for a in spec["axes"])
     ticker = spec["base"]["ticker"]
@@ -3739,6 +3744,12 @@ def _tuning_job_label(job: dict, markdown: bool = True, detail: str = "") -> str
     # picker otherwise shows two jobs of one ticker as the same line.
     model = _apple_model_label(spec["base"].get("model_key", ""))
     head = f"{f'**{ticker}**' if markdown else ticker} · {model} · {params}"
+    # Before the date, which a long line in the picker cuts off first.
+    daily = sim_tuning.best_daily_profit(job) if best else None
+    if daily is not None:
+        # Escaped in markdown, where a bare "$" opens a formula.
+        dollar = "\\$" if markdown else "$"
+        head += f" · best {'−' if daily < 0 else '+'}{dollar}{abs(daily):,.2f}/day"
     started = (job.get("created_at") or "")[:16].replace("T", " ")
     # No dataset names: a job's datasets change as they are added and dropped,
     # and the results below list them anyway.
@@ -3800,7 +3811,9 @@ def _render_tuning_jobs_body(auto_refresh: bool) -> None:
     if not active:
         return
     st.markdown("##### :material/grid_on: Running")
-    for job in sorted(active, key=lambda j: _tuning_job_label(j, markdown=False).casefold()):
+    for job in sorted(
+        active, key=lambda j: _tuning_job_label(j, markdown=False, best=False).casefold()
+    ):
         with st.container(border=True):
             st.markdown(_tuning_job_label(job))
             done = int(job["progress"]["done"])
@@ -5247,7 +5260,13 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         j["job_id"]: _tuning_job_label(j, markdown=False, detail=detail.get(j["job_id"], ""))
         for j in jobs
     }
-    ids = sorted(labels, key=lambda i: labels[i].casefold())
+    order = {
+        j["job_id"]: _tuning_job_label(
+            j, markdown=False, detail=detail.get(j["job_id"], ""), best=False
+        ).casefold()
+        for j in jobs
+    }
+    ids = sorted(labels, key=order.get)
     job_id = st.selectbox(
         "Tuning job", ids, index=ids.index(wanted) if wanted in ids else 0,
         format_func=labels.get,

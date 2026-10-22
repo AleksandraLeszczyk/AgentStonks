@@ -522,6 +522,34 @@ class TestSum:
         assert tu.pick_cell(record, "w2")["profit"] == 350.0
         assert tu.summed_baseline(record)["profit"] == 2.0
 
+    def test_the_best_day_rate_is_the_best_total_over_every_session(self):
+        """Read off the whole grid: 0.5's $750 over the two weeks' 10 sessions."""
+        record = job_record({
+            "w1": [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)],
+            "w2": [scored({"buy_k": 0.3}, -700.0), scored({"buy_k": 0.5}, 350.0)],
+        })
+        assert tu.best_daily_profit(record) == pytest.approx(75.0)
+
+    def test_the_best_day_rate_is_not_the_pick(self):
+        """A pick that must have traded on most sessions passes over 0.3, which
+        still made the most a session."""
+        record = job_record(
+            {"w1": [scored({"buy_k": 0.3}, 900.0, traded=1), scored({"buy_k": 0.5}, 100.0)]},
+            min_traded_share=0.5,
+        )
+        tu.refresh_pick(record)
+        assert record["best"]["overrides"] == {"buy_k": 0.5}
+        assert tu.best_daily_profit(record) == pytest.approx(900.0 / 5)
+
+    def test_the_best_day_rate_skips_holes_refusals_and_errors(self):
+        broken = {**scored({"buy_k": 0.5}, 5000.0), "error": "boom"}
+        record = job_record({"w1": [scored({"buy_k": 0.3}, -50.0), broken]})
+        assert tu.best_daily_profit(record) == pytest.approx(-10.0)
+        refused = {"overrides": {"buy_k": 0.3}, "invalid": "no"}
+        assert tu.best_daily_profit(job_record({"w1": [refused, broken]})) is None
+        unswept = job_record({"w1": [scored({"buy_k": 0.3}, 50.0)], "w2": []})
+        assert tu.best_daily_profit(unswept) is None
+
     def test_missing_replays_count_every_dataset(self):
         record = job_record({"w1": [scored({"buy_k": 0.3}, 1.0)], "w2": []})
         record["baseline"]["w2"] = None

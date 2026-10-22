@@ -1527,6 +1527,20 @@ def summed_cells(record: dict) -> "list[dict]":
     return out
 
 
+def best_daily_profit(record: dict) -> "float | None":
+    """The most any combination of the grid made a session, summed over every
+    dataset of the job: the highest total profit over its sessions -- every
+    session of the job, traded or not. Read off the whole grid, not the pick,
+    whose plateau rule and minimum share of days traded can pass it over. None
+    while no combination is answered on every dataset."""
+    rates = [
+        cell["profit"] / cell["days"]
+        for cell in summed_cells(record)
+        if "profit" in cell and not cell.get("error") and cell.get("days")
+    ]
+    return max(rates) if rates else None
+
+
 def summed_baseline(record: dict) -> "dict | None":
     """The base configuration summed over every dataset of the job."""
     names = dataset_names(record["spec"])
