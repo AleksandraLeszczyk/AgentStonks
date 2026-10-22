@@ -974,6 +974,10 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     # above: these are an *agent's* orders, not a model's forecast, and reading
     # the chart means telling the two apart at a glance.
     "trader_levels": "#fb923c",  # orange
+    # The same two levels for minutes no running agent rested them -- before
+    # ▶ Start, or since ▶ Stop: what it would rest, grey so it does not read
+    # as an order in the book.
+    "trader_idle": "#9ca3af",
     # And the stop under that buy: red, because it is the one line on the chart
     # that marks a loss rather than an order meant to make money.
     "trader_stop": "#f87171",

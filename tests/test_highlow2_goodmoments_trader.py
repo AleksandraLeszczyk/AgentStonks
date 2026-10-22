@@ -20,6 +20,7 @@ from agent_stonks import apple_models, base_configs, clock, model_overlays as mo
 from agent_stonks import apple_trader as at
 from agent_stonks.apple_trader import AppleTraderConfig, config_signature
 from agent_stonks.broker import Broker
+from agent_stonks.config import MODEL_OVERLAY_COLORS
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
 
@@ -439,6 +440,10 @@ class TestWiring:
         items, note = mo._signal_trader_items(TICKER, None, KEY, walked)
         assert note == "" and items[0]["label"] == "HighLow2 buy level"
         assert items[0]["values"][0] == pytest.approx(BUY_LEVEL)
+        # On the live chart with no agent running, the walk is gray.
+        idle, _ = mo._signal_trader_items(TICKER, None, KEY, walked, idle=True)
+        assert items[0]["color"] == MODEL_OVERLAY_COLORS["trader_levels"]
+        assert idle[0]["color"] == MODEL_OVERLAY_COLORS["trader_idle"]
         failed = {"forecast": None, "made_at": None, "problem": "no IEX opening"}
         items, note = mo._signal_trader_items(
             TICKER, None, KEY, mo._hybrid_buy_walk(TICKER, session, failed, hybrid_config(), KEY)

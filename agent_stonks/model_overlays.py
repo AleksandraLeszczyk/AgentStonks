@@ -58,7 +58,8 @@ Ten overlays
                      `apple_trader.session_levels` rather than deriving the
                      levels itself. Under Fast&Furious, which rests no levels,
                      it is the running agent's stop; under GoodMoments its take
-                     and its stop.
+                     and its stop. Live, minutes no running agent rested them
+                     (before ▶ Start, since ▶ Stop) are drawn gray.
 
 Both envelopes are widest at 09:30, narrow to roughly a fifth of that by
 midday and open again into the close. They are a picture of *how far the day
@@ -606,6 +607,7 @@ def compute(
     trader_config=None,
     credentials: "tuple[str, str] | None" = None,
     trader_history: "dict | None" = None,
+    trader_running: "bool | None" = None,
 ) -> dict:
     """Draw instructions for the requested overlays, plus why any are empty.
 
@@ -640,6 +642,13 @@ def compute(
     the forecast the run actually made, every sidebar edit at the minute it was
     adopted, and any restart, none of which a walk can know. It is what makes
     the chart quote the same levels as the agent's log.
+
+    `trader_running` is the live chart's: whether the agent `trader_history`
+    belongs to is running. There, `trader_levels` draws the minutes no running
+    agent rested gray -- a walk under `trader_config` (no record: what it would
+    rest if started), and, once a run is stopped, the bars after its record,
+    carried on from it like the range (`_after_record`). None -- SimLab, whose
+    walk is the run being replayed -- draws a walk in the agent's colour.
 
     Returns `{"items": [...], "notes": [...]}`. A note is a sentence naming an
     overlay that produced nothing and saying what would fix it; there is never
@@ -731,18 +740,29 @@ def compute(
                 walked = _hybrid_buy_walk(
                     symbol, session, highlow_forecast(parent), trader_config, model_key
                 )
-            return _signal_trader_items(symbol, recorded if own else None, model_key, walked)
+            return _signal_trader_items(
+                symbol, recorded if own else None, model_key, walked,
+                idle=trader_running is not None,
+            )
         if recorded is not None:
             rows, config = recorded
+            # A stopped run: the bars since, as it would have carried on.
+            after = (
+                _after_record(rows, trader_history, session, config)
+                if trader_running is False
+                and getattr(config, "strategy", None) == apple_models.STRATEGY_DAYRANGE
+                else []
+            )
             return _trader_levels_items(
                 symbol, session, day, open_price, _recorded_result(rows), config,
-                levels=rows,
+                levels=rows, after=after,
             )
         sat_out = _sat_out(symbol, day, trader_config)
         if sat_out:
             return [], sat_out
         return _trader_levels_items(
-            symbol, session, day, open_price, trader_forecast(), trader_config
+            symbol, session, day, open_price, trader_forecast(), trader_config,
+            idle=trader_running is not None,
         )
 
     builders = {
@@ -1290,6 +1310,8 @@ def _trader_levels_items(
     result: dict,
     config=None,
     levels: "list[dict] | None" = None,
+    after: "list[dict] | None" = None,
+    idle: bool = False,
 ) -> "tuple[list[dict], str]":
     """The buy, the sell and the stop, as the configured agent would rest them.
 
@@ -1302,6 +1324,11 @@ def _trader_levels_items(
     `levels` is a live run's own record (`_recorded_levels`) with `config` the
     run's configuration; it is drawn as given, sidebar edits and all, in place
     of `session_levels`' walk under `config`.
+
+    Gray for the minutes no running agent rested them (`compute`'s
+    `trader_running`): the whole walk when `idle`, and `after`, a stopped
+    run's record carried on to the newest bar (`_after_record`), from where
+    the record ends.
     """
     from .apple_trader import (  # heavy-ish, and only here
         default_config, session_levels, stop_phrase,
@@ -1327,9 +1354,6 @@ def _trader_levels_items(
             "forecast yet, so there is nothing resting."
         )
 
-    color = MODEL_OVERLAY_COLORS[TRADER_LEVELS_KEY]
-    buys = [row["buy"] for row in levels]
-    sells = [row["sell"] for row in levels]
     how = (
         f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
         + "the predicted high"
@@ -1345,32 +1369,51 @@ def _trader_levels_items(
                     "while a position is open")]
         if recorded and any(v is not None for v in stops) else []
     )
-    moves = min(buys) != max(buys) or min(sells) != max(sells)
-    if not moves:
-        x0, x1 = made_at, _session_close(day)
-        items = [
-            _level(TRADER_LEVELS_KEY, "Buy level", buys[0], color,
-                   note=f"Apple Trader's resting buy — {how}", x0=x0, x1=x1),
-            _level(TRADER_LEVELS_KEY, "Sell level", sells[0], color, dash="dashdot",
-                   note=f"Apple Trader's resting sell — {how}", x0=x0, x1=x1),
-        ]
-        return items + stop_path, ""
+    close = _session_close(day)
+    if not after:
+        return _resting_items(levels, how, made_at, close, idle=idle) + stop_path, ""
+    stopped = levels[-1]["t"]
     return (
-        [
-            _band(
-                TRADER_LEVELS_KEY, "Buy/sell levels",
-                [row["t"] for row in levels], buys, sells, color,
-                lower_label="Buy level", upper_label="Sell level", step=True,
-                note=(
-                    f"{how}; they move through the session "
-                    f"({buys[0]:.2f} – {sells[0]:.2f} at the forecast, "
-                    f"{buys[-1]:.2f} – {sells[-1]:.2f} now)"
-                ),
-            ),
-            *stop_path,
-        ],
+        _resting_items(levels, how, made_at, stopped, until="when it stopped")
+        + _resting_items([levels[-1], *after], how, stopped, close, idle=True,
+                         since="when it stopped")
+        + stop_path,
         "",
     )
+
+
+def _resting_items(
+    rows: "list[dict]", how: str, x0, x1, idle: bool = False,
+    since: str = "at the forecast", until: str = "now",
+) -> "list[dict]":
+    """The buy and sell in `rows`, from `x0` to `x1`: two flat levels when
+    neither moves, a stepped band when they do (`_trader_levels_items`).
+    `idle` draws them gray, as what the agent would rest -- it is not running.
+    `since` and `until` say in the band's note when its first and last rows
+    were."""
+    buys = [row["buy"] for row in rows]
+    sells = [row["sell"] for row in rows]
+    color = MODEL_OVERLAY_COLORS["trader_idle" if idle else TRADER_LEVELS_KEY]
+    if min(buys) == max(buys) and min(sells) == max(sells):
+        whose = "where Apple Trader would rest its {} — it is not running" if idle \
+            else "Apple Trader's resting {}"
+        return [
+            _level(TRADER_LEVELS_KEY, "Buy level", buys[0], color,
+                   note=f"{whose.format('buy')} — {how}", x0=x0, x1=x1),
+            _level(TRADER_LEVELS_KEY, "Sell level", sells[0], color, dash="dashdot",
+                   note=f"{whose.format('sell')} — {how}", x0=x0, x1=x1),
+        ]
+    return [_band(
+        TRADER_LEVELS_KEY, "Buy/sell levels",
+        [row["t"] for row in rows], buys, sells, color,
+        lower_label="Buy level", upper_label="Sell level", step=True,
+        note=(
+            ("not running, so where it would rest them: " if idle else "")
+            + f"{how}; they move through the session "
+            f"({buys[0]:.2f} – {sells[0]:.2f} {since}, "
+            f"{buys[-1]:.2f} – {sells[-1]:.2f} {until})"
+        ),
+    )]
 
 
 # --- Fast&Furious -----------------------------------------------------------
@@ -1570,10 +1613,13 @@ def _hybrid_buy_walk(
     return session_levels(config, result["forecast"], session, result["made_at"])
 
 
-def _hybrid_buy_items(model, rows: "list[dict] | str | None") -> "list[dict] | str":
+def _hybrid_buy_items(
+    model, rows: "list[dict] | str | None", idle: bool = False,
+) -> "list[dict] | str":
     """A hybrid's buy level as a path, from rows carrying `buy` (a run's
     record, or `_hybrid_buy_walk`'s), or why there is none when `rows` is that
-    reason. [] for a model with no second vote, or rows with no level yet."""
+    reason. [] for a model with no second vote, or rows with no level yet.
+    `idle`: gray, a walk no running agent rests (`compute`'s `trader_running`)."""
     if model.levels_of is None or rows is None:
         return []
     parent = OVERLAYS[_RANGE_OVERLAYS.get(model.levels_of, DAY_RANGE_KEY)].name
@@ -1584,9 +1630,10 @@ def _hybrid_buy_items(model, rows: "list[dict] | str | None") -> "list[dict] | s
         return []
     return [_path(
         TRADER_LEVELS_KEY, f"{parent} buy level", [row["t"] for row in rows], buys,
-        MODEL_OVERLAY_COLORS[TRADER_LEVELS_KEY], dash="dash", step=True,
+        MODEL_OVERLAY_COLORS["trader_idle" if idle else TRADER_LEVELS_KEY], dash="dash", step=True,
         note=(
-            f"where a buy after {parent}'s opening window has to close at or under — the buy "
+            ("not running, so where it would be: " if idle else "")
+            + f"where a buy after {parent}'s opening window has to close at or under — the buy "
             f"a {parent} run would rest under its predicted high"
         ),
     )]
@@ -1594,7 +1641,7 @@ def _hybrid_buy_items(model, rows: "list[dict] | str | None") -> "list[dict] | s
 
 def _signal_trader_items(
     symbol: str, recorded: "tuple[list[dict], object] | None", model_key: str,
-    walked: "list[dict] | str | None" = None,
+    walked: "list[dict] | str | None" = None, idle: bool = False,
 ) -> "tuple[list[dict], str]":
     """`trader_levels` under a per-minute model (Fast&Furious, GoodMoments):
     the running agent's stop -- and GoodMoments' take -- while it holds a
@@ -1604,11 +1651,15 @@ def _signal_trader_items(
     A hybrid (`apple_models.levels_of`) also draws the buy level a buy after
     its levels model's opening window has to close at or under: the run's own
     from its record, else `walked` -- the walk under the chart's
-    configuration (`_hybrid_buy_walk`), or why there is none."""
+    configuration (`_hybrid_buy_walk`), or why there is none; gray when
+    `idle` (no running agent rests it)."""
     overlay = OVERLAYS[TRADER_LEVELS_KEY]
     model = apple_models.get(model_key)
     gm_rules = model.strategy == apple_models.STRATEGY_PROBABILITY
-    vote = _hybrid_buy_items(model, recorded[0] if recorded is not None else walked)
+    vote = _hybrid_buy_items(
+        model, recorded[0] if recorded is not None else walked,
+        idle=idle and recorded is None,
+    )
     if recorded is None:
         if isinstance(vote, str):
             return [], f"{overlay.label}: {vote}"
@@ -1864,12 +1915,14 @@ def live_overlays(
     # the next rerun, not on the next bar. And the running agent's record,
     # which grows once a cycle and changes the moment a sidebar edit is
     # adopted -- which can be mid-bar.
+    # And whether it runs: ▶ Start and ▶ Stop turn the levels orange and gray.
     config, history = live_trader_view(getattr(sym_state, "app", None), sym_state.symbol)
+    running = live_trader_running(getattr(sym_state, "app", None))
     rows = (history or {}).get("rows") or []
     key = (
         bars[-1].get("t"), tuple(wanted), len(bars),
         None if config is None else astuple(config),
-        len(rows), tuple(rows[-1].values()) if rows else None,
+        len(rows), tuple(rows[-1].values()) if rows else None, running,
     )
     cached = getattr(sym_state, "model_overlay_cache", None)
     if cached and cached.get("key") == key:
@@ -1885,11 +1938,23 @@ def live_overlays(
         session_date=session_date,
         trader_config=config,
         trader_history=history,
+        trader_running=running,
         credentials=(getattr(app, "api_key", "") or None, getattr(app, "api_secret", "") or None),
         **_live_dayrange_inputs(sym_state.symbol, wanted, session_date),
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}
     return result
+
+
+def live_trader_running(app) -> bool:
+    """Whether the agent whose levels the live chart draws is running: an
+    Apple Trader or an Orchestra race, started (`live_trader_view`)."""
+    if app is None or not getattr(app, "agent_running", False):
+        return False
+    from .apple_trader import APPLE_TRADER_KEY  # heavy-ish, and only here
+    from .orchestra import ORCHESTRA_KEY
+
+    return getattr(app, "llm_personality", None) in (APPLE_TRADER_KEY, ORCHESTRA_KEY)
 
 
 def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":

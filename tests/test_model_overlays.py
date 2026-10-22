@@ -670,6 +670,26 @@ class TestTraderLevelsOverlay:
         for key in apple_models.keys():
             assert mo.TRADER_LEVELS_KEY not in mo.for_models([key], "AAPL")["keys"]
 
+    def test_a_live_chart_with_no_agent_running_draws_them_gray(self, monkeypatch):
+        """Not started, the walk is where the agent would rest its orders,
+        not orders in the book. SimLab's walk (no `trader_running`) is the run
+        being replayed, and keeps the agent's orange."""
+        from agent_stonks.config import MODEL_OVERLAY_COLORS
+
+        pytest.importorskip("agent_stonks.dayrange_model")
+        self.stub_forecast(monkeypatch)
+
+        def colors(running):
+            items = mo.compute(
+                [mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[],
+                session_date=SESSION, trader_config=self.config(), trader_running=running,
+            )["items"]
+            assert {i["label"] for i in items} == {"Buy level", "Sell level"}
+            return {i["color"] for i in items}
+
+        assert colors(False) == {MODEL_OVERLAY_COLORS["trader_idle"]}
+        assert colors(None) == {MODEL_OVERLAY_COLORS["trader_levels"]}
+
 
 class TestTraderLevelsOnDaysOff:
     """A session the agent sits out draws no levels, and says why -- not a walk
@@ -765,6 +785,64 @@ class TestRecordedTraderLevels:
         assert not [i for i in items if i["kind"] == "band"]
         levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
         assert levels == {"Pred. high": 210.0, "Pred. low": 198.0}
+
+    def stopped(self, bars):
+        """A run stopped at 09:36: three rows from 09:34, and the seed its
+        levels can be carried on from."""
+        history = self.history([207.0] * 3, highs=[210.0] * 3)
+        history["seed"] = {
+            "forecast": {"pred_high": 210.0, "pred_low": 198.0, "prev_avg": 200.0,
+                         "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0},
+            "opening_end": pd.Timestamp(f"{SESSION} 09:34", tz="America/New_York"),
+            "open_price": bars[0]["o"],
+        }
+        return history
+
+    @staticmethod
+    def stretch(item) -> "tuple[pd.Timestamp, pd.Timestamp]":
+        start, end = (item["x0"], item["x1"]) if item["kind"] == "level" \
+            else (item["t"][0], item["t"][-1])
+        return pd.Timestamp(start), pd.Timestamp(end)
+
+    def test_a_stopped_runs_levels_carry_on_gray_to_the_newest_bar(self, monkeypatch):
+        """Orange while it ran, then the levels it would have kept resting --
+        carried on from its record like the range -- gray from its last row to
+        the newest bar."""
+        from agent_stonks.config import MODEL_OVERLAY_COLORS
+
+        pytest.importorskip("agent_stonks.dayrange_model")
+        bars = minute_bars()
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        items = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                           session_date=SESSION, trader_history=self.stopped(bars),
+                           trader_running=False)["items"]
+        stopped_at = pd.Timestamp(f"{SESSION} 09:36", tz="America/New_York")
+        ran = [i for i in items if i["color"] == MODEL_OVERLAY_COLORS["trader_levels"]]
+        idle = [i for i in items if i["color"] == MODEL_OVERLAY_COLORS["trader_idle"]]
+        assert {i["label"] for i in ran} == {"Buy level", "Sell level"}
+        assert all(self.stretch(i)[1] == stopped_at for i in ran)
+        assert idle and all(self.stretch(i)[0] == stopped_at for i in idle)
+        band = next((i for i in idle if i["kind"] == "band"), None)
+        if band is not None:
+            assert band["lower"][0] == 207.0
+            assert pd.Timestamp(band["t"][-1]) == pd.Timestamp(bars[-1]["t"])
+        # The stop is the run's, while it ran.
+        stop = next(i for i in items if i["label"] == "Stop level")
+        assert self.stretch(stop)[1] == stopped_at
+
+    def test_a_running_agents_levels_are_its_record_alone(self, monkeypatch):
+        """Its record is up to the bar it last read; the live buffer's newer,
+        still-forming bar is not a minute it was idle."""
+        from agent_stonks.config import MODEL_OVERLAY_COLORS
+
+        bars = minute_bars()
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        items = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                           session_date=SESSION, trader_history=self.stopped(bars),
+                           trader_running=True)["items"]
+        assert MODEL_OVERLAY_COLORS["trader_idle"] not in {i["color"] for i in items}
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Buy level": 207.0, "Sell level": 209.0}
 
     def test_an_edit_is_drawn_as_a_step_at_the_minute_it_was_adopted(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY],
@@ -1251,6 +1329,24 @@ class TestLiveOverlays:
         mo.live_overlays(sym_state, bars, [mo.TRADER_LEVELS_KEY])
         assert len(calls) == 2
         assert calls[-1]["trader_history"]["rows"][-1]["buy"] == 205.5
+
+    def test_starting_the_agent_redraws_the_levels_within_the_bar(self, monkeypatch):
+        """▶ Start turns the gray levels orange at once, and only an Apple
+        Trader or an Orchestra race is an agent whose levels these are."""
+        calls = self.capture_compute(monkeypatch)
+        bars = minute_bars(n=40)
+        sym_state = self.make_state(bars)
+        sym_state.app = SimpleNamespace(
+            apple_trader_config=None, apple_trader_levels=None, api_key="", api_secret="",
+            agent_running=False, llm_personality="apple_trader",
+        )
+        mo.live_overlays(sym_state, bars, [mo.TRADER_LEVELS_KEY])
+        sym_state.app.agent_running = True
+        mo.live_overlays(sym_state, bars, [mo.TRADER_LEVELS_KEY])
+        assert [c["trader_running"] for c in calls] == [False, True]
+        for personality, running in (("orchestra", True), ("momentum", False)):
+            sym_state.app.llm_personality = personality
+            assert mo.live_trader_running(sym_state.app) is running
 
     def test_the_answer_is_cached_until_a_new_bar_arrives(self, monkeypatch):
         calls = []
