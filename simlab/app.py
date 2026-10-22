@@ -2099,6 +2099,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "keeps one.\n"
             "- In the signature as `runner>=` while the take is on."
         ),
+        "take_under_buy_stands_down": (
+            "After a take that sells at or under the buy level (the first buy's, not "
+            "the next rung), nothing else is bought that session; a runner it kept is "
+            "still sold by its own rules.\n\n"
+            "- In the signature as `+end<buy` while the take is on; a record from "
+            "before 2026-10-22 replays without it."
+        ),
         "scale_in": (
             "Adds to an open position on the way down while the cash left can pay for "
             "a share: each next buy rests *Next buy step* units lower than the last "

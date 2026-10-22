@@ -3411,6 +3411,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "GOOGL's — so 0.30 keeps a runner on GOOGL and INTC, never on AAPL.\n"
             "- A runner is sold at the sell level, at the flatten, or back at the fill."
         ),
+        "take_under_buy_stands_down": (
+            "After a take that sells at or under the buy level, nothing else is bought "
+            "today.\n\n"
+            "- Otherwise the buy level sits above the price just sold at, and the next "
+            "bar momentum allows buys the same shares back.\n"
+            "- Measured against the first buy's level, not the next rung lower.\n"
+            "- A runner the take kept is still sold by its own rules."
+        ),
         "min_win_k": (
             "After a trade closes for no more than this many × {unit} **per share**, nothing "
             "else is bought today.\n\n"

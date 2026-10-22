@@ -911,6 +911,13 @@ def exit_params(
         help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
         disabled=not take_on,
     )
+    take_under_buy_stands_down = col_b.checkbox(
+        "No more buys after a take under the buy level",
+        value=defaults.take_under_buy_stands_down,
+        key=copy.key("take_under_buy_stands_down"),
+        help=copy.help.get("take_under_buy_stands_down"),
+        disabled=not take_on,
+    )
     return {
         "stop_gain_fraction": float(stop_gain_fraction),
         "take_trigger": str(take_trigger),
@@ -919,6 +926,7 @@ def exit_params(
         "take_fraction": float(take_pct) / 100.0,
         "take_after_minutes": int(take_after_minutes),
         "hold_min_gain_k": float(hold_min_gain_k),
+        "take_under_buy_stands_down": bool(take_under_buy_stands_down),
     }
 
 

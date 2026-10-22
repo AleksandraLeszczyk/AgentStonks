@@ -216,6 +216,10 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     here was written against. `TestMomentumConfirmation` is where it is
     switched on.
 
+    `take_under_buy_stands_down` is pinned off, a take leaving the buy level
+    armed: what every take test here was written against.
+    `TestMomentumConfirmation` is where it is switched on.
+
     `limit_entry` is pinned off, the market buy: most tests here enter on a bar
     that dipped to the level and closed above it, filling at the close, which
     a limit at the level refuses. `TestLimitEntry` is where it is switched on.
@@ -229,6 +233,7 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("momentum_confirmation_bars", 0)
     kwargs.setdefault("take_after_minutes", 0)
     kwargs.setdefault("take_in_loss", False)
+    kwargs.setdefault("take_under_buy_stands_down", False)
     if not kwargs["momentum_confirmation_bars"] and not (
         kwargs.get("momentum_fade_bars") or kwargs.get("momentum_drop")
     ):
@@ -4084,7 +4089,7 @@ class TestMomentumConfirmation:
         assert config.momentum_confirmation_bars == 3
         assert config.has_take
         signature = config_signature(config)
-        assert ",confirm=3b" in signature and "@conf>=15m+loss," in signature
+        assert ",confirm=3b" in signature and "@conf>=15m+loss+end<buy," in signature
 
     def test_it_cannot_sit_beside_a_legacy_take(self):
         with pytest.raises(ValueError, match="only one may be set"):
@@ -4218,7 +4223,7 @@ class TestMomentumConfirmation:
     def test_the_take_at_a_loss_is_on_by_default_and_signed(self):
         config = AppleTraderConfig()
         assert config.take_in_loss
-        assert "@conf>=15m+loss," in config_signature(config)
+        assert "@conf>=15m+loss+end<buy," in config_signature(config)
         assert "+loss" not in config_signature(replace(config, take_in_loss=False))
         assert "+loss" not in config_signature(
             AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
@@ -4288,13 +4293,131 @@ class TestMomentumConfirmation:
         assert self._step(trader, tracker, tape, state, 101.0) == "sold"
         assert 0 < tracker.position_for(TICKER) < shares
 
+    # --- a take under the buy level ends the day's buying -------------------
+
+    def _stood_down(self, trader, tracker):
+        return trader.activity("hold", tracker) == ("🟠", "Agent stood down for the day")
+
+    def test_the_take_under_buy_rule_is_on_by_default_and_signed(self):
+        config = AppleTraderConfig()
+        assert config.take_under_buy_stands_down
+        assert "+end<buy," in config_signature(config)
+        assert "+end<buy" not in config_signature(
+            replace(config, take_under_buy_stands_down=False)
+        )
+        # Part of the take, so a run without one signs without it.
+        assert "+end<buy" not in config_signature(
+            AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
+        )
+        summary = at._armed_summary(
+            config, at.apple_models.get(config.model_key), DAYRANGE_BUNDLE
+        )
+        assert "a take at or under the buy level ends the day's buying" in summary
+
+    def test_a_take_under_the_buy_level_buys_nothing_more(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_in_loss=True, take_under_buy_stands_down=True,
+            hold_min_gain_k=100.0,
+        )
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert trader.plan["stand_down"] == (
+            f"momentum take at $101.00, at or under the ${BUY_LEVEL:,.2f} buy level"
+        )
+        assert any(
+            "no further entries today" in e["text"]
+            for e in state.agent_log if e.get("type") == "analysis"
+        )
+        # The next bar is still under the buy level and momentum now says buy:
+        # what bought the same shares back before the rule.
+        self._force(monkeypatch, "positive", "positive")
+        assert self._step(trader, tracker, tape, state, 101.5) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        assert self._stood_down(trader, tracker)
+
+    def test_without_it_the_same_tape_buys_back(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_in_loss=True, hold_min_gain_k=100.0
+        )
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        self._force(monkeypatch, "positive", "positive")
+        assert self._step(trader, tracker, tape, state, 101.5) == "bought"
+        assert not trader.plan.get("stand_down")
+
+    def test_a_take_above_the_buy_level_leaves_it_armed(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_under_buy_stands_down=True, hold_min_gain_k=100.0
+        )
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 105.0) == "sold"
+        assert not trader.plan.get("stand_down")
+        self._force(monkeypatch, "positive", "positive")
+        assert self._step(trader, tracker, tape, state, 102.0) == "bought"
+
+    def test_the_runner_rides_on_but_nothing_more_is_bought(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_in_loss=True, take_under_buy_stands_down=True
+        )
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        assert tracker.position_for(TICKER) > 0 and trader.entry["runner"]
+        assert trader.plan["stand_down"]
+        self._force(monkeypatch, "neutral", "neutral")
+        assert self._step(trader, tracker, tape, state, 109.5, high=109.6) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+        self._force(monkeypatch, "positive", "positive")
+        assert self._step(trader, tracker, tape, state, 101.5) == "hold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_measured_against_the_first_buy_not_the_next_rung(
+        self, state, market_open, monkeypatch
+    ):
+        """With a ladder the resting buy is the next rung, under the first
+        buy's level; a take between the two sells out under the level the next
+        buy would come from, so it counts."""
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_under_buy_stands_down=True, hold_min_gain_k=100.0,
+            scale_in=True, position_pct=50.0, buy_step_k=0.1,
+        )
+        rung = BUY_LEVEL - 0.1 * 10.0
+        assert trader.plan["buy_level"] == pytest.approx(rung)
+        self._force(monkeypatch, "negative", "negative")
+        # In profit over the $101.80 fill, above the rung, under the buy level.
+        assert self._step(trader, tracker, tape, state, 102.0) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert f"under the ${BUY_LEVEL:,.2f} buy level" in trader.plan["stand_down"]
+
+    def test_the_stand_down_is_kept_on_a_restart(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._enter(
+            state, monkeypatch, take_in_loss=True, take_under_buy_stands_down=True,
+            hold_min_gain_k=100.0,
+        )
+        self._force(monkeypatch, "negative", "negative")
+        assert self._step(trader, tracker, tape, state, 101.0) == "sold"
+        trader.publish_memory(state)
+        # ▶ Start again: not a stop-out, so the stand-down is taken back.
+        again = self._trader(take_in_loss=True, take_under_buy_stands_down=True)
+        self._force(monkeypatch, "positive", "positive")
+        assert self._step(again, tracker, tape, state, 101.5) == "hold"
+        assert again.plan["stand_down"] == trader.plan["stand_down"]
+        assert tracker.position_for(TICKER) == 0
+
     # --- the take waits for time since the fill -----------------------------
 
     def test_the_time_gate_is_on_by_default_and_signed(self):
         config = AppleTraderConfig()
         assert config.take_after_minutes == 15
         assert config.take_min_gain_fraction == 0.0
-        assert "@conf>=15m+loss," in config_signature(config)
+        assert "@conf>=15m+loss+end<buy," in config_signature(config)
         assert ">=0m" not in config_signature(replace(config, take_after_minutes=0))
         assert ">=15m" not in config_signature(
             AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
@@ -4328,7 +4451,8 @@ class TestMomentumConfirmation:
 
     def test_the_legacy_gain_gate_is_signed_when_set(self):
         config = AppleTraderConfig(
-            take_min_gain_fraction=0.2, take_after_minutes=0, take_in_loss=False
+            take_min_gain_fraction=0.2, take_after_minutes=0, take_in_loss=False,
+            take_under_buy_stands_down=False,
         )
         assert "@conf>=0.2G," in config_signature(config)
         assert ">=0G" not in config_signature(AppleTraderConfig())
@@ -4408,10 +4532,10 @@ class TestZoneTake:
     def test_momentum_by_default_and_the_zone_signed_in_its_place(self):
         config = AppleTraderConfig()
         assert config.take_trigger == "momentum"
-        assert "@conf>=15m+loss," in config_signature(config)
+        assert "@conf>=15m+loss+end<buy," in config_signature(config)
         zone = replace(config, take_trigger="zone")
         signature = config_signature(zone)
-        assert "@zone20b/3u>=15m+loss," in signature and "@conf" not in signature
+        assert "@zone20b/3u>=15m+loss+end<buy," in signature and "@conf" not in signature
         # The confirmation still gates the buy and the sell level.
         assert ",confirm=3b" in signature
         assert "@zone25b/2.5u" in config_signature(

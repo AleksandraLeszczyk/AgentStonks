@@ -246,6 +246,10 @@ _APPLE_LEGACY = {
     # position to the stop. False is that rule, and it is left out of the
     # signature.
     "take_in_loss": False,
+    # And before 2026-10-22 a take at or under the buy level left the level
+    # armed, so the session could buy the same shares back. False is that rule,
+    # and it is left out of the signature.
+    "take_under_buy_stands_down": False,
     # And before 2026-10-19 only momentum fired the take -- never a stall zone
     # forming under the position. "momentum" is that rule, also today's default,
     # so this entry is here to keep meaning the same if the default moves. A

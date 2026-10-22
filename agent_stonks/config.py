@@ -492,6 +492,18 @@ APPLE_TRADER_TAKE_AFTER_MINUTES = 15
 # SimLab record written until then replays as (`simlab.rule_agents._APPLE_LEGACY`).
 # Not swept.
 APPLE_TRADER_TAKE_IN_LOSS = True
+# Whether a take that sells at or under the buy level ends the session's buying
+# (2026-10-22, at the user's request: "if momentum take is below buy level, do
+# not buy more"). Without it the buy level rests above the price the take just
+# sold at, so the next bar the confirmation reads as a buy buys the same shares
+# back -- AMD on 2026-10-22 took at $505.91 under a $507.35 buy level and bought
+# the same 7 shares again four minutes later, at $505.12. The buy level it is measured
+# against is the one a new entry would rest at (`buy_k`), not the next rung of a
+# ladder. The stand-down is the circuit breaker's: the run goes on, a runner the
+# take kept is still managed, nothing new is bought today. False is the rule
+# before, which is what every SimLab record written until then replays as
+# (`simlab.rule_agents._APPLE_LEGACY`). Not swept.
+APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN = True
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What fires that take short of the sell level (2026-10-19, at the user's
 # request: "add alternative to sell at momentum fade -- sell at forming zone").

@@ -93,6 +93,7 @@ from .config import (
     APPLE_TRADER_TAKE_AFTER_MINUTES,
     APPLE_TRADER_TAKE_IN_LOSS,
     APPLE_TRADER_TAKE_TRIGGER,
+    APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN,
     APPLE_TRADER_TUNED_LEVELS,
     APPLE_TRADER_TUNED_STOP,
     BREACH_BROWNIAN,
@@ -431,6 +432,12 @@ class AppleTraderConfig:
     # a loss left to the stop -- which a stored record replays as. A runner kept
     # from a take at a loss has no breakeven (`_exit`).
     take_in_loss: bool = APPLE_TRADER_TAKE_IN_LOSS
+    # Whether a take that sells at or under the buy level a new entry would rest
+    # at stands the session down: no further buy today, the run and any runner
+    # it kept carrying on (`DayRangeTrader._sell`). Without it the next bar the
+    # confirmation reads as a buy buys back what the take just sold. False is
+    # the rule before 2026-10-22, which a stored record replays as.
+    take_under_buy_stands_down: bool = APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN
     # What fires the take -- one of `config.TAKE_TRIGGERS`. "momentum" is the
     # confirmation table's take row (or whichever legacy rule a record
     # carries); "zone" a stall zone forming under the position
@@ -1101,6 +1108,9 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         # replays gains-only) keeps its filed signature.
         if c.take_in_loss:
             exits += "+loss"
+        # Likewise only while on.
+        if c.take_under_buy_stands_down:
+            exits += "+end<buy"
         exits += f",runner>={c.hold_min_gain_k:g}{unit}"
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
@@ -3240,7 +3250,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         target is too close to be worth the wait and everything goes. Once per
         position: a runner is never trimmed again. The split is the same at a
         loss (the user's choice); that runner just has no breakeven (`_sell`
-        marks it `loss_runner`), so it rides on the stop.
+        marks it `loss_runner`), so it rides on the stop. A take at or under the
+        buy level also ends the session's buying (`take_under_buy_stands_down`,
+        `_take_under_buy`).
 
         The momentum is recomputed over the session on each call rather than
         tracked bar by bar, so a cycle that missed a bar still sees the turn.
@@ -3586,6 +3598,36 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         elif shares:
             # Flat: the trade is over and can be judged.
             self._close_out(state, banked, shares)
+        # After the breaker, so a trade it stands down for says so in its words.
+        if kind == self.EXIT_TAKE:
+            self._take_under_buy(state, bar)
+
+    def _take_under_buy(self, state: AppState, bar) -> None:
+        """Stand the session down after a take at or under the buy level
+        (`take_under_buy_stands_down`).
+
+        Against the level a new entry would rest at -- `buy_k` under this bar's
+        reference, not the ladder's next rung -- because that is where the next
+        buy comes from once the position is sold out: above the price the take
+        sold at, so the first bar the confirmation reads as a buy would buy the
+        same shares back. The close the take judged, as for `loss_runner`, so
+        the rule and the message it logged agree. A runner the take kept rides
+        on; only new buys stop.
+        """
+        config, plan = self.config, self.plan
+        if not config.take_under_buy_stands_down or plan.get("stand_down"):
+            return
+        level = float(plan["reference"]) - float(config.buy_k) * level_unit(config, plan)
+        close = float(bar["close"])
+        if close > level:
+            return
+        take = "zone take" if config.take_trigger == TAKE_ZONE else "momentum take"
+        self._stand_down(
+            state,
+            f"{take} at ${close:,.2f}, at or under the ${level:,.2f} buy level",
+            "The buy level rests above the price the take sold at, so buying there again "
+            "would only buy back the shares just sold.",
+        )
 
     def _stand_down(self, state: AppState, headline: str, why: str) -> None:
         """Take no further entry this session, and say once why.
@@ -5386,6 +5428,10 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             f"it is {config.hold_min_gain_k:g} × {config.unit_phrase} or more above the fill and sold if the "
             "price comes back to it"
             + (" (a take at a loss leaves that to the stop)" if config.take_in_loss else "")
+            + (
+                ", and a take at or under the buy level ends the day's buying"
+                if config.take_under_buy_stands_down else ""
+            )
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
     if config.momentum_confirmation_bars:
