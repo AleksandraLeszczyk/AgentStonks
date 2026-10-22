@@ -742,6 +742,30 @@ class TestRecordedTraderLevels:
         assert band["lower"][at - 1] == pytest.approx(198.0)
         assert band["lower"][at] < 198.0
 
+    def test_a_stopped_runs_range_carries_on_from_where_the_run_left_it(self, monkeypatch):
+        """Not from a walk of the day again: by now the buffer has swapped the
+        09:36 bar for SIP's, $1 under the $198 low the run held through 09:40,
+        and walked again from 09:35 that is a breach -- the band would drop at
+        09:41 with nothing traded near it."""
+        pytest.importorskip("agent_stonks.dayrange_model")
+        bars = minute_bars(n=40)
+        assert min(b["l"] for b in bars) > 198.0
+        bars[6]["l"] = 197.0
+        history = self.history([207.0] * 7, highs=[210.0] * 7)
+        history["seed"] = {
+            "forecast": {"pred_high": 210.0, "pred_low": 198.0, "prev_avg": 200.0,
+                         "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0},
+            "opening_end": pd.Timestamp(f"{SESSION} 09:34", tz="America/New_York"),
+            "open_price": bars[0]["o"],
+        }
+        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", bars, daily_bars=[],
+                           session_date=SESSION, trader_history=history)["items"]
+        # Held all session, so drawn flat: two levels, no band.
+        assert not [i for i in items if i["kind"] == "band"]
+        levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
+        assert levels == {"Pred. high": 210.0, "Pred. low": 198.0}
+
     def test_an_edit_is_drawn_as_a_step_at_the_minute_it_was_adopted(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY],
                              self.history([207.0, 207.0, 205.5, 205.5]), monkeypatch)

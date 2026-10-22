@@ -1124,9 +1124,10 @@ def _after_record(rows: "list[dict]", history: dict, session: pd.DataFrame, conf
     A run that has been stopped leaves a record ending at the minute it stopped,
     and the prediction is about the whole session so far. So the bars after it
     are walked (`session_levels`) from the forecast the run itself started
-    from -- its `seed`, not a fresh model call -- under its configuration, which
-    reproduces the run's own path to the bar and then carries it on. [] when
-    the record predates the seed, or nothing has closed after it.
+    from -- its `seed`, not a fresh model call -- under its configuration,
+    picking the range up where the run's last row left it, as a restart of the
+    run would. [] when the record predates the seed, or nothing has closed
+    after it.
     """
     seed = (history or {}).get("seed")
     if not seed or not rows or not len(session):
@@ -1142,6 +1143,7 @@ def _after_record(rows: "list[dict]", history: dict, session: pd.DataFrame, conf
     walk = session_levels(
         config, dict(seed["forecast"]), session,
         opening_end.tz_convert(session.index.tz), open_price=seed.get("open_price"),
+        resume={**history, "rows": rows},
     )
     return [row for row in walk if pd.Timestamp(row["t"]) > last]
 

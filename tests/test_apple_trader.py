@@ -2334,6 +2334,68 @@ class TestOpeningWindowRevision:
         assert trader.plan["pred_high"] == pytest.approx(101.5)
 
 
+class TestRevisedBarsAreReadOnce:
+    """A bar after the window counts as it stood when the run first read it.
+
+    The live buffer swaps a bar for SIP's once it is 15 minutes old, and SIP's
+    often reaches past the Finnhub/IEX bar the run read. Re-read, that was a
+    breach 15 minutes after its bar, at a minute that traded nowhere near the
+    range (TMO 2026-10-20 09:52: the last 15 minutes topped at $686.37 under a
+    $687.79 predicted high, 09:36 had become SIP's $688.69, and "brownian"
+    moved the range up $10.90)."""
+
+    def _setup(self, state, monkeypatch, policy="brownian"):
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config(
+            breach_update=policy, keep_width=True, level_unit=UNIT_PRED_RANGE,
+        ))
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        return tape, lambda: trader.run_cycle(DAYRANGE_BUNDLE, state, tracker), trader
+
+    @staticmethod
+    def _updates(state):
+        return [e["text"] for e in state.agent_log if "forecast updated" in e.get("text", "")]
+
+    def test_a_bar_revised_after_it_was_read_is_not_a_breach(
+        self, state, market_open, monkeypatch
+    ):
+        tape, cycle, trader = self._setup(state, monkeypatch)
+        tape.append(108.0, high=109.8)
+        cycle()
+        tape.rows[-1]["high"] = 110.4   # SIP's, 15 minutes later
+        for _ in range(3):
+            tape.append(107.0)
+            cycle()
+
+        assert trader.plan["pred_high"] == pytest.approx(FORECAST["pred_high"])
+        assert "range_updates" not in trader.plan
+        assert not self._updates(state)
+
+    def test_a_new_bar_through_the_range_still_is(self, state, market_open, monkeypatch):
+        tape, cycle, trader = self._setup(state, monkeypatch, policy="shift")
+        tape.append(108.0, high=109.8)
+        cycle()
+        tape.rows[-1]["high"] = 110.4
+        tape.append(110.2, high=110.3)
+        cycle()
+
+        # To the new bar's own high, not to the revision's.
+        assert trader.plan["pred_high"] == pytest.approx(110.3)
+        assert len(self._updates(state)) == 1
+
+    def test_bars_the_run_had_not_read_yet_all_count(self, state, market_open, monkeypatch):
+        """Two bars closed since the last cycle: the older one is new to the
+        run, so its breach is read with the newer one."""
+        tape, cycle, trader = self._setup(state, monkeypatch, policy="shift")
+        tape.append(108.0)
+        cycle()
+        tape.append(110.0, high=111.0)
+        tape.append(108.0)
+        cycle()
+
+        assert trader.plan["pred_high"] == pytest.approx(111.0)
+
+
 class TestBreachExit:
     """A bar through the predicted high closes an open position.
 
@@ -3199,6 +3261,147 @@ class TestRestartMemory:
         restarted.run_cycle(DAYRANGE_BUNDLE, restored, continued)
         assert restarted.entry["price"] == pytest.approx(103.0)
         assert restarted.entry["ts"] == tape.index[-2]
+
+
+class TestRestartTakesBackTheRange:
+    """A restart of today's run -- ▶ Start, 🔄 Refresh, an app restart -- takes
+    back the forecast the run made at 9:35 and, under the same range rules,
+    the range it had moved it to, instead of forecasting the day again and
+    walking the range again.
+
+    Live AMD 2026-10-22: forecast $515.23 – $531.88 at 9:35; a ▶ Start at 10:06
+    forecast it again from SIP's windows, $514.77 – $534.06, with nothing
+    traded outside either."""
+
+    CONFIG = dict(breach_update="brownian", keep_width=True, level_unit=UNIT_PRED_RANGE)
+
+    def _early(self, state, monkeypatch, bars, **kwargs):
+        tape = Tape(monkeypatch)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        trader = at.DayRangeTrader(dayrange_config(**{**self.CONFIG, **kwargs}))
+        for close, high in bars:
+            tape.append(close, high=high)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return tape, tracker, trader
+
+    @staticmethod
+    def _remade(monkeypatch) -> list:
+        """The model, asked again now, answers differently -- as HighLow does
+        once SIP has released the 9:35 windows. Any call is recorded."""
+        calls = []
+        monkeypatch.setattr(
+            at._dayrange(), "forecast_session",
+            lambda *a, **k: calls.append(1) or {**FORECAST, "pred_high": 112.0, "pred_low": 94.5},
+        )
+        return calls
+
+    def _restart(self, state, tracker, tape, **kwargs):
+        restarted = at.DayRangeTrader(dayrange_config(**{**self.CONFIG, **kwargs}))
+        tape.append(108.0)
+        restarted.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        return restarted
+
+    def test_a_restart_does_not_forecast_the_day_again(self, state, market_open, monkeypatch):
+        tape, tracker, _ = self._early(state, monkeypatch, [(108.0, 108.2)])
+        remade = self._remade(monkeypatch)
+        restarted = self._restart(state, tracker, tape)
+
+        assert not remade
+        assert restarted.plan["pred_high"] == FORECAST["pred_high"]
+        assert restarted.plan["pred_low"] == FORECAST["pred_low"]
+        rows = state.apple_trader_levels["rows"]
+        assert {(r["pred_high"], r["pred_low"]) for r in rows} == {(110.0, 95.0)}
+        assert state.apple_trader_levels["seed"]["forecast"]["pred_high"] == 110.0
+
+    def test_it_continues_the_range_the_earlier_run_moved(
+        self, state, market_open, monkeypatch
+    ):
+        tape, tracker, early = self._early(
+            state, monkeypatch, [(108.0, 108.2), (111.0, 112.5), (110.0, 110.5)]
+        )
+        moved = (early.plan["pred_high"], early.plan["pred_low"])
+        assert moved[0] > 112.5
+        logged = len(state.agent_log)
+        restarted = self._restart(state, tracker, tape)
+
+        assert (restarted.plan["pred_high"], restarted.plan["pred_low"]) == pytest.approx(moved)
+        assert restarted.plan["forecast_width"] == pytest.approx(15.0)
+        new = [e["text"] for e in state.agent_log[logged:]]
+        assert not [t for t in new if "forecast updated" in t or "caught up" in t]
+        assert any("continuing the range" in t and f"{tape.index[-2]:%H:%M}" in t for t in new)
+
+    def test_a_bar_swapped_for_sips_since_is_not_a_breach_either(
+        self, state, market_open, monkeypatch
+    ):
+        tape, tracker, _ = self._early(state, monkeypatch, [(108.0, 109.8)])
+        tape.rows[-1]["high"] = 110.4
+        restarted = self._restart(state, tracker, tape)
+
+        assert restarted.plan["pred_high"] == pytest.approx(FORECAST["pred_high"])
+        assert "range_updates" not in restarted.plan
+
+    def test_the_bars_it_missed_while_stopped_are_walked(
+        self, state, market_open, monkeypatch
+    ):
+        tape, tracker, _ = self._early(state, monkeypatch, [(108.0, 108.2)])
+        tape.append(111.0, high=112.5)            # while nothing was running
+        restarted = self._restart(state, tracker, tape)
+
+        assert restarted.plan["pred_high"] > 112.5
+        rows = {r["t"]: r["pred_high"] for r in state.apple_trader_levels["rows"]}
+        assert rows[tape.index[-2]] > 112.5
+        assert rows[tape.index[-3]] == pytest.approx(FORECAST["pred_high"])
+
+    def test_under_other_range_rules_the_day_is_walked_again_from_the_same_forecast(
+        self, state, market_open, monkeypatch
+    ):
+        """What a run under the new rules would have made of the day: the
+        forecast is the model's and stays, the range is the rules' and does
+        not."""
+        bars = [(108.0, 108.2), (111.0, 112.5), (110.0, 110.5)]
+        tape, tracker, early = self._early(state, monkeypatch, bars, breach_update="shift")
+        remade = self._remade(monkeypatch)
+        restarted = self._restart(state, tracker, tape)
+
+        fresh = TestLateStart._state()
+        late = at.DayRangeTrader(dayrange_config(**self.CONFIG))
+        monkeypatch.setattr(at._dayrange(), "forecast_session", lambda *a, **k: dict(FORECAST))
+        late.run_cycle(
+            DAYRANGE_BUNDLE, fresh, DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0)),
+        )
+        assert not remade
+        assert restarted.plan["pred_high"] != pytest.approx(early.plan["pred_high"])
+        assert restarted.plan["pred_high"] == pytest.approx(late.plan["pred_high"])
+        assert restarted.plan["pred_low"] == pytest.approx(late.plan["pred_low"])
+
+    def test_only_the_same_models_forecast_is_taken_back(self):
+        rows = [{"t": Tape.OPEN, "model_key": "highlow"}]
+        seed = {"forecast": dict(FORECAST), "opening_end": Tape.OPEN, "open_price": 101.0}
+        # A seed from before seeds named their model: the last row's.
+        assert at._resumable_seed({"rows": rows, "seed": seed}, "highlow") is seed
+        assert at._resumable_seed({"rows": rows, "seed": seed}, "dayrange") is None
+        named = {**seed, "model_key": "dayrange"}
+        assert at._resumable_seed({"rows": rows, "seed": named}, "dayrange") is named
+        assert at._resumable_seed(None, "dayrange") is None
+        assert at._resumable_seed({"rows": rows}, "highlow") is None
+
+    def test_through_the_session_file(self, state, market_open, monkeypatch):
+        from agent_stonks import session_store
+
+        tape, tracker, early = self._early(
+            state, monkeypatch, [(108.0, 108.2), (111.0, 112.5), (110.0, 110.5)]
+        )
+        state.decision_tracker = tracker
+        session_store.claim(state)
+        assert session_store.save(state) is not None
+        restored = TestLateStart._state()
+        assert session_store.restore(restored) is not None
+        remade = self._remade(monkeypatch)
+
+        restarted = self._restart(restored, tracker, tape)
+        assert not remade
+        assert restarted.plan["pred_high"] == pytest.approx(early.plan["pred_high"])
+        assert restarted.plan["pred_low"] == pytest.approx(early.plan["pred_low"])
 
 
 class TestSidebarModelSwitch:

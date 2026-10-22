@@ -1990,60 +1990,76 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         -- so it is recorded in `self.blocked` and reported once. Except for a
         model switched to mid-run (`switching`): the failure is raised, and the
         run stays on the model it had (`_adopt_form_model`).
+
+        A restart of today's run on the model it recorded takes that run's
+        forecast back (`_resumable_seed`), and under the same range rules its
+        range too (`_take_back_range`), rather than making them again. Made
+        again, the forecast reads other tapes than 9:35 did -- after 09:50
+        SIP's window, market proxy and peers where 9:35 had IEX's
+        (`highlow_model.market_window_feed`) -- and comes out different: AMD
+        2026-10-22 was forecast $515.23 – $531.88 at 9:35 and re-made
+        $514.77 – $534.06 by a ▶ Start at 10:06, with nothing traded outside
+        either. And a range walked again over bars the buffer has since
+        swapped for SIP's can find breaches the run never saw.
         """
-        try:
-            opening, tape = self._opening_window(state, frame, want)
-            # A replay's state carries placeholder keys (every *dataset* read is
-            # patched), so HighLow's SIP history falls back to the environment's
-            # there -- the one read no dataset can serve.
-            replayed = bool(getattr(state, "bar_tape_override", ""))
-            forecast, open_price = session_forecast(
-                bundle, self.ticker, opening, today,
-                key=None if replayed else state.api_key,
-                secret=None if replayed else state.api_secret,
-            )
-        except Exception as exc:
-            if switching:
-                raise
-            self.blocked = {"date": today, "reason": str(exc)}
-            _log(
-                state,
-                {
-                    "type": "error",
-                    "text": (
-                        f"Apple Trader cannot forecast today's {self.ticker} range, so it "
-                        "will not "
-                        f"trade this session: {exc}"
-                    ),
-                },
-            )
-            return False
+        prior = self._todays_record(state, today)
+        seed = None if switching else _resumable_seed(prior, self.config.model_key)
+        tape = None
+        if seed is not None:
+            forecast = dict(seed["forecast"])
+            opening_end = _market_ts(seed["opening_end"], frame.index.tz)
+            open_price = float(seed["open_price"])
+        else:
+            try:
+                opening, tape = self._opening_window(state, frame, want)
+                # A replay's state carries placeholder keys (every *dataset* read is
+                # patched), so HighLow's SIP history falls back to the environment's
+                # there -- the one read no dataset can serve.
+                replayed = bool(getattr(state, "bar_tape_override", ""))
+                forecast, open_price = session_forecast(
+                    bundle, self.ticker, opening, today,
+                    key=None if replayed else state.api_key,
+                    secret=None if replayed else state.api_secret,
+                )
+            except Exception as exc:
+                if switching:
+                    raise
+                self.blocked = {"date": today, "reason": str(exc)}
+                _log(
+                    state,
+                    {
+                        "type": "error",
+                        "text": (
+                            f"Apple Trader cannot forecast today's {self.ticker} range, so it "
+                            "will not "
+                            f"trade this session: {exc}"
+                        ),
+                    },
+                )
+                return False
+            opening_end = opening.index[-1]
+            # The official print when there is one, else the 09:30 bar's open --
+            # the same fallback `model_overlays._session_open_price` makes.
+            open_price = float(open_price or opening["open"].iloc[0])
 
         self.plan = {
             "date": today,
-            "opening_end": opening.index[-1],
-            # The official print when there is one, else the 09:30 bar's open --
-            # the same fallback `model_overlays._session_open_price` makes.
-            "open_price": float(open_price or opening["open"].iloc[0]),
+            "opening_end": opening_end,
+            "open_price": open_price,
             **forecast,
         }
         # What the forecast started from, published with the record so the
         # chart can carry the prediction on past the last bar this run read --
         # after ▶ Stop -- without running the model again
-        # (`model_overlays._after_record`).
+        # (`model_overlays._after_record`), and a restart can take it back.
         self.plan["seed"] = {
             "forecast": dict(forecast),
-            "opening_end": opening.index[-1],
-            "open_price": self.plan["open_price"],
+            "opening_end": opening_end,
+            "open_price": open_price,
+            "model_key": self.config.model_key,
         }
-        self._set_levels(opening.index[-1])
-        prior = self.slot.levels(state) or {}
-        if (
-            prior.get("rows")
-            and prior.get("ticker") == self.ticker
-            and pd.Timestamp(prior.get("date")) == pd.Timestamp(today)
-            and _record_strategy(prior) == self.config.strategy
-        ):
+        self._set_levels(opening_end)
+        if prior is not None:
             # A restart mid-session: what the earlier run rested is history and
             # stays on the chart. This run's levels start at the bar it first
             # reads, not at 09:35 -- it rested nothing before it existed.
@@ -2051,20 +2067,62 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             if not switching:
                 self._resume(state, prior.get("memory"))
         else:
-            self._record_levels(state, opening.index[-1])
+            self._record_levels(state, opening_end)
 
         # A HighLow bundle fitted on IEX openings (MU, every HighLow2 one)
         # fetched its own IEX window and was fitted on IEX volume, so the IEX
-        # caveat does not describe it.
+        # caveat does not describe it. A forecast taken back had its caveat
+        # logged by the run that made it.
         warning = (
-            None if (bundle.get("opening_feed") or "sip") != "sip"
+            None if tape is None or (bundle.get("opening_feed") or "sip") != "sip"
             else _dayrange().volume_scale_warning(tape)
         )
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
         _log(state, {"type": "analysis", "text": self._plan_summary()})
+        if seed is not None:
+            self._take_back_range(state, prior, frame)
         self._catch_up(state, frame)
         return True
+
+    def _todays_record(self, state: AppState, today) -> "dict | None":
+        """The record an earlier run published today for this instrument under
+        these rules, which this one continues -- or None."""
+        prior = self.slot.levels(state) or {}
+        if (
+            prior.get("rows")
+            and prior.get("ticker") == self.ticker
+            and pd.Timestamp(prior.get("date")) == pd.Timestamp(today)
+            and _record_strategy(prior) == self.config.strategy
+        ):
+            return prior
+        return None
+
+    def _take_back_range(self, state: AppState, record: dict, frame) -> None:
+        """Put the range back where the earlier run's last recorded bar left it,
+        logged when that is not the forecast itself.
+
+        The bars from there on are this run's to read (`_catch_up`). Only under
+        the range rules that run had (`RANGE_RULES`): started under others, the
+        range is the one these would have made of the day, so `_catch_up`
+        walks it again from the forecast -- as a late start would."""
+        recorded = record.get("config")
+        if recorded is None or any(
+            getattr(recorded, name, None) != getattr(self.config, name) for name in RANGE_RULES
+        ):
+            return
+        plan = self.plan
+        forecast = (float(plan["pred_high"]), float(plan["pred_low"]))
+        if not self._resume_range(record["rows"][-1], frame):
+            return
+        if (float(plan["pred_high"]), float(plan["pred_low"])) == forecast:
+            return
+        _log(state, {"type": "analysis", "text": (
+            f"{self.ticker}: continuing the range today's earlier run left at "
+            f"{plan['seen_to']:%H:%M}: ${float(plan['pred_low']):,.2f} – "
+            f"${float(plan['pred_high']):,.2f}, buy ${plan['buy_level']:,.2f}, "
+            f"sell ${plan['sell_level']:,.2f}."
+        )})
 
     def _catch_up(self, state: AppState, frame) -> None:
         """Walk the bars between the forecast and the newest one, one at a time.
@@ -2085,7 +2143,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         was running to rest one.
         """
         plan = self.plan
-        missed = [ts for ts in frame.index[:-1] if ts > plan["opening_end"]]
+        # After the bar a restart took the range back at, if it did: the bars
+        # before it are the earlier run's, already read.
+        start = plan.get("seen_to", plan["opening_end"])
+        missed = [ts for ts in frame.index[:-1] if ts > start]
         if not missed:
             return
         history = plan.setdefault("history", [])
@@ -2112,7 +2173,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                     "type": "analysis",
                     "text": (
                         f"{self.ticker}: caught up on the {len(missed)} bars since "
-                        f"{plan['opening_end']:%H:%M}. The forecast was revised at the "
+                        f"{start:%H:%M}. The forecast was revised at the "
                         f"bars that traded outside it ({times}); predicted range is now "
                         f"${float(plan['pred_low']):,.2f} – ${float(plan['pred_high']):,.2f}, "
                         f"buy ${plan['buy_level']:,.2f}, sell ${plan['sell_level']:,.2f}."
@@ -2856,32 +2917,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         )
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
-        # A forecast of the range *after* the opening window (HighLow2's rest
-        # head) says nothing about the window itself, so its own extremes are not a
-        # breach of it: the tape is read from the first bar after the window.
-        # Every other forecast covers the whole session and is clipped to
-        # contain the window -- the window *as the forecast read it*, which is
-        # what `or_high`/`or_low` are. Not re-read from the frame: the live
-        # buffer swaps the window's bars for SIP's once they are 15 minutes old
-        # (`bar_history.SETTLED_BAR_AGE_MIN`), and SIP's, with every venue's
-        # prints, can reach a few cents past the Finnhub/IEX bar the forecast
-        # was made from. Re-read, that revision was a "breach" no bar after the
-        # forecast had traded (AAPL 2026-10-12: the 09:30 low went $337.63 →
-        # $337.60 at 09:46, against a predicted low of $337.63, and both sides
-        # of the range moved).
-        traded = frame[frame.index > plan["opening_end"]]
-        session_high = float(traded["high"].max())
-        session_low = float(traded["low"].min())
-        if not plan.get("range_after_opening"):
-            window = frame[frame.index <= plan["opening_end"]]
-            or_high = plan.get("or_high")
-            or_low = plan.get("or_low")
-            session_high = max(session_high, float(
-                or_high if or_high is not None else window["high"].max()
-            ))
-            session_low = min(session_low, float(
-                or_low if or_low is not None else window["low"].min()
-            ))
+        session_high, session_low = self._read_extremes(frame, ts)
         high, low = dayrange.updated_range(
             plan,
             session_high=session_high,
@@ -2902,6 +2938,79 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         before["breached_high"] = session_high > before["pred_high"]
         before["breached_low"] = session_low < before["pred_low"]
         return before
+
+    def _read_extremes(self, frame, ts) -> "tuple[float, float]":
+        """The session's high and low through bar `ts`, as this run read them.
+
+        Each bar counts as it stood when it was first read, and only then:
+        the plan keeps the extremes so far (`seen_high`/`seen_low`) and the bar
+        they go to (`seen_to`), and only the bars after it are taken from the
+        frame. The live buffer swaps a bar for SIP's once it is 15 minutes old
+        (`bar_history.SETTLED_BAR_AGE_MIN`), and SIP's, with every venue's
+        prints, often reaches a few cents past the Finnhub/IEX bar first read.
+        Re-read every bar, that revision was a breach dated 15 minutes after
+        its bar, at a minute that had traded nowhere near the range (TMO
+        2026-10-20: a predicted high of $687.79 went "through" at 09:52, its
+        last 15 minutes topping at $686.37, because 09:36 had become SIP's
+        $688.69 -- and "brownian" moved the range up $10.90).
+
+        A forecast of the range *after* the opening window (HighLow2's rest
+        head) says nothing about the window itself, so its own extremes are not a
+        breach of it: the tape is read from the first bar after the window.
+        Every other forecast covers the whole session and is clipped to
+        contain the window -- the window *as the forecast read it*, which is
+        what `or_high`/`or_low` are, for the same reason (AAPL 2026-10-12: the
+        09:30 low went $337.63 → $337.60 at 09:46, against a predicted low of
+        $337.63, and both sides of the range moved).
+        """
+        plan = self.plan
+        start = plan.get("seen_to")
+        if start is None:
+            start = plan["opening_end"]
+            high, low = -math.inf, math.inf
+            if not plan.get("range_after_opening"):
+                window = frame[frame.index <= start]
+                or_high, or_low = plan.get("or_high"), plan.get("or_low")
+                high = _finite(or_high if or_high is not None else window["high"].max(), high)
+                low = _finite(or_low if or_low is not None else window["low"].min(), low)
+        else:
+            high, low = float(plan["seen_high"]), float(plan["seen_low"])
+        new = frame[(frame.index > start) & (frame.index <= ts)]
+        if len(new):
+            high = max(high, float(new["high"].max()))
+            low = min(low, float(new["low"].min()))
+        plan["seen_high"], plan["seen_low"], plan["seen_to"] = high, low, max(start, ts)
+        return high, low
+
+    def _resume_range(self, row: dict, frame) -> bool:
+        """`_take_back_range` without the log line: the range moved to `row`'s
+        (a recorded bar after the opening window, under this run's range
+        rules), the session read through that bar, and the levels rebuilt
+        there. False -- nothing done -- for a row at or before the window, or
+        past the newest bar of `frame`, which this run could not have reached.
+
+        The width a breach keeps is still the forecast's own, so it is kept
+        before the range moves. The extremes are the frame's through the row's
+        bar, held inside the range taken back: a run that moves its range moves
+        it over everything it reads, so inside is where the recording run read
+        them, and a bar the buffer has since swapped for SIP's, past it, is the
+        revision `_read_extremes` does not count. (A run that holds its
+        forecast through anything -- `off`, no containment -- reads no extremes
+        at all.)
+        """
+        plan = self.plan
+        ts = _market_ts(row["t"], frame.index.tz)
+        if ts <= plan["opening_end"] or ts > frame.index[-1]:
+            return False
+        plan.setdefault(
+            "forecast_width", float(plan["pred_high"]) - float(plan["pred_low"])
+        )
+        plan["pred_high"], plan["pred_low"] = float(row["pred_high"]), float(row["pred_low"])
+        high, low = self._read_extremes(frame[frame.index <= ts], ts)
+        plan["seen_high"] = min(high, plan["pred_high"])
+        plan["seen_low"] = max(low, plan["pred_low"])
+        self._set_levels(ts)
+        return True
 
     def _range_summary(self, ts, before: dict) -> str:
         """The one line an update writes: what the tape did, and what moved.
@@ -3638,6 +3747,44 @@ def _record_strategy(record: dict) -> str:
     return apple_models.strategy(getattr(config, "model_key", None))
 
 
+# The settings that decide where the range goes once the tape has traded
+# outside it (`DayRangeTrader._move_range`): a restart under the same ones
+# continues the earlier run's range (`_take_back_range`).
+RANGE_RULES = ("breach_update", "keep_width", "contain_range", "level_unit")
+
+
+def _resumable_seed(record: "dict | None", model_key: str) -> "dict | None":
+    """The forecast today's earlier run started from (its record's `seed`),
+    when a restart on `model_key` takes it back rather than forecasting again
+    (`DayRangeTrader._plan_session`) -- or None.
+
+    Only the same model's: a run started on another one forecasts the day with
+    it. A seed from before seeds named their model (2026-10-22) is the model of
+    the record's last row, since a run re-makes its seed whenever it re-makes
+    its forecast and records every row under the model it then runs."""
+    rows = (record or {}).get("rows") or []
+    seed = (record or {}).get("seed")
+    if not rows or not seed:
+        return None
+    made_by = seed.get("model_key") or rows[-1].get("model_key")
+    return seed if made_by == model_key else None
+
+
+def _market_ts(stamp, tz) -> pd.Timestamp:
+    """A recorded time on `tz` (the frame's); one saved without a zone is
+    exchange time, as the session file wrote it."""
+    stamp = pd.Timestamp(stamp)
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize(market_hours.MARKET_TZ)
+    return stamp.tz_convert(tz) if tz is not None else stamp
+
+
+def _finite(value, default: float) -> float:
+    """`value` as a float, or `default` for a missing one (NaN: no bar)."""
+    value = float(value)
+    return value if math.isfinite(value) else default
+
+
 def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
     """One bar's levels off a plan: what `session_levels` walks and a live run
     records (`DayRangeTrader._record_levels`), in the one shape the chart reads.
@@ -3664,6 +3811,7 @@ def session_levels(
     session,
     opening_end,
     open_price: "float | None" = None,
+    resume: "dict | None" = None,
 ) -> "list[dict]":
     """The buy and sell levels this configuration would rest, bar by bar.
 
@@ -3700,6 +3848,13 @@ def session_levels(
     No orders, no log and no ledger: nothing here touches `run_cycle`. The
     circuit breaker and the managed exit are deliberately not modelled -- they
     are about a position, and this is about where the levels sat.
+
+    `resume` is a run's published record to carry on from
+    (`model_overlays._after_record`): the walk starts where the record's last
+    row left the range, as a restart of that run would (`_resume_range`), and
+    returns rows for the bars after it only. Walked again from 09:35 instead,
+    the bars the buffer has swapped for SIP's since the run read them can move
+    the range somewhere the run never had it.
     """
     trader = DayRangeTrader(config)
     trader.plan = {
@@ -3722,6 +3877,8 @@ def session_levels(
     # draws the revised levels as if they had stood since 09:35.
     trader._set_levels(opening_end)
     out: "list[dict]" = [row(opening_end)]
+    if resume is not None and trader._resume_range(resume["rows"][-1], session):
+        out, after = [], [ts for ts in after if ts > trader.plan["seen_to"]]
     for ts in after:
         trader._move_range(session[session.index <= ts], ts)
         trader._set_levels(ts)
