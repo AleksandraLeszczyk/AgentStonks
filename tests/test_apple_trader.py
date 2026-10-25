@@ -4948,3 +4948,46 @@ class TestNoBuyIntoAFall:
 
         assert _apple_from_record({}).max_fall_k == 0.0
         assert _apple_from_record({"max_fall_k": 0.25}).max_fall_k == 0.25
+
+
+class TestConfigSettings:
+    """`config_settings`: the signature in words, for comparing two configurations."""
+
+    @staticmethod
+    def as_dict(config) -> dict:
+        return {name: value for _, name, value in at.config_settings(config)}
+
+    def test_the_levels_stop_and_rules_read_in_the_forms_words(self):
+        rows = self.as_dict(AppleTraderConfig(
+            model_key="highlow", ticker="AMD", buy_k=0.75, sell_k=0.1, position_pct=95.0,
+            level_unit="pred_range", stop_gain_fraction=0.5, breach_update="brownian",
+            momentum_confirmation_bars=3,
+        ))
+        assert rows["Instrument"] == "AMD"
+        assert rows["Buy distance"] == "0.75 × predicted range below the predicted high"
+        assert rows["Sell distance"] == "0.1 × predicted range below the predicted high"
+        assert rows["Position size"] == "95% of cash"
+        assert rows["Stop loss"] == (
+            "0.5 × the predicted gain below the fill (= 0.325 × predicted range)"
+        )
+        assert rows["If the session trades outside the forecast"].startswith("Brownian")
+        assert rows["Momentum confirmation period"] == "3 bars"
+
+    def test_rules_switched_off_are_written_out_rather_than_left_out(self):
+        rows = self.as_dict(dayrange_config(breach_exit=False, stop_gain_fraction=0.0))
+        assert rows["A breach of the predicted high sells"] == "no"
+        assert rows["Stop loss"] == "off"
+        assert rows["Sit out these sessions"] == "none"
+
+    def test_settings_that_cannot_change_a_trade_are_left_out_like_their_tokens(self):
+        full = self.as_dict(dayrange_config(position_pct=100.0, scale_in=True))
+        assert "Next buy" not in full and "Buy again lower while cash allows" not in full
+        no_take = self.as_dict(dayrange_config(negative_momentum_bars=0))
+        assert no_take["Take short of the sell level"] == "off"
+        assert "Take sells" not in no_take
+
+    def test_each_model_reads_only_its_own_rules(self):
+        gm = self.as_dict(AppleTraderConfig(model_key="goodmoments", gm_take_min_k=None))
+        assert "Entry: edge at least" in gm and "Buy distance" not in gm
+        ff = self.as_dict(AppleTraderConfig(model_key="fastfurious"))
+        assert "Entry threshold" in ff and "Buy distance" not in ff

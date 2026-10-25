@@ -4585,6 +4585,67 @@ def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
     return rows
 
 
+# What a changed setting is tinted in: the outline colour of the configuration
+# it belongs to on the heatmaps (`_tuning_view_heatmap`), faint enough to read
+# through in either theme.
+_TUNING_CHANGED_TINT = {
+    "Pick": "background-color: rgba(0, 104, 201, 0.25)",
+    "Selected": "background-color: rgba(224, 64, 251, 0.25)",
+}
+
+
+def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None") -> None:
+    """The base configuration and the shown one -- the pick, or the square
+    clicked -- side by side in words, setting by setting
+    (`tuning.compare_settings`), what the shown one changes tinted; then both
+    signatures, the form Results and the Simulate tab name runs by."""
+    spec = job["spec"]
+    try:
+        base = sim_tuning.make_config(spec["base"], {})
+        other = sim_tuning.make_config(spec["base"], shown)
+    except (TypeError, ValueError):
+        return
+    who = "Pick" if chosen is None else "Selected"
+    rows = sim_tuning.compare_settings(base, other)
+    # The section once per group, as the form heads it, not on every row.
+    for row, before in zip(rows, [None, *rows]):
+        row["group"] = row["section"] if before is None or before["section"] != row["section"] else ""
+    tint = _TUNING_CHANGED_TINT[who]
+    frame = pd.DataFrame({
+        "": [r["group"] for r in rows],
+        "Setting": [r["setting"] for r in rows],
+        "Base": [r["base"] if r["base"] is not None else "—" for r in rows],
+        who: [r["other"] if r["other"] is not None else "—" for r in rows],
+    })
+    st.markdown(f"**Configuration: base vs {who.lower()}**")
+    # A static table rather than a dataframe: it wraps a long value instead of
+    # cutting it off, and a comparison is read whole, never sorted or scrolled.
+    st.table(
+        frame.style.apply(
+            lambda r: [tint if rows[r.name]["changed"] else ""] * len(r), axis=1
+        ),
+        hide_index=True,
+    )
+    changed = [r["setting"].lower() for r in rows if r["changed"]]
+    st.caption(
+        (
+            f"The {who.lower()} changes {len(changed)} setting"
+            f"{'' if len(changed) == 1 else 's'} of the base, tinted: {', '.join(changed)}."
+            if changed else f"The {who.lower()} is the base configuration."
+        )
+        + f" Set these in an Apple Trader setup on the Simulate tab to replay "
+        f"{'the pick' if chosen is None else 'it'} with its full ledger, charts and decisions."
+    )
+    signature = rule_agent(APPLE_TRADER_KEY).signature
+    col_base, col_other = st.columns(2)
+    with col_base:
+        st.caption("Base as a signature")
+        st.code(signature(base), language=None, wrap_lines=True)
+    with col_other:
+        st.caption(f"{who} as a signature")
+        st.code(signature(other), language=None, wrap_lines=True)
+
+
 def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> None:
     """"Set as base configuration": the configuration on screen -- the pick, or
     the square clicked -- becomes what every new run of its (model, ticker)
@@ -5384,6 +5445,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     )
     shown = chosen if chosen is not None else (best or {}).get("overrides")
     if shown is not None:
+        _render_tuning_config_compare(job, shown, chosen)
         _render_tuning_set_base(job, shown, chosen)
 
     marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
@@ -5471,17 +5533,6 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         for note in forecasts["notes"]:
             st.caption(f":material/info: {note}")
         _render_tuning_session_context(job, context, chosen)
-        picked = sim_tuning.make_config(spec["base"], shown)
-        st.markdown(
-            "**The pick as a configuration**" if chosen is None
-            else "**The selected square as a configuration**"
-        )
-        st.code(rule_agent(APPLE_TRADER_KEY).signature(picked), language=None)
-        st.caption(
-            f"{_tuning_values_text(shown)}. Set these in an Apple Trader setup on the "
-            f"Simulate tab to replay {'the pick' if chosen is None else 'it'} with its "
-            "full ledger, charts and decisions."
-        )
 
     # A derived grid has no record to delete -- it is the runs themselves, and
     # they are Results' to remove.

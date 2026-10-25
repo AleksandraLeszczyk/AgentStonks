@@ -17,7 +17,7 @@ import pandas as pd
 import pytest
 
 from agent_stonks import momentum_regime
-from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTraderConfig
+from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTraderConfig, config_settings
 from agent_stonks.config import UNIT_ADR
 from agent_stonks.market_hours import MARKET_TZ
 from dataclasses import asdict, fields
@@ -2007,3 +2007,26 @@ class TestReplaySpeedups:
                     else:
                         assert len(fast) == 0
         assert momentum_regime.minute_frame is original
+
+
+class TestCompareSettings:
+    """The base and the shown configuration side by side, setting by setting."""
+
+    def test_rows_line_up_and_only_the_changed_ones_are_marked(self):
+        base = tu.make_config({"model_key": "highlow", "ticker": "AAPL"}, {})
+        other = tu.make_config({"model_key": "highlow", "ticker": "AAPL"}, {"buy_k": 0.9})
+        rows = tu.compare_settings(base, other)
+        changed = [r["setting"] for r in rows if r["changed"]]
+        assert "Buy distance" in changed and "Instrument" not in changed
+        assert [r["setting"] for r in rows] == [n for _, n, _ in config_settings(base)]
+
+    def test_a_setting_only_one_side_has_sits_in_its_place(self):
+        record = {"model_key": "highlow", "ticker": "AAPL", "scale_in": True}
+        base = tu.make_config(record, {"position_pct": 100.0})
+        other = tu.make_config(record, {"position_pct": 50.0})
+        rows = tu.compare_settings(base, other)
+        names = [r["setting"] for r in rows]
+        step = next(r for r in rows if r["setting"] == "Next buy")
+        assert step["base"] is None and step["changed"]
+        assert names.index("Next buy") == names.index("Buy again lower while cash allows") + 1
+        assert names[-1] == "Sit out these sessions"

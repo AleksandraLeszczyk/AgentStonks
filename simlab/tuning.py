@@ -72,6 +72,7 @@ from agent_stonks.apple_trader import (
     APPLE_TRADER_KEY,
     RULE_PROVIDER,
     AppleTraderConfig,
+    config_settings,
     config_signature,
     model_ticker_error,
 )
@@ -559,6 +560,32 @@ def make_config(base: dict, overrides: dict) -> AppleTraderConfig:
     from .rule_agents import rule_agent
 
     return rule_agent(APPLE_TRADER_KEY).from_record({**base, **overrides})
+
+
+def compare_settings(base: AppleTraderConfig, other: AppleTraderConfig) -> "list[dict]":
+    """Two configurations side by side, setting by setting (`config_settings`):
+    `{section, setting, base, other, changed}` in the form's order.
+
+    A row only one of them has -- the ladder's step where only one buys less
+    than everything, say -- is kept where it belongs rather than appended, with
+    None on the side that has no such setting, and counts as changed.
+    """
+    left = {(s, name): value for s, name, value in config_settings(base)}
+    right = {(s, name): value for s, name, value in config_settings(other)}
+    order = list(left)
+    previous = None
+    for key in right:
+        if key not in left:
+            order.insert(order.index(previous) + 1 if previous is not None else 0, key)
+        previous = key
+    return [
+        {
+            "section": section, "setting": name,
+            "base": left.get((section, name)), "other": right.get((section, name)),
+            "changed": left.get((section, name)) != right.get((section, name)),
+        }
+        for section, name in order
+    ]
 
 
 def expand(

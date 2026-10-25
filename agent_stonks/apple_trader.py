@@ -111,6 +111,7 @@ from .config import (
     APPLE_TRADER_ZONE_MIN_BARS,
     APPLE_TRADER_ZONE_WIDTH,
     TAKE_MOMENTUM,
+    TAKE_TRIGGER_LABELS,
     TAKE_TRIGGERS,
     TAKE_ZONE,
     UNIT_ADR,
@@ -1257,6 +1258,185 @@ def _hybrid_levels_signature(c: AppleTraderConfig) -> str:
     if c.contain_range:
         out += ",contain"
     return out
+
+
+def config_settings(config: "AppleTraderConfig | None" = None) -> "list[tuple[str, str, str]]":
+    """`config_signature` in words: (section, setting, value) rows, worded and
+    grouped like the setup form, for a reader comparing two configurations.
+
+    Covers what the signature covers -- the fields the model's rules read --
+    but every rule the form offers is written out, "no" or "off" included,
+    rather than only while on: two configurations then line up row by row. A
+    row that only means something under another setting (the take's share
+    with no take, the ladder's step at 100%) is left out, as the signature
+    leaves its token out, and so are the legacy fields while a stored record
+    does not carry them.
+    """
+    c = config or AppleTraderConfig()
+    rows = [
+        ("Model", "Instrument", c.ticker),
+        ("Model", "Model", apple_models.get(c.model_key).label
+         if c.model_key in apple_models.MODELS else c.model_key),
+    ]
+    if c.strategy == apple_models.STRATEGY_MOMENTUM:
+        rows += _momentum_settings(c)
+    elif c.strategy == apple_models.STRATEGY_PROBABILITY:
+        rows += _probability_settings(c)
+    else:
+        rows += _dayrange_settings(c)
+    days = ", ".join(event_days.LABELS[e] for e in c.skip_events) or "none"
+    rows.append(("Days off", "Sit out these sessions", days))
+    return rows
+
+
+def _yes(flag: bool) -> str:
+    return "yes" if flag else "no"
+
+
+def _dayrange_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
+    unit = LEVEL_UNIT_PHRASES[c.level_unit]
+    levels = "Levels"
+    rows = [
+        (levels, "Distances counted in", unit),
+        (levels, "Buy distance", f"{c.buy_k:g} × {unit} below the predicted high"),
+        (levels, "Sell distance", f"{c.sell_k:g} × {unit} below the predicted high"),
+        (levels, "Position size", f"{c.position_pct:g}% of cash"),
+        (levels, "Buy order", "limit at the buy level" if c.limit_entry else "market"),
+        (levels, "Momentum confirmation period",
+         f"{c.momentum_confirmation_bars} bars" if c.momentum_confirmation_bars else "off"),
+    ]
+    if c.position_pct < 100:
+        rows.append((levels, "Buy again lower while cash allows", _yes(c.scale_in)))
+    if c.can_scale_in:
+        rows.append((levels, "Next buy", (
+            f"{c.buy_step_k:g} × {unit} lower per buy" if c.buy_step_k
+            else "half-way to the bottom of the range"
+        )))
+        rows.append((levels, "Add only under the last fill", _yes(c.add_under_fill)))
+        if c.has_stop:
+            rows.append((levels, "Stop hangs under",
+                         "the next rung" if c.stop_under_next_buy else "the last fill"))
+    if c.max_fall_k:
+        rows.append((levels, "No buy into a fall over",
+                     f"{c.max_fall_k:g} × {unit} in {c.fall_bars} bars"))
+
+    breach = "Forecast breach"
+    rows.append((breach, "If the session trades outside the forecast",
+                 BREACH_LABELS.get(c.breach_update, c.breach_update)))
+    if c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+        rows.append((breach, "Keep the range's width", _yes(c.keep_width)))
+    rows.append((breach, "Forecast must contain the session so far", _yes(c.contain_range)))
+    rows.append((breach, "A breach of the predicted high sells", _yes(c.breach_exit)))
+
+    exits = "Exits"
+    if c.stop_gain_fraction:
+        # What it comes to in the levels' unit too: the same fraction is a
+        # different distance under every pair of levels.
+        stop = (
+            f"{c.stop_gain_fraction:g} × the predicted gain below the fill "
+            f"(= {round(c.stop_gain_fraction * c.target_gain_k, 3):g} × {unit})"
+        )
+    elif c.stop_k:
+        stop = f"{c.stop_k:g} × ADR below the fill"
+    else:
+        stop = "off"
+    rows.append((exits, "Stop loss", stop))
+    if c.take_trigger == TAKE_ZONE:
+        take = (
+            f"{TAKE_TRIGGER_LABELS[TAKE_ZONE]}: {c.zone_min_bars} bars inside "
+            f"{c.zone_width:g} × the minute move"
+        )
+    elif c.momentum_confirmation_bars:
+        take = TAKE_TRIGGER_LABELS[TAKE_MOMENTUM]
+    elif c.negative_momentum_bars:
+        take = (
+            f"{c.negative_momentum_bars}-bar momentum negative for "
+            f"{c.negative_for_bars} bars (earlier rule)"
+        )
+    elif c.momentum_fade_bars:
+        take = f"momentum fades over {c.momentum_fade_bars} bars (earlier rule)"
+    elif c.momentum_drop:
+        take = f"momentum drops {c.momentum_drop:g}σ from its best (earlier rule)"
+    else:
+        take = "off"
+    rows.append((exits, "Take short of the sell level", take))
+    if take != "off":
+        rows.append((exits, "Take sells", f"{c.take_fraction * 100:g}% of shares"))
+        rows.append((exits, "Take only after", (
+            f"{c.take_after_minutes} min since the last fill" if c.take_after_minutes
+            else "any time"
+        )))
+        if c.take_min_gain_fraction:
+            rows.append((exits, "Take only once the gain is",
+                         f"≥ {c.take_min_gain_fraction:g} × the predicted gain"))
+        rows.append((exits, "Take in a loss too", _yes(c.take_in_loss)))
+        rows.append((exits, "No more buys after a take under the buy level",
+                     _yes(c.take_under_buy_stands_down)))
+        rows.append((exits, "Keep a runner if the target is",
+                     f"≥ {c.hold_min_gain_k:g} × {unit} above the fill"))
+
+    breaker = "Circuit breaker"
+    rows.append((breaker, "Stand down after a trade under", (
+        f"{c.min_win_k:g} × {unit} a share" if c.min_win_k else "off"
+    )))
+    if c.min_win_k or (take != "off" and c.take_under_buy_stands_down):
+        rows.append((breaker, "Stand down only until the forecast is revised",
+                     _yes(c.breaker_until_revised)))
+    return rows
+
+
+def _momentum_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
+    signal = "Signal"
+    return [
+        (signal, "Entry threshold", f"quantile {c.ff_entry_quantile:g} of the last 20 sessions"),
+        (signal, "Hold after the last buy signal", f"{c.ff_hold_minutes} min"),
+        (signal, "Stop", (
+            f"{c.ff_stop_k:g} × the forecast 2-hour drop below the fill" if c.ff_stop_k
+            else "off"
+        )),
+        (signal, "Sell on a sell signal", _yes(c.ff_exit_on_sell_signal)),
+        (signal, "Position size", f"{c.position_pct:g}% of cash"),
+    ]
+
+
+def _probability_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
+    signal = "Signal"
+    if not c.gm_take_k:
+        take = "off"
+    elif c.gm_take_min_k is not None:
+        take = (
+            f"{c.gm_take_k:g} ADR over the fill, down to {c.gm_take_min_k:g} at the "
+            "quietest minute"
+        )
+    else:
+        take = f"{c.gm_take_k:g} ADR over the fill"
+    rows = [
+        (signal, "Entry: edge at least", f"{c.gm_enter:+g}"),
+        (signal, "Position size", f"{c.position_pct:g}% of cash"),
+        (signal, "Take-profit", take),
+        (signal, "Stop", f"{c.gm_stop_k:g} ADR under the fill" if c.gm_stop_k else "off"),
+        (signal, "Sell when the edge fades",
+         f"under {c.gm_exit:+g}" if c.gm_exit is not None else "no"),
+        (signal, "Momentum confirmation period",
+         f"{c.gm_confirm_bars} bars" if c.gm_confirm_bars else "off"),
+        ("Circuit breaker", "Raise the entry after a stop",
+         f"by {c.gm_stop_raise:g} per stop" if c.gm_stop_raise else "no"),
+    ]
+    parent_key = apple_models.levels_of(c.model_key)
+    if parent_key:
+        parent = apple_models.get(parent_key).label.replace(" model", "")
+        unit = LEVEL_UNIT_PHRASES[c.level_unit]
+        section = f"{parent} buy level"
+        rows += [
+            (section, "Buy at or under",
+             f"{c.buy_k:g} × {unit} below {parent}'s predicted high"),
+            (section, "If the session trades outside the forecast",
+             BREACH_LABELS.get(c.breach_update, c.breach_update)),
+        ]
+        if c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+            rows.append((section, "Keep the range's width", _yes(c.keep_width)))
+        rows.append((section, "Forecast must contain the session so far", _yes(c.contain_range)))
+    return rows
 
 
 def _ff_rules(c: AppleTraderConfig) -> str:
