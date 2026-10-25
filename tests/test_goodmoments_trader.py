@@ -355,10 +355,14 @@ class TestKeptApart:
         assert apple_models.GOODMOMENTS_KEY in apple_models.keys_for("AMD")
         assert apple_models.HIGHLOW2_GOODMOMENTS_KEY not in apple_models.keys_for("AMD")
 
-    def test_orchestra_neither_offers_nor_takes_it(self):
-        assert not [p for p in orchestra.all_pairs() if p.endswith(":goodmoments")]
-        with pytest.raises(ValueError, match="day-range"):
-            orchestra.OrchestraConfig([gm_config()])
+    def test_orchestra_offers_and_takes_it_but_not_fast_and_furious(self):
+        # Since 2026-10-25 Orchestra races GoodMoments pairs too
+        # (tests/test_orchestra.py); Fast&Furious's rules it is not written for.
+        assert {"AAPL:goodmoments", "AMD:goodmoments"} <= set(orchestra.all_pairs())
+        assert orchestra.OrchestraConfig([gm_config()]).keys == ["AAPL:goodmoments"]
+        assert not [p for p in orchestra.all_pairs() if p.endswith(":fastfurious")]
+        with pytest.raises(ValueError, match="runs its own"):
+            orchestra.OrchestraConfig([AppleTraderConfig(model_key=apple_models.FASTFURIOUS_KEY)])
 
     def test_tuning_offers_its_axes_only_on_it(self):
         from simlab import tuning

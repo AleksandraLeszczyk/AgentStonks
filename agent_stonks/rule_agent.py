@@ -96,6 +96,10 @@ class BaseTrader:
     #: trigger there ("Entry signal confirmed", "Buy level touched").
     ENTRY_TRIGGER_TEXT = "Entry signal confirmed"
 
+    #: What the trader did that the entry gate refused (`entry_refused`):
+    #: "AAPL reached its buy level at 10:02, but ...".
+    GATE_TRIGGER_TEXT = "reached its buy level"
+
     #: Whether an open position tracks the highest price seen since entry.
     #: Only the momentum rules trail a stop; the others exit on a level, a
     #: forecast or a fixed stop measured from the entry price itself.
@@ -188,7 +192,7 @@ class BaseTrader:
                 state,
                 {
                     "type": "status",
-                    "text": f"{self.ticker} reached its buy level at {ts:%H:%M}, "
+                    "text": f"{self.ticker} {self.GATE_TRIGGER_TEXT} at {ts:%H:%M}, "
                     f"but {reason}.",
                 },
             )

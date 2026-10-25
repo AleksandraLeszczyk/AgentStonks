@@ -4613,6 +4613,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
     """
 
     ENTRY_TRIGGER_TEXT = "Edge at the entry threshold"
+    GATE_TRIGGER_TEXT = "had an edge at its entry"
 
     #: Which rule closed a position -- carried on the log entry.
     EXIT_STOP = "stop"
@@ -4634,6 +4635,10 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         self.slot: TraderSlot = SINGLE_SLOT
         self.quiet_read = False
         self.last_close: "float | None" = None
+        # The last bar's minute of the session (0 = 09:30), for whoever
+        # watches several traders at once (`orchestra`'s board): whether the
+        # pause after a stop or the last entry minute is past.
+        self.last_minute: "int | None" = None
         # The last forecast failure reported, so a feed that is down is said
         # once rather than every minute.
         self._forecast_note: "str | None" = None
@@ -4684,6 +4689,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         ts = frame.index[-1]
         self.last_close = float(last["close"])
         minute = int(round(float(last["minutes_from_open"])))
+        self.last_minute = minute
         position = tracker.position_for(self.ticker)
         if position > 0 and self.entry is None:
             # A position without a remembered entry (a restart onto an existing

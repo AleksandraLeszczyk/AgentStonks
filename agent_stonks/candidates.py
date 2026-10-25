@@ -21,7 +21,10 @@ What is known at 09:34, and what the selection reads of it:
   minutes' move on a scale that compares across symbols.
 * **the pair's own levels**: what a target exit pays, `buy_k - sell_k`, read in
   ADRs and then as a share of the price -- which is what a trade earns on the
-  cash, the thing that matters when only one pair is held at a time.
+  cash, the thing that matters when only one pair is held at a time. A
+  GoodMoments pair's target is its take, `gm_take_k` ADRs over the fill (at
+  the session's most volatile minute, when the take follows the volatility
+  curve).
 
 The rules are `SelectionRules`, and every one of them is switchable: exclude a
 pair on earnings, on a bearish briefing (confident only, or any), on a gap
@@ -42,7 +45,7 @@ from typing import Optional
 
 import pandas as pd
 
-from . import historical, momentum_regime
+from . import apple_models, historical, momentum_regime
 from .market_hours import MARKET_TZ
 
 # "Just before the fifth minute": the selection is made once the bars of
@@ -124,7 +127,7 @@ class PairFacts:
     key: str
     label: str
     ticker: str
-    # `buy_k - sell_k`: what a target exit pays, in level units (read as ADRs).
+    # What a target exit pays, in level units (read as ADRs): `target_k`.
     target_k: float
     prev_close: Optional[float] = None
     adr: Optional[float] = None
@@ -324,13 +327,22 @@ class LiveSources:
 LIVE_SOURCES = LiveSources()
 
 
+def target_k(config) -> float:
+    """What a target exit of this pair pays, in its level units (ADRs): the
+    gap between the two levels on the day-range rules, the take over the fill
+    on GoodMoments'."""
+    if apple_models.strategy(config.model_key) == apple_models.STRATEGY_PROBABILITY:
+        return float(config.gm_take_k)
+    return float(config.buy_k) - float(config.sell_k)
+
+
 def gather_facts(config, label: str, state, day: date, sources) -> PairFacts:
     """What is known about one pair now, from the bars on `state` and the
     briefing and calendar `sources` serves (`LiveSources`, or SimLab's)."""
     ticker = config.ticker
     facts = PairFacts(
         key=f"{ticker}:{config.model_key}", label=label, ticker=ticker,
-        target_k=float(config.buy_k) - float(config.sell_k),
+        target_k=target_k(config),
     )
     facts.prev_close, facts.adr, prev_day = daily_stats(
         historical.fetch_daily_ohlc_bars(ticker)

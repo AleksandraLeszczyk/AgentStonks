@@ -2352,9 +2352,11 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
     fields["help"] = {
         **fields.get("help", {}),
         "pairs": (
-            "The (ticker, model) pairs Orchestra watches. Every pair's symbol must be "
-            "in the datasets. The order is the tie-break when two buys fill on one bar. "
-            "Each Orchestra setup is one row in Results; compare it with Apple Trader "
+            "The (ticker, model) pairs Orchestra watches: day-range pairs (HighLow, "
+            "HighLow2) rest levels under their 9:35 forecast, GoodMoments pairs "
+            "(GoodMoments, HighLow2 + GoodMoments) buy on their edge. Every pair's symbol "
+            "must be in the datasets. The order is the tie-break when two buys fill on one "
+            "bar. Each Orchestra setup is one row in Results; compare it with Apple Trader "
             "setups on the same pairs."
         ),
         "mode": (
@@ -2374,9 +2376,32 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "Together at most 100; the rest stays in cash. Position size is then a "
             "share of the pair's own cash."
         ),
+        "pair_gm_enter": (
+            "Per pair: the edge a buy needs (the model's probability of a +0.2 ADR rise "
+            "minus the time-and-volatility model's). The tuning axis worth sweeping first."
+        ),
+        "pair_gm_take_k": (
+            "Per pair: the take in ADRs over the fill (0 = off). With a pair whose own "
+            "configuration has the take follow the volatility curve, this is the take at the "
+            "most volatile minute; its quietest-minute take is kept, or cut to this."
+        ),
+        "pair_gm_stop_k": (
+            "Per pair: the stop in ADRs under the fill (0 = off). It pauses that pair's buys "
+            "for 15 bars; it never stops the replay's other pairs."
+        ),
+        "pair_hybrid_buy_k": (
+            "HighLow2 + GoodMoments only: after the opening window a buy also needs the "
+            "close at or under HighLow2's buy level, this × its unit under the predicted high."
+        ),
     }
     fields["sections"] = {
         **fields.get("sections", {}),
+        "signal_pairs": (
+            "The GoodMoments pairs: each replays on its own configuration (its base, else "
+            "the shipped defaults) with the entry, take and stop set here — and on the "
+            "hybrid HighLow2's buy distance. The position size and the days off are "
+            "Orchestra's. A race of one GoodMoments pair replays exactly as Apple Trader on it."
+        ),
         "selection": (
             "Replays Orchestra's 09:34 pick of the day's candidates from what the "
             "morning knew: each symbol's **cached** pre-market briefing (written as of "

@@ -389,8 +389,9 @@ class TestWiring:
         assert tuning.default_axes("goodmoments") == ("gm_enter", "gm_stop_k")
         assert tuning.axes_family(KEY) != tuning.axes_family("goodmoments")
 
-    def test_orchestra_does_not_race_it(self):
-        assert not [p for p in orchestra.all_pairs() if p.endswith(f":{KEY}")]
+    def test_orchestra_races_it(self):
+        # Since 2026-10-25 (tests/test_orchestra.py).
+        assert [p for p in orchestra.all_pairs() if p.endswith(f":{KEY}")] == [f"{TICKER}:{KEY}"]
 
     def test_its_runs_draw_both_models(self):
         drawn = mo.for_models([KEY], TICKER)["keys"]

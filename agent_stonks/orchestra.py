@@ -1,15 +1,18 @@
 """Orchestra: Apple Trader's rules over several (ticker, model) pairs at once.
 
 Apple Trader trades one symbol on one model. Orchestra is its own agent: it
-runs one `DayRangeTrader` per pair -- AAPL on the day-range model and AAPL on
-HighLow are two pairs -- over one shared ledger, and lets exactly one of them
+runs one Apple Trader state machine per pair -- AAPL on HighLow and AAPL on
+HighLow2 are two pairs -- over one shared ledger, and lets exactly one of them
 hold a position at a time. The pairs race for it:
 
-* **Racing.** Every pair forecasts its own session at 9:35 and rests its own
-  levels, exactly as Apple Trader would on it alone. Each bar the pairs are
-  read in Orchestra's order, and the first whose buy *fills* takes the
-  position. A buy level touched is not enough, and neither is a limit order
-  the price had already left: those leave the race open.
+* **Racing.** Every pair trades on its own rules, exactly as Apple Trader
+  would on it alone: a day-range pair (HighLow, HighLow2) forecasts its
+  session at 9:35 and rests its own levels; a GoodMoments pair (GoodMoments,
+  HighLow2 + GoodMoments -- the probability rules, since 2026-10-25) reads its
+  edge at the close of every bar. Each bar the pairs are read in Orchestra's
+  order, and the first whose buy *fills* takes the position. A buy level
+  touched is not enough, and neither is a limit order the price had already
+  left: those leave the race open.
 * **Following.** While a pair holds, it is the only one that may trade. The
   others are still read every bar -- their forecasts move with the session
   and their levels stay current on the chart -- but their entries are closed
@@ -26,16 +29,32 @@ hold a position at a time. The pairs race for it:
   pre-market briefing, the earnings calendar and the opening gap
   (`agent_stonks.candidates`). The pairs left out sit the day out: they are
   not read and never forecast. The choice is published and saved with the
-  session, so a restart keeps it rather than picking again.
-* **Stopping.** A stop-out ends the whole run, as it ends an Apple Trader one:
-  the live loop stops the agent and only ▶ Start re-arms it. A replay has no
-  ▶ Start, so there every pair's entries stay closed for the rest of that
-  session, while their levels are still read bar by bar.
+  session, so a restart keeps it rather than picking again. Nothing is read
+  before the pick, so a GoodMoments pair -- which could buy from 09:30 on
+  its own -- trades from the 09:34 bar.
+* **Stopping.** A day-range stop-out ends the whole run, as it ends an Apple
+  Trader one: the live loop stops the agent and only ▶ Start re-arms it. A
+  replay has no ▶ Start, so there every pair's entries stay closed for the
+  rest of that session, while their levels are still read bar by bar. A
+  GoodMoments stop does not stop anything -- its own rules pause that pair's
+  entries for 15 bars, as they do on Apple Trader -- so the race reopens.
 
 Nothing about a pair's own rules changes. With one pair Orchestra *is* an
 Apple Trader run, decision for decision (`tests/test_orchestra.py`), which is
 what lets it share every tuned level and every stored SimLab record with it.
 In the code a pair Orchestra is running is a "racer".
+
+What a pair is given, and what it shares
+----------------------------------------
+Every pair shares Orchestra's sizing, its closing flatten and its days off
+(`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
+-- the unit, the ladder, the exits, the breach policy -- and each keeps its two
+distances and its circuit breaker (`PER_RACER_FIELDS`). A GoodMoments pair
+keeps its own configuration -- its pair's base, or the shipped defaults -- and
+Orchestra sets only the numbers that matter most (`SIGNAL_PAIR_FIELDS`): the
+edge a buy needs, the take and the stop, and on the hybrid HighLow2's buy
+distance. Fast&Furious is not offered: neither the race nor the 09:34
+selection is written for its rules.
 
 Split: every pair at once, each on its own share
 -------------------------------------------------
@@ -59,7 +78,8 @@ once.
   every pair it is given.
 * **A stop-out stands down that pair** for the rest of the day -- through a
   restart too (`DayRangeTrader.rearm_after_stop`) -- and the others keep
-  trading. Stopping the agent would leave their positions unmanaged.
+  trading. Stopping the agent would leave their positions unmanaged. (A
+  GoodMoments pair pauses for 15 bars instead, by its own rules.)
 
 With one pair at 100% a split is the same Apple Trader run as a race of one.
 The day's budget and every account are published with Orchestra's state, so a
@@ -86,7 +106,13 @@ from . import apple_models, candidates, event_days, market_hours, momentum_regim
 from . import apple_trader as at
 from .agent import stop_agent
 from .apple_trader import AppleTraderConfig, TraderSlot
-from .config import APPLE_TRADER_CYCLE_SEC, APPLE_TRADER_TUNED_LEVELS, LEVEL_UNIT_TOKENS
+from .config import (
+    APPLE_TRADER_CYCLE_SEC,
+    APPLE_TRADER_GM_COOLDOWN_BARS,
+    APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
+    APPLE_TRADER_TUNED_LEVELS,
+    LEVEL_UNIT_TOKENS,
+)
 from .decisions import DecisionTracker
 from .state import AppState, agent_log_tag
 from .state import append_agent_log as _log
@@ -105,13 +131,43 @@ MODE_LABELS = {
     MODE_SPLIT: "Split — each pair trades its own share, all at once",
 }
 
-# The fields every racer must share. Orchestra is one rule set over several
-# instruments, not several rule sets: the pair (ticker, model) and the numbers
-# tuned per pair -- the two distances and the circuit breaker -- are the racer's
-# own, and everything else is Orchestra's.
+# The rule sets Orchestra runs pairs on: the day-range rules (two resting
+# levels) and GoodMoments' probability rules (an edge read every bar).
+STRATEGIES = (apple_models.STRATEGY_DAYRANGE, apple_models.STRATEGY_PROBABILITY)
+
+# The fields every day-range racer must share. Orchestra is one rule set over
+# several instruments, not several rule sets: the pair (ticker, model) and the
+# numbers tuned per pair -- the two distances and the circuit breaker -- are the
+# racer's own, and everything else is Orchestra's.
 PER_RACER_FIELDS = (
     "ticker", "model_key", "buy_k", "sell_k", "min_win_k",
 )
+# The fields every racer must share, whatever its rule set: Orchestra's sizing,
+# its closing flatten and the sessions it sits out.
+SHARED_BY_ALL = ("position_pct", "flatten_before_close_min", "skip_events")
+# What Orchestra sets on a GoodMoments racer, over its pair's own configuration
+# (`build_orchestra_config`): the edge a buy needs, the take and the stop -- and
+# on a hybrid the buy distance under its levels model's predicted high.
+SIGNAL_PAIR_FIELDS = ("gm_enter", "gm_take_k", "gm_stop_k")
+HYBRID_PAIR_FIELDS = SIGNAL_PAIR_FIELDS + ("buy_k",)
+
+
+def is_signal(config_or_key) -> bool:
+    """Whether a racer trades GoodMoments' rules (an edge read every bar)
+    rather than the day-range rules (two resting levels)."""
+    model_key = (
+        split_key(config_or_key)[1] if isinstance(config_or_key, str) else config_or_key.model_key
+    )
+    return (
+        model_key in apple_models.MODELS
+        and apple_models.strategy(model_key) == apple_models.STRATEGY_PROBABILITY
+    )
+
+
+def pair_fields(model_key: str) -> "tuple[str, ...]":
+    """The numbers a GoodMoments racer is given by Orchestra (the hybrid's
+    buy distance too)."""
+    return HYBRID_PAIR_FIELDS if apple_models.levels_of(model_key) else SIGNAL_PAIR_FIELDS
 
 
 def racer_key(config: AppleTraderConfig) -> str:
@@ -133,6 +189,7 @@ SHORT_MODEL_NAMES = {
     "highlow2": "HighLow2",
     "fastfurious": "Fast&Furious",
     "goodmoments": "GoodMoments",
+    "highlow2_goodmoments": "HighLow2 + GoodMoments",
 }
 
 
@@ -153,14 +210,15 @@ def racer_label(config_or_key) -> str:
 
 def all_pairs() -> "list[str]":
     """Every (ticker, model) pair Orchestra can be given, as racer keys: each
-    symbol some model covers, with each day-range model it has, in picker
-    order. Fast&Furious and GoodMoments drive their own rules (a per-minute
-    signal, no levels), which neither the race nor the 09:34 selection is
-    written for."""
+    symbol some model covers, with each day-range and GoodMoments model it
+    has, in picker order. Fast&Furious drives its own rules (a forecast of the
+    next half hour's momentum and a clock), which neither the race nor the
+    09:34 selection is written for."""
     return [
         f"{ticker}:{key}"
         for ticker in apple_models.tickers()
-        for key in apple_models.keys_for_strategy(ticker, apple_models.STRATEGY_DAYRANGE)
+        for key in apple_models.keys_for(ticker)
+        if apple_models.strategy(key) in STRATEGIES
     ]
 
 
@@ -203,24 +261,30 @@ class OrchestraConfig:
             raise ValueError("Orchestra needs at least one (ticker, model) pair")
         if self.mode not in MODE_LABELS:
             raise ValueError(f"Orchestra has no mode {self.mode!r}")
-        other = [r for r in self.racers if r.strategy != apple_models.STRATEGY_DAYRANGE]
+        other = [r for r in self.racers if r.strategy not in STRATEGIES]
         if other:
             raise ValueError(
-                f"Orchestra races the day-range rules, and {racer_label(other[0])} runs its "
-                "own: run it as Apple Trader"
+                f"Orchestra races the day-range and GoodMoments rules, and "
+                f"{racer_label(other[0])} runs its own: run it as Apple Trader"
             )
         keys = [racer_key(r) for r in self.racers]
         twice = sorted({k for k in keys if keys.count(k) > 1})
         if twice:
             raise ValueError(f"{', '.join(twice)} is in Orchestra more than once")
-        first = _shared(self.racers[0])
-        for racer in self.racers[1:]:
-            if _shared(racer) != first:
-                differ = sorted(k for k in first if first[k] != _shared(racer)[k])
-                raise ValueError(
-                    f"every pair shares Orchestra's rules, but {racer_key(racer)} differs "
-                    f"from {keys[0]} in {', '.join(differ)}"
-                )
+        # What every pair shares, then what the day-range pairs share among
+        # themselves: a GoodMoments pair keeps the rest of its own rules.
+        ranged = [r for r in self.racers if not is_signal(r)]
+        for group, shared in ((self.racers, _common), (ranged, _shared)):
+            if not group:
+                continue
+            first = shared(group[0])
+            for racer in group[1:]:
+                if shared(racer) != first:
+                    differ = sorted(k for k in first if first[k] != shared(racer)[k])
+                    raise ValueError(
+                        f"every pair shares Orchestra's rules, but {racer_key(racer)} differs "
+                        f"from {racer_key(group[0])} in {', '.join(differ)}"
+                    )
         if self.mode != MODE_SPLIT:
             self.budget_pct = {}
             return
@@ -259,6 +323,36 @@ def _shared(config: AppleTraderConfig) -> dict:
     return {k: v for k, v in asdict(config).items() if k not in PER_RACER_FIELDS}
 
 
+def _common(config: AppleTraderConfig) -> dict:
+    return {k: getattr(config, k) for k in SHARED_BY_ALL}
+
+
+def signal_racer(
+    ticker: str, model_key: str, base: AppleTraderConfig, numbers: "dict | None" = None,
+) -> AppleTraderConfig:
+    """A GoodMoments racer: its pair's own configuration (`default_config`:
+    the pair's base, else the shipped defaults; a hybrid's from both its
+    models), with Orchestra's sizing, flatten and days off from `base`
+    (`SHARED_BY_ALL`) and the numbers Orchestra sets on it (`pair_fields`)
+    from `numbers`, where given.
+
+    A take that follows the intraday volatility curve keeps its quietest-minute
+    take unless the take set here is under it, when it is cut to the take --
+    flat, that is, until the take is raised again. A take of 0 is off, and so
+    is its curve."""
+    pair = at.default_config(ticker, model_key)
+    given = {k: float(v) for k, v in (numbers or {}).items() if k in pair_fields(model_key)}
+    take = given.get("gm_take_k", float(pair.gm_take_k))
+    take_min = pair.gm_take_min_k
+    if take_min is not None:
+        take_min = min(float(take_min), take) if take else None
+    return replace(
+        pair, ticker=ticker, model_key=model_key,
+        **{name: getattr(base, name) for name in SHARED_BY_ALL},
+        **given, gm_take_min_k=take_min,
+    )
+
+
 def build_orchestra_config(
     pairs: "list[str]",
     base: AppleTraderConfig,
@@ -267,14 +361,19 @@ def build_orchestra_config(
     mode: str = MODE_RACE,
     budget_pct: "dict[str, float] | None" = None,
 ) -> OrchestraConfig:
-    """One racer per pair, each `base` with its own pair and the numbers tuned
-    for it: `levels[key]` = `(buy_k, sell_k, min_win_k)` where given, the
-    pair's shipped defaults otherwise. `selection`, `mode` and `budget_pct`
-    as `OrchestraConfig`'s."""
+    """One racer per pair. A day-range pair is `base` with its own pair and
+    the numbers tuned for it: `levels[key]` = `(buy_k, sell_k, min_win_k)`
+    where given, the pair's shipped defaults otherwise. A GoodMoments pair is
+    its own configuration with `levels[key]` = `{field: value}` of the numbers
+    Orchestra sets on it (`signal_racer`). `selection`, `mode` and
+    `budget_pct` as `OrchestraConfig`'s."""
     levels = levels or {}
     racers = []
     for key in pairs:
         ticker, model_key = split_key(key)
+        if is_signal(key):
+            racers.append(signal_racer(ticker, model_key, base, levels.get(key)))
+            continue
         buy_k, sell_k = at.dayrange_levels(ticker, model_key)
         min_win_k = at.min_win_for(ticker, model_key)
         if key in levels:
@@ -289,26 +388,54 @@ def build_orchestra_config(
 def orchestra_signature(race: OrchestraConfig) -> str:
     """Compact identity of an Orchestra setup, standing in for a model name in SimLab.
 
-    The racers in order -- each its model, symbol, two distances and circuit
-    breaker, since those are what the pair tunes -- then the shared rules once,
-    read off the first racer's own signature with its per-pair part removed, so
-    a rule signs here exactly as it does in an Apple Trader run. A split says
-    so up front and adds each pair's share of the budget ("=40%"); a race signs
-    as it always has.
+    The racers in order -- a day-range pair as its model, symbol, two distances
+    and circuit breaker, since those are what the pair tunes; a GoodMoments
+    pair as its whole rule set, as an Apple Trader run on it signs it up to
+    the size -- then the shared rules once, read off the first day-range
+    racer's own signature (the first racer's, with none) with its per-pair
+    part removed, so a rule signs here exactly as it does in an Apple Trader
+    run. A split says so up front and adds each pair's share of the budget
+    ("=40%"); a race signs as it always has.
     """
-    first = race.racers[0]
-    unit = LEVEL_UNIT_TOKENS[first.level_unit]
-    pairs = ",".join(
-        f"{r.model_key}_{r.ticker}@{r.buy_k:g}/{r.sell_k:g}{unit}"
-        + (f"/mw{r.min_win_k:g}" if r.min_win_k else "")
-        + (f"={race.budget_pct[racer_key(r)]:g}%" if race.split else "")
-        for r in race.racers
-    )
+    def pair(r: AppleTraderConfig) -> str:
+        if is_signal(r):
+            single = at.config_signature(r)
+            token = single[:single.index(",size=")] + ")"
+        else:
+            token = (
+                f"{r.model_key}_{r.ticker}@{r.buy_k:g}/{r.sell_k:g}"
+                f"{LEVEL_UNIT_TOKENS[r.level_unit]}"
+                + (f"/mw{r.min_win_k:g}" if r.min_win_k else "")
+            )
+        return token + (f"={race.budget_pct[racer_key(r)]:g}%" if race.split else "")
+
+    pairs = ",".join(pair(r) for r in race.racers)
     head = "split:" if race.split else ""
+    first = next((r for r in race.racers if not is_signal(r)), race.racers[0])
     single = at.config_signature(first)
     rules = single[single.index("size="):-1]
     rules = re.sub(r",min_win=[^,)]*", "", rules)
     return f"orchestra[{head}{pairs}]({rules}{candidates.rules_signature(race.selection)})"
+
+
+def racer_terms(config: AppleTraderConfig) -> str:
+    """A racer's own numbers, as the log's opening line lists them."""
+    if not is_signal(config):
+        return f"buy {config.buy_k:g} / sell {config.sell_k:g} × {config.unit_phrase}"
+    take = f"{config.gm_take_k:g}" if config.gm_take_k else "off"
+    if config.gm_take_k and config.gm_take_min_k is not None:
+        take = f"{config.gm_take_k:g}..{config.gm_take_min_k:g} with volatility"
+    text = (
+        f"edge {config.gm_enter:+g}, take {take} / stop "
+        + (f"{config.gm_stop_k:g}" if config.gm_stop_k else "off") + " ADR"
+    )
+    parent = apple_models.levels_of(config.model_key)
+    if parent is not None:
+        text += (
+            f", under {SHORT_MODEL_NAMES.get(parent, parent)}'s buy {config.buy_k:g} × "
+            f"{config.unit_phrase} after the opening window"
+        )
+    return text
 
 
 # --- one racer's view of the shared state --------------------------------------
@@ -701,6 +828,14 @@ class Orchestra:
             # it in a single replay); here it would stop the next session too.
             for racer in self.racers:
                 racer.trader.halt = None
+        for racer in self.racers:
+            # A GoodMoments pair fills its first forecast's caches in the
+            # background, before the bell as on Apple Trader -- here, where
+            # Orchestra would otherwise not read it until the market is open
+            # (and, with a selection, until 09:34). Live only, once a day.
+            prewarm = getattr(racer.trader, "_prewarm", None)
+            if prewarm is not None and racer.key not in self.benched:
+                prewarm(racer.bundle, state)
         if not market_hours.is_market_open():
             # Said once for Orchestra rather than once per racer.
             _log(state, {"type": "status", "text": (
@@ -842,6 +977,14 @@ class Orchestra:
     @staticmethod
     def _armed(racer: Racer) -> bool:
         trader = racer.trader
+        if is_signal(racer.config):
+            # Reading its edge, and not past the last minute it may buy in.
+            minute = getattr(trader, "last_minute", None)
+            return (
+                trader.blocked is None
+                and getattr(trader, "session", None) is not None
+                and (minute is None or minute <= APPLE_TRADER_GM_LAST_ENTRY_MINUTE)
+            )
         plan = getattr(trader, "plan", None)
         return (
             trader.blocked is None
@@ -856,59 +999,97 @@ class Orchestra:
     def board(self) -> "list[dict]":
         """One row per racer: where it stands against its buy level, in its
         own level unit, which is what makes racers on different symbols and
-        different prices comparable -- and under a split, its account."""
+        different prices comparable -- for a GoodMoments pair, where its edge
+        stands against the edge a buy needs (and on the hybrid its levels
+        model's buy level too) -- and under a split, its account."""
         rows = []
         for racer in self.racers:
             trader = racer.trader
-            plan = trader.plan or {}
+            signal = is_signal(racer.config)
+            account = self.accounts.get(racer.key)
+            if signal:
+                plan = getattr(getattr(trader, "levels", None), "plan", None) or {}
+                forecast = getattr(trader, "forecast", None) or {}
+                edge = forecast.get("edge")
+                entry = trader.enter_at() if getattr(trader, "session", None) is not None else None
+            else:
+                plan = trader.plan or {}
+                edge = entry = None
             close = trader.last_close
             unit = float(plan.get("level_unit") or 0.0)
             buy = plan.get("buy_level")
-            account = self.accounts.get(racer.key)
-            if self.holds(racer.key):
-                status = "holding"
-            elif self._benched(racer):
-                status = f"sits out today ({self.benched[racer.key]})"
-            elif self.selection is not None and self._selected_day != self._day:
-                status = "waiting for 09:34"
-            elif (trader.blocked or {}).get("sit_out"):
-                status = "sits out today (" + ", ".join(
-                    event_days.LABELS[c] for c in trader.blocked["sit_out"]
-                ) + ")"
-            elif trader.blocked is not None:
-                status = "cannot forecast"
-            elif not plan:
-                status = "waiting for the forecast"
-            elif plan.get("stand_down"):
-                status = f"stood down ({plan['stand_down']})"
-            elif plan.get("paused"):
-                status = f"paused until the forecast is revised ({plan['paused']['headline']})"
-            elif self.holder is not None:
-                status = "waiting for the holder"
-            else:
-                status = "watching" if self.split else "racing"
             rows.append({
                 "key": racer.key,
                 "label": racer.label,
                 "ticker": trader.ticker,
-                "status": status,
+                "kind": "signal" if signal else "levels",
+                "status": self._status(racer),
                 "close": close,
                 "buy": None if buy is None else float(buy),
-                "sell": None if plan.get("sell_level") is None else float(plan["sell_level"]),
+                "sell": None if plan.get("sell_level") is None or signal else float(plan["sell_level"]),
                 "to_buy": (
                     (close - float(buy)) / unit
                     if close is not None and buy is not None and unit > 0 else None
                 ),
                 "unit": unit or None,
+                "edge": None if edge is None else float(edge),
+                "entry": entry,
                 "budget_pct": self.budget_pct.get(racer.key),
                 "cash": None if account is None else account.cash,
                 "shares": None if account is None else account.shares,
             })
         return rows
 
+    def _status(self, racer: Racer) -> str:
+        """Where one racer stands, in the board's words."""
+        trader = racer.trader
+        if self.holds(racer.key):
+            return "holding"
+        if self._benched(racer):
+            return f"sits out today ({self.benched[racer.key]})"
+        if self.selection is not None and self._selected_day != self._day:
+            return "waiting for 09:34"
+        if (trader.blocked or {}).get("sit_out"):
+            return "sits out today (" + ", ".join(
+                event_days.LABELS[c] for c in trader.blocked["sit_out"]
+            ) + ")"
+        if trader.blocked is not None:
+            return "cannot forecast"
+        if is_signal(racer.config):
+            session = getattr(trader, "session", None)
+            minute = getattr(trader, "last_minute", None)
+            if session is None:
+                return "waiting for the forecast"
+            if minute is not None and minute < int(session.get("cool_until") or 0):
+                return f"paused after a stop, until {at._session_clock(session['cool_until'])}"
+            if minute is not None and minute > APPLE_TRADER_GM_LAST_ENTRY_MINUTE:
+                return f"no new entries after {at._session_clock(APPLE_TRADER_GM_LAST_ENTRY_MINUTE)}"
+        else:
+            plan = trader.plan or {}
+            if not plan:
+                return "waiting for the forecast"
+            if plan.get("stand_down"):
+                return f"stood down ({plan['stand_down']})"
+            if plan.get("paused"):
+                return f"paused until the forecast is revised ({plan['paused']['headline']})"
+        if self.holder is not None:
+            return "waiting for the holder"
+        return "watching" if self.split else "racing"
+
+    @staticmethod
+    def _signal_words(row: dict) -> str:
+        """A GoodMoments pair on the race line: its edge against the entry --
+        and on the hybrid its close against its levels model's buy level."""
+        text = f"{row['label']} edge {row['edge']:+.3f} vs entry {row['entry']:+.3f}"
+        if row.get("buy") is not None and row.get("close") is not None:
+            text += f", ${row['close']:,.2f} vs buy ${row['buy']:,.2f}"
+        return text
+
     def _race_line(self, state: AppState) -> None:
         """One log line per bar for every racer not holding -- in place of the
-        read line each would write on its own -- nearest to its buy first."""
+        read line each would write on its own -- nearest to its buy first: the
+        day-range pairs by their distance to the buy level, the GoodMoments
+        pairs by how far their edge is from the entry."""
         if self.holder is not None:
             return
         stamps = [r.trader.last_bar_ts for r in self.racers if r.trader.last_bar_ts is not None]
@@ -918,21 +1099,31 @@ class Orchestra:
         if newest == self._last_line:
             return
         self._last_line = newest
-        racing = [
-            row for row in self.board()
-            if row["status"] in ("racing", "watching") and row["to_buy"] is not None
-        ]
-        if not racing:
+        racing = [row for row in self.board() if row["status"] in ("racing", "watching")]
+        levels = sorted(
+            (row for row in racing if row["kind"] == "levels" and row["to_buy"] is not None),
+            key=lambda row: row["to_buy"],
+        )
+        signals = sorted(
+            (row for row in racing if row["kind"] == "signal" and row["edge"] is not None),
+            key=lambda row: row["entry"] - row["edge"],
+        )
+        parts = []
+        if levels:
+            parts.append("nearest to a buy first, in each pair's level unit: " + " · ".join(
+                f"{row['label']} ${row['close']:,.2f} vs buy ${row['buy']:,.2f} ({row['to_buy']:+.2f} u)"
+                for row in levels
+            ))
+        if signals:
+            parts.append(
+                "GoodMoments' edge, nearest to its entry first: "
+                + " · ".join(self._signal_words(row) for row in signals)
+            )
+        if not parts:
             return
-        racing.sort(key=lambda row: row["to_buy"])
-        parts = [
-            f"{row['label']} ${row['close']:,.2f} vs buy ${row['buy']:,.2f} ({row['to_buy']:+.2f} u)"
-            for row in racing
-        ]
         head = "the pairs without a position" if self.split else "flat"
         _log(state, {"type": "analysis", "text": (
-            f"Orchestra at {newest:%H:%M}, {head} — nearest to a buy first, in each pair's "
-            f"level unit: {' · '.join(parts)}"
+            f"Orchestra at {newest:%H:%M}, {head} — {'; '.join(parts)}"
         )})
 
     def _publish(self, state: AppState) -> None:
@@ -978,16 +1169,25 @@ class Orchestra:
             more = f" — watching {len(racing)} more" if racing else ""
             return rule_agent.TRADING, f"Agent holding {', '.join(holding)}{more}"
         if racing:
-            near = [row for row in racing if row["to_buy"] is not None]
+            near = [row for row in racing if row["kind"] == "levels" and row["to_buy"] is not None]
             if near:
                 best = min(near, key=lambda row: row["to_buy"])
                 return rule_agent.TRADING, (
                     f"Agent watching {len(racing)} pairs — nearest: {best['label']}, "
                     f"{best['to_buy']:+.2f} × its unit from its buy level"
                 )
+            edges = [row for row in racing if row["kind"] == "signal" and row["edge"] is not None]
+            if edges:
+                best = min(edges, key=lambda row: row["entry"] - row["edge"])
+                return rule_agent.TRADING, (
+                    f"Agent watching {len(racing)} pairs — nearest: {best['label']}, edge "
+                    f"{best['edge'] - best['entry']:+.3f} from its entry"
+                )
             return rule_agent.TRADING, f"Agent watching {len(racing)} pairs"
         if any(row["status"] == "waiting for the forecast" for row in board):
             return rule_agent.WAITING, "Agent waiting for the opening forecasts"
+        if any(row["status"].startswith("paused after a stop") for row in board):
+            return rule_agent.WAITING, "Agent paused after a stop"
         if all(row["status"] == "cannot forecast" for row in board):
             return rule_agent.FAILED, "Agent cannot trade today — see the log"
         if all(row["status"].startswith("sits out") for row in board):
@@ -1064,12 +1264,11 @@ def _orchestra_loop(
             f"Orchestra trading {len(kept)} pairs at once, each on its own share of the "
             "budget: "
             + ", ".join(
-                f"{racer_label(c)} {race_config.budget_pct[racer_key(c)]:g}% "
-                f"(buy {c.buy_k:g} / sell {c.sell_k:g} × {c.unit_phrase})"
+                f"{racer_label(c)} {race_config.budget_pct[racer_key(c)]:g}% ({racer_terms(c)})"
                 for c in kept
             )
             + (f"; {unused:g}% stays in cash" if unused > 1e-9 else "")
-            + ". Each forecasts its own session at 9:35, rests its own levels and sizes "
+            + f". {_how_pairs_read(kept, split=True)} and sizes "
             f"every buy at {kept[0].position_pct:g}% of the cash its share has left. The "
             "budget is what the ledger is worth at the first open bar. A stop-out stands "
             "that pair down for the day; the others keep trading."
@@ -1077,14 +1276,16 @@ def _orchestra_loop(
     elif len(kept) > 1:
         _log(state, {"type": "status", "text": (
             f"Orchestra watching {len(kept)} pairs: "
-            + ", ".join(
-                f"{racer_label(c)} (buy {c.buy_k:g} / sell {c.sell_k:g} × {c.unit_phrase})"
-                for c in kept
-            )
-            + ". Each forecasts its own session at 9:35 and rests its own levels; the first "
+            + ", ".join(f"{racer_label(c)} ({racer_terms(c)})" for c in kept)
+            + f". {_how_pairs_read(kept)}; the first "
             "whose buy fills is the only one that trades until its position is closed, then "
             "the race is open again. Ties go to the earlier pair in this list. A stop-out "
-            "stops the agent."
+            "stops the agent"
+            + (
+                " (a GoodMoments stop pauses only that pair, for "
+                f"{APPLE_TRADER_GM_COOLDOWN_BARS} bars)."
+                if any(is_signal(c) for c in kept) else "."
+            )
             + (
                 " At 09:34 it first picks the day's candidates (keeping "
                 + (f"the best {race_config.selection.max_pairs}" if race_config.selection.max_pairs else "every eligible pair")
@@ -1117,6 +1318,25 @@ def _orchestra_loop(
         # running stops this loop and starts another before this line).
         if getattr(state, "orchestra", None) and state.agent_stop_event is stop_event:
             state.orchestra = {**state.orchestra, "running": False}
+
+
+def _how_pairs_read(kept: "list[AppleTraderConfig]", split: bool = False) -> str:
+    """How the pairs find their buys, for the loop's opening line: each
+    day-range pair's levels from its 9:35 forecast, each GoodMoments pair's
+    edge at every bar."""
+    signals = [c for c in kept if is_signal(c)]
+    if not signals:
+        return (
+            "Each forecasts its own session at 9:35, rests its own levels"
+            if split else "Each forecasts its own session at 9:35 and rests its own levels"
+        )
+    if len(signals) == len(kept):
+        return "Each reads its own edge at the close of every bar"
+    return (
+        "Each day-range pair forecasts its own session at 9:35 and rests its own levels, "
+        "each GoodMoments pair reads its own edge at the close of every bar"
+        + ("," if split else "")
+    )
 
 
 def launch_orchestra(

@@ -139,23 +139,29 @@ def params(
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
     defaults = default_config(ticker, model_key)
-    # The digest of the base the form opens on (`base_record`) -- for a hybrid
-    # with none of its own, its two models' (`default_config` opens it on
-    # theirs), so the size and the days off its signal model's base set are
-    # not overridden by whatever another model's form left in the same widgets.
-    _, based_on = base_record(model_key, ticker)
-    suffix = base_configs.key_suffix(based_on, ticker) if based_on else ""
-    if not based_on and apple_models.levels_of(model_key) is not None:
-        suffix = "".join(
-            base_configs.key_suffix(part, ticker)
-            for part in (apple_models.signal_of(model_key), apple_models.levels_of(model_key))
-        )
-    copy = replace(copy, suffix=suffix)
+    copy = replace(copy, suffix=pair_suffix(model_key, ticker))
     if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
         return momentum_params(defaults, model_key, ticker, copy)
     if apple_models.strategy(model_key) == apple_models.STRATEGY_PROBABILITY:
         return probability_params(defaults, model_key, ticker, copy)
     return dayrange_params(defaults, model_key, ticker, copy, seed)
+
+
+def pair_suffix(model_key: str, ticker: str) -> str:
+    """The digest of the base a pair's form opens on (`base_record`), for its
+    widget keys -- for a hybrid with none of its own, its two models' (
+    `default_config` opens it on theirs), so the size and the days off its
+    signal model's base set are not overridden by whatever another model's
+    form left in the same widgets. Empty with no base."""
+    _, based_on = base_record(model_key, ticker)
+    if based_on:
+        return base_configs.key_suffix(based_on, ticker)
+    if apple_models.levels_of(model_key) is not None:
+        return "".join(
+            base_configs.key_suffix(part, ticker)
+            for part in (apple_models.signal_of(model_key), apple_models.levels_of(model_key))
+        )
+    return ""
 
 
 def probability_params(
@@ -1054,6 +1060,12 @@ def orchestra_params(
     pair's own numbers -- under a split, its share of the budget too -- and the
     rules they all share. None while no pair is picked.
 
+    The day-range pairs are one table (buy, sell, min win) and the rules under
+    it are theirs; the GoodMoments pairs are another (`signal_pair_params`),
+    and keep the rest of their own configuration. The size and the days off
+    are every pair's; with no day-range pair they are all that is drawn below
+    the tables.
+
     Its own agent with its own settings: `copy` carries Orchestra's widget-key
     prefix, so nothing here is shared with Apple Trader's form. Every per-pair
     widget is keyed by model and ticker, since two pairs can share a ticker.
@@ -1068,7 +1080,7 @@ def orchestra_params(
     """
     from .orchestra import (
         MODE_LABELS, MODE_SPLIT,
-        build_orchestra_config, default_pairs, all_pairs, racer_key, racer_label,
+        build_orchestra_config, default_pairs, all_pairs, is_signal, racer_key, racer_label,
     )
 
     available = {str(s).strip().upper() for s in (symbols or [])}
@@ -1104,9 +1116,21 @@ def orchestra_params(
     selection = None if split else selection_params(copy, briefing_choices)
 
     defaults = AppleTraderConfig()
-    section("Levels", copy.sections.get("pairs"))
-    level_unit = level_unit_param(defaults, copy)
+    # The day-range pairs rest levels under a forecast; the GoodMoments pairs
+    # read an edge every bar -- each kind gets its own table, with its own
+    # columns.
+    ranged = [key for key in pairs if not is_signal(key)]
+    signals = [key for key in pairs if is_signal(key)]
+    # An even split, rounded down to a tenth so it never adds up past 100.
+    even = math.floor(1000.0 / len(pairs)) / 10.0
+    levels: dict = {}
+    budget_pct: dict = {}
+    level_unit = defaults.level_unit
     unit_label = UNIT_FORM_LABELS[level_unit]
+    if ranged:
+        section("Levels", copy.sections.get("pairs"))
+        level_unit = level_unit_param(defaults, copy)
+        unit_label = UNIT_FORM_LABELS[level_unit]
     seeded = {
         racer_key(r): r for r in (seed.racers if seed is not None else [])
         if r.level_unit == level_unit
@@ -1115,18 +1139,15 @@ def orchestra_params(
     # nested in the sidebar, where the live app draws this), taken out of the
     # pair's name so the numbers keep their width.
     widths = [1.9, 1, 1, 0.3, 1, 1] if split else [1.9, 1, 1, 0.3, 1]
-    head = st.columns(widths)
-    head[0].caption("Pair")
-    head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
-    head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
-    head[4].caption("Min win", help=copy.help.get("pair_min_win_k"))
-    if split:
-        head[5].caption("Budget %", help=copy.help.get("pair_budget_pct"))
-    # An even split, rounded down to a tenth so it never adds up past 100.
-    even = math.floor(1000.0 / len(pairs)) / 10.0
-    levels: dict = {}
-    budget_pct: dict = {}
-    for key in pairs:
+    if ranged:
+        head = st.columns(widths)
+        head[0].caption("Pair")
+        head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
+        head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
+        head[4].caption("Min win", help=copy.help.get("pair_min_win_k"))
+        if split:
+            head[5].caption("Budget %", help=copy.help.get("pair_budget_pct"))
+    for key in ranged:
         ticker, _, model_key = key.partition(":")
         # The pair's base configuration's numbers (`dayrange_levels` reads it
         # first), and its digest on the row's keys so a new base re-seeds them.
@@ -1177,6 +1198,8 @@ def orchestra_params(
                 icon=":material/warning:",
             )
         levels[key] = (float(buy_k), float(sell_k), min_win_k)
+    if signals:
+        levels.update(signal_pair_params(signals, copy, label, split, even, budget_pct))
     if split:
         total = sum(budget_pct.values())
         if total <= 100.0 + 1e-6:
@@ -1186,14 +1209,26 @@ def orchestra_params(
             )
 
     col_a, col_b = st.columns(2)
-    sizing = position_params(defaults, unit_label, copy, col_a, col_b)
-    first_buy, first_sell, _ = levels[pairs[0]]
-    rules = rule_params(
-        defaults, first_buy, first_sell, unit_label, copy,
-        take_on=bool(sizing["momentum_confirmation_bars"]),
-    )
-    section("Circuit breaker", copy.sections.get("dayrange_breaker"))
-    until_revised = breaker_until_param(defaults, copy, rules)
+    if ranged:
+        sizing = position_params(defaults, unit_label, copy, col_a, col_b)
+        first_buy, first_sell, _ = levels[ranged[0]]
+        rules = rule_params(
+            defaults, first_buy, first_sell, unit_label, copy,
+            take_on=bool(sizing["momentum_confirmation_bars"]),
+        )
+        section("Circuit breaker", copy.sections.get("dayrange_breaker"))
+        until_revised = breaker_until_param(defaults, copy, rules)
+    else:
+        # GoodMoments pairs alone: what every pair shares is the size and the
+        # days off (`orchestra.SHARED_BY_ALL`); the rest is each pair's own.
+        sizing = {"position_pct": float(col_a.number_input(
+            "Position size (% of cash)",
+            min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
+            key=copy.key("dayrange_size"),
+            help=copy.help.get("position_pct"),
+        ))}
+        rules = {"skip_events": skip_param(defaults, copy)}
+        until_revised = defaults.breaker_until_revised
     base = replace(
         defaults, level_unit=level_unit, breaker_until_revised=until_revised, **sizing, **rules,
     )
@@ -1205,6 +1240,76 @@ def orchestra_params(
     except ValueError as exc:
         st.error(str(exc), icon=":material/error:")
         return None
+
+
+def signal_pair_params(
+    keys: "list[str]", copy: FormCopy, label, split: bool, even: float, budget_pct: dict,
+) -> "dict[str, dict]":
+    """Orchestra's GoodMoments pairs, one row each: the numbers Orchestra sets
+    on them (`orchestra.pair_fields`) -- the edge a buy needs, the take and the
+    stop in ADRs, and on a hybrid its levels model's buy distance -- each
+    opening on the pair's own configuration (`default_config`: its base, else
+    the shipped defaults). Everything else a GoodMoments pair trades on is that
+    configuration's. Under a split, the pair's share of the budget, written
+    into `budget_pct`. `label` names a pair's row.
+
+    Returns `{racer key: {field: value}}` for `build_orchestra_config`. Keyed
+    by model and ticker, with the pair's base digest, so a new base re-seeds
+    its row as it does the levels'."""
+    hybrids = [key for key in keys if apple_models.levels_of(key.partition(":")[2])]
+    section("Signal", copy.sections.get("signal_pairs"))
+    widths = [1.9, 1, 1, 1] + ([1] if hybrids else []) + ([1] if split else [])
+    head = st.columns(widths)
+    head[0].caption("Pair")
+    head[1].caption("Entry", help=copy.help.get("pair_gm_enter"))
+    head[2].caption("Take", help=copy.help.get("pair_gm_take_k"))
+    head[3].caption("Stop", help=copy.help.get("pair_gm_stop_k"))
+    if hybrids:
+        parent = apple_models.levels_of(hybrids[0].partition(":")[2])
+        head[4].caption(
+            f"{apple_models.get(parent).label.replace(' model', '')} buy",
+            help=copy.help.get("pair_hybrid_buy_k"),
+        )
+    if split:
+        head[-1].caption("Budget %", help=copy.help.get("pair_budget_pct"))
+    numbers: "dict[str, dict]" = {}
+    for key in keys:
+        ticker, _, model_key = key.partition(":")
+        pair = default_config(ticker, model_key)
+        suffix = pair_suffix(model_key, ticker)
+        row = st.columns(widths, vertical_alignment="center")
+        row[0].markdown(label(key))
+        given = {
+            "gm_enter": row[1].number_input(
+                f"{key} entry", min_value=-0.20, max_value=0.30, value=float(pair.gm_enter),
+                step=0.01, format="%.3f", key=copy.key(f"gm_enter_{model_key}_{ticker}{suffix}"),
+                label_visibility="collapsed",
+            ),
+            "gm_take_k": row[2].number_input(
+                f"{key} take", min_value=0.0, max_value=2.0, value=float(pair.gm_take_k),
+                step=0.05, format="%.2f", key=copy.key(f"gm_take_k_{model_key}_{ticker}{suffix}"),
+                label_visibility="collapsed",
+            ),
+            "gm_stop_k": row[3].number_input(
+                f"{key} stop", min_value=0.0, max_value=3.0, value=float(pair.gm_stop_k),
+                step=0.05, format="%.2f", key=copy.key(f"gm_stop_k_{model_key}_{ticker}{suffix}"),
+                label_visibility="collapsed",
+            ),
+        }
+        if key in hybrids:
+            given["buy_k"] = row[4].number_input(
+                f"{key} buy", min_value=0.05, max_value=3.0, value=float(pair.buy_k),
+                step=0.05, format="%.2f", key=copy.key(f"buy_k_{model_key}_{ticker}{suffix}"),
+                label_visibility="collapsed",
+            )
+        if split:
+            budget_pct[key] = float(row[-1].number_input(
+                f"{key} budget %", min_value=0.5, max_value=100.0, value=even, step=5.0,
+                format="%.1f", key=copy.key(f"budget_pct_{model_key}_{ticker}"),
+                label_visibility="collapsed",
+            ))
+        numbers[key] = {name: float(value) for name, value in given.items()}
+    return numbers
 
 
 def selection_params(

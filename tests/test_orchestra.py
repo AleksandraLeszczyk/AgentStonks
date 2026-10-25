@@ -1113,3 +1113,333 @@ class TestPairMinWinBox:
         assert app.checkbox(key=self.BOX).value is False
         assert app.number_input(key=self.KEY).value == pytest.approx(at.min_win_for("INTC"))
         assert self._min_wins(app)["INTC"] == 0.0
+
+
+# --- GoodMoments pairs: an edge read every bar, beside the levels ---------------
+
+GM_ADR = 0.02  # take +0.4%, stop -1.5% at GoodMoments' defaults (log terms)
+
+
+class Edges:
+    """GoodMoments' forecasts, scripted per symbol and bar: `edges[(ticker,
+    minute)]`. A bar not scripted reads an edge of 0 -- no buy."""
+
+    def __init__(self, monkeypatch):
+        from types import SimpleNamespace
+
+        self.edges: "dict[tuple[str, int], float]" = {}
+
+        def forecast_at(bundle, ticker, day, minute, key=None, secret=None):
+            edge = self.edges.get((ticker, minute), 0.0)
+            return {"minute": minute, "p": 0.5 + edge, "p_tv": 0.5, "edge": edge,
+                    "price": None, "adr": GM_ADR, "p_reach": 0.5}
+
+        fake = SimpleNamespace(
+            forecast_at=forecast_at, session_adr=lambda *a, **k: GM_ADR, LAST_FORECAST=388,
+            TARGET_ADR=0.2, is_half_day=lambda day: False, is_session=lambda day: True,
+            warm=lambda *a, **k: None,
+        )
+        monkeypatch.setattr(at, "_goodmoments", lambda: fake)
+
+    def next(self, tapes: Tapes, ticker: str, edge: float) -> None:
+        """The edge `ticker` reads on the bar `tapes.bar` appends next."""
+        self.edges[(ticker, 60 + len(tapes.index))] = edge
+
+
+def gm_racer(ticker="AMD", model_key="goodmoments", **kwargs):
+    """A GoodMoments racer sharing `racer`'s size, flatten and days off."""
+    return replace(dayrange_config(), ticker=ticker, model_key=model_key, **kwargs)
+
+
+class TestGoodMomentsPairsRace:
+    def _setup(self, monkeypatch, *configs):
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "AMD"], broker)
+        edges = Edges(monkeypatch)
+        state = make_state(["AAPL", "AMD"])
+        race = make_race(*configs)
+        race.run_cycle(state, tracker)  # the forecasts, and GoodMoments' 09:34 read
+        return tracker, tapes, edges, state, race
+
+    def test_its_edge_takes_the_race_and_its_take_reopens_it(self, market_open, monkeypatch):
+        tracker, tapes, edges, state, race = self._setup(
+            monkeypatch, racer("AAPL"), gm_racer("AMD"),
+        )
+        edges.next(tapes, "AMD", 0.05)
+        tapes.bar(AMD=104.0)
+        assert race.run_cycle(state, tracker) == "bought"
+        assert race.holder == "AMD:goodmoments"
+
+        # HighLow's buy level is reached while GoodMoments holds: refused.
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), AMD=104.1)
+        race.run_cycle(state, tracker)
+        assert tracker.position_for("AAPL") == 0
+        refused = [e["text"] for e in state.agent_log if "Orchestra is following" in e.get("text", "")]
+        assert refused == [refused[0]] and refused[0].startswith("AAPL reached its buy level")
+        assert "AMD · GoodMoments" in refused[0]
+
+        # Through the take (104 x e^0.004 = 104.42): sold, and the race is open.
+        tapes.bar(AMD=(104.5, 104.4, 104.5))
+        assert race.run_cycle(state, tracker) == "sold"
+        assert race.holder is None
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        assert race.holder == "AAPL:highlow"
+        assert [f[:2] for f in fills(tracker)] == [
+            ("AMD", "buy"), ("AMD", "sell"), ("AAPL", "buy"),
+        ]
+
+    def test_its_edge_is_refused_while_another_pair_holds(self, market_open, monkeypatch):
+        tracker, tapes, edges, state, race = self._setup(
+            monkeypatch, racer("AAPL"), gm_racer("AMD"),
+        )
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        assert race.holder == "AAPL:highlow"
+        edges.next(tapes, "AMD", 0.05)
+        tapes.bar(AAPL=104.0, AMD=104.0)
+        race.run_cycle(state, tracker)
+        assert tracker.position_for("AMD") == 0
+        refused = [e for e in state.agent_log if "Orchestra is following" in e.get("text", "")]
+        assert len(refused) == 1
+        assert refused[0]["text"].startswith("AMD had an edge at its entry at ")
+        assert refused[0]["racer"] == "AMD · GoodMoments"
+        board = {row["key"]: row for row in state.orchestra["board"]}
+        assert board["AMD:goodmoments"]["status"] == "waiting for the holder"
+        assert board["AMD:goodmoments"]["edge"] == pytest.approx(0.05)
+        assert board["AMD:goodmoments"]["entry"] == pytest.approx(0.02)
+
+    def test_its_stop_pauses_only_it_and_never_stops_the_race(self, market_open, monkeypatch):
+        tracker, tapes, edges, state, race = self._setup(
+            monkeypatch, racer("AAPL"), gm_racer("AMD"),
+        )
+        edges.next(tapes, "AMD", 0.05)
+        tapes.bar(AMD=104.0)
+        race.run_cycle(state, tracker)
+        # Through the stop (104 x e^-0.015 = 102.45).
+        tapes.bar(AMD=(102.0, 102.0, 104.0))
+        assert race.run_cycle(state, tracker) == "sold"
+        assert race.halt is None and race.holder is None
+        board = {row["key"]: row["status"] for row in state.orchestra["board"]}
+        assert board["AMD:goodmoments"].startswith("paused after a stop, until ")
+        assert board["AAPL:highlow"] == "racing"
+        # The race is open to the others on the next bar.
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        assert race.holder == "AAPL:highlow"
+
+    def test_the_race_line_puts_its_edge_beside_the_levels(self, market_open, monkeypatch):
+        tracker, tapes, edges, state, race = self._setup(
+            monkeypatch, racer("AAPL"), gm_racer("AMD"),
+        )
+        edges.next(tapes, "AMD", 0.01)
+        tapes.bar(AMD=104.0)
+        race.run_cycle(state, tracker)
+        line = [e["text"] for e in state.agent_log if e.get("text", "").startswith("Orchestra at ")][-1]
+        assert "nearest to a buy first, in each pair's level unit: AAPL · HighLow $104.00" in line
+        assert "; GoodMoments' edge, nearest to its entry first: AMD · GoodMoments edge +0.010 vs entry +0.020" in line
+        assert race.activity("hold", tracker)[1].startswith("Agent watching 2 pairs — nearest: AAPL · HighLow")
+
+
+class TestARaceOfOneGoodMomentsPairIsASingleRun:
+    """A GoodMoments pair races exactly as Apple Trader runs it alone."""
+
+    # (close, low, high, edge) per bar after the opening window.
+    PATH = [
+        (104.0, 104.0, 104.0, 0.0),
+        (104.0, 104.0, 104.0, 0.05),    # buy
+        (104.2, 104.2, 104.2, 0.0),
+        (104.6, 104.1, 104.6, 0.0),     # take
+        (104.0, 104.0, 104.0, 0.05),    # buy again
+        (102.0, 102.0, 104.0, 0.0),     # stop
+        (102.5, 102.5, 102.5, 0.05),    # paused
+        (102.6, 102.6, 102.6, 0.0),
+    ]
+
+    # The hybrid's HighLow2 buy level at 110 - 0.05 x 10 = 109.50, over every close.
+    @pytest.mark.parametrize("model_key, kwargs", [
+        ("goodmoments", {}),
+        ("highlow2_goodmoments", {"buy_k": 0.05, "sell_k": 0.0}),
+    ])
+    def test_same_decisions_and_log(self, market_open, monkeypatch, model_key, kwargs):
+        def run(as_race: bool):
+            broker = Broker2()
+            tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+            tapes = Tapes(monkeypatch, ["AAPL"], broker)
+            edges = Edges(monkeypatch)
+            state = make_state(["AAPL"])
+            config = gm_racer("AAPL", model_key, **kwargs)
+            # The hybrid's bundle carries HighLow2's under its key.
+            bundle = {**BUNDLE, "highlow2": BUNDLE}
+            if as_race:
+                race = ar.build_orchestra(ar.OrchestraConfig([config]), {ar.racer_key(config): bundle})
+                cycle = lambda: race.run_cycle(state, tracker)  # noqa: E731
+            else:
+                trader = at.build_trader(config, bundle)
+                cycle = lambda: trader.run_cycle(bundle, state, tracker)  # noqa: E731
+            outcomes = [cycle()]
+            for close, low, high, edge in self.PATH:
+                edges.next(tapes, "AAPL", edge)
+                tapes.bar(AAPL=(close, low, high))
+                outcomes.append(cycle())
+            decisions = [
+                (d.symbol, d.action, d.status, d.filled_quantity, d.price, d.reasoning)
+                for d in tracker.decisions
+            ]
+            log = [(e["type"], e.get("text")) for e in state.agent_log]
+            return outcomes, decisions, log
+
+        raced = run(as_race=True)
+        assert raced == run(as_race=False)
+        assert [d[1] for d in raced[1]] == ["buy", "sell", "buy", "sell"]
+
+
+class TestGoodMomentsPairsSplit:
+    def test_a_goodmoments_pair_trades_its_own_share_beside_a_day_range_pair(
+        self, market_open, monkeypatch,
+    ):
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "AMD"], broker)
+        edges = Edges(monkeypatch)
+        state = make_state(["AAPL", "AMD"])
+        race = make_split(
+            {"AAPL:highlow": 60.0, "AMD:goodmoments": 40.0},
+            flat_racer("AAPL"), gm_racer("AMD", stop_gain_fraction=0.0),
+        )
+        race.run_cycle(state, tracker)
+        edges.next(tapes, "AMD", 0.05)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), AMD=104.0)
+        race.run_cycle(state, tracker)
+        # 95% of each pair's own share: 5,700 / 103 and 3,800 / 104.
+        assert fills(tracker) == [("AAPL", "buy", 55.0), ("AMD", "buy", 36.0)]
+        assert state.orchestra["holders"] == ["AAPL:highlow", "AMD:goodmoments"]
+
+
+class TestGoodMomentsPairsConfig:
+    def test_they_share_only_the_size_the_flatten_and_the_days_off(self):
+        # A GoodMoments pair keeps its own rules: another stop, unit, ladder...
+        mixed = ar.OrchestraConfig([
+            racer("AAPL"), gm_racer("AMD", stop_gain_fraction=0.9, level_unit="pred_range",
+                                    scale_in=True, take_after_minutes=5),
+        ])
+        assert mixed.keys == ["AAPL:highlow", "AMD:goodmoments"]
+        for shared in (dict(position_pct=50.0), dict(skip_events=("cpi",)),
+                       dict(flatten_before_close_min=1)):
+            with pytest.raises(ValueError, match=next(iter(shared))):
+                ar.OrchestraConfig([racer("AAPL"), gm_racer("AMD", **shared)])
+        # ...and two GoodMoments pairs need not agree on theirs.
+        ar.OrchestraConfig([gm_racer("AAPL", gm_confirm_bars=3), gm_racer("AMD", gm_exit=0.0)])
+
+    def test_build_opens_each_on_its_own_configuration(self):
+        from dataclasses import asdict
+
+        from agent_stonks import base_configs
+
+        base_configs.set_base(asdict(at.AppleTraderConfig(
+            model_key="goodmoments", ticker="AAPL", gm_enter=0.08, gm_take_k=0.5,
+            gm_take_min_k=0.2, gm_stop_k=0.3, gm_confirm_bars=3, position_pct=80.0, skip_events=(),
+        )))
+        base = at.AppleTraderConfig(position_pct=60.0, skip_events=("cpi",))
+        race = ar.build_orchestra_config(
+            ["AAPL:highlow", "AAPL:goodmoments", "AMD:goodmoments", "AAPL:highlow2_goodmoments"],
+            base,
+            {"AAPL:goodmoments": {"gm_take_k": 0.15},
+             "AAPL:highlow2_goodmoments": {"buy_k": 0.8, "gm_enter": 0.05, "sell_k": 0.4}},
+        )
+        _, gm, amd, hybrid = race.racers
+        # Its base, the number set here, and Orchestra's size and days off.
+        assert (gm.gm_enter, gm.gm_take_k, gm.gm_stop_k, gm.gm_confirm_bars) == (0.08, 0.15, 0.3, 3)
+        assert gm.gm_take_min_k == 0.15  # the volatility take cut to the take
+        assert (gm.position_pct, gm.skip_events) == (60.0, ("cpi",))
+        # No base: the shipped defaults, AMD's own stop.
+        assert (amd.gm_enter, amd.gm_take_k, amd.gm_stop_k) == (0.02, 0.2, 0.5)
+        # The hybrid: GoodMoments' base under HighLow2's level, with its buy set
+        # here -- and nothing it is not given (the sell stays 0).
+        assert (hybrid.buy_k, hybrid.sell_k, hybrid.gm_enter) == (0.8, 0.0, 0.05)
+        assert (hybrid.gm_take_k, hybrid.gm_take_min_k) == (0.5, 0.2)
+        assert isinstance(
+            ar.build_orchestra(race, {k: BUNDLE for k in race.keys}).by_key[
+                "AAPL:highlow2_goodmoments"].trader,
+            at.HighLow2GoodMomentsTrader,
+        )
+        # A take of 0 is off, and its curve with it.
+        off = ar.build_orchestra_config(["AAPL:goodmoments"], base, {"AAPL:goodmoments": {"gm_take_k": 0}})
+        assert (off.racers[0].gm_take_k, off.racers[0].gm_take_min_k) == (0.0, None)
+
+    def test_signature_signs_its_whole_rule_set_and_the_shared_rules_once(self):
+        base = at.AppleTraderConfig()
+        ranged = ar.build_orchestra_config(["AAPL:highlow"], base)
+        mixed = ar.build_orchestra_config(["AAPL:highlow", "AMD:goodmoments"], base)
+        sig = ar.orchestra_signature(mixed)
+        assert sig.startswith("orchestra[highlow_AAPL@")
+        assert ",goodmoments_AMD(enter=+0.02,exit=off,take=0.2A,stop=0.5A,raise=0.05/stop)](" in sig
+        assert sig.count("size=") == 1
+        # The shared rules are the day-range pair's, as without it.
+        assert sig.split("](")[1] == ar.orchestra_signature(ranged).split("](")[1]
+        alone = ar.orchestra_signature(ar.build_orchestra_config(["AMD:goodmoments"], base))
+        assert alone.endswith("](size=95%,skip=earn+cpi+nfp+mkt+geo)")
+        split = ar.build_orchestra_config(
+            ["AMD:goodmoments"], base, mode=ar.MODE_SPLIT, budget_pct={"AMD:goodmoments": 40},
+        )
+        assert "stop=0.5A,raise=0.05/stop)=40%](" in ar.orchestra_signature(split)
+
+    def test_simlab_round_trips_it(self):
+        from simlab.rule_agents import rule_agent
+
+        agent = rule_agent(ar.ORCHESTRA_KEY)
+        race = ar.build_orchestra_config(
+            ["AAPL:highlow", "AMD:goodmoments", "AAPL:highlow2_goodmoments"], at.AppleTraderConfig(),
+        )
+        assert agent.from_record(agent.to_record(race)) == race
+        assert agent.signature(agent.from_record(agent.to_record(race))) == agent.signature(race)
+
+    def test_the_morning_pick_ranks_it_by_its_take(self):
+        from agent_stonks import candidates
+
+        assert candidates.target_k(gm_racer("AMD", gm_take_k=0.35)) == 0.35
+        assert candidates.target_k(racer("AAPL")) == pytest.approx(0.65)
+
+
+class TestGoodMomentsPairsForm:
+    def _run(self, pairs, **state):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_orchestra_form, default_timeout=30)
+        app.session_state["o_pairs"] = pairs
+        for key, value in state.items():
+            app.session_state[key] = value
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_a_row_of_entry_take_and_stop_beside_the_levels(self):
+        pairs = ["AAPL:highlow", "AMD:goodmoments", "AAPL:highlow2_goodmoments"]
+        app = self._run(pairs, o_gm_enter_goodmoments_AMD=0.04)
+        app.number_input(key="o_buy_k_highlow2_goodmoments_AAPL").set_value(0.9).run()
+        race = app.session_state["out"]
+        assert race.keys == pairs
+        _, amd, hybrid = race.racers
+        assert (amd.gm_enter, amd.gm_take_k, amd.gm_stop_k) == (0.04, 0.2, 0.5)
+        assert hybrid.buy_k == 0.9 and hybrid.sell_k == 0.0
+        # Only the hybrid has a buy distance in the signal table.
+        assert not [w for w in app.number_input if w.key == "o_buy_k_goodmoments_AMD"]
+        # The size every pair shares.
+        app.number_input(key="o_dayrange_size").set_value(50.0).run()
+        assert {r.position_pct for r in app.session_state["out"].racers} == {50.0}
+
+    def test_goodmoments_pairs_alone_draw_no_day_range_rules(self):
+        app = self._run(["AAPL:goodmoments", "AMD:goodmoments"])
+        keys = {w.key for w in app.number_input} | {w.key for w in app.selectbox}
+        assert "o_dayrange_size" in keys
+        assert "o_level_unit" not in keys and "o_take_trigger" not in keys
+        app.multiselect(key="o_skip_events").set_value(["cpi"]).run()
+        race = app.session_state["out"]
+        assert [r.skip_events for r in race.racers] == [("cpi",), ("cpi",)]
+        # AAPL's own stop (0.75) and AMD's (0.5), not one shared stop.
+        assert [r.gm_stop_k for r in race.racers] == [0.75, 0.5]
+
+    def test_split_gives_each_its_share(self):
+        app = self._run(["AAPL:highlow", "AMD:goodmoments"], o_mode=ar.MODE_SPLIT)
+        assert app.session_state["out"].budget_pct == {"AAPL:highlow": 50.0, "AMD:goodmoments": 50.0}

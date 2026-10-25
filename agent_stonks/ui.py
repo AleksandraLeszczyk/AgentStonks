@@ -2586,12 +2586,14 @@ def _agent_log_panel() -> None:
 def _orchestra_board(state: AppState) -> None:
     """Where every pair of today's Orchestra stands (`AppState.orchestra`):
     its status and how far its last close is above its buy level, counted in
-    its own level unit so pairs at different prices compare."""
+    its own level unit so pairs at different prices compare -- and for a
+    GoodMoments pair its edge against the entry it needs."""
     race = getattr(state, "orchestra", None) or {}
     board = race.get("board") or []
     if not board or state.llm_personality != ORCHESTRA_KEY:
         return
     split = race.get("mode") == "split"
+    signals = any(row.get("kind") == "signal" for row in board)
     holder = race.get("holder")
     if split:
         budget = race.get("budget") or {}
@@ -2617,6 +2619,7 @@ def _orchestra_board(state: AppState) -> None:
                 "Last": row["close"],
                 "Buy": row["buy"],
                 "Sell": row["sell"],
+                **({"Edge": row.get("edge"), "Entry": row.get("entry")} if signals else {}),
                 **(
                     {
                         "Budget %": row.get("budget_pct"),
@@ -2644,6 +2647,16 @@ def _orchestra_board(state: AppState) -> None:
                 format="%+.2f",
                 help="(last close − buy level) ÷ the pair's level unit. The pair "
                 "nearest 0 is the nearest to buying.",
+            ),
+            "Edge": st.column_config.NumberColumn(
+                format="%+.3f",
+                help="A GoodMoments pair's edge on its last bar: the model's probability of "
+                "a +0.2 ADR rise minus the time-and-volatility model's.",
+            ),
+            "Entry": st.column_config.NumberColumn(
+                format="%+.3f",
+                help="The edge a GoodMoments pair's buy needs now — its entry, raised by its "
+                "circuit breaker after a stop.",
             ),
         },
     )
@@ -3482,7 +3495,9 @@ _ORCHESTRA_COPY = dc_replace(
             "- Reads the pre-market briefing (bias, confidence), the earnings calendar, "
             "and the opening gap on the daily ADR.\n"
             "- Ranks what is left by what a target exit pays as a share of the price "
-            "(`buy − sell` ADRs over the price), best first.\n"
+            "(`buy − sell` ADRs over the price; a GoodMoments pair's take), best first.\n"
+            "- Nothing is read before the pick, so a GoodMoments pair — which could buy "
+            "from 09:30 — trades from 09:34.\n"
             "- The Candidates tab shows the pick — provisional until 09:34, then the "
             "one Orchestra made. A restart keeps it."
         ),
@@ -3493,7 +3508,22 @@ _ORCHESTRA_COPY = dc_replace(
             "- **Min win** — each pair's circuit breaker: a trade that closes for no more "
             "than this stands *that pair* down for the day; the others keep racing.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
-            "- Everything below the table is shared by every pair."
+            "- Everything below the tables is shared by every day-range pair; the "
+            "position size and the days off by every pair."
+        ),
+        "signal_pairs": (
+            "The GoodMoments pairs — GoodMoments, and HighLow2 + GoodMoments — read their "
+            "edge at the close of every bar and buy at the market when it is at the entry.\n\n"
+            "- **Entry / Take / Stop** — each pair's own, starting from its base "
+            "configuration (or the shipped defaults).\n"
+            "- **HighLow2 buy** (the hybrid only) — after the opening window a buy also needs "
+            "the close at or under HighLow2's buy level, this × its unit under the predicted high.\n"
+            "- **Budget %** (Split only) — the pair's share of the budget.\n"
+            "- Everything else — the take's fall with volatility, the sale on a fading edge, "
+            "the momentum confirmation, the circuit breaker — is the pair's own configuration. "
+            "The position size and the days off below are Orchestra's.\n"
+            "- A stop pauses only that pair's buys for 15 bars; it does not stop the agent.\n"
+            "- Read once, at ▶ Start."
         ),
     },
     help={
@@ -3501,7 +3531,8 @@ _ORCHESTRA_COPY = dc_replace(
         "mode": (
             "**Race** — every pair watches for its buy; the first whose buy fills takes "
             "the budget and is the only one that trades until its position is closed, "
-            "then the race is open again. A stop-out stops the agent.\n\n"
+            "then the race is open again. A stop-out stops the agent (a GoodMoments "
+            "pair's stop only pauses that pair).\n\n"
             "**Split** — every pair trades at once, each on its own share of the budget "
             "(the Budget % column). A pair sizes every buy off the cash its share has "
             "left, and holds only the shares it bought itself. The budget is what the "
@@ -3514,8 +3545,10 @@ _ORCHESTRA_COPY = dc_replace(
             "the pair's own cash, not of the account's."
         ),
         "pairs": (
-            "The (ticker, model) pairs Orchestra watches — AAPL on the day-range model "
-            "and AAPL on HighLow are two pairs. The defaults are the pairs SimLab's "
+            "The (ticker, model) pairs Orchestra watches — AAPL on HighLow and AAPL on "
+            "HighLow2 are two pairs. Day-range pairs (HighLow, HighLow2) rest levels under "
+            "their 9:35 forecast; GoodMoments pairs (GoodMoments, HighLow2 + GoodMoments) "
+            "buy on their edge. The defaults are the pairs SimLab's "
             "tuning has picked levels for. The order is the tie-break: when two buys "
             "would fill on the same bar, the pair listed first takes it. Every pair's "
             "ticker must be streamed."
@@ -3524,6 +3557,26 @@ _ORCHESTRA_COPY = dc_replace(
             "Per pair: a trade that closes for no more than this many units a share "
             "stands that pair down for the rest of the day. Untick the box beside it "
             "to switch it off for that pair."
+        ),
+        "pair_gm_enter": (
+            "Per pair: the edge a buy needs — the model's probability of a +0.2 ADR rise "
+            "before the close, minus the time-and-volatility model's. Higher buys less often."
+        ),
+        "pair_gm_take_k": (
+            "Per pair: the take-profit, in ADRs over the fill. 0 switches it off. When the "
+            "pair's own configuration has the take follow the intraday volatility curve, "
+            "this is the take at the session's most volatile minute; it falls to the "
+            "configuration's quietest-minute take, or to this if that is lower."
+        ),
+        "pair_gm_stop_k": (
+            "Per pair: the stop, in ADRs under the fill. 0 switches it off. A stop pauses "
+            "that pair's buys for 15 bars (and, with the pair's circuit breaker, raises its "
+            "entry for the day); it does not stop the agent."
+        ),
+        "pair_hybrid_buy_k": (
+            "HighLow2 + GoodMoments only: from the bar after the opening window a buy also "
+            "needs the bar's close at or under HighLow2's buy level — this × the pair's level "
+            "unit under HighLow2's predicted high, moved with the forecast through a breach."
         ),
         "select_on": (
             "Off, Orchestra races every pair all day. On, it picks the day's "
@@ -3618,9 +3671,9 @@ def _orchestra_params(symbols: list[str]) -> "OrchestraConfig | None":
         race = apple_trader_ui.orchestra_params(symbols, _ORCHESTRA_COPY, seed=seed)
         if seed is not None:
             st.caption(
-                "The running Orchestra picks up a change to a pair's buy or sell distance "
-                "at its next bar. Every other setting — and adding or removing a pair — "
-                "takes effect on ▶ Start."
+                "The running Orchestra picks up a change to a day-range pair's buy or sell "
+                "distance at its next bar. Every other setting — a GoodMoments pair's "
+                "numbers, and adding or removing a pair — takes effect on ▶ Start."
             )
         if race is not None:
             missing = [t for t in race.tickers if t not in symbols]
