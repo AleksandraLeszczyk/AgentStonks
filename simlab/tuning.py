@@ -1535,18 +1535,26 @@ def summed_cells(record: dict) -> "list[dict]":
     return out
 
 
+def daily_profit(cell: "dict | None") -> "float | None":
+    """A summed cell's total profit over its sessions -- every session, traded
+    or not -- or None for a hole, a refusal or an error."""
+    if not cell or "profit" not in cell or cell.get("error") or not cell.get("days"):
+        return None
+    return cell["profit"] / cell["days"]
+
+
+def best_daily_cell(record: dict) -> "dict | None":
+    """The combination of the grid that made the most a session, summed over
+    every dataset of the job (`daily_profit`). Read off the whole grid, not the
+    pick, whose plateau rule and minimum share of days traded can pass it over.
+    None while no combination is answered on every dataset."""
+    cells = [cell for cell in summed_cells(record) if daily_profit(cell) is not None]
+    return max(cells, key=daily_profit, default=None)
+
+
 def best_daily_profit(record: dict) -> "float | None":
-    """The most any combination of the grid made a session, summed over every
-    dataset of the job: the highest total profit over its sessions -- every
-    session of the job, traded or not. Read off the whole grid, not the pick,
-    whose plateau rule and minimum share of days traded can pass it over. None
-    while no combination is answered on every dataset."""
-    rates = [
-        cell["profit"] / cell["days"]
-        for cell in summed_cells(record)
-        if "profit" in cell and not cell.get("error") and cell.get("days")
-    ]
-    return max(rates) if rates else None
+    """The most any combination of the grid made a session (`best_daily_cell`)."""
+    return daily_profit(best_daily_cell(record))
 
 
 def summed_baseline(record: dict) -> "dict | None":

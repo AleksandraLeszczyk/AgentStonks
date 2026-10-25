@@ -3771,8 +3771,9 @@ def _derived_discriminators(jobs: list[dict]) -> dict[str, str]:
 def _tuning_job_label(
     job: dict, markdown: bool = True, detail: str = "", best: bool = True
 ) -> str:
-    """One job as a line: what it sweeps, the most a combination of it made a
-    session (`best`, `tuning.best_daily_profit`), and when it started. Sorted
+    """One job as a line: the instrument, then the win rate and the profit per
+    session of the combination that made the most a session (`best`,
+    `tuning.best_daily_cell`), then what it sweeps and when it started. Sorted
     on without `best`, so jobs of one grid stay in the order they started."""
     spec = job["spec"]
     params = " × ".join(_tuning_param_label(a["name"]) for a in spec["axes"])
@@ -3781,13 +3782,17 @@ def _tuning_job_label(
     # different prices under the day-range and the high/low forecast -- and the
     # picker otherwise shows two jobs of one ticker as the same line.
     model = _apple_model_label(spec["base"].get("model_key", ""))
-    head = f"{f'**{ticker}**' if markdown else ticker} · {model} · {params}"
-    # Before the date, which a long line in the picker cuts off first.
-    daily = sim_tuning.best_daily_profit(job) if best else None
-    if daily is not None:
+    parts = [f"**{ticker}**" if markdown else ticker]
+    # Ahead of everything else, which a long line in the picker cuts off first.
+    cell = sim_tuning.best_daily_cell(job) if best else None
+    if cell is not None:
+        rate = sim_tuning.win_rate(cell)
+        parts.append(f"win {rate:.0f}%" if rate is not None else "win —")
+        daily = sim_tuning.daily_profit(cell)
         # Escaped in markdown, where a bare "$" opens a formula.
         dollar = "\\$" if markdown else "$"
-        head += f" · best {'−' if daily < 0 else '+'}{dollar}{abs(daily):,.2f}/day"
+        parts.append(f"{'−' if daily < 0 else '+'}{dollar}{abs(daily):,.2f}/day")
+    head = " · ".join([*parts, model, params])
     started = (job.get("created_at") or "")[:16].replace("T", " ")
     # No dataset names: a job's datasets change as they are added and dropped,
     # and the results below list them anyway.

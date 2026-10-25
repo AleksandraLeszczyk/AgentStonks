@@ -549,6 +549,27 @@ class TestSum:
         assert tu.best_daily_profit(job_record({"w1": [refused, broken]})) is None
         unswept = job_record({"w1": [scored({"buy_k": 0.3}, 50.0)], "w2": []})
         assert tu.best_daily_profit(unswept) is None
+        assert tu.best_daily_cell(unswept) is None
+
+    def test_the_best_day_cell_carries_its_own_win_rate(self):
+        """The job label's win rate is the best-a-session combination's, summed
+        over the datasets -- not the pick's."""
+        trips = lambda cell, n, won: {**cell, "round_trips": n, "wins": won}  # noqa: E731
+        record = job_record(
+            {
+                "w1": [trips(scored({"buy_k": 0.3}, 900.0, traded=1), 2, 1),
+                       trips(scored({"buy_k": 0.5}, 100.0), 4, 4)],
+                "w2": [trips(scored({"buy_k": 0.3}, 100.0, traded=1), 2, 2),
+                       trips(scored({"buy_k": 0.5}, 100.0), 4, 4)],
+            },
+            min_traded_share=0.5,
+        )
+        tu.refresh_pick(record)
+        assert record["best"]["overrides"] == {"buy_k": 0.5}
+        cell = tu.best_daily_cell(record)
+        assert cell["overrides"] == {"buy_k": 0.3}
+        assert tu.win_rate(cell) == 75.0
+        assert tu.daily_profit(cell) == pytest.approx(100.0)
 
     def test_missing_replays_count_every_dataset(self):
         record = job_record({"w1": [scored({"buy_k": 0.3}, 1.0)], "w2": []})
