@@ -280,6 +280,35 @@ def model_metrics(rows: "list[dict]") -> "list[dict]":
     return sorted(out, key=lambda r: r["per_session"], reverse=True)
 
 
+def best_per_instrument(rows: "list[dict]") -> "list[dict]":
+    """`pair_metrics` rows by instrument: the model whose base made the most a
+    session over the window, the runner-up and by how much the winner leads it,
+    and how many models the instrument was compared on. A session rate rather
+    than the window's profit, since two models of one instrument may have been
+    replayed on different sessions. Best instrument first."""
+    by_ticker: "dict[str, list[dict]]" = {}
+    for row in rows:
+        by_ticker.setdefault(row["ticker"], []).append(row)
+    out = []
+    for ticker, group in by_ticker.items():
+        best, *rest = sorted(group, key=lambda r: r["per_session"], reverse=True)
+        second = rest[0] if rest else None
+        out.append({
+            "ticker": ticker,
+            "model_key": best["model_key"],
+            "per_session": best["per_session"],
+            "profit": best["profit"],
+            "sessions": best["sessions"],
+            "days_up": best["days_up"],
+            "days_down": best["days_down"],
+            "models": len(group),
+            "runner_up": second["model_key"] if second else None,
+            "runner_up_per_session": second["per_session"] if second else None,
+            "lead": round(best["per_session"] - second["per_session"], 2) if second else None,
+        })
+    return sorted(out, key=lambda r: r["per_session"], reverse=True)
+
+
 def weekly(series: "list[BaseSeries]", span: "tuple[str, str]") -> "list[dict]":
     """Per pair and week (its Monday), the per-session profit in the window."""
     out = []

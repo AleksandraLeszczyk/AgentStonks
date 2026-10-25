@@ -5565,9 +5565,14 @@ def _ml_model_color(model_key: str) -> str:
     return _ML_MODEL_COLORS[index % len(_ML_MODEL_COLORS)]
 
 
+def _ml_model(model_key: str) -> str:
+    """A model's name without the trailing "model", for tight columns."""
+    return _apple_model_label(model_key).replace(" model", "")
+
+
 def _ml_pair(model_key: str, ticker: str) -> str:
     """`AMD · HighLow`: an instrument and the model it trades on."""
-    return f"{ticker} · {_apple_model_label(model_key).replace(' model', '')}"
+    return f"{ticker} · {_ml_model(model_key)}"
 
 
 def _ml_day(day: str) -> str:
@@ -5674,6 +5679,38 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
         "in_profit": "Instruments in profit",
         "best": "Best instrument",
         "worst": "Worst instrument",
+    })
+
+    st.markdown("**Best model per instrument**")
+    st.dataframe(pd.DataFrame([
+        {
+            "ticker": b["ticker"],
+            "model": _ml_model(b["model_key"]),
+            "per_session": b["per_session"],
+            "profit": b["profit"],
+            "days": f"{b['days_up']} up · {b['days_down']} down of {b['sessions']}",
+            "runner_up": _ml_model(b["runner_up"]) if b["runner_up"] else None,
+            "runner_up_per_session": b["runner_up_per_session"],
+            "lead": b["lead"],
+            "models": b["models"],
+        }
+        for b in ml_summary.best_per_instrument(rows)
+    ]), hide_index=True, placeholder="—", column_config={
+        "ticker": "Instrument",
+        "model": "Best model",
+        "per_session": money("Profit a session ($)", format="%+.2f"),
+        "profit": money("Profit ($)", format="%+.2f", help="Over the window."),
+        "days": "Days",
+        "runner_up": "Runner-up",
+        "runner_up_per_session": money("Runner-up a session ($)", format="%+.2f"),
+        "lead": money(
+            "Lead a session ($)", format="%+.2f",
+            help="How much more the best model made a session than the runner-up.",
+        ),
+        "models": st.column_config.NumberColumn(
+            "Models compared",
+            help="How many models have a replay of their base on this instrument in the window.",
+        ),
     })
 
     ordered = sorted(rows, key=lambda r: r["per_session"])

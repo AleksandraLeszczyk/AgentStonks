@@ -143,6 +143,22 @@ class TestWindows:
         assert (second["per_session"], second["profit"], second["in_profit"]) == (40.0, 200.0, 1)
         assert (second["best"], second["worst"]) == ("AMD", "MU")
 
+    def test_each_instrument_names_its_best_model_and_the_runner_up(self):
+        def row(model, ticker, per_session):
+            return {"model_key": model, "ticker": ticker, "per_session": per_session,
+                    "profit": per_session * 5, "sessions": 5, "days_up": 3, "days_down": 2}
+
+        found = ms.best_per_instrument([
+            row("highlow", "AAPL", 40.0), row("goodmoments", "AAPL", 90.0),
+            row("highlow2", "AAPL", -10.0), row("highlow", "MU", 120.0),
+        ])
+        assert [(b["ticker"], b["model_key"]) for b in found] == [
+            ("MU", "highlow"), ("AAPL", "goodmoments")
+        ]
+        aapl = found[1]
+        assert (aapl["runner_up"], aapl["lead"], aapl["models"]) == ("highlow", 50.0, 3)
+        assert found[0]["runner_up"] is None and found[0]["lead"] is None
+
     def test_weeks_start_on_monday(self):
         [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})], bases={})
         weeks = ms.weekly([series], ms.window([series], ms.ALL))
