@@ -1844,12 +1844,25 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "every bar (off in the notebook's pick); **momentum confirmation** — HighLow's "
             "behaviour table over N bars: no buy on negative momentum, a reached take held "
             "while momentum is positive (0 = off, the notebook's pick); **sell when the edge "
-            "fades** — off in the notebook's pick.\n"
+            "fades** — off in the notebook's pick; **circuit breaker** — each stop raises the "
+            "entry for the rest of the session (not in the notebook).\n"
             "- In the signature as `enter=+0.02,exit=off,take=0.2A,stop=0.75A`, a take that "
-            "follows volatility as `take=0.4..0.1A@vol`, the confirmation as `confirm=3b`; the "
+            "follows volatility as `take=0.4..0.1A@vol`, the breaker as `raise=0.05/stop`, the "
+            "confirmation as `confirm=3b`; a record from before the breaker replays without "
+            "it; the "
             "day-range fields are not, since nothing reads them under this model.\n"
             "- The defaults are notebook 4's design 2, chosen on July–December 2025: +$496 on "
             "199 test sessions at $10,000 a trade, inside the placebo spread."
+        ),
+        "probability_breaker": (
+            "Each stop raises the edge a buy needs for the rest of the session, on top of "
+            "the 15-minute pause. In the signature as `raise=0.05/stop` while it is on; a "
+            "Tuning axis of its own."
+        ),
+        "gm_stop_raise": (
+            "How much each stop raises the entry, for the rest of the session: the entry plus "
+            "this × the day's stops. 0.05 by default, picked off the stored runs rather than "
+            "swept — sweep it here. Unticked, a stop only pauses entries for 15 minutes."
         ),
         "hybrid_levels": (
             "The second vote: from 09:35 a GoodMoments buy also needs the bar to close at or "

@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .candidates import SelectionRules
     from .orchestra import OrchestraConfig
 from .config import (
+    APPLE_TRADER_GM_STOP_RAISE,
     BREACH_LABELS,
     BREACH_OFFERED,
     LEVEL_UNITS,
@@ -161,8 +162,9 @@ def probability_params(
 ) -> AppleTraderConfig:
     """GoodMoments' rules: the edge a buy needs, the take and the stop in ADRs,
     the take's optional fall with the intraday volatility curve, the optional
-    momentum confirmation of the buy and the take, and the optional sale on a
-    fading edge -- notebook 4's pick by default.
+    momentum confirmation of the buy and the take, the optional sale on a
+    fading edge -- notebook 4's pick by default -- and the circuit breaker,
+    which raises the edge a buy needs after every stop.
 
     Keyed by model and instrument like Fast&Furious's, and read once, at
     ▶ Start. The size is the day-range form's own widget, so one number is the
@@ -249,6 +251,7 @@ def probability_params(
             "buy would be sold on the next bar: the sale on a fading edge is off until it does."
         )
         gm_exit = None
+    gm_stop_raise = stop_raise_param(defaults, model_key, ticker, copy)
     levels = (
         hybrid_levels_params(defaults, model_key, ticker, copy)
         if apple_models.levels_of(model_key) is not None else {}
@@ -265,9 +268,37 @@ def probability_params(
         gm_take_min_k=gm_take_min_k,
         gm_stop_k=float(stop_k),
         gm_confirm_bars=int(confirm_bars),
+        gm_stop_raise=gm_stop_raise,
         skip_events=skip_events,
         **levels,
     )
+
+
+def stop_raise_param(
+    defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
+) -> float:
+    """GoodMoments' circuit breaker: how much each stop raises the edge a buy
+    needs for the rest of the session. Switched off by its box rather than by
+    a 0, like the day-range breaker, so the step stays on screen, greyed out."""
+    section("Circuit breaker", copy.sections.get("probability_breaker"))
+    col_a, col_b = st.columns(2)
+    raise_on = col_a.checkbox(
+        "Raise the entry after a stop",
+        value=defaults.gm_stop_raise > 0,
+        key=copy.key(f"gm_stop_raise_on_{model_key}_{ticker}"),
+        help=copy.help.get("gm_stop_raise"),
+    )
+    step = col_b.number_input(
+        "…by this much per stop (edge)",
+        min_value=0.005, max_value=0.30,
+        value=float(defaults.gm_stop_raise or APPLE_TRADER_GM_STOP_RAISE),
+        step=0.01, format="%.3f", disabled=not raise_on,
+        key=copy.key(f"gm_stop_raise_{model_key}_{ticker}"),
+        help=copy.help.get("gm_stop_raise"),
+    )
+    if raise_on and not defaults.gm_stop_k:
+        col_a.caption("The stop is off, so nothing will raise it.")
+    return float(step) if raise_on else 0.0
 
 
 def hybrid_levels_params(

@@ -73,6 +73,7 @@ from .config import (
     APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
     APPLE_TRADER_GM_STOP_K,
     APPLE_TRADER_GM_STOP_K_BY_TICKER,
+    APPLE_TRADER_GM_STOP_RAISE,
     APPLE_TRADER_GM_TAKE_K,
     APPLE_TRADER_GM_TAKE_MIN_K,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
@@ -602,6 +603,11 @@ class AppleTraderConfig:
     # own field rather than `momentum_confirmation_bars`, which every stored
     # GoodMoments record carries at the day-range default.
     gm_confirm_bars: int = APPLE_TRADER_GM_CONFIRM_BARS
+    # GoodMoments' circuit breaker: how much each stop raises the edge an entry
+    # needs, for the rest of the session (`GoodMomentsTrader.enter_at`) -- on
+    # top of the 15-bar pause. 0 switches it off, which is what every record
+    # made before 2026-10-25 replays as.
+    gm_stop_raise: float = APPLE_TRADER_GM_STOP_RAISE
 
     def __post_init__(self) -> None:
         # Resolved before the checks below, which need numbers -- and before
@@ -793,6 +799,12 @@ class AppleTraderConfig:
                     f"{name} {getattr(self, name)!r} is a distance from the fill in ADRs and "
                     "cannot be negative (0 switches it off)"
                 )
+        self.gm_stop_raise = float(self.gm_stop_raise)
+        if not 0.0 <= self.gm_stop_raise < 1.0:
+            raise ValueError(
+                f"gm_stop_raise {self.gm_stop_raise!r} is how much each stop raises the entry "
+                "edge, between 0 and 1 (0 switches the circuit breaker off)"
+            )
         if float(self.gm_confirm_bars) != int(self.gm_confirm_bars) or int(self.gm_confirm_bars) < 0:
             raise ValueError(
                 f"gm_confirm_bars {self.gm_confirm_bars!r} is a whole number of bars, 0 or "
@@ -1196,7 +1208,8 @@ def _probability_signature(c: AppleTraderConfig) -> str:
 
     `enter=+0.02` is the edge a buy needs, `exit` the edge under which a long
     is sold (`off` without one), `take` and `stop` the two distances from the
-    fill in **A**DRs (`off` at 0). A take that follows the intraday volatility
+    fill in **A**DRs (`off` at 0), `raise=0.05/stop` the circuit breaker -- how
+    much each stop raises the entry, only while it is on. A take that follows the intraday volatility
     curve signs as `take=0.4..0.1A@vol` -- at the most volatile minute, then at
     the quietest; one that does not keeps the form every record before it was
     filed under. The momentum confirmation signs as `confirm=3b`, only while
@@ -1208,12 +1221,13 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     if c.gm_take_k and c.gm_take_min_k is not None:
         take = f"{c.gm_take_k:g}..{c.gm_take_min_k:g}A@vol"
     stop = f"{c.gm_stop_k:g}A" if c.gm_stop_k else "off"
+    raise_ = f",raise={c.gm_stop_raise:g}/stop" if c.gm_stop_raise else ""
     confirm = f",confirm={c.gm_confirm_bars}b" if c.gm_confirm_bars else ""
     skip = ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events) if c.skip_events else ""
     levels = _hybrid_levels_signature(c) if apple_models.levels_of(c.model_key) else ""
     return (
         f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop}"
-        f"{confirm}{levels},size={c.position_pct:g}%{skip})"
+        f"{raise_}{confirm}{levels},size={c.position_pct:g}%{skip})"
     )
 
 
@@ -4443,7 +4457,9 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
     where a fall of 0.2 ADR is as likely as the rise:
 
     * **enter** at market when the edge is at least `gm_enter` (0.02), up to the
-      15:30 bar and never within 15 bars of a stop;
+      15:30 bar and never within 15 bars of a stop -- and, with the **circuit
+      breaker** (`gm_stop_raise`), at least `gm_stop_raise` more for every stop
+      the session has taken (`enter_at`);
     * **take** `gm_take_k` (0.2) ADR over the fill -- the question's own target
       -- and **stop** `gm_stop_k` (0.75; AMD's 0.5) ADR under it, both resting from the
       fill on and checked against every bar after it (a bar touching both is a
@@ -4481,6 +4497,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
       than at the 15:59 close.
     * **No stand-down.** A stop pauses entries for 15 bars, as the notebook's
       rules do, rather than ending the run as the day-range rules' stop does.
+      What the notebook does not have is the circuit breaker: after a stop the
+      next entry needs a clearer edge (`gm_stop_raise`; 0 is the notebook).
     """
 
     ENTRY_TRIGGER_TEXT = "Edge at the entry threshold"
@@ -4515,6 +4533,9 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         # The last reason the confirmation refused an entry, so a stretch of
         # refused bars is logged once.
         self._momentum_note: "str | None" = None
+        # The raised entry last said to have refused one (the circuit breaker),
+        # for the same reason.
+        self._breaker_note: "float | None" = None
 
     def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
         if outcome != rule_agent.CLOSED and (self.blocked or {}).get("sit_out"):
@@ -4581,10 +4602,17 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         if position > 0:
             stop, take = self.entry.get("stop"), self.entry.get("take")
             if stop is not None and float(last["low"]) <= float(stop):
+                self.session["stops"] = int(self.session.get("stops") or 0) + 1
+                raised = (
+                    f", and from then on a buy needs an edge of {self.enter_at():+.3f} "
+                    f"(circuit breaker: {self.config.gm_stop_raise:+g} for each of today's "
+                    f"{self.session['stops']} stop{'s' if self.session['stops'] > 1 else ''})"
+                    if self.config.gm_stop_raise else ""
+                )
                 self._sell(state, tracker, position, self.EXIT_STOP, (
                     f"The {ts:%H:%M} bar traded down to ${float(last['low']):,.2f}, through the "
                     f"${float(stop):,.2f} stop ({self.config.gm_stop_k:g} ADR under the fill). "
-                    f"No new entry for {APPLE_TRADER_GM_COOLDOWN_BARS} bars."
+                    f"No new entry for {APPLE_TRADER_GM_COOLDOWN_BARS} bars{raised}."
                 ))
                 self.session["cool_until"] = minute + APPLE_TRADER_GM_COOLDOWN_BARS
                 return rule_agent.SOLD
@@ -4650,6 +4678,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             return sold
         if minute < int(self.session.get("cool_until") or 0):
             return sold
+        if self._refuse_on_breaker(state, ts):
+            return sold
         if self._refuse_on_levels(state, frame, ts, last, minute):
             return sold
         if self._refuse_on_momentum(state, frame, ts):
@@ -4673,6 +4703,32 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         """What a buy's reasoning says about a second model, as a sentence
         ending in a space. Nothing, on GoodMoments alone."""
         return ""
+
+    # --- the circuit breaker ------------------------------------------------
+
+    def enter_at(self) -> float:
+        """The edge a buy needs now: `gm_enter`, raised by `gm_stop_raise` for
+        every stop the session has taken."""
+        stops = int((self.session or {}).get("stops") or 0)
+        return float(self.config.gm_enter) + stops * float(self.config.gm_stop_raise)
+
+    def _refuse_on_breaker(self, state: AppState, ts) -> bool:
+        """Whether the circuit breaker refuses an entry the edge alone would
+        make: over `gm_enter`, under what today's stops have raised it to. Said
+        once per raised threshold; the next bar is judged again."""
+        needed = self.enter_at()
+        fc = self.forecast
+        if fc is None or fc["edge"] >= needed:
+            return False
+        if needed != self._breaker_note:
+            self._breaker_note = needed
+            stops = int(self.session.get("stops") or 0)
+            _log(state, {"type": "status", "text": (
+                f"The edge of {fc['edge']:+.3f} at {ts:%H:%M} is over the {self.config.gm_enter:+g} "
+                f"entry, but after {stops} stop{'s' if stops > 1 else ''} today the circuit breaker "
+                f"asks for {needed:+.3f}. Not buying; each bar is judged again."
+            )})
+        return True
 
     # --- the momentum confirmation ------------------------------------------
 
@@ -4724,6 +4780,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             self.last_bar_ts = None
             self.forecast = None
             self._forecast_note = None
+            self._breaker_note = None
         if self.blocked is not None and self.blocked["date"] != today:
             self.blocked = None
 
@@ -4774,8 +4831,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
                 f"will not trade this session: {exc}"
             )})
             return False
-        self.session = {"date": today, "adr": float(adr), "cool_until": 0, "history": [],
-                        "vol_scale": vol_scale}
+        self.session = {"date": today, "adr": float(adr), "cool_until": 0, "stops": 0,
+                        "history": [], "vol_scale": vol_scale}
         prior = self.slot.levels(state) or {}
         if (
             prior.get("rows")
@@ -4816,6 +4873,11 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
                "while it is negative (or flat and turning down), and a reached take is held "
                "while it is still positive."
                if self.config.gm_confirm_bars else "")
+            + (f" Circuit breaker: every stop raises the entry by {self.config.gm_stop_raise:+g}"
+               + (f" — {self.session['stops']} so far today, so a buy needs {self.enter_at():+.3f}"
+                  if self.session["stops"] else "")
+               + "."
+               if self.config.gm_stop_raise else "")
         )})
         return True
 
@@ -4901,7 +4963,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         reasoning = (
             f"The model puts the chance of a {math.exp(_goodmoments().TARGET_ADR * adr) - 1:.2%} rise before the "
             f"close at {fc['p']:.1%}, against {fc['p_tv']:.1%} from the clock and today's volatility "
-            f"alone: an edge of {fc['edge']:+.3f}, at or above the {self.config.gm_enter:+g} entry. "
+            f"alone: an edge of {fc['edge']:+.3f}, at or above the {self._entry_words()}. "
             f"{self._entry_note(bar, minute)}"
             f"Buying; {', '.join(exits + ['the closing flatten'])}."
         )
@@ -4920,6 +4982,17 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             # Partly filled: what is left is the same position, same levels.
             self.entry = entry
 
+    def _entry_words(self) -> str:
+        """The entry a buy cleared, in words: the configured edge, or what
+        today's stops have raised it to."""
+        stops = int((self.session or {}).get("stops") or 0)
+        if not (stops and self.config.gm_stop_raise):
+            return f"{self.config.gm_enter:+g} entry"
+        return (
+            f"{self.enter_at():+.3f} entry (the {self.config.gm_enter:+g} raised by the circuit "
+            f"breaker after {stops} stop{'s' if stops > 1 else ''} today)"
+        )
+
     def _resume(self, state: AppState, memory: "dict | None") -> None:
         """Take back an earlier run's open position (its take and stop) and its
         pause after a stop, on a restart the same day. The entry is only a
@@ -4927,6 +5000,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         if not memory:
             return
         self.session["cool_until"] = int(memory.get("cool_until") or 0)
+        self.session["stops"] = int(memory.get("stops") or 0)
         entry = memory.get("entry")
         if entry and self.entry is None:
             self.entry = dict(entry)
@@ -4942,6 +5016,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         return {
             "entry": dict(self.entry) if self.entry is not None else None,
             "cool_until": int((self.session or {}).get("cool_until") or 0),
+            "stops": int((self.session or {}).get("stops") or 0),
         }
 
     def publish_memory(self, state: AppState) -> None:
@@ -4985,6 +5060,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             "p": fc.get("p"),
             "p_tv": fc.get("p_tv"),
             "edge": fc.get("edge"),
+            # The edge a buy needed on this bar: the circuit breaker's steps.
+            "enter": self.enter_at(),
             "take": (self.entry or {}).get("take"),
             "stop": (self.entry or {}).get("stop"),
         }
@@ -4996,7 +5073,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         if fc is not None:
             parts.append(
                 f"P(+{_goodmoments().TARGET_ADR:g} ADR by the close) {fc['p']:.1%} vs {fc['p_tv']:.1%} on time and volatility "
-                f"(edge {fc['edge']:+.3f}, entry {self.config.gm_enter:+g})"
+                f"(edge {fc['edge']:+.3f}, entry {self.enter_at():+g})"
             )
         else:
             parts.append("no forecast")
@@ -5318,6 +5395,8 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         exits.append(
             f"at a stop {config.gm_stop_k:g} ADR under it, after which it buys nothing for "
             f"{APPLE_TRADER_GM_COOLDOWN_BARS} bars"
+            + (f" and then needs an edge {config.gm_stop_raise:g} higher for each stop that day"
+               if config.gm_stop_raise else "")
         )
     if config.gm_exit is not None:
         exits.append(f"once the edge is under {config.gm_exit:+g}")

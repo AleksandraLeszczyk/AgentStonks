@@ -327,10 +327,10 @@ class TestKeptApart:
     def test_its_signature_reads_only_its_own_rules(self):
         base = gm_config()
         assert config_signature(base) == (
-            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,size=95%)"
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,raise=0.05/stop,size=95%)"
         )
         assert config_signature(replace(base, buy_k=0.9, sell_k=0.2, ff_stop_k=0.0)) == config_signature(base)
-        assert config_signature(replace(base, gm_exit=-0.02, gm_take_k=0.0)) == (
+        assert config_signature(replace(base, gm_exit=-0.02, gm_take_k=0.0, gm_stop_raise=0.0)) == (
             "goodmoments_AAPL(enter=+0.02,exit=-0.02,take=off,stop=0.75A,size=95%)"
         )
         dayrange = AppleTraderConfig(model_key="dayrange")
@@ -501,10 +501,10 @@ class TestAdaptiveTake:
     def test_its_signature_and_its_checks(self):
         assert gm_config().gm_take_min_k is None
         assert config_signature(gm_config(gm_take_k=TAKE_MAX, gm_take_min_k=TAKE_MIN)) == (
-            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.4..0.1A@vol,stop=0.75A,size=95%)"
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.4..0.1A@vol,stop=0.75A,raise=0.05/stop,size=95%)"
         )
         assert config_signature(gm_config(gm_take_k=0.0, gm_take_min_k=0.0)) == (
-            "goodmoments_AAPL(enter=+0.02,exit=off,take=off,stop=0.75A,size=95%)"
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=off,stop=0.75A,raise=0.05/stop,size=95%)"
         )
         for bad in (dict(gm_take_min_k=0.3), dict(gm_take_min_k=-0.05)):    # gm_take_k is 0.2
             with pytest.raises(ValueError, match="gm_take_min_k"):
@@ -569,11 +569,135 @@ class TestForm:
         knob.set_value(3).run()
         assert app.session_state["out"].gm_confirm_bars == 3
 
+    def test_the_circuit_breaker_is_on_and_its_box_switches_it_off(self, app):
+        assert app.checkbox(key="t_gm_stop_raise_on_goodmoments_AAPL").value is True
+        assert app.session_state["out"].gm_stop_raise == pytest.approx(0.05)
+        app.number_input(key="t_gm_stop_raise_goodmoments_AAPL").set_value(0.03).run()
+        assert app.session_state["out"].gm_stop_raise == pytest.approx(0.03)
+        app.checkbox(key="t_gm_stop_raise_on_goodmoments_AAPL").uncheck().run()
+        assert app.session_state["out"].gm_stop_raise == 0.0
+        assert app.number_input(key="t_gm_stop_raise_goodmoments_AAPL").disabled
+
     def test_a_trough_take_above_the_peak_take_is_refused(self, app):
         app.checkbox(key="t_gm_take_adaptive_goodmoments_AAPL").check().run()
         app.number_input(key="t_gm_take_min_k_goodmoments_AAPL").set_value(0.5).run()
         assert app.session_state["out"].gm_take_min_k is None
         assert "at most the take-profit" in app.warning[0].value
+
+
+class TestCircuitBreaker:
+    """Each stop raises the edge a buy needs for the rest of the session
+    (`gm_stop_raise`, 2026-10-25), on top of the 15-bar pause."""
+
+    RAISE = 0.05
+
+    def _stopped(self, monkeypatch, state, **config):
+        """Bought at bar 60, stopped at bar 61, paused through bar 75."""
+        trader, tracker, tape = _setup(monkeypatch, state, **config)
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+        tape.append(98.6, low=STOP - 0.01)
+        assert cycle(trader, state, tracker) == "sold"
+        for _ in range(14):
+            tape.append(98.6)
+            cycle(trader, state, tracker)
+        return trader, tracker, tape
+
+    def test_after_a_stop_a_buy_needs_the_raised_edge(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        assert trader.enter_at() == pytest.approx(ENTER + self.RAISE)
+        tape.append(98.6, edge=ENTER + self.RAISE - 0.01)    # bar 76: over the entry, under the raise
+        assert cycle(trader, state, tracker) == "hold"
+        tape.append(98.6, edge=ENTER + self.RAISE)
+        assert cycle(trader, state, tracker) == "bought"
+        buy = [e for e in state.agent_log if e.get("type") == "decision" and e.get("action") == "buy"][-1]
+        assert "raised by the circuit breaker after 1 stop today" in buy["reasoning"]
+
+    def test_the_stop_says_what_the_next_buy_needs(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        stop = [e for e in state.agent_log if e.get("type") == "decision" and e.get("action") == "sell"][-1]
+        assert f"a buy needs an edge of {ENTER + self.RAISE:+.3f}" in stop["reasoning"]
+
+    def test_a_refusal_is_said_once(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        for _ in range(3):
+            tape.append(98.6, edge=ENTER + 0.01)
+            assert cycle(trader, state, tracker) == "hold"
+        said = [e for e in state.agent_log if "the circuit breaker asks for" in (e.get("text") or "")]
+        assert len(said) == 1
+
+    def test_every_stop_raises_it_again(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        tape.append(98.6, edge=0.2)                            # bar 76: bought
+        assert cycle(trader, state, tracker) == "bought"
+        tape.append(96.0, low=98.6 * math.exp(-0.75 * ADR) - 0.01)   # bar 77: stopped again
+        assert cycle(trader, state, tracker) == "sold"
+        assert trader.enter_at() == pytest.approx(ENTER + 2 * self.RAISE)
+
+    def test_switched_off_the_pause_is_all_a_stop_does(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state, gm_stop_raise=0.0)
+        assert trader.enter_at() == pytest.approx(ENTER)
+        tape.append(98.6, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+
+    def test_a_new_session_starts_from_the_entry(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        trader._roll_session(pd.Timestamp("2026-07-22"))
+        assert trader.enter_at() == pytest.approx(ENTER)
+
+    def test_the_raised_entry_survives_a_restart(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        again = at.build_trader(gm_config(), BUNDLE)
+        tape.append(98.6, edge=ENTER + self.RAISE - 0.01)      # bar 76
+        assert cycle(again, state, tracker) == "hold"
+        assert again.enter_at() == pytest.approx(ENTER + self.RAISE)
+
+    def test_the_record_carries_the_entry_of_each_bar(self, monkeypatch, state):
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        rows = state.apple_trader_levels["rows"]
+        # The stop bar's row is written before its stop is read.
+        assert [r["enter"] for r in rows[:3]] == pytest.approx([ENTER, ENTER, ENTER + self.RAISE])
+
+    def test_its_signature_and_its_checks(self):
+        from simlab.rule_agents import _apple_from_record
+
+        assert ",raise=0.05/stop," in config_signature(gm_config())
+        assert "raise=" not in config_signature(gm_config(gm_stop_raise=0.0))
+        old = _apple_from_record({"model_key": "goodmoments", "ticker": TICKER, "gm_enter": 0.08})
+        assert old.gm_stop_raise == 0.0 and "raise=" not in config_signature(old)
+        with pytest.raises(ValueError, match="gm_stop_raise"):
+            gm_config(gm_stop_raise=-0.01)
+
+    def test_tuning_offers_it_on_goodmoments(self):
+        from simlab import tuning
+
+        assert "gm_stop_raise" in tuning.TUNABLES
+        assert "gm_stop_raise" in tuning.axes_for(apple_models.GOODMOMENTS_KEY, ["gm_stop_raise"])
+        assert tuning.axes_for("highlow", ["gm_stop_raise"]) == []
+
+    def test_the_chart_steps_the_entry_threshold(self):
+        from agent_stonks import model_overlays as mo
+
+        stamps = [Tape.OPEN + pd.Timedelta(minutes=m) for m in (60, 61, 62, 63)]
+        fc = pd.DataFrame(
+            {"edge": [0.03, 0.03, 0.06, 0.08], "p": [0.5] * 4, "p_tv": [0.47] * 4,
+             "price": [100.0] * 4},
+            index=[60, 61, 62, 63],
+        )
+        rows = [{"t": stamps[0], "enter": 0.02}, {"t": stamps[2], "enter": 0.07}]
+        result = {"fc": fc, "stamps": stamps, "enter": 0.02, "exit": None, "raise": 0.05,
+                  "problem": ""}
+        items, _ = mo._goodmoments_signal_items(result, rows)
+        line = next(i for i in items if i["label"] == "Entry threshold")
+        assert line["values"] == pytest.approx([2.0, 2.0, 7.0, 7.0])
+        # 62 is under the raised entry: the 63 bar starts a new run of buy signals.
+        markers = [i["note"] for i in items if i["kind"] == "event"]
+        assert len(markers) == 2
+        assert "+0.02 entry" in markers[0] and "+0.07 entry" in markers[1]
+        # A replay's chart has no record to step: the note says what a stop does.
+        items, _ = mo._goodmoments_signal_items(result)
+        line = next(i for i in items if i["label"] == "Entry threshold")
+        assert set(line["values"]) == {2.0} and "+0.05 more after each stop" in line["note"]
 
 
 class TestMomentumConfirmation:
@@ -705,7 +829,7 @@ class TestMomentumConfirmation:
 
         assert gm_config().gm_confirm_bars == 0
         assert config_signature(gm_config(gm_confirm_bars=3)) == (
-            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,confirm=3b,size=95%)"
+            "goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,raise=0.05/stop,confirm=3b,size=95%)"
         )
         for bad in (-1, 1.5):
             with pytest.raises(ValueError, match="gm_confirm_bars"):

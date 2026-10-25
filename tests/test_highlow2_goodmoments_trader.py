@@ -372,7 +372,7 @@ class TestWiring:
     def test_its_signature_adds_the_buy_level_to_goodmoments(self):
         config = hybrid_config(skip_events=())
         assert config_signature(config) == (
-            "highlow2_goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,"
+            "highlow2_goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,raise=0.05/stop,"
             "buy<=H-0.6R,breach=brownian,keep_width,size=95%)"
         )
         assert config_signature(replace(config, buy_k=0.8)) != config_signature(config)

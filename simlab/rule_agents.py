@@ -266,6 +266,10 @@ _APPLE_LEGACY = {
     # the tape's momentum (before 2026-10-21). 0 is that rule, also today's
     # default, and it is left out of the signature.
     "gm_confirm_bars": 0,
+    # And a stop paused its entries for 15 bars and asked no more of the edge
+    # after them (before 2026-10-25). 0 is that rule, and it is left out of the
+    # signature.
+    "gm_stop_raise": 0.0,
 }
 
 

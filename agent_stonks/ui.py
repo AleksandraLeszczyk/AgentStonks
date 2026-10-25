@@ -3013,12 +3013,18 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "clock and today's volatility alone. The rules trade the difference, the **edge** — "
             "no levels.\n\n"
             "- **Buy** — at market when the edge is at least the entry below, until 15:30.\n"
-            "- **Sell** — at the take-profit, at the stop (then no entry for 15 minutes), on a "
-            "fading edge if that is switched on, or at the closing flatten.\n\n"
+            "- **Sell** — at the take-profit, at the stop (then no entry for 15 minutes, and "
+            "a higher edge needed after it — the circuit breaker below), on a fading edge if "
+            "that is switched on, or at the closing flatten.\n\n"
             "Notebook 4's chosen system. Its record at $10,000 a trade after 1 bp a side: "
             "+$1,443 on July–December 2025 (where it was chosen), +$496 on 2026 to 16 October "
             "(349 trades, 68% winners) — inside the placebo spread, and holding AAPL made almost "
             "four times as much."
+        ),
+        "probability_breaker": (
+            "What a stop does to the rest of the session. Each one raises the edge a buy "
+            "needs, on top of the 15-minute pause: a stop says today's reading of the edge "
+            "was wrong at least once, so the next entry has to be a clearer one."
         ),
         "hybrid_levels": (
             "The second vote. From 09:35 a GoodMoments buy also needs the bar to close at or "
@@ -3155,6 +3161,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- The curve is the same every day (fitted on 2023 – Sep 2026), so it does not "
             "know today is busier than usual; the ADR still scales both ends.\n"
             "- Off keeps one take all day (the notebook's rule)."
+        ),
+        "gm_stop_raise": (
+            "After every stop, a buy needs this much more edge for the rest of the session — "
+            "the entry plus this × today's stops. Back to the entry at the next session.\n\n"
+            "- **0.05** by default: on the stored runs every stop came on an entry within "
+            "0.002 of the threshold, and every re-entry after one had an edge 0.099 or more "
+            "over it — so it refuses only signals as marginal as the ones that stopped out.\n"
+            "- Not swept. Unticked, a stop only pauses entries for 15 minutes (the notebook's "
+            "rule).\n"
+            "- Does nothing with the stop off."
         ),
         "gm_confirm_bars": (
             "HighLow's momentum confirmation on GoodMoments' rules: the same behaviour table "

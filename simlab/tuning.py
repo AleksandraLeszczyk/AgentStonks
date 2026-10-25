@@ -278,6 +278,12 @@ TUNABLES: "dict[str, Tunable]" = {
             "gm_confirm_bars", "Momentum confirmation period (bars, GoodMoments)", 0, 60, 1,
             (0, 6, 1), "%d", integer=True,
         ),
+        # GoodMoments' circuit breaker: how much each stop raises the entry
+        # for the rest of the session; 0 is the notebook's rule.
+        Tunable(
+            "gm_stop_raise", "Entry raise per stop (edge, circuit breaker)", 0.0, 0.30, 0.005,
+            (0.0, 0.10, 0.025), "%.3f",
+        ),
     )
 }
 
@@ -365,6 +371,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "gm_take_min_k",
     "gm_stop_k",
     "gm_confirm_bars",
+    "gm_stop_raise",
 )
 
 
@@ -381,7 +388,8 @@ MOMENTUM_AXES: "tuple[str, ...]" = (
 )
 # GoodMoments' fields, for the same reason.
 PROBABILITY_AXES: "tuple[str, ...]" = (
-    "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "gm_confirm_bars", "position_pct",
+    "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "gm_confirm_bars", "gm_stop_raise",
+    "position_pct",
 )
 # A hybrid on GoodMoments' rules (`apple_models.levels_of`) reads those, plus
 # the buy level its second vote is made at and how a breach moves it.

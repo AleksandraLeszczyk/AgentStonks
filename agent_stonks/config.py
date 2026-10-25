@@ -851,6 +851,18 @@ APPLE_TRADER_GM_STOP_K_BY_TICKER = {"AMD": 0.5}
 APPLE_TRADER_GM_CONFIRM_BARS = 0
 APPLE_TRADER_GM_LAST_ENTRY_MINUTE = 360
 APPLE_TRADER_GM_COOLDOWN_BARS = 15
+# GoodMoments' circuit breaker (2026-10-25, the user's call): every stop raises
+# the edge an entry needs by this much for the rest of the session, on top of
+# the 15-bar pause -- after n stops a buy needs GM_ENTER + n x this. A stop says
+# today's reading of the edge was wrong at least once, so the next entry has to
+# be a clearer one.
+# 0.05 from the stored SimLab runs (AAPL, 2026-09-14 to 10-16, entry 0.05 and
+# 0.08): all four stops came on entries within 0.002 of the threshold, and all
+# seven re-entries after a stop had edges at least 0.099 over it and made money
+# -- a raise under 0.10 would have changed none of them, so 0.05 refuses only
+# signals as marginal as the ones that stopped out. Not swept. 0 switches it off, which is what every
+# SimLab record made before it replays as (`simlab.rule_agents._APPLE_LEGACY`).
+APPLE_TRADER_GM_STOP_RAISE = 0.05
 # Flatten this many minutes before the close: the day-range forecast is a
 # statement about one session, and the momentum regime does not survive the
 # overnight gap either.

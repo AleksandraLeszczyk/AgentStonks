@@ -747,7 +747,14 @@ def compute(
         ),
         FASTFURIOUS_SIGNAL_KEY: lambda: _fastfurious_signal_items(fastfurious_forecast()),
         FASTFURIOUS_RANGE_KEY: lambda: _fastfurious_range_items(fastfurious_forecast()),
-        GOODMOMENTS_SIGNAL_KEY: lambda: _goodmoments_signal_items(goodmoments_forecast()),
+        GOODMOMENTS_SIGNAL_KEY: lambda: _goodmoments_signal_items(
+            goodmoments_forecast(),
+            # A live run on GoodMoments' rules: the entry its circuit breaker
+            # asked for at each bar, from its own record.
+            recorded[0] if recorded is not None and apple_models.strategy(
+                getattr(recorded[1], "model_key", None)
+            ) == apple_models.STRATEGY_PROBABILITY else None,
+        ),
         TRADER_LEVELS_KEY: trader_items,
     }
 
@@ -1646,19 +1653,21 @@ def _goodmoments_forecast(
     (SIP to 15 minutes back, IEX since), so a past session is drawn with what
     the model said at each minute and a live one with what it has said so far.
     The thresholds are the configured run's when the chart's configuration is
-    a GoodMoments one, the notebook's otherwise.
+    a GoodMoments one, the notebook's otherwise -- the notebook has no circuit
+    breaker, so `raise` is then 0.
 
-    Returns `{"fc", "stamps", "enter", "exit", "problem"}`.
+    Returns `{"fc", "stamps", "enter", "exit", "raise", "problem"}`.
     """
     from .config import APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT
 
     model_key = apple_models.GOODMOMENTS_KEY
-    enter, exit_ = APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT
+    enter, exit_, raise_ = APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT, 0.0
     named = getattr(config, "model_key", None) if config is not None else None
     if named == model_key or (named and apple_models.signal_of(named) == model_key):
         # A run on GoodMoments' rules, alone or in a hybrid: that run's own.
         enter, exit_ = float(config.gm_enter), config.gm_exit
-    out = {"fc": None, "stamps": [], "enter": enter, "exit": exit_, "problem": ""}
+        raise_ = float(getattr(config, "gm_stop_raise", 0.0) or 0.0)
+    out = {"fc": None, "stamps": [], "enter": enter, "exit": exit_, "raise": raise_, "problem": ""}
     try:
         bundle = apple_models.load(model_key, symbol)
         if bundle is None:
@@ -1682,14 +1691,22 @@ def _goodmoments_forecast(
     return {**out, "fc": fc, "stamps": [open_ts + pd.Timedelta(minutes=int(m)) for m in fc.index]}
 
 
-def _goodmoments_signal_items(result: dict) -> "tuple[list[dict], str]":
+def _goodmoments_signal_items(
+    result: dict, rows: "list[dict] | None" = None,
+) -> "tuple[list[dict], str]":
     """The edge the trades are made on, and its buy signals.
 
     The edge is drawn in percentage points on the momentum panel at the bar it
     was made at -- its horizon is the close, so there is no later moment it
     belongs to -- with the entry threshold (and the exit, when one is set).
     A ▲ marks the first bar of each run at or over the entry up to 15:30, the
-    last bar the rules buy on."""
+    last bar the rules buy on.
+
+    `rows` is a live run's record (`_recorded_levels`): each row carries the
+    entry its circuit breaker asked for at that bar, so the threshold steps up
+    after a stop and the ▲s are read against it. Without one -- a replay, a
+    chart of no run -- the threshold is the configured entry, and its note says
+    what a stop would raise it by."""
     from .config import APPLE_TRADER_GM_LAST_ENTRY_MINUTE
 
     overlay = OVERLAYS[GOODMOMENTS_SIGNAL_KEY]
@@ -1697,6 +1714,30 @@ def _goodmoments_signal_items(result: dict) -> "tuple[list[dict], str]":
         return [], f"{overlay.label}: {result['problem']}"
     fc, stamps = result["fc"], result["stamps"]
     enter, exit_ = result["enter"], result["exit"]
+    # The entry in force at each bar: the last recorded one at or before it.
+    steps = sorted(
+        (pd.Timestamp(row["t"]), float(row["enter"]))
+        for row in rows or () if row.get("enter") is not None
+    )
+    entries, current, i = [], enter, 0
+    for stamp in stamps:
+        while i < len(steps) and steps[i][0] <= stamp:
+            current = steps[i][1]
+            i += 1
+        entries.append(current)
+    raised = max(entries, default=enter) > enter + 1e-12
+    if raised:
+        threshold_note = (
+            f"buy at an edge of {enter:+g} or more, raised by the circuit breaker after each "
+            f"stop — {entries[-1]:+.3f} now"
+        )
+    elif result.get("raise"):
+        threshold_note = (
+            f"buy at an edge of {enter:+g} or more — {result['raise']:+g} more after each stop "
+            "that day (circuit breaker)"
+        )
+    else:
+        threshold_note = f"buy at an edge of {enter:+g} or more"
     color = MODEL_OVERLAY_COLORS["goodmoments"]
     text = [
         f"made at the {stamp:%H:%M} bar · P(+0.2 ADR by the close) {p:.1%} vs {tv:.1%} on time "
@@ -1712,8 +1753,8 @@ def _goodmoments_signal_items(result: dict) -> "tuple[list[dict], str]":
             text=text,
         ),
         _series(
-            GOODMOMENTS_SIGNAL_KEY, "Entry threshold", stamps, [enter * 100] * len(stamps), color,
-            unit="pts", dash="dash", width=1.0, note=f"buy at an edge of {enter:+g} or more",
+            GOODMOMENTS_SIGNAL_KEY, "Entry threshold", stamps, [e * 100 for e in entries], color,
+            unit="pts", dash="dash", width=1.0, note=threshold_note,
         ),
     ]
     if exit_ is not None:
@@ -1722,9 +1763,11 @@ def _goodmoments_signal_items(result: dict) -> "tuple[list[dict], str]":
             MODEL_OVERLAY_COLORS["trader_stop"], unit="pts", dash="dash", width=1.0,
             note=f"sell a long once the edge is under {exit_:+g}",
         ))
-    on = (fc["edge"] >= enter).to_numpy() & (fc.index.to_numpy() <= APPLE_TRADER_GM_LAST_ENTRY_MINUTE)
+    on = (fc["edge"].to_numpy() >= np.array(entries)) & (
+        fc.index.to_numpy() <= APPLE_TRADER_GM_LAST_ENTRY_MINUTE
+    )
     before = np.r_[False, on[:-1]]
-    for stamp, (minute, row), now, was in zip(stamps, fc.iterrows(), on, before):
+    for stamp, (minute, row), now, was, needed in zip(stamps, fc.iterrows(), on, before, entries):
         if not now or was:
             continue
         items.append(_event(
@@ -1733,7 +1776,7 @@ def _goodmoments_signal_items(result: dict) -> "tuple[list[dict], str]":
             stamp, color, icon="▲", price=float(row["price"]), line=False,
             note=(
                 f"P(+0.2 ADR by the close) {row['p']:.1%} against {row['p_tv']:.1%} on time and "
-                f"volatility — at or over the {enter:+g} entry"
+                f"volatility — at or over the {needed:+g} entry"
             ),
         ))
     return items, ""
