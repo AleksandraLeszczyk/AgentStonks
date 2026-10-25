@@ -289,7 +289,10 @@ def hybrid_levels_params(
             ticker=ticker, buy_k=f"{float(defaults.buy_k):g}", model=parent,
         ) or None,
     )
-    return {"buy_k": float(buy_k), "sell_k": 0.0, "breach_update": breach_param(defaults, copy)}
+    return {
+        "buy_k": float(buy_k), "sell_k": 0.0,
+        "breach_update": breach_param(defaults, copy, scope=ticker),
+    }
 
 
 def momentum_params(
@@ -511,7 +514,7 @@ def dayrange_params(
     rules = rule_params(
         defaults, float(buy_k), float(sell_k), unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
-        stop_scope=f"{model_key}_{ticker}", stop_seed=stop_seed,
+        stop_scope=f"{model_key}_{ticker}", stop_seed=stop_seed, breach_scope=ticker,
     )
     min_win_k = min_win_param(
         ticker, float(buy_k), float(sell_k), unit_label, copy, float(defaults.min_win_k)
@@ -597,13 +600,14 @@ def repaired_sell(buy_k: float, sell_k: float, label: str = "") -> float:
 def rule_params(
     defaults: AppleTraderConfig, buy_k: float, sell_k: float, unit_label: str,
     copy: FormCopy, take_on: bool, stop_scope: str = "",
-    stop_seed: "float | None" = None,
+    stop_seed: "float | None" = None, breach_scope: str = "",
 ) -> dict:
     """The forecast-breach rules and the managed exit: shared by every
     instrument, but for the stop -- see `exit_params` for `stop_scope` and
-    `stop_seed`. `buy_k` and `sell_k` only feed the stop's `?`, which says what
-    the stop fraction comes to against them."""
-    breach_update = breach_param(defaults, copy)
+    `stop_seed` -- and the breach policy (`breach_param`, `breach_scope`).
+    `buy_k` and `sell_k` only feed the stop's `?`, which says what the stop
+    fraction comes to against them."""
+    breach_update = breach_param(defaults, copy, scope=breach_scope)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     exits = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
@@ -742,12 +746,15 @@ def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
     return choice
 
 
-def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
+def breach_param(defaults: AppleTraderConfig, copy: FormCopy, scope: str = "") -> str:
     """What happens when the session trades outside the forecast.
 
-    Not keyed by ticker: it is a rule about the forecast rather than a number
-    swept per instrument, so switching symbol keeps the choice — the same reason
-    the exit knobs below are not keyed either.
+    Its default is per instrument since 2026-10-25 (`apple_trader.breach_for`:
+    "shift" on the thinly traded names), so a single run's form passes the
+    ticker as `scope` and switching symbol re-seeds it. Only where the key has
+    no base digest on it, though: a base is one pair's, so its digest already
+    makes the key the pair's own -- and keeps what the remembered setup holds
+    under it. Orchestra's pairs share one policy and pass no scope.
     """
     section("Forecast breach", copy.sections.get("dayrange_breach"))
     # The rules offered, plus the one this form was seeded with if it is an
@@ -760,7 +767,7 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
         options,
         index=options.index(defaults.breach_update),
         format_func=lambda key: BREACH_LABELS[key],
-        key=copy.key("breach_update"),
+        key=copy.key("breach_update" if copy.suffix or not scope else f"breach_update_{scope}"),
         help=copy.help.get("breach_update"),
     )
     return str(choice)

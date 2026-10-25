@@ -224,6 +224,39 @@ class TestForm:
         assert "`buy_k` 0.85" in text
 
 
+def _two_symbol_form() -> None:
+    import streamlit as st
+
+    from agent_stonks import apple_trader_ui
+
+    copy = apple_trader_ui.FormCopy(
+        prefix="t", unavailable_suffix="", instrument_help="", model_help=""
+    )
+    st.session_state["out"] = apple_trader_ui.params(["AAPL", "AMGN"], copy)
+
+
+class TestBreachPerInstrument:
+    """The breach policy's default follows the instrument (2026-10-25), so
+    switching symbol re-seeds it -- where no base digest scopes the key already."""
+
+    def test_switching_symbol_reseeds_the_policy(self, form):
+        app = form(AppTest.from_function(_two_symbol_form, default_timeout=30))
+        assert app.session_state["out"].breach_update == "brownian"
+        app.selectbox(key="t_ticker").select("AMGN").run()
+        assert not app.exception
+        assert app.selectbox(key="t_breach_update_AMGN").value == "shift"
+        assert app.session_state["out"].breach_update == "shift"
+        app.selectbox(key="t_ticker").select("AAPL").run()
+        assert app.session_state["out"].breach_update == "brownian"
+
+    def test_a_pairs_base_keeps_its_key_and_its_policy(self, form):
+        base_configs.set_base(asdict(_base(breach_update="shift")))
+        app = form()
+        suffix = base_configs.key_suffix("highlow", "AAPL")
+        assert app.selectbox(key=f"t_breach_update{suffix}").value == "shift"
+        assert app.session_state["out"].breach_update == "shift"
+
+
 class TestCircuitBreakerBox:
     """The breaker is switched off by its box; the threshold is kept, greyed out."""
 

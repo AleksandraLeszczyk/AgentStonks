@@ -7,7 +7,7 @@ depending on the saved artifact or on live market data.
 
 import threading
 import types
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
 
 import pandas as pd
@@ -1063,7 +1063,7 @@ class TestIntradayRangeUpdate:
     def test_the_opening_window_never_triggers_an_update(
         self, state, market_open, monkeypatch
     ):
-        """Its extremes are already in the forecast (`apply_open_constraint`),
+        """Its extremes are already in the forecast (its 9:35 clip),
         and the bar the plan was built on is not traded either."""
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(120.0))
         tape = Tape(monkeypatch, minutes=0)
@@ -2128,6 +2128,56 @@ class TestStopDefaults:
     def test_the_tuned_stop_signs_the_run(self):
         config = AppleTraderConfig(model_key="highlow", ticker="AAPL")
         assert f",stop=E-{at.stop_for('AAPL', 'highlow'):g}G" in config_signature(config)
+
+
+class TestBreachDefaults:
+    """What a breach of the forecast does starts per instrument (2026-10-25):
+    the Brownian extension on the heavily traded names, the extreme so far on
+    the thin ones."""
+
+    @pytest.mark.parametrize("ticker", ["AAPL", "AMD", "INTC", "MU", "NVDA"])
+    def test_the_heavily_traded_names_extend_past_the_extreme(self, ticker):
+        assert AppleTraderConfig(model_key="highlow", ticker=ticker).breach_update == "brownian"
+
+    @pytest.mark.parametrize("ticker", ["AMGN", "TMO"])
+    def test_the_thin_names_move_to_the_extreme_so_far(self, ticker):
+        config = AppleTraderConfig(model_key="highlow", ticker=ticker)
+        assert config.breach_update == "shift"
+        assert ",breach=shift" in config_signature(config)
+
+    def test_highlow2_follows_the_instrument_too(self):
+        assert AppleTraderConfig(model_key="highlow2", ticker="AAPL").breach_update == "brownian"
+
+    def test_a_symbol_with_no_entry_takes_the_shared_default(self):
+        assert at.breach_for("ZZZZ", "highlow") == at.APPLE_TRADER_BREACH_UPDATE == "brownian"
+
+    def test_a_policy_given_explicitly_wins(self):
+        assert AppleTraderConfig(
+            model_key="highlow", ticker="AMGN", breach_update="brownian"
+        ).breach_update == "brownian"
+        assert AppleTraderConfig(
+            model_key="highlow", ticker="AAPL", breach_update="off"
+        ).breach_update == "off"
+
+    def test_the_pairs_base_configuration_wins_over_the_instrument(self):
+        from agent_stonks import base_configs
+
+        base_configs.set_base(asdict(
+            AppleTraderConfig(model_key="highlow", ticker="TMO", breach_update="brownian")
+        ))
+        assert at.breach_for("TMO", "highlow") == "brownian"
+        assert AppleTraderConfig(model_key="highlow", ticker="TMO").breach_update == "brownian"
+        # ... but not over what the code ships.
+        assert at.breach_for("TMO", "highlow", use_base=False) == "shift"
+        assert at.shipped_config("TMO", "highlow").breach_update == "shift"
+
+    def test_a_record_without_the_field_still_replays_held(self):
+        from simlab.rule_agents import _apple_from_record
+
+        old = _apple_from_record(
+            {"model_key": "highlow", "ticker": "AMGN", "buy_k": 0.75, "sell_k": 0.10}
+        )
+        assert old.breach_update == "off"
 
 
 class TestRangeContainment:

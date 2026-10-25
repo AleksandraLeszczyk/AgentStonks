@@ -3266,7 +3266,10 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "counted in — the 9:35 predicted range, or the ADR — and move the other side "
             "with the breached one. The range only widens when that would put the other "
             "side past a price the session has already traded. "
-            "Neither updating policy has been swept."
+            "Neither updating policy has been swept.\n\n"
+            "The default is per instrument: Brownian on the heavily traded names (AAPL, "
+            "AMD, INTC, MU, NVDA), the extreme so far on the thinner AMGN and TMO — "
+            "unless the pair's base configuration says otherwise."
         ),
         "contain_range": (
             "Keeps the forecast wide enough to hold what the session has printed.\n\n"

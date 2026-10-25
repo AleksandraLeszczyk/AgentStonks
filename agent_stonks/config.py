@@ -525,6 +525,18 @@ BREACH_LABELS = {
 # to add, rather than stopping at it. Records name their policy in full
 # (`asdict`), so one made under "shift" still replays as "shift".
 APPLE_TRADER_BREACH_UPDATE = BREACH_BROWNIAN
+# Per instrument since 2026-10-25, at the user's request: the Brownian
+# extension on the heavily traded names (AAPL, AMD, INTC, MU, NVDA), "shift"
+# -- move to the extreme so far, no further -- on the thinner ones. Those are
+# the two whose HighLow notebooks keep sessions short of 385 bars, because a
+# quiet minute there often printed no trade at all (AMGN from 310 bars, TMO
+# from 260; `highlow_model.NOTEBOOK_MIN_BARS`). A symbol with no entry takes
+# APPLE_TRADER_BREACH_UPDATE. A pair's base configuration, once SimLab has set
+# one, carries its own and is read before this (`apple_trader.breach_for`).
+APPLE_TRADER_BREACH_UPDATE_BY_TICKER: "dict[str, str]" = {
+    "AMGN": BREACH_SHIFT,
+    "TMO": BREACH_SHIFT,
+}
 
 # Whether the forecast is always widened to hold what the session has actually
 # printed (`day_range.contain_session`). The 9:35 forecast is already

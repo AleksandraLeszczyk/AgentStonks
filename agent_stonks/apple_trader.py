@@ -54,6 +54,7 @@ from .rule_agent import BaseTrader
 from .state import append_agent_log as _log
 from .config import (
     APPLE_TRADER_BREACH_UPDATE,
+    APPLE_TRADER_BREACH_UPDATE_BY_TICKER,
     APPLE_TRADER_BRIEFING_WAIT_BARS as BRIEFING_WAIT_BARS,
     APPLE_TRADER_CONTAIN_RANGE,
     APPLE_TRADER_KEEP_WIDTH,
@@ -232,6 +233,23 @@ def stop_for(ticker: str, model_key: "str | None" = None, use_base: bool = True)
     return APPLE_TRADER_STOP_GAIN_FRACTION if tuned is None else tuned
 
 
+def breach_for(ticker: str, model_key: "str | None" = None, use_base: bool = True) -> str:
+    """What a breach of the forecast does on a run of this model on this
+    symbol, as it starts: the pair's base configuration (`base_configs`) unless
+    `use_base` is off, then the instrument's own policy
+    (`config.APPLE_TRADER_BREACH_UPDATE_BY_TICKER`: "shift" on the thinly
+    traded names), else the shared default, the Brownian extension. A base
+    naming a policy this app does not know is passed over, as `default_config`
+    passes over the whole of such a base."""
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    if use_base:
+        record, _ = base_record(model_key, symbol)
+        policy = str((record or {}).get("breach_update") or "")
+        if policy in BREACH_POLICIES:
+            return policy
+    return APPLE_TRADER_BREACH_UPDATE_BY_TICKER.get(symbol, APPLE_TRADER_BREACH_UPDATE)
+
+
 def gm_stop_for(ticker: str) -> float:
     """GoodMoments' stop, in ADRs under the fill, a run on this symbol starts
     from: its notebook 4's pick (`config.APPLE_TRADER_GM_STOP_K_BY_TICKER`,
@@ -291,6 +309,7 @@ def shipped_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
         model_key=model_key, ticker=ticker, buy_k=buy_k, sell_k=sell_k,
         stop_gain_fraction=stop_for(ticker, model_key, use_base=False),
         min_win_k=min_win_for(ticker, model_key, use_base=False),
+        breach_update=breach_for(ticker, model_key, use_base=False),
     )
 
 
@@ -455,8 +474,10 @@ class AppleTraderConfig:
     # notebook's rule (one forecast, held all day); "shift" moves both sides by
     # the breach, "brownian" past it by the expected excursion (both sides
     # with `keep_width`, the breached one without), "extreme" the breached side
-    # only -- and the levels with it. See `_update_range`.
-    breach_update: str = APPLE_TRADER_BREACH_UPDATE
+    # only -- and the levels with it. See `_update_range`. None -> the pair's
+    # own (`breach_for`: "shift" on the thinly traded names, else "brownian"),
+    # filled in by `__post_init__`, so after construction it is one of them.
+    breach_update: Optional[str] = None
     # Whether the forecast is always widened to hold what the session has
     # printed, whatever `breach_update` says (`day_range.contain_session`).
     # With it on, "off" no longer keeps a predicted high the tape has traded
@@ -590,6 +611,8 @@ class AppleTraderConfig:
             self.min_win_k = min_win_for(self.ticker, self.model_key)
         if self.stop_gain_fraction is None:
             self.stop_gain_fraction = stop_for(self.ticker, self.model_key)
+        if self.breach_update is None:
+            self.breach_update = breach_for(self.ticker, self.model_key)
         for name in (
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",

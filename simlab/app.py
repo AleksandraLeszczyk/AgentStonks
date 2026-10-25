@@ -1981,11 +1981,14 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "keeping the width it last had, *Brownian* moving the breached side only.\n\n"
             "In the signature unless held, so each queues as its own configuration — "
             "the only way to find out what it is worth, since the levels were swept with "
-            "the forecast fixed."
+            "the forecast fixed.\n\n"
+            "The default is per instrument: Brownian on the heavily traded names (AAPL, "
+            "AMD, INTC, MU, NVDA), the extreme so far on the thinner AMGN and TMO — "
+            "unless the pair's base configuration says otherwise."
         ),
         "contain_range": (
             "Whether the forecast is always widened to hold what the session has printed "
-            "— `apply_open_constraint`'s 9:35 clip, kept true all day.\n\n"
+            "— the forecast's 9:35 clip, kept true all day.\n\n"
             "- In the signature as `contain` when on.\n"
             "- Pair it with the breach policy rather than sweeping it alone: with it on, "
             "*hold* moves a breached side to the extreme too, so it only differs from "
