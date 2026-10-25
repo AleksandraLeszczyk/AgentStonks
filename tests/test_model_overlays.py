@@ -29,8 +29,8 @@ SESSION_START = datetime(2026, 8, 7, 13, 25, tzinfo=timezone.utc)
 
 @pytest.fixture(autouse=True)
 def _no_days_off(monkeypatch, request):
-    """SESSION -- TimeToChange3's held-out day, which the recorded forecasts
-    here are pinned to -- is a jobs-report day, which every default
+    """SESSION -- TimeToChange3's held-out day once, which the recorded
+    forecasts here were pinned to -- is a jobs-report day, which every default
     configuration sits out. These tests are about how levels are drawn, so the
     calendar is emptied for them; `TestTraderLevelsOnDaysOff` reads it."""
     if request.node.cls is not None and request.node.cls.__name__ == "TestTraderLevelsOnDaysOff":
@@ -71,9 +71,9 @@ class TestCatalogue:
         """The catalogue reads `apple_models`, so re-running a notebook for a
         new symbol widens the picker without a change here; only a symbol
         nothing was fitted on is excluded."""
-        for symbol in ("AAPL", "GOOGL", "INTC"):
-            assert mo.OVERLAYS[mo.DAY_RANGE_KEY].covers(symbol), symbol
-        assert not mo.OVERLAYS[mo.DAY_RANGE_KEY].covers("MSFT")
+        for symbol in apple_models.HIGHLOW_TICKERS:
+            assert mo.OVERLAYS[mo.HIGHLOW_RANGE_KEY].covers(symbol), symbol
+        assert not mo.OVERLAYS[mo.HIGHLOW_RANGE_KEY].covers("MSFT")
         # ...except the one model that claims to transfer, which covers every
         # symbol because it was fitted without ticker dummies.
         assert mo.OVERLAYS[mo.PROFILE_RANGE_KEY].covers("MSFT")
@@ -88,21 +88,21 @@ class TestForModels:
     draws which model."""
 
     def test_the_day_range_model_selects_the_day_range_overlay(self):
-        assert mo.for_models([apple_models.DAYRANGE_KEY], "AAPL")["keys"] == [
-            mo.DAY_RANGE_KEY
+        assert mo.for_models([apple_models.HIGHLOW_KEY], "AAPL")["keys"] == [
+            mo.HIGHLOW_RANGE_KEY
         ]
 
     def test_an_overlay_is_never_selected_for_a_symbol_it_has_no_model_for(self):
         """A rule run's stored symbol list can be wider than the one instrument
         it traded, so this is asked about tabs the model was never fitted on --
         where the picker has no such option to select."""
-        assert mo.for_models([apple_models.DAYRANGE_KEY], "MSFT")["keys"] == []
+        assert mo.for_models([apple_models.HIGHLOW_KEY], "MSFT")["keys"] == []
 
     def test_no_symbol_asks_the_question_without_one(self):
         """The default is "which overlays draw these models", not "none" --
         filtering is what naming a symbol adds."""
-        assert mo.for_models([apple_models.DAYRANGE_KEY])["keys"] == [
-            mo.DAY_RANGE_KEY
+        assert mo.for_models([apple_models.HIGHLOW_KEY])["keys"] == [
+            mo.HIGHLOW_RANGE_KEY
         ]
 
     def test_the_transferable_profile_model_is_never_auto_selected(self):
@@ -133,14 +133,14 @@ class TestCompute:
         assert mo.compute(["nope"], "AAPL", minute_bars())["items"] == []
 
     def test_a_symbol_the_model_does_not_cover_is_a_note_not_an_error(self):
-        result = mo.compute([mo.DAY_RANGE_KEY], "MSFT", minute_bars())
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "MSFT", minute_bars())
         assert result["items"] == []
         assert "MSFT" in result["notes"][0]
         assert "fitted on" in result["notes"][0]
 
     def test_a_missing_bundle_is_a_note_not_an_exception(self, monkeypatch):
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: None)
-        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars())
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars())
         assert result["items"] == []
         assert result["notes"] and "Predicted day range" in result["notes"][0]
 
@@ -149,12 +149,12 @@ class TestCompute:
             raise RuntimeError("the checkpoint is corrupt")
 
         monkeypatch.setattr(mo.apple_models, "load", boom)
-        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars())
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars())
         assert result["items"] == []
         assert "the checkpoint is corrupt" in result["notes"][0]
 
     def test_bars_from_another_day_produce_a_note(self):
-        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
                             session_date="2026-08-06")
         assert result["items"] == []
         assert "2026-08-06" in result["notes"][0]
@@ -224,14 +224,17 @@ class TestProfileRangeOverlay:
 
 
 class TestDayRangeOverlay:
+    """A day-range forecast drawn: flat while the session stays inside it, a
+    stepped band once it trades outside. On HighLow's overlay; HighLow2's is
+    drawn by the same code."""
+
     def stub_forecast(self, monkeypatch, high=210.0, low=198.0):
-        import agent_stonks.dayrange_model as dr
+        hl = pytest.importorskip("agent_stonks.highlow_model")
 
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: {"stub": True})
-        monkeypatch.setattr(dr, "opening_minutes", lambda bundle=None: 5)
-        monkeypatch.setattr(dr, "daily_frame_from_bars", lambda bars: pd.DataFrame())
+        monkeypatch.setattr(hl, "opening_minutes", lambda bundle=None: 5)
         monkeypatch.setattr(
-            dr, "forecast_session",
+            hl, "forecast_session",
             lambda *a, **k: {
                 "pred_high": high, "pred_low": low, "prev_avg": 200.0,
                 "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0,
@@ -240,9 +243,8 @@ class TestDayRangeOverlay:
 
     def test_produces_two_levels_and_the_band_between_them(self, monkeypatch):
         """A session that stays inside its forecast leaves it flat all day."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch, low=196.0)   # the tape bottoms at 196.80
-        items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION)["items"]
         levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
         assert levels == {"Pred. high": 210.0, "Pred. low": 196.0}
@@ -250,9 +252,8 @@ class TestDayRangeOverlay:
         assert (band["y0"], band["y1"]) == (196.0, 210.0)
 
     def test_the_band_runs_from_the_forecast_to_the_closing_bell(self, monkeypatch):
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch, low=196.0)
-        items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION)["items"]
         band = next(i for i in items if i["kind"] == "span")
         close = pd.Timestamp(band["x1"]).tz_convert("America/New_York")
@@ -265,11 +266,10 @@ class TestDayRangeOverlay:
         """The tape bottoms at 196.80, under the 198.00 predicted low, so the
         low is revised and the flat pair becomes two curves -- and under
         "move to the extreme so far" the high follows it down."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         from agent_stonks.apple_trader import AppleTraderConfig
 
         self.stub_forecast(monkeypatch)
-        items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION,
                            trader_config=AppleTraderConfig(
                                ticker="AAPL", breach_update="shift"))["items"]
@@ -290,10 +290,9 @@ class TestDayRangeOverlay:
         """Under the default Brownian update the breached low goes past the
         session's own 196.80 by the reach still to come and the high follows at
         the forecast's width -- and nothing is drawn past the newest bar."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
-        band = mo.compute([mo.DAY_RANGE_KEY], "AAPL", bars,
+        band = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", bars,
                           daily_bars=[], session_date=SESSION)["items"][0]
         assert band["kind"] == "band" and not band["forward"]
         assert band["lower"][-1] < 196.80
@@ -306,11 +305,10 @@ class TestDayRangeOverlay:
         """The walk reads each bar before recording it, so a breach on the very
         first bar after the forecast used to be in every row: the band came out
         flat at the revised high, as if that had been the forecast all along."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch, low=196.0)
         bars = minute_bars()
         bars[5] = {**bars[5], "h": 215.0}    # the 09:35 bar, first after the window
-        band = mo.compute([mo.DAY_RANGE_KEY], "AAPL", bars,
+        band = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", bars,
                           daily_bars=[], session_date=SESSION)["items"][0]
         assert band["kind"] == "band" and band["step"]
         start = pd.Timestamp(band["t"][0]).tz_convert("America/New_York")
@@ -321,9 +319,8 @@ class TestDayRangeOverlay:
     def test_the_low_only_steps_down_and_never_back_up(self, monkeypatch):
         """Piecewise, not a curve fitted to the tape: each step holds until the
         session trades through it again."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
-        band = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(),
+        band = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
                           daily_bars=[], session_date=SESSION)["items"][0]
         lows = band["lower"]
         assert all(b <= a for a, b in zip(lows, lows[1:]))
@@ -335,11 +332,10 @@ class TestDayRangeOverlay:
         """The reason both overlays share one walk. A chart showing the buy and
         sell stepping up under a predicted high that stood still would have the
         model's own line contradicting the orders derived from it."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
         bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
-        items = mo.compute([mo.DAY_RANGE_KEY, mo.TRADER_LEVELS_KEY], "AAPL", bars,
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY, mo.TRADER_LEVELS_KEY], "AAPL", bars,
                            daily_bars=[], session_date=SESSION)["items"]
         ranges = next(i for i in items if i["label"] == "Pred. high / low")
         levels = next(i for i in items if i["label"] == "Buy/sell levels")
@@ -353,18 +349,16 @@ class TestDayRangeOverlay:
         )
 
     def test_bars_that_miss_the_open_refuse_rather_than_forecast(self, monkeypatch):
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         late = minute_bars()[30:]
-        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", late,
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", late,
                             daily_bars=[], session_date=SESSION)
         assert result["items"] == []
         assert "09:30 open" in result["notes"][0]
 
     def test_fewer_bars_than_the_opening_window_is_a_note(self, monkeypatch):
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
-        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(n=3),
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(n=3),
                             daily_bars=[], session_date=SESSION)
         assert result["items"] == []
         assert "first 5 minutes" in result["notes"][0]
@@ -518,7 +512,6 @@ class TestTraderLevelsOverlay:
         )
 
     def items(self, monkeypatch, config=None, bars=None):
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         return mo.compute(
             [mo.TRADER_LEVELS_KEY], "AAPL", bars if bars is not None else minute_bars(),
@@ -545,7 +538,6 @@ class TestTraderLevelsOverlay:
             assert {i["label"] for i in items} == {"Buy level", "Sell level"}
 
     def test_moving_levels_carry_no_stop_either(self, monkeypatch):
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
         bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
@@ -573,7 +565,6 @@ class TestTraderLevelsOverlay:
     def test_a_breach_moves_the_levels_and_switches_it_to_a_band(self, monkeypatch):
         """The same settings that move the agent's orders move the drawing --
         which is the whole reason this asks the trader rather than deriving it."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
         # Push the last bar clean through the 210.0 predicted high.
@@ -633,7 +624,6 @@ class TestTraderLevelsOverlay:
         """The chart asks the trader, so a rule that moves the levels under
         "off" has to move the drawing under "off" too -- otherwise the picture
         shows orders resting where the agent is no longer resting them."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
         bars[-1] = {**bars[-1], "h": 215.0, "c": 214.0}
@@ -676,7 +666,6 @@ class TestTraderLevelsOverlay:
         being replayed, and keeps the agent's orange."""
         from agent_stonks.config import MODEL_OVERLAY_COLORS
 
-        pytest.importorskip("agent_stonks.dayrange_model")
         self.stub_forecast(monkeypatch)
 
         def colors(running):
@@ -696,7 +685,7 @@ class TestTraderLevelsOnDaysOff:
     of orders it would never rest."""
 
     def test_a_jobs_report_day_rests_nothing_and_says_so(self, monkeypatch):
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
         out = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", minute_bars(), daily_bars=[],
                          session_date=SESSION)
         assert out["items"] == []
@@ -716,7 +705,7 @@ class TestRecordedTraderLevels:
     the ones the agent's log quotes."""
 
     def history(self, buys, sells=None, highs=None, day=SESSION, ticker="AAPL",
-                model_key="dayrange"):
+                model_key="highlow"):
         from agent_stonks.apple_trader import AppleTraderConfig
 
         start = pd.Timestamp(f"{day} 09:34", tz="America/New_York")
@@ -733,7 +722,6 @@ class TestRecordedTraderLevels:
 
     def compute(self, keys, history, monkeypatch):
         # The walk and the forecast must not be needed: the record replaces both.
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
         monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
         return mo.compute(keys, "AAPL", minute_bars(), daily_bars=[],
                           session_date=SESSION, trader_history=history)["items"]
@@ -743,7 +731,6 @@ class TestRecordedTraderLevels:
         the session so far, so the bars after them are walked from the run's
         own forecast (its seed) -- the low revised at the bar that first traded
         under it, and nothing drawn past the newest bar."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         bars = minute_bars()
         history = self.history([207.0] * 3, highs=[210.0] * 3)
         history["seed"] = {
@@ -752,7 +739,7 @@ class TestRecordedTraderLevels:
             "opening_end": pd.Timestamp(f"{SESSION} 09:34", tz="America/New_York"),
             "open_price": bars[0]["o"],
         }
-        band = next(i for i in self.compute([mo.DAY_RANGE_KEY], history, monkeypatch)
+        band = next(i for i in self.compute([mo.HIGHLOW_RANGE_KEY], history, monkeypatch)
                     if i["kind"] == "band")
         stamps = [pd.Timestamp(t) for t in band["t"]]
         assert stamps[-1] == pd.Timestamp(bars[-1]["t"])
@@ -767,7 +754,6 @@ class TestRecordedTraderLevels:
         09:36 bar for SIP's, $1 under the $198 low the run held through 09:40,
         and walked again from 09:35 that is a breach -- the band would drop at
         09:41 with nothing traded near it."""
-        pytest.importorskip("agent_stonks.dayrange_model")
         bars = minute_bars(n=40)
         assert min(b["l"] for b in bars) > 198.0
         bars[6]["l"] = 197.0
@@ -778,8 +764,8 @@ class TestRecordedTraderLevels:
             "opening_end": pd.Timestamp(f"{SESSION} 09:34", tz="America/New_York"),
             "open_price": bars[0]["o"],
         }
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
-        items = mo.compute([mo.DAY_RANGE_KEY], "AAPL", bars, daily_bars=[],
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
+        items = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", bars, daily_bars=[],
                            session_date=SESSION, trader_history=history)["items"]
         # Held all session, so drawn flat: two levels, no band.
         assert not [i for i in items if i["kind"] == "band"]
@@ -810,9 +796,8 @@ class TestRecordedTraderLevels:
         the newest bar."""
         from agent_stonks.config import MODEL_OVERLAY_COLORS
 
-        pytest.importorskip("agent_stonks.dayrange_model")
         bars = minute_bars()
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
         items = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
                            session_date=SESSION, trader_history=self.stopped(bars),
                            trader_running=False)["items"]
@@ -836,7 +821,7 @@ class TestRecordedTraderLevels:
         from agent_stonks.config import MODEL_OVERLAY_COLORS
 
         bars = minute_bars()
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: pytest.fail("forecast"))
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
         items = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
                            session_date=SESSION, trader_history=self.stopped(bars),
                            trader_running=True)["items"]
@@ -879,11 +864,11 @@ class TestRecordedTraderLevels:
         assert not [i for i in items if i["label"] == "Stop level"]
 
     def test_a_switched_run_draws_each_range_only_for_its_own_minutes(self, monkeypatch):
-        """TimeToChange3 until 09:36, HighLow from then: HighLow's range
-        starts at the switch, not at the TimeToChange3 forecast."""
+        """HighLow2 until 09:36, HighLow from then: HighLow's range starts at
+        the switch, not at HighLow2's forecast."""
         history = self.history([207.0] * 4, highs=[210.0, 210.0, 206.0, 206.0],
                                model_key="highlow")
-        for row, model in zip(history["rows"], ["dayrange"] * 2 + ["highlow"] * 2):
+        for row, model in zip(history["rows"], ["highlow2"] * 2 + ["highlow"] * 2):
             row["model_key"] = model
         items = self.compute([mo.HIGHLOW_RANGE_KEY], history, monkeypatch)
         high = next(i for i in items if i["label"] == "Pred. high")
@@ -897,20 +882,20 @@ class TestRecordedTraderLevels:
         assert levels["Buy level"] == 207.0 and levels["Sell level"] == 209.0
 
     def test_the_day_range_is_the_runs_own_forecast(self, monkeypatch):
-        items = self.compute([mo.DAY_RANGE_KEY],
+        items = self.compute([mo.HIGHLOW_RANGE_KEY],
                              self.history([207.0] * 3, highs=[210.0, 212.0, 212.0]),
                              monkeypatch)
         band = next(i for i in items if i["kind"] == "band")
         assert band["upper"] == [210.0, 212.0, 212.0]
 
-    def test_a_highlow_run_draws_its_range_on_the_highlow_overlay_only(self, monkeypatch):
-        history = self.history([207.0] * 3, highs=[210.0, 212.0, 212.0], model_key="highlow")
-        items = self.compute([mo.HIGHLOW_RANGE_KEY], history, monkeypatch)
+    def test_a_highlow2_run_draws_its_range_on_the_highlow2_overlay_only(self, monkeypatch):
+        history = self.history([207.0] * 3, highs=[210.0, 212.0, 212.0], model_key="highlow2")
+        items = self.compute([mo.HIGHLOW2_RANGE_KEY], history, monkeypatch)
         assert next(i for i in items if i["kind"] == "band")["upper"][-1] == 212.0
-        # The TimeToChange3 overlay is not this run's model, so it forecasts as before.
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: {
+        # The HighLow overlay is not this run's model, so it forecasts as before.
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: {
             "forecast": None, "made_at": None, "problem": "stub"})
-        result = mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
+        result = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
                             session_date=SESSION, trader_history=history)
         assert result["items"] == [] and "stub" in result["notes"][0]
 
@@ -918,7 +903,7 @@ class TestRecordedTraderLevels:
         calls = []
         monkeypatch.setattr(mo, "_trader_levels_items",
                             lambda *a, **k: calls.append(k) or ([], ""))
-        monkeypatch.setattr(mo, "_day_range_forecast", lambda *a, **k: {
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: {
             "forecast": None, "made_at": None, "problem": "stub"})
         for history in (self.history([207.0], day="2026-08-06"),
                         self.history([207.0], ticker="GOOGL")):
@@ -928,19 +913,16 @@ class TestRecordedTraderLevels:
 
 
 class TestHighLowOverlay:
-    """HighLow's range is drawn like TimeToChange3's, and an agent configured on
-    HighLow has its levels drawn under HighLow's high -- not TimeToChange3's."""
+    """Each range model's forecast is drawn under its own key, and an agent
+    configured on one has its levels drawn under that model's high -- HighLow's
+    or HighLow2's, never the other's."""
 
-    def stub_both(self, monkeypatch, ttc3_high=210.0, highlow_high=206.0):
-        import agent_stonks.dayrange_model as dr
-        import agent_stonks.highlow_model as hl
+    def stub_both(self, monkeypatch, highlow_high=206.0, highlow2_high=210.0):
+        hl = pytest.importorskip("agent_stonks.highlow_model")
+        hl2 = pytest.importorskip("agent_stonks.highlow2_model")
 
         monkeypatch.setattr(mo.apple_models, "load", lambda *a, **k: {"stub": True})
-        monkeypatch.setattr(dr, "opening_minutes", lambda bundle=None: 5)
-        monkeypatch.setattr(dr, "daily_frame_from_bars", lambda bars: pd.DataFrame())
         base = {"prev_avg": 200.0, "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0}
-        monkeypatch.setattr(dr, "forecast_session",
-                            lambda *a, **k: {**base, "pred_high": ttc3_high, "pred_low": 190.0})
         seen = []
 
         def highlow(bundle, ticker, opening, day, key=None, secret=None):
@@ -948,6 +930,8 @@ class TestHighLowOverlay:
             return {**base, "pred_high": highlow_high, "pred_low": 190.0}
 
         monkeypatch.setattr(hl, "forecast_session", highlow)
+        monkeypatch.setattr(hl2, "forecast_session",
+                            lambda *a, **k: {**base, "pred_high": highlow2_high, "pred_low": 190.0})
         return seen
 
     def config(self, **kwargs):
@@ -960,7 +944,6 @@ class TestHighLowOverlay:
         )
 
     def test_the_highlow_range_is_two_levels_under_its_own_key(self, monkeypatch):
-        pytest.importorskip("agent_stonks.highlow_model")
         self.stub_both(monkeypatch)
         items = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(),
                            daily_bars=[], session_date=SESSION)["items"]
@@ -969,7 +952,6 @@ class TestHighLowOverlay:
         assert {i["key"] for i in items} == {mo.HIGHLOW_RANGE_KEY}
 
     def test_the_agents_levels_follow_the_model_it_is_configured_on(self, monkeypatch):
-        pytest.importorskip("agent_stonks.highlow_model")
         self.stub_both(monkeypatch)
 
         def buy(model_key):
@@ -979,24 +961,23 @@ class TestHighLowOverlay:
             )["items"]
             return next(i["value"] for i in items if i["label"] == "Buy level")
 
-        assert buy("dayrange") == pytest.approx(210.0 - 0.75 * 3.0)
+        assert buy("highlow2") == pytest.approx(210.0 - 0.75 * 3.0)
         assert buy("highlow") == pytest.approx(206.0 - 0.75 * 3.0)
 
     def test_a_symbol_only_highlow_covers_draws_highlows_levels(self, monkeypatch):
-        """MU has no TimeToChange3 bundle: the agent's levels are offered there,
-        and hang off HighLow's forecast with or without a MU configuration."""
-        pytest.importorskip("agent_stonks.highlow_model")
-        import agent_stonks.dayrange_model as dr
+        """MU has no HighLow2 bundle: the agent's levels are offered there, and
+        hang off HighLow's forecast with or without a MU configuration."""
         from agent_stonks.apple_trader import AppleTraderConfig
 
         self.stub_both(monkeypatch)
 
-        def no_ttc3(*a, **k):
-            raise AssertionError("MU has no TimeToChange3 bundle to ask")
+        def no_highlow2(*a, **k):
+            raise AssertionError("MU has no HighLow2 bundle to ask")
 
-        monkeypatch.setattr(dr, "forecast_session", no_ttc3)
+        monkeypatch.setattr(pytest.importorskip("agent_stonks.highlow2_model"),
+                            "forecast_session", no_highlow2)
         assert mo.TRADER_LEVELS_KEY in mo.keys_for("MU")
-        assert mo.DAY_RANGE_KEY not in mo.keys_for("MU")
+        assert mo.HIGHLOW2_RANGE_KEY not in mo.keys_for("MU")
 
         def buy(config):
             items = mo.compute(
@@ -1007,10 +988,9 @@ class TestHighLowOverlay:
 
         mu_highlow = buy(AppleTraderConfig(ticker="MU", model_key="highlow"))
         assert buy(None) == mu_highlow
-        assert buy(self.config(model_key="dayrange")) == mu_highlow  # an AAPL agent's
+        assert buy(self.config(model_key="highlow2")) == mu_highlow  # an AAPL agent's
 
     def test_the_credentials_reach_the_sip_history(self, monkeypatch):
-        pytest.importorskip("agent_stonks.highlow_model")
         seen = self.stub_both(monkeypatch)
         mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
                    session_date=SESSION, credentials=("k", "s"))
@@ -1025,42 +1005,35 @@ class TestSessionForecast:
     """`session_forecast` hands back the numbers `trader_levels` hangs the levels
     off -- the configured model's forecast -- and which overlay draws it."""
 
-    def test_a_day_range_agent_gets_time_to_change3s_forecast(self, monkeypatch):
-        pytest.importorskip("agent_stonks.highlow_model")
+    def test_a_highlow2_agent_gets_highlow2s_forecast(self, monkeypatch):
         TestHighLowOverlay().stub_both(monkeypatch)
-        result = mo.session_forecast(apple_models.DAYRANGE_KEY, "aapl", minute_bars(),
-                                     daily_bars=[], session_date=SESSION)
-        assert result["overlay"] == mo.DAY_RANGE_KEY
+        result = mo.session_forecast(apple_models.HIGHLOW2_KEY, "aapl", minute_bars(),
+                                     session_date=SESSION)
+        assert result["overlay"] == mo.HIGHLOW2_RANGE_KEY
         assert result["forecast"]["pred_high"] == 210.0
         made = pd.Timestamp(result["made_at"]).tz_convert("America/New_York")
         assert (made.hour, made.minute) == (9, 34)
 
-    def test_a_highlow_agent_gets_highlows_and_never_asks_time_to_change3(self, monkeypatch):
-        pytest.importorskip("agent_stonks.highlow_model")
-        import agent_stonks.dayrange_model as dr
-
+    def test_a_highlow_agent_gets_highlows_and_never_asks_highlow2(self, monkeypatch):
         TestHighLowOverlay().stub_both(monkeypatch)
-        monkeypatch.setattr(dr, "forecast_session", lambda *a, **k: pytest.fail("ttc3"))
+        monkeypatch.setattr(pytest.importorskip("agent_stonks.highlow2_model"),
+                            "forecast_session", lambda *a, **k: pytest.fail("highlow2"))
         result = mo.session_forecast(apple_models.HIGHLOW_KEY, "AAPL", minute_bars(),
                                      session_date=SESSION)
         assert result["overlay"] == mo.HIGHLOW_RANGE_KEY
         assert result["forecast"]["pred_high"] == 206.0
 
-    def test_the_official_open_reaches_time_to_change3(self, monkeypatch):
-        pytest.importorskip("agent_stonks.dayrange_model")
-        import agent_stonks.dayrange_model as dr
-
-        TestDayRangeOverlay().stub_forecast(monkeypatch)
-        seen = []
-        monkeypatch.setattr(dr, "forecast_session",
-                            lambda *a, open_price=None, **k: seen.append(open_price) or {
-                                "pred_high": 210.0, "pred_low": 198.0})
-        mo.session_forecast(apple_models.DAYRANGE_KEY, "AAPL", minute_bars(),
-                            daily_bars=[], session_date=SESSION, open_price=200.5)
-        assert seen == [200.5]
+    def test_a_removed_model_is_a_reason_not_the_default_models_forecast(self, monkeypatch):
+        """`apple_models.get` falls back to the default model for an unknown
+        key; a tuning job on a removed model must not be drawn under HighLow's
+        range as though it were its own."""
+        TestHighLowOverlay().stub_both(monkeypatch)
+        result = mo.session_forecast("dayrange", "AAPL", minute_bars(), session_date=SESSION)
+        assert result["forecast"] is None
+        assert "not a model this app can run" in result["problem"]
 
     def test_a_day_with_no_bars_is_a_reason_not_a_forecast(self):
-        result = mo.session_forecast(apple_models.DAYRANGE_KEY, "AAPL", minute_bars(),
+        result = mo.session_forecast(apple_models.HIGHLOW_KEY, "AAPL", minute_bars(),
                                      session_date="2026-08-10")
         assert result["forecast"] is None
         assert result["problem"] == "No bars for 2026-08-10."
@@ -1254,17 +1227,6 @@ class TestFastFuriousOverlay:
 
 
 class TestLiveOverlays:
-    LONG_HISTORY = [{"t": "2026-08-06", "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 1.0}]
-
-    @pytest.fixture(autouse=True)
-    def no_network(self, monkeypatch):
-        self.fetched = []
-        monkeypatch.setattr(
-            mo.historical, "fetch_daily_ohlc_bars",
-            lambda sym, *a, **k: self.fetched.append(sym) or self.LONG_HISTORY,
-        )
-        monkeypatch.setattr(mo.historical, "fetch_session_open", lambda *a, **k: 201.5)
-
     def make_state(self, bars):
         return SimpleNamespace(
             symbol="AAPL", daily_bars=[], bars=bars, model_overlay_cache=None
@@ -1277,41 +1239,6 @@ class TestLiveOverlays:
             lambda *a, **k: calls.append(k) or {"items": [], "notes": []},
         )
         return calls
-
-    def test_the_day_range_forecast_gets_the_traders_long_history(self, monkeypatch):
-        """The live buffer's 365-day baseline is ~250 sessions, under the 253
-        the forecast requires -- the overlay drew nothing live until the
-        forecast was handed the trader's 420-day history instead."""
-        calls = self.capture_compute(monkeypatch)
-        bars = minute_bars(n=40)
-        mo.live_overlays(self.make_state(bars), bars, [mo.DAY_RANGE_KEY])
-        assert calls[0]["dayrange_daily_bars"] == self.LONG_HISTORY
-        assert calls[0]["daily_bars"] == []
-        assert self.fetched == ["AAPL"]
-
-    def test_the_opening_print_is_only_used_for_todays_session(self, monkeypatch):
-        calls = self.capture_compute(monkeypatch)
-        bars = minute_bars(n=40)  # SESSION is in the past
-        mo.live_overlays(self.make_state(bars), bars, [mo.DAY_RANGE_KEY])
-        assert calls[0]["open_price"] is None
-
-    def test_overlays_without_the_forecast_do_not_fetch_it(self, monkeypatch):
-        calls = self.capture_compute(monkeypatch)
-        bars = minute_bars(n=40)
-        mo.live_overlays(self.make_state(bars), bars, [mo.PROFILE_RANGE_KEY])
-        assert "dayrange_daily_bars" not in calls[0]
-        assert self.fetched == []
-
-    def test_compute_hands_the_forecast_its_own_history(self, monkeypatch):
-        seen = []
-        monkeypatch.setattr(
-            mo, "_day_range_forecast",
-            lambda symbol, session, daily, *a: seen.append(daily)
-            or {"forecast": None, "made_at": None, "problem": "stub"},
-        )
-        mo.compute([mo.DAY_RANGE_KEY], "AAPL", minute_bars(), daily_bars=[],
-                   session_date=SESSION, dayrange_daily_bars=self.LONG_HISTORY)
-        assert seen == [self.LONG_HISTORY]
 
     def test_a_new_row_in_the_agents_record_redraws_within_the_bar(self, monkeypatch):
         """A sidebar edit is adopted mid-bar; the chart must not wait a minute."""
@@ -1359,11 +1286,11 @@ class TestLiveOverlays:
         bars = minute_bars(n=40)
         state = self.make_state(bars)
 
-        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY])
-        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.HIGHLOW_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.HIGHLOW_RANGE_KEY])
         assert len(calls) == 1
 
-        mo.live_overlays(state, bars + minute_bars(n=1, base=210.0), [mo.DAY_RANGE_KEY])
+        mo.live_overlays(state, bars + minute_bars(n=1, base=210.0), [mo.HIGHLOW_RANGE_KEY])
         assert len(calls) == 2
 
     def test_the_agents_configuration_is_part_of_the_cache_key(self, monkeypatch):
@@ -1402,8 +1329,8 @@ class TestLiveOverlays:
         )
         bars = minute_bars(n=40)
         state = self.make_state(bars)
-        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY])
-        mo.live_overlays(state, bars, [mo.DAY_RANGE_KEY, mo.PROFILE_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.HIGHLOW_RANGE_KEY])
+        mo.live_overlays(state, bars, [mo.HIGHLOW_RANGE_KEY, mo.PROFILE_RANGE_KEY])
         assert len(calls) == 2
 
     def test_nothing_selected_does_not_touch_the_models(self, monkeypatch):

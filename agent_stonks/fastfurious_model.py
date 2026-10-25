@@ -101,7 +101,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# LightGBM brings its own OpenMP runtime (see `dayrange_model`); loaded up front
+# LightGBM brings its own OpenMP runtime (see `highlow_model`); loaded up front
 # as the other LightGBM-backed model modules do.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 

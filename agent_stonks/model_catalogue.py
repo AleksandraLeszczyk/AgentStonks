@@ -16,17 +16,17 @@ design constraint, and it is not fussiness: `apple_models` goes out of its way
 to keep a 200 MB dependency off the default start-up path, and a tab that lists
 model names would undo that if it had to instantiate them to do it. So:
 
-* `dayrange` is read from its **JSON sidecar**, which carries the metrics, the
-  settings and the whole feature list. Its `model_path` helper lives in a
-  module that imports torch at module scope, so the path is mirrored here
+* a saved model is read from its **JSON sidecar**, which carries the metrics,
+  the settings and the feature list. Its `model_path` helper lives in a module
+  that imports torch or LightGBM at module scope, so the path is mirrored here
   instead -- see `_saved_path`.
 * `open_profile` is a gzipped JSON pack, so its metadata is readable with the
   standard library alone even though scoring it needs LightGBM.
 
 Availability is answered the same cheap way: `importlib.util.find_spec` for the
 dependency plus `Path.exists` for the file. A model reported ready here has
-still only been *found*, not loaded -- for the torch-backed day-range bundle
-that is a weaker claim than it sounds.
+still only been *found*, not loaded -- for a torch-backed bundle that is a
+weaker claim than it sounds.
 The tab says so.
 
 The mirror contract, again
@@ -45,7 +45,6 @@ import gzip
 import json
 import math
 import os
-import re
 from dataclasses import dataclass, field
 from importlib.util import find_spec
 from pathlib import Path
@@ -250,58 +249,6 @@ def format_metric(value: "object | None") -> str:
     return f"{number:.2e}"
 
 
-def dayrange_error_pct_adr(
-    meta: dict, sessions: "dict | None" = None, ticker: str = ""
-) -> "float | None":
-    """A day-range bundle's held-out MAE as a percentage of a typical day's range.
-
-    The sidecar grades the model in log units, which is a *fraction of the
-    day's reference price*; dividing that by the average daily range expressed
-    as a fraction of the same price gives how much of a normal day the model
-    typically misses by. Both sides are dimensionless, so the price cancels and
-    the answer means the same thing on a $300 stock and a $25 one -- and it is
-    the unit the rules downstream are already written in, where the buy and
-    sell levels and the stop are all multiples of ADR (`apple_trader`).
-
-    The denominator is the ADR the saved file carries: `adr14_abs` on the
-    bundle's own simulation day, over that day's reference price. One day's
-    reading standing in for the test window's, so this is an estimate to a few
-    points rather than a measurement -- `simlab.drift` computes the same ratio
-    per session against each session's own ADR, which is the exact version.
-
-    A refit sidecar can lack that simulation day (INTC's does). Then the ADR
-    is taken the way `highlow_error_pct_adr` takes it -- from the SIP rollups
-    in `data/highlow`, averaged over the sidecar's `test_window` -- or, with no
-    rollups covering the window, there is no percentage.
-    """
-    test = meta.get("test_metrics_ensemble") or {}
-    sim = meta.get("sim_date_forecast") or {}
-    try:
-        mae = float(test["mae_mean"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if mae != mae:
-        return None
-    if sim:
-        try:
-            adr_rel = float(sim["adr14_abs"]) / float(sim["prev_avg"])
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
-            return None
-    else:
-        match = re.match(
-            r"\s*(\d{4}-\d{2}-\d{2})\s*\.\.\s*(\d{4}-\d{2}-\d{2})",
-            str(meta.get("test_window") or ""),
-        )
-        if match is None:
-            return None
-        if sessions is None:
-            sessions = _highlow_sessions(ticker or str(meta.get("ticker") or ""))
-        adr_rel, _ = _window_adr(sessions, match.group(1), match.group(2))
-    if adr_rel != adr_rel or adr_rel <= 0:
-        return None
-    return 100.0 * mae / adr_rel
-
-
 # Where `highlow_model` caches its per-session SIP rollups. Mirrored rather
 # than imported for the same reason as `_saved_path`: that module imports
 # torch. Pinned against `highlow_model.history_path` by the tests.
@@ -339,13 +286,15 @@ def highlow_error_pct_adr(
     """A HighLow bundle's test-window MAE as a percentage of its ADR, and how
     many sessions that ADR was averaged over -- or None.
 
-    The sidecar grades the model in log units, as TimeToChange3's does, but
-    unlike TimeToChange3's it records no ADR at all, so the denominator comes
+    The sidecar grades the model in log units -- a *fraction of the day's
+    reference price* -- and records no ADR at all, so the denominator comes
     from the SIP rollups the model itself reads (`data/highlow`). It is the
     model's own `adr14` -- the mean `log(high / low)` of the previous 14
     sessions -- averaged over the test-window sessions the cache holds. Also
-    a fraction of the price, so the price cancels as in
-    `dayrange_error_pct_adr`.
+    a fraction of the price, so the price cancels and the answer means the
+    same thing on a $300 stock and a $25 one -- and it is the unit the rules
+    downstream are written in, where the levels and the stop are multiples of
+    the range (`apple_trader`).
 
     An estimate: the sidecar has only the window's mean error, so this is
     mean error over mean ADR rather than the mean of the per-session ratios,
@@ -370,126 +319,6 @@ def highlow_error_pct_adr(
 
 
 # --- one builder per model --------------------------------------------------
-
-def _dayrange_spec(ticker: str) -> ModelSpec:
-    path = _saved_path(
-        "APPLE_DAYRANGE_MODEL", "timetochange3_dayrange_{ticker}.joblib", ticker
-    )
-    files = (
-        ModelFile("bundle", path),
-        ModelFile("N-BEATS weights", path.with_name(f"{path.stem}_nbeats.pt")),
-        ModelFile("N-HiTS weights", path.with_name(f"{path.stem}_nhits.pt")),
-        ModelFile("metadata", path.with_suffix(".json")),
-    )
-    available, reason = _availability(files, "torch", "lightgbm", "sklearn", "joblib")
-    meta = _read_json(path.with_suffix(".json"))
-    test = meta.get("test_metrics_ensemble") or {}
-    metrics = {k: v for k, v in test.items()}
-    if meta.get("opening_correction_loo_gain") is not None:
-        metrics["opening-stage LOO gain"] = meta["opening_correction_loo_gain"]
-    if meta.get("opening_stage_loo_mae") is not None:
-        metrics["opening-stage LOO MAE"] = meta["opening_stage_loo_mae"]
-    error_pct = dayrange_error_pct_adr(meta, ticker=ticker)
-    if error_pct is not None:
-        # First, not last: it is the row's headline, and the log-unit MAE it is
-        # derived from is directly above it in `test_metrics_ensemble`.
-        metrics = {"MAE (% of ADR)": error_pct, **metrics}
-    features = tuple(
-        list(meta.get("daily_features") or [])
-        + list(meta.get("opening_features") or [])
-        + list(meta.get("sequence_channels") or [])
-    )
-    return ModelSpec(
-        key=apple_models.DAYRANGE_KEY,
-        label=apple_models.get(apple_models.DAYRANGE_KEY).label,
-        summary=apple_models.get(apple_models.DAYRANGE_KEY).summary,
-        ticker=ticker,
-        ticker_note="",
-        project="TimeToChange3, mirrors `dayrange`",
-        predicts=(
-            "Where the **whole session's** high and low will land, called once at "
-            "9:35 from the daily history plus the first five 1-minute bars, then "
-            "never updated. What it predicts well is the *width* of the day; "
-            "notebook 3 showed the direction is not predictable here at all."
-        ),
-        target=(
-            meta.get("target_definition")
-            or "log(extreme_today / ((prev_open + prev_close) / 2))"
-        )
-        + "  →  y_high, y_low",
-        algorithm=(
-            "Equal-weight blend of "
-            + ", ".join(meta.get("daily_models") or ["lgbm", "nbeats", "nhits"])
-            + ", + an opening ridge on the residuals, clipped to contain the "
-            "observed 5-minute range"
-        ),
-        family="LightGBM + N-BEATS + N-HiTS blend",
-        consumers=("Apple Trader — day-range strategy", "Chart overlay — predicted day range"),
-        features=features,
-        inputs=(
-            f"~252 sessions of unadjusted daily bars (a {meta.get('lookback', 32)}-day "
-            f"× {len(meta.get('sequence_channels') or []) or 8}-channel sequence inside "
-            f"it) + the first {meta.get('opening_minutes', 5)} minutes of today"
-        ),
-        metrics=metrics,
-        headline=(
-            ("MAE (% of ADR)", f"{error_pct:.1f}%")
-            if error_pct is not None
-            # No simulation day in the sidecar means no ADR to divide by, and a
-            # percentage of an assumed range would be worse than the raw error.
-            else ("MAE (log units)", format_metric(test.get("mae_mean")))
-        ),
-        files=files,
-        trained_at=str(meta.get("created") or ""),
-        data_note=(
-            f"Daily stage fitted through {meta.get('daily_fit_through', '?')} · "
-            f"opening ridge on {meta.get('opening_fit_sessions', '?')} sessions · "
-            f"held out {meta.get('held_out', '?')} · best single model on validation: "
-            f"{meta.get('best_on_validation', '?')}"
-            if meta
-            else ""
-        ),
-        versions={},
-        threshold=None,
-        requires=apple_models.get(apple_models.DAYRANGE_KEY).requires,
-        available=available,
-        unavailable_reason=reason,
-        caveat=(
-            f"MAE {format_metric(test.get('mae_mean'))} log units"
-            + (
-                f" (~${float(test['mae_usd_mean']):,.2f})"
-                if test.get("mae_usd_mean") is not None
-                else ""
-            )
-            + " on the held-out test window"
-            + (
-                f" — about {error_pct:.0f}% of a typical day's range"
-                if error_pct is not None
-                else ""
-            )
-            + (
-                f", and {float(test['skill vs rolling 14d']):.0%} of a 14-day rolling "
-                "baseline's error removed"
-                if test.get("skill vs rolling 14d") is not None
-                else ""
-            )
-            + ". "
-            + (
-                "The range that percentage is measured against is the 14-day average "
-                "on the bundle's own simulation day — the only one the file records — "
-                "so read it to the nearest few points, and see SimLab's Drift tab for "
-                "the same ratio against each session's own ADR. "
-                if error_pct is not None
-                else ""
-            )
-            + "It is a statement about the "
-            "day's width, not its direction, so the rules on it are a mean-reversion "
-            "bet. Missing PyTorch makes the bundle unavailable rather than degrading "
-            "to LightGBM alone: two of three voters gone is a different predictor, not "
-            "a smaller install."
-        ),
-    )
-
 
 def _open_profile_spec() -> ModelSpec:
     path = Path(
@@ -686,7 +515,7 @@ def _highlow_group_inputs(meta: dict) -> "list[str]":
     out = []
     if meta.get("peers") and kept & {"lead_or_ret_adr", "theme_or_ret", "theme_gap", "theme_range",
                                      "theme_dispersion", "beta_theme63", "own_vs_theme"}:
-        # BE reads its peers on IEX; a SIP-opening notebook (ORCL's) on SIP
+        # An IEX-opening notebook reads its peers on IEX, a SIP-opening one on SIP
         out.append(f"; the same first minutes of its theme peers {', '.join(meta['peers'])} "
                    f"(from {'SIP' if sip_opening else 'IEX'}), with their SIP history")
     if any(c.startswith("mkt_") or c in {"rel_vol", "beta63", "corr63", "idio_or_ret_adr", "idio_gap_adr"}
@@ -717,13 +546,13 @@ def _highlow_spec(ticker: str) -> ModelSpec:
     metrics = {k: v for k, v in test.items()}
     if meta.get("walk_forward_mae_mean") is not None:
         metrics["walk-forward MAE"] = meta["walk_forward_mae_mean"]
-    # Sidecars from 2026-10-03 on (AVGO, NVDA) carry the notebook's own score in
+    # Sidecars from 2026-10-03 on (NVDA's and later) carry the notebook's own score in
     # ADR units, per session; older ones only the log MAE, put over the cached ADR.
     exact = test.get("mae_adr_mean")
     measured = None if exact is not None else highlow_error_pct_adr(meta, ticker=ticker)
     error_pct = float(exact) if exact is not None else measured[0] if measured else None
     if error_pct is not None:
-        # First, as on TimeToChange3's row: it is the headline.
+        # First: it is the headline.
         metrics = {"MAE (% of ADR)": error_pct, **metrics}
     weights = {k: w for k, w in (meta.get("weights") or {}).items() if w}
     data = meta.get("data") or {}
@@ -737,9 +566,8 @@ def _highlow_spec(ticker: str) -> ModelSpec:
         project="HighLow_5m, mirrors `highlow`",
         predicts=(
             "Where the **whole session's** high and low will land, called once at "
-            "9:35 and measured from the 9:35 price in 14-day average ranges. Like "
-            "TimeToChange3 it forecasts the *width* of the day well and its centre "
-            "only roughly."
+            "9:35 and measured from the 9:35 price in 14-day average ranges. It "
+            "forecasts the *width* of the day well and its centre only roughly."
         ),
         target="up = log(high / close5) / adr14, down = log(close5 / low) / adr14",
         algorithm=(
@@ -802,8 +630,8 @@ def _highlow_spec(ticker: str) -> ModelSpec:
                 if meta.get("ttc3_published_test_mae_mean") is not None
                 else ""
             )
-            + ". The shipped trading distances were swept on TimeToChange3's forecast, "
-            "not this one."
+            + ". The shipped trading distances are SimLab Tuning picks on a few weeks of "
+            "tape (`config.APPLE_TRADER_TUNED_LEVELS`), scored in sample."
         ),
     )
 
@@ -1119,7 +947,6 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
 
 
 _BUILDERS = {
-    apple_models.DAYRANGE_KEY: _dayrange_spec,
     apple_models.HIGHLOW_KEY: _highlow_spec,
     apple_models.HIGHLOW2_KEY: _highlow2_spec,
     apple_models.FASTFURIOUS_KEY: _fastfurious_spec,

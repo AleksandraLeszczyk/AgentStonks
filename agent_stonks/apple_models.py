@@ -2,22 +2,17 @@
 
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
-named X" and never branch on which one they got. Today there are five saved
-models, the first three of which share a rule set, and one hybrid of two of
+named X" and never branch on which one they got. Today there are four saved
+models, the first two of which share a rule set, and one hybrid of two of
 them:
 
-`dayrange`           TimeToChange3's blend of LightGBM, N-BEATS and N-HiTS, plus
-                     an opening ridge, forecasting where the *whole session's*
-                     high and low will land, once, from the first five minutes.
-                     30% of a 14-day rolling baseline's error removed over 129
-                     test sessions. The levels rest under the predicted high,
-                     flat all day.
-`highlow`            HighLow_5m's forecast of the same two numbers, anchored on
-                     the 9:35 price and fitted on every session since 2023 (35%
-                     less error than TimeToChange3 on the same test window).
-                     Only the forecast differs: its bundle carries
-                     `kind="highlow"` and `apple_trader.DayRangeTrader` asks
-                     `highlow_model` for today's range instead.
+`highlow`            HighLow_5m's forecast of where the *whole session's* high
+                     and low will land, once, from the first five minutes,
+                     anchored on the 9:35 price and fitted on every session
+                     since 2023. The levels rest under the predicted high
+                     (`apple_trader.DayRangeTrader`); its bundle carries
+                     `kind="highlow"` and the forecast comes from
+                     `highlow_model`.
 `highlow2`           HighLow2_5m's forecast of the same two numbers under
                      stricter rules: this morning read entirely from IEX, the
                      pre-market as an input, shock days out of training, five
@@ -56,12 +51,11 @@ them:
                      `HIGHLOW2_KEY`; `apple_trader.HighLow2GoodMomentsTrader`
                      trades it.
 
-The persistence classifier, the N-BEATS persistence forecaster and the
-delta-momentum regressor used to sit beside them and have been removed, and so
-have HighLow_3m, Day Range × Intraday Volatility and Fast&Furious + HighLow
-(2026-10-20). Their bundles may still be in `Code/Models`, but nothing here
-reads them, and a stored SimLab record naming one is refused rather than
-replayed on another model (`apple_trader.model_ticker_error`).
+Every model that used to sit beside them has been removed -- most recently
+TimeToChange3's day-range forecast (`dayrange`, 2026-10-25), whose arithmetic
+for moving a range intraday lives on in `day_range` because the HighLow models
+share it. A stored SimLab record naming a removed model is refused rather than
+replayed on another one (`apple_trader.model_ticker_error`).
 
 Which symbols a model exists for
 --------------------------------
@@ -74,11 +68,10 @@ Everything downstream reads `keys_for(ticker)` instead of `MODELS`, which is
 what makes an instrument with no model at all a supported choice rather than a
 broken one: a rule set written on the tape, the momentum regime, the position
 and the clock needs no model. Adding a ticker to a model here (plus its bundle
-in `Code/Models`) is the whole change needed to offer it -- ORCL, for instance,
-is trained in `FinNotebooks/Models` and is one entry away.
+in `Code/Models`) is the whole change needed to offer it.
 
 `AppleModel.strategy` names which rule set a model drives, and
-`apple_trader.build_trader` turns it into a state machine: the three range
+`apple_trader.build_trader` turns it into a state machine: the two range
 models drive the day-range rules (two resting levels), Fast&Furious the
 momentum rules (a per-minute signal) and GoodMoments the probability rules (a
 per-minute edge, a take and a stop in ADRs). A caller written for one of them
@@ -108,41 +101,31 @@ STRATEGY_PROBABILITY = "probability"
 # arriving without one means.
 DEFAULT_TICKER = "AAPL"
 
-# Which symbols the day-range model was fitted on. Each really is its own
-# model: TimeToChange3's pipeline was run per ticker, and each run produced its
-# own bundle.
-DAYRANGE_TICKERS = (DEFAULT_TICKER, "GOOGL", "INTC")
-
 # Which symbols HighLow_5m has saved a bundle for (`highlow15m_<TICKER>.*`).
 # AAPL (saved 2026-09-15), INTC (2026-09-21), MU (2026-09-30, its opening
-# read from IEX -- see `highlow_model`), BE (2026-09-30, IEX opening plus its
-# theme peers VST, PLUG and XLU), AVGO (2026-10-04, base features, sessions
-# kept from 320 bars), NVDA (2026-10-04, reads SPY, the pre-market, the
-# previous evening, the opening's shape and the volatility regime), and QCOM,
-# ORCL and META (2026-10-13, NVDA's recipe; all three read the opening's trade
-# counts and VWAP, and ORCL also SPY and its SIP theme peers MSFT, AMZN and
-# GOOGL), and AMGN (2026-10-19, the same recipe outside tech: SPY, the
-# pre-market, the previous evening, the opening's trade counts and its biotech
-# peers GILD, REGN and VRTX, sessions kept from 310 bars), and TMO (2026-10-20,
+# read from IEX -- see `highlow_model`), NVDA (2026-10-04, reads SPY, the
+# pre-market, the previous evening, the opening's shape and the volatility
+# regime), AMGN (2026-10-19, NVDA's recipe outside tech: SPY, the pre-market,
+# the previous evening, the opening's trade counts and its biotech peers GILD,
+# REGN and VRTX, sessions kept from 310 bars), TMO (2026-10-20,
 # the same recipe, of which the blend kept only its life-science tools peers
 # DHR, A and WAT; sessions kept from 260 bars, the peers' with first bars as
 # late as 09:37), and AMD (2026-10-21, the same recipe: SPY, the previous
 # evening, the opening's shape, the volatility regime and its chip peers NVDA,
-# INTC and AVGO -- AVGO's history cleaned at AVGO's own 320 bars); GOOGL is
-# in the notebook's config but has not been run through it.
+# INTC and AVGO -- AVGO's history cleaned at AVGO's own 320 bars). BE, AVGO,
+# QCOM, ORCL and META had bundles of their own until 2026-10-25, when they were
+# removed at the user's request.
 # Adding one is this tuple plus its files in `Code/Models` -- and a check that
 # the bundle's shipped candidates read only the base features and the custom
 # groups `highlow_model` mirrors (`GROUP_COLS`; `_build_bundle` refuses
 # anything else).
-HIGHLOW_TICKERS = (
-    DEFAULT_TICKER, "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO", "AMD",
-)
+HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD")
 
 # Which symbols HighLow2_5m is wired up for (`highlow2_5m_<TICKER>.*`): AAPL
 # (saved 2026-10-04). INTC's bundle (2026-10-06, with a rest-of-session head:
 # the high and low from 9:35 to the close, which `highlow2_model.forecast_from`
 # hands the trader in place of the day's) was wired up until 2026-10-20 and
-# removed at the user's request; its files stay in `Code/Models`. The notebook
+# removed at the user's request; its files went on 2026-10-25. The notebook
 # has processed GOOGL, MSFT, AMZN, META, NVDA, AMD, MU, AVGO and QCOM as training
 # pools, but fitted no model of their own. Adding one is this tuple plus its two
 # files in `Code/Models` -- `_build_bundle` refuses a bundle whose shipped blend
@@ -214,33 +197,15 @@ class AppleModel:
         return (ticker or DEFAULT_TICKER).upper() in self.tickers
 
 
-def _load_dayrange(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The TimeToChange3 bundle for one ticker, or None if torch/LightGBM are
-    not installed.
+def _load_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """The HighLow bundle for one ticker, or None if torch/LightGBM are not
+    installed.
 
     Imported here rather than at module scope: the module pulls LightGBM in
     ahead of torch on purpose, and doing that at `import apple_models` time
     would impose a 200 MB dependency, and the ordering, on every process that
     only wanted to list the model names.
     """
-    try:
-        from . import dayrange_model
-    except ImportError:
-        return None
-    return dayrange_model.load_bundle(ticker)
-
-
-def _dayrange_path(ticker: str = DEFAULT_TICKER) -> Path:
-    try:
-        from . import dayrange_model
-    except ImportError:
-        return Path(f"timetochange3_dayrange_{(ticker or DEFAULT_TICKER).upper()}.joblib")
-    return dayrange_model.model_path(ticker)
-
-
-def _load_highlow(ticker: str = DEFAULT_TICKER) -> "dict | None":
-    """The HighLow bundle for one ticker, imported late for the same reason as
-    the day-range one (torch and LightGBM, in that order)."""
     try:
         from . import highlow_model
     except ImportError:
@@ -340,7 +305,6 @@ def _highlow2_goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
     return " ".join(missing) or "Both halves loaded; try again."
 
 
-DAYRANGE_KEY = "dayrange"
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 FASTFURIOUS_KEY = "fastfurious"
@@ -348,24 +312,6 @@ GOODMOMENTS_KEY = "goodmoments"
 HIGHLOW2_GOODMOMENTS_KEY = "highlow2_goodmoments"
 
 MODELS: "dict[str, AppleModel]" = {
-    DAYRANGE_KEY: AppleModel(
-        key=DAYRANGE_KEY,
-        label="Day-range forecast (TimeToChange3)",
-        summary=(
-            "Forecasts where the whole session's high and low will land, once, at 9:35 "
-            "— an equal blend of LightGBM, N-BEATS and N-HiTS over a year of daily "
-            "history, corrected by a ridge on the first five minutes and clipped to "
-            "contain the opening range. It removes 30% of a 14-day rolling baseline's "
-            "error over 129 test sessions. What it predicts well is the *width* of the "
-            "day, not its direction, which is why the rules around it buy well below "
-            "the predicted high and sell just under it."
-        ),
-        requires="PyTorch, LightGBM, scikit-learn and joblib, plus both .pt checkpoints",
-        strategy=STRATEGY_DAYRANGE,
-        tickers=DAYRANGE_TICKERS,
-        load=_load_dayrange,
-        path=_dayrange_path,
-    ),
     HIGHLOW_KEY: AppleModel(
         key=HIGHLOW_KEY,
         label="HighLow model",
@@ -373,24 +319,19 @@ MODELS: "dict[str, AppleModel]" = {
             "FinNotebooks' HighLow_5m forecast of where the session's high and low "
             "will land, made once at 9:35 -- measured from the 9:35 price in units "
             "of the 14-day average range, by a blend picked per ticker on validation "
-            "(AAPL and AVGO: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + "
-            "N-BEATS + N-HiTS; BE: N-BEATS + N-HiTS; NVDA: LightGBM + N-HiTS; QCOM, "
-            "ORCL, TMO and AMD: LightGBM + N-BEATS + N-HiTS; META and AMGN: N-BEATS alone), fitted on "
-            "every session since 2023 with its first five minutes (MU's and BE's read "
-            "from IEX, the only tape there is at 9:35 on a basic plan; BE's also with "
-            "VST's opening move, its lead AI-power peer; NVDA's with SPY's opening, the "
-            "pre-market to 9:19 and the previous evening's after-hours; QCOM's, ORCL's "
-            "and META's also with the opening's trade counts and VWAP, and ORCL's with "
-            "SPY and its cloud peers MSFT, AMZN and GOOGL; AMGN's with SPY, the "
-            "pre-market, the previous evening, the opening's trade counts and its "
-            "biotech peers GILD, REGN and VRTX; TMO's with its life-science tools peers "
-            "DHR, A and WAT; AMD's with SPY, the previous evening and its chip peers "
-            "NVDA, INTC and AVGO). On the "
-            "129-session test window its error is 35% below "
+            "(AAPL: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + N-BEATS + "
+            "N-HiTS; NVDA: LightGBM + N-HiTS; TMO and AMD: LightGBM + N-BEATS + "
+            "N-HiTS; AMGN: N-BEATS alone), fitted on every session since 2023 with its "
+            "first five minutes (MU's read from IEX, the only tape there is at 9:35 on "
+            "a basic plan; NVDA's with SPY's opening, the pre-market to 9:19 and the "
+            "previous evening's after-hours; AMGN's with SPY, the pre-market, the "
+            "previous evening, the opening's trade counts and its biotech peers GILD, "
+            "REGN and VRTX; TMO's with its life-science tools peers DHR, A and WAT; "
+            "AMD's with SPY, the previous evening and its chip peers NVDA, INTC and "
+            "AVGO). On the 129-session test window its error is 35% below "
             "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
-            "INTC; MU, BE and AVGO have no TimeToChange3 bundle, and beat that approach "
-            "retrained on them by 25%, 33% and 34%, QCOM, ORCL and META by 43%, 31% "
-            "and 29%, AMGN by 34%, TMO by 42% (AMD's notebook ran no such comparison). "
+            "INTC; MU has no TimeToChange3 bundle and beats that approach retrained on "
+            "it by 25%, AMGN by 34%, TMO by 42% (AMD's notebook ran no such comparison). "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -398,12 +339,9 @@ MODELS: "dict[str, AppleModel]" = {
         requires=(
             "PyTorch, LightGBM, scikit-learn and joblib, the weighted network "
             "checkpoints, and Alpaca credentials for ~150 sessions of SIP minute history "
-            "(plus IEX openings on MU and BE, BE's peers VST, PLUG and XLU, on NVDA, "
-            "ORCL, AMGN and AMD SPY's history, on ORCL its peers MSFT, AMZN and GOOGL, on "
-            "AMGN GILD, REGN and VRTX, on TMO DHR, A and WAT, on AMD NVDA, INTC and "
-            "AVGO, and on NVDA, QCOM, ORCL, "
-            "META and AMGN this "
-            "morning's SIP pre-market)"
+            "(plus IEX openings on MU, on NVDA, AMGN and AMD SPY's history, on AMGN "
+            "GILD, REGN and VRTX, on TMO DHR, A and WAT, on AMD NVDA, INTC and AVGO, "
+            "and on NVDA and AMGN this morning's SIP pre-market)"
         ),
         strategy=STRATEGY_DAYRANGE,
         tickers=HIGHLOW_TICKERS,
@@ -537,7 +475,7 @@ MODELS: "dict[str, AppleModel]" = {
     ),
 }
 
-DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else DAYRANGE_KEY
+DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else HIGHLOW_KEY
 
 
 def keys() -> "list[str]":

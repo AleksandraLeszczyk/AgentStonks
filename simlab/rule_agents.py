@@ -31,7 +31,6 @@ from agent_stonks.config import (
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_SELL_K,
     BREACH_OFF,
-    LEVELS_DAYRANGE,
     TAKE_MOMENTUM,
     UNIT_ADR,
 )
@@ -180,15 +179,10 @@ _APPLE_LEGACY = {
     # the two levels never moved. "off" is that rule, and it is left out of the
     # signature, so such a record replays and files exactly where it did.
     "breach_update": BREACH_OFF,
-    # And before the reference was a choice, the levels always hung off the
-    # predicted high -- which is still the default, so this entry changes
-    # nothing today and is here so that it keeps meaning the same thing if the
-    # default ever moves.
-    "level_source": LEVELS_DAYRANGE,
     # And before the unit was a choice, a k was always an ADR -- which is no
-    # longer the default, so unlike `level_source` above this entry is doing
-    # work today. Every stored record's distances, its stop as a fraction of
-    # the predicted gain, its runner threshold and its circuit breaker were all
+    # longer the default, so this entry is doing work today. Every stored
+    # record's distances, its stop as a fraction of the predicted gain, its
+    # runner threshold and its circuit breaker were all
     # counted in ADRs, and re-reading those same numbers as predicted ranges
     # would replay a different strategy under the signature of the original.
     "level_unit": UNIT_ADR,
@@ -275,8 +269,8 @@ _APPLE_LEGACY = {
 }
 
 
-# A record may still carry fields of a strategy that has been removed -- an
-# entry mode, a trailing stop, a delta-momentum threshold. They describe a run
+# A record may still carry fields of a strategy or a model that has been
+# removed -- an entry mode, a trailing stop, `level_source`. They describe a run
 # that already happened and mean nothing to today's config, so they are dropped
 # on the way in; the model key they came with is what gets the run refused.
 _APPLE_FIELDS = {f.name for f in fields(AppleTraderConfig)}

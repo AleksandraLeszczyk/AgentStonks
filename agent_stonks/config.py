@@ -237,57 +237,27 @@ STRATEGIST_BRIEFING_POLL_SEC = 2.0
 # Apple Trader: the rule-based (non-LLM) loop that trades its configured symbol
 # off a saved model's forecast (see agent_stonks.apple_trader).
 #
-# MODEL names the model it runs on -- a key of agent_stonks.apple_models.MODELS,
-# of which "dayrange" is the only one.
+# MODEL names the model a new config runs on -- a key of
+# agent_stonks.apple_models.MODELS. HighLow since 2026-10-25, when
+# TimeToChange3's day-range model ("dayrange", the default until then) was
+# removed at the user's request.
 #
-# The day-range model forecasts where the whole session's high and low will land, once, at 9:35,
-# and the rules built on it are TimeToChange3 notebook 05's: two resting levels
-# a fixed number of level units below the predicted high H, with U the unit
-# APPLE_TRADER_LEVEL_UNIT names -- the notebook's 14-day average daily range,
-# or the forecast's own predicted range.
+# The day-range rules (HighLow's and HighLow2's) hang off a forecast of where
+# the whole session's high and low will land, made once at 9:35, and are
+# TimeToChange3 notebook 05's: two resting levels a fixed number of level
+# units below the predicted high H, with U the unit APPLE_TRADER_LEVEL_UNIT
+# names -- the 14-day average daily range, or the forecast's own predicted
+# range.
 #
 #     buy_level  = H - BUY_K  * U
 #     sell_level = H - SELL_K * U
 #
-# The notebook specifies 0.75 and 0.10 and only ever swept them over five
-# sessions. The levels used here are per instrument instead, because the stocks
-# do not dip alike: notebook 05's own grid (buy 0.30..1.30, sell 0.05..0.50,
-# step 0.05) re-run with its own fill rules over *every* session each ticker has
-# minute bars and a forecast for. `TimeToChange3/scripts/sweep_levels.py`
-# reproduces the table. A cell is eligible only if it trades on at least half
-# the sessions -- otherwise the deepest buy distances "win" on a handful of
-# fills -- and the pick is the eligible cell with the best 3x3 neighbourhood
-# mean: the middle of a profitable plateau rather than its sharpest cell.
-#
-#   ticker  days  buy   sell  total  traded  up  1st half  2nd half  at 0.75/0.10
-#   AAPL     36   0.40  0.25  +1230    34    22    +1001     +229       +1077
-#   GOOGL    31   0.65  0.05   +534    23    14     +244     +291        +146
-#   INTC     31   0.50  0.05   +403    28    15    -1444    +1847        -258
-#
-# Dollars on $10,000 per session, limit fills, no costs, and picked on the same
-# sessions it is scored on. How far to trust each differs: AAPL's whole grid is
-# profitable and the pick sits on a broad plateau; GOOGL's holds up in both
-# halves; INTC's flips sign between halves, so it is the best cell of a surface
-# that is mostly noise. GOOGL and INTC both pick the grid's smallest sell
-# distance, so their optimum may lie past the edge that was searched. ORCL was
-# swept too (it is not wired up) and no cell makes money.
-#
-# The live ledger fills at market rather than at the level (see
-# `DayRangeTrader`), so expect less than these totals. A symbol with no entry
-# falls back to the notebook's 0.75 / 0.10, which is also what a SimLab record
-# written without the two fields replays at.
-#
-APPLE_TRADER_MODEL = "dayrange"
+# The notebook specifies 0.75 and 0.10. That is what a (model, instrument) pair
+# with no tuning pick below starts from, and what a SimLab record written
+# without the two fields replays at.
+APPLE_TRADER_MODEL = "highlow"
 APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
-# (buy_k, sell_k) per instrument -- see the day-range block above. Since
-# 2026-09-26 only the fallback for a (model, instrument) pair with no SimLab
-# tuning pick below; no shipped pair falls back to it today.
-APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
-    "AAPL": (0.40, 0.25),
-    "GOOGL": (0.65, 0.05),
-    "INTC": (0.50, 0.05),
-}
 # (buy_k, sell_k) per (model, instrument): the pick of SimLab's Tuning tab, one
 # job per pair, each a buy × sell grid (buy 0.45..0.95, sell 0.05..0.45, step
 # 0.10) replayed through the real engine -- market fills, the managed exit --
@@ -296,34 +266,27 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # three weeks' heatmaps summed (highest cell, no minimum share of days traded):
 #
 #   model     ticker  buy   sell  total   return  weeks up  days traded  job
-#   dayrange  AAPL    0.55  0.05  +3757   +3.76%    3/3        14/14     20260923-181947-96f7cb
-#   dayrange  GOOGL   0.85  0.45  +1317   +1.32%    2/3         9/14     20260923-182822-178bfa
-#   dayrange  INTC    0.65  0.05  +7191   +7.19%    2/3         9/14     20260923-182628-bdbe37
 #   highlow   AAPL    0.75  0.35  +3775   +3.77%    3/3        12/14     20260923-191233-fd16ae  (replaced 2026-10-01, below)
 #   highlow   INTC    0.85  0.35  +5971   +5.97%    3/3         7/14     20260923-191641-b7ded5
 #
 # How far to trust them. Every week is in sample -- the pick is read off the
 # sum it is scored on -- and three weeks is 14 sessions. The grids were swept
 # under the managed exit as it stood on 2026-09-23 (momentum confirmation off,
-# the legacy fade / negative-momentum take on, no scale-in, no keep_width, and
-# the brownian breach rule on dayrange), not under today's defaults, so a
-# replay with today's exit will not reproduce these totals. On INTC and GOOGL
-# (dayrange) the picked cell is well clear of the runner-up, i.e. a peak rather
-# than a plateau. Every pick made most of its total in the first week
-# (tech_week_2026-09-07); dayrange GOOGL and INTC lost money on the third. On
-# dayrange INTC the untuned 0.50/0.05 made +7262 on the same weeks, more than
-# the pick (0.50 sits between the grid's 0.10 steps). Re-read the Tuning tab's
-# jobs after adding a week before trusting any of these over the fallback.
+# the legacy fade / negative-momentum take on, no scale-in, no keep_width), not
+# under today's defaults, so a replay with today's exit will not reproduce
+# these totals. Every pick made most of its total in the first week
+# (tech_week_2026-09-07). Both were replaced by the 2026-10-04 picks below.
+# (TimeToChange3's three day-range pairs were tuned in the same run and went
+# with that model.)
 #
-# HighLow MU, BE and AAPL from jobs run 2026-09-30, installed 2026-10-01: the
+# HighLow MU and AAPL from jobs run 2026-09-30, installed 2026-10-01: the
 # same grid widened to buy 0.35..0.95, highest summed cell, yfinance tape at
-# $100,000 per week. MU and BE on two weeks (2026-09-14 and -09-21; 10
-# sessions; MU's job also required trading on at least half the days), AAPL on
-# the three tech weeks above:
+# $100,000 per week. MU on two weeks (2026-09-14 and -09-21; 10 sessions; its
+# job also required trading on at least half the days), AAPL on the three tech
+# weeks above:
 #
 #   model     ticker  buy   sell  total   return  weeks up  days traded  wins   job
 #   highlow   MU      0.55  0.35  +5739   +5.74%    2/2        9/10      11/15  20260930-113034-ec08db
-#   highlow   BE      0.55  0.45  +6561   +6.56%    2/2       10/10       9/12  20260930-164413-6e0c3c
 #   highlow   AAPL    0.75  0.05  +4939   +4.94%    3/3        9/14       8/9   20260930-184245-da9c77
 #
 # Their bases were the exit of 2026-09-30 (momentum confirmation, the minimum
@@ -335,72 +298,54 @@ APPLE_TRADER_DAYRANGE_LEVELS: "dict[str, tuple[float, float]]" = {
 # those defaults the pick makes +1785 on the same weeks, the old 0.75/0.35
 # +887. 0.75/0.05 beat 0.75/0.35 under every setup tried.
 #
-# MU and BE picks sit in a buy-0.55 row that is profitable at every sell
-# distance (MU +3.2k..+5.7k, BE +3.1k..+6.6k). On MU every buy from 0.35 to 0.65
-# makes money and 0.75 and deeper do not; on BE the rows either side of 0.55 are
-# mixed, so the pick is a ridge rather than a plateau, and its sell is the
-# grid's edge. BE's target is only 0.10 units, so its circuit breaker is 0.01
-# (APPLE_TRADER_MIN_WIN), not the default 0.10 it was scored under, which stood
-# the session down after any trade that only reached the target. That costs on
-# these weeks: +5584 instead of +6561 under the job's base (19 buys instead of
-# 12), +2897 instead of +4084 under the 2026-10-01 defaults. The stop sits 0.05 units
-# under the fill. The untuned 0.75/0.10 made -2 on MU and +2019 on BE.
+# MU's pick sits in a buy-0.55 row that is profitable at every sell distance
+# (+3.2k..+5.7k). Every buy from 0.35 to 0.65 makes money and 0.75 and deeper
+# do not. The untuned 0.75/0.10 made -2.
 #
-# Every pair below but dayrange AAPL and GOOGL re-tuned 2026-10-04 (installed the
-# same day, the user's request) with the stop as a third axis: buy 0.45..0.95 x
-# sell 0.05..0.45 x stop 0.4/0.6/0.8/1.0 of the predicted gain (0.3/0.5/0.7/0.9
-# on INTC, NVDA and AVGO HighLow), on two yfinance weeks (week_2026-09-14 and
+# Every pair below re-tuned 2026-10-04 (installed the same day, the user's
+# request) with the stop as a third axis: buy 0.45..0.95 x sell 0.05..0.45 x
+# stop 0.4/0.6/0.8/1.0 of the predicted gain (0.3/0.5/0.7/0.9 on INTC and NVDA
+# HighLow), on two yfinance weeks (week_2026-09-14 and
 # week_2026-09-27; 10 sessions) at $100,000 per week, highest summed cell (INTC
 # HighLow's job also required trading on half the days). The stop is installed
 # with the levels, per pair (APPLE_TRADER_TUNED_STOP below). "Base" is the
-# pair's previous default (old levels, stop 0.5) on the same weeks. Seven of the
-# eight jobs ran with a 3-bar momentum confirmation and contain_range off, which
-# became the defaults the same day (the user's call), so "total" is what the
-# shipped defaults replay to; "old rules" is pick / base under the defaults
-# before that switch (5 bars, contain_range on):
+# pair's previous default (old levels, stop 0.5) on the same weeks. Every job
+# but INTC HighLow's ran with a 3-bar momentum confirmation and contain_range
+# off, which became the defaults the same day (the user's call), so "total" is
+# what the shipped defaults replay to; "old rules" is pick / base under the
+# defaults before that switch (5 bars, contain_range on). Three more pairs were
+# tuned that day -- TimeToChange3 INTC, HighLow BE and AVGO -- and went with
+# their models (2026-10-25):
 #
 #   model     ticker  buy   sell  stop  total   base    weeks up  traded  wins   old rules        job
 #   highlow   AAPL    0.65  0.10  1.0   +2185   -56       2/2      8/10   9/9    +357 / -158     20261004-122522-bb7ab1
 #   highlow2  AAPL    0.60  0.35  0.4    +814   +22       1/2      9/10   4/11   +863 / -589     20261004-123206-0d0ba0
-#   dayrange  INTC    0.45  0.05  0.8   +8257  +3879      2/2      9/10   11/12  +7423 / +697    20261004-123706-76751f
-#   highlow   BE      0.70  0.30  0.4   +2271   -95       1/2      8/10   12/16  -662 / +43      20261004-123758-37dc10
 #   highlow   MU      0.55  0.35  0.6   +6068  +5295      2/2      7/10   10/13  +4085 / +3201   20261004-123830-8cb4bd
 #   highlow   INTC    0.70  0.05  0.7   +1440  -227       2/2      5/10   6/6    (= total, base) 20261004-162236-6d0e8e
 #   highlow   NVDA    0.65  0.05  0.5   +2389  +183       2/2      9/10   8/9    +1223 / +324    20261004-182658-b47693
-#   highlow   AVGO    0.45  0.40  0.3   +1030  -2742      2/2      9/10   7/9    -485 / -2184    20261004-183552-2593c3
 #
 # INTC HighLow is the exception: its job ran under the old rules, so its row is
 # those rules' numbers. Under the shipped 3 bars / contain_range off its pick
 # makes +540 (week 09-14 -1710, 09-27 +2250) against -398 for its previous
 # default -- still ahead, but re-run that job on the new base before trusting it.
-# Ties along the stop axis go to the smaller stop (grid order): dayrange INTC
-# scores the same at 0.8 and 1.0, NVDA at 0.5, 0.7 and 0.9 -- the stop never
-# fired between them. Weak picks: highlow2 AAPL and BE lost money on the
-# 09-27 week, 4 of 11 highlow2 round trips won, and AVGO's buy is the grid's
-# shallowest edge with a 0.05-unit target (only 114 of 392 cells made money).
+# Ties along the stop axis go to the smaller stop (grid order): NVDA scores the
+# same at 0.5, 0.7 and 0.9 -- the stop never fired between them. Weak pick:
+# highlow2 AAPL lost money on the 09-27 week, and 4 of its 11 round trips won.
 APPLE_TRADER_TUNED_LEVELS: "dict[tuple[str, str], tuple[float, float]]" = {
-    ("dayrange", "AAPL"): (0.55, 0.05),
-    ("dayrange", "GOOGL"): (0.85, 0.45),
-    ("dayrange", "INTC"): (0.45, 0.05),
     ("highlow", "AAPL"): (0.65, 0.10),
     ("highlow", "INTC"): (0.70, 0.05),
     ("highlow", "MU"): (0.55, 0.35),
-    ("highlow", "BE"): (0.70, 0.30),
     ("highlow", "NVDA"): (0.65, 0.05),
-    ("highlow", "AVGO"): (0.45, 0.40),
     ("highlow2", "AAPL"): (0.60, 0.35),
 }
 # The stop (APPLE_TRADER_STOP_GAIN_FRACTION, a share of the predicted gain) per
 # (model, instrument): the third axis of the 2026-10-04 jobs above, read off the
 # same picked cell. A pair with no entry starts from the shared default.
 APPLE_TRADER_TUNED_STOP: "dict[tuple[str, str], float]" = {
-    ("dayrange", "INTC"): 0.8,
     ("highlow", "AAPL"): 1.0,
     ("highlow", "INTC"): 0.7,
     ("highlow", "MU"): 0.6,
-    ("highlow", "BE"): 0.4,
     ("highlow", "NVDA"): 0.5,
-    ("highlow", "AVGO"): 0.3,
     ("highlow2", "AAPL"): 0.4,
 }
 # The day-range managed exit, on top of the sell level and the closing flatten
@@ -432,14 +377,14 @@ APPLE_TRADER_TUNED_STOP: "dict[tuple[str, str], float]" = {
 # not: 0.20 ADR was a third of AAPL's 0.15-ADR target and a third of GOOGL's
 # 0.60-ADR one is 0.20 too -- same number, wildly different bets.
 #
-# Read the two together before changing either. On the shipped pairs 0.5 of the
-# predicted gain is 0.075 ADR on AAPL, 0.30 on GOOGL and 0.225 on INTC, so this
-# default is a much tighter stop on AAPL than the 0.20 ADR it replaces and a
-# wider one on GOOGL. 0 switches the stop off, which is what every record
-# written before the managed exit existed replays as.
+# Read the two together before changing either. On the notebook-05 pairs it was
+# written against (TimeToChange3's, since removed) 0.5 of the predicted gain was
+# 0.075 ADR on AAPL, 0.30 on GOOGL and 0.225 on INTC, so this default was a much
+# tighter stop on AAPL than the 0.20 ADR it replaced and a wider one on GOOGL.
+# 0 switches the stop off, which is what every record written before the
+# managed exit existed replays as.
 # Since 2026-10-04 only the default of a pair with no tuned stop
-# (APPLE_TRADER_TUNED_STOP): today dayrange AAPL and GOOGL, and the intraday-
-# volatility model.
+# (APPLE_TRADER_TUNED_STOP): today HighLow on AMGN, TMO and AMD.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
 # The momentum take as it was 2026-09-23 to -24 (`DayRangeTrader._momentum_negative`),
 # kept so the records made then replay; a new config uses the momentum
@@ -526,10 +471,9 @@ APPLE_TRADER_TAKE_TRIGGER = TAKE_MOMENTUM
 APPLE_TRADER_ZONE_MIN_BARS = 20
 APPLE_TRADER_ZONE_WIDTH = 3.0
 # What the agent does when the session trades through the forecast it was given
-# at 9:35 -- the vocabulary lives here rather than in `dayrange_model`, which
-# defines the arithmetic (`updated_range`) but costs 200 MB of torch to import,
-# and both the form and the config dataclass need to name a policy without
-# paying that. Same reason `TRADING_MODES` is a list here.
+# at 9:35 -- the vocabulary lives here and the arithmetic in `day_range`
+# (`updated_range`), so the form and the config dataclass can name a policy
+# without importing the rules. Same reason `TRADING_MODES` is a list here.
 #
 #   "off"       the 9:35 forecast stands all session, whatever the tape prints
 #   "shift"     a breach moves both sides: the breached one to the session's own
@@ -544,8 +488,8 @@ APPLE_TRADER_ZONE_WIDTH = 3.0
 #               to add, ADR x sqrt(session left)/2; with APPLE_TRADER_KEEP_WIDTH
 #               the other side follows at the unit's width, without it it stays
 #
-# The forecast already refuses to sit under the opening window's high
-# (`dayrange_model.apply_open_constraint`); the moving policies carry that same
+# The forecast already refuses to sit under the opening window's high (each
+# model clips its own at 9:35); the moving policies carry that same
 # correction through the rest of the day, and `DayRangeTrader` rebuilds its two
 # levels from the updated high each time it moves.
 BREACH_OFF = "off"
@@ -569,10 +513,10 @@ BREACH_LABELS = {
 # user's request: a day that has broken out of its forecast has moved, not
 # widened, so the range keeps its predicted width. Under the default
 # "pred_range" unit that also keeps the unit fixed, and both levels translate
-# by exactly the breach. No policy has been swept, and
-# APPLE_TRADER_DAYRANGE_LEVELS above was -- under "off", with the forecast held
-# fixed all day -- so the two numbers there were picked against a rule this
-# setting changes. A SimLab record written before the setting existed replays
+# by exactly the breach. No policy has been swept, and TimeToChange3's
+# notebook levels (the defaults then) were -- under "off", with the forecast
+# held fixed all day -- so they were picked against a rule this setting
+# changes. A SimLab record written before the setting existed replays
 # under "off" and one written under "extreme" replays that
 # (`simlab.rule_agents._APPLE_LEGACY`), so no stored result moves.
 #
@@ -583,8 +527,8 @@ BREACH_LABELS = {
 APPLE_TRADER_BREACH_UPDATE = BREACH_BROWNIAN
 
 # Whether the forecast is always widened to hold what the session has actually
-# printed (`dayrange_model.contain_session`). The 9:35 forecast is already
-# clipped to contain the opening five minutes (`apply_open_constraint`); this
+# printed (`day_range.contain_session`). The 9:35 forecast is already
+# clipped to contain the opening five minutes; this
 # is that same rule applied for the rest of the day, so a predicted high the
 # tape has traded through stops being the number the levels are measured from.
 #
@@ -612,7 +556,7 @@ APPLE_TRADER_CONTAIN_RANGE = False
 # where the policy puts it (the extreme, or past it by the Brownian reach) and
 # the other side follows at that width; the only thing allowed to make the
 # range wider is a followed side that would exclude a price the session has
-# already printed (`dayrange_model.contain_session`). At the user's request,
+# already printed (`day_range.contain_session`). At the user's request,
 # 2026-09-25: a moved forecast is the same day moved, not a wider day.
 #
 # Without it "shift" keeps the width the range had just before the breach
@@ -649,20 +593,6 @@ APPLE_TRADER_KEEP_WIDTH = True
 # every record written before it existed replays as.
 APPLE_TRADER_BREACH_EXIT = True
 
-# What the two levels hang off -- the reference `buy_k` and `sell_k` are
-# measured below (`apple_trader.DayRangeTrader._set_levels`): the model's
-# predicted high, one number for the session.
-#
-# "intraday" -- that forecast read through IntradayVolatility's time-of-day
-# shape, the "Day Range × Intraday Volatility" model -- was removed on
-# 2026-10-20. It stays a value a stored record can carry, so that such a record
-# is refused (`apple_trader.level_source_error`) rather than replayed on the
-# flat high and filed in Results beside runs it never matched.
-LEVELS_DAYRANGE = "dayrange"
-LEVELS_INTRADAY = "intraday"
-LEVEL_SOURCES = (LEVELS_DAYRANGE, LEVELS_INTRADAY)
-APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
-
 # What one "k" is worth in dollars -- the yardstick `buy_k` and `sell_k` are
 # counted in, and with them everything written against the gap between the two
 # levels (`apple_trader.level_unit`).
@@ -680,12 +610,8 @@ APPLE_TRADER_LEVEL_SOURCE = LEVELS_DAYRANGE
 # narrow -- the forecast sets where the levels sit and has no say in how far
 # apart they are. Under "pred_range" one forecast decides both.
 #
-# Three consequences worth having in mind before switching:
+# Two consequences worth having in mind before switching:
 #
-#   * APPLE_TRADER_DAYRANGE_LEVELS below was swept in ADRs. A k means a
-#     different number of dollars here, so those pairs are starting points
-#     under this unit rather than swept ones -- the same caveat
-#     APPLE_TRADER_BREACH_UPDATE carries, for the same reason.
 #   * The unit is no longer constant within a session. APPLE_TRADER_BREACH_UPDATE
 #     ratchets `pred_high` up and `pred_low` down, so a breached day *widens*
 #     the range and the two levels spread apart, where under "adr" a breach
@@ -721,8 +647,9 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # same levels on the same tape is how one weak trade becomes five.
 #
 # Read it against the levels above before trusting the default. The most a
-# target exit can net is (buy_k - sell_k) x ADR -- 0.15 on AAPL's swept pair,
-# 0.60 on GOOGL's, 0.45 on INTC's -- so at 0.20 an AAPL run stands down after
+# target exit can net is (buy_k - sell_k) x ADR -- 0.15 on AAPL's notebook-05
+# pair, 0.60 on GOOGL's, 0.45 on INTC's (TimeToChange3's, the defaults when
+# this was written) -- so at 0.20 an AAPL run stands down after
 # its first completed trade however well it went, while GOOGL and INTC stand
 # down only on an exit worse than the target. That is a real strategy choice
 # ("one trade a day unless it runs"), not a bug, and the form says so where the
@@ -735,21 +662,17 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # better) alive and catches what the rule is for -- a breakeven runner, a
 # flatten at the fill, a take that gave out early. Since 2026-09-23 (the user's
 # call) 0.10 is every instrument's default; the per-symbol table below stays for
-# the same reason the levels are per instrument (APPLE_TRADER_DAYRANGE_LEVELS):
+# the same reason the levels are per pair (APPLE_TRADER_TUNED_LEVELS):
 # the number only means something against that symbol's own buy/sell
 # distances. Counted in the level unit, like every k.
 # With the tuned pairs of 2026-09-26 (APPLE_TRADER_TUNED_LEVELS) the target is
 # 0.40 to 0.60 units on every model and instrument, so 0.10 stands a run down
-# only on an exit well short of it. The HighLow pairs of 2026-10-01 are
-# narrower: 0.20 on MU, and 0.10 on BE, where 0.10 made it one trade a day
-# unless it beat the target. BE gets 0.01 (the user's call, 2026-10-01), which
-# leaves its target exit alive -- at a cost on the tuning weeks, see the levels.
-# The 2026-10-04 picks widen BE to 0.40, but its job was scored at 0.01, so it
-# stays. AVGO's pick is 0.05 apart, under the 0.10 default, and gets 0.01 too:
-# its pick replays to the dollar the same at 0.01 as at the 0.10 it was scored
-# under, on both weeks and under today's defaults.
+# only on an exit well short of it. HighLow MU's pair of 2026-10-01 is
+# narrower, 0.20. BE and AVGO had 0.01 of their own (pairs 0.10 and 0.05 apart,
+# where 0.10 made it one trade a day) until their HighLow bundles were removed
+# on 2026-10-25; no symbol has an entry today.
 APPLE_TRADER_MIN_WIN_K = 0.10
-APPLE_TRADER_MIN_WIN: "dict[str, float]" = {"BE": 0.01, "AVGO": 0.01}
+APPLE_TRADER_MIN_WIN: "dict[str, float]" = {}
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Whether a day-range position may be added to on the way down
@@ -762,8 +685,8 @@ APPLE_TRADER_POSITION_PCT = 95.0
 # bar that reaches a rung under the stop is stopped out first. At each pair's
 # default stop (APPLE_TRADER_TUNED_STOP) and a fill at the buy level the first
 # rung (0.1 units down) is above it on most model/ticker pairs, but not on
-# HighLow AVGO (stop 0.015 units under the fill) or HighLow2 AAPL (0.10, level
-# with the rung) -- those never add -- and a fill under the level leaves less
+# HighLow2 AAPL (0.10, level with the rung) -- it never adds -- and a fill
+# under the level leaves less
 # room. An add also has to close under the last
 # fill (since 2026-09-28), so a first buy made under the next rung is not
 # added to at once at no better a price. Not swept.
@@ -972,13 +895,13 @@ SESSION_MARKER_COLOR = "#5b6478"
 # color per overlay, so a level, its band and its label are recognisably the
 # same prediction.
 MODEL_OVERLAY_COLORS: dict[str, str] = {
-    "day_range":     "#22d3ee",  # cyan, as the ML predicted profile curve
     "profile_range": "#a78bfa",  # violet
     "profile_poc":   "#f472b6",  # pink -- one number inside the violet band
     # IntradayVolatility's time-of-day envelope.
     "intraday_range":    "#facc15",
-    # HighLow's forecast of the same two numbers as "day_range": a sibling of
-    # that cyan, bluer, so the two ranges can be drawn together and told apart.
+    # HighLow's forecast of the day's high and low: a sibling of the cyan the
+    # ML predicted profile curve is drawn in, bluer (TimeToChange3's range,
+    # removed 2026-10-25, had the cyan itself).
     "highlow_range": "#60a5fa",
     # HighLow2's: the same family, a step further toward indigo.
     "highlow2_range": "#818cf8",

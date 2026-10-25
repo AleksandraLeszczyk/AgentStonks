@@ -70,7 +70,7 @@ Where the racers keep their state
 ---------------------------------
 Apple Trader keeps its form and its record in `AppState.apple_trader_config`
 and `apple_trader_levels`. Orchestra gives each racer a `RacerSlot` instead,
-keyed by `racer_key` ("INTC:dayrange"), in `AppState.orchestra_configs` and
+keyed by `racer_key` ("INTC:highlow"), in `AppState.orchestra_configs` and
 `orchestra_levels`; Orchestra as a whole -- order, holder, the board -- is
 `AppState.orchestra`. The chart of a symbol draws the racer holding it, else
 the first racer on it (`model_overlays.live_trader_view`).
@@ -126,10 +126,9 @@ def split_key(key: str) -> "tuple[str, str]":
 
 
 # What a racer's model is called beside its symbol. The registry's labels are
-# written for a picker ("Day-range forecast (TimeToChange3)") and are too long
-# to repeat on every log line and board row.
+# written for a picker ("HighLow2 model") and are too long to repeat on every
+# log line and board row.
 SHORT_MODEL_NAMES = {
-    "dayrange": "Day Range",
     "highlow": "HighLow",
     "highlow2": "HighLow2",
     "fastfurious": "Fast&Furious",
@@ -138,14 +137,17 @@ SHORT_MODEL_NAMES = {
 
 
 def racer_label(config_or_key) -> str:
-    """"INTC · Day Range": what the log, the board and the form call a racer."""
+    """"INTC · HighLow": what the log, the board and the form call a racer."""
     # A key is the string; anything else is a config, of whichever class --
     # see `apple_trader.as_config`.
     if isinstance(config_or_key, str):
         ticker, model_key = split_key(config_or_key)
     else:
         ticker, model_key = config_or_key.ticker, config_or_key.model_key
-    name = SHORT_MODEL_NAMES.get(model_key) or apple_models.get(model_key).label
+    # A removed model keeps its key rather than borrowing the default's label.
+    name = SHORT_MODEL_NAMES.get(model_key) or (
+        apple_models.MODELS[model_key].label if model_key in apple_models.MODELS else model_key
+    )
     return f"{ticker} · {name}"
 
 
@@ -686,7 +688,7 @@ class Orchestra:
     # --- one cycle -----------------------------------------------------
 
     def run_cycle(self, state: AppState, tracker: DecisionTracker) -> str:
-        today = at._dayrange().market_date()
+        today = at.day_range.market_date()
         if self._day != today:
             # A new session: nobody holds overnight (every racer flattens
             # before the close), and a stop-out is only about its own day.

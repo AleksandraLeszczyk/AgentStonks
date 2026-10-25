@@ -373,20 +373,11 @@ def filter_runs(
 # tag at all -- the reason itself is always shown, so a trader whose wording
 # changes loses the headline and never gains a wrong one.
 _DECISION_TRIGGERS: "tuple[tuple[str, str], ...]" = (
-    # --- Apple Trader's removed momentum strategy: kept so stored runs keep
-    # their tags ---
-    ("trailing stop:", "Trailing stop"),
-    ("forecast reversal:", "ML forecast — reversal"),
-    ("momentum regime is still", "ML forecast — anticipated turn"),
-    ("momentum regime turned", "ML probability — change holds"),
-    # --- Apple Trader, day-range strategy (TimeToChange3) ---
+    # --- Apple Trader, day-range strategy ---
+    # Before the buy level: the stop's reason reads "the bar traded down to" too.
+    ("stop loss:", "Stop loss"),
     ("the bar traded down to", "Predicted-range buy level"),
     ("target:", "Predicted-range sell level"),
-    # --- Apple Trader's removed delta-momentum strategy, for stored runs ---
-    ("stop:", "Stop loss"),
-    ("momentum floor:", "Momentum floor"),
-    ("model exit:", "ML forecast — move over"),
-    ("the model puts the next 15 bars at", "ML forecast — turn upwards"),
     # --- every Apple Trader strategy: the closing bell, not a signal ---
     ("session ends in", "Flattened at the close"),
     # --- the LLM agents, whose fills come from tactics they armed earlier ---

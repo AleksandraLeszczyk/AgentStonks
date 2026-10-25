@@ -72,8 +72,8 @@ notebook only ever saw completed sessions), today's close is the bell, not its
 last bar so far, and two `to_numpy()` calls take `copy=True` because this venv's
 pandas 3 hands back read-only views where the notebooks' pandas 2 copied. If
 NewsImpact's windows, volatility profile or beta
-change, retrain AND update this module -- the contract `dayrange_model` has
-with `dayrange`.
+change, retrain AND update this module -- the contract `highlow_model` has
+with `highlow`.
 `tests/test_newsimpact_model.py` pins it against the notebook's own events.
 
 The pickle was written by scikit-learn 1.7.2 and this app runs 1.9.0. It

@@ -38,7 +38,7 @@ class TestStore:
         assert found["source"]["job_id"] == "j1"
         assert found["set_at"]
         # Other pairs, the same symbol under another model included, have none.
-        assert base_configs.entry("dayrange", "AAPL") is None
+        assert base_configs.entry("highlow2", "AAPL") is None
         assert base_configs.entry("highlow", "INTC") is None
 
     def test_the_key_suffix_follows_the_configuration(self):
@@ -82,7 +82,7 @@ class TestDefaults:
             at.dayrange_levels("AAPL", "highlow", use_base=False),
             at.stop_for("AAPL", "highlow", use_base=False),
         ) == shipped
-        assert at.dayrange_levels("AAPL", "dayrange") != (0.85, 0.15)
+        assert at.dayrange_levels("AAPL", "highlow2") != (0.85, 0.15)
         # A breaker asked for without a model is the symbol's table.
         assert at.min_win_for("AAPL") == at.APPLE_TRADER_MIN_WIN.get("AAPL", at.APPLE_TRADER_MIN_WIN_K)
 
@@ -205,9 +205,11 @@ class TestForm:
 
     def test_other_pairs_keep_the_form_as_it_was(self, form):
         base_configs.set_base(asdict(_base()))
-        app = form()  # AAPL on its default model, which has no base
-        assert app.number_input(key="t_buy_k_dayrange_AAPL").value == pytest.approx(
-            at.dayrange_levels("AAPL", "dayrange")[0]
+        app = form()
+        app.selectbox(key="t_model_AAPL").select("highlow2").run()  # a model with no base
+        assert not app.exception
+        assert app.number_input(key="t_buy_k_highlow2_AAPL").value == pytest.approx(
+            at.dayrange_levels("AAPL", "highlow2")[0]
         )
         assert app.session_state["out"].limit_entry is True
 

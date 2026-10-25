@@ -3188,17 +3188,11 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "held to the close.\n"
             "- It has to sit below the entry."
         ),
-        "model_dayrange": (
-            "The levels hang off the predicted high — one number for the whole session. "
-            "The notebook's rule, and what the buy and sell distances were swept against."
-        ),
         "model_highlow": (
-            "The day-range rules, unchanged, on HighLow's predicted high and predicted "
-            "range instead of TimeToChange3's.\n\n"
-            "- Its range is usually **narrower** (it anchors on the 9:35 price), so "
-            "distances counted in the predicted range sit closer together.\n"
-            "- The shipped buy/sell distances were swept on TimeToChange3's forecast, "
-            "not this one.\n"
+            "The day-range rules on HighLow's predicted high and predicted range.\n\n"
+            "- It anchors on the 9:35 price, so its range is usually **narrow** and "
+            "distances counted in the predicted range sit close together.\n"
+            "- The shipped buy/sell distances are SimLab Tuning picks, in sample.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP minute history: the first "
             "run fetches it (tens of seconds) and caches it under `data/highlow/`."
         ),
@@ -3222,9 +3216,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "after-hours, so the stream's feed does not change its forecast.\n"
             "- It was fitted **without shock days** (the day after earnings, jobs-report "
             "days): on those it forecasts an ordinary day's width.\n"
-            "- No buy/sell distances were ever swept on it: it starts from the pair "
-            "TimeToChange3's notebook 05 swept for the instrument. Sweep them on "
-            "SimLab's Tuning tab.\n"
+            "- Its buy/sell distances are a SimLab Tuning pick on two weeks (2026-10-04), "
+            "and a weak one: sweep them again on the Tuning tab.\n"
             "- At 9:35 it needs ~150 sessions of Alpaca SIP and IEX minute history, "
             "extended hours included: the first run fetches it (tens of seconds) and "
             "caches it under `data/highlow2/`."

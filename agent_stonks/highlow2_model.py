@@ -17,7 +17,7 @@ bundle:
   `close5`, the opening volume, *and today's open*: the gap is read off `open5`,
   not off a SIP daily open. On the notebook's Alpaca plan SIP is 15 minutes
   behind, so at 9:35 IEX is the only tape there is. The daily history and the
-  targets are SIP. Unlike HighLow's IEX bundles (MU, BE) there is no seam on the
+  targets are SIP. Unlike HighLow's IEX bundle (MU) there is no seam on the
   open: a replay and a live run read the same numbers.
 * **The pre-market.** Ten features read what traded before the open, as public
   at 9:35: SIP from 04:00 to its 09:19 bar (the last one out on a 15-minute
@@ -42,7 +42,8 @@ slightly ahead (the notebook's README: parity with a small edge, not a clear
 win).
 
 **The rest of the session** (a bundle may carry it: INTC's, saved 2026-10-06,
-did, and was wired up until 2026-10-20; AAPL's has no such head). A second LightGBM pair, same features, forecasts the high and low
+did, wired up until 2026-10-20 and deleted 2026-10-25; AAPL's has no such
+head). A second LightGBM pair, same features, forecasts the high and low
 from the 9:35 bar to the close -- what is still there to trade once the
 forecast exists:
 
@@ -59,7 +60,7 @@ The notebook found it no better than reading the day forecast as the rest
 it because a rest-of-session forecast was asked for.
 
 Apple Trader uses it only for the forecast, as it uses HighLow:
-`forecast_session` returns the keys `dayrange_model.forecast_session` returns
+`forecast_session` returns the keys `highlow_model.forecast_session` returns
 and `apple_trader.DayRangeTrader` runs on them unchanged. With a rest head,
 those keys carry the rest forecast -- the trader's reference high and its
 predicted range are the rest of the session's -- and say so
@@ -131,7 +132,7 @@ import numpy as np
 import pandas as pd
 
 # LightGBM brings its own OpenMP runtime, which the torch-backed model modules
-# have to be loaded after (see `dayrange_model`). This one never imports torch,
+# have to be loaded after (see `highlow_model`). This one never imports torch,
 # but loads LightGBM up front for the same reason they do.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -1259,7 +1260,7 @@ def forecast_from(bundle: dict, history: History, morning: Morning, session_date
     """The predicted high and low from the history (`history_inputs`) and this
     morning (`fetch_morning`).
 
-    Returns the keys `dayrange_model.forecast_session` returns --
+    Returns the keys `highlow_model.forecast_session` returns --
     `{"pred_high", "pred_low", "prev_avg", "adr14_abs", "or_high", "or_low"}`
     in dollars -- so `apple_trader.DayRangeTrader` runs on it unchanged.
 

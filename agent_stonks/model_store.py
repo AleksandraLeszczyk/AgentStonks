@@ -58,7 +58,7 @@ class ModelStore:
     """One model family's files, resolved per ticker and loaded at most once.
 
     `filename` is a template taking `{ticker}` (already upper-cased), e.g.
-    ``"timetochange3_dayrange_{ticker}.joblib"``. It deliberately mirrors
+    ``"highlow15m_{ticker}.joblib"``. It deliberately mirrors
     the name the notebook saves under -- the two stores agreeing is what makes
     a retrain visible to the app with no further step.
 

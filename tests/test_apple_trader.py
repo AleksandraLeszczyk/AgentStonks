@@ -6,6 +6,7 @@ depending on the saved artifact or on live market data.
 """
 
 import threading
+import types
 from dataclasses import replace
 from datetime import date, datetime, timezone
 
@@ -18,7 +19,7 @@ from agent_stonks import clock
 from agent_stonks import rule_agent
 from agent_stonks.apple_trader import DEFAULT_TICKER as TICKER
 from agent_stonks.apple_trader import AppleTraderConfig, config_signature
-from agent_stonks.config import UNIT_ADR, UNIT_PRED_RANGE
+from agent_stonks.config import APPLE_TRADER_STOP_GAIN_FRACTION, UNIT_ADR, UNIT_PRED_RANGE
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
@@ -79,15 +80,29 @@ class TestCycleTiming:
 
 
 # --------------------------------------------------------------------------
-# The day-range rules (TimeToChange3): one forecast, two resting levels.
+# The day-range rules: one forecast, two resting levels.
 #
 # Driven through a stubbed forecast: these pin the RULES -- when a level is a
 # buy, when it is a sell, and what the opening window and the closing bell
-# override -- without depending on the saved bundle. `tests/test_dayrange_model.py` pins the
-# forecast itself.
+# override -- without depending on the saved bundle. `tests/test_highlow_model.py`
+# and `tests/test_highlow2_model.py` pin the forecasts themselves.
 # --------------------------------------------------------------------------
 
 DAYRANGE_BUNDLE = {"opening_minutes": 5}
+
+# Stands in for the model module `apple_trader.session_forecast` dispatches to.
+# `Tape` routes the forecast of a bundle that names no model (`DAYRANGE_BUNDLE`)
+# through its `forecast_session`, which a test replaces to script a refusal or a
+# different answer; a bundle that names one (`kind`) still goes to that model's
+# module, for a test that stubs the module instead.
+STUB_MODEL = types.SimpleNamespace(forecast_session=None)
+SESSION_FORECAST = at.session_forecast
+
+
+def _stub_or_model(bundle, ticker, opening, today, *args, **kwargs):
+    if bundle.get("kind"):
+        return SESSION_FORECAST(bundle, ticker, opening, today, *args, **kwargs)
+    return STUB_MODEL.forecast_session(bundle, ticker, opening, today), None
 
 # The forecast the stub returns: a $10 average daily range around a predicted
 # high of $110, so at the notebook's 0.75 / 0.10 -- which `dayrange_config`
@@ -134,7 +149,6 @@ class Tape:
         for i in range(minutes):
             self.append(101.0 + i * 0.1, low=100.9, high=101.5, offset=i)
 
-        dayrange = at._dayrange()
         monkeypatch.setattr(
             at.momentum_regime, "minute_frame", lambda *a, **k: self.frame()
         )
@@ -147,7 +161,8 @@ class Tape:
         # yfinance is one of the consolidated tapes the opening window falls
         # back to (`TestOpeningWindowTape`); no test may reach it for real.
         monkeypatch.setattr(at.historical, "fetch_intraday_bars", lambda *a, **k: [])
-        monkeypatch.setattr(dayrange, "forecast_session", self._forecast)
+        monkeypatch.setattr(STUB_MODEL, "forecast_session", self._forecast)
+        monkeypatch.setattr(at, "session_forecast", _stub_or_model)
 
     def _forecast(self, *args, **kwargs):
         self.forecast_calls += 1
@@ -227,6 +242,11 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     `skip_events` is pinned empty: the notebook trades every session, and the
     days-off calendar would otherwise decide which of these tests' dates trade.
     `TestDaysOff` is where it is switched on.
+
+    The model is HighLow (TimeToChange3, which these tests were written on, was
+    removed 2026-10-25), with the stop pinned to the shared default -- half the
+    predicted gain -- rather than HighLow AAPL's tuned 1.0, which `STOP_PRICE`
+    above is arithmetic on.
     """
     kwargs.setdefault("skip_events", ())
     kwargs.setdefault("limit_entry", False)
@@ -249,7 +269,8 @@ def dayrange_config(**kwargs) -> AppleTraderConfig:
     kwargs.setdefault("scale_in", False)
     kwargs.setdefault("buy_step_k", 0.0)
     kwargs.setdefault("max_fall_k", 0.0)
-    return AppleTraderConfig(model_key="dayrange", **kwargs)
+    kwargs.setdefault("stop_gain_fraction", APPLE_TRADER_STOP_GAIN_FRACTION)
+    return AppleTraderConfig(model_key="highlow", **kwargs)
 
 
 class TestDayRangeEntry:
@@ -473,7 +494,9 @@ class TestStopIsAShareOfThePredictedGain:
         return trader
 
     def test_the_default_risks_half_of_what_the_target_pays(self):
-        assert AppleTraderConfig().stop_gain_fraction == 0.5
+        """On a pair no tuning job picked a stop for (HighLow AMGN)."""
+        assert APPLE_TRADER_STOP_GAIN_FRACTION == 0.5
+        assert AppleTraderConfig(model_key="highlow", ticker="AMGN").stop_gain_fraction == 0.5
 
     def test_the_distance_is_the_fraction_of_the_two_levels_gap(self):
         config = dayrange_config(buy_k=0.75, sell_k=0.10, stop_gain_fraction=0.5)
@@ -965,7 +988,7 @@ class TestIntradayRangeUpdate:
         tape.append(111.5, high=112.0)   # the 10:35 bar: 325 minutes to the close
         trader = self._run("brownian", state, tracker, tape)
 
-        reach = at._dayrange().brownian_reach(10.0, 325.0)
+        reach = at.day_range.brownian_reach(10.0, 325.0)
         assert reach > 0
         assert trader.plan["pred_high"] == pytest.approx(112.0 + reach)
         assert trader.plan["buy_level"] == pytest.approx(112.0 + reach - 7.5)
@@ -1102,56 +1125,43 @@ class TestIntradayRangeUpdate:
         assert trader.plan["range_updates"] == 1
 
 
-class TestIntradayLevelsRemoved:
-    """Levels under IntradayVolatility's time-of-day curve -- the "Day Range ×
-    Intraday Volatility" model, and `level_source="intraday"` before it -- were
-    removed on 2026-10-20. A stored record made with either is refused, not
-    replayed on the flat predicted high under another signature."""
+class TestRemovedModelsAreRefused:
+    """A stored record naming a model since removed -- TimeToChange3's
+    day-range forecast (2026-10-25), Day Range × Intraday Volatility,
+    Fast&Furious + HighLow and HighLow_3m (2026-10-20), the persistence
+    classifier before them -- is refused, not replayed on a model that is left."""
 
-    def test_the_default_is_the_flat_predicted_high(self):
-        assert AppleTraderConfig().level_source == "dayrange"
-        assert AppleTraderConfig(model_key="dayrange").level_source == "dayrange"
+    @pytest.mark.parametrize(
+        "key", ["dayrange", "dayrange_intraday", "ff_highlow", "highlow3m", "persistence"]
+    )
+    def test_a_record_naming_one_is_refused(self, key):
+        from simlab.rule_agents import _apple_from_record
 
-    def test_a_record_from_when_it_was_a_setting_keeps_its_signature_and_is_refused(self):
+        old = _apple_from_record({"model_key": key, "buy_k": 0.75, "sell_k": 0.10})
+        assert "has been removed" in at.model_ticker_error(old)
+        assert at.config_error(old) == at.model_ticker_error(old)
+
+    def test_a_record_from_when_the_reference_was_a_setting_decodes_and_is_refused(self):
+        """`level_source` went with the last model it could be set on; a record
+        still carrying it decodes with the field dropped, and the model key it
+        came with is what refuses it."""
         from simlab.rule_agents import _apple_from_record
 
         old = _apple_from_record({
             "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
             "level_source": "intraday",
         })
-        assert old.model_key == "dayrange" and old.level_source == "intraday"
-        assert ",levels=intraday" in config_signature(old)
-        error = at.config_error(old)
-        assert error and "removed" in error and "flat predicted high" in error
+        assert not hasattr(old, "level_source")
+        assert "has been removed" in at.config_error(old)
 
-    def test_a_record_naming_the_model_is_refused(self):
+    def test_a_record_with_no_model_key_is_refused(self):
+        """Before the key existed Apple Trader ran only the persistence
+        classifier, so such a record decodes as that and is refused rather than
+        replayed on today's default model."""
         from simlab.rule_agents import _apple_from_record
 
-        old = _apple_from_record({"model_key": "dayrange_intraday", "buy_k": 0.75})
-        assert "has been removed" in at.model_ticker_error(old)
-
-    def test_a_record_with_no_reference_at_all_is_still_the_flat_model(self):
-        from simlab.rule_agents import _apple_from_record
-
-        old = _apple_from_record({"model_key": "dayrange", "buy_k": 0.75})
-        assert old.level_source == "dayrange"
-        assert "levels=" not in config_signature(old)
-        assert at.config_error(old) is None
-
-    def test_an_unknown_level_source_is_refused(self):
-        with pytest.raises(ValueError, match="level_source"):
-            dayrange_config(level_source="vwap")
-
-
-class TestFastFuriousHighLowRemoved:
-    """Fast&Furious + HighLow (Fast&Furious's signal for the opening window,
-    HighLow's levels after it) was removed on 2026-10-20: a stored record naming
-    it is refused, not replayed as HighLow alone."""
-
-    def test_a_record_naming_the_model_is_refused(self):
-        from simlab.rule_agents import _apple_from_record
-
-        old = _apple_from_record({"model_key": "ff_highlow", "ff_entry_quantile": 0.95})
+        old = _apple_from_record({"buy_k": 0.75, "sell_k": 0.10})
+        assert old.model_key == "persistence"
         assert "has been removed" in at.model_ticker_error(old)
 
 
@@ -1178,7 +1188,6 @@ class TestHighLowModel:
     def test_it_drives_the_day_range_trader(self):
         config = AppleTraderConfig(model_key=self.KEY)
         assert isinstance(at.build_trader(config, self.BUNDLE), at.DayRangeTrader)
-        assert config.level_source == "dayrange"
 
     def test_the_levels_hang_off_the_highlow_forecast(self, state, market_open, monkeypatch):
         tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(104.0))
@@ -1191,7 +1200,7 @@ class TestHighLowModel:
         # 120 - 0.75 x 10 and 120 - 0.10 x 10: HighLow's high, the same rule.
         assert trader.plan["buy_level"] == pytest.approx(112.5)
         assert trader.plan["sell_level"] == pytest.approx(119.0)
-        # TimeToChange3 was never asked, and the SIP history got the run's keys.
+        # The stub model was never asked, and the SIP history got the run's keys.
         assert tape.forecast_calls == 0
         assert calls == [{"ticker": TICKER, "bars": self.BUNDLE["opening_minutes"],
                           "key": "k", "secret": "s"}]
@@ -1438,7 +1447,7 @@ class TestDaysOff:
         sig = config_signature(AppleTraderConfig(skip_events=["geo", "earnings"]))
         assert sig.endswith(",skip=earn+geo)")
         assert ",skip=" not in config_signature(AppleTraderConfig(skip_events=()))
-        assert _apple_from_record({"model_key": "dayrange"}).skip_events == ()
+        assert _apple_from_record({"model_key": "highlow"}).skip_events == ()
         assert AppleTraderConfig().skip_events == at.event_days.CATEGORIES
 
     def test_an_unknown_day_is_refused(self):
@@ -1479,9 +1488,8 @@ class TestMinimumWin:
     def test_off_by_default_in_these_tests_and_0_10_in_the_app(self):
         assert dayrange_config().min_win_k == 0.0
         # 0.10 on every instrument since 2026-09-23 -- what AAPL alone had
-        # before, because its levels are only 0.15 ADR apart -- except BE
-        # (0.01 since 2026-10-01, its HighLow levels are 0.10 apart).
-        for ticker in ("AAPL", "GOOGL", "INTC"):
+        # before, because its levels were only 0.15 ADR apart.
+        for ticker in ("AAPL", "INTC", "MU"):
             assert AppleTraderConfig(ticker=ticker).min_win_k == 0.10, ticker
 
     def test_every_instruments_default_leaves_its_target_exit_alive(self):
@@ -1691,7 +1699,7 @@ class TestDayRangeGuards:
             calls["n"] += 1
             raise ValueError("only 40 daily sessions of history")
 
-        monkeypatch.setattr(at._dayrange(), "forecast_session", boom)
+        monkeypatch.setattr(STUB_MODEL, "forecast_session", boom)
         trader = at.DayRangeTrader(dayrange_config())
 
         for _ in range(4):
@@ -1949,7 +1957,7 @@ class TestStrategySelection:
 
     def test_the_levels_are_the_signature(self):
         base = config_signature(dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0))
-        assert base == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
+        assert base == "highlow_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         assert base != config_signature(
             dayrange_config(buy_k=0.8, stop_gain_fraction=0.0, negative_momentum_bars=0)
         )
@@ -1960,7 +1968,7 @@ class TestStrategySelection:
     def test_the_exit_is_in_the_signature_only_while_switched_on(self):
         on = config_signature(dayrange_config())
         assert on == (
-            "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%,"
+            "highlow_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%,"
             "stop=E-0.5G,take=70%@neg15b/5b,runner>=0.3A)"
         )
         # A legacy record's take signs in its own form, as it was filed.
@@ -1998,21 +2006,12 @@ class TestStrategySelection:
 
     def test_the_intraday_update_is_in_the_signature_only_while_switched_on(self):
         off = config_signature(dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0))
-        assert off == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
+        assert off == "highlow_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
         for policy in ("extreme", "brownian"):
             signed = config_signature(
                 dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0, breach_update=policy)
             )
             assert signed == off[:-1] + f",breach={policy})"
-
-    def test_the_level_source_is_in_the_signature_only_when_it_is_not_the_high(self):
-        """It sits beside the two distances rather than at the end: "H" in
-        `buy=H-0.75A` is whatever the source says it is."""
-        flat = config_signature(dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0))
-        assert flat == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
-        assert config_signature(
-            dayrange_config(stop_gain_fraction=0.0, negative_momentum_bars=0, level_source="intraday")
-        ) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,levels=intraday,size=95%)"
 
     def test_the_intraday_update_defaults_to_brownian(self):
         """`dayrange_config` pins it off; the app's own default does not. The
@@ -2051,7 +2050,7 @@ class TestStrategySelection:
 # Which symbol a run trades, and the one thing that constrains it: a model was
 # fitted on a symbol or it was not. `UNMODELLED` is the case where nothing is.
 
-NON_AAPL = "GOOGL"
+NON_AAPL = "INTC"
 UNMODELLED = "MSFT"
 
 
@@ -2069,20 +2068,18 @@ class TestDayRangeLevelDefaults:
 
     def test_the_same_instrument_differs_by_model(self):
         """The same distance is a different price under a different forecast."""
-        assert at.dayrange_levels("AAPL", "dayrange") != at.dayrange_levels("AAPL", "highlow")
+        assert at.dayrange_levels("AAPL", "highlow") != at.dayrange_levels("AAPL", "highlow2")
 
-    def test_a_pair_never_tuned_falls_back_to_the_instruments_sweep(self, monkeypatch):
-        # Every shipped pair on a swept instrument has a tuning pick today, so
-        # the picks are taken away to see what an untuned one starts from.
+    def test_a_pair_never_tuned_starts_from_the_notebook_pair(self, monkeypatch):
+        assert ("highlow", "AMGN") not in at.APPLE_TRADER_TUNED_LEVELS
+        assert at.dayrange_levels("AMGN", "highlow", use_base=False) == (0.75, 0.10)
+        # With the picks taken away, every pair is one.
         monkeypatch.setattr(at, "APPLE_TRADER_TUNED_LEVELS", {})
-        for ticker in apple_models.DAYRANGE_TICKERS:
-            assert (
-                at.dayrange_levels(ticker, "dayrange", use_base=False)
-                == at.APPLE_TRADER_DAYRANGE_LEVELS[ticker]
-            )
-
-    def test_every_ticker_the_model_is_wired_up_for_has_a_pair(self):
-        assert set(apple_models.DAYRANGE_TICKERS) <= set(at.APPLE_TRADER_DAYRANGE_LEVELS)
+        for key in apple_models.keys():
+            if apple_models.strategy(key) != apple_models.STRATEGY_DAYRANGE:
+                continue
+            for ticker in apple_models.MODELS[key].tickers:
+                assert at.dayrange_levels(ticker, key, use_base=False) == (0.75, 0.10)
 
     def test_a_symbol_never_swept_falls_back_to_the_notebook_pair(self):
         assert at.dayrange_levels("ZZZZ") == (0.75, 0.10)
@@ -2090,14 +2087,14 @@ class TestDayRangeLevelDefaults:
         assert (config.buy_k, config.sell_k) == (0.75, 0.10)
 
     def test_a_level_given_explicitly_wins_and_the_other_keeps_its_default(self):
-        _, googl_sell = at.dayrange_levels("GOOGL", "dayrange")
-        config = AppleTraderConfig(model_key="dayrange", ticker="GOOGL", buy_k=0.9)
-        assert (config.buy_k, config.sell_k) == (0.9, googl_sell)
+        _, intc_sell = at.dayrange_levels("INTC", "highlow")
+        config = AppleTraderConfig(model_key="highlow", ticker="INTC", buy_k=0.9)
+        assert (config.buy_k, config.sell_k) == (0.9, intc_sell)
 
     def test_the_default_pair_signs_the_run(self):
-        buy_k, sell_k = at.dayrange_levels("AAPL", "dayrange")
-        assert config_signature(AppleTraderConfig(model_key="dayrange")).startswith(
-            f"dayrange_AAPL(buy=H-{buy_k:g}R,sell=H-{sell_k:g}R,size=95%"
+        buy_k, sell_k = at.dayrange_levels("AAPL", "highlow")
+        assert config_signature(AppleTraderConfig(model_key="highlow")).startswith(
+            f"highlow_AAPL(buy=H-{buy_k:g}R,sell=H-{sell_k:g}R,size=95%"
         )
 
 
@@ -2113,8 +2110,8 @@ class TestStopDefaults:
         assert set(at.APPLE_TRADER_TUNED_STOP) <= set(at.APPLE_TRADER_TUNED_LEVELS)
 
     def test_a_pair_never_tuned_starts_from_the_shared_default(self):
-        assert ("dayrange", "AAPL") not in at.APPLE_TRADER_TUNED_STOP
-        assert AppleTraderConfig(model_key="dayrange", ticker="AAPL").stop_gain_fraction == (
+        assert ("highlow", "AMGN") not in at.APPLE_TRADER_TUNED_STOP
+        assert AppleTraderConfig(model_key="highlow", ticker="AMGN").stop_gain_fraction == (
             at.APPLE_TRADER_STOP_GAIN_FRACTION
         )
         assert at.stop_for("ZZZZ", "highlow") == at.APPLE_TRADER_STOP_GAIN_FRACTION
@@ -2136,8 +2133,8 @@ class TestStopDefaults:
 class TestRangeContainment:
     """The forecast is never left arguing with the tape.
 
-    `apply_open_constraint` already clips the 9:35 prediction to contain the
-    opening five minutes. This is the same rule for the rest of the session,
+    Each model already clips the 9:35 prediction to contain the opening five
+    minutes. This is the same rule for the rest of the session,
     and unlike the breach policies it is arithmetic: it never leads the tape,
     it only declines to keep a number the tape has passed.
     """
@@ -2204,12 +2201,11 @@ class TestRangeContainment:
     def test_the_model_helper_never_crosses_the_two_sides(self):
         """Whatever it is handed, it widens -- so it cannot put the low above
         the high, which would be a range no level could be read from."""
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        high, low = dayrange.contain_session(
+        high, low = at.day_range.contain_session(
             110.0, 95.0, session_high=112.0, session_low=94.0
         )
         assert (high, low) == (112.0, 94.0)
-        high, low = dayrange.contain_session(
+        high, low = at.day_range.contain_session(
             110.0, 95.0, session_high=None, session_low=None
         )
         assert (high, low) == (110.0, 95.0)
@@ -2217,13 +2213,13 @@ class TestRangeContainment:
     def test_a_record_written_before_it_replays_without_it(self):
         from simlab.rule_agents import _apple_from_record
 
-        old = _apple_from_record({"model_key": "dayrange", "buy_k": 0.75})
+        old = _apple_from_record({"model_key": "highlow", "buy_k": 0.75})
         assert old.contain_range is False
         assert "contain" not in config_signature(old)
         # Off by default since 2026-10-04, so the one that signs it says so.
-        assert "contain" not in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "contain" not in config_signature(AppleTraderConfig(model_key="highlow"))
         assert "contain" in config_signature(
-            AppleTraderConfig(model_key="dayrange", contain_range=True)
+            AppleTraderConfig(model_key="highlow", contain_range=True)
         )
 
 
@@ -2260,7 +2256,7 @@ class TestKeepWidth:
         tape.append(94.5, low=94.0)
         trader = self._run("brownian", state, tape, level_unit=UNIT_PRED_RANGE)
 
-        reach = at._dayrange().brownian_reach(10.0, 325.0)
+        reach = at.day_range.brownian_reach(10.0, 325.0)
         assert trader.plan["pred_low"] == pytest.approx(94.0 - reach)
         assert trader.plan["pred_high"] - trader.plan["pred_low"] == pytest.approx(15.0)
         assert at.level_unit(trader.config, trader.plan) == pytest.approx(15.0)
@@ -2269,14 +2265,14 @@ class TestKeepWidth:
         from simlab.rule_agents import _apple_from_record
 
         old = _apple_from_record(
-            {"model_key": "dayrange", "buy_k": 0.75, "breach_update": "brownian"}
+            {"model_key": "highlow", "buy_k": 0.75, "breach_update": "brownian"}
         )
         assert old.keep_width is False
         assert "keep_width" not in config_signature(old)
-        new = AppleTraderConfig(model_key="dayrange", breach_update="brownian")
+        new = AppleTraderConfig(model_key="highlow", breach_update="brownian")
         assert "keep_width" in config_signature(new)
         # Nothing to keep when nothing moves.
-        held = AppleTraderConfig(model_key="dayrange", breach_update="off")
+        held = AppleTraderConfig(model_key="highlow", breach_update="off")
         assert "keep_width" not in config_signature(held)
 
 
@@ -2295,7 +2291,7 @@ class TestOpeningWindowRevision:
 
     def _setup(self, state, monkeypatch, forecast):
         tape = Tape(monkeypatch)
-        monkeypatch.setattr(at._dayrange(), "forecast_session", lambda *a, **k: dict(forecast))
+        monkeypatch.setattr(STUB_MODEL, "forecast_session", lambda *a, **k: dict(forecast))
         trader = at.DayRangeTrader(dayrange_config(
             breach_update="brownian", keep_width=True, level_unit=UNIT_PRED_RANGE,
         ))
@@ -2509,10 +2505,10 @@ class TestBreachExit:
     def test_a_record_written_before_it_replays_without_it(self):
         from simlab.rule_agents import _apple_from_record
 
-        old = _apple_from_record({"model_key": "dayrange", "buy_k": 0.75})
+        old = _apple_from_record({"model_key": "highlow", "buy_k": 0.75})
         assert old.breach_exit is False
         assert "breach_exit" not in config_signature(old)
-        assert "breach_exit" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "breach_exit" in config_signature(AppleTraderConfig(model_key="highlow"))
 
 
 class TestPredictedRangeUnit:
@@ -2723,32 +2719,30 @@ class TestPredictedRangeUnit:
 
 class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
-        # HighLow_5m has been run on AAPL and INTC, not GOOGL; HighLow2_5m (its
-        # INTC bundle removed 2026-10-20), Fast&Furious and GoodMoments on AAPL alone,
-        # and so their hybrid.
+        # HighLow_5m has been run on AAPL and INTC among others; HighLow2_5m
+        # (its INTC bundle removed 2026-10-20) and Fast&Furious on AAPL alone,
+        # GoodMoments on AAPL and AMD, and their hybrid where both are.
         assert apple_models.keys_for(TICKER) == [
-            "dayrange", "highlow", "highlow2", "fastfurious", "goodmoments",
-            "highlow2_goodmoments",
+            "highlow", "highlow2", "fastfurious", "goodmoments", "highlow2_goodmoments",
         ]
-        assert apple_models.keys_for("INTC") == ["dayrange", "highlow"]
-        for symbol in (NON_AAPL,):
-            assert apple_models.keys_for(symbol) == ["dayrange"]
+        assert apple_models.keys_for(NON_AAPL) == ["highlow"]
+        assert apple_models.keys_for("AMD") == ["highlow", "goodmoments"]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
         self, monkeypatch
     ):
-        """The check that keeps 'Apple Trader on GOOGL' from meaning a model
+        """The check that keeps 'Apple Trader on INTC' from meaning a model
         fitted on a different stock's tape.
 
         Stubbed back to AAPL-only, because the shipped model covers every
         shipped symbol and the machinery would otherwise go untested."""
         monkeypatch.setitem(
-            apple_models.MODELS, "dayrange",
-            replace(apple_models.MODELS["dayrange"], tickers=(TICKER,)),
+            apple_models.MODELS, "highlow",
+            replace(apple_models.MODELS["highlow"], tickers=(TICKER,)),
         )
         error = at.model_ticker_error(
-            AppleTraderConfig(model_key="dayrange", ticker=NON_AAPL)
+            AppleTraderConfig(model_key="highlow", ticker=NON_AAPL)
         )
         assert error is not None
         assert "AAPL only" in error and NON_AAPL in error
@@ -2756,7 +2750,7 @@ class TestInstrument:
 
     def test_an_unmodelled_symbol_is_refused_with_no_alternative_offered(self):
         error = at.model_ticker_error(
-            AppleTraderConfig(model_key="dayrange", ticker=UNMODELLED)
+            AppleTraderConfig(model_key="highlow", ticker=UNMODELLED)
         )
         assert error is not None and "pick another instrument" in error
 
@@ -2787,27 +2781,27 @@ class TestInstrument:
     def test_the_pairing_is_part_of_config_error(self):
         """One call is what every launch path checks, so the pairing cannot be
         enforced in the live loop and forgotten in SimLab."""
-        config = AppleTraderConfig(model_key="dayrange", ticker=UNMODELLED)
+        config = AppleTraderConfig(model_key="highlow", ticker=UNMODELLED)
         assert "cannot trade" in (at.config_error(config, DAYRANGE_BUNDLE) or "")
 
     def test_a_ticker_is_normalised(self):
-        assert AppleTraderConfig(ticker=" googl ").ticker == "GOOGL"
+        assert AppleTraderConfig(ticker=" intc ").ticker == "INTC"
 
     def test_the_signature_carries_the_symbol(self):
         """The same levels over two tapes are two experiments; filing them
         together would average them into one row in Results."""
-        aapl = config_signature(AppleTraderConfig(model_key="dayrange"))
-        googl = config_signature(AppleTraderConfig(model_key="dayrange", ticker=NON_AAPL))
-        assert aapl.startswith("dayrange_AAPL(") and googl.startswith("dayrange_GOOGL(")
-        assert aapl != googl
+        aapl = config_signature(AppleTraderConfig(model_key="highlow"))
+        intc = config_signature(AppleTraderConfig(model_key="highlow", ticker=NON_AAPL))
+        assert aapl.startswith("highlow_AAPL(") and intc.startswith("highlow_INTC(")
+        assert aapl != intc
 
     def test_a_config_without_a_symbol_is_an_aapl_run(self):
-        assert AppleTraderConfig(model_key="dayrange").ticker == TICKER
+        assert AppleTraderConfig(model_key="highlow").ticker == TICKER
 
     def test_the_loop_refuses_the_pairing_before_it_loads_anything(
         self, state, monkeypatch
     ):
-        """'There is no MSFT day-range model' rather than 'the file is
+        """'There is no MSFT HighLow model' rather than 'the file is
         missing': different problems, different fixes."""
         loaded: list = []
         monkeypatch.setattr(
@@ -2816,7 +2810,7 @@ class TestInstrument:
         )
         at._apple_trader_loop(
             state, tracker_for_loop(), AppleTraderConfig(
-                model_key="dayrange", ticker=UNMODELLED
+                model_key="highlow", ticker=UNMODELLED
             ), 60, threading.Event(),
         )
         assert loaded == []
@@ -2833,10 +2827,10 @@ class TestInstrument:
         )
         at._apple_trader_loop(
             state, tracker_for_loop(), AppleTraderConfig(
-                model_key="dayrange", ticker=NON_AAPL
+                model_key="highlow", ticker=NON_AAPL
             ), 60, threading.Event(),
         )
-        assert asked == [("dayrange", NON_AAPL)]
+        assert asked == [("highlow", NON_AAPL)]
 
 
 class TestStopOutEndsTheRun:
@@ -2930,7 +2924,7 @@ class TestStatusLineActivity:
         def boom(*args, **kwargs):
             raise ValueError("only 40 daily sessions of history")
 
-        monkeypatch.setattr(at._dayrange(), "forecast_session", boom)
+        monkeypatch.setattr(STUB_MODEL, "forecast_session", boom)
         tape.append(104.0)
         dot, text = self._activity(trader, state, tracker)
         assert dot == "🔴" and "cannot trade today" in text
@@ -3109,7 +3103,7 @@ class TestSidebarLevelEdits:
 
     def test_a_form_for_another_instrument_is_ignored(self, state, market_open, monkeypatch):
         trader, tracker, tape = self._started(state, monkeypatch)
-        state.apple_trader_config = dayrange_config(ticker="GOOGL", buy_k=1.5, sell_k=0.9)
+        state.apple_trader_config = dayrange_config(ticker="INTC", buy_k=1.5, sell_k=0.9)
         tape.append(108.0)
         trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
         assert trader.config.buy_k == 0.75
@@ -3295,7 +3289,7 @@ class TestRestartTakesBackTheRange:
         once SIP has released the 9:35 windows. Any call is recorded."""
         calls = []
         monkeypatch.setattr(
-            at._dayrange(), "forecast_session",
+            STUB_MODEL, "forecast_session",
             lambda *a, **k: calls.append(1) or {**FORECAST, "pred_high": 112.0, "pred_low": 94.5},
         )
         return calls
@@ -3370,7 +3364,7 @@ class TestRestartTakesBackTheRange:
 
         fresh = TestLateStart._state()
         late = at.DayRangeTrader(dayrange_config(**self.CONFIG))
-        monkeypatch.setattr(at._dayrange(), "forecast_session", lambda *a, **k: dict(FORECAST))
+        monkeypatch.setattr(STUB_MODEL, "forecast_session", lambda *a, **k: dict(FORECAST))
         late.run_cycle(
             DAYRANGE_BUNDLE, fresh, DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0)),
         )
@@ -3384,10 +3378,10 @@ class TestRestartTakesBackTheRange:
         seed = {"forecast": dict(FORECAST), "opening_end": Tape.OPEN, "open_price": 101.0}
         # A seed from before seeds named their model: the last row's.
         assert at._resumable_seed({"rows": rows, "seed": seed}, "highlow") is seed
-        assert at._resumable_seed({"rows": rows, "seed": seed}, "dayrange") is None
-        named = {**seed, "model_key": "dayrange"}
-        assert at._resumable_seed({"rows": rows, "seed": named}, "dayrange") is named
-        assert at._resumable_seed(None, "dayrange") is None
+        assert at._resumable_seed({"rows": rows, "seed": seed}, "highlow2") is None
+        named = {**seed, "model_key": "highlow2"}
+        assert at._resumable_seed({"rows": rows, "seed": named}, "highlow2") is named
+        assert at._resumable_seed(None, "highlow2") is None
         assert at._resumable_seed({"rows": rows}, "highlow") is None
 
     def test_through_the_session_file(self, state, market_open, monkeypatch):
@@ -3414,22 +3408,18 @@ class TestSidebarModelSwitch:
     bar: it re-forecasts the day with that model and rests the new model's
     levels, and the chart's record shows both, each for its own minutes."""
 
-    HIGHLOW = {"kind": "highlow", "opening_minutes": 5}
+    HIGHLOW2 = {"kind": "highlow2", "opening_minutes": 5, "opening_feed": "iex"}
 
     def _stub_highlow(self, monkeypatch, pred_high=120.0, fails=False):
-        original = at.session_forecast
-
-        def forecast(bundle, *args, **kwargs):
-            if bundle.get("kind") != "highlow":
-                return original(bundle, *args, **kwargs)
+        def forecast(*args, **kwargs):
             if fails:
                 raise RuntimeError("no SIP history")
-            return {**FORECAST, "pred_high": pred_high}, None
+            return {**FORECAST, "pred_high": pred_high}
 
-        monkeypatch.setattr(at, "session_forecast", forecast)
+        monkeypatch.setattr(at._highlow2(), "forecast_session", forecast)
         monkeypatch.setattr(
             at.apple_models, "load",
-            lambda key, ticker: self.HIGHLOW if key == "highlow" else DAYRANGE_BUNDLE,
+            lambda key, ticker: self.HIGHLOW2 if key == "highlow2" else DAYRANGE_BUNDLE,
         )
 
     def _started(self, state, monkeypatch, broker=None, close=108.0, **bar):
@@ -3445,7 +3435,7 @@ class TestSidebarModelSwitch:
     def _switch(self, state, **kwargs):
         kwargs.setdefault("buy_k", 0.5)
         kwargs.setdefault("sell_k", 0.1)
-        state.apple_trader_config = replace(dayrange_config(**kwargs), model_key="highlow")
+        state.apple_trader_config = replace(dayrange_config(**kwargs), model_key="highlow2")
 
     def test_a_switch_reforecasts_and_moves_the_levels_from_the_next_bar(
         self, state, market_open, monkeypatch
@@ -3457,15 +3447,15 @@ class TestSidebarModelSwitch:
         # The loop still hands over the bundle it was started with.
         trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
 
-        assert trader.config.model_key == "highlow"
+        assert trader.config.model_key == "highlow2"
         assert (trader.config.buy_k, trader.config.sell_k) == (0.5, 0.1)
         assert trader.plan["pred_high"] == pytest.approx(120.0)
         assert trader.plan["buy_level"] == pytest.approx(120.0 - 5.0)
         assert trader.plan["sell_level"] == pytest.approx(120.0 - 1.0)
         rows = state.apple_trader_levels["rows"]
-        assert [r["model_key"] for r in rows] == ["dayrange", "dayrange", "highlow"]
+        assert [r["model_key"] for r in rows] == ["highlow", "highlow", "highlow2"]
         assert [r["buy"] for r in rows] == pytest.approx([BUY_LEVEL, BUY_LEVEL, 115.0])
-        assert state.apple_trader_levels["config"].model_key == "highlow"
+        assert state.apple_trader_levels["config"].model_key == "highlow2"
         switched = [e["text"] for e in state.agent_log if "model switched" in e.get("text", "")]
         assert len(switched) == 1 and "was $102.50" in switched[0]
 
@@ -3502,7 +3492,7 @@ class TestSidebarModelSwitch:
         for _ in range(3):
             tape.append(108.0)
             trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert trader.config.model_key == "dayrange"
+        assert trader.config.model_key == "highlow"
         assert trader.blocked is None
         assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
         refused = [e for e in state.agent_log if "run stays on" in e.get("text", "")]
@@ -3514,7 +3504,7 @@ class TestSidebarModelSwitch:
         self._switch(state)
         tape.append(108.0)
         trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
-        assert trader.config.model_key == "dayrange"
+        assert trader.config.model_key == "highlow"
         assert any("run stays on" in e.get("text", "") for e in state.agent_log)
 
     def test_before_the_forecast_the_new_model_simply_makes_it(
@@ -3526,7 +3516,7 @@ class TestSidebarModelSwitch:
         trader = at.DayRangeTrader(dayrange_config())
         self._switch(state)
         assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "warming_up"
-        assert trader.config.model_key == "highlow" and trader.plan is None
+        assert trader.config.model_key == "highlow2" and trader.plan is None
         for i in (3, 4):
             tape.append(101.0, offset=i)
         trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
@@ -3780,32 +3770,32 @@ class TestScaleIn(_Ladder):
 
     def test_signed_only_where_it_can_change_a_trade(self):
         assert "adds=+0.1A,stop@fill" in config_signature(
-            AppleTraderConfig(model_key="dayrange", level_unit=UNIT_ADR)
+            AppleTraderConfig(model_key="highlow", level_unit=UNIT_ADR)
         )
         assert "adds=half,stop@fill" in config_signature(
-            AppleTraderConfig(model_key="dayrange", buy_step_k=0.0)
+            AppleTraderConfig(model_key="highlow", buy_step_k=0.0)
         )
         legacy = config_signature(
             AppleTraderConfig(
-                model_key="dayrange", stop_under_next_buy=True, buy_step_k=0.0
+                model_key="highlow", stop_under_next_buy=True, buy_step_k=0.0
             )
         )
         assert "adds=half" in legacy and "stop@fill" not in legacy
         assert "stop@fill" not in config_signature(
-            AppleTraderConfig(model_key="dayrange", stop_gain_fraction=0.0)
+            AppleTraderConfig(model_key="highlow", stop_gain_fraction=0.0)
         )
-        assert "add<fill" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert "add<fill" in config_signature(AppleTraderConfig(model_key="highlow"))
         assert "add<fill" not in config_signature(
-            AppleTraderConfig(model_key="dayrange", add_under_fill=False)
+            AppleTraderConfig(model_key="highlow", add_under_fill=False)
         )
         assert "add<fill" not in config_signature(
-            AppleTraderConfig(model_key="dayrange", position_pct=100.0)
+            AppleTraderConfig(model_key="highlow", position_pct=100.0)
         )
         assert "adds=" not in config_signature(
-            AppleTraderConfig(model_key="dayrange", position_pct=100.0)
+            AppleTraderConfig(model_key="highlow", position_pct=100.0)
         )
         assert "adds=" not in config_signature(
-            AppleTraderConfig(model_key="dayrange", scale_in=False)
+            AppleTraderConfig(model_key="highlow", scale_in=False)
         )
 
     def test_a_record_from_before_the_ladder_replays_without_it(self):
@@ -3969,9 +3959,9 @@ class TestLimitEntry:
         assert trader.entry["last_fill"] == pytest.approx(101.2)
 
     def test_signed_only_while_on(self):
-        assert ",limit" in config_signature(AppleTraderConfig(model_key="dayrange"))
+        assert ",limit" in config_signature(AppleTraderConfig(model_key="highlow"))
         assert ",limit" not in config_signature(
-            AppleTraderConfig(model_key="dayrange", limit_entry=False)
+            AppleTraderConfig(model_key="highlow", limit_entry=False)
         )
 
     def test_a_record_from_before_it_replays_with_market_buys(self):

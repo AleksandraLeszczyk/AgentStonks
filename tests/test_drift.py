@@ -68,56 +68,7 @@ class TestAggregate:
 # --- training cutoffs from saved metadata -----------------------------------
 
 
-DAYRANGE_META = {
-    "daily_fit_through": "2026-07-09",
-    "opening_correction": True,
-    "opening_fit_sessions": 35,
-    "held_out": "2026-08-28",
-    "test_metrics_ensemble": {
-        "mae_mean": 0.0077, "mae_y_high": 0.0078, "mae_y_low": 0.0076,
-        "bias_y_high": -0.0017, "bias_y_low": -0.0006, "mae_usd_mean": 2.11,
-    },
-    # A normal day is 2% of the price here, so the held-out MAE is 38.5% of one.
-    "sim_date_forecast": {"date": "2026-08-28", "prev_avg": 300.0, "adr14_abs": 6.0},
-}
-
-
 class TestTraining:
-    def test_day_range_cutoffs_are_the_daily_fit_and_the_opening_ridge(self):
-        training = dr.dayrange_training_from_metadata(DAYRANGE_META)
-        cutoffs = {c.date: c for c in training["cutoffs"]}
-        assert set(cutoffs) == {"2026-07-09", "2026-08-27"}
-        assert "35" in cutoffs["2026-08-27"].note
-        refs = {r.metric: r.value for r in training["references"]}
-        assert refs["mae"] == 0.0077 and refs["bias_high"] == -0.0017 and refs["mae_usd"] == 2.11
-
-    def test_the_headline_reference_is_the_ml_models_tab_number(self):
-        """The dotted line on the chart is what the other page prints, so the two
-        are read off the same arithmetic rather than each doing its own."""
-        training = dr.dayrange_training_from_metadata(DAYRANGE_META)
-        refs = {r.metric: r for r in training["references"]}
-        assert refs["mae_pct_adr"].value == pytest.approx(38.5)
-        assert refs["mae_pct_adr"].value == pytest.approx(
-            dr.model_catalogue.dayrange_error_pct_adr(DAYRANGE_META)
-        )
-
-    def test_a_sidecar_without_a_simulation_day_has_no_adr_reference(self):
-        """Nothing to divide by, so no line -- the series is still scored."""
-        meta = {k: v for k, v in DAYRANGE_META.items() if k != "sim_date_forecast"}
-        assert "mae_pct_adr" not in {r.metric for r in
-                                     dr.dayrange_training_from_metadata(meta)["references"]}
-
-    def test_a_bundle_without_an_opening_ridge_has_only_the_daily_cutoff(self):
-        training = dr.dayrange_training_from_metadata({**DAYRANGE_META, "opening_correction": False})
-        assert [c.date for c in training["cutoffs"]] == ["2026-07-09"]
-
-    def test_the_ridge_cutoff_is_the_last_weekday_before_the_held_out_day(self):
-        training = dr.dayrange_training_from_metadata({**DAYRANGE_META, "held_out": "2026-08-10"})
-        assert "2026-08-07" in [c.date for c in training["cutoffs"]]  # a Monday -> Friday
-
-    def test_missing_metadata_is_no_cutoffs_rather_than_an_error(self):
-        assert dr.dayrange_training_from_metadata({}) == {"cutoffs": [], "references": []}
-
     def test_intraday_vol_cutoffs_are_its_two_samples(self):
         model = {"shape": {"sample": ["2023-01-03", "2026-09-11"]},
                  "day_range": {"sample": ["2019-02-04", "2026-09-10"], "residual_sd": 0.3}}
@@ -264,58 +215,6 @@ class TestStore:
         assert dr.store_signature(TICKER, FEED) != before
 
 
-class TestDayRange:
-    @pytest.fixture()
-    def stubbed(self, monkeypatch):
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        seen = []
-        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: {"opening_minutes": 5})
-
-        def forecast(bundle, history, opening, session_date, open_price=None):
-            seen.append({"history_last": history.index.max(), "opening": len(opening),
-                         "open": open_price, "day": pd.Timestamp(session_date)})
-            return {"pred_high": 105.0, "pred_low": 99.0, "prev_avg": 100.0,
-                    "adr14_abs": 2.0, "or_high": 101.2, "or_low": 100.8}
-
-        monkeypatch.setattr(dayrange, "forecast_session", forecast)
-        return seen
-
-    def test_each_minute_session_is_scored_against_its_own_high_and_low(self, store, stubbed):
-        result = dr.evaluate_dayrange(TICKER, FEED)
-        assert [r["date"] for r in result["rows"]] == [str(d) for d in DAYS]
-        row = result["rows"][0]
-        assert row["bias_high"] == pytest.approx(math.log(105.0 / 106.0))
-        assert row["bias_low"] == pytest.approx(math.log(99.0 / 100.0))
-        assert row["mae"] == pytest.approx(
-            (abs(math.log(105.0 / 106.0)) + abs(math.log(99.0 / 100.0))) / 2
-        )
-        assert row["mae_usd"] == pytest.approx((1.0 + 1.0) / 2)
-        # Against the session's own 14-day range ($2.00), not the one day's ADR
-        # the saved file records: a $1.00 miss is half a normal day.
-        assert row["mae_pct_adr"] == pytest.approx(50.0)
-
-    def test_a_session_with_no_average_range_is_left_unscored(self, store, monkeypatch, stubbed):
-        """A gap in the series rather than a division by zero dressed as a number."""
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: {
-            "pred_high": 105.0, "pred_low": 99.0, "prev_avg": 100.0,
-            "adr14_abs": 0.0, "or_high": 101.2, "or_low": 100.8,
-        })
-        rows = dr.evaluate_dayrange(TICKER, FEED)["rows"]
-        assert rows and all(r["mae_pct_adr"] is None and r["mae_usd"] is not None for r in rows)
-
-    def test_the_forecast_sees_only_the_past_plus_the_open(self, store, stubbed):
-        dr.evaluate_dayrange(TICKER, FEED)
-        for call in stubbed:
-            assert call["history_last"] < call["day"]
-            assert call["opening"] == 5 and call["open"] == 101.0
-
-    def test_a_missing_bundle_is_a_note(self, store, monkeypatch):
-        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: None)
-        result = dr.evaluate_dayrange(TICKER, FEED)
-        assert result["rows"] == [] and result["notes"]
-
-
 class TestHighLow:
     FORECAST = {"pred_high": 105.0, "pred_low": 99.0, "prev_avg": 100.0,
                 "adr14_abs": 2.0, "or_high": 101.2, "or_low": 100.8}
@@ -338,12 +237,26 @@ class TestHighLow:
         monkeypatch.setattr(highlow, "forecast_session", forecast)
         return seen
 
-    def test_scored_exactly_as_the_other_day_range_model(self, store, stubbed, monkeypatch):
-        """One truth and one arithmetic, so the two charts can be read side by side."""
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: dict(self.FORECAST))
-        assert dr.evaluate_highlow(TICKER, FEED)["rows"] == dr.evaluate_dayrange(TICKER, FEED)["rows"]
-        assert [r["date"] for r in dr.evaluate_highlow(TICKER, FEED)["rows"]] == [str(d) for d in DAYS]
+    def test_each_minute_session_is_scored_against_its_own_high_and_low(self, store, stubbed):
+        result = dr.evaluate_highlow(TICKER, FEED)
+        assert [r["date"] for r in result["rows"]] == [str(d) for d in DAYS]
+        row = result["rows"][0]
+        assert row["bias_high"] == pytest.approx(math.log(105.0 / 106.0))
+        assert row["bias_low"] == pytest.approx(math.log(99.0 / 100.0))
+        assert row["mae"] == pytest.approx(
+            (abs(math.log(105.0 / 106.0)) + abs(math.log(99.0 / 100.0))) / 2
+        )
+        assert row["mae_usd"] == pytest.approx((1.0 + 1.0) / 2)
+        # Against the session's own 14-day range ($2.00), not the window's mean
+        # the ML Models tab divides by: a $1.00 miss is half a normal day.
+        assert row["mae_pct_adr"] == pytest.approx(50.0)
+
+    def test_a_session_with_no_average_range_is_left_unscored(self, store, highlow, monkeypatch):
+        """A gap in the series rather than a division by zero dressed as a number."""
+        monkeypatch.setattr(highlow, "forecast_session",
+                            lambda *a, **k: {**self.FORECAST, "adr14_abs": 0.0})
+        rows = dr.evaluate_highlow(TICKER, FEED)["rows"]
+        assert rows and all(r["mae_pct_adr"] is None and r["mae_usd"] is not None for r in rows)
 
     def test_the_forecast_is_fed_the_days_first_five_minutes(self, store, stubbed):
         dr.evaluate_highlow(TICKER, FEED)
@@ -407,13 +320,15 @@ class TestHighLow2:
         monkeypatch.setattr(hl2, "forecast_session", forecast)
         return warmed, seen
 
-    def test_scored_exactly_as_the_other_day_range_models(self, store, stubbed, monkeypatch):
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: dict(self.FORECAST))
-        monkeypatch.setattr(dr.apple_models, "load", lambda *a, **k: {"opening_minutes": 5,
-                                                                      "kind": "highlow2"})
+    def test_scored_exactly_as_highlow(self, store, stubbed, monkeypatch):
+        """One truth and one arithmetic, so the two charts can be read side by side."""
+        highlow = pytest.importorskip("agent_stonks.highlow_model")
+        monkeypatch.setattr(highlow, "history_frame", lambda *a, **k: pd.DataFrame())
+        monkeypatch.setattr(highlow, "forecast_session", lambda *a, **k: dict(self.FORECAST))
+        monkeypatch.setattr(dr.apple_models, "load",
+                            lambda key, *a, **k: {"opening_minutes": 5, "kind": key})
         result = dr.evaluate_highlow2(TICKER, FEED)
-        assert result["rows"] == dr.evaluate_dayrange(TICKER, FEED)["rows"]
+        assert result["rows"] and result["rows"] == dr.evaluate_highlow(TICKER, FEED)["rows"]
 
     def test_the_history_is_warmed_once_and_every_day_forecast(self, store, stubbed):
         warmed, seen = stubbed

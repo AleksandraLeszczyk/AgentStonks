@@ -394,8 +394,8 @@ def fetch_daily_ohlc_bars(
 ) -> list[dict]:
     """Completed daily OHLCV bars from yfinance, oldest-first, **unadjusted**.
 
-    The long daily history behind a per-session model (see
-    `agent_stonks.dayrange_model`), in the same {"t","o","h","l","c","v"} shape
+    The long daily history behind a per-session read (Orchestra's 09:34
+    candidates, the days-off rule), in the same {"t","o","h","l","c","v"} shape
     the rest of the app uses -- `t` is a plain "YYYY-MM-DD".
 
     Two properties this deliberately has:

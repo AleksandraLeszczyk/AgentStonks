@@ -54,31 +54,6 @@ AAPL_FORECASTS = {
     "2026-09-25": (337.29399002103725, 332.5079589178143, 6.917621428571432),
 }
 
-# The same for INTC's bundle (saved 2026-10-06), which also carries a rest-of-
-# session head: (pred_rest_high, pred_rest_low, pred_high, pred_low,
-# adr14_usd). `forecast_from` hands the trader the first pair as pred_high /
-# pred_low and keeps the second as day_high / day_low. The test window and the
-# traded week, the session after an earnings day (2025-01-31) and after half
-# days (2024-07-08, 2024-12-26, 2025-07-07, 2025-12-01), and 2026-09-21, whose
-# rest-of-session high sits below what the first five minutes printed.
-INTC_FORECASTS = {
-    "2024-07-08": (33.653399958665865, 32.979311586094695, 33.68899238171411, 32.81514112327082, 0.6352499999999998),
-    "2024-12-26": (20.415150544556337, 19.93796409728379, 20.419515197508705, 19.91577075817311, 0.783392857142857),
-    "2025-01-31": (20.468291343253107, 19.848999688892693, 20.51683366066669, 19.796686061413745, 0.6424999999999998),
-    "2025-07-07": (22.5188442286951, 22.013866565181853, 22.5188442286951, 22.007600310374087, 0.8258571428571427),
-    "2025-12-01": (40.29963069117448, 39.27663688107967, 40.36337938496258, 39.17036115186083, 1.5211785714285715),
-    "2026-03-02": (45.93118165988787, 44.311311349017885, 45.9664432171674, 43.98, 2.331371428571429),
-    "2026-09-08": (103.21130906791724, 99.58459740466576, 103.45734591368306, 99.53505095865792, 3.8296357142857156),
-    "2026-09-11": (104.59972602449962, 100.93032141277503, 104.79434094865248, 100.84018930760458, 3.8160571428571433),
-    "2026-09-17": (107.07370421725656, 103.40731044394668, 107.07370421725656, 103.40731044394668, 4.159364285714288),
-    "2026-09-18": (110.80260175746898, 107.26898194337983, 111.01163450626952, 107.26898194337983, 4.315078571428573),
-    "2026-09-21": (117.68644957913268, 113.6133809882278, 119.46, 113.17508647400595, 4.275078571428572),
-    "2026-09-22": (123.64901109614857, 119.32624813278916, 123.64901109614857, 119.15681708811482, 4.769150000000001),
-    "2026-09-23": (123.63759001022927, 120.072666126089, 124.15098076853747, 120.072666126089, 4.79272142857143),
-    "2026-09-24": (123.28991830894942, 119.06826119340272, 123.41388066334582, 119.06826119340272, 4.927007142857144),
-    "2026-09-25": (127.65654665412843, 123.42400029041261, 127.93335837109514, 123.42400029041261, 5.158792857142857),
-}
-
 
 # --- synthetic sessions -------------------------------------------------------
 
@@ -204,8 +179,8 @@ def _bundle(path="synthetic"):
 class TestRegistry:
     def test_highlow2_is_offered_where_a_bundle_was_saved(self):
         assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("AAPL")
-        # INTC's bundle (the one with a rest head) is unwired since 2026-10-20;
-        # its files stay, and the mirror tests below still load it directly.
+        # INTC's bundle (the one with a rest head) was unwired 2026-10-20 and
+        # its files went 2026-10-25.
         assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("INTC")
         assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("MU")
 
@@ -508,15 +483,6 @@ class TestBundle:
         assert set(bundle["model"].feature_cols) == set(H.FEATURE_COLS)
         assert bundle["rest_head"] is False and bundle["model"].rest is None
 
-    def test_intcs_bundle_carries_a_rest_head(self):
-        bundle = _installed_bundle("INTC")
-        assert bundle["ticker"] == "INTC" and bundle["rest_head"] is True
-        assert bundle["target"] == "close5/adr14"
-        rest = bundle["model"].rest
-        assert rest.target.label == "close5/adr14/rest" and bundle["model"].rest_within_day
-        assert sorted(rest.models) == ["lgbm_11", "lgbm_23", "lgbm_7"]
-        assert set(rest.feature_cols) == set(H.FEATURE_COLS)
-
     def _resaved(self, tmp_path, ticker="AAPL", **changes):
         import joblib
 
@@ -552,11 +518,18 @@ class TestBundle:
         assert H._build_bundle(target) is None
 
     def test_a_rest_head_it_cannot_mirror_refuses_the_whole_bundle(self, tmp_path):
-        """Not the day head alone: the trader's levels hang off the rest head."""
+        """Not the day head alone: the trader's levels hang off the rest head.
+        AAPL's day head stands in for one (INTC's bundle, the one with a real
+        rest head, went 2026-10-25)."""
         import joblib
 
-        blob, target = self._resaved(tmp_path, ticker="INTC")
-        rest = blob["rest"]
+        blob, target = self._resaved(tmp_path)
+        rest = {
+            "models": blob["models"], "weights": blob["weights"],
+            "feature_cols": blob["feature_cols"],
+            "target": {**(blob.get("target") or {}), "span": "rest"},
+        }
+        blob = {**blob, "rest": rest}
         for broken in (
             {**rest, "feature_cols": rest["feature_cols"] + ["vix"]},
             {**rest, "weights": {**rest["weights"], "nbeats": 0.5}},
@@ -616,21 +589,6 @@ class TestAgainstTheNotebook:
         assert out["pred_low"] == pytest.approx(low, abs=1e-8)
         assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)
         assert "range_after_opening" not in out
-
-    @pytest.mark.parametrize("day", sorted(INTC_FORECASTS))
-    def test_reproduces_intcs_rest_and_day_forecasts(self, day):
-        """Both heads, and the rest's handed over as pred_high / pred_low."""
-        bundle, sip, iex, history = notebook_inputs("INTC")
-        stamp = pd.Timestamp(day)
-        morning = H.morning_from_bars(_one_day(sip, stamp), _one_day(iex, stamp), stamp)
-        out = H.forecast_from(bundle, history, morning, stamp)
-        rest_high, rest_low, high, low, adr = INTC_FORECASTS[day]
-        assert out["pred_high"] == pytest.approx(rest_high, abs=1e-8)
-        assert out["pred_low"] == pytest.approx(rest_low, abs=1e-8)
-        assert out["day_high"] == pytest.approx(high, abs=1e-8)
-        assert out["day_low"] == pytest.approx(low, abs=1e-8)
-        assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)
-        assert out["range_after_opening"] is True
 
     def test_the_cached_morning_is_the_fetched_one(self, cache_dir):
         """`_cached_morning` against `morning_from_bars` on real tape."""

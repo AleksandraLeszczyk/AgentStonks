@@ -64,38 +64,6 @@ MU_FORECASTS = {
     "2026-09-04": (1020.1816140024187, 969.415, 40.40555000000001),
     "2026-09-11": (1004.0314071814445, 973.5282062200738, 39.09912142857146),
 }
-# BE, saved 2026-09-30: IEX opening, sessions kept from 370 bars, and both nets
-# read `lead_or_ret_adr` -- VST's opening move, or the three peers' mean when VST
-# has no session (2024-01-25, 2024-01-30 and 2025-12-31 are such days).
-# 2025-03-20 follows a 380-bar session the 385 threshold would have dropped.
-BE_FORECASTS = {
-    "2024-01-25": (12.385294410373472, 11.885134703937394, 0.6581000000000004),
-    "2024-01-30": (11.881398568113182, 11.366851973681667, 0.6709571428571429),
-    "2025-03-03": (24.983474312555384, 23.119309288859345, 1.6507214285714285),
-    "2025-03-20": (26.055005754281275, 24.464228977126428, 1.8423714285714288),
-    "2025-12-31": (89.345984174502, 84.049977889037, 7.901228571428571),
-    "2026-03-02": (159.82499929282542, 148.27041193059029, 15.58590714285714),
-    "2026-08-31": (210.73049738457146, 198.0394663021734, 15.116421428571426),
-    "2026-09-01": (210.54852122632903, 198.7941043872093, 14.943564285714283),
-    "2026-09-02": (212.38925753695253, 201.09077201113618, 14.754278571428566),
-    "2026-09-03": (219.88020886985672, 206.8663942954915, 14.263428571428566),
-    "2026-09-04": (246.9925999891292, 230.829461243144, 14.648428571428566),
-    "2026-09-11": (277.22314330940884, 261.28178609658266, 15.301199999999994),
-}
-# AVGO, saved 2026-10-04: base features, sessions kept from 320 bars. The two
-# 2024 days sit among the pre-split sessions of 329-384 bars the 385 rule would
-# drop -- at 385, 2024-05-03's high would be $0.48 lower.
-AVGO_FORECASTS = {
-    "2024-05-03": (127.3698548374877, 123.9940384456728, 4.501428571428578),
-    "2024-06-13": (173.82198972533345, 167.12403198972592, 3.7571428571428607),
-    "2026-03-02": (314.7496307012425, 305.4854750385193, 12.973792857142863),
-    "2026-08-31": (376.37418046961415, 367.44915793162437, 11.280750000000003),
-    "2026-09-01": (367.28976454490817, 359.2512686175464, 10.77503571428572),
-    "2026-09-02": (369.84648315202537, 360.83229156351285, 10.59503571428572),
-    "2026-09-03": (353.6499, 341.5438502477626, 10.09003571428572),
-    "2026-09-04": (364.39602275294214, 353.0329087468992, 9.595000000000008),
-    "2026-09-11": (366.32834780285083, 358.7532893099266, 9.227),
-}
 # NVDA, saved 2026-10-04, fitted through 2026-09-11 and held out on the three
 # weeks after: reads SPY's opening, the pre-market, the previous evening, the
 # opening's shape and the regime. 2024-07-05 and 2025-12-26 follow a half day
@@ -112,39 +80,6 @@ NVDA_FORECASTS = {
     "2026-09-14": (212.4665030058211, 207.3424562526983, 6.372857142857143),
     "2026-09-21": (225.2065022842249, 221.0988011605764, 4.872142857142857),
     "2026-10-02": (238.31206881509854, 233.84640363077662, 4.331221428571425),
-}
-# QCOM, ORCL and META, saved 2026-10-13 on NVDA's recipe (fitted through
-# 2026-09-11, held out the three weeks after), all reading the opening's trade
-# counts and VWAP. The mornings after results evenings: QCOM 2025-11-06 and
-# 2026-07-30, ORCL 2025-09-10 (the backlog jump) and 2026-09-11, META 2025-10-30
-# and 2026-07-30. ORCL also reads SPY and its SIP peers MSFT, AMZN and GOOGL,
-# and keeps sessions whose first SIP bar printed late: 2024-05-03 starts at
-# 09:31, 2024-07-16 at 09:32 (07-17 reads it as yesterday).
-QCOM_FORECASTS = {
-    "2025-11-06": (178.53379085128552, 172.07724482662405, 7.091357142857144),
-    "2026-03-02": (139.49750738326694, 136.22550067174865, 3.513921428571424),
-    "2026-07-30": (154.18849901034432, 146.0, 6.7293214285714305),
-    "2026-09-14": (176.47917602686746, 169.44318384599953, 6.097685714285713),
-    "2026-09-21": (184.43757187055803, 177.75930557826086, 8.212850000000001),
-    "2026-10-02": (187.99036899603894, 182.44954656305347, 8.948742857142859),
-}
-ORCL_FORECASTS = {
-    "2024-05-03": (116.63738592412194, 115.08607241795097, 2.241257142857141),
-    "2024-07-16": (144.03678496649653, 141.99635062120075, 3.0093928571428523),
-    "2024-07-17": (141.63276215762528, 139.04601065124723, 2.940821428571423),
-    "2025-09-10": (338.3776459554302, 312.09, 6.535392857142853),
-    "2026-03-02": (145.9566752019453, 140.29462983145982, 7.15372142857143),
-    "2026-09-11": (166.0, 150.34934103752846, 5.717857142857143),
-    "2026-09-14": (146.84638734436578, 139.55037926600713, 6.461428571428572),
-    "2026-10-02": (145.6143902898878, 140.19950775877965, 5.502821428571431),
-}
-META_FORECASTS = {
-    "2025-10-30": (671.5275195038935, 650.0537511165068, 14.588828571428573),
-    "2026-03-02": (651.2686924897537, 633.9976668259108, 17.230157142857163),
-    "2026-07-30": (540.9664659944181, 522.4033104690162, 19.63481428571428),
-    "2026-09-14": (662.9581153181897, 644.1331402946303, 18.41187857142858),
-    "2026-09-21": (707.8884532398749, 679.6, 18.84087142857143),
-    "2026-10-02": (741.58, 720.4196161827942, 27.165607142857148),
 }
 # AMGN, saved 2026-10-19 on the same recipe (N-BEATS alone): SPY, the
 # pre-market, the previous evening, the opening's trade count and its SIP theme
@@ -205,23 +140,21 @@ AMD_FORECASTS = {
     "2026-10-02": (645.1264286419882, 625.8618001952129, 21.23724285714283),
 }
 NOTEBOOK_FORECASTS = {
-    "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS, "BE": BE_FORECASTS,
-    "AVGO": AVGO_FORECASTS, "NVDA": NVDA_FORECASTS, "QCOM": QCOM_FORECASTS,
-    "ORCL": ORCL_FORECASTS, "META": META_FORECASTS, "AMGN": AMGN_FORECASTS,
-    "TMO": TMO_FORECASTS, "AMD": AMD_FORECASTS,
+    "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS,
+    "NVDA": NVDA_FORECASTS, "AMGN": AMGN_FORECASTS, "TMO": TMO_FORECASTS,
+    "AMD": AMD_FORECASTS,
 }
 # The candidates each bundle ships with non-zero weight.
 SHIPPED = {
     "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
-    "BE": ["nbeats", "nhits"], "AVGO": ["lgbm", "nbeats"], "NVDA": ["lgbm", "nhits"],
-    "QCOM": ["lgbm", "nbeats", "nhits"], "ORCL": ["lgbm", "nbeats", "nhits"], "META": ["nbeats"],
-    "AMGN": ["nbeats"], "TMO": ["lgbm", "nbeats", "nhits"], "AMD": ["lgbm", "nbeats", "nhits"],
+    "NVDA": ["lgbm", "nhits"], "AMGN": ["nbeats"], "TMO": ["lgbm", "nbeats", "nhits"],
+    "AMD": ["lgbm", "nbeats", "nhits"],
 }
 # The tape each bundle reads the opening from.
-OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "BE": "iex", "AVGO": "sip", "NVDA": "sip",
-                 "QCOM": "sip", "ORCL": "sip", "META": "sip", "AMGN": "sip", "TMO": "sip", "AMD": "sip"}
+OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "NVDA": "sip", "AMGN": "sip",
+                 "TMO": "sip", "AMD": "sip"}
 # The last session of each notebook's tape the mirror test reads.
-NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO", "AMD")}
+NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "AMGN", "TMO", "AMD")}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -281,10 +214,12 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU", "BE", "AVGO", "NVDA", "QCOM", "ORCL", "META", "AMGN", "TMO",
-                       "AMD"):
+        for symbol in ("AAPL", "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
-        assert apple_models.HIGHLOW_KEY not in apple_models.keys_for("GOOGL")
+        # GOOGL was never run through it; the other five lost their bundles
+        # on 2026-10-25.
+        for symbol in ("GOOGL", "BE", "AVGO", "QCOM", "ORCL", "META"):
+            assert apple_models.HIGHLOW_KEY not in apple_models.keys_for(symbol)
 
     def test_it_drives_the_day_range_rules(self):
         assert apple_models.strategy(apple_models.HIGHLOW_KEY) == apple_models.STRATEGY_DAYRANGE
@@ -379,8 +314,10 @@ class TestThinOpeningFeed:
 
 
 class TestThemePeers:
-    """BE's bundle reads its theme peers: each one's history and IEX window go
-    to the forecast in the sidecar's order, lead first."""
+    """A bundle reading theme peers hands each one's history and window to the
+    forecast in the sidecar's order, lead first. Written on BE's shape (an IEX
+    opening, its peers on IEX), which no bundle shipped today has -- TMO's,
+    AMGN's and AMD's read theirs on SIP -- but which the mirror still serves."""
 
     def test_forecast_session_hands_every_peer_its_history_and_window(self, monkeypatch):
         H._forecast_cache.clear()
@@ -494,36 +431,20 @@ class TestThemePeers:
         assert H.peers(bundle) == ("GILD", "REGN", "VRTX") and H.peer_feed(bundle) == "sip"
 
     def test_a_bundle_reading_peers_refuses_without_them(self):
-        bundle, raw, thin, history, *_ = notebook_inputs("BE")
-        stamp = pd.Timestamp("2026-09-04")
+        bundle, raw, thin, history, *_ = notebook_inputs("TMO")
+        stamp = pd.Timestamp("2026-09-14")
+        assert thin is None  # a SIP opening: the window is the caller's bars
         with pytest.raises(ValueError, match="theme peers"):
-            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp,
-                            _one_day(thin, stamp, 5))
-
-    def test_a_lead_peer_without_a_window_falls_back_to_the_group(self):
-        """2025-12-31: VST's SIP session was short (380 bars), so the notebook has
-        no VST row and reads the mean of PLUG and XLU. Handing the mirror VST's
-        IEX window instead -- which is all 9:35 knows live -- moves the forecast."""
-        bundle, raw, thin, history, peer_tapes, _ = notebook_inputs("BE")
-        stamp = pd.Timestamp("2025-12-31")
-        peer_data = _peer_data(peer_tapes, stamp)
-        assert peer_data["VST"][1].empty
-        opening, window = _one_day(raw, stamp).iloc[:5], _one_day(thin, stamp, 5)
-        kept = H.forecast_from(bundle, history, opening, stamp, window, peer_data)
-        vst_raw = peer_tapes["VST"][2]
-        live = H.forecast_from(bundle, history, opening, stamp, window,
-                               {**peer_data, "VST": (peer_data["VST"][0], _one_day(vst_raw, stamp, 5))})
-        assert kept["pred_high"] == pytest.approx(BE_FORECASTS["2025-12-31"][0], abs=1e-5)
-        assert 1e-5 < abs(live["pred_high"] - kept["pred_high"]) < 0.01
+            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp)
 
     def test_a_cache_cleaned_at_another_bar_count_is_rebuilt(self, cache_dir, monkeypatch):
         sip = FakeSip(_tape(date(2025, 12, 1), date(2026, 9, 30)))
         monkeypatch.setattr(H, "_fetch_rollups", sip)
-        H.history_frame("BE", date(2026, 9, 14), "k", "s", "iex")
-        H.history_frame("BE", date(2026, 9, 14), "k", "s", "iex", min_bars=370)
+        H.history_frame("TMO", date(2026, 9, 14), "k", "s")
+        H.history_frame("TMO", date(2026, 9, 14), "k", "s", min_bars=260)
         assert len(sip.calls) == 2
-        assert H._read_cache("BE", "iex", 370)["min_bars"] == 370
-        assert H._read_cache("BE", "iex")["sessions"] == {}
+        assert H._read_cache("TMO", min_bars=260)["min_bars"] == 260
+        assert H._read_cache("TMO")["sessions"] == {}
 
     def test_a_short_quiet_session_is_kept_at_the_bundles_threshold(self):
         tape = _tape(date(2026, 3, 2), date(2026, 3, 2))
@@ -531,12 +452,12 @@ class TestThemePeers:
         bars = tape[date(2026, 3, 2)][:375] + tape[date(2026, 3, 2)][385:]
         frame = H.minute_frame_from_bars(bars)
         assert H.session_rollups(frame)[0].empty
-        assert len(H.session_rollups(frame, min_bars=370)[0]) == 1
+        assert len(H.session_rollups(frame, min_bars=260)[0]) == 1
 
     def test_theme_columns_need_the_sidecar_to_name_the_peers(self, tmp_path):
-        src = H.model_path("BE")
+        src = H.model_path("TMO")
         if not src.exists():
-            pytest.skip("the HighLow BE bundle is not installed")
+            pytest.skip("the HighLow TMO bundle is not installed")
         import json
         for extra in (src, src.with_name(f"{src.stem}_nbeats.pt"), src.with_name(f"{src.stem}_nhits.pt")):
             (tmp_path / extra.name).write_bytes(extra.read_bytes())
@@ -676,36 +597,28 @@ class TestExtendedHoursAndMarket:
         assert H._build_bundle(path) is None
 
     def test_theme_peers_are_read_on_the_bundles_opening_feed(self, tmp_path):
-        """BE's notebook reads its peers on IEX (`load_peers`' default), the
-        SIP-opening ones (ORCL's) ask for `feed="sip"`."""
-        assert H.peer_feed(H._build_bundle(self._copy("BE", tmp_path))) == "iex"
-        orcl = H._build_bundle(self._copy("ORCL", tmp_path))
-        assert H.peers(orcl) == ("MSFT", "AMZN", "GOOGL") and H.peer_feed(orcl) == "sip"
+        """An IEX-opening notebook reads its peers on IEX (`load_peers`'
+        default; MU's would), the SIP-opening ones (TMO's) ask for `feed="sip"`."""
+        assert H.peer_feed(H._build_bundle(self._copy("MU", tmp_path))) == "iex"
+        tmo = H._build_bundle(self._copy("TMO", tmp_path))
+        assert H.peers(tmo) == ("DHR", "A", "WAT") and H.peer_feed(tmo) == "sip"
 
-    def test_avgo_keeps_sessions_from_its_notebooks_threshold(self, tmp_path):
-        bundle = H._build_bundle(self._copy("AVGO", tmp_path))
-        assert "min_bars_per_session" not in bundle["metadata"]
-        assert H.min_bars(bundle) == 320 and H.groups(bundle) == ()
-
-    def test_qcom_orcl_and_meta_read_the_microstructure_group(self, tmp_path):
-        groups = {t: H.groups(H._build_bundle(self._copy(t, tmp_path))) for t in ("QCOM", "ORCL", "META")}
+    def test_amgn_and_tmo_read_the_theme_and_amgn_the_microstructure(self, tmp_path):
+        groups = {t: H.groups(H._build_bundle(self._copy(t, tmp_path))) for t in ("AMGN", "TMO")}
         assert groups == {
-            "QCOM": ("premarket", "afterhours", "microstructure"),
-            "ORCL": ("market", "theme", "premarket", "afterhours", "opening_shape", "regime",
-                     "microstructure"),
-            # its linear median reads the theme too, at weight 0: no peers fetched
-            "META": ("premarket", "afterhours", "opening_shape", "regime", "microstructure"),
+            "AMGN": ("market", "theme", "premarket", "afterhours", "microstructure"),
+            "TMO": ("theme",),
         }
 
-    def test_orcl_keeps_sessions_whose_first_bar_is_two_minutes_late(self, tmp_path):
-        bundle = H._build_bundle(self._copy("ORCL", tmp_path))
+    def test_tmo_keeps_sessions_whose_first_bar_is_a_minute_late(self, tmp_path):
+        bundle = H._build_bundle(self._copy("TMO", tmp_path))
         assert "max_first_minute" not in bundle["metadata"]
-        assert H.max_first_minute(bundle) == 2
-        assert H.max_first_minute(H._build_bundle(self._copy("META", tmp_path))) == 0
+        assert H.max_first_minute(bundle) == 1
+        assert H.max_first_minute(H._build_bundle(self._copy("AMGN", tmp_path))) == 0
 
 
 class TestMicrostructure:
-    """QCOM's, ORCL's and META's group: the opening's trade counts and VWAP,
+    """The microstructure group (AMGN's): the opening's trade counts and VWAP,
     cached per session off Alpaca's `n` and `vw`, and today's read off a window
     fetched for them -- the caller's bars carry neither."""
 
@@ -775,17 +688,19 @@ class TestMicrostructure:
         H._forecast_cache.clear()
 
     def test_a_morning_without_trade_counts_is_refused(self):
-        bundle, raw, _, history, _, extras = notebook_inputs("QCOM")
+        bundle, raw, _, history, peer_tapes, extras = notebook_inputs("AMGN")
         stamp = pd.Timestamp("2026-09-14")
         inputs = _extra_inputs(extras, stamp)
         inputs["micro_window"] = inputs["micro_window"][H.OHLCV]  # yfinance-like: no n, no vw
         with pytest.raises(ValueError, match="trade counts and VWAP"):
-            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp, **inputs)
+            H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp,
+                            None, _peer_data(peer_tapes, stamp), **inputs)
 
 
 class TestLateFirstPrint:
-    """ORCL's notebook keeps a session whose first SIP bar printed at 09:31 or
-    09:32 (the opening auction landed there on 13 quiet days of 2023-24)."""
+    """A notebook may keep a session whose first SIP bar printed a minute or two
+    late (the opening auction landed at 09:31 on quiet days of 2023-24: TMO's,
+    and ORCL's before its bundle went)."""
 
     def test_such_a_session_is_kept_only_up_to_the_bundles_limit(self):
         day = date(2026, 3, 2)
@@ -958,8 +873,8 @@ def notebook_inputs(ticker: str):
         extras["market"] = (H.session_rollups(m_raw)[0], m_raw)
     # Each theme peer as the notebook's `load_peers` reads it: SIP rollups at the
     # peer's own threshold (385 bars, AMGN's REGN 130), openings on the peer feed
-    # (BE's IEX, trimmed to the sessions SIP kept; ORCL's SIP, the kept sessions'
-    # own) -- and that feed's raw tape.
+    # (IEX trimmed to the sessions SIP kept, or SIP, the kept sessions' own) --
+    # and that feed's raw tape.
     peer_tapes = {}
     for peer in H.peers(bundle):
         peer_raw = NOTEBOOK / "data" / peer / "raw"
@@ -1046,24 +961,28 @@ class TestAgainstTheNotebook:
         assert bundle["ticker"] == ticker  # the file that loaded is the right one
         assert sorted(bundle["daily_models"]) == SHIPPED[ticker]
 
-    @pytest.mark.parametrize("ticker,refused", [("ORCL", True), ("INTC", False)])
+    @pytest.mark.parametrize("refused", [True, False])
     def test_a_bundle_whose_shipped_candidate_reads_an_unmirrored_group_is_refused(
-        self, tmp_path, ticker, refused
+        self, tmp_path, refused
     ):
-        """ORCL's linear median reads the calendar group, which this module never
-        builds; at weight 0 that is harmless, weighted it must not load. INTC's
+        """A linear median reading the calendar group (ORCL's did; no bundle
+        shipped today does, so one is made here), which this module never
+        builds: at weight 0 that is harmless, weighted it must not load. INTC's
         reads microstructure, mirrored since 2026-10-13: weighted, it loads."""
         import joblib
 
-        src = H.model_path(ticker)
+        src = H.model_path("INTC")
         if not src.exists():
-            pytest.skip(f"the HighLow {ticker} bundle is not installed")
+            pytest.skip("the HighLow INTC bundle is not installed")
         H._register_unpickle_alias()
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             blob = joblib.load(src)
         blob["weights"] = {**blob["weights"], "linear": 1.0}
+        if refused:
+            linear = blob["models"]["linear"]
+            linear.feature_cols = list(linear.feature_cols) + ["cal_month"]
         target = tmp_path / src.name
         joblib.dump(blob, target)
         for extra in (src.with_name(f"{src.stem}_nbeats.pt"), src.with_name(f"{src.stem}_nhits.pt"),

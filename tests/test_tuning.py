@@ -1263,11 +1263,12 @@ def store(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def stub_model(monkeypatch):
-    dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-    bundle = {"model": None, "metadata": {}, "daily_models": [], "opening_minutes": 5,
-              "lookback": 32, "trained_at": "2026-08-10"}
-    monkeypatch.setattr(dayrange, "load_bundle", lambda ticker=None: bundle)
-    monkeypatch.setattr(dayrange, "forecast_session", lambda *a, **k: dict(FORECAST))
+    highlow = pytest.importorskip("agent_stonks.highlow_model")
+    bundle = {"kind": "highlow", "model": None, "metadata": {}, "daily_models": [],
+              "opening_minutes": 5, "opening_feed": "sip", "lookback": 32,
+              "trained_at": "2026-09-15"}
+    monkeypatch.setattr(highlow, "load_bundle", lambda ticker=None: bundle)
+    monkeypatch.setattr(highlow, "forecast_session", lambda *a, **k: dict(FORECAST))
 
 
 class TestJob:

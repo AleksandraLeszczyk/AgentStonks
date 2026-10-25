@@ -217,7 +217,7 @@ class TestMinuteMoveInReplay:
 
     def test_a_tuning_replay_reads_the_week_before(self, store):
         paths = sim_tuning._replay_inputs(
-            AppleTraderConfig(model_key="dayrange"), [DAY.isoformat()], sim_data.DEFAULT_FEED,
+            AppleTraderConfig(model_key="highlow"), [DAY.isoformat()], sim_data.DEFAULT_FEED,
         )
         assert sim_data.stored_bars_path("AAPL", self.FRIDAY, sim_data.DEFAULT_FEED) in paths
 
@@ -410,7 +410,7 @@ class TestLiveFeed:
 
     def test_a_tuning_replay_reads_both_tapes(self, store):
         paths = sim_tuning._replay_inputs(
-            AppleTraderConfig(model_key="dayrange"), [DAY.isoformat()], sim_data.LIVE_FEED,
+            AppleTraderConfig(model_key="highlow"), [DAY.isoformat()], sim_data.LIVE_FEED,
         )
         assert sim_data.bars_path("AAPL", DAY, "sip") in paths
         assert sim_data.bars_path("AAPL", DAY, "iex") in paths
@@ -1139,12 +1139,12 @@ class TestRuleAgentRecords:
         record without the exit fields must neither pick up today's stop and
         momentum take nor sign as a run that had them."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
+        old = agent.from_record({"model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10})
         assert (old.stop_k, old.stop_gain_fraction, old.momentum_drop) == (0.0, 0.0, 0.0)
         assert (old.momentum_fade_bars, old.negative_momentum_bars) == (0, 0)
-        assert agent.signature(old) == "dayrange_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
+        assert agent.signature(old) == "highlow_AAPL(buy=H-0.75A,sell=H-0.1A,size=95%)"
 
-        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="highlow")))
         assert today.stop_gain_fraction > 0 and today.momentum_confirmation_bars > 0
         assert today.negative_momentum_bars == 0
         assert today.momentum_drop == 0 and today.momentum_fade_bars == 0
@@ -1159,7 +1159,7 @@ class TestRuleAgentRecords:
         be a different stop, filed in Results beside the original."""
         agent = rule_agent(APPLE_TRADER_KEY)
         old = agent.from_record({
-            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10, "stop_k": 0.2,
+            "model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10, "stop_k": 0.2,
         })
         assert (old.stop_k, old.stop_gain_fraction) == (0.2, 0.0)
         assert ",stop=E-0.2A" in agent.signature(old)
@@ -1172,13 +1172,13 @@ class TestRuleAgentRecords:
         rather than picking up today's 15-bar turn beside it."""
         agent = rule_agent(APPLE_TRADER_KEY)
         old = agent.from_record({
-            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10, "momentum_drop": 1.0,
+            "model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10, "momentum_drop": 1.0,
         })
         assert (old.momentum_drop, old.momentum_fade_bars) == (1.0, 0)
         assert old.negative_momentum_bars == 0
         assert "@mom-1," in agent.signature(old)
 
-        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="highlow")))
         assert "@conf>=15m+loss+end<buy," in agent.signature(today)
         assert ",confirm=3b" in agent.signature(today)
 
@@ -1186,14 +1186,14 @@ class TestRuleAgentRecords:
         """A record from before 2026-10-19 has no `take_trigger` and replays the
         momentum take it was run under; a zone take comes back as one."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        record = agent.to_record(AppleTraderConfig(model_key="highlow"))
         for name in ("take_trigger", "zone_min_bars", "zone_width"):
             record.pop(name)
         old = agent.from_record(record)
         assert old.take_trigger == "momentum"
-        assert agent.signature(old) == agent.signature(AppleTraderConfig(model_key="dayrange"))
+        assert agent.signature(old) == agent.signature(AppleTraderConfig(model_key="highlow"))
 
-        zone = AppleTraderConfig(model_key="dayrange", take_trigger="zone", zone_min_bars=25)
+        zone = AppleTraderConfig(model_key="highlow", take_trigger="zone", zone_min_bars=25)
         back = agent.from_record(agent.to_record(zone))
         assert (back.take_trigger, back.zone_min_bars, back.zone_width) == ("zone", 25, 3.0)
         assert "@zone25b/3u" in agent.signature(back)
@@ -1203,7 +1203,7 @@ class TestRuleAgentRecords:
         rather than for time. Such a record carries the 0.2 and no wait: it
         replays the gate it was run under and signs as it was filed."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        record = agent.to_record(AppleTraderConfig(model_key="highlow"))
         record["take_min_gain_fraction"] = 0.2
         record.pop("take_after_minutes")
         record.pop("take_in_loss")
@@ -1216,7 +1216,7 @@ class TestRuleAgentRecords:
         """Until 2026-10-06 the take fired in profit only. A record without
         `take_in_loss` replays that and signs as it was filed, with no `+loss`."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        record = agent.to_record(AppleTraderConfig(model_key="highlow"))
         record.pop("take_in_loss")
         record.pop("take_under_buy_stands_down")
         old = agent.from_record(record)
@@ -1228,7 +1228,7 @@ class TestRuleAgentRecords:
         armed. A record without `take_under_buy_stands_down` replays that and
         signs as it was filed, with no `+end<buy`."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        record = agent.to_record(AppleTraderConfig(model_key="highlow"))
         record.pop("take_under_buy_stands_down")
         old = agent.from_record(record)
         assert not old.take_under_buy_stands_down
@@ -1241,7 +1241,7 @@ class TestRuleAgentRecords:
         today's negative-momentum streak beside it."""
         agent = rule_agent(APPLE_TRADER_KEY)
         old = agent.from_record({
-            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
+            "model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10,
             "momentum_fade_bars": 15,
         })
         assert (old.momentum_fade_bars, old.negative_momentum_bars) == (15, 0)
@@ -1249,7 +1249,8 @@ class TestRuleAgentRecords:
 
     def test_a_record_written_today_carries_the_new_unit(self):
         agent = rule_agent(APPLE_TRADER_KEY)
-        record = agent.to_record(AppleTraderConfig(model_key="dayrange"))
+        # A pair no tuning job picked a stop for, so the shared default.
+        record = agent.to_record(AppleTraderConfig(model_key="highlow", ticker="AMGN"))
         assert record["stop_gain_fraction"] == 0.5 and record["stop_k"] == 0.0
         assert ",stop=E-0.5G" in agent.signature(agent.from_record(record))
 
@@ -1260,13 +1261,13 @@ class TestRuleAgentRecords:
         run whose levels moved."""
         agent = rule_agent(APPLE_TRADER_KEY)
         old = agent.from_record({
-            "model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
+            "model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10,
             "stop_k": 0.2, "momentum_drop": 1.0,
         })
         assert old.breach_update == "off"
         assert "breach" not in agent.signature(old)
 
-        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="highlow")))
         assert today.breach_update == "brownian"
         assert "levels=" not in agent.signature(today)   # the default source signs nothing
         assert ",breach=brownian" in agent.signature(today)
@@ -1279,34 +1280,21 @@ class TestRuleAgentRecords:
         """A session used to go on buying its levels however badly the last trade
         went, stopping only on a stop. 0 is that rule, and it signs as it did."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
+        old = agent.from_record({"model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10})
         assert old.min_win_k == 0.0
         assert "min_win" not in agent.signature(old)
 
-        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="dayrange")))
+        today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="highlow")))
         assert today.min_win_k == 0.10   # AAPL's own default
         assert ",min_win=0.1R" in agent.signature(today)
-
-    def test_a_record_from_before_the_level_source_rests_on_the_predicted_high(self):
-        """It is the default too, so this changes nothing today -- it is here so
-        that the record keeps meaning what it meant if the default ever moves."""
-        agent = rule_agent(APPLE_TRADER_KEY)
-        old = agent.from_record({"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10})
-        assert old.level_source == "dayrange"
-
-        moved = replace(old, level_source="intraday")
-        assert agent.signature(moved) != agent.signature(old)
-        assert "levels=intraday" in agent.signature(moved)
-
 
 class TestDayRangeEngine:
     """The day-range rules replayed end to end on the engine.
 
-    The forecast itself is stubbed -- `tests/test_dayrange_model.py` pins that
-    against the notebook -- so what this covers is the wiring: the strategy the
-    model selects, the levels working over a real stored tape, and the daily
-    history reaching the trader through the patched fetch rather than through
-    yfinance.
+    On HighLow, with its forecast stubbed -- `tests/test_highlow_model.py` pins
+    that against the notebook -- so what this covers is the wiring: the
+    strategy the model selects, the levels working over a real stored tape, and
+    the opening window reaching the forecast from the dataset.
     """
 
     # 105.50 predicted high on a $4 average daily range puts the notebook's
@@ -1324,8 +1312,8 @@ class TestDayRangeEngine:
         slide to 102.4, then a climb to 105.5.
 
         Written for AAPL unless the test is parameterised with another symbol
-        (`indirect=True`), which is how the same session is replayed under a
-        ticker the day-range model was retrained for.
+        (`indirect=True`), which is how the same session is replayed under
+        another ticker the model was fitted on.
         """
         symbol = getattr(request, "param", "AAPL")
         monkeypatch.setattr(sim_data, "STORE_DIR", tmp_path / "store")
@@ -1353,27 +1341,27 @@ class TestDayRangeEngine:
     def _stub_model(self, monkeypatch) -> dict:
         """The bundle and the forecast, replaced at the model module so the
         registry, the config check and the trader all see the stub."""
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
+        highlow = pytest.importorskip("agent_stonks.highlow_model")
         bundle = {
-            "model": None, "metadata": {}, "daily_models": ["lgbm", "nbeats", "nhits"],
-            "opening_minutes": 5, "lookback": 32, "trained_at": "2026-08-10",
+            "kind": "highlow", "model": None, "metadata": {}, "daily_models": ["lgbm", "nbeats"],
+            "opening_minutes": 5, "opening_feed": "sip", "lookback": 32,
+            "trained_at": "2026-09-15",
         }
         seen: dict = {}
 
-        def forecast(bundle_, history, opening, session_date, open_price=None):
-            seen["history"] = history
+        def forecast(bundle_, ticker, opening, session_date, key=None, secret=None):
+            seen["ticker"] = ticker
             seen["opening"] = opening
-            seen["open_price"] = open_price
             return dict(self.FORECAST)
 
-        monkeypatch.setattr(dayrange, "load_bundle", lambda ticker=None: bundle)
-        monkeypatch.setattr(dayrange, "forecast_session", forecast)
+        monkeypatch.setattr(highlow, "load_bundle", lambda ticker=None: bundle)
+        monkeypatch.setattr(highlow, "forecast_session", forecast)
         return seen
 
     def _run(self, monkeypatch, rule_config: "dict | None" = None, symbol: str = "AAPL"):
         seen = self._stub_model(monkeypatch)
         rules = {
-            "model_key": "dayrange", "ticker": symbol, "buy_k": 0.75, "sell_k": 0.10,
+            "model_key": "highlow", "ticker": symbol, "buy_k": 0.75, "sell_k": 0.10,
             # Written out, like a record made today: the tape here dives
             # straight to the buy level, which the confirmation would not buy.
             "momentum_confirmation_bars": 0,
@@ -1409,18 +1397,6 @@ class TestDayRangeEngine:
         assert float(shallow.decisions[0]["price"]) > float(deep.decisions[0]["price"])
         assert parse_ts(shallow.decisions[0]["ts"]) < parse_ts(deep.decisions[0]["ts"])
 
-    def test_the_daily_history_comes_from_the_dataset_not_the_network(
-        self, dayrange_store, monkeypatch
-    ):
-        """The model needs a year of daily bars, which live is a yfinance
-        download of the last 420 days -- wall-clock days, not simulated ones.
-        Inside a run it has to be the stored history, clipped."""
-        seen, result = self._run(monkeypatch)
-        assert result.error is None
-        history = seen["history"]
-        assert len(history) == 30
-        assert history.index.max() < pd.Timestamp("2026-06-15")
-
     def test_the_forecast_is_built_on_the_first_five_stored_minutes(
         self, dayrange_store, monkeypatch
     ):
@@ -1431,35 +1407,35 @@ class TestDayRangeEngine:
         assert opening.index[-1].strftime("%H:%M") == "09:34"
 
     def test_a_missing_bundle_fails_loudly(self, dayrange_store, monkeypatch):
-        dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-        monkeypatch.setattr(dayrange, "load_bundle", lambda ticker=None: None)
+        highlow = pytest.importorskip("agent_stonks.highlow_model")
+        monkeypatch.setattr(highlow, "load_bundle", lambda ticker=None: None)
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
             api_key="", symbols=["AAPL"], days=[DAY],
-            rule_config={"model_key": "dayrange"},
+            rule_config={"model_key": "highlow"},
         )
         result = SimulationEngine(market, config).run()
         error = result.error or ""
-        assert "timetochange3_dayrange_AAPL.joblib" in error
+        assert "highlow15m_AAPL.joblib" in error
         assert "PyTorch" in error
 
-    @pytest.mark.parametrize("dayrange_store", ["GOOGL", "INTC"], indirect=True)
+    @pytest.mark.parametrize("dayrange_store", ["INTC", "MU"], indirect=True)
     def test_the_retrained_symbols_replay_on_the_same_day_loop(
         self, dayrange_store, monkeypatch
     ):
-        """TimeToChange3 was fitted per ticker, so GOOGL and INTC are the same
-        strategy on another tape -- nothing about the loop, the levels or the
-        ledger changes, and the run is filed under its own symbol."""
+        """HighLow was fitted per ticker, so INTC and MU are the same strategy
+        on another tape -- nothing about the loop, the levels or the ledger
+        changes, and the run is filed under its own symbol."""
         symbol = dayrange_store
         seen, result = self._run(monkeypatch, symbol=symbol)
         assert result.error is None
         assert [d["symbol"] for d in result.decisions][:2] == [symbol, symbol]
         assert result.config_summary["rule_config"]["ticker"] == symbol
-        # The daily history and the opening window came from that symbol's
-        # stored bars -- there are no AAPL bars in this dataset at all, so a
-        # path still hard-coded to AAPL could not have produced a forecast.
-        assert len(seen["history"]) == 30
+        # The opening window came from that symbol's stored bars -- there are
+        # no AAPL bars in this dataset at all, so a path still hard-coded to
+        # AAPL could not have produced a forecast.
+        assert seen["ticker"] == symbol
         assert len(seen["opening"]) == 5
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
@@ -1471,23 +1447,23 @@ class TestDayRangeEngine:
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
             api_key="", symbols=["MSFT"], days=[DAY],
-            rule_config={"model_key": "dayrange", "ticker": "MSFT"},
+            rule_config={"model_key": "highlow", "ticker": "MSFT"},
         )
         error = SimulationEngine(market, config).run().error or ""
-        assert "cannot trade MSFT" in error and "AAPL, GOOGL, INTC only" in error
+        assert "cannot trade MSFT" in error and "AAPL, INTC, MU, NVDA, AMGN, TMO, AMD only" in error
 
     def test_the_dataset_is_checked_against_the_configured_symbol(
         self, dayrange_store, monkeypatch
     ):
-        """An AAPL dataset and a GOOGL config is a run that cannot trade."""
+        """An AAPL dataset and an INTC config is a run that cannot trade."""
         self._stub_model(monkeypatch)
         market = SimMarket(["AAPL"], [DAY])
         config = SimulationConfig(
             personality=APPLE_TRADER_KEY, provider=RULE_PROVIDER, model="rules",
             api_key="", symbols=["AAPL"], days=[DAY],
-            rule_config={"model_key": "dayrange", "ticker": "GOOGL"},
+            rule_config={"model_key": "highlow", "ticker": "INTC"},
         )
-        assert "only trades GOOGL" in (SimulationEngine(market, config).run().error or "")
+        assert "only trades INTC" in (SimulationEngine(market, config).run().error or "")
 
     def test_the_strategy_leads_the_configuration_signature(self, dayrange_store, monkeypatch):
         """Results groups on this string. A day-range run and a momentum run
@@ -1495,8 +1471,8 @@ class TestDayRangeEngine:
         _, result = self._run(monkeypatch)
         assert result.config_summary["rule_based"] is True
         assert config_signature(
-            AppleTraderConfig(model_key="dayrange")
-        ).startswith("dayrange_AAPL(buy=")
+            AppleTraderConfig(model_key="highlow")
+        ).startswith("highlow_AAPL(buy=")
 
     def _store_last_week(self, symbol="AAPL"):
         """The Friday before DAY, moving $0.50 a minute either way: a neutral
@@ -1569,7 +1545,7 @@ class TestDayRangeEngine:
 
         self._stub_model(monkeypatch)
         record = {"racers": [
-            {"model_key": "dayrange", "buy_k": 0.75, "sell_k": 0.10,
+            {"model_key": "highlow", "buy_k": 0.75, "sell_k": 0.10,
              "momentum_confirmation_bars": 0, **r}
             for r in racers
         ], "selection": selection}
@@ -1612,7 +1588,7 @@ class TestDayRangeEngine:
         assert result.error is None
         assert bool([d for d in result.decisions if d["status"] == "filled"]) == trades
         line = next(e["text"] for e in result.agent_log if e["text"].startswith("Candidates at 09:34"))
-        assert ("Left out: AAPL · Day Range — bearish briefing, high confidence" in line) == (not trades)
+        assert ("Left out: AAPL · HighLow — bearish briefing, high confidence" in line) == (not trades)
         assert ",brief=gemini/m)" in result.config_summary["model"]
         assert len(list((tmp_path / "briefings").rglob("*.json"))) == 1
 
@@ -1628,11 +1604,11 @@ class TestDayRangeEngine:
         from agent_stonks.orchestra import ORCHESTRA_KEY, build_orchestra_config
 
         agent = rule_agent(ORCHESTRA_KEY)
-        race = build_orchestra_config(["AAPL:dayrange", "INTC:highlow"], AppleTraderConfig())
+        race = build_orchestra_config(["AAPL:highlow", "INTC:highlow"], AppleTraderConfig())
         back = agent.from_record(json.loads(json.dumps(agent.to_record(race))))
         assert back == race
         assert agent.symbols(back) == ["AAPL", "INTC"]
-        assert agent.signature(back).startswith("orchestra[dayrange_AAPL@")
+        assert agent.signature(back).startswith("orchestra[highlow_AAPL@")
 
 
 class TestRuleAgentRegistry:
@@ -1663,9 +1639,9 @@ class TestRuleAgentRegistry:
         # on the day-range model, whose signature reads no threshold and so
         # needs no bundle on disk to answer.
         agent = rule_agent(APPLE_TRADER_KEY)
-        base = agent.from_record({"model_key": "dayrange"})
+        base = agent.from_record({"model_key": "highlow"})
         assert agent.signature(base) == agent.signature(
-            agent.from_record({"model_key": "dayrange"})
+            agent.from_record({"model_key": "highlow"})
         )
         for field, value in (
             ("buy_k", 0.2), ("sell_k", 0.3), ("position_pct", 50.0),
@@ -2115,45 +2091,15 @@ class TestDecisionTrigger:
     def _reason(self, text):
         return {"action": "sell", "reasoning": text}
 
-    def test_a_trailing_stop_is_named(self):
+    def test_the_day_range_stop_is_named(self):
+        """Its reason reads "the bar traded down to" like the buy's does, so it
+        has to be told apart before the buy level is."""
         assert sim_results.decision_trigger(self._reason(
-            "Trailing stop: $89.46 is -0.52% off the $89.93 high since the $89.77 "
-            "entry, past the 0.50% give-back. Selling at market (-0.34%)."
-        )) == "Trailing stop"
-
-    def test_a_hard_stop_is_named(self):
-        assert sim_results.decision_trigger(self._reason(
-            "Stop: $88.10 is below the $88.50 floor 0.50% under the $88.94 entry. "
-            "Selling at market (-0.94%)."
+            "Stop loss: the bar traded down to $99.70, at or through the $99.75 stop "
+            "(half the predicted gain, $3.25, under the $103.00 fill). The day is not "
+            "going the way the forecast said, so the position is closed at market "
+            "(-3.20%) and nothing more is bought this session."
         )) == "Stop loss"
-
-    def test_the_two_stops_are_not_confused(self):
-        """They are different exits -- one gives back from a peak, the other
-        breaks a floor under the entry -- and 'Stop:' is a prefix of neither."""
-        trailing = sim_results.decision_trigger(self._reason("Trailing stop: ..."))
-        hard = sim_results.decision_trigger(self._reason("Stop: ..."))
-        assert trailing != hard
-
-    def test_a_model_entry_is_named_as_a_forecast(self):
-        assert sim_results.decision_trigger(self._reason(
-            "Momentum regime is still balanced on this bar (momentum +0.73, and it "
-            "has held 20 bars), but the forecast puts it at 9% (>= 5%) to turn "
-            "positive on the next bar and stay there."
-        )) == "ML forecast — anticipated turn"
-
-    def test_a_persistence_entry_is_named_as_a_probability(self):
-        assert sim_results.decision_trigger(self._reason(
-            "Momentum regime turned balanced -> positive on this bar (momentum +1.11, "
-            "the old regime had held 6 bars), and the persistence model puts it at "
-            "24% (>= 22%) to hold."
-        )) == "ML probability — change holds"
-
-    def test_a_forecast_reversal_exit_is_named(self):
-        assert sim_results.decision_trigger(self._reason(
-            "Forecast reversal: the momentum regime is still positive (momentum "
-            "+0.42, 6 bars in), but the model puts it at 41% (>= 30%) to flip "
-            "negative inside the forecast horizon."
-        )) == "ML forecast — reversal"
 
     def test_the_day_range_levels_are_named_apart(self):
         buy = sim_results.decision_trigger(self._reason(
@@ -2166,15 +2112,6 @@ class TestDecisionTrigger:
         ))
         assert buy == "Predicted-range buy level"
         assert sell == "Predicted-range sell level"
-
-    def test_the_delta_momentum_exits_are_named(self):
-        assert sim_results.decision_trigger(self._reason(
-            "Momentum floor: the score is -1.20 bps/min, below -2 × θ (-0.90)."
-        )) == "Momentum floor"
-        assert sim_results.decision_trigger(self._reason(
-            "Model exit: the regime is positive and the model puts the next 15 bars "
-            "at -0.44 bps/min, at or past the -0.3 sell threshold."
-        )) == "ML forecast — move over"
 
     def test_the_closing_bell_is_not_a_signal(self):
         """Worth its own tag: a flatten at the close says nothing about the
@@ -2287,7 +2224,7 @@ class TestMLModelBreakdown:
             "summary": {"return_pct": 1.0, "profit_efficiency": 0.5},
         }
 
-    def _apple(self, model_key="dayrange", return_pct=1.0):
+    def _apple(self, model_key="highlow", return_pct=1.0):
         return {
             "run_id": "r1", "dataset": "ds1",
             "config_summary": {
@@ -2299,7 +2236,7 @@ class TestMLModelBreakdown:
         }
 
     def test_apple_trader_is_the_model_it_names(self):
-        assert sim_results.ml_model_key(self._apple("dayrange")) == "dayrange"
+        assert sim_results.ml_model_key(self._apple("highlow")) == "highlow"
 
     def test_an_llm_run_is_grouped_by_provider(self):
         assert sim_results.ml_model_key(self._llm("anthropic")) == (
@@ -2326,10 +2263,10 @@ class TestMLModelBreakdown:
     def test_the_winning_run_names_its_ml_model(self):
         rows = sim_results.breakdown(
             [self._apple("nbeats", return_pct=1.0),
-             self._apple("dayrange", return_pct=9.0)],
+             self._apple("highlow", return_pct=9.0)],
             by="agent",
         )
-        assert rows[0]["best_run"]["ml_model"] == "dayrange"
+        assert rows[0]["best_run"]["ml_model"] == "highlow"
 
     # `ml_models` is the same extraction without the grouping rules, and it is
     # what the Results chart reads to draw the run's own forecasts over its
@@ -2338,7 +2275,7 @@ class TestMLModelBreakdown:
     # made trades it cannot name.
 
     def test_ml_models_lists_the_bundle_a_rule_run_loaded(self):
-        assert sim_results.ml_models(self._apple("dayrange")) == ["dayrange"]
+        assert sim_results.ml_models(self._apple("highlow")) == ["highlow"]
 
     def test_ml_models_refuses_to_guess_where_the_record_cannot_say(self):
         assert sim_results.ml_models(self._apple("")) is None
@@ -2354,9 +2291,9 @@ class TestMLModelBreakdown:
         from agent_stonks import model_overlays
 
         ran = model_overlays.for_models(
-            sim_results.ml_models(self._apple("dayrange")), "AAPL"
+            sim_results.ml_models(self._apple("highlow")), "AAPL"
         )
-        assert ran["keys"] == [model_overlays.DAY_RANGE_KEY]
+        assert ran["keys"] == [model_overlays.HIGHLOW_RANGE_KEY]
 
     def test_an_llm_run_preselects_nothing(self):
         """Nothing in it can answer "was the model right", so the chart opens
@@ -2374,10 +2311,11 @@ class TestMLModelLabels:
     in `apple_models` moves its row without touching stored runs."""
 
     def test_a_model_key_becomes_its_registry_name(self):
-        assert sim_app._ml_model_label("dayrange") == "Day-range forecast"
+        assert sim_app._ml_model_label("highlow2") == "HighLow2 model"
         # A removed model is not in the registry any more, so a stored run on
         # it shows its key rather than borrowing a real model's name.
         assert sim_app._ml_model_label("nbeats") == "nbeats"
+        assert sim_app._ml_model_label("dayrange") == "dayrange"
 
     def test_a_provider_is_marked_as_an_llm(self):
         assert sim_app._ml_model_label("llm:openai") == "openai (LLM)"
@@ -2556,14 +2494,14 @@ class TestRunFilters:
         runs = [
             self._run(personality="momentum", symbols=["AAPL"]),
             self._run(personality="contrarian", symbols=["INTC"]),
-            self._rule_run(ticker="GOOGL", model_key="dayrange"),
+            self._rule_run(ticker="GOOGL", model_key="highlow"),
         ]
         options = sim_results.filter_options(runs)
         assert options["agents"] == ["apple_trader", "contrarian", "momentum"]
         assert options["instruments"] == ["AAPL", "GOOGL", "INTC"]
         # LLM runs group by provider on this axis; the rule run names its model.
         assert options["ml_models"] == [
-            "dayrange", f"{sim_results.LLM_MODEL_PREFIX}openai",
+            "highlow", f"{sim_results.LLM_MODEL_PREFIX}openai",
         ]
 
     def test_sentinel_options_sort_last(self):
@@ -2593,7 +2531,7 @@ class TestRunFilters:
     def test_new_filters_select_and_intersect(self):
         aapl = self._rule_run(ticker="AAPL", model_key="persistence")
         intc = self._rule_run(ticker="INTC", model_key="persistence")
-        googl = self._rule_run(ticker="GOOGL", model_key="dayrange")
+        googl = self._rule_run(ticker="GOOGL", model_key="highlow")
         llm = self._run(personality="momentum", symbols=["AAPL"])
         runs = [aapl, intc, googl, llm]
 
@@ -2608,7 +2546,7 @@ class TestRunFilters:
             runs, instruments=["AAPL"], agents=["momentum"]
         ) == [llm]
         assert sim_results.filter_runs(
-            runs, instruments=["INTC"], ml_models=["dayrange"]
+            runs, instruments=["INTC"], ml_models=["highlow"]
         ) == []
 
     def test_filter_keys_match_breakdown_groups(self):
@@ -2624,7 +2562,7 @@ class TestRunFilters:
         runs = [
             self._run(personality="momentum", symbols=["AAPL"]),
             self._run(personality="contrarian", symbols=["INTC"], dataset="ds2"),
-            self._rule_run(ticker="GOOGL", model_key="dayrange"),
+            self._rule_run(ticker="GOOGL", model_key="highlow"),
         ]
         options = sim_results.filter_options(runs)
         pairs = {
@@ -2980,8 +2918,8 @@ class TestSweptSetupTitles:
     """
 
     def test_one_configuration_collapses_to_its_signature(self):
-        assert sim_app._setup_title(["dayrange_AAPL(buy=H-0.4A)"]) == (
-            "dayrange_AAPL(buy=H-0.4A)"
+        assert sim_app._setup_title(["highlow_AAPL(buy=H-0.4A)"]) == (
+            "highlow_AAPL(buy=H-0.4A)"
         )
 
     def test_a_grid_collapses_to_its_count(self):
@@ -3092,8 +3030,8 @@ class TestRuleCombinations:
     def test_setups_on_different_instruments_are_different_combinations(self):
         combos, _ = sim_app._rule_combinations(
             {APPLE_TRADER_KEY: [
-                AppleTraderConfig(model_key="dayrange", ticker="AAPL"),
-                AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
+                AppleTraderConfig(model_key="highlow", ticker="AAPL"),
+                AppleTraderConfig(model_key="highlow", ticker="GOOGL"),
             ]},
             ["ds1"],
         )
@@ -3116,7 +3054,7 @@ class TestExperimentSymbols:
     def test_a_rule_agent_gets_only_its_own_instrument(self):
         assert sim_app._experiment_symbols(
             APPLE_TRADER_KEY,
-            AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
+            AppleTraderConfig(model_key="highlow", ticker="GOOGL"),
             ["AAPL", "GOOGL", "SPY"],
         ) == ["GOOGL"]
 
@@ -3126,7 +3064,7 @@ class TestExperimentSymbols:
         it is what `_rule_agents_missing_ticker` answers."""
         assert sim_app._experiment_symbols(
             APPLE_TRADER_KEY,
-            AppleTraderConfig(model_key="dayrange", ticker="INTC"),
+            AppleTraderConfig(model_key="highlow", ticker="INTC"),
             ["AAPL"],
         ) == ["INTC"]
 
@@ -3226,8 +3164,8 @@ class TestRuleSetupTickerCheck:
     def test_only_the_setup_that_is_missing_is_reported(self):
         missing = sim_app._rule_agents_missing_ticker(
             {APPLE_TRADER_KEY: [
-                AppleTraderConfig(model_key="dayrange", ticker="AAPL"),
-                AppleTraderConfig(model_key="dayrange", ticker="GOOGL"),
+                AppleTraderConfig(model_key="highlow", ticker="AAPL"),
+                AppleTraderConfig(model_key="highlow", ticker="GOOGL"),
             ]},
             self.datasets(ds1=["AAPL"]), ["ds1"],
         )
@@ -3257,7 +3195,7 @@ class TestBreachShiftRecords:
 
     def test_a_record_under_the_earlier_rule_replays_it_and_keeps_its_signature(self):
         agent = rule_agent(APPLE_TRADER_KEY)
-        old = agent.from_record({"model_key": "dayrange", "breach_update": "extreme"})
+        old = agent.from_record({"model_key": "highlow", "breach_update": "extreme"})
         assert old.breach_update == "extreme"
         assert ",breach=extreme" in agent.signature(old)
 
@@ -3265,7 +3203,7 @@ class TestBreachShiftRecords:
         """The default moved to "brownian" on 2026-09-29; a record made under
         "shift" names it, so it keeps its signature."""
         agent = rule_agent(APPLE_TRADER_KEY)
-        record = agent.to_record(AppleTraderConfig(model_key="dayrange", breach_update="shift"))
+        record = agent.to_record(AppleTraderConfig(model_key="highlow", breach_update="shift"))
         assert ",breach=shift" in agent.signature(agent.from_record(record))
 
     def test_the_earlier_rule_is_a_valid_sweep_value_but_not_offered(self):

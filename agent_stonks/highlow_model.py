@@ -1,8 +1,8 @@
 """Where the day's high and low will land, called at 9:35 (HighLow).
 
-The same question TimeToChange3's day-range model answers (`dayrange_model`),
-asked of a much larger dataset and anchored differently. FinNotebooks'
-`HighLow_5m` project writes it as `highlow15m_<TICKER>.*` in `Code/Models`:
+The same question TimeToChange3's day-range model answered (removed from the
+app 2026-10-25), asked of a much larger dataset and anchored differently.
+FinNotebooks' `HighLow_5m` project writes it as `highlow15m_<TICKER>.*` in `Code/Models`:
 
     up   = log(high  / close5) / adr14     how far above the 9:35 price the high lands
     down = log(close5 / low)   / adr14     how far below it the low lands
@@ -12,20 +12,21 @@ asked of a much larger dataset and anchored differently. FinNotebooks'
 
 `close5`, `high5`, `low5` come from the first five 1-minute bars; `adr14` is the
 mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
-on validation and the bundle records it: AAPL and AVGO ship 0.5 LightGBM + 0.5
-N-BEATS, INTC ships N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS,
-BE 0.75 N-BEATS + 0.25 N-HiTS, NVDA 0.5 LightGBM + 0.5 N-HiTS, QCOM, ORCL and
-TMO 0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, AMD 0.5 LightGBM + 0.25 N-BEATS +
-0.25 N-HiTS, META and AMGN N-BEATS alone; every other
-candidate is in the bundle at weight 0 and is not loaded. On the 129-session
+on validation and the bundle records it: AAPL ships 0.5 LightGBM + 0.5
+N-BEATS, INTC N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS, NVDA
+0.5 LightGBM + 0.5 N-HiTS, TMO 0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, AMD
+0.5 LightGBM + 0.25 N-BEATS + 0.25 N-HiTS, AMGN N-BEATS alone; every other
+candidate is in the bundle at weight 0 and is not loaded. (BE, AVGO, QCOM, ORCL
+and META had bundles too until 2026-10-25; the mirror machinery they brought
+in -- the theme peers, the trade counts -- is still read by the ones left.) On the 129-session
 test window AAPL scores 0.0050 mean absolute log error per extreme ($1.37)
 against TimeToChange3's 0.0077, INTC 0.0150 ($1.22) against 0.0216.
 
 Each notebook may build custom feature groups beside the base 48 and keep
-whichever earn their place on validation. Mirrored here (`GROUP_COLS`): BE's
-"theme" (below), the five NVDA reads (further below) -- market, regime,
-premarket, afterhours, opening_shape -- and QCOM's, ORCL's and META's
-microstructure (last). Not mirrored: calendar (only weight-0 linear medians
+whichever earn their place on validation. Mirrored here (`GROUP_COLS`): the
+"theme" peers (below; TMO, AMGN, AMD), the five NVDA reads (further below) --
+market, regime, premarket, afterhours, opening_shape -- and the
+microstructure (last; AMGN). Not mirrored: calendar (only weight-0 linear medians
 read it so far). `_build_bundle` refuses a bundle whose weighted candidates
 read a column outside the mirror rather than predicting off a missing one.
 
@@ -35,8 +36,8 @@ count misses some -- INTC's 28 Nov 2025 passed it). That list ends in 2025, so
 
 Apple Trader uses it *only* for the forecast. Everything downstream -- the two
 resting levels, the breach update, the managed exit, the circuit breaker -- is
-`apple_trader.DayRangeTrader`, unchanged, reading `pred_high`/`pred_low` from
-here instead of from `dayrange_model`. `forecast_session` returns the same keys
+`apple_trader.DayRangeTrader`, reading `pred_high`/`pred_low` from here (or
+from `highlow2_model`). `forecast_session` returns the same keys as that one
 for exactly that reason.
 
 The mirror contract
@@ -71,13 +72,13 @@ History is always read strictly *before* the session being forecast, from the
 session date the caller names rather than from the wall clock, so a SimLab
 replay reads the same honest history a live run on that day would have.
 
-Today's open is the first minute bar's, not the official auction print that
-`dayrange_model` asks for: this model's daily frame is rolled up from minute
-bars, so that is the open it was fitted on.
+Today's open is the first minute bar's, not the official auction print:
+this model's daily frame is rolled up from minute bars, so that is the open it
+was fitted on.
 
 Minute volume is on the consolidated scale here too: `or_volume_rel` and
 `or_volume_z` read today's opening five minutes against SIP history, so an IEX
-opening window biases both. `dayrange_model.volume_scale_warning` applies as is,
+opening window biases both. `day_range.volume_scale_warning` applies as is,
 except to a bundle fitted on IEX openings (below), which is on IEX's scale.
 
 IEX openings (MU)
@@ -104,35 +105,33 @@ as for every bundle: the notebook read it from SIP. A replay on a SIP dataset is
 therefore the notebook exactly; live at 9:35 the only 09:30 bar is IEX's, a
 median 6 bp (p90 22 bp) off SIP's on MU, about 0.01-0.05 ADR on those two features.
 
-Theme peers (BE)
-----------------
-BE's bundle (saved 2026-09-30) is the first whose shipped candidates read a
-custom column: both nets (N-BEATS 0.75 + N-HiTS 0.25) take `lead_or_ret_adr`,
-the lead peer's (VST's) opening five minutes in VST's own ADR, falling back to
-the mean over all three peers (VST, PLUG, XLU) on a morning VST did not print --
-13 of the notebook's 767 sessions, the latest 2025-12-31. So the "theme" group
-is mirrored (`theme_from`, verbatim but for reading cached opening summaries)
-and every peer is fed to it. Each peer is read as the notebook's `load_peers`
-reads it: SIP rollups cleaned at the standard 385 bars, openings from IEX
-(`PEER_OPENING_FEED`), cached like any other symbol, plus today's IEX window
-fetched at 9:35. The group's other columns are unshipped and match the
-notebook to ~1e-11, except `theme_gap`: it reads the peer's open today, which
-is IEX's first bar here and SIP's in the notebook (0.02-0.04 ADR apart on the
-days checked). A retrain that weights `theme_gap` inherits that seam, the
-same one `gap_adr` has.
+Theme peers
+-----------
+A bundle may read a "theme": its peers' opening five minutes, each in the
+peer's own ADR (`lead_or_ret_adr` for the lead peer, falling back to the mean
+over all of them on a morning the lead did not print, beside the group's
+dispersion, range and beta columns). BE's bundle (2026-09-30, removed
+2026-10-25) brought it in; TMO, AMGN and AMD read it now. So the group is
+mirrored (`theme_from`, verbatim but for reading cached opening summaries) and
+every peer is fed to it. Each peer is read as the notebook's `load_peers`
+reads it: SIP rollups cleaned at the peer's own bar count, openings off the
+bundle's own opening feed (`peer_feed` -- SIP for every bundle shipped today;
+`load_peers`' IEX default was BE's), cached like any other symbol, plus
+today's window fetched at 9:35. `theme_gap` reads the peer's open today, which
+is the window's first bar here and may be a different tape's in the notebook;
+it inherits the same seam `gap_adr` has.
 
-A peer whose SIP session today turns out incomplete would have no row in the
+A peer whose session today turns out incomplete would have no row in the
 notebook, so its `lead_or_ret_adr` would fall back. At 9:35 nobody knows that
-yet, so the mirror counts it. VST on 2025-12-31 (380 bars) is one: $0.0009 on
-BE's predicted high. The mirror test hands the peers the windows the notebook
-kept, so it pins the code and not this seam.
+yet, so the mirror counts it. The mirror tests hand the peers the windows the
+notebook kept, so they pin the code and not this seam.
 
-BE also keeps sessions of 370 bars or more rather than 385 (the sidecar's
-`min_bars_per_session`, 44 quiet sessions). The own history is cleaned at that
-threshold, and the cache records the threshold it was cleaned at; at 385,
-2025-03-20's forecast would be $0.08 off. AVGO keeps sessions from 320 bars
-(its pre-split tape lost odd-lot minutes), which its sidecar does not record:
-`NOTEBOOK_MIN_BARS` supplies it.
+A thin name's sidecar may keep sessions from fewer than 385 bars
+(`min_bars_per_session`; BE's said 370). The own history is cleaned at that
+threshold, and the cache records the threshold it was cleaned at. A notebook
+can also set one its sidecar does not record -- AVGO keeps sessions from 320
+bars (its pre-split tape lost odd-lot minutes), which matters still because it
+is one of AMD's peers: `NOTEBOOK_MIN_BARS` supplies it.
 
 SPY, the pre-market and the evening (NVDA)
 ------------------------------------------
@@ -168,34 +167,32 @@ The mirror matches the notebook to ~4e-7 $ on all 644 sessions it can forecast
 (from March 2024), and the live Alpaca path reproduces 2026-08-27, 09-14,
 09-21 and 10-02. A cold fetch of NVDA and SPY took 39 s.
 
-Trade counts, SIP peers and a late first print (QCOM, ORCL, META)
------------------------------------------------------------------
-The three bundles saved 2026-10-13 follow NVDA's recipe, and all three read
-the "microstructure" group: the opening five minutes' VWAP against the 9:35
-price (`or_vwap_pos`, the only one QCOM reads), the first bar's share of the
-window's volume, its trade count and average trade size each against their
-own 20 sessions, and how much of the overnight gap was given back
-(`gap_fill`). Alpaca's bars carry the trade count and VWAP (`n`, `vw`), so
-the history cache keeps them per session (`_MICRO_SUMMARY`, rebuilt on a cache
-written before them: `micro`). The caller's bars do not -- neither the bar
-buffer nor yfinance has them -- so `forecast_session` fetches the ticker's own
-window for them, on SIP once SIP has released it (every replay, as in the
+Trade counts and a late first print
+-----------------------------------
+The "microstructure" group (brought in by QCOM's, ORCL's and META's bundles of
+2026-10-13, since removed; AMGN reads its `or_trades_rel` now): the opening
+five minutes' VWAP against the 9:35 price (`or_vwap_pos`), the first bar's
+share of the window's volume, its trade count and average trade size each
+against their own 20 sessions, and how much of the overnight gap was given
+back (`gap_fill`). Alpaca's bars carry the trade count and VWAP (`n`, `vw`),
+so the history cache keeps them per session (`_MICRO_SUMMARY`, rebuilt on a
+cache written before them: `micro`). The caller's bars do not -- neither the
+bar buffer nor yfinance has them -- so `forecast_session` fetches the ticker's
+own window for them, on SIP once SIP has released it (every replay, as in the
 notebook) and on IEX before that (live at 9:35: `market_window_feed`). A
 window without them is refused rather than read as zero.
 
-ORCL also reads SPY (as NVDA) and its theme on MSFT, AMZN and GOOGL. Its
-notebook reads the peers on SIP (`load_peers(feed="sip")`), so a SIP-opening
-bundle's peers are cached on SIP and today's windows come off the released
-feed like SPY's; BE's stay on IEX (`peer_feed`). And ORCL's notebook keeps a
-session whose first SIP bar printed at 09:31 or 09:32 (`max_first_minute`,
-not in the sidecar: `NOTEBOOK_MAX_FIRST_MINUTE`) -- 13 quiet days of 2023-24,
+A notebook may also keep a session whose first SIP bar printed a minute or two
+late (`max_first_minute`, not in the sidecar: `NOTEBOOK_MAX_FIRST_MINUTE`) --
+quiet days of 2023-24 where the opening auction printed in the 09:31 bar,
 outside any live history window, but part of the mirror check.
 
 Thin peers (AMGN)
 -----------------
-AMGN's bundle (saved 2026-10-19, N-BEATS alone) is ORCL's recipe outside
-tech: SPY's opening range, the pre-market, the previous evening, the opening's
-trade count and its theme on SIP -- GILD (the lead), REGN and VRTX. Nothing
+AMGN's bundle (saved 2026-10-19, N-BEATS alone) is NVDA's recipe outside
+tech, with the two groups above: SPY's opening range, the pre-market, the
+previous evening, the opening's trade count and its theme on SIP -- GILD (the
+lead), REGN and VRTX. Nothing
 new to mirror but the session thresholds. Before the round-lot reform of
 November 2025 a quiet minute of a $250-1,200 stock often printed no bar, so
 AMGN's notebook keeps its own sessions from 310 bars and each peer's from just
@@ -222,9 +219,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# The OpenMP trap `dayrange_model` documents applies unchanged: this bundle
-# holds LightGBM and a torch network in one process. Same three measures, same
-# reasons -- see that module's header.
+# The OpenMP trap. This bundle holds LightGBM and a torch network in one
+# process, and both wheels bundle their own OpenMP runtime; this environment has
+# no system `libomp`. Loading a LightGBM model in a process that imported torch
+# first segfaults with no traceback, so LightGBM is imported first -- and both
+# honour OMP_NUM_THREADS, which is capped before either is loaded.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 try:  # pragma: no cover - depends on which optional extras are installed
@@ -235,6 +234,14 @@ except ImportError:
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 
+# The import order above protects LightGBM and *arms the opposite trap*: with
+# both OpenMP runtimes loaded and LightGBM's first, the next torch op that goes
+# parallel takes the process down instead -- `MaxPool1d` on a (1, 8, 32)
+# tensor is enough, which every N-HiTS block does. That one cannot be fixed by
+# import order, because another module may already have imported both, so the
+# cap is applied at runtime. Process-global, deliberately: it is a property of
+# this environment, not of this model. Any module that runs torch in a
+# LightGBM process needs the same.
 torch.set_num_threads(1)
 
 from . import market_hours, model_store  # noqa: E402
@@ -251,14 +258,15 @@ OPENING_MINUTES = 5
 # sidecar without the key predates it and read SIP.
 OPENING_FEED_SIP = "sip"
 OPENING_FEED_IEX = "iex"
-# The feed a thin-opening bundle's (BE's) theme peers are read on
-# (`highlow.data.load_peers`' default). The SIP-opening notebooks (ORCL's) ask
-# for `feed="sip"`: `peer_feed`.
+# The feed an IEX-opening bundle's theme peers are read on
+# (`highlow.data.load_peers`' default; BE's, removed 2026-10-25). The
+# SIP-opening notebooks -- every bundle shipped today -- ask for `feed="sip"`:
+# `peer_feed`.
 PEER_OPENING_FEED = OPENING_FEED_IEX
 SESSION_MINUTES = 390
 # A full session has 390 bars. Anything under this is a half day or a feed gap
 # (`config.MIN_BARS_PER_SESSION`), and the notebook drops those sessions. A
-# thin name's sidecar can lower it (`min_bars_per_session`, BE's 370).
+# thin name's sidecar can lower it (`min_bars_per_session`).
 MIN_BARS_PER_SESSION = 385
 # Thresholds a notebook set (`config._TICKERS[...]["min_bars"]`) but its
 # sidecar does not record. AVGO's pre-split tape (to July 2024) lost odd-lot
@@ -276,15 +284,15 @@ NOTEBOOK_MIN_BARS: "dict[str, int]" = {
     "AVGO": 320, "AMGN": 310, "GILD": 370, "REGN": 130, "VRTX": 240,
     "TMO": 260, "DHR": 340, "A": 270, "WAT": 100,
 }
-# The same for the first bar (`config._TICKERS[...]["max_first_minute"]`): on 13
-# quiet ORCL sessions of 2023-24 the opening auction printed in the 09:31 bar
-# (once 09:32) and SIP has no 09:30 bar, so its notebook keeps a session whose
-# first bar is up to two minutes late; TMO's on two 2023 sessions (09:31). Its
+# The same for the first bar (`config._TICKERS[...]["max_first_minute"]`): on
+# two quiet TMO sessions of 2023 the opening auction printed in the 09:31 bar
+# and SIP has no 09:30 bar, so its notebook keeps a session whose first bar is
+# a minute late (ORCL's, removed 2026-10-25, kept two). Its
 # NYSE peers' auctions print later still -- DHR's up to 09:36, A's 09:35, WAT's
 # 09:37 -- and those sessions are kept too: with no bar in the opening window
 # the peer has no opening summary that day and the theme group reads the
 # others (`theme_from`). Everywhere else the first bar must be 09:30's.
-NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {"ORCL": 2, "TMO": 1, "DHR": 6, "A": 5, "WAT": 7}
+NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {"TMO": 1, "DHR": 6, "A": 5, "WAT": 7}
 
 # Prior sessions the feature row needs: 126-day momentum and volatility read
 # `mid.shift(126)` of a series that is itself shifted a day.
@@ -906,7 +914,7 @@ def session_rollups(
     `rollups` has one row per kept session with `_ROLLUP_COLS`, the opening
     summary and the opening's trade summary (`_MICRO_SUMMARY`, NaN where the
     bars carry no trade counts); `dropped_dates` are the sessions `clean_minute`
-    refused (half days, feed gaps, ORCL's opening print after `max_first_minute`),
+    refused (half days, feed gaps, an opening print after `max_first_minute`),
     remembered so the cache knows it has already looked at them.
     Every step groups by date, so rolling up in chunks gives the same rows as
     rolling up the whole history at once.
@@ -1272,8 +1280,8 @@ def _build_bundle(path: Path) -> "dict | None":
         "max_first_minute": int(metadata.get("max_first_minute")
                                 or NOTEBOOK_MAX_FIRST_MINUTE.get(ticker or "", 0)),
         "peers": peers,
-        # BE's notebook reads its peers' openings on IEX (`load_peers`' default),
-        # the SIP-opening ones (ORCL's) on SIP: the bundle's own opening feed.
+        # An IEX-opening notebook reads its peers' openings on IEX (`load_peers`'
+        # default), a SIP-opening one on SIP: the bundle's own opening feed.
         "peer_feed": PEER_OPENING_FEED if feed != OPENING_FEED_SIP else OPENING_FEED_SIP,
         "groups": groups,
         "market_proxy": market_proxy if "market" in groups else None,
@@ -1302,7 +1310,7 @@ def opening_feed(bundle: "dict | None" = None) -> str:
 
 
 def min_bars(bundle: "dict | None" = None) -> int:
-    """The bar count a session needs to be kept: 385, or the sidecar's (BE 370)."""
+    """The bar count a session needs to be kept: 385, or the sidecar's."""
     try:
         return int((bundle or {})["min_bars"])
     except (KeyError, TypeError, ValueError):
@@ -1311,7 +1319,7 @@ def min_bars(bundle: "dict | None" = None) -> int:
 
 def max_first_minute(bundle: "dict | None" = None) -> int:
     """How late a kept session's first bar may print, in minutes after 09:30:
-    0, or the notebook's (ORCL 2)."""
+    0, or the notebook's (TMO 1)."""
     try:
         return int((bundle or {})["max_first_minute"])
     except (KeyError, TypeError, ValueError):
@@ -1324,7 +1332,7 @@ def peers(bundle: "dict | None" = None) -> "tuple[str, ...]":
 
 
 def peer_feed(bundle: "dict | None" = None) -> str:
-    """The tape the theme peers' openings are read from: IEX (BE) or SIP (ORCL)."""
+    """The tape the theme peers' openings are read from: IEX or SIP, the bundle's own."""
     return str((bundle or {}).get("peer_feed") or PEER_OPENING_FEED)
 
 
@@ -1338,7 +1346,7 @@ def peer_kept(peer: str) -> dict:
 
 
 def reads_microstructure(bundle: "dict | None" = None) -> bool:
-    """Whether the blend reads the opening's trade counts and VWAP (QCOM, ORCL, META)."""
+    """Whether the blend reads the opening's trade counts and VWAP (AMGN)."""
     return "microstructure" in groups(bundle)
 
 
@@ -1698,7 +1706,7 @@ def forecast_from(
     empty.
 
     `peer_data` is `{peer: (history, today's window)}` for a bundle that
-    reads the theme group (`peers`, BE and ORCL): each peer's `history_frame`
+    reads the theme group (`peers`; TMO, AMGN, AMD): each peer's `history_frame`
     on `peer_feed`, and its window as `fetch_opening_window` returns it (None
     or empty when the feed printed nothing).
 
@@ -1708,13 +1716,13 @@ def forecast_from(
     to 04:00-09:19 here); and the pre-market and evening history comes from
     `history`'s extended-hours columns (`history_frame(..., extended=True)`).
 
-    For one reading the microstructure group (QCOM, ORCL, META), `micro_window`
+    For one reading the microstructure group (AMGN), `micro_window`
     is today's opening window with Alpaca's trade counts and VWAP (`trades`,
     `vwap`) on SIP's tape, and the history's trade summaries come from
     `history_frame(..., micro=True)`. A non-SIP-opening bundle reads them off
     `opening_window` instead, as the notebook reads them off its opening feed.
 
-    Returns the keys `dayrange_model.forecast_session` returns --
+    Returns the keys every day-range model's `forecast_session` returns --
     `{"pred_high", "pred_low", "prev_avg", "adr14_abs", "or_high", "or_low"}`
     in dollars -- so `apple_trader.DayRangeTrader` runs on it unchanged.
     Raises ValueError when the inputs cannot support a forecast.
@@ -1885,13 +1893,13 @@ def forecast_session(
     A bundle that reads the open from IEX (`opening_feed`) is handed today's
     IEX window fetched here, whatever tape `opening_bars` is on, so a replay of
     a SIP dataset forecasts from what a live run would have seen at 9:35. So is
-    a bundle that reads theme peers (BE), for each peer, beside its history.
+    a bundle that reads theme peers, for each peer, beside its history.
 
     A bundle reading the market group (NVDA) gets the proxy's history and
     today's window -- on SIP when SIP has released it, so every replay reads
     the notebook's tape, and on IEX live at 9:35 (`market_window_feed`). So do
-    SIP theme peers (ORCL's), and the trade counts and VWAP of the ticker's own
-    window for a bundle reading the microstructure group (QCOM, ORCL, META):
+    SIP theme peers, and the trade counts and VWAP of the ticker's own
+    window for a bundle reading the microstructure group (AMGN):
     the caller's bars carry neither. One reading the pre-market gets today's
     SIP bars to 09:19.
     """

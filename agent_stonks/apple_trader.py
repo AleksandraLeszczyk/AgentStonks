@@ -7,8 +7,9 @@ built on a saved model from FinNotebooks. Same paper ledger, same fill path,
 same log -- only the decision-making is deterministic, so the same tape always
 produces the same trades.
 
-Two rule sets. The range models drive TimeToChange3's day-range rules
-(`DayRangeTrader`): one forecast at 9:35 of where the session's high and low
+Three rule sets. The range models (HighLow, HighLow2) drive the day-range
+rules of TimeToChange3's notebook 05 (`DayRangeTrader`): one forecast at 9:35
+of where the session's high and low
 will land, then two resting levels derived from it and nothing more asked of
 the model all day. Fast&Furious drives the momentum rules (`FastFuriousTrader`):
 a forecast of the next 30 minutes' momentum at every bar, bought when it is
@@ -45,8 +46,8 @@ import pandas as pd
 from . import agent as agent_mod
 from . import state as state_mod
 from . import (
-    apple_models, bar_history, base_configs, candle_patterns, clock, event_days, historical,
-    intraday_vol_model, market_hours, momentum_regime, rule_agent,
+    apple_models, bar_history, base_configs, candle_patterns, clock, day_range, event_days,
+    historical, intraday_vol_model, market_hours, momentum_regime, rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -60,7 +61,6 @@ from .config import (
     APPLE_TRADER_BUY_K,
     APPLE_TRADER_CYCLE_SEC,
     APPLE_TRADER_BUY_STEP_K,
-    APPLE_TRADER_DAYRANGE_LEVELS,
     APPLE_TRADER_FF_ENTRY_QUANTILE,
     APPLE_TRADER_FF_EXIT_ON_SELL_SIGNAL,
     APPLE_TRADER_FF_HOLD_MINUTES,
@@ -76,7 +76,6 @@ from .config import (
     APPLE_TRADER_GM_TAKE_MIN_K,
     APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN,
     APPLE_TRADER_HOLD_MIN_GAIN_K,
-    APPLE_TRADER_LEVEL_SOURCE,
     APPLE_TRADER_MIN_WIN,
     APPLE_TRADER_MIN_WIN_K,
     APPLE_TRADER_MODEL,
@@ -101,8 +100,6 @@ from .config import (
     BREACH_OFF,
     BREACH_POLICIES,
     BREACH_SHIFT,
-    LEVELS_DAYRANGE,
-    LEVEL_SOURCES,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
     LEVEL_UNIT_PHRASES,
@@ -196,12 +193,11 @@ def dayrange_levels(
     result made its default from SimLab (`base_configs`) -- unless `use_base`
     is off; then SimLab's tuning pick for the pair as shipped
     (`config.APPLE_TRADER_TUNED_LEVELS`, with how far each deserves trust).
-    A pair never tuned falls back to the instrument's notebook-05 sweep
-    (`config.APPLE_TRADER_DAYRANGE_LEVELS`), and a symbol never swept at all
-    to the notebook's specified pair. A hybrid with no base of its own takes
-    its levels model's buy distance (`apple_models.levels_of`) and a sell of 0:
-    it rests no sell -- its exits are its signal model's -- and 0 sits under
-    every buy distance a form or a grid can reach.
+    A pair never tuned falls back to notebook 05's specified pair. A hybrid
+    with no base of its own takes its levels model's buy distance
+    (`apple_models.levels_of`) and a sell of 0: it rests no sell -- its exits
+    are its signal model's -- and 0 sits under every buy distance a form or a
+    grid can reach.
     """
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
     if use_base:
@@ -215,7 +211,7 @@ def dayrange_levels(
     tuned = _tuned(APPLE_TRADER_TUNED_LEVELS, model_key, symbol)
     if tuned is not None:
         return tuned
-    return APPLE_TRADER_DAYRANGE_LEVELS.get(symbol, (APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K))
+    return APPLE_TRADER_BUY_K, APPLE_TRADER_SELL_K
 
 
 def stop_for(ticker: str, model_key: "str | None" = None, use_base: bool = True) -> float:
@@ -455,14 +451,14 @@ class AppleTraderConfig:
     # worth keeping a runner for. Short of it the take sells everything.
     hold_min_gain_k: float = APPLE_TRADER_HOLD_MIN_GAIN_K
     # What to do when the session trades through the forecast the two levels
-    # are built on -- one of `dayrange_model.BREACH_POLICIES`. "off" is the
+    # are built on -- one of `config.BREACH_POLICIES`. "off" is the
     # notebook's rule (one forecast, held all day); "shift" moves both sides by
     # the breach, "brownian" past it by the expected excursion (both sides
     # with `keep_width`, the breached one without), "extreme" the breached side
     # only -- and the levels with it. See `_update_range`.
     breach_update: str = APPLE_TRADER_BREACH_UPDATE
     # Whether the forecast is always widened to hold what the session has
-    # printed, whatever `breach_update` says (`dayrange_model.contain_session`).
+    # printed, whatever `breach_update` says (`day_range.contain_session`).
     # With it on, "off" no longer keeps a predicted high the tape has traded
     # through -- and therefore agrees with "extreme" on a breached side.
     contain_range: bool = APPLE_TRADER_CONTAIN_RANGE
@@ -476,11 +472,6 @@ class AppleTraderConfig:
     # Tested against the high as it stood when the bar opened, and after the
     # sell level, so a breach that also reaches the target logs as the target.
     breach_exit: bool = APPLE_TRADER_BREACH_EXIT
-    # Which number the two distances above are measured below: "dayrange", the
-    # predicted high itself. "intraday" (IntradayVolatility's time-of-day shape,
-    # removed 2026-10-20) is only ever a stored record's, which
-    # `level_source_error` refuses. See `config.LEVEL_SOURCES`.
-    level_source: str = APPLE_TRADER_LEVEL_SOURCE
     # What one k is worth in dollars -- one of `config.LEVEL_UNITS`. "adr" is
     # the trailing 14-day average daily range, a fixed number for the session
     # and no part of the model's output; "pred_range" is `pred_high -
@@ -713,12 +704,6 @@ class AppleTraderConfig:
             raise ValueError(
                 f"breach_update {self.breach_update!r} is not one of "
                 f"{', '.join(BREACH_POLICIES)}"
-            )
-        self.level_source = str(self.level_source or LEVELS_DAYRANGE)
-        if self.level_source not in LEVEL_SOURCES:
-            raise ValueError(
-                f"level_source {self.level_source!r} is not one of "
-                f"{', '.join(LEVEL_SOURCES)}"
             )
         self.level_unit = str(self.level_unit or UNIT_ADR)
         if self.level_unit not in LEVEL_UNITS:
@@ -1164,14 +1149,8 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # existed (which replays with none) keeps the signature it was filed under.
     if c.skip_events:
         breach += ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events)
-    # Written only when the reference is not the predicted high: a record from
-    # when it could be IntradayVolatility's curve keeps the identity it was
-    # filed under (and is refused, `level_source_error`).
-    levels = "" if c.level_source == LEVELS_DAYRANGE else f",levels={c.level_source}"
-    # "H" in the two distances is whatever `level_source` says it is, which is
-    # why that token is next to them rather than at the end.
     return (
-        f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}{unit},sell=H-{c.sell_k:g}{unit}{levels},"
+        f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}{unit},sell=H-{c.sell_k:g}{unit},"
         f"size={c.position_pct:g}%{adds}{exits}{breach})"
     )
 
@@ -1280,47 +1259,17 @@ def config_error(config: AppleTraderConfig, bundle: "dict | None" = None) -> "st
     later is checked everywhere it needs to be rather than in whichever launch
     path was remembered.
     """
-    return (
-        model_ticker_error(config) or level_source_error(config)
-    )
+    return model_ticker_error(config)
 
 
-def level_source_error(config: AppleTraderConfig) -> "str | None":
-    """Why a record measuring its levels below something other than the
-    predicted high cannot run, or None.
-
-    The only other reference there was is IntradayVolatility's time-of-day
-    curve stretched to the day-range forecast ("Day Range × Intraday
-    Volatility", removed 2026-10-20). A stored SimLab record made with it is
-    refused rather than replayed on the flat high, which would be a different
-    strategy filed beside the original as though it matched.
-    """
-    if config.level_source == LEVELS_DAYRANGE:
-        return None
-    return (
-        f"levels measured below '{config.level_source}' are not something this app can "
-        "run: levels under IntradayVolatility's time-of-day curve were removed with the "
-        "Day Range × Intraday Volatility model (2026-10-20), and a run configured on them "
-        "is not replayed on the flat predicted high."
-    )
-
-
-def _dayrange():
-    """`agent_stonks.dayrange_model`, imported on first use.
+def _highlow():
+    """`agent_stonks.highlow_model`, imported on first use.
 
     Kept out of this module's imports because it pulls PyTorch and LightGBM in
     (in that order, deliberately -- see its docstring), and a process that only
     lists the agents or renders the form must not pay for a 200 MB dependency
     it does not use. `sys.modules` makes the repeat calls free.
     """
-    from . import dayrange_model
-
-    return dayrange_model
-
-
-def _highlow():
-    """`agent_stonks.highlow_model`, imported on first use (same reason as
-    `_dayrange`)."""
     from . import highlow_model
 
     return highlow_model
@@ -1355,11 +1304,11 @@ def session_forecast(
     (`pred_high`, `pred_low`, `adr14_abs`, ...), and every level, exit and
     breach rule downstream reads those and nothing else.
 
-    `open_price` is the official opening print the day-range model is fed. The
-    HighLow models roll their daily
-    bars up from minute bars, so they read the first bar's open instead (IEX's,
-    for HighLow2) and need no print; None then makes the plan
-    fall back to the caller's first bar.
+    `open_price` is always None: the HighLow models roll their daily bars up
+    from minute bars, so they read the first bar's open (IEX's, for HighLow2)
+    rather than an official print, and the plan falls back to the caller's
+    first bar. It stays in the return so the plan and the record's seed keep
+    their shape -- TimeToChange3, removed 2026-10-25, was fed the print.
     """
     if bundle.get("kind") == "highlow":
         return (
@@ -1371,17 +1320,10 @@ def session_forecast(
             _highlow2().forecast_session(bundle, ticker, opening, today, key, secret),
             None,
         )
-    dayrange = _dayrange()
-    history = dayrange.daily_frame_from_bars(
-        historical.fetch_daily_ohlc_bars(ticker, days=dayrange.DAILY_HISTORY_DAYS)
+    raise ValueError(
+        f"no day-range forecast for a bundle of kind {bundle.get('kind')!r} -- "
+        "HighLow and HighLow2 are the models that make one."
     )
-    # Returned too, so the plan (and the record's seed) carries the print the
-    # forecast was built from.
-    open_price = historical.fetch_session_open(ticker)
-    forecast = dayrange.forecast_session(
-        bundle, history, opening, today, open_price=open_price,
-    )
-    return forecast, open_price
 
 
 def _window_bars(
@@ -1672,9 +1614,9 @@ class _SitsOut:
 class DayRangeTrader(_SitsOut, BaseTrader):
     """The day-range rules: one forecast at 9:35, then two resting levels.
 
-    TimeToChange3's model says where the session's high and low will land, and
-    it says it exactly once -- from the daily history up to yesterday plus the
-    first five minutes of this morning. The model is never re-run, so the rule
+    The model (HighLow or HighLow2) says where the session's high and low will
+    land, and it says it exactly once -- from the history up to yesterday plus
+    the first five minutes of this morning. The model is never re-run, so the rule
     built on it cannot be a per-bar signal. It is two price levels, set at 9:35,
     from notebook 05:
 
@@ -1693,11 +1635,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     `off` this is the notebook's rule exactly.
 
     It is a mean-reversion bet, and the reason it is shaped that way is in the
-    model's own results: what TimeToChange3 forecasts well is the *width* of
-    the session, not its direction. So the rule never takes a view on where the
-    day is going -- it buys well below where the day is expected to top out and
-    sells just under it, and on a day that never dips that far it simply does
-    nothing.
+    results of TimeToChange3, the model the rule was written for: what it
+    forecast well was the *width* of the session, not its direction. So the
+    rule never takes a view on where the day is going -- it buys well below
+    where the day is expected to top out and sells just under it, and on a day
+    that never dips that far it simply does nothing.
 
     The entry is those two levels and nothing else -- no regime, no
     probability. The exit has more to it (`_exit`): on top of the sell level
@@ -1720,8 +1662,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     The trigger is the notebook's, bar for bar: a buy fires on a bar whose
     **low** touched the buy level and a sell on a bar whose **high** touched
     the sell level, checked in that order and never both on one bar.
-    `tests/test_dayrange_model.py` pins the forecast itself to notebook 05's
-    recorded number for 2026-08-07.
 
     Three differences remain, and only the first is small:
 
@@ -1829,7 +1769,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         if refused is not None:
             return refused
 
-        today = _dayrange().market_date()
+        today = day_range.market_date()
         self._roll_session(today)
 
         frame = momentum_regime.minute_frame(sym_state)
@@ -1848,7 +1788,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         self._adopt_form_levels(state, frame.index[-1])
         bundle = self._bundle or bundle
 
-        want = _dayrange().opening_minutes(bundle)
+        want = day_range.opening_minutes(bundle)
         if self.plan is None:
             if self.blocked is not None:
                 return "no_data"
@@ -2085,7 +2025,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # logged by the run that made it.
         warning = (
             None if tape is None or (bundle.get("opening_feed") or "sip") != "sip"
-            else _dayrange().volume_scale_warning(tape)
+            else day_range.volume_scale_warning(tape)
         )
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
@@ -2265,7 +2205,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             self.config, self._bundle = new, bundle
             try:
                 self._plan_session(
-                    bundle, state, frame, today, _dayrange().opening_minutes(bundle),
+                    bundle, state, frame, today, day_range.opening_minutes(bundle),
                     switching=True,
                 )
             except Exception as exc:
@@ -2872,12 +2812,12 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         statement has been falsified in one direction, and going on measuring
         against it -- the position's target in particular -- means trading
         against a number the tape has already disproved. So the breached side is
-        moved (`dayrange_model.updated_range` decides how far; `breach_update`
+        moved (`day_range.updated_range` decides how far; `breach_update`
         picks the policy) and both levels are rebuilt from the new high.
 
         Deliberately once per closed bar and only outside the opening window:
         the bar the plan was built on is the last bar of that window, and its
-        extremes are already in the forecast through `apply_open_constraint`.
+        extremes are already in the forecast through its 9:35 clip.
 
         What this does to a run in flight, in both directions. An open position's
         sell level moves *up*, so a day that is running further than forecast is
@@ -2914,7 +2854,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         if ts <= plan["opening_end"]:
             return None
 
-        dayrange = _dayrange()
         # Re-based to this bar's minute first, so that under a reference which
         # moves with the clock the "was" in the log line is this minute's level
         # without the breach rather than last minute's with it -- the breach's
@@ -2928,11 +2867,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
         session_high, session_low = self._read_extremes(frame, ts)
-        high, low = dayrange.updated_range(
+        high, low = day_range.updated_range(
             plan,
             session_high=session_high,
             session_low=session_low,
-            minutes_left=dayrange.minutes_left_at(ts),
+            minutes_left=day_range.minutes_left_at(ts),
             policy=config.breach_update,
             contain=config.contain_range,
             width=breach_width(config, plan),
@@ -3035,7 +2974,6 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         exactly when it matters.
         """
         plan, config = self.plan, self.config
-        dayrange = _dayrange()
         moved = []
         breached_high = before.get("breached_high", plan["pred_high"] != before["pred_high"])
         breached_low = before.get("breached_low", plan["pred_low"] != before["pred_low"])
@@ -3050,8 +2988,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             )
         width = breach_width(config, plan)
         if config.breach_update == BREACH_BROWNIAN:
-            left = dayrange.minutes_left_at(ts)
-            reach = dayrange.brownian_reach(plan["adr14_abs"], left)
+            left = day_range.minutes_left_at(ts)
+            reach = day_range.brownian_reach(plan["adr14_abs"], left)
             how = (
                 f"the extreme so far, extended by the ${reach:,.2f} a driftless walk with "
                 f"this ADR's volatility is still expected to add over the {left:.0f} min left"
@@ -3869,7 +3807,7 @@ def session_levels(
     a change to it shows up in the picture the same day it shows up in the
     trades.
 
-    `forecast` is `dayrange_model.forecast_session`'s dict, `session` the day's
+    `forecast` is a model's `forecast_session` dict, `session` the day's
     minute bars and `opening_end` the last bar of the window the forecast was
     built on -- bars at or before it are skipped, exactly as the loop skips
     trading them. Returns one
@@ -5118,7 +5056,7 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
         """Make HighLow2's forecast once its window has closed, and move its
         levels with every bar after it."""
         part = bundle.get(apple_models.HIGHLOW2_KEY)
-        self.window_minutes = _dayrange().opening_minutes(part)
+        self.window_minutes = day_range.opening_minutes(part)
         if self._levels_day != today:
             self.levels, self.levels_problem, self._levels_day = None, None, today
         if self.levels is None:
@@ -5371,7 +5309,7 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
     levels_model = apple_models.levels_of(config.model_key)
     if levels_model is not None:
         part = bundle.get(levels_model) or {}
-        made = 30 + _dayrange().opening_minutes(part)
+        made = 30 + day_range.opening_minutes(part)
         confirm += (
             f" From 9:{made:02d}, when {apple_models.get(levels_model).label} forecasts today's "
             f"high and low, a buy also needs the bar's close at or under its buy level, "
@@ -5396,9 +5334,9 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     if config.strategy == apple_models.STRATEGY_PROBABILITY:
         return _probability_armed_summary(config, model, bundle)
     metadata = bundle.get("metadata") or {}
-    # TimeToChange3 files its held-out score as `test_metrics_ensemble`, HighLow
-    # and HighLow2 as `test_metrics`; the dollar error is `mae_usd_mean` in all.
-    scores = metadata.get("test_metrics_ensemble") or metadata.get("test_metrics") or {}
+    # HighLow and HighLow2 file their held-out score as `test_metrics`, the
+    # dollar error as `mae_usd_mean`.
+    scores = metadata.get("test_metrics") or {}
     mae = scores.get("mae_usd_mean")
     quality = f", held-out mean error ${mae:.2f}" if mae else ""
     exits = []
@@ -5468,7 +5406,7 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     # When the forecast is made, and of what: the window the bundle reads, and
     # the whole day's extremes or (a HighLow2 bundle with a rest head) those
     # still to come after it.
-    made = 30 + _dayrange().opening_minutes(bundle)
+    made = 30 + day_range.opening_minutes(bundle)
     extremes = (
         f"the rest of today's {config.ticker} high and low"
         if bundle.get("rest_head")

@@ -8,15 +8,8 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Ten overlays
-------------
-`day_range`          TimeToChange3's forecast of where the session's high and
-                     low will land, made once from the first five minutes -- the
-                     model's claim about the *width* of the day. Two price levels
-                     and the band between them while the tape stays inside that
-                     claim; once it trades outside, the forecast is revised for
-                     the rest of the session and the pair is drawn stepped, off
-                     the same walk `trader_levels` uses. See `dayrange_model`.
+Nine overlays
+-------------
 `profile_range`      the LevelsML density model's predicted price profile,
                      reduced to the three numbers a price axis can carry: its
                      outer quantiles and its point of control. The curve itself
@@ -28,9 +21,15 @@ Ten overlays
                      price envelope around the open, scaled to that model's own
                      daily-bar forecast of the day's range. See
                      `intraday_vol_model`, including why that forecast is weak.
-`highlow_range`      HighLow's forecast of the same two numbers, drawn exactly
-                     like `day_range` (flat, or stepped once the session
-                     breaks it). See `highlow_model`.
+`highlow_range`      HighLow's forecast of where the session's high and low
+                     will land, made once from the first five minutes -- the
+                     model's claim about the *width* of the day. Two price
+                     levels and the band between them while the tape stays
+                     inside that claim; once it trades outside, the forecast is
+                     revised for the rest of the session and the pair is drawn
+                     stepped, off the same walk `trader_levels` uses. See
+                     `highlow_model`. (TimeToChange3's `day_range` was drawn
+                     the same way until that model was removed, 2026-10-25.)
 `highlow2_range`     HighLow2's, drawn the same way. See `highlow2_model`.
 `fastfurious_signal` Fast&Furious's forecast of the next 30 minutes' average
                      momentum, read at the close of every bar: a line in bps
@@ -96,9 +95,9 @@ Point-in-time honesty
 ---------------------
 An overlay drawn on a past session must show what the model *could have said
 that morning*, not what it would say knowing how the day ended. Both models
-that see daily history are given completed days only, and today's row is
-assembled from the opening window exactly as the traders assemble it
-(`dayrange_model.session_daily_frame` is the shared seam).
+that see history are given completed sessions only, and today's inputs are
+assembled from the opening window exactly as the traders assemble them (each
+model's own `forecast_session` is the shared seam).
 
 Every model is optional in the same way it is everywhere else: a missing file
 or a missing dependency produces a note explaining why an overlay is empty,
@@ -115,7 +114,7 @@ import numpy as np
 import pandas as pd
 
 from . import (
-    apple_models, clock, event_days, historical, intraday_vol_model, market_hours,
+    apple_models, clock, event_days, intraday_vol_model, market_hours,
     momentum_regime, profile_model,
 )
 from .config import MODEL_OVERLAY_COLORS
@@ -123,7 +122,6 @@ from .config import MODEL_OVERLAY_COLORS
 
 # --- the catalogue ----------------------------------------------------------
 
-DAY_RANGE_KEY = "day_range"
 PROFILE_RANGE_KEY = "profile_range"
 INTRADAY_RANGE_KEY = "intraday_range"
 TRADER_LEVELS_KEY = "trader_levels"
@@ -169,20 +167,6 @@ class ModelOverlay:
 
 
 OVERLAYS: "dict[str, ModelOverlay]" = {
-    DAY_RANGE_KEY: ModelOverlay(
-        key=DAY_RANGE_KEY,
-        label="Predicted day range (TimeToChange3)",
-        name="TimeToChange3",
-        summary=(
-            "TimeToChange3's forecast of the session's high and low, made once from "
-            "the first five minutes. Two levels and the band between them while the "
-            "session stays inside it, and a stepped pair once it trades outside and "
-            "the forecast is revised."
-        ),
-        requires="PyTorch, LightGBM and the day-range bundle",
-        tickers=apple_models.DAYRANGE_TICKERS,
-        models=(apple_models.DAYRANGE_KEY,),
-    ),
     PROFILE_RANGE_KEY: ModelOverlay(
         key=PROFILE_RANGE_KEY,
         label="Predicted price profile range (LevelsML)",
@@ -214,9 +198,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         name="HighLow",
         summary=(
             "HighLow's forecast of the session's high and low, made once from the "
-            "first five minutes and anchored on the 9:35 price. Drawn like the "
-            "TimeToChange3 range: flat while the session stays inside it, stepped "
-            "once it trades outside."
+            "first five minutes and anchored on the 9:35 price. Two levels and the "
+            "band between them while the session stays inside it, and a stepped pair "
+            "once it trades outside and the forecast is revised."
         ),
         requires="PyTorch, LightGBM, the HighLow bundle and Alpaca SIP minute history",
         tickers=apple_models.HIGHLOW_TICKERS,
@@ -305,9 +289,9 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         # Every symbol some Apple Trader model covers: the levels hang off
         # whichever forecast the configured model makes (HighLow alone on MU).
         tickers=tuple(apple_models.tickers()),
-        # Deliberately not `models=(DAYRANGE_KEY,)`, though it is built on that
-        # forecast: `for_models` pre-selects what a *model* said, and these are
-        # one agent's orders, not a forecast of the day.
+        # Deliberately no `models`, though it is built on a model's forecast:
+        # `for_models` pre-selects what a *model* said, and these are one
+        # agent's orders, not a forecast of the day.
         models=(),
     ),
 }
@@ -603,7 +587,6 @@ def compute(
     daily_bars: "list[dict] | None" = None,
     session_date=None,
     open_price: "float | None" = None,
-    dayrange_daily_bars: "list[dict] | None" = None,
     trader_config=None,
     credentials: "tuple[str, str] | None" = None,
     trader_history: "dict | None" = None,
@@ -619,9 +602,6 @@ def compute(
     `session_date` names the day being drawn; it defaults to the last bar's,
     which is what a live caller wants and what a single-day replay wants too.
     `open_price` is the official opening print when the caller has one.
-    `dayrange_daily_bars` is the day-range forecast's own daily history, for a
-    caller whose `daily_bars` cannot serve it (see `live_overlays`); it
-    defaults to `daily_bars`.
 
     `trader_config` is the `AppleTraderConfig` whose orders `trader_levels`
     draws. None means the shipped configuration for this instrument, which is
@@ -637,7 +617,7 @@ def compute(
 
     `trader_history` is a live Apple Trader's own record of what it rested
     (`AppState.apple_trader_levels`). When it is for this symbol and this day,
-    `trader_levels` and the day-range overlay of the model it runs draw it
+    `trader_levels` and the range overlay of the model it runs draw it
     instead of walking the session under `trader_config`: the record carries
     the forecast the run actually made, every sidebar edit at the minute it was
     adopted, and any restart, none of which a walk can know. It is what makes
@@ -667,16 +647,6 @@ def compute(
 
     # Asked for at most once per call, however many overlays draw it.
     memo: dict = {}
-    dayrange_history = (
-        (daily_bars or []) if dayrange_daily_bars is None else dayrange_daily_bars
-    )
-
-    def day_range_forecast() -> dict:
-        if "result" not in memo:
-            memo["result"] = _day_range_forecast(
-                symbol, session, dayrange_history, day, open_price
-            )
-        return memo["result"]
 
     def highlow_forecast(model_key: str = apple_models.HIGHLOW_KEY) -> dict:
         if model_key not in memo:
@@ -701,7 +671,7 @@ def compute(
         model_key = trader_model(trader_config, symbol)
         if model_key in _HIGHLOW_MODULES:
             return highlow_forecast(model_key)
-        return day_range_forecast()
+        return {"forecast": None, "made_at": None, "problem": _not_a_range_model(model_key)}
 
     recorded = _recorded_levels(trader_history, symbol, day)
 
@@ -719,8 +689,7 @@ def compute(
             walked = own + _after_record(own, trader_history, session, recorded[1])
             return _day_range_items(_recorded_result(own), day, symbol, key=key, walked=walked)
         return _day_range_items(
-            forecast(), day, symbol, session,
-            open_price if key == DAY_RANGE_KEY else None, trader_config, key=key,
+            forecast(), day, symbol, session, None, trader_config, key=key,
         )
 
     def trader_items() -> "tuple[list[dict], str]":
@@ -766,7 +735,6 @@ def compute(
         )
 
     builders = {
-        DAY_RANGE_KEY: lambda: range_items(DAY_RANGE_KEY, day_range_forecast),
         PROFILE_RANGE_KEY: lambda: _profile_range_items(
             session, daily_bars or [], day
         ),
@@ -819,8 +787,7 @@ def _session_of(
     return day, session, ""
 
 
-# The range overlay that draws each model's forecast; every other model (the
-# two TimeToChange3 ones) forecasts through TimeToChange3's.
+# The range overlay that draws each day-range model's forecast.
 _RANGE_OVERLAYS = {
     apple_models.HIGHLOW_KEY: HIGHLOW_RANGE_KEY,
     apple_models.HIGHLOW2_KEY: HIGHLOW2_RANGE_KEY,
@@ -831,9 +798,7 @@ def session_forecast(
     model_key: "str | None",
     ticker: str,
     bars: "list[dict]",
-    daily_bars: "list[dict] | None" = None,
     session_date=None,
-    open_price: "float | None" = None,
     credentials: "tuple[str, str] | None" = None,
 ) -> dict:
     """The morning forecast of the session's high and low that an Apple Trader
@@ -843,15 +808,18 @@ def session_forecast(
     `compute` (whose arguments these are), for a chart that wants the two
     numbers themselves -- SimLab's Tuning tab draws one per session over daily
     candles. Returns `{"forecast", "made_at", "problem", "overlay"}`: the first
-    three as `_day_range_forecast` returns them, `overlay` the key of the range
+    three as `_highlow_forecast` returns them, `overlay` the key of the range
     overlay that draws this model's forecast, for its label and colour. A
     hybrid's is its levels model's, which its buy level hangs off.
     """
     symbol = (ticker or "").upper()
     model_key = apple_models.levels_of(model_key) or model_key
-    overlay = _RANGE_OVERLAYS.get(model_key or "", DAY_RANGE_KEY)
+    overlay = _RANGE_OVERLAYS.get(model_key or "", HIGHLOW_RANGE_KEY)
     day, session, problem = _session_of(bars or [], session_date)
-    if apple_models.strategy(model_key) != apple_models.STRATEGY_DAYRANGE:
+    if model_key not in apple_models.MODELS:
+        # `apple_models.get` would answer for the default model instead.
+        result = {"forecast": None, "made_at": None, "problem": _not_a_range_model(model_key)}
+    elif apple_models.strategy(model_key) != apple_models.STRATEGY_DAYRANGE:
         # Its forecast is made every minute and is not a range of the day.
         label = apple_models.get(model_key).label
         what = (
@@ -865,14 +833,12 @@ def session_forecast(
         overlay = _SIGNAL_OVERLAYS.get(model_key, FASTFURIOUS_SIGNAL_KEY)
     elif session is None:
         result = {"forecast": None, "made_at": None, "problem": problem}
-    elif overlay == DAY_RANGE_KEY:
-        result = _day_range_forecast(symbol, session, daily_bars or [], day, open_price)
     else:
         result = _highlow_forecast(symbol, session, day, credentials, model_key)
     return {**result, "overlay": overlay}
 
 
-# --- day range (TimeToChange3) ----------------------------------------------
+# --- day range (HighLow, HighLow2) ------------------------------------------
 
 
 def _session_close(day: pd.Timestamp) -> pd.Timestamp:
@@ -887,50 +853,12 @@ def _session_close(day: pd.Timestamp) -> pd.Timestamp:
     )
 
 
-def _day_range_forecast(
-    symbol: str,
-    session: pd.DataFrame,
-    daily_bars: "list[dict]",
-    day: pd.Timestamp,
-    open_price: "float | None",
-) -> dict:
-    """TimeToChange3's forecast for the session, or why there is none.
-
-    Returns `{"forecast": dict | None, "made_at": Timestamp | None, "problem":
-    str}`. Two overlays draw this one forecast -- the day range itself, and the
-    intraday envelope stretched between its high and low -- so `compute` asks
-    for it once per call and each overlay names itself in the note. Selecting
-    both must not run three networks twice.
-    """
-    def failed(problem: str) -> dict:
-        return {"forecast": None, "made_at": None, "problem": problem}
-
-    try:
-        bundle = apple_models.load(apple_models.DAYRANGE_KEY, symbol)
-        if bundle is None:
-            return failed(apple_models.unavailable_reason(apple_models.DAYRANGE_KEY, symbol))
-
-        from . import dayrange_model  # heavy (torch + LightGBM); only once it is needed
-
-        want = dayrange_model.opening_minutes(bundle)
-        if len(session) < want:
-            return failed(
-                f"the forecast is built on the first {want} minutes and only "
-                f"{len(session)} bars have closed."
-            )
-        opening = session.iloc[:want]
-        if float(opening["minutes_from_open"].iloc[0]) >= 1.0:
-            return failed(
-                f"these bars start at {session.index[0]:%H:%M}, not the 09:30 open, so "
-                "the first five minutes the forecast needs are not here."
-            )
-        history = dayrange_model.daily_frame_from_bars(daily_bars)
-        forecast = dayrange_model.forecast_session(
-            bundle, history, opening, day, open_price=open_price
-        )
-    except Exception as exc:  # a decoration must never take the chart down
-        return failed(str(exc))
-    return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
+def _not_a_range_model(model_key: "str | None") -> str:
+    """Why there is no range to draw under a model this app cannot run."""
+    return (
+        f"'{model_key}' is not a model this app can run any more, so there is no "
+        "forecast to draw under it."
+    )
 
 
 # The module behind each HighLow model, imported only once its forecast is
@@ -940,8 +868,7 @@ _HIGHLOW_MODULES = {
     apple_models.HIGHLOW_KEY: "highlow_model",
     apple_models.HIGHLOW2_KEY: "highlow2_model",
 }
-# What the trader-levels note calls the forecast its levels hang off, when it
-# is not TimeToChange3's.
+# What the trader-levels note calls the forecast its levels hang off.
 _HIGHLOW_NAMES = {
     apple_models.HIGHLOW_KEY: OVERLAYS[HIGHLOW_RANGE_KEY].name,
     apple_models.HIGHLOW2_KEY: OVERLAYS[HIGHLOW2_RANGE_KEY].name,
@@ -956,8 +883,7 @@ def _highlow_forecast(
     model_key: str = apple_models.HIGHLOW_KEY,
 ) -> dict:
     """HighLow's (or HighLow2's, `model_key`) forecast for the session, or why
-    there is none -- the same `{"forecast", "made_at", "problem"}` shape
-    `_day_range_forecast` returns.
+    there is none, as `{"forecast", "made_at", "problem"}`.
 
     Its history is minute bars strictly before `day`, read from the model's
     own cache (`highlow_model.history_frame`, `highlow2_model.history_inputs`),
@@ -1001,7 +927,7 @@ def _day_range_items(
     session: "pd.DataFrame | None" = None,
     open_price: "float | None" = None,
     config=None,
-    key: str = DAY_RANGE_KEY,
+    key: str = HIGHLOW_RANGE_KEY,
     walked: "list[dict] | None" = None,
 ) -> "tuple[list[dict], str]":
     """The predicted high and low, and the range between them.
@@ -1010,7 +936,7 @@ def _day_range_items(
     curves once it does not -- the same shape `trader_levels` draws, for the
     same reason and off the same walk. A forecast the tape has traded through
     is revised during the session (`apple_trader.DayRangeTrader._update_range`,
-    `dayrange_model.contain_session`), and the buy and sell levels are rebuilt
+    `day_range.contain_session`), and the buy and sell levels are rebuilt
     from the revision every time it moves. Drawing the 9:35 numbers flat while
     the levels beneath them step up would put the two halves of one picture in
     disagreement, and the half that was wrong would be the one labelled with
@@ -1019,9 +945,8 @@ def _day_range_items(
     Falls back to the flat 9:35 forecast when there is no session to walk,
     which is what a caller with bars but no usable window has.
 
-    `key` is the overlay being drawn: `day_range` (TimeToChange3),
-    `highlow_range` or `highlow2_range`, which differ only in whose forecast
-    `result` holds.
+    `key` is the overlay being drawn: `highlow_range` or `highlow2_range`,
+    which differ only in whose forecast `result` holds.
 
     `walked` is a live run's own record (`_recorded_levels`), drawn as given in
     place of the walk.
@@ -1169,7 +1094,7 @@ def _after_record(rows: "list[dict]", history: dict, session: pd.DataFrame, conf
 
 
 def _recorded_result(rows: "list[dict]") -> dict:
-    """The forecast a recorded run started from, in `_day_range_forecast`'s shape."""
+    """The forecast a recorded run started from, in `_highlow_forecast`'s shape."""
     first = rows[0]
     return {
         "forecast": {"pred_high": first["pred_high"], "pred_low": first["pred_low"]},
@@ -1622,7 +1547,7 @@ def _hybrid_buy_items(
     `idle`: gray, a walk no running agent rests (`compute`'s `trader_running`)."""
     if model.levels_of is None or rows is None:
         return []
-    parent = OVERLAYS[_RANGE_OVERLAYS.get(model.levels_of, DAY_RANGE_KEY)].name
+    parent = OVERLAYS[_RANGE_OVERLAYS.get(model.levels_of, HIGHLOW_RANGE_KEY)].name
     if isinstance(rows, str):
         return f"no {parent} buy level — {rows}"
     buys = [row.get("buy") for row in rows]
@@ -1940,7 +1865,6 @@ def live_overlays(
         trader_history=history,
         trader_running=running,
         credentials=(getattr(app, "api_key", "") or None, getattr(app, "api_secret", "") or None),
-        **_live_dayrange_inputs(sym_state.symbol, wanted, session_date),
     )
     sym_state.model_overlay_cache = {"key": key, "result": result}
     return result
@@ -1997,34 +1921,3 @@ def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
     if record:
         return record.get("config") or configs.get(key), record
     return configs.get(key), None
-
-
-# The overlays that run TimeToChange3's forecast, and so need its inputs.
-_DAYRANGE_DRIVEN = (DAY_RANGE_KEY,)
-
-
-def _live_dayrange_inputs(
-    symbol: str, wanted: "list[str]", session_date: "datetime | None"
-) -> dict:
-    """The day-range forecast's inputs, fetched the way Apple Trader fetches them.
-
-    The live `SymbolState.daily_bars` is the volume baseline: 365 calendar days
-    off the stream's feed, which is about 250 completed sessions -- short of the
-    253 `dayrange_model.require_history` demands, so every live forecast was
-    refused and the overlay drew nothing. It is also not the unadjusted yfinance
-    series the model was fitted on. So the forecast gets the trader's history
-    (`fetch_daily_ohlc_bars`' 420-day default is `dayrange_model.DAILY_HISTORY_DAYS`)
-    and its official opening print; the other overlays keep the buffer's bars.
-
-    Fetched only when an overlay that needs it is selected for a symbol it
-    covers, and both reads are cached in `historical`. The opening print is
-    today's, so a chart of an earlier session falls back to its first bar.
-    """
-    if not any(k in _DAYRANGE_DRIVEN and OVERLAYS[k].covers(symbol) for k in wanted):
-        return {}
-    today = clock.now().astimezone(market_hours.MARKET_TZ).date()
-    is_today = session_date is not None and session_date.date() == today
-    return {
-        "dayrange_daily_bars": historical.fetch_daily_ohlc_bars(symbol),
-        "open_price": historical.fetch_session_open(symbol) if is_today else None,
-    }

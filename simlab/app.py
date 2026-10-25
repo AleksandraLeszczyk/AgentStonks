@@ -252,14 +252,14 @@ def _render_apple_rules() -> None:
             + ", ".join(apple_models.get(k).label for k in apple_models.keys_for(symbol))
             for symbol in apple_models.tickers()
         )
-        + ". TimeToChange3 was run per ticker."
+        + ". Each model was fitted per ticker."
     )
 
-    st.markdown("##### The day-range rules — `dayrange`")
+    st.markdown("##### The day-range rules — HighLow, HighLow2")
     st.markdown(
         "One question, asked once. At **9:35** the model forecasts where the session's "
-        "high **H** and low will land, from a year of daily history plus the first five "
-        "minutes, and the rest of the day is two levels derived from it "
+        "high **H** and low will land, from the history up to yesterday plus the first "
+        "five minutes, and the rest of the day is two levels derived from it "
         "(TimeToChange3 notebook 05), with **A** the trailing 14-day average daily range "
         "in dollars:\n"
         "- **Buy** when a bar's low reaches `H − buy × A`, well under where the day is "
@@ -339,9 +339,9 @@ def _render_apple_rules() -> None:
                     # A hybrid's levels model rides along under its key.
                     if model.levels_of and bundle.get(model.levels_of):
                         st.markdown(f"*{apple_models.get(model.levels_of).label}*")
-                        _render_dayrange_bundle(bundle[model.levels_of])
+                        _render_range_bundle(bundle[model.levels_of])
                 else:
-                    _render_dayrange_bundle(bundle)
+                    _render_range_bundle(bundle)
 
 
 def _render_fastfurious_bundle(bundle: dict) -> None:
@@ -384,31 +384,26 @@ def _render_goodmoments_bundle(bundle: dict) -> None:
              "params": metadata.get("params")}, expanded=False)
 
 
-def _render_dayrange_bundle(bundle: dict) -> None:
-    """The day-range bundle's provenance, in its own units.
+def _render_range_bundle(bundle: dict) -> None:
+    """A day-range bundle's provenance (HighLow, HighLow2), in its own units.
 
     The error is dollars of misprediction on a price, not an AUC on a label,
     and there is no threshold at all.
     """
     metadata = bundle.get("metadata") or {}
-    test = metadata.get("test_metrics_ensemble") or {}
+    test = metadata.get("test_metrics") or {}
+    data = metadata.get("data") or {}
     cols = st.columns(4)
     cols[0].metric("Blend", " + ".join(bundle.get("daily_models") or []))
     cols[1].metric("Built from", f"first {bundle.get('opening_minutes', 5)} min")
     cols[2].metric("Held-out error", f"${test.get('mae_usd_mean', float('nan')):.2f}")
-    cols[3].metric(
-        "vs 14-day baseline", f"{test.get('skill vs rolling 14d', float('nan')):.0%}"
-    )
+    cols[3].metric("Fitted through", str(data.get("fit_through", "?")))
     st.caption(
-        f"Fitted {bundle.get('trained_at', '?')} on daily bars through "
-        f"{metadata.get('daily_fit_through', '?')}; the opening ridge on "
-        f"{metadata.get('opening_fit_sessions', '?')} sessions after that, with "
-        f"{metadata.get('held_out', '?')} held out of everything. The error is the mean "
-        "absolute miss on the day's high and low over a 129-session test window."
+        f"Saved {bundle.get('trained_at', '?')}. The error is the mean absolute miss on "
+        "the day's high and low over the notebook's test window."
     )
     st.json(
-        {"test_metrics": test, "constraint": metadata.get("constraint"),
-         "opening_correction_gain": metadata.get("opening_correction_loo_gain")},
+        {"test_metrics": test, "weights": metadata.get("weights")},
         expanded=False,
     )
 
@@ -1796,8 +1791,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- The buy rests `buy × unit` below it, the sell `sell × unit` below it.\n"
             "- Each distinct pair is its own configuration in Results — sweeping them is "
             "the intended use.\n"
-            "- The defaults are each instrument's best plateau over the notebook's "
-            "sessions: still only a month or two of days.\n\n"
+            "- The defaults are each model and instrument's Tuning-tab pick: in sample, "
+            "on a few weeks of days.\n\n"
             "No entry mode and no probability — neither means anything to a forecast of "
             "the day's range, and the signature leaves them out so a day-range result is "
             "never filed beside a momentum one."
@@ -1912,14 +1907,10 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "on a yfinance dataset the take and the stop are checked on yfinance's bars.\n"
             "- A stop does not end the session: entries pause 15 minutes, as in the notebook."
         ),
-        "model_dayrange": (
-            "The predicted high, flat for the session — what the shipped buy/sell "
-            "distances were swept against, and what every stored record replays as."
-        ),
         "model_highlow": (
             "The day-range rules on HighLow's predicted high and range. The shipped "
-            "distances were swept on TimeToChange3's forecast, so sweep them again on "
-            "the Tuning tab.\n\n"
+            "distances are Tuning-tab picks, in sample, so sweep them again there once "
+            "more weeks are stored.\n\n"
             "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY "
             "/ ALPACA_SECRET), cached under `data/highlow/` — the first replay fetches it."
         ),
@@ -3668,12 +3659,11 @@ def _tuning_metric_text(metric: str, value) -> str:
     return f"{value:g}"
 
 
-# Two settings a derived grid can differ by that are not numbers, in the short
-# form `config_signature` writes them as — `breach=brownian`, `levels=intraday`
-# — since that is what they are called everywhere else in this app.
+# Settings a derived grid can differ by that are not numbers, in the short
+# form `config_signature` writes them as — `breach=brownian`, `contain` —
+# since that is what they are called everywhere else in this app.
 _SHORT_FIELD_LABELS = {
     "breach_update": "breach",
-    "level_source": "levels",
     "level_unit": "unit",
     "contain_range": "contain",
     "breach_exit": "breach exit",
@@ -4819,22 +4809,17 @@ def _tuning_session_context(job: dict, chosen: "dict | None" = None) -> dict:
 def _tuning_forecast(symbol: str, model_key: str, feed: str, day: str, signature: tuple) -> dict:
     """One session's morning forecast of its high and low, as the replay made it.
 
-    The inputs `_overlay_day` hands the overlays -- the stored tape's opening
-    minutes, completed daily bars strictly before the day and the stored
-    opening print -- so the range is the one every cell's levels hung off at
-    09:35, whatever the configuration did with it afterwards. `signature`
+    The stored tape's opening minutes `_overlay_day` hands the overlays, so the
+    range is the one every cell's levels hung off at 09:35, whatever the
+    configuration did with it afterwards. `signature`
     (`drift.signature`) is the half of the key that moves when the store or
     the model does; a day with no forecast is cached with its reason, as
     `_overlay_day` caches its notes.
     """
     session = date.fromisoformat(day)
     market = SimMarket([symbol], [session], feed)
-    t = market.session_open(session) + timedelta(minutes=1)
     result = model_overlays.session_forecast(
-        model_key, symbol, market.series[symbol].minute_bars,
-        daily_bars=market.completed_daily_bars(symbol, t),
-        session_date=session,
-        open_price=market.session_open_price(symbol, t),
+        model_key, symbol, market.series[symbol].minute_bars, session_date=session,
     )
     forecast = result["forecast"]
     return {

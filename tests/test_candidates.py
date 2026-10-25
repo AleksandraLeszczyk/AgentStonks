@@ -9,7 +9,7 @@ from agent_stonks import candidates as cd
 from agent_stonks.candidates import PairFacts, SelectionRules, select_candidates
 
 
-def facts(key="AAPL:dayrange", target_k=0.5, adr=4.0, price=200.0, **kwargs):
+def facts(key="AAPL:highlow2", target_k=0.5, adr=4.0, price=200.0, **kwargs):
     ticker = key.partition(":")[0]
     base = dict(
         key=key, label=key, ticker=ticker, target_k=target_k,
@@ -28,37 +28,37 @@ class TestTheRules:
     def test_ranks_by_what_a_target_pays_on_the_price_and_keeps_the_best(self):
         result = select_candidates(
             [
-                facts("AAPL:dayrange", target_k=0.5, adr=4.0, price=200.0),   # 1.00%
-                facts("INTC:dayrange", target_k=0.6, adr=1.0, price=25.0),    # 2.40%
-                facts("BE:highlow", target_k=0.1, adr=6.0, price=40.0),       # 1.50%
+                facts("AAPL:highlow2", target_k=0.5, adr=4.0, price=200.0),   # 1.00%
+                facts("INTC:highlow", target_k=0.6, adr=1.0, price=25.0),    # 2.40%
+                facts("NVDA:highlow", target_k=0.1, adr=6.0, price=40.0),       # 1.50%
                 facts("MU:highlow", target_k=0.2, adr=3.0, price=150.0),      # 0.40%
             ],
             SelectionRules(max_pairs=2),
         )
-        assert picked(result) == ["INTC:dayrange", "BE:highlow"]
+        assert picked(result) == ["INTC:highlow", "NVDA:highlow"]
         # In the order given, each with its rank.
         assert [c.facts.key for c in result] == [
-            "AAPL:dayrange", "INTC:dayrange", "BE:highlow", "MU:highlow",
+            "AAPL:highlow2", "INTC:highlow", "NVDA:highlow", "MU:highlow",
         ]
         assert result[0].reason == "ranked #3 of 4; keeps the best 2"
         assert result[1].reason.startswith("#1 of 4 by target (2.40%")
 
     def test_ties_keep_orchestras_order(self):
         result = select_candidates(
-            [facts("AAPL:highlow"), facts("AAPL:dayrange")], SelectionRules(max_pairs=1),
+            [facts("AAPL:highlow"), facts("AAPL:highlow2")], SelectionRules(max_pairs=1),
         )
         assert picked(result) == ["AAPL:highlow"]
 
     def test_zero_keeps_every_eligible_pair(self):
         result = select_candidates(
-            [facts("AAPL:dayrange"), facts("INTC:dayrange"), facts("MU:highlow")],
+            [facts("AAPL:highlow2"), facts("INTC:highlow"), facts("MU:highlow")],
             SelectionRules(max_pairs=0),
         )
         assert len(picked(result)) == 3
 
     def test_earnings_leave_a_pair_out_unless_switched_off(self):
-        f = [facts("AAPL:dayrange", earnings="2026-10-29 16:30 ET"), facts("INTC:dayrange")]
-        assert picked(select_candidates(f, SelectionRules())) == ["INTC:dayrange"]
+        f = [facts("AAPL:highlow2", earnings="2026-10-29 16:30 ET"), facts("INTC:highlow")]
+        assert picked(select_candidates(f, SelectionRules())) == ["INTC:highlow"]
         assert select_candidates(f, SelectionRules())[0].reason == "earnings 2026-10-29 16:30 ET"
         assert len(picked(select_candidates(f, SelectionRules(exclude_earnings=False)))) == 2
 
@@ -69,18 +69,18 @@ class TestTheRules:
         ("off", "high", False),
     ])
     def test_a_bearish_briefing(self, rule, confidence, out):
-        f = [facts("AAPL:dayrange", bias="bearish", confidence=confidence)]
+        f = [facts("AAPL:highlow2", bias="bearish", confidence=confidence)]
         result = select_candidates(f, SelectionRules(exclude_bearish=rule))
         assert (not result[0].selected) == out
 
     def test_a_pair_without_a_briefing_is_not_left_out_for_it(self):
-        f = [facts("AAPL:dayrange", bias=None, confidence=None, briefing_note="no briefing")]
-        assert picked(select_candidates(f, SelectionRules(exclude_bearish="any"))) == ["AAPL:dayrange"]
+        f = [facts("AAPL:highlow2", bias=None, confidence=None, briefing_note="no briefing")]
+        assert picked(select_candidates(f, SelectionRules(exclude_bearish="any"))) == ["AAPL:highlow2"]
 
     def test_the_gap_limit_reads_both_ways(self):
         f = [
-            facts("AAPL:dayrange", open=206.0),   # +1.5 ADR
-            facts("INTC:dayrange", open=194.0),   # -1.5 ADR
+            facts("AAPL:highlow2", open=206.0),   # +1.5 ADR
+            facts("INTC:highlow", open=194.0),   # -1.5 ADR
             facts("MU:highlow", open=202.0),      # +0.5 ADR
         ]
         result = select_candidates(f, SelectionRules(max_gap_adr=1.0, max_pairs=0))
@@ -153,8 +153,8 @@ class TestTheFacts:
             def earnings(self, ticker, day):
                 return [pd.Timestamp("2026-09-14 16:30-04:00")]
 
-        config = SimpleNamespace(ticker="AAPL", model_key="dayrange", buy_k=0.55, sell_k=0.05)
-        f = cd.gather_facts(config, "AAPL · Day Range", state, date(2026, 9, 15), Sources())
+        config = SimpleNamespace(ticker="AAPL", model_key="highlow", buy_k=0.55, sell_k=0.05)
+        f = cd.gather_facts(config, "AAPL · HighLow", state, date(2026, 9, 15), Sources())
         assert (f.prev_close, f.adr, f.open, f.last) == (100.0, 4.0, 101.0, 103.5)
         assert f.gap_adr == pytest.approx(0.25) and f.move_adr == pytest.approx(0.625)
         assert f.target_pct == pytest.approx(100 * 0.5 * 4.0 / 103.5)

@@ -1,9 +1,9 @@
 """Parameter tuning for Apple Trader: sweep one grid over several datasets and sum them.
 
-TimeToChange3's notebook 05 sweeps the buy and sell distances over its sessions
-and reads a profit heatmap; `scripts/sweep_levels.py` turned that into the
-per-ticker defaults this app ships. This module is the same exercise inside
-SimLab, with two differences that are the point of doing it here:
+TimeToChange3's notebook 05 swept the buy and sell distances over its sessions
+and read a profit heatmap; `scripts/sweep_levels.py` turned that into the
+per-ticker defaults this app shipped first. This module is the same exercise
+inside SimLab, with two differences that are the point of doing it here:
 
 * **every cell is a real replay.** Each combination runs through
   `SimulationEngine` with the real `DayRangeTrader` -- market fills near the

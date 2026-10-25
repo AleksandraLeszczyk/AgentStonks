@@ -3,9 +3,9 @@
 Three things are worth pinning, and they are the three ways this module can be
 wrong without anyone noticing.
 
-**The mirrored paths.** `model_catalogue` reads the day-range sidecar
-without importing the module that owns it, because that module imports
-PyTorch at module scope and a tab that lists model names must not drag a
+**The mirrored paths.** `model_catalogue` reads the saved models' sidecars
+without importing the modules that own them, because those import PyTorch or
+LightGBM at module scope and a tab that lists model names must not drag a
 200 MB dependency into the process. The price of that is a copy of their
 `model_path` lookup, and the copy has to keep agreeing -- a renamed file or a
 new env override would otherwise show a user a path nothing reads. These tests
@@ -37,23 +37,14 @@ from agent_stonks import apple_models, model_catalogue as mc
 
 # --- the mirrored paths -----------------------------------------------------
 
-@pytest.mark.parametrize("ticker", ["AAPL", "GOOGL", "INTC"])
-def test_dayrange_path_mirrors_the_real_one(ticker):
-    dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-    assert mc._saved_path(
-        "APPLE_DAYRANGE_MODEL", "timetochange3_dayrange_{ticker}.joblib", ticker
-    ) == dayrange.model_path(ticker)
-
-
-def test_dayrange_sidecar_paths_mirror_the_real_ones():
-    dayrange = pytest.importorskip("agent_stonks.dayrange_model")
-    spec = mc.spec(apple_models.DAYRANGE_KEY, "AAPL")
+@pytest.mark.parametrize("ticker", ["AAPL", "INTC"])
+def test_highlow_path_mirrors_the_real_one(ticker):
+    highlow = pytest.importorskip("agent_stonks.highlow_model")
+    spec = mc.spec(apple_models.HIGHLOW_KEY, ticker)
     by_role = {f.role: f.path for f in spec.files}
-    real = dayrange.model_path("AAPL")
+    real = highlow.model_path(ticker)
     assert by_role["bundle"] == real
-    assert by_role["N-BEATS weights"] == dayrange.checkpoint_path("nbeats", real)
-    assert by_role["N-HiTS weights"] == dayrange.checkpoint_path("nhits", real)
-    assert by_role["metadata"] == dayrange.metadata_path(real)
+    assert by_role["metadata"] == real.with_suffix(".json")
 
 
 @pytest.mark.parametrize("ticker", ["AAPL", "NVDA"])
@@ -67,14 +58,14 @@ def test_fastfurious_path_mirrors_the_real_one(ticker):
 def test_per_ticker_env_override_does_not_answer_for_other_symbols(monkeypatch, tmp_path):
     """The distinction each model module is careful about: the bare env var names
     one file, so it can only mean the default ticker's."""
-    monkeypatch.setenv("APPLE_DAYRANGE_MODEL", str(tmp_path / "only_aapl.joblib"))
-    pattern = "timetochange3_dayrange_{ticker}.joblib"
-    assert mc._saved_path("APPLE_DAYRANGE_MODEL", pattern, "AAPL").name == "only_aapl.joblib"
-    assert mc._saved_path("APPLE_DAYRANGE_MODEL", pattern, "GOOGL").name == (
-        "timetochange3_dayrange_GOOGL.joblib"
+    monkeypatch.setenv("APPLE_HIGHLOW_MODEL", str(tmp_path / "only_aapl.joblib"))
+    pattern = "highlow15m_{ticker}.joblib"
+    assert mc._saved_path("APPLE_HIGHLOW_MODEL", pattern, "AAPL").name == "only_aapl.joblib"
+    assert mc._saved_path("APPLE_HIGHLOW_MODEL", pattern, "INTC").name == (
+        "highlow15m_INTC.joblib"
     )
-    monkeypatch.setenv("APPLE_DAYRANGE_MODEL_GOOGL", str(tmp_path / "googl.joblib"))
-    assert mc._saved_path("APPLE_DAYRANGE_MODEL", pattern, "GOOGL").name == "googl.joblib"
+    monkeypatch.setenv("APPLE_HIGHLOW_MODEL_INTC", str(tmp_path / "intc.joblib"))
+    assert mc._saved_path("APPLE_HIGHLOW_MODEL", pattern, "INTC").name == "intc.joblib"
 
 
 # --- reading a spec off the files -------------------------------------------
@@ -93,109 +84,6 @@ def test_open_profile_spec_reads_the_gzipped_pack():
 
 
 # --- the day-range headline -------------------------------------------------
-
-DAYRANGE_SIDECAR = {
-    "created": "2026-09-09T16:09:02",
-    "daily_fit_through": "2026-07-09",
-    "opening_correction": True,
-    "held_out": "2026-08-28",
-    "test_metrics_ensemble": {"mae_mean": 0.008, "mae_usd_mean": 2.4},
-    # prev_avg 200, adr14_abs 4 -> a normal day is 2% of the price, so an
-    # error of 0.008 log units is 40% of one.
-    "sim_date_forecast": {"date": "2026-08-28", "prev_avg": 200.0, "adr14_abs": 4.0},
-}
-
-
-def _dayrange_spec_from(meta, tmp_path, monkeypatch, ticker="AAPL"):
-    """A spec built off a sidecar written here, with no bundle beside it.
-
-    The bundle's absence makes the spec *unavailable*, which is orthogonal to
-    what these tests read: the headline is assembled from the JSON either way.
-    """
-    bundle = tmp_path / "timetochange3_dayrange_TEST.joblib"
-    if meta is not None:
-        bundle.with_suffix(".json").write_text(json.dumps(meta))
-    monkeypatch.setenv(f"APPLE_DAYRANGE_MODEL_{ticker}", str(bundle))
-    return mc.spec(apple_models.DAYRANGE_KEY, ticker)
-
-
-class TestDayRangeErrorPctAdr:
-    """The headline is a ratio of two things the sidecar records separately.
-
-    Both sides are fractions of a price -- the MAE because the target is a log
-    ratio, the ADR because it is divided by the day it was measured on -- so
-    the price cancels and what is left is "how much of a normal day the model
-    misses by", which is the unit the trading rules are written in.
-    """
-
-    def test_the_ratio_is_the_log_mae_over_the_relative_adr(self):
-        assert mc.dayrange_error_pct_adr(DAYRANGE_SIDECAR) == pytest.approx(40.0)
-
-    def test_the_spec_leads_with_it(self, tmp_path, monkeypatch):
-        spec = _dayrange_spec_from(DAYRANGE_SIDECAR, tmp_path, monkeypatch)
-        assert spec.headline == ("MAE (% of ADR)", "40.0%")
-        # First in the metrics table too, and numeric so the table formats it.
-        assert next(iter(spec.metrics)) == "MAE (% of ADR)"
-        assert spec.metrics["MAE (% of ADR)"] == pytest.approx(40.0)
-        assert "40% of a typical day's range" in spec.caveat
-
-    @pytest.mark.parametrize("meta", [
-        {k: v for k, v in DAYRANGE_SIDECAR.items() if k != "sim_date_forecast"},
-        {**DAYRANGE_SIDECAR, "sim_date_forecast": {"prev_avg": 200.0, "adr14_abs": 0.0}},
-        {**DAYRANGE_SIDECAR, "test_metrics_ensemble": {}},
-        {},
-    ])
-    def test_no_adr_to_divide_by_is_no_percentage(self, meta):
-        """A percentage of an assumed range would be worse than the raw error."""
-        assert mc.dayrange_error_pct_adr(meta) is None
-
-    def test_the_headline_falls_back_to_the_log_mae(self, tmp_path, monkeypatch):
-        meta = {k: v for k, v in DAYRANGE_SIDECAR.items() if k != "sim_date_forecast"}
-        spec = _dayrange_spec_from(meta, tmp_path, monkeypatch)
-        assert spec.headline == ("MAE (log units)", "0.00800")
-        assert "MAE (% of ADR)" not in spec.metrics
-
-    def test_an_unreadable_sidecar_still_builds_a_spec(self, tmp_path, monkeypatch):
-        spec = _dayrange_spec_from(None, tmp_path, monkeypatch)
-        assert spec.headline == ("MAE (log units)", "—")
-        assert not spec.available
-
-
-# A refit sidecar with no simulation day (INTC's): the ADR comes from the SIP
-# rollups over the sidecar's test window, as for HighLow. 20 sessions of 2%.
-REFIT_SESSIONS = {
-    f"2026-01-{day:02d}": {"high": 100.0 * math.exp(0.02), "low": 100.0}
-    for day in range(1, 21)
-}
-REFIT_SIDECAR = {
-    "ticker": "INTC",
-    "test_metrics_ensemble": {"mae_mean": 0.005},
-    "test_window": "2026-01-15 .. 2026-01-20 (6 sessions)",
-}
-
-
-class TestDayRangeErrorPctAdrFromTheSessionCache:
-    def test_a_sidecar_without_a_simulation_day_uses_the_cached_window_adr(self):
-        assert mc.dayrange_error_pct_adr(REFIT_SIDECAR, REFIT_SESSIONS) == pytest.approx(25.0)
-
-    def test_the_simulation_day_still_wins_when_there_is_one(self):
-        meta = {**DAYRANGE_SIDECAR, "test_window": REFIT_SIDECAR["test_window"]}
-        assert mc.dayrange_error_pct_adr(meta, REFIT_SESSIONS) == pytest.approx(40.0)
-
-    @pytest.mark.parametrize("meta, sessions", [
-        (REFIT_SIDECAR, {}),
-        ({**REFIT_SIDECAR, "test_window": ""}, REFIT_SESSIONS),
-        ({**REFIT_SIDECAR, "test_window": "not a window"}, REFIT_SESSIONS),
-        ({**REFIT_SIDECAR, "test_metrics_ensemble": {}}, REFIT_SESSIONS),
-    ])
-    def test_nothing_to_measure_is_no_percentage(self, meta, sessions):
-        assert mc.dayrange_error_pct_adr(meta, sessions) is None
-
-    def test_the_spec_leads_with_it(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mc, "_highlow_sessions", lambda ticker: REFIT_SESSIONS)
-        spec = _dayrange_spec_from(REFIT_SIDECAR, tmp_path, monkeypatch, ticker="INTC")
-        assert spec.headline == ("MAE (% of ADR)", "25.0%")
-
 
 def test_highlow_history_dir_mirrors_the_real_one():
     highlow = pytest.importorskip("agent_stonks.highlow_model")
@@ -273,7 +161,7 @@ class TestHighLowErrorPctAdr:
         assert "MAE (% of ADR)" not in spec.metrics
 
     def test_the_notebooks_own_adr_score_wins_over_the_estimate(self, tmp_path, monkeypatch):
-        """AVGO's and NVDA's sidecars (2026-10-04) score the test window in ADR
+        """NVDA's sidecar (2026-10-04) and the ones after it score the test window in ADR
         units per session; that is the exact figure, so the cache is not read."""
         meta = {**HIGHLOW_SIDECAR, "test_metrics": {**HIGHLOW_SIDECAR["test_metrics"], "mae_adr_mean": 27.13},
                 "weights": {"lgbm": 0.5, "nbeats": 0.0, "nhits": 0.5}}

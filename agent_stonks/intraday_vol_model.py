@@ -16,7 +16,7 @@ day_range  a HAR forecast of the day's log high-low range from daily bars:
 Together they answer the question the chart overlay asks -- how wide should the
 price be allowed to swing *at this time of day* -- in two ways that differ only
 in where the day's extremes come from (`envelope`): this model's own day-range
-forecast, or TimeToChange3's predicted high and low.
+forecast, or another model's predicted high and low.
 
 What it is not
 --------------

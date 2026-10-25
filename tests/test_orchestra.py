@@ -118,7 +118,7 @@ def make_state(symbols) -> AppState:
     return state
 
 
-def racer(ticker, model_key="dayrange", **kwargs):
+def racer(ticker, model_key="highlow", **kwargs):
     return replace(dayrange_config(**kwargs), ticker=ticker, model_key=model_key)
 
 
@@ -150,7 +150,7 @@ class TestDaysOff:
         race.run_cycle(state, tracker)
 
         board = {row["key"]: row["status"] for row in state.orchestra["board"]}
-        assert board["AAPL:dayrange"] == "sits out today (Geopolitical shock)"
+        assert board["AAPL:highlow"] == "sits out today (Geopolitical shock)"
         assert [f[:2] for f in fills(tracker)] == [("INTC", "buy")]
 
 
@@ -168,13 +168,13 @@ class TestFirstFillTakesTheRace:
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01))
         assert race.run_cycle(state, tracker) == "bought"
 
-        assert race.holder == "AAPL:dayrange"
+        assert race.holder == "AAPL:highlow"
         assert [f[:2] for f in fills(tracker)] == [("AAPL", "buy")]
         assert tracker.position_for("INTC") == 0
         refusals = [e["text"] for e in state.agent_log if "Orchestra is following" in e.get("text", "")]
         assert len(refusals) == 1 and refusals[0].startswith("INTC reached its buy level")
         board = {row["key"]: row["status"] for row in state.orchestra["board"]}
-        assert board == {"AAPL:dayrange": "holding", "INTC:dayrange": "waiting for the holder"}
+        assert board == {"AAPL:highlow": "holding", "INTC:highlow": "waiting for the holder"}
 
     def test_a_gated_racer_is_reported_once_per_holding(self, market_open, monkeypatch):
         broker = Broker2()
@@ -190,7 +190,7 @@ class TestFirstFillTakesTheRace:
             race.run_cycle(state, tracker)
         refusals = [e for e in state.agent_log if "Orchestra is following" in e.get("text", "")]
         assert len(refusals) == 1
-        assert refusals[0]["racer"] == "INTC · Day Range"
+        assert refusals[0]["racer"] == "INTC · HighLow"
 
 
 class TestTheRaceReopens:
@@ -213,7 +213,7 @@ class TestTheRaceReopens:
 
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
         assert race.run_cycle(state, tracker) == "bought"
-        assert race.holder == "INTC:dayrange"
+        assert race.holder == "INTC:highlow"
         assert [f[:2] for f in fills(tracker)] == [
             ("AAPL", "buy"), ("AAPL", "sell"), ("INTC", "buy"),
         ]
@@ -231,11 +231,11 @@ class TestTheRaceReopens:
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
-        assert race.holder == "AAPL:dayrange"
+        assert race.holder == "AAPL:highlow"
 
         tapes.bar(AAPL=(109.5, 109.0, SELL_LEVEL + 0.5), INTC=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
-        assert race.holder == "INTC:dayrange"
+        assert race.holder == "INTC:highlow"
         assert [f[:2] for f in fills(tracker)][-2:] == [("AAPL", "sell"), ("INTC", "buy")]
 
     def test_a_breaker_stand_down_keeps_the_others_racing(self, market_open, monkeypatch):
@@ -254,9 +254,9 @@ class TestTheRaceReopens:
 
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01))
         assert race.run_cycle(state, tracker) == "bought"
-        assert race.holder == "INTC:dayrange"
+        assert race.holder == "INTC:highlow"
         statuses = {row["key"]: row["status"] for row in state.orchestra["board"]}
-        assert statuses["AAPL:dayrange"].startswith("stood down")
+        assert statuses["AAPL:highlow"].startswith("stood down")
 
 
 class TestOneSymbolTwoModels:
@@ -269,25 +269,25 @@ class TestOneSymbolTwoModels:
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tapes = Tapes(monkeypatch, ["AAPL"], broker)
         state = make_state(["AAPL"])
-        first = racer("AAPL", "dayrange")
+        first = racer("AAPL", "highlow")
         # A shallower buy and an earlier sell under the second model.
-        second = racer("AAPL", "highlow", buy_k=0.40, sell_k=0.30)
+        second = racer("AAPL", "highlow2", buy_k=0.40, sell_k=0.30)
         race = make_race(first, second)
         race.run_cycle(state, tracker)
 
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
-        assert race.holder == "AAPL:dayrange"
-        assert race.by_key["AAPL:highlow"].trader.entry is None
+        assert race.holder == "AAPL:highlow"
+        assert race.by_key["AAPL:highlow2"].trader.entry is None
 
         # Through the second racer's sell level (107.00) but not the holder's:
         # nothing is sold, because the second racer holds nothing.
         tapes.bar(AAPL=(107.5, 107.0, 107.5))
         race.run_cycle(state, tracker)
         assert [f[:2] for f in fills(tracker)] == [("AAPL", "buy")]
-        assert race.by_key["AAPL:highlow"].trader.entry is None
+        assert race.by_key["AAPL:highlow2"].trader.entry is None
         # Each racer keeps its own record, under its own key.
-        assert set(state.orchestra_levels) == {"AAPL:dayrange", "AAPL:highlow"}
+        assert set(state.orchestra_levels) == {"AAPL:highlow", "AAPL:highlow2"}
         assert state.apple_trader_levels is None
 
 
@@ -303,7 +303,7 @@ class TestStopOut:
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(99.0, 98.0, 99.5))
         assert race.run_cycle(state, tracker) == "sold"
-        assert race.halt and race.halt.startswith("AAPL · Day Range")
+        assert race.halt and race.halt.startswith("AAPL · HighLow")
 
         # A replay keeps going bar by bar: the race stays down all session.
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
@@ -319,7 +319,7 @@ class TestStopOut:
         race.run_cycle(state, tracker)
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
         assert race.run_cycle(state, tracker) == "bought"
-        assert race.halt is None and race.holder == "INTC:dayrange"
+        assert race.halt is None and race.holder == "INTC:highlow"
 
 
 class TestARaceOfOneIsASingleRun:
@@ -396,13 +396,13 @@ class TestOrchestraConfig:
         assert not isinstance(stale[0], at.AppleTraderConfig)
         race = ar.OrchestraConfig(stale)
         assert race.racers == [aapl, intc]
-        assert ar.racer_label(stale[1]) == ar.racer_label("INTC:dayrange")
+        assert ar.racer_label(stale[1]) == ar.racer_label("INTC:highlow")
 
     def test_build_takes_each_pairs_own_tuned_numbers(self):
-        race = ar.build_orchestra_config(["INTC:dayrange", "AAPL:highlow"], at.AppleTraderConfig())
+        race = ar.build_orchestra_config(["INTC:highlow", "AAPL:highlow2"], at.AppleTraderConfig())
         intc, aapl = race.racers
-        assert (intc.buy_k, intc.sell_k) == at.dayrange_levels("INTC", "dayrange")
-        assert (aapl.buy_k, aapl.sell_k) == at.dayrange_levels("AAPL", "highlow")
+        assert (intc.buy_k, intc.sell_k) == at.dayrange_levels("INTC", "highlow")
+        assert (aapl.buy_k, aapl.sell_k) == at.dayrange_levels("AAPL", "highlow2")
         assert race.tickers == ["INTC", "AAPL"]
 
     def test_build_takes_edited_numbers_where_given(self):
@@ -413,9 +413,9 @@ class TestOrchestraConfig:
         assert (mu.buy_k, mu.sell_k, mu.min_win_k) == (0.9, 0.2, 0.05)
 
     def test_signature_names_every_pair_and_the_shared_rules_once(self):
-        race = ar.build_orchestra_config(["AAPL:dayrange", "MU:highlow"], at.AppleTraderConfig())
+        race = ar.build_orchestra_config(["AAPL:highlow", "MU:highlow"], at.AppleTraderConfig())
         sig = ar.orchestra_signature(race)
-        assert sig.startswith("orchestra[dayrange_AAPL@")
+        assert sig.startswith("orchestra[highlow_AAPL@")
         assert ",highlow_MU@" in sig
         assert sig.count("size=") == 1
         assert "min_win=" not in sig
@@ -432,7 +432,7 @@ class TestTheChartAndTheSessionFile:
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
         state = make_state(["AAPL", "INTC"])
-        race = make_race(racer("AAPL", "dayrange"), racer("AAPL", "highlow"), racer("INTC"))
+        race = make_race(racer("AAPL", "highlow"), racer("AAPL", "highlow2"), racer("INTC"))
         race.run_cycle(state, tracker)
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
@@ -442,7 +442,7 @@ class TestTheChartAndTheSessionFile:
     def test_a_symbols_chart_draws_its_first_racer_or_the_holder(self, market_open, monkeypatch):
         state, _ = self._raced(monkeypatch)
         config, record = model_overlays.live_trader_view(state, "AAPL")
-        assert config.model_key == "dayrange" and record["ticker"] == "AAPL"
+        assert config.model_key == "highlow" and record["ticker"] == "AAPL"
         config, record = model_overlays.live_trader_view(state, "INTC")
         assert config.ticker == "INTC" and record["memory"]["entry"] is not None
         assert model_overlays.live_trader_view(state, "MU") == (None, None)
@@ -455,20 +455,20 @@ class TestTheChartAndTheSessionFile:
         record = session_store.loads(session_store.dumps(session_store.capture(state)))
         fresh = AppState()
         session_store.restore(fresh, record)
-        assert set(fresh.orchestra_levels) == {"AAPL:dayrange", "AAPL:highlow", "INTC:dayrange"}
-        assert fresh.orchestra["holder"] == "INTC:dayrange"
+        assert set(fresh.orchestra_levels) == {"AAPL:highlow", "AAPL:highlow2", "INTC:highlow"}
+        assert fresh.orchestra["holder"] == "INTC:highlow"
         assert fresh.orchestra["running"] is False
-        assert fresh.orchestra_levels["INTC:dayrange"]["memory"]["entry"] is not None
+        assert fresh.orchestra_levels["INTC:highlow"]["memory"]["entry"] is not None
 
     def test_a_restarted_race_follows_the_racer_the_ledger_still_holds(
         self, market_open, monkeypatch
     ):
         state, tracker = self._raced(monkeypatch)
-        race = make_race(racer("AAPL", "dayrange"), racer("AAPL", "highlow"), racer("INTC"))
+        race = make_race(racer("AAPL", "highlow"), racer("AAPL", "highlow2"), racer("INTC"))
         race.run_cycle(state, tracker)
-        assert race.holder == "INTC:dayrange"
+        assert race.holder == "INTC:highlow"
         # Its own memory came back with it: the fill, not a re-adoption.
-        assert race.by_key["INTC:dayrange"].trader.entry["price"] == pytest.approx(103.0)
+        assert race.by_key["INTC:highlow"].trader.entry["price"] == pytest.approx(103.0)
 
 
 class TestTheLiveLoop:
@@ -539,8 +539,8 @@ class TestTheLiveLoop:
         loop.join(timeout=10)
 
         errors = [e["text"] for e in state.agent_log if e["type"] == "error"]
-        assert any(t.startswith("INTC · Day Range is left out of Orchestra") for t in errors)
-        assert state.orchestra["order"] == ["AAPL:dayrange"]
+        assert any(t.startswith("INTC · HighLow is left out of Orchestra") for t in errors)
+        assert state.orchestra["order"] == ["AAPL:highlow"]
 
 
 
@@ -603,10 +603,10 @@ class TestTheMorningPick:
         tapes.opening_bar()
         race.run_cycle(state, tracker)
         picked = state.orchestra["selection"]
-        assert [r["key"] for r in picked["rows"] if r["selected"]] == ["INTC:dayrange"]
-        assert set(race.benched) == {"AAPL:dayrange", "MU:dayrange"}
+        assert [r["key"] for r in picked["rows"] if r["selected"]] == ["INTC:highlow"]
+        assert set(race.benched) == {"AAPL:highlow", "MU:highlow"}
         line = next(e["text"] for e in state.agent_log if e["text"].startswith("Candidates at 09:34"))
-        assert "INTC · Day Range" in line and "Left out: AAPL · Day Range" in line
+        assert "INTC · HighLow" in line and "Left out: AAPL · HighLow" in line
 
         # 09:35: only the candidate forecasts, and only it may buy.
         tapes.opening_bar()
@@ -618,7 +618,7 @@ class TestTheMorningPick:
         assert race.run_cycle(state, tracker) == "bought"
         assert [f[:2] for f in fills(tracker)] == [("INTC", "buy")]
         statuses = {row["key"]: row["status"] for row in state.orchestra["board"]}
-        assert statuses["AAPL:dayrange"].startswith("sits out today (ranked #")
+        assert statuses["AAPL:highlow"].startswith("sits out today (ranked #")
 
     def test_a_confidently_bearish_morning_keeps_a_pair_out(self, market_open, monkeypatch):
         from agent_stonks.candidates import SelectionRules
@@ -633,7 +633,7 @@ class TestTheMorningPick:
             sources=_Sources(briefings={"AAPL": {"bias": "bearish", "confidence": "high"}}),
         )
         race.run_cycle(state, tracker)
-        assert race.benched == {"AAPL:dayrange": "bearish briefing, high confidence"}
+        assert race.benched == {"AAPL:highlow": "bearish briefing, high confidence"}
 
     def test_earnings_since_the_last_close_keep_a_pair_out(self, market_open, monkeypatch):
         from agent_stonks.candidates import SelectionRules
@@ -648,8 +648,8 @@ class TestTheMorningPick:
             sources=_Sources(earnings={"INTC": [pd.Timestamp("2026-07-20 16:05-04:00")]}),
         )
         race.run_cycle(state, tracker)
-        assert list(race.benched) == ["INTC:dayrange"]
-        assert race.benched["INTC:dayrange"].startswith("earnings 2026-07-20 16:05")
+        assert list(race.benched) == ["INTC:highlow"]
+        assert race.benched["INTC:highlow"].startswith("earnings 2026-07-20 16:05")
 
     def test_a_restart_keeps_the_mornings_pick(self, market_open, monkeypatch):
         from agent_stonks.candidates import SelectionRules
@@ -660,13 +660,13 @@ class TestTheMorningPick:
         state = make_state(["AAPL", "INTC"])
         rules = SelectionRules(max_pairs=1)
         make_race(racer("AAPL"), racer("INTC"), selection=rules, sources=_Sources()).run_cycle(state, tracker)
-        assert [r["key"] for r in state.orchestra["selection"]["rows"] if r["selected"]] == ["INTC:dayrange"]
+        assert [r["key"] for r in state.orchestra["selection"]["rows"] if r["selected"]] == ["INTC:highlow"]
 
         # Later the same morning the facts would say otherwise; the pick stands.
         _daily(monkeypatch, {"AAPL": 9.0, "INTC": 1.0})
         again = make_race(racer("AAPL"), racer("INTC"), selection=rules, sources=_Sources())
         again.run_cycle(state, tracker)
-        assert list(again.benched) == ["AAPL:dayrange"]
+        assert list(again.benched) == ["AAPL:highlow"]
         assert any(e["text"].startswith("Keeping today's candidates") for e in state.agent_log)
 
     def test_the_selection_is_in_the_signature_and_the_record(self):
@@ -675,7 +675,7 @@ class TestTheMorningPick:
 
         agent = rule_agent(ar.ORCHESTRA_KEY)
         race = ar.build_orchestra_config(
-            ["AAPL:dayrange", "INTC:dayrange"], at.AppleTraderConfig(),
+            ["AAPL:highlow", "INTC:highlow"], at.AppleTraderConfig(),
             selection=SelectionRules(max_pairs=1, briefing_provider="gemini", briefing_model="g"),
         )
         assert ",select=1,earn,bear=high,brief=gemini/g)" in ar.orchestra_signature(race)
@@ -694,7 +694,7 @@ def make_split(shares: dict, *configs) -> ar.Orchestra:
     return ar.build_orchestra(race, {k: BUNDLE for k in race.keys})
 
 
-def flat_racer(ticker, model_key="dayrange", **kwargs):
+def flat_racer(ticker, model_key="highlow", **kwargs):
     """A racer with no stop unless a test gives it one: a bar that dips to one
     pair's buy level must not stop out another pair already holding."""
     kwargs.setdefault("stop_gain_fraction", 0.0)
@@ -708,7 +708,7 @@ class TestSplit:
         tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
         state = make_state(["AAPL", "INTC"])
         race = make_split(
-            {"AAPL:dayrange": 60.0, "INTC:dayrange": 40.0}, flat_racer("AAPL"), flat_racer("INTC"),
+            {"AAPL:highlow": 60.0, "INTC:highlow": 40.0}, flat_racer("AAPL"), flat_racer("INTC"),
         )
         race.run_cycle(state, tracker)
         assert race.budget_base == 10_000.0
@@ -719,22 +719,22 @@ class TestSplit:
         # 95% of each pair's own share, at the $103 close: 5,700 / 103 and 3,800 / 103.
         assert fills(tracker) == [("AAPL", "buy", 55.0), ("INTC", "buy", 36.0)]
         fee = tracker.trade_cost
-        aapl, intc = race.accounts["AAPL:dayrange"], race.accounts["INTC:dayrange"]
+        aapl, intc = race.accounts["AAPL:highlow"], race.accounts["INTC:highlow"]
         assert aapl.cash == pytest.approx(6_000.0 - 55 * 103.0 - fee)
         assert intc.cash == pytest.approx(4_000.0 - 36 * 103.0 - fee)
         assert (aapl.shares, intc.shares) == (55.0, 36.0)
-        assert race.holder is None and state.orchestra["holders"] == ["AAPL:dayrange", "INTC:dayrange"]
+        assert race.holder is None and state.orchestra["holders"] == ["AAPL:highlow", "INTC:highlow"]
         assert not any("Orchestra is following" in e.get("text", "") for e in state.agent_log)
         board = {row["key"]: row for row in state.orchestra["board"]}
-        assert board["AAPL:dayrange"]["status"] == board["INTC:dayrange"]["status"] == "holding"
-        assert board["INTC:dayrange"]["budget_pct"] == 40.0
+        assert board["AAPL:highlow"]["status"] == board["INTC:highlow"]["status"] == "holding"
+        assert board["INTC:highlow"]["budget_pct"] == 40.0
 
     def test_what_no_pair_is_given_stays_in_cash(self, market_open, monkeypatch):
         broker = Broker2()
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tapes = Tapes(monkeypatch, ["AAPL"], broker)
         state = make_state(["AAPL"])
-        race = make_split({"AAPL:dayrange": 30.0}, flat_racer("AAPL"))
+        race = make_split({"AAPL:highlow": 30.0}, flat_racer("AAPL"))
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
@@ -748,9 +748,9 @@ class TestSplit:
         state = make_state(["AAPL"])
         # HighLow buys at 106.00 and sells at 107.00; the day range at 102.50 / 109.00.
         race = make_split(
-            {"AAPL:dayrange": 50.0, "AAPL:highlow": 50.0},
-            flat_racer("AAPL", "dayrange"),
-            flat_racer("AAPL", "highlow", buy_k=0.40, sell_k=0.30),
+            {"AAPL:highlow": 50.0, "AAPL:highlow2": 50.0},
+            flat_racer("AAPL", "highlow"),
+            flat_racer("AAPL", "highlow2", buy_k=0.40, sell_k=0.30),
         )
         race.run_cycle(state, tracker)
 
@@ -767,9 +767,9 @@ class TestSplit:
         assert race.run_cycle(state, tracker) == "sold"
         assert fills(tracker)[-1] == ("AAPL", "sell", 44.0)
         assert tracker.position_for("AAPL") == 46.0
-        assert race.accounts["AAPL:highlow"].shares == 0.0
-        assert race.by_key["AAPL:dayrange"].trader.entry["price"] == pytest.approx(103.0)
-        assert state.orchestra["holders"] == ["AAPL:dayrange"]
+        assert race.accounts["AAPL:highlow2"].shares == 0.0
+        assert race.by_key["AAPL:highlow"].trader.entry["price"] == pytest.approx(103.0)
+        assert state.orchestra["holders"] == ["AAPL:highlow"]
 
     def test_a_stop_out_stands_only_that_pair_down(self, market_open, monkeypatch):
         broker = Broker2()
@@ -777,7 +777,7 @@ class TestSplit:
         tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
         state = make_state(["AAPL", "INTC"])
         race = make_split(
-            {"AAPL:dayrange": 50.0, "INTC:dayrange": 50.0},
+            {"AAPL:highlow": 50.0, "INTC:highlow": 50.0},
             racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5),
         )
         race.run_cycle(state, tracker)
@@ -788,7 +788,7 @@ class TestSplit:
         # Nothing stops the agent: the others have positions to manage.
         assert race.halt is None
         assert any(
-            e.get("text", "").startswith("AAPL · Day Range stopped out: it sits out the rest")
+            e.get("text", "").startswith("AAPL · HighLow stopped out: it sits out the rest")
             for e in state.agent_log
         )
 
@@ -796,42 +796,42 @@ class TestSplit:
         assert race.run_cycle(state, tracker) == "bought"
         assert [f[:2] for f in fills(tracker)] == [("AAPL", "buy"), ("AAPL", "sell"), ("INTC", "buy")]
         statuses = {row["key"]: row["status"] for row in state.orchestra["board"]}
-        assert statuses["AAPL:dayrange"] == "stood down (stopped out)"
+        assert statuses["AAPL:highlow"] == "stood down (stopped out)"
 
         # Started again the same day (a crash, or ▶ Stop and ▶ Start): the
         # stopped pair stays out -- the run never stopped, so this is no say-so.
         race.publish_memory(state)
         again = make_split(
-            {"AAPL:dayrange": 50.0, "INTC:dayrange": 50.0},
+            {"AAPL:highlow": 50.0, "INTC:highlow": 50.0},
             racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5),
         )
         again.run_cycle(state, tracker)
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=104.0)
         again.run_cycle(state, tracker)
         assert [f[:2] for f in fills(tracker)][-1] == ("INTC", "buy")
-        assert again.by_key["AAPL:dayrange"].trader.plan["stand_down"] == "stopped out"
+        assert again.by_key["AAPL:highlow"].trader.plan["stand_down"] == "stopped out"
 
     def test_a_restart_continues_the_days_budget_and_accounts(self, market_open, monkeypatch):
         broker = Broker2()
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
         state = make_state(["AAPL", "INTC"])
-        shares = {"AAPL:dayrange": 50.0, "INTC:dayrange": 40.0}
+        shares = {"AAPL:highlow": 50.0, "INTC:highlow": 40.0}
         race = make_split(shares, flat_racer("AAPL"), flat_racer("INTC"))
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
         race.publish_memory(state)
-        aapl = race.accounts["AAPL:dayrange"]
+        aapl = race.accounts["AAPL:highlow"]
 
         # The ledger is now mostly AAPL; the budget is not re-read off it, and
         # INTC's share of it is moved up, out of the cash nobody was given.
-        again = make_split({**shares, "INTC:dayrange": 50.0}, flat_racer("AAPL"), flat_racer("INTC"))
+        again = make_split({**shares, "INTC:highlow": 50.0}, flat_racer("AAPL"), flat_racer("INTC"))
         again.run_cycle(state, tracker)
         assert again.budget_base == 10_000.0
-        assert again.accounts["AAPL:dayrange"] == aapl
-        assert again.accounts["INTC:dayrange"].cash == pytest.approx(5_000.0)
-        assert again.by_key["AAPL:dayrange"].trader.entry["price"] == pytest.approx(103.0)
+        assert again.accounts["AAPL:highlow"] == aapl
+        assert again.accounts["INTC:highlow"].cash == pytest.approx(5_000.0)
+        assert again.by_key["AAPL:highlow"].trader.entry["price"] == pytest.approx(103.0)
 
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
         again.run_cycle(state, tracker)
@@ -845,7 +845,7 @@ class TestSplit:
         tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
         state = make_state(["AAPL", "INTC"])
         race = make_split(
-            {"AAPL:dayrange": 50.0, "INTC:dayrange": 25.0}, flat_racer("AAPL"), flat_racer("INTC"),
+            {"AAPL:highlow": 50.0, "INTC:highlow": 25.0}, flat_racer("AAPL"), flat_racer("INTC"),
         )
         race.run_cycle(state, tracker)
         tapes.bar(INTC=(103.0, BUY_LEVEL - 0.01))
@@ -855,12 +855,12 @@ class TestSplit:
         fresh = AppState()
         session_store.restore(fresh, record)
         assert fresh.orchestra["mode"] == "split"
-        assert fresh.orchestra["holders"] == ["INTC:dayrange"]
+        assert fresh.orchestra["holders"] == ["INTC:highlow"]
         budget = fresh.orchestra["budget"]
         assert budget["base"] == 10_000.0
         # 95% of $2,500 at $103.
-        assert budget["accounts"]["INTC:dayrange"]["shares"] == 23.0
-        assert budget["accounts"]["AAPL:dayrange"] == {"pct": 50.0, "cash": 5_000.0, "shares": 0.0}
+        assert budget["accounts"]["INTC:highlow"]["shares"] == 23.0
+        assert budget["accounts"]["AAPL:highlow"] == {"pct": 50.0, "cash": 5_000.0, "shares": 0.0}
 
     def test_a_ledger_already_holding_is_booked_to_the_first_pair_on_it(
         self, market_open, monkeypatch
@@ -873,14 +873,14 @@ class TestSplit:
         tracker.record_trade("AAPL", "buy", 20, "earlier", "k", "s")
         monkeypatch.setattr(state, "mark_price", lambda symbol: 100.0)
         race = make_split(
-            {"AAPL:dayrange": 50.0, "INTC:dayrange": 50.0}, flat_racer("AAPL"), flat_racer("INTC"),
+            {"AAPL:highlow": 50.0, "INTC:highlow": 50.0}, flat_racer("AAPL"), flat_racer("INTC"),
         )
         race.run_cycle(state, tracker)
         cash = 10_000.0 - 2_000.0 - tracker.trade_cost
         assert race.budget_base == pytest.approx(cash + 2_000.0)
-        assert race.accounts["AAPL:dayrange"].shares == 20.0
-        assert race.accounts["AAPL:dayrange"].cash == pytest.approx(race.budget_base / 2 - 2_000.0)
-        assert race.accounts["INTC:dayrange"].cash == pytest.approx(race.budget_base / 2)
+        assert race.accounts["AAPL:highlow"].shares == 20.0
+        assert race.accounts["AAPL:highlow"].cash == pytest.approx(race.budget_base / 2 - 2_000.0)
+        assert race.accounts["INTC:highlow"].cash == pytest.approx(race.budget_base / 2)
         del tapes
 
     def test_shares_sold_outside_the_app_come_off_the_last_pair_on_the_symbol(
@@ -891,9 +891,9 @@ class TestSplit:
         tapes = Tapes(monkeypatch, ["AAPL"], broker)
         state = make_state(["AAPL"])
         race = make_split(
-            {"AAPL:dayrange": 50.0, "AAPL:highlow": 50.0},
-            flat_racer("AAPL", "dayrange"),
-            flat_racer("AAPL", "highlow", buy_k=0.40, sell_k=0.30),
+            {"AAPL:highlow": 50.0, "AAPL:highlow2": 50.0},
+            flat_racer("AAPL", "highlow"),
+            flat_racer("AAPL", "highlow2", buy_k=0.40, sell_k=0.30),
         )
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(106.5, 105.9, 106.6))
@@ -907,9 +907,9 @@ class TestSplit:
         # Above HighLow's 106.00 buy, so the flat pair does not buy straight back.
         tapes.bar(AAPL=(106.8, 106.2, 106.9))
         race.run_cycle(state, tracker)
-        assert race.accounts["AAPL:highlow"].shares == 0.0
-        assert race.accounts["AAPL:dayrange"].shares == 40.0
-        assert state.orchestra["holders"] == ["AAPL:dayrange"]
+        assert race.accounts["AAPL:highlow2"].shares == 0.0
+        assert race.accounts["AAPL:highlow"].shares == 40.0
+        assert state.orchestra["holders"] == ["AAPL:highlow"]
 
     def test_a_restart_hands_a_dropped_pairs_shares_to_the_next_pair_on_it(
         self, market_open, monkeypatch
@@ -920,20 +920,20 @@ class TestSplit:
         state = make_state(["AAPL"])
         monkeypatch.setattr(state, "mark_price", lambda symbol: 106.5)
         race = make_split(
-            {"AAPL:highlow": 50.0, "AAPL:dayrange": 50.0},
-            flat_racer("AAPL", "highlow", buy_k=0.40, sell_k=0.30),
-            flat_racer("AAPL", "dayrange"),
+            {"AAPL:highlow2": 50.0, "AAPL:highlow": 50.0},
+            flat_racer("AAPL", "highlow2", buy_k=0.40, sell_k=0.30),
+            flat_racer("AAPL", "highlow"),
         )
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(106.5, 105.9, 106.6))
         race.run_cycle(state, tracker)
-        assert race.accounts["AAPL:highlow"].shares == 44.0
+        assert race.accounts["AAPL:highlow2"].shares == 44.0
 
         # Started again without HighLow: its 44 are the day range's to manage.
-        again = make_split({"AAPL:dayrange": 50.0}, flat_racer("AAPL", "dayrange"))
+        again = make_split({"AAPL:highlow": 50.0}, flat_racer("AAPL", "highlow"))
         again.run_cycle(state, tracker)
-        assert again.accounts["AAPL:dayrange"].shares == 44.0
-        assert again.accounts["AAPL:dayrange"].cash == pytest.approx(5_000.0 - 44 * 106.5)
+        assert again.accounts["AAPL:highlow"].shares == 44.0
+        assert again.accounts["AAPL:highlow"].cash == pytest.approx(5_000.0 - 44 * 106.5)
         assert any("no pair bought" in e.get("text", "") for e in state.agent_log)
 
     def test_the_chart_draws_the_pair_holding_the_symbol(self, market_open, monkeypatch):
@@ -942,16 +942,16 @@ class TestSplit:
         tapes = Tapes(monkeypatch, ["AAPL"], broker)
         state = make_state(["AAPL"])
         race = make_split(
-            {"AAPL:dayrange": 50.0, "AAPL:highlow": 50.0},
-            flat_racer("AAPL", "dayrange"),
-            flat_racer("AAPL", "highlow", buy_k=0.40, sell_k=0.30),
+            {"AAPL:highlow": 50.0, "AAPL:highlow2": 50.0},
+            flat_racer("AAPL", "highlow"),
+            flat_racer("AAPL", "highlow2", buy_k=0.40, sell_k=0.30),
         )
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(106.5, 105.9, 106.6))
         race.run_cycle(state, tracker)
         race.publish_memory(state)
         config, record = model_overlays.live_trader_view(state, "AAPL")
-        assert config.model_key == "highlow" and record["memory"]["entry"] is not None
+        assert config.model_key == "highlow2" and record["memory"]["entry"] is not None
 
 
 class TestASplitOfOneIsASingleRun:
@@ -971,7 +971,7 @@ class TestASplitOfOneIsASingleRun:
             state = make_state(["AAPL"])
             config = racer("AAPL", **kwargs)
             if as_split:
-                race = make_split({"AAPL:dayrange": 100.0}, config)
+                race = make_split({"AAPL:highlow": 100.0}, config)
                 cycle = lambda: race.run_cycle(state, tracker)  # noqa: E731
             else:
                 trader = at.DayRangeTrader(config)
@@ -995,14 +995,14 @@ class TestSplitConfig:
         with pytest.raises(ValueError, match="at most 100%"):
             ar.OrchestraConfig(
                 [racer("AAPL"), racer("INTC")], mode=ar.MODE_SPLIT,
-                budget_pct={"AAPL:dayrange": 60.0, "INTC:dayrange": 50.0},
+                budget_pct={"AAPL:highlow": 60.0, "INTC:highlow": 50.0},
             )
 
     def test_refuses_a_pair_without_a_share(self):
-        with pytest.raises(ValueError, match="INTC · Day Range has no share"):
+        with pytest.raises(ValueError, match="INTC · HighLow has no share"):
             ar.OrchestraConfig(
                 [racer("AAPL"), racer("INTC")], mode=ar.MODE_SPLIT,
-                budget_pct={"AAPL:dayrange": 60.0},
+                budget_pct={"AAPL:highlow": 60.0},
             )
 
     def test_refuses_the_morning_pick(self):
@@ -1010,7 +1010,7 @@ class TestSplitConfig:
 
         with pytest.raises(ValueError, match="09:34"):
             ar.OrchestraConfig(
-                [racer("AAPL")], mode=ar.MODE_SPLIT, budget_pct={"AAPL:dayrange": 100.0},
+                [racer("AAPL")], mode=ar.MODE_SPLIT, budget_pct={"AAPL:highlow": 100.0},
                 selection=SelectionRules(),
             )
 
@@ -1018,12 +1018,12 @@ class TestSplitConfig:
         # A pair left out of the run takes its share into cash.
         race = ar.OrchestraConfig(
             [racer("AAPL")], mode=ar.MODE_SPLIT,
-            budget_pct={"AAPL:dayrange": 60.0, "INTC:dayrange": 40.0},
+            budget_pct={"AAPL:highlow": 60.0, "INTC:highlow": 40.0},
         )
-        assert race.budget_pct == {"AAPL:dayrange": 60.0}
+        assert race.budget_pct == {"AAPL:highlow": 60.0}
 
     def test_a_race_carries_no_shares(self):
-        race = ar.OrchestraConfig([racer("AAPL")], budget_pct={"AAPL:dayrange": 60.0})
+        race = ar.OrchestraConfig([racer("AAPL")], budget_pct={"AAPL:highlow": 60.0})
         assert race.mode == ar.MODE_RACE and race.budget_pct == {}
 
     def test_signature_and_record(self):
@@ -1031,18 +1031,18 @@ class TestSplitConfig:
 
         agent = rule_agent(ar.ORCHESTRA_KEY)
         split = ar.build_orchestra_config(
-            ["AAPL:dayrange", "MU:highlow"], at.AppleTraderConfig(),
-            mode=ar.MODE_SPLIT, budget_pct={"AAPL:dayrange": 60.0, "MU:highlow": 40.0},
+            ["AAPL:highlow", "MU:highlow"], at.AppleTraderConfig(),
+            mode=ar.MODE_SPLIT, budget_pct={"AAPL:highlow": 60.0, "MU:highlow": 40.0},
         )
         sig = ar.orchestra_signature(split)
-        assert sig.startswith("orchestra[split:dayrange_AAPL@") and "=60%," in sig
+        assert sig.startswith("orchestra[split:highlow_AAPL@") and "=60%," in sig
         assert sig.split("](")[0].endswith("=40%")
         assert agent.from_record(agent.to_record(split)) == split
         # A race signs as it always has, and a record from before the split
         # existed is a race.
-        race = ar.build_orchestra_config(["AAPL:dayrange", "MU:highlow"], at.AppleTraderConfig())
+        race = ar.build_orchestra_config(["AAPL:highlow", "MU:highlow"], at.AppleTraderConfig())
         pairs = ar.orchestra_signature(race).split("](")[0]
-        assert pairs.startswith("orchestra[dayrange_AAPL@") and "%" not in pairs
+        assert pairs.startswith("orchestra[highlow_AAPL@") and "%" not in pairs
         legacy = agent.to_record(race)
         del legacy["mode"], legacy["budget_pct"]
         assert agent.from_record(legacy) == race
@@ -1066,8 +1066,8 @@ class TestPairMinWinBox:
     """Each pair's circuit breaker is switched off by its own box, like Apple
     Trader's; the threshold is kept, greyed out."""
 
-    PAIRS = ["AAPL:dayrange", "INTC:dayrange"]
-    KEY, BOX = "o_min_win_k_dayrange_INTC", "o_min_win_on_dayrange_INTC"
+    PAIRS = ["AAPL:highlow", "INTC:highlow"]
+    KEY, BOX = "o_min_win_k_highlow_INTC", "o_min_win_on_highlow_INTC"
 
     def _run(self, **state):
         from streamlit.testing.v1 import AppTest
@@ -1089,8 +1089,8 @@ class TestPairMinWinBox:
         assert app.checkbox(key=self.BOX).value is True
         assert not app.number_input(key=self.KEY).disabled
         assert self._min_wins(app) == {
-            "AAPL": pytest.approx(at.min_win_for("AAPL", "dayrange")),
-            "INTC": pytest.approx(at.min_win_for("INTC", "dayrange")),
+            "AAPL": pytest.approx(at.min_win_for("AAPL", "highlow")),
+            "INTC": pytest.approx(at.min_win_for("INTC", "highlow")),
         }
 
     def test_unticking_one_pair_leaves_the_other_on(self):
@@ -1100,10 +1100,10 @@ class TestPairMinWinBox:
         assert app.number_input(key=self.KEY).disabled
         wins = self._min_wins(app)
         assert wins["INTC"] == 0.0
-        assert wins["AAPL"] == pytest.approx(at.min_win_for("AAPL", "dayrange"))
+        assert wins["AAPL"] == pytest.approx(at.min_win_for("AAPL", "highlow"))
         sig = ar.orchestra_signature(app.session_state["out"])
-        assert "dayrange_AAPL@" in sig and "/mw" in sig.split("dayrange_INTC@")[0]
-        assert "/mw" not in sig.split("dayrange_INTC@")[1].split(",")[0]
+        assert "highlow_AAPL@" in sig and "/mw" in sig.split("highlow_INTC@")[0]
+        assert "/mw" not in sig.split("highlow_INTC@")[1].split(",")[0]
         app.checkbox(key=self.BOX).check().run()
         assert self._min_wins(app)["INTC"] == pytest.approx(0.07)
 
