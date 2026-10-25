@@ -64,6 +64,7 @@ from agent_stonks.market_hours import MARKET_TZ, is_market_open
 from . import data as sim_data
 from . import drift as sim_drift
 from . import experiments as sim_experiments
+from . import ml_summary
 from . import prompts as sim_prompts
 from . import results as sim_results
 from . import session_context as sim_session
@@ -5545,6 +5546,347 @@ def _render_tuning_results(jobs: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ML summary — the models' base configurations, read off the tuning jobs
+# ---------------------------------------------------------------------------
+
+_ML_WINDOWS = {
+    ml_summary.WEEK: "Last week",
+    ml_summary.MONTH: "Last month",
+    ml_summary.ALL: "All tuning data",
+}
+# One colour per model on the bar chart, in the order the models rank.
+_ML_MODEL_COLORS = ["#60a5fa", "#26c6a2", "#fb923c", "#a78bfa", "#f472b6", "#facc15", "#818cf8"]
+
+
+def _ml_pair(model_key: str, ticker: str) -> str:
+    """`AMD · HighLow`: an instrument and the model it trades on."""
+    return f"{ticker} · {_apple_model_label(model_key).replace(' model', '')}"
+
+
+def _ml_day(day: str) -> str:
+    return date.fromisoformat(day).strftime("%a %d %b")
+
+
+def _ml_usd(value: float) -> str:
+    """A signed whole-dollar amount outside markdown (a metric, a chart label)."""
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.0f}"
+
+
+def render_ml_summary_tab() -> None:
+    st.caption(
+        "How each model has done lately in its base configuration, instrument by "
+        "instrument, and how it did on event days — CPI and jobs reports, the day after "
+        "earnings, geopolitical and market shocks — against a normal day. Nothing is "
+        "replayed here: every tuning job replays its base configuration beside the grid "
+        "(its *Base profit*), and this reads those replays, one job per model and "
+        "instrument — the one reaching the latest session, the newest on a tie, since "
+        "two jobs' bases are two different configurations."
+    )
+    series = ml_summary.base_series(sim_tuning.list_jobs())
+    if not series:
+        st.info(
+            "No tuning job has replayed a base configuration yet — start one in the Tuning tab.",
+            icon=":material/tune:",
+        )
+        return
+    name = st.segmented_control(
+        "Window", list(_ML_WINDOWS), format_func=_ML_WINDOWS.get,
+        default=ml_summary.MONTH, key="ml_summary_window",
+    ) or ml_summary.MONTH
+    span = ml_summary.window(series, name)
+    rows = [r for r in (ml_summary.pair_metrics(s, span) for s in series) if r]
+    missing = [_ml_pair(s.model_key, s.ticker) for s in series if s.last_day < span[0]]
+    first = min(d for s in series for d in s.daily if d >= span[0])
+    st.caption(
+        f"Sessions {_ml_day(first)} → {_ml_day(span[1])} {span[1][:4]}, counted back from "
+        "the latest session any tuning job has replayed. Every session counts, traded or "
+        "not, and each pair is its own account at the job's starting cash."
+        + (f" Not replayed in this window: {', '.join(missing)}." if missing else "")
+    )
+    if rows:
+        _render_ml_models(rows, ml_summary.weekly(series, span))
+    st.divider()
+    _render_ml_events(series, span)
+
+
+def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
+    models = ml_summary.model_metrics(rows)
+    st.markdown("##### :material/leaderboard: Models in their base configuration")
+    best_pair = max(rows, key=lambda r: r["per_session"])
+    worst_pair = min(rows, key=lambda r: r["per_session"])
+    up = sum(1 for r in rows if r["profit"] > 0)
+    with st.container(horizontal=True):
+        st.metric(
+            "Best model", _apple_model_label(models[0]["model_key"]),
+            f"{_ml_usd(models[0]['per_session'])} a session", border=True,
+            help="Its mean profit a session over the instruments it trades.",
+        )
+        st.metric(
+            "Best instrument", _ml_pair(best_pair["model_key"], best_pair["ticker"]),
+            f"{_ml_usd(best_pair['per_session'])} a session", border=True,
+        )
+        st.metric(
+            "Worst instrument", _ml_pair(worst_pair["model_key"], worst_pair["ticker"]),
+            f"{_ml_usd(worst_pair['per_session'])} a session", border=True,
+        )
+        st.metric(
+            "Pairs in profit", f"{up} of {len(rows)}", border=True,
+            help="Model × instrument pairs whose base made money over the window.",
+        )
+
+    money = st.column_config.NumberColumn
+    colors = {m["model_key"]: _ML_MODEL_COLORS[i % len(_ML_MODEL_COLORS)] for i, m in enumerate(models)}
+    st.dataframe(pd.DataFrame([
+        {
+            "model": _apple_model_label(m["model_key"]),
+            "per_session": m["per_session"],
+            "profit": m["profit"],
+            "in_profit": f"{m['in_profit']} of {m['instruments']}",
+            "best": m["best"],
+            "worst": m["worst"],
+        }
+        for m in models
+    ]), hide_index=True, column_config={
+        "model": "Model",
+        "per_session": money(
+            "Profit a session ($)", format="%+.2f",
+            help="The mean over its instruments of each one's profit a session: every "
+            "instrument is its own account, so each counts alike.",
+        ),
+        "profit": money("Total profit ($)", format="%+.2f", help="Summed over its instruments."),
+        "in_profit": "Instruments in profit",
+        "best": "Best instrument",
+        "worst": "Worst instrument",
+    })
+
+    ordered = sorted(rows, key=lambda r: r["per_session"])
+    fig = go.Figure()
+    for m in models:
+        group = [r for r in ordered if r["model_key"] == m["model_key"]]
+        fig.add_trace(go.Bar(
+            x=[r["per_session"] for r in group],
+            y=[_ml_pair(r["model_key"], r["ticker"]) for r in group],
+            orientation="h", name=_apple_model_label(m["model_key"]),
+            marker_color=colors[m["model_key"]],
+            text=[_ml_usd(r["per_session"]) for r in group], textposition="outside",
+            hovertemplate="%{y}: %{x:+,.2f} $ a session<extra></extra>",
+        ))
+    fig.update_yaxes(
+        categoryorder="array",
+        categoryarray=[_ml_pair(r["model_key"], r["ticker"]) for r in ordered],
+    )
+    fig.update_layout(
+        title="Profit a session, by instrument ($)", barmode="overlay",
+        legend=dict(orientation="h", y=-0.15),
+    )
+    st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(rows) + 120)))
+
+    st.dataframe(pd.DataFrame([
+        {
+            "ticker": r["ticker"],
+            "model": _apple_model_label(r["model_key"]),
+            "per_session": r["per_session"],
+            "return_pct": r["return_pct"],
+            "profit": r["profit"],
+            "sessions": r["sessions"],
+            "days": f"{r['days_up']} up · {r['days_down']} down",
+            "best_day": r["best_day"],
+            "worst_day": r["worst_day"],
+            "skips": ", ".join(ml_summary.event_label(c) for c in r["skip_events"]) or "—",
+            "signature": r["signature"],
+            "job": r["job_id"] + (f" (of {r['jobs']})" if r["jobs"] > 1 else ""),
+        }
+        for r in sorted(rows, key=lambda r: r["per_session"], reverse=True)
+    ]), hide_index=True, column_config={
+        "ticker": "Instrument",
+        "model": "Model",
+        "per_session": money("Profit a session ($)", format="%+.2f"),
+        "return_pct": money("Return a session", format="%+.3f%%",
+                            help="Profit a session as a share of the starting cash."),
+        "profit": money("Total profit ($)", format="%+.2f"),
+        "sessions": "Sessions",
+        "days": "Days",
+        "best_day": money("Best day ($)", format="%+.2f"),
+        "worst_day": money("Worst day ($)", format="%+.2f"),
+        "skips": st.column_config.TextColumn(
+            "Base sits out",
+            help="The days its base configuration makes no trade on by rule (`skip_events`): "
+            "those count as flat sessions above and are left out of the event comparison.",
+        ),
+        "signature": st.column_config.TextColumn("Base configuration", width="medium"),
+        "job": st.column_config.TextColumn(
+            "Tuning job", help="The job read for this pair, and how many the pair has.",
+        ),
+    })
+
+    weeks = sorted({w["week"] for w in weekly})
+    if len(weeks) > 1:
+        pairs = [_ml_pair(r["model_key"], r["ticker"]) for r in ordered]
+        cells = {(_ml_pair(w["model_key"], w["ticker"]), w["week"]): w for w in weekly}
+        z = [[(cells.get((p, w)) or {}).get("per_session") for w in weeks] for p in pairs]
+        # A window rarely starts on a Monday, so its first week can be a day or two.
+        sessions = [[(cells.get((p, w)) or {}).get("sessions") or 0 for w in weeks] for p in pairs]
+        fig = go.Figure(go.Heatmap(
+            z=z, x=[f"w/c {_ml_day(w)}" for w in weeks], y=pairs, customdata=sessions,
+            text=[[_ml_usd(v) if v is not None else "" for v in row] for row in z],
+            texttemplate="%{text}", colorscale="RdYlGn", zmid=0, hoverongaps=False,
+            colorbar=dict(title="$ a session"),
+            hovertemplate="%{y}, %{x}: %{z:+,.2f} $ a session over %{customdata} "
+            "sessions<extra></extra>",
+        ))
+        fig.update_layout(title="Week by week: profit a session ($)")
+        st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(pairs) + 120)))
+
+
+def _render_ml_events(series: "list[ml_summary.BaseSeries]", span: "tuple[str, str]") -> None:
+    st.markdown("##### :material/event: Event days against a normal day")
+    days = [d for s in series for d in s.daily]
+    events = ml_summary.events_by_day(sorted({s.ticker for s in series}), days)
+    impact, normals = ml_summary.event_impact(series, events, span)
+    if not impact:
+        st.info(
+            "No event day in this window — no CPI or jobs report, no report for any of the "
+            "instruments, no shock the calendar or a briefing flagged.",
+            icon=":material/event_available:",
+        )
+        return
+    summaries = ml_summary.event_summaries(impact)
+    lines = [_ml_event_line(g) for g in summaries]
+    instruments = ml_summary.instrument_impact(impact)
+    better = [i for i in instruments if i["delta"] > 0]
+    worse = [i for i in reversed(instruments) if i["delta"] <= 0]
+
+    def instrument_text(i: dict) -> str:
+        return (
+            f"**{i['ticker']}** {_tuning_usd(i['delta'])} a session against a normal day "
+            f"({_tuning_usd(i['event_mean'])} on event days, {_tuning_usd(i['normal_mean'])} "
+            f"normally; {i['better']} of {i['sessions']} better)"
+        )
+
+    if better:
+        lines.append(":green[**Did better on event days:**] " + "; ".join(map(instrument_text, better)))
+    if worse:
+        lines.append(":red[**Did worse on event days:**] " + "; ".join(map(instrument_text, worse)))
+    st.markdown("\n".join(f"- {line}" for line in lines))
+    counted = [n["normal_days"] for n in normals if n["normal_days"]]
+    st.caption(
+        f"{len(summaries)} event day{'s' if len(summaries) != 1 else ''} in the window, each a "
+        "single session per pair, set against the pair's own mean on the window's normal "
+        f"days ({min(counted)}–{max(counted)} of them): what happened, not an estimate of what "
+        "an event does. A normal day has no event and was traded under a forecast; a session "
+        "the base sat out by its own rule is not counted either way. Events are dated after "
+        "the fact — the calendar's every row, the day after a report, a shock a pre-market "
+        "briefing flagged — so a shock that broke mid-session counts here although no trader "
+        "could have sat it out."
+        if counted else ""
+    )
+
+    columns = sorted({r["day"] for r in impact})
+    pairs = sorted(
+        {(r["model_key"], r["ticker"]) for r in impact}, key=lambda p: (p[1], p[0]), reverse=True
+    )
+    by_cell = {(r["model_key"], r["ticker"], r["day"]): r for r in impact}
+    # A day's column names every event any pair had on it, an instrument's own
+    # (a report) with the instrument.
+    labels: "dict[str, dict[str, None]]" = {}
+    for r in impact:
+        labels.setdefault(r["day"], {}).update(
+            dict.fromkeys(e.label + (f" ({e.scope})" if e.scope else "") for e in r["events"])
+        )
+    z, text = [], []
+    for model_key, ticker in pairs:
+        z_row, text_row = [], []
+        for day in columns:
+            row = by_cell.get((model_key, ticker, day))
+            z_row.append(row["delta"] if row and row["delta"] is not None else None)
+            text_row.append(
+                "" if row is None else "sat out" if row["sat_out"]
+                else "no forecast" if row["delta"] is None else _ml_usd(row["delta"])
+            )
+        z.append(z_row)
+        text.append(text_row)
+    fig = go.Figure(go.Heatmap(
+        z=z, x=[f"{_ml_day(d)} · {' + '.join(labels[d])}" for d in columns],
+        y=[_ml_pair(m, t) for m, t in pairs],
+        text=text, texttemplate="%{text}", colorscale="RdYlGn", zmid=0, hoverongaps=False,
+        colorbar=dict(title="$ vs normal"),
+        hovertemplate="%{y}, %{x}: %{z:+,.2f} $ against a normal day<extra></extra>",
+    ))
+    fig.update_layout(title="What each event day made against a normal day ($)")
+    st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(pairs) + 140)))
+
+    money = st.column_config.NumberColumn
+    with st.expander(f"Every event session ({len(impact)})", icon=":material/table_rows:"):
+        st.dataframe(pd.DataFrame([
+            {
+                "day": r["day"],
+                "event": " + ".join(
+                    e.label + (f" ({e.what})" if e.what else "") for e in r["events"]
+                ),
+                "ticker": r["ticker"],
+                "model": _apple_model_label(r["model_key"]),
+                "profit": r["profit"],
+                "normal": r["normal_mean"],
+                "delta": r["delta"],
+                "sigma": r["sigma"],
+                "note": "sat out by its base" if r["sat_out"]
+                else "no forecast" if r["delta"] is None else "",
+            }
+            for r in sorted(impact, key=lambda r: (r["day"], r["ticker"]), reverse=True)
+        ]), hide_index=True, column_config={
+            "day": "Day",
+            "event": st.column_config.TextColumn("Event", width="large"),
+            "ticker": "Instrument",
+            "model": "Model",
+            "profit": money("Profit ($)", format="%+.2f"),
+            "normal": money("Normal day ($)", format="%+.2f",
+                            help="The pair's mean profit on the window's normal days."),
+            "delta": money("Against normal ($)", format="%+.2f"),
+            "sigma": money(
+                "In normal spreads", format="%+.1f",
+                help="The difference in standard deviations of the pair's normal days: "
+                "beyond ±1 is a session out of the ordinary for that pair.",
+            ),
+            "note": "Note",
+        })
+
+
+def _ml_event_line(group: dict) -> str:
+    """One event day as an insight line: what it was, and who did better or
+    worse on it than on a normal day."""
+    scopes = sorted({e.scope for e in group["events"] if e.scope})
+    what = " + ".join(e.label for e in group["events"])
+    head = f"**{_ml_day(group['day'])} · {what}**" + (f" ({', '.join(scopes)})" if scopes else "")
+    rows = group["rows"]
+    skipped = group["skipped"]
+    tail = ""
+    if skipped:
+        sat = sum(1 for r in skipped if r["sat_out"])
+        parts = []
+        if sat:
+            parts.append(f"{sat} sat it out by {'its' if sat == 1 else 'their'} base")
+        if len(skipped) - sat:
+            parts.append(f"{len(skipped) - sat} had no forecast")
+        tail = " (" + ", ".join(parts) + ")"
+    if not rows:
+        return f"{head} — not traded{tail}."
+    if len(rows) == 1:
+        r = rows[0]
+        return (
+            f"{head} — {_ml_pair(r['model_key'], r['ticker'])} made {_tuning_usd(r['profit'])}, "
+            f"\\${abs(r['delta']):,.0f} {'more' if r['delta'] >= 0 else 'less'} than on "
+            f"a normal day ({_tuning_usd(r['normal_mean'])}){tail}."
+        )
+    best, worst = group["best"], group["worst"]
+    return (
+        f"{head} — {group['better']} of {len(rows)} pairs made more than on a normal day{tail}. "
+        f"Best: {_ml_pair(best['model_key'], best['ticker'])} {_tuning_usd(best['delta'])} "
+        f"against normal; worst: {_ml_pair(worst['model_key'], worst['ticker'])} "
+        f"{_tuning_usd(worst['delta'])}."
+    )
+
+
+# ---------------------------------------------------------------------------
 
 # The tab bar, as labels rather than as a literal list at the call site: the
 # active tab is session state now (`TAB_STATE_KEY`), and the value stored there
@@ -5557,17 +5899,19 @@ def _render_tuning_results(jobs: list[dict]) -> None:
 # follows both, being about the models again, as they have held up rather than
 # as they were saved. Then the datasets, the runs, and what the runs came to:
 # Results one at a time and Summary across all of them, which is the last thing
-# there is to look at.
+# there is to look at. ML summary closes the models' group: what the tuning jobs'
+# base replays say about each model lately, and on event days.
 TAB_AGENTS = ":material/smart_toy: Agents"
 TAB_MODELS = ":material/neurology: ML Models"
 TAB_TUNING = ":material/tune: Tuning"
 TAB_DRIFT = ":material/monitoring: Drift"
+TAB_ML_SUMMARY = ":material/query_stats: ML summary"
 TAB_DATASETS = ":material/database: Datasets"
 TAB_SIMULATE = ":material/play_circle: Simulate"
 TAB_RESULTS = ":material/insights: Results"
 TAB_SUMMARY = ":material/leaderboard: Summary"
 SIMLAB_TABS = [
-    TAB_AGENTS, TAB_MODELS, TAB_TUNING, TAB_DRIFT,
+    TAB_AGENTS, TAB_MODELS, TAB_TUNING, TAB_DRIFT, TAB_ML_SUMMARY,
     TAB_DATASETS, TAB_SIMULATE, TAB_RESULTS, TAB_SUMMARY,
 ]
 TAB_STATE_KEY = "simlab_tab"
@@ -5631,7 +5975,7 @@ def build_ui() -> None:
     _render_pipeline()
     st.divider()
     (
-        tab_agents, tab_models, tab_tuning, tab_drift, tab_datasets, tab_sim,
+        tab_agents, tab_models, tab_tuning, tab_drift, tab_ml_summary, tab_datasets, tab_sim,
         tab_results, tab_summary,
     ) = st.tabs(
         SIMLAB_TABS, key=TAB_STATE_KEY,
@@ -5652,6 +5996,8 @@ def build_ui() -> None:
         render_tuning_tab()
     with tab_drift:
         render_drift_tab()
+    with tab_ml_summary:
+        render_ml_summary_tab()
     with tab_datasets:
         render_datasets_tab()
     with tab_sim:
