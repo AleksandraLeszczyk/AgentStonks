@@ -24,8 +24,9 @@ def baseline(daily: dict, sat_out=(), no_forecast=()) -> dict:
 
 
 def job(job_id: str, daily: dict, ticker="AMD", model="highlow", created="2026-10-20T10:00",
-        skip=(), **cell) -> dict:
-    """A finished job whose base replayed `daily` on one dataset."""
+        skip=(), grid=None, **cell) -> dict:
+    """A finished job whose base replayed `daily` on one dataset, and each
+    `grid` buy_k its own `daily`."""
     base = asdict(AppleTraderConfig(ticker=ticker, model_key=model, skip_events=tuple(skip)))
     return {
         "job_id": job_id, "status": tu.FINISHED, "created_at": created,
@@ -35,8 +36,20 @@ def job(job_id: str, daily: dict, ticker="AMD", model="highlow", created="2026-1
             "starting_cash": 100_000.0,
         },
         "baseline": {"w": baseline(daily, **cell)},
-        "cells": {"w": []},
+        "cells": {"w": [
+            {**baseline(days), "overrides": {"buy_k": buy_k}}
+            for buy_k, days in (grid or {}).items()
+        ]},
     }
+
+
+def stored(buy_k: float, ticker="AMD", set_at="2026-10-25T10:00") -> dict:
+    """`bases` holding the pair's base at `buy_k`, as `stored_bases` decodes one."""
+    record = asdict(AppleTraderConfig(
+        ticker=ticker, model_key="highlow", buy_k=buy_k, skip_events=()
+    ))
+    config = tu.make_config(record, {})
+    return {(config.model_key, config.ticker): (config, set_at)}
 
 
 WEEK1 = {"2026-10-05": 100.0, "2026-10-06": -50.0, "2026-10-07": 0.0}
@@ -44,11 +57,13 @@ WEEK2 = {"2026-10-12": 300.0, "2026-10-13": 100.0, "2026-10-14": -200.0}
 
 
 class TestBaseSeries:
+    """Without a stored base, a pair is read from one job's own base."""
+
     def test_a_pair_is_read_from_the_job_reaching_its_latest_session(self):
         old_but_longer = job("a", {**WEEK1, **WEEK2}, created="2026-10-01T00:00")
         newer_but_shorter = job("b", WEEK1, created="2026-10-20T00:00")
-        [series] = ms.base_series([newer_but_shorter, old_but_longer])
-        assert series.job_id == "a" and series.jobs == 2
+        [series] = ms.base_series([newer_but_shorter, old_but_longer], bases={})
+        assert series.job_ids == ["a"] and series.source == ms.FROM_JOB
         assert series.last_day == "2026-10-14"
 
     def test_on_a_tie_the_newest_job_wins_and_pairs_stay_apart(self):
@@ -56,26 +71,59 @@ class TestBaseSeries:
             job("old", WEEK1, created="2026-10-01T00:00"),
             job("new", WEEK1, created="2026-10-02T00:00"),
             job("mu", WEEK1, ticker="MU"),
-        ])
-        assert [(s.ticker, s.job_id) for s in found] == [("AMD", "new"), ("MU", "mu")]
+        ], bases={})
+        assert [(s.ticker, s.job_ids) for s in found] == [("AMD", ["new"]), ("MU", ["mu"])]
 
     def test_derived_grids_and_unscored_bases_are_skipped(self):
         derived = {**job("d", WEEK1), "status": tu.DERIVED}
         broken = job("x", WEEK1)
         broken["baseline"]["w"]["error"] = "boom"
-        assert ms.base_series([derived, broken]) == []
+        assert ms.base_series([derived, broken], bases={}) == []
+
+
+class TestStoredBase:
+    """With a stored base, a pair is read from that configuration's replays."""
+
+    def test_a_square_of_a_grid_is_the_bases_replay(self):
+        jobs = [job("a", WEEK1, grid={0.5: {"2026-10-05": 7.0}})]
+        [series] = ms.base_series(jobs, bases=stored(0.5))
+        assert series.source == ms.FROM_BASE and series.base_set_at == "2026-10-25T10:00"
+        assert series.daily == {"2026-10-05": 7.0} and series.signature.startswith("highlow_AMD(buy=H-0.5")
+
+    def test_setting_another_base_reads_its_own_replays(self):
+        jobs = [job("a", WEEK1, grid={0.5: {"2026-10-05": 7.0}, 0.6: {"2026-10-05": -3.0}})]
+        assert ms.base_series(jobs, bases=stored(0.6))[0].daily == {"2026-10-05": -3.0}
+
+    def test_every_job_that_replayed_it_adds_its_sessions_the_newest_winning(self):
+        jobs = [
+            job("old", WEEK1, created="2026-10-01T00:00",
+                grid={0.5: {"2026-10-05": 1.0, "2026-10-06": 2.0}}),
+            job("new", WEEK2, created="2026-10-20T00:00",
+                grid={0.5: {"2026-10-06": 5.0, "2026-10-12": 9.0}}),
+        ]
+        [series] = ms.base_series(jobs, bases=stored(0.5))
+        assert series.daily == {"2026-10-05": 1.0, "2026-10-06": 5.0, "2026-10-12": 9.0}
+        assert series.job_ids == ["new", "old"]
+
+    def test_a_base_no_job_replayed_falls_back_and_says_so(self):
+        [series] = ms.base_series([job("a", WEEK1)], bases=stored(0.55))
+        assert series.source == ms.FROM_JOB and series.job_ids == ["a"]
+        assert series.base_set_at == "2026-10-25T10:00"
+        assert series.daily == WEEK1
 
 
 class TestWindows:
     def test_a_week_counts_back_from_the_latest_session_of_any_pair(self):
-        series = ms.base_series([job("a", {**WEEK1, **WEEK2}), job("m", WEEK1, ticker="MU")])
+        series = ms.base_series(
+            [job("a", {**WEEK1, **WEEK2}), job("m", WEEK1, ticker="MU")], bases={}
+        )
         assert ms.window(series, ms.WEEK) == ("2026-10-08", "2026-10-14")
         assert ms.window(series, ms.ALL) == ("2026-10-05", "2026-10-14")
         mu = next(s for s in series if s.ticker == "MU")
         assert ms.pair_metrics(mu, ms.window(series, ms.WEEK)) is None
 
     def test_every_session_counts_traded_or_not(self):
-        [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})])
+        [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})], bases={})
         week = ms.pair_metrics(series, ms.window([series], ms.WEEK))
         assert (week["sessions"], week["profit"], week["per_session"]) == (3, 200.0, 66.67)
         assert (week["days_up"], week["days_down"]) == (2, 1)
@@ -84,6 +132,7 @@ class TestWindows:
         assert whole["sessions"] == 6 and whole["worst_day"] == -200.0
 
     def test_a_model_is_the_mean_of_its_instruments(self):
+        """Profit a session and the window's profit alike: per instrument."""
         rows = [
             {"model_key": "highlow", "ticker": "AMD", "per_session": 100.0, "profit": 500.0},
             {"model_key": "highlow", "ticker": "MU", "per_session": -20.0, "profit": -100.0},
@@ -91,12 +140,11 @@ class TestWindows:
         ]
         best, second = ms.model_metrics(rows)
         assert (best["model_key"], best["per_session"], best["profit"]) == ("goodmoments", 50.0, 250.0)
-        assert (second["per_session"], second["in_profit"], second["best"], second["worst"]) == (
-            40.0, 1, "AMD", "MU"
-        )
+        assert (second["per_session"], second["profit"], second["in_profit"]) == (40.0, 200.0, 1)
+        assert (second["best"], second["worst"]) == ("AMD", "MU")
 
     def test_weeks_start_on_monday(self):
-        [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})])
+        [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})], bases={})
         weeks = ms.weekly([series], ms.window([series], ms.ALL))
         assert [(w["week"], w["per_session"]) for w in weeks] == [
             ("2026-10-05", 16.67), ("2026-10-12", 66.67)
@@ -142,7 +190,7 @@ class TestEventImpact:
     EVENTS = {("AMD", "2026-10-14"): [ms.DayEvent(event_days.CPI, "CPI")]}
 
     def test_an_event_day_is_set_against_the_pairs_normal_days(self):
-        [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})])
+        [series] = ms.base_series([job("a", {**WEEK1, **WEEK2})], bases={})
         rows, normals = ms.event_impact([series], self.EVENTS, ms.window([series], ms.ALL))
         [row] = rows
         assert normals[0]["normal_days"] == 5
@@ -152,7 +200,7 @@ class TestEventImpact:
 
     def test_a_session_the_base_sat_out_is_shown_but_not_counted(self):
         [series] = ms.base_series([job("a", {**WEEK1, **WEEK2}, sat_out=["2026-10-14"],
-                                       no_forecast=["2026-10-06"])])
+                                       no_forecast=["2026-10-06"])], bases={})
         rows, normals = ms.event_impact([series], self.EVENTS, ms.window([series], ms.ALL))
         assert rows[0]["profit"] is None and rows[0]["sat_out"]
         assert normals[0]["normal_days"] == 4  # the day without a forecast is left out too
@@ -163,7 +211,7 @@ class TestEventImpact:
         series = ms.base_series([
             job("a", {**WEEK1, **WEEK2}),
             job("m", {"2026-10-12": 0.0, "2026-10-13": 0.0, "2026-10-14": 500.0}, ticker="MU"),
-        ])
+        ], bases={})
         events = {**self.EVENTS, ("MU", "2026-10-14"): [ms.DayEvent(event_days.CPI, "CPI")]}
         rows, _ = ms.event_impact(series, events, ms.window(series, ms.ALL))
         [day] = ms.event_summaries(rows)

@@ -5554,8 +5554,15 @@ _ML_WINDOWS = {
     ml_summary.MONTH: "Last month",
     ml_summary.ALL: "All tuning data",
 }
-# One colour per model on the bar chart, in the order the models rank.
+# One colour per model on the bar chart, by its place in the registry, so a
+# model keeps its colour whatever the window or the ranking.
 _ML_MODEL_COLORS = ["#60a5fa", "#26c6a2", "#fb923c", "#a78bfa", "#f472b6", "#facc15", "#818cf8"]
+
+
+def _ml_model_color(model_key: str) -> str:
+    keys = list(apple_models.MODELS)
+    index = keys.index(model_key) if model_key in keys else len(keys)
+    return _ML_MODEL_COLORS[index % len(_ML_MODEL_COLORS)]
 
 
 def _ml_pair(model_key: str, ticker: str) -> str:
@@ -5577,10 +5584,11 @@ def render_ml_summary_tab() -> None:
         "How each model has done lately in its base configuration, instrument by "
         "instrument, and how it did on event days — CPI and jobs reports, the day after "
         "earnings, geopolitical and market shocks — against a normal day. Nothing is "
-        "replayed here: every tuning job replays its base configuration beside the grid "
-        "(its *Base profit*), and this reads those replays, one job per model and "
-        "instrument — the one reaching the latest session, the newest on a tie, since "
-        "two jobs' bases are two different configurations."
+        "replayed here: each model and instrument is read off the tuning jobs' replays of "
+        "its base configuration — the one *Set as base configuration* stored, a job's own "
+        "base or any square of its grid — so setting another base updates everything "
+        "below. A pair with no base stored is read from the base of its job reaching the "
+        "latest session."
     )
     series = ml_summary.base_series(sim_tuning.list_jobs())
     if not series:
@@ -5603,6 +5611,13 @@ def render_ml_summary_tab() -> None:
         "not, and each pair is its own account at the job's starting cash."
         + (f" Not replayed in this window: {', '.join(missing)}." if missing else "")
     )
+    for s in series:
+        if s.source == ml_summary.FROM_JOB and s.base_set_at:
+            st.caption(
+                f":material/warning: {_ml_pair(s.model_key, s.ticker)}'s base configuration, "
+                f"set {s.base_set_at[:10]}, has not been replayed by any tuning job, so it is "
+                f"read from job `{s.job_ids[0]}`'s base. Start a tuning job from it to see it here."
+            )
     if rows:
         _render_ml_models(rows, ml_summary.weekly(series, span))
     st.divider()
@@ -5635,7 +5650,6 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
         )
 
     money = st.column_config.NumberColumn
-    colors = {m["model_key"]: _ML_MODEL_COLORS[i % len(_ML_MODEL_COLORS)] for i, m in enumerate(models)}
     st.dataframe(pd.DataFrame([
         {
             "model": _apple_model_label(m["model_key"]),
@@ -5653,7 +5667,10 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
             help="The mean over its instruments of each one's profit a session: every "
             "instrument is its own account, so each counts alike.",
         ),
-        "profit": money("Total profit ($)", format="%+.2f", help="Summed over its instruments."),
+        "profit": money(
+            "Profit per instrument ($)", format="%+.2f",
+            help="The mean over its instruments of each one's profit over the window.",
+        ),
         "in_profit": "Instruments in profit",
         "best": "Best instrument",
         "worst": "Worst instrument",
@@ -5667,7 +5684,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
             x=[r["per_session"] for r in group],
             y=[_ml_pair(r["model_key"], r["ticker"]) for r in group],
             orientation="h", name=_apple_model_label(m["model_key"]),
-            marker_color=colors[m["model_key"]],
+            marker_color=_ml_model_color(m["model_key"]),
             text=[_ml_usd(r["per_session"]) for r in group], textposition="outside",
             hovertemplate="%{y}: %{x:+,.2f} $ a session<extra></extra>",
         ))
@@ -5694,7 +5711,11 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
             "worst_day": r["worst_day"],
             "skips": ", ".join(ml_summary.event_label(c) for c in r["skip_events"]) or "—",
             "signature": r["signature"],
-            "job": r["job_id"] + (f" (of {r['jobs']})" if r["jobs"] > 1 else ""),
+            "source": (
+                f"base set {r['base_set_at'][:10]}" if r["source"] == ml_summary.FROM_BASE
+                else "job's base" + (" (stored base not replayed)" if r["base_set_at"] else "")
+            ),
+            "jobs": ", ".join(r["job_ids"]),
         }
         for r in sorted(rows, key=lambda r: r["per_session"], reverse=True)
     ]), hide_index=True, column_config={
@@ -5713,9 +5734,15 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
             help="The days its base configuration makes no trade on by rule (`skip_events`): "
             "those count as flat sessions above and are left out of the event comparison.",
         ),
-        "signature": st.column_config.TextColumn("Base configuration", width="medium"),
-        "job": st.column_config.TextColumn(
-            "Tuning job", help="The job read for this pair, and how many the pair has.",
+        "signature": st.column_config.TextColumn("Configuration", width="medium"),
+        "source": st.column_config.TextColumn(
+            "Read as",
+            help="`base set …` — the pair's stored base configuration, wherever a tuning job "
+            "replayed it. `job's base` — no base stored (or none replayed), so the base of "
+            "the pair's job reaching the latest session.",
+        ),
+        "jobs": st.column_config.TextColumn(
+            "Tuning jobs", help="The jobs whose replays were read, newest first.",
         ),
     })
 

@@ -1,16 +1,23 @@
 """The ML summary: how each model's base configuration has done lately, and
 how it did on event days, read off the tuning jobs.
 
-A tuning job replays its base configuration on every dataset beside the grid
-(the "Base profit" column of its results), so the store of jobs already holds,
-per (model, instrument), a session-by-session P&L of one fixed configuration
-over the weeks it was swept on. Nothing here replays anything: it reads those
-baseline cells (`daily`, one profit per session) and lines them up.
+Every cell of a tuning job -- its base configuration's on each dataset (the
+"Base profit" column of its results) and every square of its grid -- is a
+replay of one fixed configuration with a profit per session (`daily`), so the
+store of jobs already holds, per (model, instrument), the weeks they were swept
+on session by session. Nothing here replays anything: it reads those cells and
+lines them up.
 
-One job per pair. A pair often has several jobs whose bases differ -- AMD's
-sit out different days, say -- and adding their sessions together would mix
-configurations, so a pair is read from the job that reaches the latest session,
-the most recently started one on a tie (`base_series`).
+Which replays a pair is read from follows its base configuration -- the one
+"Set as base configuration" stored (`agent_stonks.base_configs`), which is what
+every new run of the pair starts from: every cell of every one of the pair's
+jobs that replayed exactly that configuration, a job's own base or a square of
+its grid, newest job first where two answer the same session. Set another base
+and the next render reads the pair off the new one's replays. A pair with no
+base stored, or whose base no job has replayed, falls back on the base of the
+job reaching its latest session (the most recently started on a tie); jobs'
+bases differ -- AMD's sit out different days, say -- so two are never added
+together.
 
 Event days are classified after the fact (`events_by_day`), not as a trader
 would have had to that morning: the calendar's every row, known before the open
@@ -50,22 +57,31 @@ def event_label(category: str) -> str:
     return event_days.LABELS.get(category) or EXTRA_LABELS.get(category) or category
 
 
+# Where a pair's replays were read from (`BaseSeries.source`).
+FROM_BASE = "base"
+FROM_JOB = "job"
+
+
 @dataclass
 class BaseSeries:
-    """One pair's base configuration, session by session, from one job."""
+    """One pair's configuration, session by session: its stored base's
+    replays (`FROM_BASE`), or one job's base (`FROM_JOB`)."""
 
     model_key: str
     ticker: str
-    job_id: str
-    created_at: str
     signature: str
     skip_events: "tuple[str, ...]"
     starting_cash: float
+    source: str = FROM_JOB
+    # The jobs read, newest first.
+    job_ids: "list[str]" = field(default_factory=list)
+    created_at: str = ""
+    # When the stored base was set; with `FROM_JOB`, set only when the pair has
+    # a base no job has replayed, so the fallback can say so.
+    base_set_at: str = ""
     daily: "dict[str, float]" = field(default_factory=dict)
     sat_out: "set[str]" = field(default_factory=set)
     no_forecast: "set[str]" = field(default_factory=set)
-    # How many jobs the pair has, this one included.
-    jobs: int = 1
 
     @property
     def last_day(self) -> str:
@@ -76,52 +92,124 @@ class BaseSeries:
         by its own rule, and with a forecast to trade on."""
         return day not in self.sat_out and day not in self.no_forecast
 
+    def add(self, cell: dict) -> None:
+        """One replay's sessions, over whatever an earlier one said of them."""
+        self.daily.update({str(d): float(p) for d, p in (cell.get("daily") or {}).items()})
+        self.sat_out |= {str(d) for d in cell.get("sat_out_days") or ()}
+        self.no_forecast |= {str(d) for d in cell.get("no_forecast_days") or ()}
 
-def _series(job: dict) -> "BaseSeries | None":
+
+def _new_series(config, job: dict, source: str) -> BaseSeries:
+    return BaseSeries(
+        model_key=config.model_key, ticker=config.ticker,
+        signature=tuning.config_signature(config), skip_events=tuple(config.skip_events),
+        starting_cash=float(job["spec"].get("starting_cash") or 0.0), source=source,
+        job_ids=[job["job_id"]], created_at=str(job.get("created_at") or ""),
+    )
+
+
+def _job_base(job: dict) -> "BaseSeries | None":
+    """A job's own base, every dataset it was replayed on."""
     spec = job["spec"]
     try:
         config = tuning.make_config(spec["base"], {})
     except (TypeError, ValueError):
         return None  # a removed model, or a field since narrowed
-    out = BaseSeries(
-        model_key=config.model_key, ticker=config.ticker, job_id=job["job_id"],
-        created_at=str(job.get("created_at") or ""),
-        signature=tuning.config_signature(config),
-        skip_events=tuple(config.skip_events),
-        starting_cash=float(spec.get("starting_cash") or 0.0),
-    )
+    out = _new_series(config, job, FROM_JOB)
     for name in tuning.dataset_names(spec):
         cell = (job.get("baseline") or {}).get(name)
-        if not tuning.is_scored(cell):
-            continue
-        out.daily.update({str(d): float(p) for d, p in (cell.get("daily") or {}).items()})
-        out.sat_out |= {str(d) for d in cell.get("sat_out_days") or ()}
-        out.no_forecast |= {str(d) for d in cell.get("no_forecast_days") or ()}
+        if tuning.is_scored(cell):
+            out.add(cell)
     return out if out.daily else None
 
 
-def base_series(jobs: "list[dict]") -> "list[BaseSeries]":
-    """Every pair's base configuration from the job that reaches its latest
-    session (the most recently started on a tie), by instrument then model.
-    Derived grids are not jobs anybody swept a base in, and are skipped."""
-    chosen: "dict[tuple[str, str], BaseSeries]" = {}
-    counts: "dict[tuple[str, str], int]" = {}
+def _replays(job: dict):
+    """(configuration, cell) for every scored cell of a job -- its base's on
+    each dataset and its grid's -- decoded once per combination."""
+    spec = job["spec"]
+    decoded: "dict[str, object]" = {}
+    for name in tuning.dataset_names(spec):
+        for cell in [(job.get("baseline") or {}).get(name), *((job.get("cells") or {}).get(name) or ())]:
+            if not tuning.is_scored(cell):
+                continue
+            key = tuning.overrides_key(cell.get("overrides"))
+            if key not in decoded:
+                try:
+                    decoded[key] = tuning.make_config(spec["base"], cell.get("overrides") or {})
+                except (TypeError, ValueError):
+                    decoded[key] = None
+            if decoded[key] is not None:
+                yield decoded[key], cell
+
+
+def _stored_base(jobs: "list[dict]", config, set_at: str) -> "BaseSeries | None":
+    """Every replay of `config` in `jobs`, the newest job's on a shared session."""
+    out = None
+    for job in sorted(jobs, key=lambda j: str(j.get("created_at") or "")):
+        matched = False
+        for replayed, cell in _replays(job):
+            if replayed != config:
+                continue
+            if out is None:
+                out = _new_series(config, job, FROM_BASE)
+                out.job_ids = []
+            out.add(cell)
+            matched = True
+        if matched:
+            out.job_ids.insert(0, job["job_id"])
+            out.created_at = str(job.get("created_at") or "")
+            out.starting_cash = float(job["spec"].get("starting_cash") or 0.0)
+    if out is not None:
+        out.base_set_at = set_at
+    return out
+
+
+def stored_bases() -> "dict[tuple[str, str], tuple[object, str]]":
+    """{(model, ticker): (configuration, set at)} for every stored base,
+    decoded as a tuning job's base is (`tuning.make_config`) -- a field a record
+    lacks reads as what its absence meant then -- so the two compare alike."""
+    from agent_stonks import base_configs
+
+    out = {}
+    for entry in base_configs.load().values():
+        try:
+            config = tuning.make_config(entry["config"], {})
+        except (KeyError, TypeError, ValueError):
+            continue  # a removed model, or a field since narrowed
+        out[(config.model_key, config.ticker)] = (config, str(entry.get("set_at") or ""))
+    return out
+
+
+def base_series(jobs: "list[dict]", bases: "dict | None" = None) -> "list[BaseSeries]":
+    """Every pair the tuning jobs cover, by instrument then model: its stored
+    base's replays (`bases`, `stored_bases()` by default), else the base of the
+    job reaching its latest session (the most recently started on a tie).
+    Derived grids are not jobs anybody swept, and are skipped."""
+    bases = stored_bases() if bases is None else bases
+    by_pair: "dict[tuple[str, str], list[dict]]" = {}
+    fallback: "dict[tuple[str, str], BaseSeries]" = {}
     for job in jobs:
         if tuning.is_derived(job):
             continue
-        series = _series(job)
+        series = _job_base(job)
         if series is None:
             continue
         key = (series.model_key, series.ticker)
-        counts[key] = counts.get(key, 0) + 1
-        current = chosen.get(key)
+        by_pair.setdefault(key, []).append(job)
+        current = fallback.get(key)
         if current is None or (series.last_day, series.created_at) > (
             current.last_day, current.created_at
         ):
-            chosen[key] = series
-    for key, series in chosen.items():
-        series.jobs = counts[key]
-    return sorted(chosen.values(), key=lambda s: (s.ticker, s.model_key))
+            fallback[key] = series
+    out = []
+    for key, pair_jobs in by_pair.items():
+        stored = bases.get(key)
+        series = _stored_base(pair_jobs, *stored) if stored else None
+        if series is None:
+            series = fallback[key]
+            series.base_set_at = stored[1] if stored else ""
+        out.append(series)
+    return sorted(out, key=lambda s: (s.ticker, s.model_key))
 
 
 def window(series: "list[BaseSeries]", name: str) -> "tuple[str, str] | None":
@@ -154,8 +242,8 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
     per_session = total / len(days)
     flat = tuning._FLAT_DAY_USD
     return {
-        "model_key": s.model_key, "ticker": s.ticker, "job_id": s.job_id,
-        "signature": s.signature, "jobs": s.jobs,
+        "model_key": s.model_key, "ticker": s.ticker, "job_ids": s.job_ids,
+        "signature": s.signature, "source": s.source, "base_set_at": s.base_set_at,
         "sessions": len(days),
         "profit": round(total, 2),
         "per_session": round(per_session, 2),
@@ -170,9 +258,10 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
 
 
 def model_metrics(rows: "list[dict]") -> "list[dict]":
-    """`pair_metrics` rows by model: the mean per-session profit over its
-    instruments -- each its own account, so weighted alike -- their summed
-    profit, and the best and worst of them. Best model first."""
+    """`pair_metrics` rows by model: the mean over its instruments -- each its
+    own account, so weighted alike -- of the profit a session and of the
+    window's profit, how many made money, and the best and worst of them. Best
+    model first."""
     by_model: "dict[str, list[dict]]" = {}
     for row in rows:
         by_model.setdefault(row["model_key"], []).append(row)
@@ -183,7 +272,7 @@ def model_metrics(rows: "list[dict]") -> "list[dict]":
             "model_key": model_key,
             "instruments": len(group),
             "per_session": round(statistics.fmean(r["per_session"] for r in group), 2),
-            "profit": round(sum(r["profit"] for r in group), 2),
+            "profit": round(statistics.fmean(r["profit"] for r in group), 2),
             "in_profit": sum(1 for r in group if r["profit"] > tuning._FLAT_DAY_USD),
             "best": ranked[0]["ticker"],
             "worst": ranked[-1]["ticker"],
