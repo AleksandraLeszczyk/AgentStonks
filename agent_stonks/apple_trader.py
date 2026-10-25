@@ -55,6 +55,7 @@ from .state import append_agent_log as _log
 from .config import (
     APPLE_TRADER_BREACH_UPDATE,
     APPLE_TRADER_BREACH_UPDATE_BY_TICKER,
+    APPLE_TRADER_BREAKER_UNTIL_REVISED,
     APPLE_TRADER_BRIEFING_WAIT_BARS as BRIEFING_WAIT_BARS,
     APPLE_TRADER_CONTAIN_RANGE,
     APPLE_TRADER_KEEP_WIDTH,
@@ -454,6 +455,12 @@ class AppleTraderConfig:
     # confirmation reads as a buy buys back what the take just sold. False is
     # the rule before 2026-10-22, which a stored record replays as.
     take_under_buy_stands_down: bool = APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN
+    # What the two circuit breakers above and `min_win_k` hold the entries for:
+    # False the rest of the session; True only until the session trades through
+    # a predicted boundary and the forecast is revised (`_stand_down`,
+    # `_pause_holds`). Never the stop's stand-down. False is every record's
+    # from before 2026-10-25.
+    breaker_until_revised: bool = APPLE_TRADER_BREAKER_UNTIL_REVISED
     # What fires the take -- one of `config.TAKE_TRIGGERS`. "momentum" is the
     # confirmation table's take row (or whichever legacy rule a record
     # carries); "zone" a stall zone forming under the position
@@ -1134,6 +1141,11 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         exits += f",runner>={c.hold_min_gain_k:g}{unit}"
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
+    # Only while a breaker it applies to can trip, so a run with neither signs
+    # the same with it on or off -- and every record from before it, which
+    # replays with it off, keeps the signature it was filed under.
+    if c.breaker_until_revised and (c.min_win_k or (take and c.take_under_buy_stands_down)):
+        exits += ",until_revised"
     # Only where it can change a trade (`can_scale_in`), so a run at 100% signs
     # the same with the setting on or off -- and every record written before it
     # existed, which replays with it off, keeps the signature it was filed under.
@@ -1795,6 +1807,13 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             and tracker.position_for(self.ticker) <= 0
         ):
             return rule_agent.WAITING, "Agent stood down for the day"
+        if (
+            outcome != rule_agent.CLOSED
+            and self.plan is not None
+            and self.plan.get("paused")
+            and tracker.position_for(self.ticker) <= 0
+        ):
+            return rule_agent.WAITING, "Agent paused until the forecast is revised"
         return super().activity(outcome, tracker)
 
     # --- one cycle --------------------------------------------------------
@@ -1930,6 +1949,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # tried today and found not to work, and re-arming them on the same tape
         # is how one bad trade becomes five.
         if self.plan.get("stand_down"):
+            return "hold"
+        # Or paused by a circuit breaker until the forecast is revised
+        # (`breaker_until_revised`): the same, until the tape trades through a
+        # predicted boundary.
+        if self._pause_holds(state, ts):
             return "hold"
 
         if fresh_bar and float(last["low"]) <= self.plan["buy_level"]:
@@ -2238,7 +2262,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         if refusal is None and self.plan is not None:
             before = (float(self.plan["buy_level"]), float(self.plan["sell_level"]))
             old = (self.config, self._bundle, self.plan)
-            kept = {k: self.plan[k] for k in ("stand_down",) if k in self.plan}
+            kept = {k: self.plan[k] for k in ("stand_down", "paused") if k in self.plan}
             self.config, self._bundle = new, bundle
             try:
                 self._plan_session(
@@ -2250,6 +2274,14 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 refusal = f"it cannot forecast today's {self.ticker} range: {exc}"
             else:
                 self.plan.update(kept)
+                if self.plan.get("paused"):
+                    # Waiting for a revision of the forecast that is traded
+                    # now, not of the one the run switched away from.
+                    self.plan["paused"] = {
+                        **self.plan["paused"],
+                        "pred_high": float(self.plan["pred_high"]),
+                        "pred_low": float(self.plan["pred_low"]),
+                    }
 
         if refusal is not None:
             if self._refused_model != form.model_key:
@@ -2392,6 +2424,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         return {
             "entry": dict(self.entry) if self.entry is not None else None,
             "stand_down": (self.plan or {}).get("stand_down"),
+            "paused": (self.plan or {}).get("paused"),
         }
 
     def publish_memory(self, state: AppState) -> None:
@@ -2419,7 +2452,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         that run, and pressing ▶ Start again is the say-so to trade again today
         -- unless `rearm_after_stop` is off (a split Orchestra's pairs), when it
         holds like any other. The breaker's stand-down (`_close_out`) did not
-        stop the run, so it still holds."""
+        stop the run, so it still holds, and so does a breaker's pause until the
+        forecast is revised (`breaker_until_revised`)."""
         if not memory:
             return
         stand_down = memory.get("stand_down")
@@ -2443,6 +2477,22 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                     "text": (
                         f"{self.ticker}: continuing today's run, which had stood down "
                         f"({stand_down}) — still no new entries today."
+                    ),
+                },
+            )
+        paused = memory.get("paused")
+        if paused and not self.plan.get("stand_down") and not self.plan.get("paused"):
+            # Against the forecast it paused on: one revised since (the run
+            # taking its range back) lets the entries in on the next bar.
+            self.plan["paused"] = dict(paused)
+            _log(
+                state,
+                {
+                    "type": "status",
+                    "text": (
+                        f"{self.ticker}: continuing today's run, which a circuit breaker had "
+                        f"paused ({paused.get('headline')}) — no new entries until the "
+                        "forecast is revised."
                     ),
                 },
             )
@@ -3590,7 +3640,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         on; only new buys stop.
         """
         config, plan = self.config, self.plan
-        if not config.take_under_buy_stands_down or plan.get("stand_down"):
+        if not config.take_under_buy_stands_down or plan.get("stand_down") or plan.get("paused"):
             return
         level = float(plan["reference"]) - float(config.buy_k) * level_unit(config, plan)
         close = float(bar["close"])
@@ -3613,6 +3663,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         """
         if self.plan.get("stand_down"):
             return
+        if headline != self.STOPPED_OUT and self.config.breaker_until_revised:
+            self._pause(state, headline, why)
+            return
+        self.plan.pop("paused", None)
         self.plan["stand_down"] = headline
         _log(
             state,
@@ -3623,6 +3677,61 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 ),
             },
         )
+
+    def _pause(self, state: AppState, headline: str, why: str) -> None:
+        """Take no further entry until the forecast is revised
+        (`breaker_until_revised`), and say so once.
+
+        The pause is kept against the forecast as it stands now: the first bar
+        whose range update moves the predicted high or low -- the session
+        trading through a predicted boundary -- ends it (`_pause_holds`). A
+        breaker tripping again later pauses again, against the revised one."""
+        if self.plan.get("paused"):
+            return
+        self.plan["paused"] = {
+            "headline": headline,
+            "pred_high": float(self.plan["pred_high"]),
+            "pred_low": float(self.plan["pred_low"]),
+        }
+        revised = (
+            "until the session trades outside the forecast and it is revised"
+            if self.config.breach_update != BREACH_OFF or self.config.contain_range
+            else "until the forecast is revised — which, with it held all day, is the "
+                 "rest of the session"
+        )
+        _log(
+            state,
+            {
+                "type": "analysis",
+                "text": f"{self.ticker}: {headline} — no further entries {revised}. {why}",
+            },
+        )
+
+    def _pause_holds(self, state: AppState, ts) -> bool:
+        """Whether a circuit breaker's pause still holds the entries: until the
+        forecast it paused on has been revised. Ended -- and said -- on the
+        first bar it has."""
+        paused = self.plan.get("paused")
+        if not paused:
+            return False
+        high, low = float(self.plan["pred_high"]), float(self.plan["pred_low"])
+        if high == float(paused["pred_high"]) and low == float(paused["pred_low"]):
+            return True
+        self.plan.pop("paused", None)
+        _log(
+            state,
+            {
+                "type": "analysis",
+                "text": (
+                    f"{self.ticker}: the forecast has been revised (predicted high "
+                    f"${float(paused['pred_high']):,.2f} → ${high:,.2f}, low "
+                    f"${float(paused['pred_low']):,.2f} → ${low:,.2f}), so the circuit breaker's "
+                    f"pause ({paused.get('headline')}) ends at {pd.Timestamp(ts):%H:%M}: "
+                    "the levels are armed again."
+                ),
+            },
+        )
+        return False
 
     def _close_out(self, state: AppState, banked: float, shares: float) -> None:
         """Judge a finished trade, and stand the session down if it barely paid.
@@ -3641,7 +3750,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         rather than a circuit breaker. The form says so when they disagree.
         """
         config, plan = self.config, self.plan
-        if not config.min_win_k or shares <= 0 or plan.get("stand_down"):
+        if not config.min_win_k or shares <= 0 or plan.get("stand_down") or plan.get("paused"):
             return
         unit = level_unit(config, plan)
         per_share = banked / shares
@@ -3745,6 +3854,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                     parts.append(f"stop ${self._stop_price():,.2f}")
         elif plan.get("stand_down"):
             parts.append(f"{plan['stand_down']}, no new entries today")
+        elif plan.get("paused"):
+            parts.append(f"{plan['paused']['headline']}, no new entries until the forecast is revised")
         return " · ".join(parts)
 
 

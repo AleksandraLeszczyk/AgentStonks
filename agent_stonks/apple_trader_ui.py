@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 from .config import (
     APPLE_TRADER_GM_STOP_RAISE,
     BREACH_LABELS,
+    BREACH_OFF,
     BREACH_OFFERED,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
@@ -550,6 +551,7 @@ def dayrange_params(
     min_win_k = min_win_param(
         ticker, float(buy_k), float(sell_k), unit_label, copy, float(defaults.min_win_k)
     )
+    until_revised = breaker_until_param(defaults, copy, rules)
     return replace(
         defaults,
         model_key=model_key,
@@ -558,6 +560,7 @@ def dayrange_params(
         sell_k=float(sell_k),
         level_unit=level_unit,
         min_win_k=min_win_k,
+        breaker_until_revised=until_revised,
         **sizing,
         **rules,
     )
@@ -720,6 +723,28 @@ def min_win_param(
             icon=":material/warning:",
         )
     return min_win_k
+
+
+def breaker_until_param(defaults: AppleTraderConfig, copy: FormCopy, rules: dict) -> bool:
+    """What a circuit breaker -- a weak trade, or a take at or under the buy
+    level -- holds the entries for: the rest of the session, or only until
+    the session trades through a predicted boundary and the forecast is
+    revised (`breaker_until_revised`). One rule for every instrument, and for
+    every racer, so not keyed by ticker. `rules` is the breach rules the form
+    holds: with the forecast held all day nothing revises it, which the
+    caption says."""
+    until = st.checkbox(
+        "Only until the forecast is revised (the session trades outside it)",
+        value=bool(defaults.breaker_until_revised),
+        key=copy.key("breaker_until_revised"),
+        help=copy.help.get("breaker_until_revised"),
+    )
+    if until and rules.get("breach_update") == BREACH_OFF and not rules.get("contain_range"):
+        st.caption(
+            "With the 9:35 forecast held all day and nothing containing it, it is never "
+            "revised: a breaker still holds for the rest of the session."
+        )
+    return bool(until)
 
 
 def breaker_opens_on(number_key: str, default: float, ticker: str) -> bool:
@@ -1167,7 +1192,11 @@ def orchestra_params(
         defaults, first_buy, first_sell, unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
     )
-    base = replace(defaults, level_unit=level_unit, **sizing, **rules)
+    section("Circuit breaker", copy.sections.get("dayrange_breaker"))
+    until_revised = breaker_until_param(defaults, copy, rules)
+    base = replace(
+        defaults, level_unit=level_unit, breaker_until_revised=until_revised, **sizing, **rules,
+    )
     try:
         return build_orchestra_config(
             list(pairs), base, levels, selection=selection,

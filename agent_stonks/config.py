@@ -685,6 +685,17 @@ APPLE_TRADER_LEVEL_UNIT = UNIT_PRED_RANGE
 # on 2026-10-25; no symbol has an entry today.
 APPLE_TRADER_MIN_WIN_K = 0.10
 APPLE_TRADER_MIN_WIN: "dict[str, float]" = {}
+# What a circuit breaker -- a weak trade (MIN_WIN above) or a take at or under
+# the buy level (TAKE_UNDER_BUY_STANDS_DOWN) -- holds the entries for. False:
+# the rest of the session, the rule since each breaker existed. True (an option
+# since 2026-10-25, the user's): only until the forecast is revised because the
+# session traded through a predicted boundary (`DayRangeTrader._update_range`
+# moved the predicted high or low), on the grounds that a revised forecast is a
+# new claim about the day and its levels have not yet been tried. Under "Hold
+# the 9:35 forecast" with containment off nothing revises it, so the pause is
+# the rest of the day there too. A stop still stands the day down -- and stops
+# the agent -- either way. Not swept.
+APPLE_TRADER_BREAKER_UNTIL_REVISED = False
 APPLE_TRADER_CYCLE_SEC = 60
 APPLE_TRADER_POSITION_PCT = 95.0
 # Whether a day-range position may be added to on the way down

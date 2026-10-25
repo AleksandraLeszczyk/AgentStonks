@@ -2144,6 +2144,13 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Unticked, the run is replayed with no circuit breaker: the levels re-arm after "
             "every trade, and only a stop stands the session down."
         ),
+        "breaker_until_revised": (
+            "Ticked, a circuit breaker (a weak trade, or a take at or under the buy level) "
+            "holds the entries only until the session trades through a predicted boundary "
+            "and the forecast is revised, rather than for the rest of the day. In the "
+            "signature as `until_revised` while a breaker is on; a record from before it "
+            "replays with it off. Never the stop's stand-down."
+        ),
     },
 )
 

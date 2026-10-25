@@ -2990,7 +2990,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "When to stop buying for the day. Two things end it:\n\n"
             "- **A stop** — the day has not gone the way the forecast said.\n"
             "- **A trade that barely paid** — the forecast said the day was wide enough "
-            "for the dip to be worth buying, and the trade says otherwise."
+            "for the dip to be worth buying, and the trade says otherwise.\n\n"
+            "Either breaker (that one, or a take at or under the buy level) can instead hold "
+            "the entries only until the forecast is revised — see the box below."
         ),
         "momentum": (
             "At the close of every bar from 09:31 to 15:30 the model forecasts the average "
@@ -3448,6 +3450,19 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Unticked, a trade that barely paid does not end the day: the levels re-arm "
             "after every trade, and only a stop stands the session down.\n\n"
             "- The threshold below is kept for when it is ticked again."
+        ),
+        "breaker_until_revised": (
+            "What a circuit breaker — a trade that barely paid, or a take at or under the "
+            "buy level — holds the entries for.\n\n"
+            "- **Unticked** — the rest of the session.\n"
+            "- **Ticked** — only until the session trades through the predicted high or low "
+            "and the forecast is revised (by the breach rule above, or by containment). The "
+            "revised forecast is a new claim about the day, so its levels are armed again; a "
+            "breaker that trips after that pauses again.\n"
+            "- With the 9:35 forecast held all day and containment off nothing revises it, "
+            "so ticked or not the breaker holds for the day.\n"
+            "- A stop always ends the day's buying and stops the agent.\n"
+            "- Not swept."
         ),
     },
 )

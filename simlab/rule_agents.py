@@ -270,6 +270,10 @@ _APPLE_LEGACY = {
     # after them (before 2026-10-25). 0 is that rule, and it is left out of the
     # signature.
     "gm_stop_raise": 0.0,
+    # And a circuit breaker stood the session down for the rest of the day,
+    # whatever the forecast did after (before 2026-10-25). False is that rule,
+    # and it is left out of the signature.
+    "breaker_until_revised": False,
 }
 
 

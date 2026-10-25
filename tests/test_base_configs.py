@@ -257,6 +257,15 @@ class TestBreachPerInstrument:
         assert app.session_state["out"].breach_update == "shift"
 
 
+class TestBreakerUntilRevisedBox:
+    def test_off_by_default_and_ticked_it_is_on(self, form):
+        app = form()
+        assert app.checkbox(key="t_breaker_until_revised").value is False
+        assert app.session_state["out"].breaker_until_revised is False
+        app.checkbox(key="t_breaker_until_revised").check().run()
+        assert app.session_state["out"].breaker_until_revised is True
+
+
 class TestCircuitBreakerBox:
     """The breaker is switched off by its box; the threshold is kept, greyed out."""
 

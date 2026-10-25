@@ -847,6 +847,7 @@ class Orchestra:
             trader.blocked is None
             and plan is not None
             and not plan.get("stand_down")
+            and not plan.get("paused")
         )
 
     def _benched(self, racer: Racer) -> bool:
@@ -880,6 +881,8 @@ class Orchestra:
                 status = "waiting for the forecast"
             elif plan.get("stand_down"):
                 status = f"stood down ({plan['stand_down']})"
+            elif plan.get("paused"):
+                status = f"paused until the forecast is revised ({plan['paused']['headline']})"
             elif self.holder is not None:
                 status = "waiting for the holder"
             else:

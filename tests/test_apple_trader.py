@@ -1455,6 +1455,117 @@ class TestDaysOff:
             AppleTraderConfig(skip_events=("fomc",))
 
 
+class TestBreakerUntilRevised:
+    """`breaker_until_revised` (2026-10-25): a circuit breaker holds the entries
+    only until the session trades through a predicted boundary and the forecast
+    is revised, rather than for the rest of the day. Never the stop's stand-down.
+
+    The fixture's forecast is 95-110 on a $10 ADR, levels 102.50 / 109.00. A
+    103.00 fill sold on the bar reaching 109 nets 0.58 ADR, under the 0.8 bar
+    these set, so it trips the breaker. A bar printing 111 then breaches the
+    110.00 predicted high: under "shift" the range moves up $1 and the buy level
+    with it, to 103.50."""
+
+    def _paused(self, state, monkeypatch, **kwargs):
+        kwargs.setdefault("breach_update", "shift")
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(
+            dayrange_config(min_win_k=0.8, breaker_until_revised=True, **kwargs)
+        )
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        tape.append(108.8, high=SELL_LEVEL + 0.05)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        return trader, tracker, tape
+
+    def test_a_thin_win_pauses_rather_than_stands_down(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._paused(state, monkeypatch)
+        assert trader.plan.get("paused") and not trader.plan.get("stand_down")
+        assert trader.halt is None
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert any("until the session trades outside the forecast" in (e.get("text") or "")
+                   for e in state.agent_log)
+
+    def test_a_revised_forecast_arms_the_levels_again(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._paused(state, monkeypatch)
+        tape.append(110.8, low=110.5, high=111.0)            # through the 110 high
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert not trader.plan.get("paused")
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL + 1.0)
+        assert any("the forecast has been revised" in (e.get("text") or "")
+                   for e in state.agent_log)
+        tape.append(103.6, low=BUY_LEVEL + 1.0 - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_a_breaker_after_the_revision_pauses_again(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._paused(state, monkeypatch)
+        tape.append(110.8, low=110.5, high=111.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        tape.append(103.6, low=BUY_LEVEL + 0.99)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        tape.append(103.6)                                    # out flat at the fill
+        monkeypatch.setattr(at.DayRangeTrader, "closing_soon", lambda self: True)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["paused"]["pred_high"] == pytest.approx(111.0)
+
+    def test_with_the_forecast_held_all_day_it_is_the_rest_of_the_day(
+        self, state, market_open, monkeypatch
+    ):
+        trader, tracker, tape = self._paused(state, monkeypatch, breach_update="off")
+        assert any("the rest of the session" in (e.get("text") or "") for e in state.agent_log)
+        tape.append(110.8, low=110.5, high=111.0)            # nothing revises it
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.plan.get("paused")
+
+    def test_a_stop_still_stands_the_day_down(self, state, market_open, monkeypatch):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config(min_win_k=0.8, breaker_until_revised=True))
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        tape.append(99.0, low=STOP_PRICE - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert trader.plan["stand_down"] == at.DayRangeTrader.STOPPED_OUT
+        assert not trader.plan.get("paused")
+
+    def test_every_breaker_but_the_stop_pauses(self, state, market_open, monkeypatch):
+        """A take at or under the buy level goes through the same door."""
+        trader, tracker, tape = self._paused(state, monkeypatch)
+        trader.plan.pop("paused")
+        trader._stand_down(state, "momentum take at $102.40, at or under the buy level", "why")
+        assert trader.plan["paused"]["headline"].startswith("momentum take")
+        assert not trader.plan.get("stand_down")
+
+    def test_the_pause_survives_a_restart(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._paused(state, monkeypatch)
+        trader.publish_memory(state)
+        again = at.DayRangeTrader(dayrange_config(min_win_k=0.8, breaker_until_revised=True,
+                                                  breach_update="shift"))
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert again.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert again.plan.get("paused")
+
+    def test_its_signature(self):
+        from simlab.rule_agents import _apple_from_record
+
+        on = config_signature(dayrange_config(min_win_k=0.8, breaker_until_revised=True))
+        assert ",until_revised" in on
+        assert ",until_revised" not in config_signature(dayrange_config(min_win_k=0.8))
+        # Nothing for it to apply to: it signs nothing.
+        assert ",until_revised" not in config_signature(
+            dayrange_config(min_win_k=0.0, breaker_until_revised=True)
+        )
+        old = _apple_from_record({"model_key": "highlow", "buy_k": 0.75, "sell_k": 0.1,
+                                  "min_win_k": 0.1})
+        assert old.breaker_until_revised is False
+
+
 class TestMinimumWin:
     """The session circuit breaker: stop buying after a trade that barely paid.
 
