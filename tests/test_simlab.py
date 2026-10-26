@@ -2032,6 +2032,15 @@ class TestBreakdown:
         with pytest.raises(ValueError):
             sim_results.breakdown([], by="provider-only")
 
+    def test_return_per_session_divides_by_every_session(self):
+        record = self._run(return_pct=2.5)
+        record["config_summary"]["days"] = ["2026-10-19", "2026-10-20", "2026-10-21",
+                                            "2026-10-22", "2026-10-23"]
+        assert sim_results.return_per_session(record) == pytest.approx(0.5)
+        assert sim_results.return_per_session(self._run(return_pct=2.5)) is None  # no days
+        record["summary"]["return_pct"] = None
+        assert sim_results.return_per_session(record) is None
+
 
 class TestInstrumentBreakdown:
     """Which symbol a stored run is filed under, and why it is one row.

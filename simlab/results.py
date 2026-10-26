@@ -293,6 +293,17 @@ def agent_key(record: dict) -> str:
     return (record.get("config_summary") or {}).get("personality") or "?"
 
 
+def return_per_session(record: dict) -> Optional[float]:
+    """A stored run's return as a % of starting cash per session -- every
+    session in its dataset counted, traded or not, the same rate the Tuning
+    tab and the ML summary divide by. None when the record cannot say."""
+    return_pct = (record.get("summary") or {}).get("return_pct")
+    days = (record.get("config_summary") or {}).get("days") or []
+    if return_pct is None or not days:
+        return None
+    return float(return_pct) / len(days)
+
+
 # Sentinels are answers, not names, and they read as noise at the top of an
 # option list -- so every option list sorts them to the end.
 _SENTINELS = (NO_DATASET, MULTI_INSTRUMENT, UNKNOWN_INSTRUMENT)

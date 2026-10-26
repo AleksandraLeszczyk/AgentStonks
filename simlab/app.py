@@ -49,6 +49,7 @@ from agent_stonks.apple_trader import (
 )
 from agent_stonks import apple_trader_ui
 from agent_stonks.orchestra import ORCHESTRA_KEY, racer_label
+from agent_stonks.orchestra import MODE_RACE as ORCHESTRA_MODE_RACE
 from agent_stonks.orchestra import all_pairs as orchestra_all_pairs
 from agent_stonks.orchestra import default_pairs as default_orchestra_pairs
 from agent_stonks.orchestra import pairs_widget as orchestra_pairs_widget
@@ -3244,14 +3245,23 @@ def render_results_tab() -> None:
         st.info("No runs match the current filters.")
         return
 
-    labels = {
-        r["run_id"]: (
-            f"{r['run_id']} · {r.get('config_summary', {}).get('personality')} · "
-            f"{r.get('config_summary', {}).get('model')} · {r.get('dataset')} · "
-            f"{r.get('summary', {}).get('return_pct', 0):+.2f}%"
-        )
-        for r in runs
-    }
+    # Id, rate, agent and dataset only: a rule run's model is its whole rule
+    # signature, which buried the rest of the name. The run itself shows it.
+    def _run_name(record: dict) -> str:
+        per_session = sim_results.return_per_session(record)
+        rate = "—" if per_session is None else f"{per_session:+.2f}%"
+        key = sim_results.agent_key(record)
+        # "Orchestra", not "Orchestra (rule-based, no LLM)".
+        agent = _agent_label(key).split(" (")[0]
+        rule_config = (record.get("config_summary") or {}).get("rule_config") or {}
+        if key == ORCHESTRA_KEY:
+            # A record made before the split existed is a race.
+            agent += f" {rule_config.get('mode') or ORCHESTRA_MODE_RACE}"
+        elif key == APPLE_TRADER_KEY:
+            agent += f" {sim_results.instrument_key(record)}"
+        return f"{record['run_id']} · {rate} a session · {agent} · {sim_results.dataset_key(record)}"
+
+    labels = {r["run_id"]: _run_name(r) for r in runs}
     default_id = st.session_state.get("last_run_id", runs[0]["run_id"])
     ids = list(labels)
     selected = st.selectbox(
