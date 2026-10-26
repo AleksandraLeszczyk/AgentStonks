@@ -13,7 +13,7 @@ import pytest
 
 from agent_stonks import orchestra as ar
 from agent_stonks import apple_trader as at
-from agent_stonks import clock, model_overlays, session_store
+from agent_stonks import clock, model_overlays, orchestra_defaults, session_store
 from agent_stonks.broker import Broker
 from agent_stonks.decisions import DecisionTracker
 from agent_stonks.state import AppState
@@ -1046,6 +1046,84 @@ class TestSplitConfig:
         legacy = agent.to_record(race)
         del legacy["mode"], legacy["budget_pct"]
         assert agent.from_record(legacy) == race
+
+
+# --- the default pairs, set from SimLab's ML summary ---------------------------
+
+
+def _orchestra_form_seeded() -> None:
+    """`_orchestra_form` with a running Orchestra's configuration as its seed."""
+    import streamlit as st
+
+    from agent_stonks import apple_trader_ui
+
+    copy = apple_trader_ui.FormCopy(
+        prefix="o", unavailable_suffix="", instrument_help="", model_help=""
+    )
+    st.session_state["out"] = apple_trader_ui.orchestra_params(
+        None, copy, seed=st.session_state.get("seed")
+    )
+
+
+class TestDefaultPairsSet:
+    """"Set Orchestra" on SimLab's ML summary (`orchestra_defaults`): what
+    Orchestra's pair picker opens on."""
+
+    TUNED = {f"{ticker}:{model}" for model, ticker in at.APPLE_TRADER_TUNED_LEVELS}
+
+    def test_the_stored_pairs_in_picker_order(self):
+        orchestra_defaults.set_pairs(["MU:highlow", "AAPL:goodmoments"])
+        assert ar.default_pairs() == [
+            k for k in ar.all_pairs() if k in {"MU:highlow", "AAPL:goodmoments"}
+        ]
+
+    def test_a_pair_orchestra_does_not_offer_is_dropped(self):
+        """A removed model, or Fast&Furious, which drives its own rules."""
+        orchestra_defaults.set_pairs(["MU:highlow", "BE:highlow", "AAPL:fastfurious"])
+        assert ar.default_pairs() == ["MU:highlow"]
+
+    def test_with_none_left_the_tuned_pairs_are_back(self):
+        orchestra_defaults.set_pairs(["BE:highlow"])
+        assert set(ar.default_pairs()) == self.TUNED
+        orchestra_defaults.set_pairs(["MU:highlow"])
+        orchestra_defaults.clear()
+        assert set(ar.default_pairs()) == self.TUNED
+
+    def test_nothing_set_or_an_unreadable_file_is_nothing_stored(self):
+        assert orchestra_defaults.pairs() is None
+        orchestra_defaults.PAIRS_PATH.write_text("{not json", encoding="utf-8")
+        assert orchestra_defaults.pairs() is None
+        with pytest.raises(ValueError):
+            orchestra_defaults.set_pairs([])
+
+    def test_the_picker_key_follows_the_stored_pairs(self):
+        """Unchanged with nothing set, so a remembered pick stays where it was."""
+        assert ar.pairs_widget() == "pairs"
+        orchestra_defaults.set_pairs(["MU:highlow"])
+        first = ar.pairs_widget()
+        orchestra_defaults.set_pairs(["AAPL:highlow"])
+        assert first.startswith("pairs_set") and ar.pairs_widget() not in ("pairs", first)
+        orchestra_defaults.clear()
+        assert ar.pairs_widget() == "pairs"
+
+    def _run(self, **state):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_orchestra_form_seeded, default_timeout=30)
+        for key, value in state.items():
+            app.session_state[key] = value
+        app.run()
+        assert not app.exception, app.exception
+        return [ar.racer_key(r) for r in app.session_state["out"].racers]
+
+    def test_a_new_default_replaces_an_earlier_pick(self):
+        orchestra_defaults.set_pairs(["MU:highlow"])
+        assert self._run(o_pairs=["INTC:highlow"]) == ["MU:highlow"]
+
+    def test_while_orchestra_runs_the_picker_reopens_on_its_pairs(self):
+        running = ar.build_orchestra_config(["AAPL:highlow"], at.AppleTraderConfig())
+        orchestra_defaults.set_pairs(["MU:highlow"])
+        assert self._run(seed=running) == ["AAPL:highlow"]
 
 
 # --- the pair table's min win box ---------------------------------------------

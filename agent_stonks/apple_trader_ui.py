@@ -1080,7 +1080,8 @@ def orchestra_params(
     """
     from .orchestra import (
         MODE_LABELS, MODE_SPLIT,
-        build_orchestra_config, default_pairs, all_pairs, is_signal, racer_key, racer_label,
+        build_orchestra_config, default_pairs, all_pairs, is_signal, pairs_widget, racer_key,
+        racer_label,
     )
 
     available = {str(s).strip().upper() for s in (symbols or [])}
@@ -1100,13 +1101,19 @@ def orchestra_params(
     split = mode == MODE_SPLIT
     # The chips carry the plain label: Streamlit keeps a chip's text from when
     # it was picked, so a "(not streamed)" there would outlive the fix. The
-    # rows below say it instead.
+    # rows below say it instead. A default set from SimLab's ML summary
+    # changes the key (`pairs_widget`) and so re-seeds the picker -- on the
+    # running Orchestra's pairs while one runs, which then keeps its racers.
+    offered = all_pairs()
     pairs = st.multiselect(
         "Pairs",
-        all_pairs(),
-        default=default_pairs(),
+        offered,
+        default=(
+            [k for k in (racer_key(r) for r in seed.racers) if k in offered]
+            if seed is not None else default_pairs()
+        ),
         format_func=racer_label,
-        key=copy.key("pairs"),
+        key=copy.key(pairs_widget()),
         help=copy.help.get("pairs"),
     )
     if not pairs:

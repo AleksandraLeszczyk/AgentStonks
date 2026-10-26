@@ -104,6 +104,7 @@ from typing import Optional
 
 from . import apple_models, candidates, event_days, market_hours, momentum_regime, rule_agent
 from . import apple_trader as at
+from . import orchestra_defaults
 from .agent import stop_agent
 from .apple_trader import AppleTraderConfig, TraderSlot
 from .config import (
@@ -223,11 +224,25 @@ def all_pairs() -> "list[str]":
 
 
 def default_pairs() -> "list[str]":
-    """The pairs Orchestra starts from: every pair SimLab's tuning has picked
-    levels for (`config.APPLE_TRADER_TUNED_LEVELS`), in picker order. A pair
-    nobody tuned is offered, not chosen."""
+    """The pairs Orchestra starts from, in picker order: the ones SimLab's ML
+    summary set (`orchestra_defaults`), else every pair SimLab's tuning has
+    picked levels for (`config.APPLE_TRADER_TUNED_LEVELS`). A pair nobody
+    tuned is offered, not chosen; a stored pair Orchestra no longer offers (a
+    removed model) is dropped, and with none left the tuned pairs are back."""
+    offered = all_pairs()
+    stored = set(orchestra_defaults.pairs() or ())
+    chosen = [key for key in offered if key in stored]
+    if chosen:
+        return chosen
     tuned = {f"{ticker}:{model}" for model, ticker in APPLE_TRADER_TUNED_LEVELS}
-    return [key for key in all_pairs() if key in tuned]
+    return [key for key in offered if key in tuned]
+
+
+def pairs_widget() -> str:
+    """The pair picker's widget name in a form (`FormCopy.key`): carries the
+    stored default's digest (`orchestra_defaults.key_suffix`), so a new
+    default re-seeds the picker of every open page."""
+    return f"pairs{orchestra_defaults.key_suffix()}"
 
 
 # --- the configuration --------------------------------------------------------

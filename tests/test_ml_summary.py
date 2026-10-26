@@ -228,6 +228,59 @@ class TestWindows:
         ]
 
 
+def _best_table() -> None:
+    import streamlit as st
+
+    from simlab import app as sim_app
+
+    sim_app._render_ml_best(st.session_state["best"], "month")
+
+
+class TestSetOrchestra:
+    """The best-model table's boxes and its Set Orchestra button
+    (simlab/app.py, `orchestra_defaults`)."""
+
+    @staticmethod
+    def best(ticker: str, model: str) -> dict:
+        return {"ticker": ticker, "model_key": model, "per_session": 10.0, "profit": 50.0,
+                "sessions": 5, "days_up": 3, "days_down": 2, "models": 1,
+                "runner_up": None, "runner_up_per_session": None, "lead": None}
+
+    def run(self, rows):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_best_table, default_timeout=60)
+        app.session_state["best"] = rows
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_the_boxes_open_on_orchestras_pairs_and_the_button_sets_them(self):
+        from agent_stonks import orchestra as ar
+        from agent_stonks import orchestra_defaults
+
+        rows = [self.best("AAPL", "highlow"), self.best("AMD", "goodmoments")]
+        assert "AAPL:highlow" in ar.default_pairs() and "AMD:goodmoments" not in ar.default_pairs()
+        app = self.run(rows)
+        app.button(key="ml_set_orchestra").click().run()
+        assert orchestra_defaults.pairs() == ["AAPL:highlow"]
+        assert ar.default_pairs() == ["AAPL:highlow"]
+        assert "now opens on AAPL · HighLow" in app.success[0].value
+
+    def test_restore_brings_the_tuned_pairs_back(self):
+        from agent_stonks import orchestra_defaults
+
+        orchestra_defaults.set_pairs(["AMD:goodmoments"])
+        app = self.run([self.best("AMD", "goodmoments")])
+        app.button(key="ml_restore_orchestra").click().run()
+        assert orchestra_defaults.pairs() is None
+        assert "tuned pairs again" in app.success[0].value
+
+    def test_nothing_ticked_sets_nothing(self):
+        app = self.run([self.best("AMD", "goodmoments")])
+        assert app.button(key="ml_set_orchestra").disabled
+
+
 CPI_ROW = {"date": "2026-10-14", "category": event_days.CPI, "scope": "ALL", "event": "CPI"}
 
 

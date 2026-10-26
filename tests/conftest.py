@@ -103,6 +103,16 @@ def _base_configs_in_tmp(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _orchestra_defaults_in_tmp(monkeypatch, tmp_path):
+    """Keep Orchestra's default pairs (`orchestra_defaults`) out of the real
+    data/orchestra_pairs.json, so Orchestra opens on the tuned pairs whatever
+    SimLab has set on this machine."""
+    from agent_stonks import orchestra_defaults
+
+    monkeypatch.setattr(orchestra_defaults, "PAIRS_PATH", tmp_path / "orchestra_pairs.json")
+
+
+@pytest.fixture(autouse=True)
 def _notification_settings_in_tmp(monkeypatch, tmp_path):
     """Keep the email settings out of the real data/notifications.json, so no
     test that fills a trade can email whoever is set there."""

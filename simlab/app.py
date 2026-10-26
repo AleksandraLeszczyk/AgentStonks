@@ -7,6 +7,7 @@ only reads the local dataset store and replays agents against it.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import textwrap
@@ -30,6 +31,7 @@ from agent_stonks import (
     clock,
     minute_momentum,
     model_overlays,
+    orchestra_defaults,
 )
 from agent_stonks import observability as obs
 from agent_stonks.agent import (
@@ -46,8 +48,10 @@ from agent_stonks.apple_trader import (
     default_config,
 )
 from agent_stonks import apple_trader_ui
-from agent_stonks.orchestra import ORCHESTRA_KEY
+from agent_stonks.orchestra import ORCHESTRA_KEY, racer_label
+from agent_stonks.orchestra import all_pairs as orchestra_all_pairs
 from agent_stonks.orchestra import default_pairs as default_orchestra_pairs
+from agent_stonks.orchestra import pairs_widget as orchestra_pairs_widget
 from agent_stonks.charts import (
     _rgba,
     add_candle_patterns,
@@ -1422,7 +1426,9 @@ def _configured_rule_tickers(personalities: list[str]) -> dict[str, list[str]]:
         found = []
         for slot in _rule_slots(personality):
             if personality == ORCHESTRA_KEY:
-                pairs = st.session_state.get(f"sim_rule_{personality}_{slot}_pairs")
+                pairs = st.session_state.get(
+                    f"sim_rule_{personality}_{slot}_{orchestra_pairs_widget()}"
+                )
                 symbols = [
                     str(p).partition(":")[0].upper()
                     for p in (default_orchestra_pairs() if pairs is None else pairs)
@@ -5658,7 +5664,7 @@ def render_ml_summary_tab() -> None:
                 f"read from job `{s.job_ids[0]}`'s base. Start a tuning job from it to see it here."
             )
     if rows:
-        _render_ml_models(rows, ml_summary.weekly(series, span))
+        _render_ml_models(rows, ml_summary.weekly(series, span), name)
     _render_ml_untuned(untuned)
     st.divider()
     _render_ml_events(series, span)
@@ -5715,7 +5721,7 @@ def _render_ml_untuned(pairs: "list[dict]") -> None:
     })
 
 
-def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
+def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> None:
     models = ml_summary.model_metrics(rows)
     st.markdown("##### :material/leaderboard: Models in their base configuration")
     best_pair = max(rows, key=lambda r: r["per_session"])
@@ -5767,37 +5773,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
         "worst": "Worst instrument",
     })
 
-    st.markdown("**Best model per instrument**")
-    st.dataframe(pd.DataFrame([
-        {
-            "ticker": b["ticker"],
-            "model": _ml_model(b["model_key"]),
-            "per_session": b["per_session"],
-            "profit": b["profit"],
-            "days": f"{b['days_up']} up · {b['days_down']} down of {b['sessions']}",
-            "runner_up": _ml_model(b["runner_up"]) if b["runner_up"] else None,
-            "runner_up_per_session": b["runner_up_per_session"],
-            "lead": b["lead"],
-            "models": b["models"],
-        }
-        for b in ml_summary.best_per_instrument(rows)
-    ]), hide_index=True, placeholder="—", column_config={
-        "ticker": "Instrument",
-        "model": "Best model",
-        "per_session": money("Profit a session ($)", format="%+.2f"),
-        "profit": money("Profit ($)", format="%+.2f", help="Over the window."),
-        "days": "Days",
-        "runner_up": "Runner-up",
-        "runner_up_per_session": money("Runner-up a session ($)", format="%+.2f"),
-        "lead": money(
-            "Lead a session ($)", format="%+.2f",
-            help="How much more the best model made a session than the runner-up.",
-        ),
-        "models": st.column_config.NumberColumn(
-            "Models compared",
-            help="How many models have a replay of their base on this instrument in the window.",
-        ),
-    })
+    _render_ml_best(ml_summary.best_per_instrument(rows), window)
 
     ordered = sorted(rows, key=lambda r: r["per_session"])
     fig = go.Figure()
@@ -5886,6 +5862,109 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:
         ))
         fig.update_layout(title="Week by week: profit a session ($)")
         st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(pairs) + 120)))
+
+
+# What "Set Orchestra" just did, for the rerun its click causes to say so.
+_ML_ORCHESTRA_DONE = "ml_orchestra_done"
+
+
+def _ml_set_orchestra(pairs: "list[str]", window: str) -> None:
+    """Make `pairs` Orchestra's default pairs (an on_click callback)."""
+    orchestra_defaults.set_pairs(pairs, source={"from": "SimLab ML summary", "window": window})
+    st.session_state[_ML_ORCHESTRA_DONE] = "set"
+
+
+def _ml_restore_orchestra() -> None:
+    """Back to the tuned pairs (an on_click callback)."""
+    orchestra_defaults.clear()
+    st.session_state[_ML_ORCHESTRA_DONE] = "restored"
+
+
+def _render_ml_best(best: "list[dict]", window: str) -> None:
+    """Best model per instrument, a box to tick on each row, and under it the
+    button that makes the ticked pairs Orchestra's default pairs
+    (`orchestra_defaults`): what its pair picker opens on, live and here.
+
+    The boxes open ticked on the pairs Orchestra opens on now. The table's key
+    carries its pairs and that default, so another window or a new default
+    ticks them afresh rather than keeping ticks made against other rows."""
+    money = st.column_config.NumberColumn
+    st.markdown("**Best model per instrument**")
+    keys = [f"{b['ticker']}:{b['model_key']}" for b in best]
+    current = default_orchestra_pairs()
+    digest = hashlib.sha1(json.dumps([keys, current]).encode("utf-8")).hexdigest()[:8]
+    picked = st.dataframe(pd.DataFrame([
+        {
+            "ticker": b["ticker"],
+            "model": _ml_model(b["model_key"]),
+            "per_session": b["per_session"],
+            "profit": b["profit"],
+            "days": f"{b['days_up']} up · {b['days_down']} down of {b['sessions']}",
+            "runner_up": _ml_model(b["runner_up"]) if b["runner_up"] else None,
+            "runner_up_per_session": b["runner_up_per_session"],
+            "lead": b["lead"],
+            "models": b["models"],
+        }
+        for b in best
+    ]), hide_index=True, placeholder="—", column_config={
+        "ticker": "Instrument",
+        "model": "Best model",
+        "per_session": money("Profit a session ($)", format="%+.2f"),
+        "profit": money("Profit ($)", format="%+.2f", help="Over the window."),
+        "days": "Days",
+        "runner_up": "Runner-up",
+        "runner_up_per_session": money("Runner-up a session ($)", format="%+.2f"),
+        "lead": money(
+            "Lead a session ($)", format="%+.2f",
+            help="How much more the best model made a session than the runner-up.",
+        ),
+        "models": st.column_config.NumberColumn(
+            "Models compared",
+            help="How many models have a replay of their base on this instrument in the window.",
+        ),
+    }, key=f"ml_best_{digest}", on_select="rerun", selection_mode="multi-row",
+        selection_default={"selection": {"rows": [i for i, k in enumerate(keys) if k in current]}},
+    )
+    chosen = [keys[i] for i in picked.selection.rows]
+    offered = set(orchestra_all_pairs())
+    racers = [k for k in chosen if k in offered]
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.button(
+            "Set Orchestra", icon=":material/queue_music:", type="primary",
+            disabled=not racers, key="ml_set_orchestra",
+            on_click=_ml_set_orchestra, args=(racers, window),
+            help="Makes the ticked pairs, and only those, what Orchestra's pair picker opens "
+            "on — in the live app and in SimLab's Simulate setups, on their next rerun. A "
+            "running Orchestra keeps its pairs until ▶ Start.",
+        )
+        if orchestra_defaults.pairs() is not None:
+            st.button(
+                "Restore the tuned pairs", icon=":material/undo:", key="ml_restore_orchestra",
+                on_click=_ml_restore_orchestra,
+                help="Orchestra opens on every pair SimLab's tuning has picked levels for, "
+                "as it did before a default was set here.",
+            )
+    left_out = [k for k in chosen if k not in offered]
+    if left_out:
+        st.caption(
+            f":material/warning: {', '.join(racer_label(k) for k in left_out)} cannot race "
+            "in Orchestra — Fast&Furious drives its own rules — so Set Orchestra leaves "
+            f"{'it' if len(left_out) == 1 else 'them'} out."
+        )
+    done = st.session_state.pop(_ML_ORCHESTRA_DONE, None)
+    stored = orchestra_defaults.load()
+    names = ", ".join(racer_label(k) for k in current)
+    if done == "set":
+        st.success(f"Orchestra now opens on {names}.", icon=":material/check_circle:")
+    elif done == "restored":
+        st.success(f"Orchestra opens on the tuned pairs again: {names}.",
+                   icon=":material/check_circle:")
+    else:
+        st.caption(
+            f"Orchestra opens on {names} — "
+            + (f"set here on {stored['set_at'][:10]}." if stored
+               else "the tuned pairs; nothing has been set here.")
+        )
 
 
 def _render_ml_events(series: "list[ml_summary.BaseSeries]", span: "tuple[str, str]") -> None:

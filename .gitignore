@@ -238,6 +238,7 @@ data/net_gamma/
 data/sessions/
 data/last_setup.json
 data/apple_trader_base.json
+data/orchestra_pairs.json
 data/logs/
 data/replay/
 data/aggressiveness/
