@@ -3702,7 +3702,7 @@ def _tuning_values_text(values: "dict | None") -> str:
 def _tuning_metric_text(metric: str, value) -> str:
     if value is None:
         return ""
-    if metric in ("profit", "worst_day"):
+    if metric in ("profit", "per_session", "worst_day"):
         return f"{value:+,.0f}"
     if metric == "return_pct":
         return f"{value:+.2f}%"
@@ -3814,7 +3814,9 @@ def render_tuning_tab() -> None:
         "per dataset, then their sum — and pick the combination with the best total "
         "profit. Every cell is a full replay through the same engine and trader as "
         "Simulate — market fills, the managed exit, the flatten — so a cell's number is "
-        "what a Simulate run of that configuration would show. A finished job takes a "
+        "what a Simulate run of that configuration would show. A square shows its profit "
+        "a session, every session counted, traded or not, and under it (±) the standard "
+        "deviation of its sessions' profits. A finished job takes a "
         "new dataset (a new week, say) with the same settings, and datasets can be "
         "dropped again."
     )
@@ -4301,7 +4303,8 @@ def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> "int | str |
         help=f"The heatmaps show the first two parameters. A value of {param} draws the "
         f"grid at that value. **Best of all** draws each square at whichever {param} "
         "made the most there — the hover names it. **Average** draws each square's "
-        f"profit averaged over every {param} the configuration accepts.",
+        f"profit a session and its std averaged over every {param} the configuration "
+        "accepts.",
     )
     return default if view is None else view
 
@@ -4320,6 +4323,7 @@ def _tuning_view_heatmap(
     square at that value of the third; on Best of all, the value it won at.
     An Average square is several configurations, so it names none.
     """
+    cells = sim_tuning.with_session_stats(cells)
     if len(axes) < 3:
         config_of = (lambda cell: cell["overrides"]) if clickable else None
         return _tuning_heatmap(cells, axes, marks, title, config_of=config_of)
@@ -4331,7 +4335,7 @@ def _tuning_view_heatmap(
         config_of = lambda cell: {**cell["overrides"], name: cell["best_of"]["value"]}  # noqa: E731
     elif view == sim_tuning.SLICE_MEAN:
         title, shown = f"{title} · average over {param}", marks
-        metric_label = f"Average {sim_tuning.METRICS[sim_tuning.PICK_METRIC].lower()}"
+        metric_label = f"Average {sim_tuning.METRICS[_TUNING_HEAT_METRIC].lower()}"
         config_of = None
     else:
         value = values[int(view)]
@@ -4339,14 +4343,22 @@ def _tuning_view_heatmap(
         shown = {label: o for label, o in marks.items() if (o or {}).get(name) == value}
         config_of = lambda cell: {**cell["overrides"], name: value}  # noqa: E731
     return _tuning_heatmap(
-        sim_tuning.slice_cells(cells, axes, view), axes[:2], shown, title,
-        metric_label=metric_label, config_of=config_of if clickable else None,
+        sim_tuning.slice_cells(cells, axes, view, _TUNING_HEAT_METRIC), axes[:2], shown,
+        title, metric_label=metric_label, config_of=config_of if clickable else None,
     )
 
 
-def _tuning_hover_data(cell: "dict | None") -> list:
-    """[return %, a line on days and datasets, a line on the third parameter]
-    for one cell's hover.
+def _tuning_square_text(metric: str, cell: dict) -> str:
+    """A scored square's label: its `metric`, and under it the session spread
+    (`tuning.session_std`) when it has one."""
+    text = _tuning_metric_text(metric, cell[metric])
+    std = sim_tuning.session_std(cell)
+    return text if std is None else f"{text}<br>±{std:,.0f}"
+
+
+def _tuning_hover_data(cell: "dict | None", metric: str = "per_session") -> list:
+    """[`metric` and the session spread, the total and a line on days and
+    datasets, a line on the third parameter] for one cell's hover.
 
     The third line is empty except on a collapsed three-axis view
     (`tuning.slice_cells`): which value of the third parameter a square's best
@@ -4372,7 +4384,6 @@ def _tuning_hover_data(cell: "dict | None") -> list:
             f"(of {best_of['count']} values)"
         )
     elif mean_of:
-        metric = sim_tuning.PICK_METRIC
         third = (
             f"Average of {mean_of['count']} {_tuning_param_label(mean_of['name'])} values: "
             f"{_tuning_metric_text(metric, mean_of['low'])} to "
@@ -4380,19 +4391,33 @@ def _tuning_hover_data(cell: "dict | None") -> list:
         )
         if mean_of["of"] > mean_of["count"]:
             third += f" ({mean_of['of'] - mean_of['count']} refused or errored, left out)"
-    return [f"{cell['return_pct']:+.2f}%", note, third]
+    std = sim_tuning.session_std(cell)
+    value = _tuning_metric_text(metric, cell[metric]) + (
+        f" · std {std:,.0f}" if std is not None else ""
+    )
+    total = f"Total {cell['profit']:+,.0f} · return {cell['return_pct']:+.2f}%"
+    return [value, f"{total}<br>{note}", third]
+
+
+# What the heatmaps are coloured by: the total over the number of sessions, so
+# a grid of one week and the sum of five read in the same units.
+_TUNING_HEAT_METRIC = "per_session"
 
 
 def _tuning_heatmap(
-    cells: list[dict], axes: list[dict], marks: dict, title: str, metric: str = "profit",
+    cells: list[dict], axes: list[dict], marks: dict, title: str,
+    metric: str = _TUNING_HEAT_METRIC,
     metric_label: "str | None" = None,
     config_of: "Callable[[dict], dict] | None" = None,
 ) -> go.Figure:
     """The grid coloured by `metric`; `marks` outlines named cells (the pick, the
     base, the square clicked).
 
-    The hover carries the return beside the dollar profit: the profit is what
-    the cells are ranked on, the return is what it means against the cash.
+    Cells come with their session stats (`tuning.with_session_stats`): each
+    square is labelled with its profit a session and, under it, the standard
+    deviation of its sessions' profits -- a bar's is its error bar. The hover
+    adds the total and the return: the total is what the pick is ranked on,
+    the return is what it means against the cash.
     A three-axis grid comes here already sliced to its first two axes
     (`_tuning_view_heatmap`), and the hover then says what was done with the
     third.
@@ -4411,7 +4436,7 @@ def _tuning_heatmap(
         return by_key.get(sim_tuning.overrides_key(overrides))
 
     def custom_of(cell: "dict | None") -> list:
-        data = _tuning_hover_data(cell)
+        data = _tuning_hover_data(cell, metric)
         if config_of is not None and sim_tuning.is_scored(cell):
             data.append(json.dumps(config_of(cell)))
         return data
@@ -4419,7 +4444,7 @@ def _tuning_heatmap(
     metric_label = metric_label or sim_tuning.METRICS[metric]
     collapsed = any(c.get("best_of") or c.get("mean_of") for c in cells)
     hover_tail = (
-        f"{metric_label}: %{{text}}<br>Return: %{{customdata[0]}}<br>%{{customdata[1]}}"
+        f"{metric_label}: %{{customdata[0]}}<br>%{{customdata[1]}}"
         + ("<br>%{customdata[2]}" if collapsed else "") + "<extra></extra>"
     )
     # A bar chart's stars: (colour, size).
@@ -4447,10 +4472,15 @@ def _tuning_heatmap(
         xs = [sim_tuning.axis_tick(axis["name"], v) for v in axis["values"]]
         found = [cell_at({axis["name"]: value}) for value in axis["values"]]
         ys = [cell[metric] if sim_tuning.is_scored(cell) else None for cell in found]
+        stds = [sim_tuning.session_std(cell) for cell in found]
         fig.add_trace(go.Bar(
             x=xs, y=ys, name=metric_label,
             marker_color=[PALETTE["up"] if (y or 0) >= 0 else PALETTE["down"] for y in ys],
-            text=[_tuning_metric_text(metric, y) for y in ys], textposition="outside",
+            text=[_tuning_metric_text(metric, y) for y in ys], textposition="inside",
+            error_y=dict(
+                type="data", array=[s or 0 for s in stds], visible=any(stds),
+                color=PALETTE["muted"], thickness=1.5,
+            ),
             customdata=[custom_of(cell) for cell in found], unselected=undimmed,
             hovertemplate=f"{_tuning_param_label(axis['name'])} %{{x}}<br>" + hover_tail,
         ))
@@ -4483,7 +4513,7 @@ def _tuning_heatmap(
                 cell = cell_at({row_axis["name"]: row_value, col_axis["name"]: col_value})
                 if sim_tuning.is_scored(cell):
                     z_row.append(cell[metric])
-                    text_row.append(_tuning_metric_text(metric, cell[metric]))
+                    text_row.append(_tuning_square_text(metric, cell))
                     hover = hover_tail
                 else:
                     z_row.append(None)
@@ -4502,7 +4532,7 @@ def _tuning_heatmap(
             z.append(z_row)
             text.append(text_row)
             custom.append(custom_row)
-        centred = metric in ("profit", "return_pct", "worst_day")
+        centred = metric in ("profit", "per_session", "return_pct", "worst_day")
         fig.add_trace(go.Heatmap(
             z=z, x=xs, y=ys, text=text, texttemplate="%{text}", colorscale="RdYlGn",
             zmid=0 if centred else None, hoverongaps=False, customdata=custom,

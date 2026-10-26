@@ -57,6 +57,7 @@ import math
 import multiprocessing
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import uuid
@@ -125,6 +126,9 @@ PICK_PLATEAU = "plateau"
 # formula.
 METRICS = {
     "profit": "Total profit",
+    # What the heatmaps are drawn by (`with_session_stats`): the total over
+    # the sessions, so it ranks a job's cells as the total does.
+    "per_session": "Profit a session",
     "return_pct": "Return",
     "days_up": "Profitable days",
     "worst_day": "Worst day",
@@ -1407,9 +1411,11 @@ def slice_cells(
       as it is, with `best_of` naming the value it won at. Ties go to the
       earlier value. No minimum share of days traded applies: this is a
       picture of the surface, not the pick.
-    * mean: `metric`, the return and the days traded averaged over the values
-      of the third the configuration accepts, with `mean_of` saying how many
-      that was out of how many, and the lowest and highest `metric` among them.
+    * mean: `metric`, the profit, the return, the days traded and -- when
+      every value has one -- the session spread (`session_std`) averaged over
+      the values of the third the configuration accepts, with `mean_of` saying
+      how many that was out of how many, and the lowest and highest `metric`
+      among them.
 
     A square collapses only once every value of the third has an answer, for
     the reason `combine` waits for every dataset: the best or the average of
@@ -1453,12 +1459,17 @@ def slice_cells(
             continue
         mean = lambda field: sum(float(p.get(field) or 0) for _, p in scored) / len(scored)  # noqa: E731
         found = [float(p[metric]) for _, p in scored]
+        stds = [p.get("session_std") for _, p in scored]
         out.append({
             "overrides": dict(overrides),
             "return_pct": round(mean("return_pct"), 4),
+            "profit": round(mean("profit"), 2),
             metric: round(mean(metric), 2),
             "days": scored[0][1].get("days") or 0,
             "days_traded": round(mean("days_traded"), 1),
+            # Cells drawn by `with_session_stats`: the average of their spreads.
+            **({"session_std": round(statistics.fmean(stds), 2)}
+               if all(s is not None for s in stds) else {}),
             "error": None,
             "mean_of": {
                 "name": name, "count": len(scored), "of": len(values),
@@ -1524,6 +1535,7 @@ def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
     # A dataset scored before round trips were counted leaves the sum without
     # them, rather than a rate over the other datasets' trades only.
     counted = all(p.get("round_trips") is not None for p in parts)
+    sessions = [session_profits(p) for p in parts]
     return {
         "overrides": dict(overrides),
         "profit": round(total("profit"), 2),
@@ -1538,6 +1550,9 @@ def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
         "wins": total("wins") if counted else None,
         "worst_day": min(p["worst_day"] for p in parts),
         "best_day": max(p["best_day"] for p in parts),
+        "session_profits": (
+            None if any(s is None for s in sessions) else [x for s in sessions for x in s]
+        ),
         "datasets": len(parts),
         "datasets_up": sum(1 for p in parts if p["profit"] > _FLAT_DAY_USD),
         "reused": sum(1 for p in parts if p.get("run_id")),
@@ -1568,6 +1583,46 @@ def daily_profit(cell: "dict | None") -> "float | None":
     if not cell or "profit" not in cell or cell.get("error") or not cell.get("days"):
         return None
     return cell["profit"] / cell["days"]
+
+
+def session_profits(cell: "dict | None") -> "list[float] | None":
+    """Every session's profit of a scored cell -- its own `daily`, or a sum's
+    over every dataset (`combine`) -- or None for a cell that did not keep
+    them. A session two summed datasets share is in it twice, as it is in the
+    sum's profit."""
+    if not is_scored(cell):
+        return None
+    if "session_profits" in cell:
+        return cell["session_profits"]
+    daily = cell.get("daily")
+    if not daily or len(daily) != cell.get("days"):
+        return None
+    return [float(daily[day]) for day in sorted(daily)]
+
+
+def session_std(cell: "dict | None") -> "float | None":
+    """How much a scored cell's profit moved from session to session: the
+    sample standard deviation over every session, traded or not, as
+    `daily_profit` counts them. None with fewer than two sessions or a cell
+    that did not keep them. A collapsed square (`slice_cells`) carries its
+    own: the average of its values'."""
+    if not is_scored(cell):
+        return None
+    if "session_std" in cell:
+        return cell["session_std"]
+    profits = session_profits(cell)
+    return statistics.stdev(profits) if profits and len(profits) > 1 else None
+
+
+def with_session_stats(cells: "list[dict]") -> "list[dict]":
+    """`cells` with each scored one's profit a session (`per_session`,
+    `daily_profit`) and its spread (`session_std`) set: what the heatmaps are
+    drawn by."""
+    return [
+        {**c, "per_session": daily_profit(c), "session_std": session_std(c)}
+        if is_scored(c) else c
+        for c in cells
+    ]
 
 
 def best_daily_cell(record: dict) -> "dict | None":

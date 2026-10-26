@@ -577,6 +577,62 @@ class TestSum:
         assert tu.missing_replays(record) == 1 + 3
 
 
+def with_daily(cell: dict, *profits: float) -> dict:
+    """`cell` with one session a profit, from the first of its week."""
+    days = [(TUNE_DAY + timedelta(days=i)).isoformat() for i in range(len(profits))]
+    return {**cell, "days": len(profits), "daily": dict(zip(days, profits))}
+
+
+class TestSessionStats:
+    """What a heatmap square shows: the profit a session and how much the
+    sessions' profits spread."""
+
+    def test_a_cells_spread_is_over_its_own_sessions(self):
+        cell = with_daily(scored({"buy_k": 0.3}, 300.0), 100.0, -50.0, 250.0)
+        assert tu.session_profits(cell) == [100.0, -50.0, 250.0]
+        assert tu.session_std(cell) == pytest.approx(150.0)
+        [stats] = tu.with_session_stats([cell])
+        assert stats["per_session"] == pytest.approx(100.0)
+        assert stats["session_std"] == pytest.approx(150.0)
+
+    def test_no_spread_without_two_sessions_kept(self):
+        assert tu.session_std(with_daily(scored({}, 10.0), 10.0)) is None
+        assert tu.session_std(scored({}, 10.0)) is None  # kept no `daily`
+        refused = {"overrides": {}, "invalid": "no"}
+        assert tu.with_session_stats([refused]) == [refused]
+
+    def test_a_sums_spread_is_over_every_datasets_sessions(self):
+        total = tu.combine({"buy_k": 0.3}, [
+            with_daily(scored({"buy_k": 0.3}, 100.0), 100.0, 0.0),
+            with_daily(scored({"buy_k": 0.3}, -100.0), -40.0, -60.0),
+        ])
+        assert sorted(total["session_profits"]) == [-60.0, -40.0, 0.0, 100.0]
+        assert tu.daily_profit(total) == pytest.approx(0.0)
+        assert tu.session_std(total) == pytest.approx(
+            (sum(x * x for x in (100.0, 0.0, -40.0, -60.0)) / 3) ** 0.5
+        )
+
+    def test_a_sum_with_a_dataset_that_kept_no_sessions_has_no_spread(self):
+        total = tu.combine({"buy_k": 0.3}, [
+            with_daily(scored({"buy_k": 0.3}, 100.0), 100.0, 0.0),
+            scored({"buy_k": 0.3}, -100.0),
+        ])
+        assert total["session_profits"] is None and tu.session_std(total) is None
+
+    def test_an_average_square_averages_the_spreads(self):
+        cells = tu.with_session_stats([
+            with_daily(scored({"buy_k": 0.3, "sell_k": 0.1, "take_fraction": take}, 0.0), *daily)
+            for take, daily in ((0.5, (10.0, -10.0)), (0.75, (30.0, -30.0)), (1.0, (0.0, 0.0)))
+        ])
+        axes = [{"name": "buy_k", "values": [0.3]}, {"name": "sell_k", "values": [0.1]},
+                AXES3[2]]
+        [square] = tu.slice_cells(cells, axes, tu.SLICE_MEAN, "per_session")
+        assert square["session_std"] == pytest.approx(
+            (2 ** 0.5 * 10 + 2 ** 0.5 * 30 + 0) / 3, abs=0.005
+        )
+        assert square["per_session"] == 0.0 and square["profit"] == 0.0
+
+
 # --- a third axis -----------------------------------------------------------
 
 
@@ -861,6 +917,48 @@ class TestClickedSquare:
         assert sim_app._tuning_daily_chart(record).layout.title.text == (
             "The pick, session by session"
         )
+
+
+class TestHeatmapLabels:
+    """A square is its profit a session, the sessions' std under it
+    (simlab/app.py)."""
+
+    def test_a_square_shows_its_profit_a_session_and_its_std(self):
+        from simlab import app as sim_app
+
+        cells = [
+            with_daily(scored({"buy_k": 0.3, "sell_k": 0.1}, 300.0), 100.0, -50.0, 250.0),
+            scored({"buy_k": 0.5, "sell_k": 0.1}, -40.0),  # kept no sessions
+        ]
+        fig = sim_app._tuning_view_heatmap(cells, AXES2, {}, "t", None)
+        [heatmap] = [t for t in fig.data if t.type == "heatmap"]
+        assert heatmap.z[0][0] == pytest.approx(100.0) and heatmap.z[1][0] == pytest.approx(-8.0)
+        assert heatmap.text[0][0] == "+100<br>±150" and heatmap.text[1][0] == "-8"
+        assert heatmap.customdata[0][0][0] == "+100 · std 150"
+        assert heatmap.customdata[0][0][1].startswith("Total +300 · return +3.00%")
+        assert heatmap.colorbar.title.text == "Profit a session"
+
+    def test_a_bar_carries_its_std_as_an_error_bar(self):
+        from simlab import app as sim_app
+
+        axes = [{"name": "buy_k", "values": [0.3, 0.5]}]
+        cells = [with_daily(scored({"buy_k": 0.3}, 300.0), 100.0, -50.0, 250.0),
+                 {"overrides": {"buy_k": 0.5}, "invalid": "no"}]
+        fig = sim_app._tuning_view_heatmap(cells, axes, {}, "t", None)
+        [bar] = [t for t in fig.data if t.type == "bar"]
+        assert list(bar.y) == [pytest.approx(100.0), None]
+        assert list(bar.error_y.array) == [pytest.approx(150.0), 0]
+
+    def test_an_average_square_is_labelled_as_one(self):
+        from simlab import app as sim_app
+
+        fig = sim_app._tuning_view_heatmap(
+            cells3(TestThirdAxis.PROFITS), AXES3, {}, "t", tu.SLICE_MEAN
+        )
+        [heatmap] = [t for t in fig.data if t.type == "heatmap"]
+        assert heatmap.colorbar.title.text == "Average profit a session"
+        # (0.3, 0.1): 100, 400 and 100 over 5 sessions each.
+        assert heatmap.z[0][0] == pytest.approx(40.0)
 
 
 class TestVerdict:
