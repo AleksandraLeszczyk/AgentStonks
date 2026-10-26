@@ -41,7 +41,7 @@ import streamlit as st
 from . import apple_models, base_configs, event_days, intraday_vol_model
 from .apple_trader import (
     AppleTraderConfig, base_record, confirmation_for, dayrange_levels, default_config,
-    min_win_for, shipped_config,
+    min_win_for, shipped_config, stop_for,
 )
 
 if TYPE_CHECKING:
@@ -649,11 +649,12 @@ def repaired_sell(buy_k: float, sell_k: float, label: str = "") -> float:
 def rule_params(
     defaults: AppleTraderConfig, buy_k: float, sell_k: float, unit_label: str,
     copy: FormCopy, take_on: bool, stop_scope: str = "",
-    stop_seed: "float | None" = None, breach_scope: str = "",
+    stop_seed: "float | None" = None, breach_scope: str = "", stop: bool = True,
 ) -> dict:
     """The forecast-breach rules and the managed exit: shared by every
-    instrument, but for the stop -- see `exit_params` for `stop_scope` and
-    `stop_seed` -- and the breach policy (`breach_param`, `breach_scope`).
+    instrument, but for the stop -- see `exit_params` for `stop_scope`,
+    `stop_seed` and `stop` -- and the breach policy (`breach_param`,
+    `breach_scope`).
     `buy_k` and `sell_k` only feed the stop's `?`, which says what the stop
     fraction comes to against them."""
     breach_update = breach_param(defaults, copy, scope=breach_scope)
@@ -661,7 +662,7 @@ def rule_params(
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     exits = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
-        stop_scope=stop_scope, stop_seed=stop_seed,
+        stop_scope=stop_scope, stop_seed=stop_seed, stop=stop,
     )
     skip_events = skip_param(defaults, copy)
     return {
@@ -931,6 +932,7 @@ def exit_params(
     take_on: bool = True,
     stop_scope: str = "",
     stop_seed: "float | None" = None,
+    stop: bool = True,
 ) -> dict:
     """The managed exit: a stop under the fill, a take, and a runner -- as the
     config fields they set.
@@ -952,8 +954,9 @@ def exit_params(
     instrument with the levels: `defaults.stop_gain_fraction` is then the
     pair's own, `stop_scope` (model and ticker) goes into its widget key so a
     switch re-seeds it, and `stop_seed` is a running agent's stop for the same
-    pair, which it opens on instead -- as the levels do. Orchestra's racers
-    share one stop and pass no scope.
+    pair, which it opens on instead -- as the levels do. Without `stop` it is
+    left out: Orchestra sets one per pair, beside its levels (since
+    2026-10-26; its pairs shared one before).
 
     The stop is the one that takes the levels as an argument, because it is
     written as a share of what they are playing for rather than as a distance
@@ -964,22 +967,26 @@ def exit_params(
     """
     section("Exits", copy.sections.get("dayrange_exits"))
     col_a, col_b = st.columns(2)
-    stop_key = copy.key(f"stop_gain_fraction_{stop_scope}" if stop_scope else "stop_gain_fraction")
-    start_stop = defaults.stop_gain_fraction if stop_seed is None else stop_seed
-    shown = float(st.session_state.get(stop_key, start_stop))
-    stop_gain_fraction = col_a.number_input(
-        "Stop loss (× the predicted gain, below the fill)",
-        min_value=0.0, max_value=3.0, value=start_stop, step=0.05,
-        format="%.2f",
-        key=stop_key,
-        help="\n\n".join(p for p in (
-            copy.help.get("stop_gain_fraction", "").format(
-                stop_gain_fraction=f"{defaults.stop_gain_fraction:g}"
-            ),
-            stop_note(shown, float(buy_k), float(sell_k), unit_label),
-        ) if p),
-    )
-    stop_warning(col_a, float(stop_gain_fraction))
+    stopped = {}
+    if stop:
+        stop_key = copy.key(
+            f"stop_gain_fraction_{stop_scope}" if stop_scope else "stop_gain_fraction"
+        )
+        start_stop = defaults.stop_gain_fraction if stop_seed is None else stop_seed
+        shown = float(st.session_state.get(stop_key, start_stop))
+        stopped["stop_gain_fraction"] = float(col_a.number_input(
+            "Stop loss (× the predicted gain, below the fill)",
+            min_value=0.0, max_value=3.0, value=start_stop, step=0.05,
+            format="%.2f",
+            key=stop_key,
+            help="\n\n".join(p for p in (
+                copy.help.get("stop_gain_fraction", "").format(
+                    stop_gain_fraction=f"{defaults.stop_gain_fraction:g}"
+                ),
+                stop_note(shown, float(buy_k), float(sell_k), unit_label),
+            ) if p),
+        ))
+        stop_warning(col_a, stopped["stop_gain_fraction"])
     # Before the knobs it greys out: the zone's two, and -- with the
     # confirmation off -- the take's own.
     take_trigger = col_b.selectbox(
@@ -1041,7 +1048,7 @@ def exit_params(
         disabled=not take_on,
     )
     return {
-        "stop_gain_fraction": float(stop_gain_fraction),
+        **stopped,
         "take_trigger": str(take_trigger),
         "zone_min_bars": int(zone_min_bars),
         "zone_width": float(zone_width),
@@ -1113,7 +1120,7 @@ def orchestra_params(
     pair's own numbers -- under a split, its share of the budget too -- and the
     rules they all share. None while no pair is picked.
 
-    The day-range pairs are one table (buy, sell, momentum confirmation) and
+    The day-range pairs are one table (buy, sell, stop, momentum confirmation) and
     the rules under it -- the circuit breaker too, one for every pair -- are
     theirs; the GoodMoments pairs are another (`signal_pair_params`), and keep
     the rest of their own configuration. The size and the days off are every
@@ -1125,9 +1132,9 @@ def orchestra_params(
 
     `seed` is a running Orchestra's configuration, for the same reason as
     `params`' -- a running racer adopts what its two widgets hold, so they
-    reopen on its numbers rather than the pair's shipped ones. Its momentum
-    confirmation reopens on the running racer's too, though only ▶ Start
-    takes a change to it.
+    reopen on its numbers rather than the pair's shipped ones. Its stop and
+    momentum confirmation reopen on the running racer's too, though only
+    ▶ Start takes a change to them.
 
     `briefing_choices` are the (provider, model) pairs whose briefings SimLab
     has cached, for a replay to read; None live, where the app's own briefing
@@ -1195,15 +1202,16 @@ def orchestra_params(
         unit_label = UNIT_FORM_LABELS[level_unit]
     running = {racer_key(r): r for r in (seed.racers if seed is not None else [])}
     seeded = {key: r for key, r in running.items() if r.level_unit == level_unit}
-    widths = [1.9, 1, 1, 1, 1] if split else [1.9, 1, 1, 1]
+    widths = [1.9, 1, 1, 1, 1, 1] if split else [1.9, 1, 1, 1, 1]
     if ranged:
         head = st.columns(widths)
         head[0].caption("Pair")
         head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
         head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
-        head[3].caption("Confirm", help=copy.help.get("pair_confirmation_bars"))
+        head[3].caption("Stop", help=copy.help.get("pair_stop_gain_fraction"))
+        head[4].caption("Confirm", help=copy.help.get("pair_confirmation_bars"))
         if split:
-            head[4].caption("Budget %", help=copy.help.get("pair_budget_pct"))
+            head[5].caption("Budget %", help=copy.help.get("pair_budget_pct"))
     for key in ranged:
         ticker, _, model_key = key.partition(":")
         # The pair's base configuration's numbers (`dayrange_levels` reads it
@@ -1213,10 +1221,14 @@ def orchestra_params(
         start_buy, start_sell = default_buy, default_sell
         if key in seeded:
             start_buy, start_sell = float(seeded[key].buy_k), float(seeded[key].sell_k)
-        # The pair's own period -- SimLab's tuning picks it per pair -- or a
-        # running racer's, which the row reopens on like its distances.
+        # The pair's own stop and period -- SimLab's tuning picks both per
+        # pair -- or a running racer's, which the row reopens on like its
+        # distances. The stop is a share of the gap between the levels, so
+        # whatever the unit.
+        start_stop = stop_for(ticker, model_key)
         start_confirm = confirmation_for(ticker, model_key)
         if key in running:
+            start_stop = float(running[key].stop_gain_fraction)
             start_confirm = int(running[key].momentum_confirmation_bars)
         row = st.columns(widths, vertical_alignment="center")
         row[0].markdown(label(key))
@@ -1230,21 +1242,34 @@ def orchestra_params(
             format="%.2f", key=copy.key(f"sell_k_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
-        confirm = row[3].number_input(
+        stop = row[3].number_input(
+            f"{key} stop", min_value=0.0, max_value=3.0, value=start_stop, step=0.05,
+            format="%.2f", key=copy.key(f"stop_gain_fraction_{model_key}_{ticker}{suffix}"),
+            label_visibility="collapsed",
+        )
+        confirm = row[4].number_input(
             f"{key} confirmation", min_value=0, max_value=60, value=start_confirm, step=1,
             key=copy.key(f"momentum_confirmation_bars_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
         if split:
-            budget_pct[key] = float(row[4].number_input(
+            budget_pct[key] = float(row[5].number_input(
                 f"{key} budget %", min_value=0.5, max_value=100.0, value=even, step=5.0,
                 format="%.1f", key=copy.key(f"budget_pct_{model_key}_{ticker}"),
                 label_visibility="collapsed",
             ))
         sell_k = repaired_sell(float(buy_k), float(sell_k), racer_label(key))
         levels[key] = {
-            "buy_k": float(buy_k), "sell_k": sell_k, "momentum_confirmation_bars": int(confirm),
+            "buy_k": float(buy_k), "sell_k": sell_k, "stop_gain_fraction": float(stop),
+            "momentum_confirmation_bars": int(confirm),
         }
+    wide = [racer_label(key) for key in ranged if levels[key]["stop_gain_fraction"] > 1]
+    if wide:
+        st.warning(
+            f"{', '.join(wide)}: the stop is wider than the predicted gain — it risks more "
+            "than a target exit can pay.",
+            icon=":material/warning:",
+        )
     if signals:
         levels.update(signal_pair_params(signals, copy, label, split, even, budget_pct))
     if split:
@@ -1263,6 +1288,7 @@ def orchestra_params(
         rules = rule_params(
             defaults, first["buy_k"], first["sell_k"], unit_label, copy,
             take_on=any(levels[key]["momentum_confirmation_bars"] for key in ranged),
+            stop=False,
         )
         section("Circuit breaker", copy.sections.get("dayrange_breaker"))
         # One threshold for every pair (the user's call, 2026-10-26; it was

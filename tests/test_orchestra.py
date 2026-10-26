@@ -419,15 +419,30 @@ class TestOrchestraConfig:
         assert intc.momentum_confirmation_bars == 0
         assert mu.min_win_k == intc.min_win_k == 0.05
 
-    def test_pairs_may_differ_in_their_confirmation_and_breaker(self):
-        """The confirmation is each pair's own; the breaker is one setting
-        since 2026-10-26, but a record from before it has one per pair."""
+    def test_pairs_may_differ_in_their_stop_confirmation_and_breaker(self):
+        """The stop and the confirmation are each pair's own; the breaker is
+        one setting since 2026-10-26, but a record from before it has one per
+        pair."""
         ar.OrchestraConfig([
-            racer("AAPL", momentum_confirmation_bars=3, negative_momentum_bars=0, min_win_k=0.1),
-            racer("INTC", momentum_confirmation_bars=0, negative_momentum_bars=0, min_win_k=0.0),
+            racer("AAPL", momentum_confirmation_bars=3, negative_momentum_bars=0, min_win_k=0.1,
+                  stop_gain_fraction=0.3),
+            racer("INTC", momentum_confirmation_bars=0, negative_momentum_bars=0, min_win_k=0.0,
+                  stop_gain_fraction=0.9),
         ])
-        with pytest.raises(ValueError, match="stop_gain_fraction"):
-            ar.OrchestraConfig([racer("AAPL"), racer("INTC", stop_gain_fraction=0.9)])
+        with pytest.raises(ValueError, match="hold_min_gain_k"):
+            ar.OrchestraConfig([racer("AAPL"), racer("INTC", hold_min_gain_k=0.9)])
+
+    def test_build_takes_each_pairs_tuned_stop(self):
+        race = ar.build_orchestra_config(
+            ["INTC:highlow", "AAPL:highlow2"], at.AppleTraderConfig(stop_gain_fraction=0.1),
+        )
+        intc, aapl = race.racers
+        assert intc.stop_gain_fraction == at.stop_for("INTC", "highlow")
+        assert aapl.stop_gain_fraction == at.stop_for("AAPL", "highlow2")
+        given = ar.build_orchestra_config(
+            ["INTC:highlow"], at.AppleTraderConfig(), {"INTC:highlow": {"stop_gain_fraction": 0}},
+        )
+        assert given.racers[0].stop_gain_fraction == 0.0 and not given.racers[0].has_stop
 
     def test_signature_names_every_pair_and_the_shared_rules_once(self):
         race = ar.build_orchestra_config(["AAPL:highlow", "MU:highlow"], at.AppleTraderConfig())
@@ -462,11 +477,32 @@ class TestOrchestraConfig:
         # though the first pair has none.
         assert "confirm=" not in rules and "take=70%@conf" in rules
 
-    def test_the_log_lists_each_pairs_confirmation(self):
-        assert ar.racer_terms(racer("INTC", momentum_confirmation_bars=1)) == (
-            "buy 0.75 / sell 0.1 × ADR, momentum confirmed over 1 bar"
+    def test_one_stop_signs_with_the_rules_as_before(self):
+        race = ar.OrchestraConfig([
+            racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5),
+        ])
+        sig = ar.orchestra_signature(race)
+        assert "/stop" not in sig and ",stop=E-0.5G" in sig
+
+    def test_stops_that_differ_sign_on_each_pair(self):
+        ladder = dict(scale_in=True, position_pct=50.0, buy_step_k=0.1)
+        race = ar.OrchestraConfig([
+            racer("AAPL", stop_gain_fraction=0.0, **ladder),
+            racer("INTC", stop_gain_fraction=0.4, **ladder),
+        ])
+        pairs, rules = ar.orchestra_signature(race).split("](")
+        assert "highlow_AAPL@0.75/0.1A," in pairs and pairs.endswith("highlow_INTC@0.75/0.1A/stop0.4G")
+        # The rules once, without the stop -- and with what it drives on a
+        # ladder, though the first pair has none.
+        assert "stop=E-" not in rules and ",stop@fill" in rules
+
+    def test_the_log_lists_each_pairs_stop_and_confirmation(self):
+        assert ar.racer_terms(racer("INTC", momentum_confirmation_bars=1, stop_gain_fraction=0.4)) == (
+            "buy 0.75 / sell 0.1 × ADR, stop 0.4 × the predicted gain, momentum confirmed over 1 bar"
         )
-        assert ar.racer_terms(racer("MU")).endswith(", no momentum confirmation")
+        assert ar.racer_terms(racer("MU", stop_gain_fraction=0.0)).endswith(
+            ", no stop, no momentum confirmation"
+        )
         assert ar.racer_terms(gm_racer("AMD", gm_confirm_bars=3)).endswith(
             " ADR, momentum confirmed over 3 bars"
         )
@@ -1054,28 +1090,44 @@ class TestASplitOfOneIsASingleRun:
         assert run(as_split=True) == run(as_split=False)
 
 
-class TestEachPairsOwnConfirmation:
-    """Each pair reads momentum over its own confirmation period (2026-10-26):
-    in a split of two on one tape, each trades exactly as an Apple Trader run
-    of it alone on its share would."""
+class TestEachPairsOwnNumbers:
+    """Each pair trades on its own stop and its own momentum confirmation
+    period (2026-10-26): in a split of two on one tape, each trades exactly as
+    an Apple Trader run of it alone on its share would."""
 
-    PATH = [
-        dict(AAPL=104.0, INTC=104.0),
-        dict(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01)),
-        dict(AAPL=(103.5, BUY_LEVEL - 0.01), INTC=(103.5, BUY_LEVEL - 0.01)),
-        dict(AAPL=(104.0, BUY_LEVEL - 0.01), INTC=(104.0, BUY_LEVEL - 0.01)),
-        dict(AAPL=(109.5, 109.0, SELL_LEVEL + 0.5), INTC=(109.5, 109.0, SELL_LEVEL + 0.5)),
-        dict(AAPL=(108.0, 107.5, 109.5), INTC=(108.0, 107.5, 109.5)),
-        dict(AAPL=104.0, INTC=104.0),
-    ]
-    CONFIRM = {"AAPL": 0, "INTC": 2}
+    CONFIRMATION = (
+        {"AAPL": dict(momentum_confirmation_bars=0), "INTC": dict(momentum_confirmation_bars=2)},
+        [
+            dict(AAPL=104.0, INTC=104.0),
+            dict(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01)),
+            dict(AAPL=(103.5, BUY_LEVEL - 0.01), INTC=(103.5, BUY_LEVEL - 0.01)),
+            dict(AAPL=(104.0, BUY_LEVEL - 0.01), INTC=(104.0, BUY_LEVEL - 0.01)),
+            dict(AAPL=(109.5, 109.0, SELL_LEVEL + 0.5), INTC=(109.5, 109.0, SELL_LEVEL + 0.5)),
+            dict(AAPL=(108.0, 107.5, 109.5), INTC=(108.0, 107.5, 109.5)),
+            dict(AAPL=104.0, INTC=104.0),
+        ],
+    )
+    # INTC's stop, 0.3 of the 6.50 the levels are apart, sits at 101.05 under
+    # a 103 fill; AAPL has none and rides the dip to the target.
+    STOP = (
+        {"AAPL": dict(stop_gain_fraction=0.0), "INTC": dict(stop_gain_fraction=0.3)},
+        [
+            dict(AAPL=104.0, INTC=104.0),
+            dict(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01)),
+            dict(AAPL=(101.5, 100.5, 103.0), INTC=(101.5, 100.5, 103.0)),
+            dict(AAPL=(105.0, 101.0, 105.0), INTC=(105.0, 101.0, 105.0)),
+            dict(AAPL=(109.5, 109.0, SELL_LEVEL + 0.5), INTC=(109.5, 109.0, SELL_LEVEL + 0.5)),
+            dict(AAPL=104.0, INTC=104.0),
+        ],
+    )
 
-    def _config(self, ticker):
-        return flat_racer(
-            ticker, momentum_confirmation_bars=self.CONFIRM[ticker], negative_momentum_bars=0,
-        )
+    @staticmethod
+    def _config(ticker, own):
+        kwargs = {"momentum_confirmation_bars": 0, "negative_momentum_bars": 0, **own[ticker]}
+        return flat_racer(ticker, **kwargs)
 
-    def _run(self, monkeypatch, symbols, cash, cycle_for):
+    @staticmethod
+    def _run(monkeypatch, symbols, cash, cycle_for, path):
         broker = Broker2()
         tracker = DecisionTracker(starting_cash=cash, broker=broker)
         tapes = Tapes(monkeypatch, symbols, broker)
@@ -1084,7 +1136,7 @@ class TestEachPairsOwnConfirmation:
             state.sym(symbol).abs_mean_minute_momentum = 0.05
         cycle = cycle_for(state, tracker)
         cycle()
-        for bar in self.PATH:
+        for bar in path:
             tapes.bar(**{s: v for s, v in bar.items() if s in symbols})
             cycle()
         return [
@@ -1092,23 +1144,26 @@ class TestEachPairsOwnConfirmation:
             for d in tracker.decisions
         ]
 
-    def test_each_pair_trades_as_its_own_run(self, market_open, monkeypatch):
+    @pytest.mark.parametrize("case", ["CONFIRMATION", "STOP"])
+    def test_each_pair_trades_as_its_own_run(self, market_open, monkeypatch, case):
+        own, path = getattr(self, case)
+
         def split(state, tracker):
             race = make_split(
                 {"AAPL:highlow": 50.0, "INTC:highlow": 50.0},
-                self._config("AAPL"), self._config("INTC"),
+                self._config("AAPL", own), self._config("INTC", own),
             )
             return lambda: race.run_cycle(state, tracker)
 
-        both = self._run(monkeypatch, ["AAPL", "INTC"], 10_000.0, split)
+        both = self._run(monkeypatch, ["AAPL", "INTC"], 10_000.0, split, path)
         for ticker in ("AAPL", "INTC"):
             def single(state, tracker, ticker=ticker):
-                trader = at.DayRangeTrader(self._config(ticker))
+                trader = at.DayRangeTrader(self._config(ticker, own))
                 return lambda: trader.run_cycle(BUNDLE, state, tracker)
 
-            alone = self._run(monkeypatch, [ticker], 5_000.0, single)
+            alone = self._run(monkeypatch, [ticker], 5_000.0, single, path)
             assert [d for d in both if d[0] == ticker] == alone
-        # The same tape, two periods, two different days.
+        # The same tape, two pairs' own numbers, two different days.
         aapl = [d[1:] for d in both if d[0] == "AAPL"]
         intc = [d[1:] for d in both if d[0] == "INTC"]
         assert aapl and intc and aapl != intc
@@ -1324,8 +1379,8 @@ class TestOneCircuitBreaker(_PairForm):
 
 
 class TestConfirmationPerPair(_PairForm):
-    """Each pair's momentum confirmation period, on its row (the user's
-    request, 2026-10-26): it was one period for every pair."""
+    """Each pair's stop and momentum confirmation period, on its row (the
+    user's requests, 2026-10-26): each was one setting for every pair."""
 
     def test_each_row_opens_on_its_pairs_own(self):
         from dataclasses import asdict
@@ -1348,7 +1403,8 @@ class TestConfirmationPerPair(_PairForm):
         confirm = self._racers(app, "momentum_confirmation_bars")
         assert confirm == {"AAPL": at.APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS, "INTC": 0}
         sig = ar.orchestra_signature(app.session_state["out"])
-        assert "highlow_AAPL@" in sig and f"/conf{confirm['AAPL']}b," in sig
+        aapl, intc = sig.split("](")[0].split(",highlow_INTC@")
+        assert f"/conf{confirm['AAPL']}b" in aapl and "/conf" not in intc
         # The take stays on while any pair confirms.
         assert not app.number_input(key="o_take_pct").disabled
         app.number_input(key="o_momentum_confirmation_bars_highlow_AAPL").set_value(0).run()
@@ -1366,6 +1422,33 @@ class TestConfirmationPerPair(_PairForm):
         app.run()
         assert not app.exception, app.exception
         assert app.session_state["out"].racers[0].momentum_confirmation_bars == 6
+
+    def test_each_row_has_its_own_stop(self):
+        app = self._run()
+        assert self._racers(app, "stop_gain_fraction") == {
+            "AAPL": at.stop_for("AAPL", "highlow"), "INTC": at.stop_for("INTC", "highlow"),
+        }
+        # No shared stop under the exits any more.
+        assert not [w for w in app.number_input if w.key == "o_stop_gain_fraction"]
+        app.number_input(key="o_stop_gain_fraction_highlow_INTC").set_value(0.0).run()
+        assert self._racers(app, "stop_gain_fraction") == {
+            "AAPL": at.stop_for("AAPL", "highlow"), "INTC": 0.0,
+        }
+        app.number_input(key="o_stop_gain_fraction_highlow_AAPL").set_value(1.5).run()
+        assert any("stop is wider than the predicted gain" in w.value for w in app.warning)
+
+    def test_a_running_racers_stop_reopens_its_row(self):
+        from streamlit.testing.v1 import AppTest
+
+        running = ar.build_orchestra_config(
+            ["AAPL:highlow"], at.AppleTraderConfig(),
+            {"AAPL:highlow": {"stop_gain_fraction": 0.25}},
+        )
+        app = AppTest.from_function(_orchestra_form_seeded, default_timeout=30)
+        app.session_state["seed"] = running
+        app.run()
+        assert not app.exception, app.exception
+        assert app.session_state["out"].racers[0].stop_gain_fraction == 0.25
 
     def test_a_goodmoments_row_has_its_own(self):
         self.PAIRS = ["AAPL:highlow", "AMD:goodmoments"]

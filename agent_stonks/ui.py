@@ -3428,8 +3428,7 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- 0.5 risks \\$0.50 for every \\$1.00 the trade plays for — "
             "on any instrument, at any levels.\n"
             "- Starts at **{stop_gain_fraction}**: the stop SimLab tuned with this model "
-            "and instrument's levels, or the shared default for a pair it did not "
-            "(Orchestra's pairs share one).\n"
+            "and instrument's levels, or the shared default for a pair it did not.\n"
             "- After a stop the agent stops; press ▶ Start Agent to trade again.\n"
             "- 0 switches the stop off."
         ),
@@ -3574,6 +3573,8 @@ _ORCHESTRA_COPY = dc_replace(
             "Every pair forecasts its own **H** at 9:35 and rests its own buy and sell "
             "below it, in the same unit.\n\n"
             "- **Buy / Sell** — each pair's own distances, starting from its tuned pair.\n"
+            "- **Stop** — each pair's stop loss, as a share of its predicted gain "
+            "(`buy − sell`) under the fill (0 = off), starting from its tuned stop.\n"
             "- **Confirm** — each pair's momentum confirmation period, in bars (0 = off), "
             "starting from its base configuration: SimLab's tuning picks it per pair.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
@@ -3622,6 +3623,14 @@ _ORCHESTRA_COPY = dc_replace(
             "tuning has picked levels for. The order is the tie-break: when two buys "
             "would fill on the same bar, the pair listed first takes it. Every pair's "
             "ticker must be streamed."
+        ),
+        "pair_stop_gain_fraction": (
+            "Per pair: sells everything when a bar's low reaches this share of the pair's "
+            "predicted gain (`buy − sell`) under the fill — 0.5 risks \\$0.50 for every "
+            "\\$1.00 the trade plays for. 0 switches it off for this pair. Starts from the "
+            "stop SimLab tuned with the pair's levels. In a race a stop-out stops the agent; "
+            "in a split it stands only that pair down. A running Orchestra takes a change "
+            "on ▶ Start."
         ),
         "pair_confirmation_bars": (
             "Per pair: the momentum confirmation period, in bars — the look-back over which "

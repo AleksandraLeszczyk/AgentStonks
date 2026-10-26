@@ -2072,8 +2072,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
         "stop_gain_fraction": (
             "Starts at **{stop_gain_fraction}**: the stop tuned with this model and "
-            "instrument's levels, or the shared default for a pair never tuned "
-            "(Orchestra's pairs share one). A share of the **predicted gain** "
+            "instrument's levels, or the shared default for a pair never tuned. A share "
+            "of the **predicted gain** "
             "(`buy − sell`, what a target exit pays), not a distance of its own.\n\n"
             "- 0.5 risks \\$0.50 for every \\$1.00 the trade plays for, on every "
             "instrument. In ADRs it would not travel: 0.20 ADR was a third of AAPL's "
@@ -2419,6 +2419,11 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "share of the budget (Budget %); the budget is the ledger's worth at each "
             "session's first bar, so it compounds day to day. A split of one pair at "
             "100% replays exactly as Apple Trader."
+        ),
+        "pair_stop_gain_fraction": (
+            "Per pair: the stop as a share of the pair's predicted gain (`buy − sell`) under "
+            "the fill (0 = off), starting from the stop tuned with its levels. Pairs that "
+            "differ sign it on each pair (`/stop0.5G`) rather than once with the shared rules."
         ),
         "pair_confirmation_bars": (
             "Per pair: the momentum confirmation period in bars (0 = off, and the momentum "

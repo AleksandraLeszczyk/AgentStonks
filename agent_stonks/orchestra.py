@@ -49,8 +49,8 @@ What a pair is given, and what it shares
 Every pair shares Orchestra's sizing, its closing flatten and its days off
 (`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
 -- the unit, the ladder, the exits, the breach policy, the circuit breaker --
-and each keeps its two distances and its momentum confirmation period
-(`DAYRANGE_PAIR_FIELDS`). A GoodMoments pair keeps its own configuration --
+and each keeps its two distances, its stop and its momentum confirmation
+period (`DAYRANGE_PAIR_FIELDS`). A GoodMoments pair keeps its own configuration --
 its pair's base, or the shipped defaults -- and Orchestra sets only the
 numbers that matter most (`SIGNAL_PAIR_FIELDS`): the edge a buy needs, the
 take, the stop and its momentum confirmation, and on the hybrid HighLow2's
@@ -138,9 +138,10 @@ MODE_LABELS = {
 STRATEGIES = (apple_models.STRATEGY_DAYRANGE, apple_models.STRATEGY_PROBABILITY)
 
 # What Orchestra sets on each day-range racer, over the rules they share: the
-# two distances and the momentum confirmation period, tuned per pair (the
-# confirmation per pair since 2026-10-26, the user's request; it was shared).
-DAYRANGE_PAIR_FIELDS = ("buy_k", "sell_k", "momentum_confirmation_bars")
+# two distances, the stop and the momentum confirmation period, tuned per pair
+# (the confirmation and the stop per pair since 2026-10-26, the user's
+# requests; they were shared).
+DAYRANGE_PAIR_FIELDS = ("buy_k", "sell_k", "stop_gain_fraction", "momentum_confirmation_bars")
 # The fields a day-range racer need not share with the others. Orchestra is
 # one rule set over several instruments, not several rule sets: the pair
 # (ticker, model) and its own numbers are the racer's, and everything else is
@@ -396,9 +397,9 @@ def build_orchestra_config(
 ) -> OrchestraConfig:
     """One racer per pair, `levels[key]` = `{field: value}` of the numbers
     Orchestra sets on it (`pair_fields`). A day-range pair is `base` -- its
-    circuit breaker too, one for every pair -- with its own two distances and
-    momentum confirmation period: those given, the pair's own for the rest
-    (its base configuration's, else the shipped ones). A GoodMoments pair is
+    circuit breaker too, one for every pair -- with its own two distances,
+    stop and momentum confirmation period: those given, the pair's own for the
+    rest (its base configuration's, else the shipped ones). A GoodMoments pair is
     its own configuration with the numbers given (`signal_racer`).
     `selection`, `mode` and `budget_pct` as `OrchestraConfig`'s."""
     levels = levels or {}
@@ -411,6 +412,7 @@ def build_orchestra_config(
         buy_k, sell_k = at.dayrange_levels(ticker, model_key)
         own = {
             "buy_k": float(buy_k), "sell_k": float(sell_k),
+            "stop_gain_fraction": at.stop_for(ticker, model_key),
             "momentum_confirmation_bars": at.confirmation_for(ticker, model_key),
         }
         own.update(_pair_numbers(model_key, levels.get(key)))
@@ -430,14 +432,16 @@ def orchestra_signature(race: OrchestraConfig) -> str:
     run. A split says so up front and adds each pair's share of the budget
     ("=40%"); a race signs as it always has.
 
-    The day-range pairs' momentum confirmation is signed with the shared rules
-    (`confirm=3b`) while they all have the same one -- every record from before
-    it was set per pair -- and otherwise on each pair that has one ("/conf3b"),
-    with the rules then read off the first pair that has one, so the take it
-    drives is in them.
+    The day-range pairs' momentum confirmation and stop are each signed with
+    the shared rules (`confirm=3b`, `stop=E-0.5G`) while every pair has the
+    same one -- every record from before they were set per pair -- and
+    otherwise on each pair that has one ("/conf3b", "/stop0.5G"). The rules
+    are then read off the first pair that has the ones that differ, so what
+    they drive -- the take, the stop under the fill on a ladder -- is in them.
     """
     ranged = [r for r in race.racers if not is_signal(r)]
     own_confirmation = len({r.momentum_confirmation_bars for r in ranged}) > 1
+    own_stop = len({(r.stop_gain_fraction, r.stop_k) for r in ranged}) > 1
 
     def pair(r: AppleTraderConfig) -> str:
         if is_signal(r):
@@ -452,21 +456,37 @@ def orchestra_signature(race: OrchestraConfig) -> str:
                     f"/conf{r.momentum_confirmation_bars}b"
                     if own_confirmation and r.momentum_confirmation_bars else ""
                 )
+                + (_stop_token(r) if own_stop else "")
             )
         return token + (f"={race.budget_pct[racer_key(r)]:g}%" if race.split else "")
 
     pairs = ",".join(pair(r) for r in race.racers)
     head = "split:" if race.split else ""
-    first = next(
-        (r for r in ranged if r.momentum_confirmation_bars or not own_confirmation),
-        race.racers[0],
+    # The first pair with the most of what differs; with nothing differing,
+    # the first pair.
+    first = max(
+        ranged,
+        key=lambda r: (own_confirmation and bool(r.momentum_confirmation_bars))
+        + (own_stop and r.has_stop),
+        default=race.racers[0],
     )
     single = at.config_signature(first)
     rules = single[single.index("size="):-1]
     rules = re.sub(r",min_win=[^,)]*", "", rules)
     if own_confirmation:
         rules = re.sub(r",confirm=\d+b", "", rules)
+    if own_stop:
+        rules = re.sub(r",stop=E-[^,)]*", "", rules)
     return f"orchestra[{head}{pairs}]({rules}{candidates.rules_signature(race.selection)})"
+
+
+def _stop_token(r: AppleTraderConfig) -> str:
+    """A day-range pair's own stop in its signature, as the rules would sign
+    it: a share of the predicted gain, or a legacy record's ADRs. Nothing
+    without one."""
+    if r.stop_gain_fraction:
+        return f"/stop{r.stop_gain_fraction:g}G"
+    return f"/stop{r.stop_k:g}A" if r.stop_k else ""
 
 
 def racer_terms(config: AppleTraderConfig) -> str:
@@ -474,7 +494,11 @@ def racer_terms(config: AppleTraderConfig) -> str:
     if not is_signal(config):
         return (
             f"buy {config.buy_k:g} / sell {config.sell_k:g} × {config.unit_phrase}, "
-            + _confirmation_terms(config.momentum_confirmation_bars)
+            + (
+                f"stop {config.stop_gain_fraction:g} × the predicted gain"
+                if config.stop_gain_fraction else "no stop"
+            )
+            + ", " + _confirmation_terms(config.momentum_confirmation_bars)
         )
     take = f"{config.gm_take_k:g}" if config.gm_take_k else "off"
     if config.gm_take_k and config.gm_take_min_k is not None:
