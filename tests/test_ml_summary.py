@@ -11,6 +11,7 @@ from agent_stonks import event_days
 from agent_stonks.apple_trader import AppleTraderConfig
 from simlab import ml_summary as ms
 from simlab import tuning as tu
+from simlab.data import Dataset
 
 
 def baseline(daily: dict, sat_out=(), no_forecast=()) -> dict:
@@ -110,6 +111,66 @@ class TestStoredBase:
         assert series.source == ms.FROM_JOB and series.job_ids == ["a"]
         assert series.base_set_at == "2026-10-25T10:00"
         assert series.daily == WEEK1
+
+
+def dataset(*symbols: str) -> Dataset:
+    return Dataset(name="w", symbols=list(symbols), start="2026-10-05", end="2026-10-09")
+
+
+class TestUntunedPairs:
+    """Every pair the app can trade that no job has scored a replay of."""
+
+    PAIRS = [("highlow", "AMD"), ("highlow", "MU"), ("highlow2", "AAPL"), ("highlow2", "GOOG")]
+
+    def untuned(self, jobs, datasets=(), bases=None):
+        series = ms.base_series(jobs, bases=bases or {})
+        return ms.untuned_pairs(series, jobs, list(datasets), pairs=self.PAIRS)
+
+    def test_a_pair_with_its_base_replayed_is_tuned(self):
+        found = self.untuned([job("a", WEEK1, grid={0.5: WEEK1})], bases=stored(0.5))
+        assert [(p["ticker"], p["model_key"]) for p in found] == [
+            ("AAPL", "highlow2"), ("GOOG", "highlow2"), ("MU", "highlow")
+        ]
+        assert all(p["status"] == ms.NO_JOB and p["job_ids"] == [] for p in found)
+
+    def test_a_tuned_pair_with_no_base_set_is_listed(self):
+        amd = next(p for p in self.untuned([job("a", WEEK1)]) if p["ticker"] == "AMD")
+        assert (amd["status"], amd["job_ids"]) == (ms.NO_BASE, ["a"])
+
+    def test_a_base_set_but_never_replayed_is_a_base(self):
+        found = self.untuned([job("a", WEEK1)], bases=stored(0.55))
+        assert "AMD" not in {p["ticker"] for p in found}
+
+    def test_why_a_pair_with_jobs_is_still_untuned(self):
+        running = {**job("r", WEEK1, ticker="MU"), "status": tu.RUNNING}
+        running["baseline"] = {}
+        failed = job("f", WEEK1, ticker="AAPL", model="highlow2", created="2026-10-01T00:00")
+        failed["status"] = tu.FAILED
+        failed["baseline"]["w"]["error"] = "boom"
+        stopped = {**job("s", WEEK1, ticker="AAPL", model="highlow2"), "status": tu.FAILED}
+        stopped["baseline"] = {}
+        found = {(p["ticker"], p["model_key"]): p for p in self.untuned([running, failed, stopped])}
+        assert found[("MU", "highlow")]["status"] == ms.JOB_RUNNING
+        assert found[("AAPL", "highlow2")]["status"] == ms.NOT_SCORED
+        assert found[("AAPL", "highlow2")]["job_ids"] == ["s", "f"]
+
+    def test_a_running_job_that_scored_its_base_has_tuned_the_pair(self):
+        running = {**job("r", WEEK1, ticker="MU"), "status": tu.RUNNING}
+        mu = next(p for p in self.untuned([running]) if p["ticker"] == "MU")
+        assert mu["status"] == ms.NO_BASE
+
+    def test_how_many_datasets_carry_the_instrument(self):
+        found = self.untuned([], datasets=[dataset("AMD", "MU"), dataset("mu", "GOOGL")])
+        assert {(p["ticker"], p["datasets"]) for p in found} == {
+            ("AMD", 1), ("MU", 2), ("AAPL", 0), ("GOOG", 0)
+        }
+
+    def test_the_registry_by_default(self):
+        from agent_stonks import apple_models
+
+        pairs = ms.registry_pairs()
+        assert ("highlow", apple_models.DEFAULT_TICKER) in pairs
+        assert all(t in apple_models.MODELS[k].tickers for k, t in pairs)
 
 
 class TestWindows:

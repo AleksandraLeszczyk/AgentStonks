@@ -5596,12 +5596,15 @@ def render_ml_summary_tab() -> None:
         "below. A pair with no base stored is read from the base of its job reaching the "
         "latest session."
     )
-    series = ml_summary.base_series(sim_tuning.list_jobs())
+    jobs = sim_tuning.list_jobs()
+    series = ml_summary.base_series(jobs)
+    untuned = ml_summary.untuned_pairs(series, jobs, sim_data.list_datasets())
     if not series:
         st.info(
             "No tuning job has replayed a base configuration yet — start one in the Tuning tab.",
             icon=":material/tune:",
         )
+        _render_ml_untuned(untuned)
         return
     name = st.segmented_control(
         "Window", list(_ML_WINDOWS), format_func=_ML_WINDOWS.get,
@@ -5626,8 +5629,60 @@ def render_ml_summary_tab() -> None:
             )
     if rows:
         _render_ml_models(rows, ml_summary.weekly(series, span))
+    _render_ml_untuned(untuned)
     st.divider()
     _render_ml_events(series, span)
+
+
+_ML_UNTUNED_STATUS = {
+    ml_summary.NO_JOB: "No tuning job",
+    ml_summary.JOB_RUNNING: "Job running, base not replayed yet",
+    ml_summary.NOT_SCORED: "Jobs never scored its base",
+    ml_summary.NO_BASE: "Tuned, no base set",
+}
+
+
+def _render_ml_untuned(pairs: "list[dict]") -> None:
+    st.markdown("##### :material/pending_actions: Not tuned yet")
+    if not pairs:
+        st.caption(
+            "Every model has a base configuration set from tuning on every instrument it "
+            "was fitted on."
+        )
+        return
+    st.caption(
+        "Model × instrument pairs the app can trade with no base configuration set: a new "
+        "run of one starts from the shipped defaults (a hybrid, from its two models' "
+        "bases). A pair no tuning job has replayed is missing above: "
+        "start one in the Tuning tab, on a dataset that carries the instrument. A tuned "
+        "one is above, read off its job's base: pick a configuration in the Tuning tab "
+        "and *Set as base configuration*."
+    )
+    st.dataframe(pd.DataFrame([
+        {
+            "ticker": p["ticker"],
+            "model": _apple_model_label(p["model_key"]),
+            "status": _ML_UNTUNED_STATUS[p["status"]],
+            "datasets": p["datasets"],
+            "jobs": ", ".join(p["job_ids"]) or None,
+        }
+        for p in pairs
+    ]), hide_index=True, placeholder="—", column_config={
+        "ticker": "Instrument",
+        "model": "Model",
+        "status": st.column_config.TextColumn(
+            "Why", width="medium",
+            help="No tuning job; a job running that has not replayed the base yet; jobs "
+            "that never scored the base (failed, stopped or every replay an error); or "
+            "tuned, but no pick set as the base configuration.",
+        ),
+        "datasets": st.column_config.NumberColumn(
+            "SimLab datasets",
+            help="Datasets that carry the instrument. A tuning job needs one: with none, "
+            "create one in the Datasets tab first.",
+        ),
+        "jobs": st.column_config.TextColumn("Tuning jobs", help="The pair's jobs, newest first."),
+    })
 
 
 def _render_ml_models(rows: "list[dict]", weekly: "list[dict]") -> None:

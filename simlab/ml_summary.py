@@ -17,7 +17,9 @@ and the next render reads the pair off the new one's replays. A pair with no
 base stored, or whose base no job has replayed, falls back on the base of the
 job reaching its latest session (the most recently started on a tie); jobs'
 bases differ -- AMD's sit out different days, say -- so two are never added
-together.
+together. A pair the app can trade with no base stored is not tuned -- no job
+has scored a replay of it, or none of its jobs' picks was set as its base --
+and is listed apart (`untuned_pairs`) rather than left to go missing.
 
 Event days are classified after the fact (`events_by_day`), not as a trader
 would have had to that morning: the calendar's every row, known before the open
@@ -210,6 +212,74 @@ def base_series(jobs: "list[dict]", bases: "dict | None" = None) -> "list[BaseSe
             series.base_set_at = stored[1] if stored else ""
         out.append(series)
     return sorted(out, key=lambda s: (s.ticker, s.model_key))
+
+
+def registry_pairs() -> "list[tuple[str, str]]":
+    """(model, ticker) for every model on every instrument it was fitted on
+    (`apple_models.MODELS`), in the registry's order: every pair the app can
+    trade."""
+    from agent_stonks import apple_models
+
+    return [(key, ticker) for key, model in apple_models.MODELS.items() for ticker in model.tickers]
+
+
+# Why a pair is untuned (`untuned_pairs`).
+NO_JOB = "no job"
+JOB_RUNNING = "running"
+NOT_SCORED = "not scored"
+NO_BASE = "no base"
+
+
+def untuned_pairs(
+    series: "list[BaseSeries]",
+    jobs: "list[dict]",
+    datasets: "list",
+    pairs: "list[tuple[str, str]] | None" = None,
+) -> "list[dict]":
+    """Every pair the app can trade (`pairs`, `registry_pairs()` by default)
+    with no tuned base configuration, by instrument, then the registry's order.
+    Each with why: no job at all, one still running, only jobs whose base
+    never scored (failed, stopped, every replay an error), or jobs that scored
+    but none of whose picks was set as its base (`NO_BASE`: `series` reads it
+    off a job's base, and a new run starts from `apple_trader.default_config`'s
+    fallback); the pair's jobs
+    newest first; and how many `datasets` (`simlab.data.Dataset`) carry the
+    instrument, since a job needs one. A pair whose stored base no job has
+    replayed has a base, and is not listed."""
+    pairs = registry_pairs() if pairs is None else pairs
+    replayed = {(s.model_key, s.ticker): s for s in series}
+    tuned = {
+        key for key, s in replayed.items() if s.source == FROM_BASE or s.base_set_at
+    }
+    by_pair: "dict[tuple[str, str], list[dict]]" = {}
+    for job in sorted(jobs, key=lambda j: str(j.get("created_at") or ""), reverse=True):
+        if tuning.is_derived(job):
+            continue
+        try:
+            config = tuning.make_config(job["spec"]["base"], {})
+        except (KeyError, TypeError, ValueError):
+            continue  # a removed model, or a field since narrowed
+        by_pair.setdefault((config.model_key, config.ticker), []).append(job)
+    order = {pair: index for index, pair in enumerate(pairs)}
+    out = []
+    for model_key, ticker in sorted(
+        (p for p in pairs if p not in tuned), key=lambda p: (p[1], order[p])
+    ):
+        pair_jobs = by_pair.get((model_key, ticker), [])
+        if (model_key, ticker) in replayed:
+            status = NO_BASE
+        elif any(j.get("status") == tuning.RUNNING for j in pair_jobs):
+            status = JOB_RUNNING
+        else:
+            status = NOT_SCORED if pair_jobs else NO_JOB
+        out.append({
+            "model_key": model_key, "ticker": ticker, "status": status,
+            "job_ids": [j["job_id"] for j in pair_jobs],
+            "datasets": sum(
+                1 for d in datasets if ticker in {str(s).upper() for s in d.symbols or ()}
+            ),
+        })
+    return out
 
 
 def window(series: "list[BaseSeries]", name: str) -> "tuple[str, str] | None":
