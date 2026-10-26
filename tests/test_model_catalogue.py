@@ -171,11 +171,12 @@ class TestHighLowErrorPctAdr:
         assert [f.role for f in spec.files] == ["bundle", "N-HiTS weights", "metadata"]
 
 
-def test_highlow2_path_mirrors_the_real_one():
+@pytest.mark.parametrize("ticker", apple_models.HIGHLOW2_TICKERS)
+def test_highlow2_path_mirrors_the_real_one(ticker):
     highlow2 = pytest.importorskip("agent_stonks.highlow2_model")
-    spec = mc.spec(apple_models.HIGHLOW2_KEY, "AAPL")
+    spec = mc.spec(apple_models.HIGHLOW2_KEY, ticker)
     by_role = {f.role: f.path for f in spec.files}
-    real = highlow2.model_path("AAPL")
+    real = highlow2.model_path(ticker)
     assert by_role["bundle"] == real
     assert by_role["metadata"] == highlow2.metadata_path(real)
 
@@ -213,6 +214,16 @@ class TestHighLow2Spec:
         assert "9-session test window" in spec.caveat
         assert "GOOGL, MSFT pooled in" in spec.ticker_note
         assert "1450 sessions (500 AAPL)" in spec.data_note
+
+    def test_a_ticker_highlow5m_never_modelled_is_compared_with_its_recipe(self, tmp_path, monkeypatch):
+        """GOOG's sidecar: HighLow_5m had no GOOG model, so the notebook's
+        walk-forward is against that notebook's recipe refitted on GOOG's data
+        -- said so, not passed off as HighLow_5m's own."""
+        meta = {k: v for k, v in HIGHLOW2_SIDECAR.items() if k != "walk_forward_vs_highlow5m"}
+        meta["walk_forward_vs_highlow5m_recipe_on_this_data"] = {"2025": -0.0467, "2026": -0.0164}
+        spec = _highlow2_spec_from(meta, tmp_path, monkeypatch)
+        assert spec.metrics["walk-forward vs HighLow_5m's recipe · 2025"] == -0.0467
+        assert not any(k.startswith("walk-forward vs HighLow_5m ·") for k in spec.metrics)
 
     def test_a_sidecar_without_a_score_falls_back_to_nothing_invented(self, tmp_path, monkeypatch):
         """The notebook's own sidecar carries no metrics."""

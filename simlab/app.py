@@ -1939,8 +1939,9 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "live app never briefed counts as an ordinary day."
         ),
         "model_highlow2": (
-            "The day-range rules on HighLow2's predicted high and range. No distances were "
-            "ever swept on it, so sweep them on the Tuning tab.\n\n"
+            "The day-range rules on HighLow2's predicted high and range. AAPL's distances "
+            "are a weak Tuning pick (2026-10-04); GOOG's were never swept, so sweep them on "
+            "the Tuning tab.\n\n"
             "- Reads every input from Alpaca, whatever the dataset's tape: SIP and IEX "
             "minute history before each replayed day, and that morning's IEX opening and "
             "pre-market (ALPACA_API_KEY / ALPACA_SECRET), cached under `data/highlow2/` — "

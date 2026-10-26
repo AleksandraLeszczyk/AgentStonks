@@ -36,10 +36,13 @@ bundle:
   the open (`events.skip_dates`). Its calendar is hand-curated and ends with the
   traded week, so nothing here reads it.
 
-On its held-out window (8-18 Sep 2026, 9 sessions) it misses each extreme by
-0.0036 log units ($1.17), 15.8% of the 14-day range -- level with HighLow_5m,
-slightly ahead (the notebook's README: parity with a small edge, not a clear
-win).
+On its held-out window (8-18 Sep 2026, 9 sessions) AAPL's misses each extreme
+by 0.0036 log units ($1.17), 15.8% of the 14-day range -- level with
+HighLow_5m, slightly ahead (the notebook's README: parity with a small edge,
+not a clear win). GOOG's (2026-10-26, the same recipe with AAPL, MSFT, AMZN,
+META and NVDA pooled in) misses by 0.0034 ($1.17), 19.7% of its range, level
+with HighLow_5m's recipe run on GOOG's data -- HighLow_5m never had a GOOG
+model -- and 3.5% ahead of it over the walk-forward.
 
 **The rest of the session** (a bundle may carry it: INTC's, saved 2026-10-06,
 did, wired up until 2026-10-20 and deleted 2026-10-25; AAPL's has no such

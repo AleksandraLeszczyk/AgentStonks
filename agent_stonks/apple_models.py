@@ -122,15 +122,19 @@ DEFAULT_TICKER = "AAPL"
 HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD")
 
 # Which symbols HighLow2_5m is wired up for (`highlow2_5m_<TICKER>.*`): AAPL
-# (saved 2026-10-04). INTC's bundle (2026-10-06, with a rest-of-session head:
-# the high and low from 9:35 to the close, which `highlow2_model.forecast_from`
-# hands the trader in place of the day's) was wired up until 2026-10-20 and
-# removed at the user's request; its files went on 2026-10-25. The notebook
-# has processed GOOGL, MSFT, AMZN, META, NVDA, AMD, MU, AVGO and QCOM as training
-# pools, but fitted no model of their own. Adding one is this tuple plus its two
-# files in `Code/Models` -- `_build_bundle` refuses a bundle whose shipped blend
-# (either head) reads anything but the base and pre-market groups.
-HIGHLOW2_TICKERS = (DEFAULT_TICKER,)
+# (saved 2026-10-04) and GOOG (Alphabet's class C line, 2026-10-26: AAPL's
+# recipe unchanged, AAPL, MSFT, AMZN, META and NVDA pooled in; the notebook
+# built and tried features of GOOG's own -- GOOGL's tape, the peers' openings,
+# implied vol -- and shipped none). INTC's bundle (2026-10-06, with a
+# rest-of-session head: the high and low from 9:35 to the close, which
+# `highlow2_model.forecast_from` hands the trader in place of the day's) was
+# wired up until 2026-10-20 and removed at the user's request; its files went
+# on 2026-10-25. The notebook has processed GOOGL, MSFT, AMZN, META, NVDA, AMD,
+# MU, AVGO and QCOM as training pools, but fitted no model of their own.
+# Adding one is this tuple plus its two files in `Code/Models` --
+# `_build_bundle` refuses a bundle whose shipped blend (either head) reads
+# anything but the base and pre-market groups.
+HIGHLOW2_TICKERS = (DEFAULT_TICKER, "GOOG")
 
 # Which symbols Fast&Furious has saved a bundle for (`fastfurious_<TICKER>.*`):
 # AAPL (fitted through 2026-09-04; the app reads the amended re-run,
@@ -361,7 +365,8 @@ MODELS: "dict[str, AppleModel]" = {
             "(the day after earnings, jobs reports, geopolitical shocks) left out of "
             "training; and five similar mega-caps pooled in as training rows. LightGBM "
             "alone, three seeds. On AAPL's 9-session test window it misses each extreme by "
-            "$1.17 (15.8% of the 14-day range), level with HighLow and slightly ahead. "
+            "$1.17 (15.8% of the 14-day range), level with HighLow and slightly ahead; on "
+            "GOOG's, by $1.17 too (19.7%), level with HighLow's recipe run on GOOG. "
             "Only the forecast changes: the levels, exits and breach rules are the "
             "day-range strategy's."
         ),

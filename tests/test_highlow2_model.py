@@ -54,6 +54,36 @@ AAPL_FORECASTS = {
     "2026-09-25": (337.29399002103725, 332.5079589178143, 6.917621428571432),
 }
 
+# The same, with the GOOG bundle saved 2026-10-26: its test window and traded
+# week, shock days it was fitted without (2024-11-01 NFP; 2025-07-24,
+# 2026-02-05 and 2026-04-30, the sessions after Alphabet's results) and the
+# sessions after a half day.
+GOOG_FORECASTS = {
+    "2024-11-01": (173.72556118359506, 170.2568067612198, 3.4433785714285716),
+    "2025-07-07": (181.28629250273266, 178.46841326471082, 4.340442857142857),
+    "2025-07-24": (199.21593122285248, 194.88447641785464, 3.97222142857143),
+    "2025-12-01": (321.820258958315, 314.29367133709985, 9.718464285714276),
+    "2025-12-26": (318.4267106938967, 313.86038128717485, 7.37127857142858),
+    "2026-02-05": (322.12358946387985, 307.2, 8.881049999999991),
+    "2026-04-30": (374.0, 365.2254009355234, 6.965342857142856),
+    "2026-09-08": (335.0317716555483, 330.88074447734704, 5.798185714285718),
+    "2026-09-09": (330.0580361047199, 324.6900521748478, 5.885328571428578),
+    "2026-09-10": (330.0041977479322, 325.1436781583953, 5.756757142857148),
+    "2026-09-11": (340.9210066976873, 333.14, 5.800257142857147),
+    "2026-09-14": (343.7991245217809, 338.3602327001613, 5.937400000000001),
+    "2026-09-15": (345.0663947544583, 339.4013395826083, 5.883828571428572),
+    "2026-09-16": (344.849418937087, 339.94435525056394, 5.928471428571429),
+    "2026-09-17": (345.83, 340.07033618684625, 6.00347142857143),
+    "2026-09-18": (356.10068859953765, 350.3160759779913, 6.150257142857141),
+    "2026-09-21": (353.48184171469677, 344.51069061031285, 6.3723999999999945),
+    "2026-09-22": (357.62080502166094, 352.81792372986587, 6.4588285714285645),
+    "2026-09-23": (346.81247715593344, 341.40862248985445, 7.14313571428571),
+    "2026-09-24": (337.1289386872143, 330.9598688127286, 7.51028571428571),
+    "2026-09-25": (345.92067474452097, 338.2107863781264, 7.650285714285709),
+}
+
+NOTEBOOK_FORECASTS = {"AAPL": AAPL_FORECASTS, "GOOG": GOOG_FORECASTS}
+
 
 # --- synthetic sessions -------------------------------------------------------
 
@@ -179,6 +209,9 @@ def _bundle(path="synthetic"):
 class TestRegistry:
     def test_highlow2_is_offered_where_a_bundle_was_saved(self):
         assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("AAPL")
+        assert apple_models.HIGHLOW2_KEY in apple_models.keys_for("GOOG")
+        # The class A line was a pool candidate, never a model of its own.
+        assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("GOOGL")
         # INTC's bundle (the one with a rest head) was unwired 2026-10-20 and
         # its files went 2026-10-25.
         assert apple_models.HIGHLOW2_KEY not in apple_models.keys_for("INTC")
@@ -474,10 +507,11 @@ def _installed_bundle(ticker="AAPL"):
 
 
 class TestBundle:
-    def test_the_shipped_blend_is_three_lightgbm_seeds(self):
-        bundle = _installed_bundle()
+    @pytest.mark.parametrize("ticker", apple_models.HIGHLOW2_TICKERS)
+    def test_the_shipped_blend_is_three_lightgbm_seeds(self, ticker):
+        bundle = _installed_bundle(ticker)
         assert bundle["kind"] == "highlow2"
-        assert bundle["ticker"] == "AAPL"
+        assert bundle["ticker"] == ticker
         assert bundle["daily_models"] == ["lgbm_11", "lgbm_23", "lgbm_7"]
         assert bundle["opening_feed"] == "iex" and bundle["target"] == "close5/adr14"
         assert set(bundle["model"].feature_cols) == set(H.FEATURE_COLS)
@@ -578,13 +612,15 @@ class TestAgainstTheNotebook:
     code, reproduce the notebook package's forecasts. LightGBM alone and the
     same library version, so to the last digit rather than within float noise."""
 
-    @pytest.mark.parametrize("day", sorted(AAPL_FORECASTS))
-    def test_reproduces_the_notebook_forecast(self, day):
-        bundle, sip, iex, history = notebook_inputs()
+    @pytest.mark.parametrize(
+        "symbol, day", [(symbol, day) for symbol, pins in NOTEBOOK_FORECASTS.items() for day in sorted(pins)]
+    )
+    def test_reproduces_the_notebook_forecast(self, symbol, day):
+        bundle, sip, iex, history = notebook_inputs(symbol)
         stamp = pd.Timestamp(day)
         morning = H.morning_from_bars(_one_day(sip, stamp), _one_day(iex, stamp), stamp)
         out = H.forecast_from(bundle, history, morning, stamp)
-        high, low, adr = AAPL_FORECASTS[day]
+        high, low, adr = NOTEBOOK_FORECASTS[symbol][day]
         assert out["pred_high"] == pytest.approx(high, abs=1e-8)
         assert out["pred_low"] == pytest.approx(low, abs=1e-8)
         assert out["adr14_abs"] == pytest.approx(adr, abs=1e-9)

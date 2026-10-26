@@ -656,6 +656,10 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         metrics = {"MAE (% of ADR)": error_pct, **metrics}
     for window, change in (meta.get("walk_forward_vs_highlow5m") or {}).items():
         metrics[f"walk-forward vs HighLow_5m · {window}"] = change
+    # A ticker HighLow_5m never had a model for (GOOG) is compared with that
+    # notebook's recipe refitted on this one's data instead.
+    for window, change in (meta.get("walk_forward_vs_highlow5m_recipe_on_this_data") or {}).items():
+        metrics[f"walk-forward vs HighLow_5m's recipe · {window}"] = change
     # A bundle with a rest-of-session head hands the trader that head's
     # forecast, so its `test_metrics` are the rest head's, against the extremes
     # after 9:35; the day head's sit beside them.
