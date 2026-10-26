@@ -2402,10 +2402,24 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "session's first bar, so it compounds day to day. A split of one pair at "
             "100% replays exactly as Apple Trader."
         ),
-        "pair_min_win_k": (
-            "Per pair: a trade that closes for no more than this many units a share "
-            "stands that pair down for the rest of the session. Untick the box beside "
-            "it to replay the pair with no circuit breaker."
+        "pair_confirmation_bars": (
+            "Per pair: the momentum confirmation period in bars (0 = off, and the momentum "
+            "take with it), starting from the pair's base configuration. Pairs that differ "
+            "sign it on each pair (`/conf3b`) rather than once with the shared rules."
+        ),
+        "pair_gm_confirm_bars": (
+            "Per pair: GoodMoments' momentum confirmation in bars (0 = off) — the buy waits "
+            "for momentum, and a reached take is held while it is positive."
+        ),
+        "min_win_k": (
+            "One circuit breaker for every day-range pair: after a trade closes for no more "
+            "than this many × {unit} a share, that pair buys nothing else that session; the "
+            "others keep trading. At or over a pair's `buy − sell`, every trade stands that "
+            "pair down. Signed on each pair as `/mw`."
+        ),
+        "min_win_on": (
+            "Unticked, the pairs are replayed with no circuit breaker: the levels re-arm "
+            "after every trade."
         ),
         "pair_budget_pct": (
             "Split only: this pair's share of each session's budget, in percent. "
@@ -2434,8 +2448,8 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
         **fields.get("sections", {}),
         "signal_pairs": (
             "The GoodMoments pairs: each replays on its own configuration (its base, else "
-            "the shipped defaults) with the entry, take and stop set here — and on the "
-            "hybrid HighLow2's buy distance. The position size and the days off are "
+            "the shipped defaults) with the entry, take, stop and momentum confirmation set "
+            "here — and on the hybrid HighLow2's buy distance. The position size and the days off are "
             "Orchestra's. A race of one GoodMoments pair replays exactly as Apple Trader on it."
         ),
         "selection": (

@@ -1062,7 +1062,7 @@ def _agent_momentum(state, sym_state) -> "tuple[int, str]":
     personality = getattr(state, "llm_personality", None)
     if personality in (APPLE_TRADER_KEY, ORCHESTRA_KEY):
         if personality == ORCHESTRA_KEY:
-            # The racer this symbol's chart draws: they share these settings.
+            # The racer this symbol's chart draws, on its own confirmation.
             config, _ = model_overlays.live_trader_view(state, sym_state.symbol)
         else:
             running = (getattr(state, "apple_trader_levels", None) or {}) if state.agent_running else {}
@@ -3553,22 +3553,23 @@ _ORCHESTRA_COPY = dc_replace(
             "Every pair forecasts its own **H** at 9:35 and rests its own buy and sell "
             "below it, in the same unit.\n\n"
             "- **Buy / Sell** — each pair's own distances, starting from its tuned pair.\n"
-            "- **Min win** — each pair's circuit breaker: a trade that closes for no more "
-            "than this stands *that pair* down for the day; the others keep racing.\n"
+            "- **Confirm** — each pair's momentum confirmation period, in bars (0 = off), "
+            "starting from its base configuration: SimLab's tuning picks it per pair.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
-            "- Everything below the tables is shared by every day-range pair; the "
-            "position size and the days off by every pair."
+            "- Everything below the tables is shared by every day-range pair — the "
+            "circuit breaker too; the position size and the days off by every pair."
         ),
         "signal_pairs": (
             "The GoodMoments pairs — GoodMoments, and HighLow2 + GoodMoments — read their "
             "edge at the close of every bar and buy at the market when it is at the entry.\n\n"
-            "- **Entry / Take / Stop** — each pair's own, starting from its base "
-            "configuration (or the shipped defaults).\n"
+            "- **Entry / Take / Stop / Confirm** — each pair's own, starting from its base "
+            "configuration (or the shipped defaults). Confirm is the momentum confirmation "
+            "period in bars, 0 = off.\n"
             "- **HighLow2 buy** (the hybrid only) — after the opening window a buy also needs "
             "the close at or under HighLow2's buy level, this × its unit under the predicted high.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
             "- Everything else — the take's fall with volatility, the sale on a fading edge, "
-            "the momentum confirmation, the circuit breaker — is the pair's own configuration. "
+            "the circuit breaker — is the pair's own configuration. "
             "The position size and the days off below are Orchestra's.\n"
             "- A stop pauses only that pair's buys for 15 bars; it does not stop the agent.\n"
             "- Read once, at ▶ Start."
@@ -3601,10 +3602,33 @@ _ORCHESTRA_COPY = dc_replace(
             "would fill on the same bar, the pair listed first takes it. Every pair's "
             "ticker must be streamed."
         ),
-        "pair_min_win_k": (
-            "Per pair: a trade that closes for no more than this many units a share "
-            "stands that pair down for the rest of the day. Untick the box beside it "
-            "to switch it off for that pair."
+        "pair_confirmation_bars": (
+            "Per pair: the momentum confirmation period, in bars — the look-back over which "
+            "the behaviour table gates this pair's buy at the buy level, its sale at the sell "
+            "level and its momentum take. 0 switches it off for this pair, and the momentum "
+            "take with it. Starts from the pair's base configuration. A running Orchestra "
+            "takes a change on ▶ Start."
+        ),
+        "pair_gm_confirm_bars": (
+            "Per pair: HighLow's momentum confirmation on GoodMoments' rules, in bars — a "
+            "buy waits until momentum allows it, and a reached take is held while momentum "
+            "is still positive. 0 switches it off."
+        ),
+        "min_win_k": (
+            "After a trade closes for no more than this many × {unit} **per share**, that "
+            "pair buys nothing else today; the other pairs keep trading.\n\n"
+            "- One threshold for every day-range pair (a GoodMoments pair keeps its own "
+            "circuit breaker).\n"
+            "- Judged over the whole position: a momentum take and its runner count as "
+            "one trade.\n"
+            "- At or above a pair's `buy − sell`, every trade stands that pair down — a "
+            "one-trade-a-day rule.\n"
+            "- Greyed out while the box above is unticked."
+        ),
+        "min_win_on": (
+            "Unticked, a trade that barely paid stands no pair down: each pair's levels "
+            "re-arm after every trade.\n\n"
+            "- The threshold below is kept for when it is ticked again."
         ),
         "pair_gm_enter": (
             "Per pair: the edge a buy needs — the model's probability of a +0.2 ADR rise "
@@ -3723,8 +3747,9 @@ def _orchestra_params(symbols: list[str]) -> "OrchestraConfig | None":
         if seed is not None:
             st.caption(
                 "The running Orchestra picks up a change to a day-range pair's buy or sell "
-                "distance at its next bar. Every other setting — a GoodMoments pair's "
-                "numbers, and adding or removing a pair — takes effect on ▶ Start."
+                "distance at its next bar. Every other setting — a pair's confirmation, a "
+                "GoodMoments pair's numbers, and adding or removing a pair — takes effect "
+                "on ▶ Start."
             )
         if race is not None:
             missing = [t for t in race.tickers if t not in symbols]

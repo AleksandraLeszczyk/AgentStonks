@@ -40,8 +40,8 @@ import streamlit as st
 
 from . import apple_models, base_configs, event_days, intraday_vol_model
 from .apple_trader import (
-    AppleTraderConfig, base_record, dayrange_levels, default_config, min_win_for,
-    shipped_config,
+    AppleTraderConfig, base_record, confirmation_for, dayrange_levels, default_config,
+    min_win_for, shipped_config,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from .orchestra import OrchestraConfig
 from .config import (
     APPLE_TRADER_GM_STOP_RAISE,
+    APPLE_TRADER_MIN_WIN_K,
     BREACH_LABELS,
     BREACH_OFF,
     BREACH_OFFERED,
@@ -574,11 +575,14 @@ def dayrange_params(
 
 def position_params(
     defaults: AppleTraderConfig, unit_label: str, copy: FormCopy, col_a, col_b,
+    confirmation: bool = True,
 ) -> dict:
     """How much is bought and when a buy waits for momentum: the size, the
     ladder and the confirmation period. Shared by every instrument (and every
     racer), so none of it is keyed by ticker. `col_a` and `col_b` are the two
-    columns the levels sit in, which the size and the period continue."""
+    columns the levels sit in, which the size and the period continue.
+    Without `confirmation` the period is left out: Orchestra sets one per pair
+    (`orchestra_params`)."""
     position_pct = col_a.number_input(
         "Position size (% of cash)",
         min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
@@ -603,20 +607,22 @@ def position_params(
         disabled=not scale_in or float(position_pct) >= 100,
         help=copy.help.get("buy_step_k"),
     )
-    # One look-back for both sides of the behaviour table: the buy at the buy
-    # level, and the sells at and short of the sell level (the Exits below).
-    momentum_confirmation_bars = col_b.number_input(
-        "Momentum confirmation period (bars)",
-        min_value=0, max_value=60, value=int(defaults.momentum_confirmation_bars), step=1,
-        key=copy.key("momentum_confirmation_bars"),
-        help=copy.help.get("momentum_confirmation_bars"),
-    )
-    return {
+    sizing = {
         "position_pct": float(position_pct),
         "scale_in": bool(scale_in),
         "buy_step_k": float(buy_step_k),
-        "momentum_confirmation_bars": int(momentum_confirmation_bars),
     }
+    if confirmation:
+        # One look-back for both sides of the behaviour table: the buy at the
+        # buy level, and the sells at and short of the sell level (the Exits
+        # below).
+        sizing["momentum_confirmation_bars"] = int(col_b.number_input(
+            "Momentum confirmation period (bars)",
+            min_value=0, max_value=60, value=int(defaults.momentum_confirmation_bars), step=1,
+            key=copy.key("momentum_confirmation_bars"),
+            help=copy.help.get("momentum_confirmation_bars"),
+        ))
+    return sizing
 
 
 def repaired_sell(buy_k: float, sell_k: float, label: str = "") -> float:
@@ -703,23 +709,9 @@ def min_win_param(
     """
     section("Circuit breaker", copy.sections.get("dayrange_breaker"))
     default = min_win_for(ticker) if default is None else float(default)
-    number_key = copy.key(f"min_win_k_{ticker}")
-    on = st.checkbox(
-        "Stand down after a weak trade",
-        value=breaker_opens_on(number_key, default, ticker),
-        key=copy.key(f"min_win_on_{ticker}"),
-        help=copy.help.get("min_win_on"),
+    min_win_k = min_win_inputs(
+        copy, unit_label, default, min_win_for(ticker), scope=f"_{ticker}", ticker=ticker,
     )
-    min_win_k = st.number_input(
-        f"Stand down after a trade under (× {unit_label} a share)",
-        min_value=0.01, max_value=3.0, value=default or min_win_for(ticker),
-        step=0.05, format="%.2f",
-        key=number_key, disabled=not on,
-        help=copy.help.get("min_win_k", "").format(
-            ticker=ticker, min_win_k=f"{default:g}", unit=unit_label
-        ),
-    )
-    min_win_k = float(min_win_k) if on else 0.0
     target_gain = buy_k - sell_k
     if min_win_k and min_win_k >= target_gain:
         st.warning(
@@ -729,6 +721,34 @@ def min_win_param(
             icon=":material/warning:",
         )
     return min_win_k
+
+
+def min_win_inputs(
+    copy: FormCopy, unit_label: str, default: float, fallback: float,
+    scope: str = "", ticker: str = "",
+) -> float:
+    """The weak-trade breaker's box and threshold, as the `min_win_k` they
+    set: 0 while the box is unticked. `scope` ends both widget keys -- a
+    single run's are per ticker, Orchestra's one setting has none. `fallback`
+    is what the threshold opens on in place of a 0 (`breaker_opens_on`).
+    `ticker` fills the threshold's `?`."""
+    number_key = copy.key(f"min_win_k{scope}")
+    on = st.checkbox(
+        "Stand down after a weak trade",
+        value=breaker_opens_on(number_key, default, fallback),
+        key=copy.key(f"min_win_on{scope}"),
+        help=copy.help.get("min_win_on"),
+    )
+    min_win_k = st.number_input(
+        f"Stand down after a trade under (× {unit_label} a share)",
+        min_value=0.01, max_value=3.0, value=default or fallback,
+        step=0.05, format="%.2f",
+        key=number_key, disabled=not on,
+        help=copy.help.get("min_win_k", "").format(
+            ticker=ticker, min_win_k=f"{default:g}", unit=unit_label
+        ),
+    )
+    return float(min_win_k) if on else 0.0
 
 
 def breaker_until_param(defaults: AppleTraderConfig, copy: FormCopy, rules: dict) -> bool:
@@ -753,17 +773,17 @@ def breaker_until_param(defaults: AppleTraderConfig, copy: FormCopy, rules: dict
     return bool(until)
 
 
-def breaker_opens_on(number_key: str, default: float, ticker: str) -> bool:
+def breaker_opens_on(number_key: str, default: float, fallback: float) -> bool:
     """Whether a circuit breaker's box opens ticked, read before its threshold.
 
     A 0 in the threshold -- kept from before the box existed, or a base saved
     with the breaker off -- meant "off": the box opens unticked and the field
-    is moved to the symbol's own default, since 0 is no longer a threshold it
-    takes.
+    is moved to `fallback` (the symbol's own default), since 0 is no longer a
+    threshold it takes.
     """
     kept = st.session_state.get(number_key)
     if kept is not None and not kept:
-        st.session_state[number_key] = min_win_for(ticker)
+        st.session_state[number_key] = fallback
     return bool(default if kept is None else kept)
 
 
@@ -1060,11 +1080,11 @@ def orchestra_params(
     pair's own numbers -- under a split, its share of the budget too -- and the
     rules they all share. None while no pair is picked.
 
-    The day-range pairs are one table (buy, sell, min win) and the rules under
-    it are theirs; the GoodMoments pairs are another (`signal_pair_params`),
-    and keep the rest of their own configuration. The size and the days off
-    are every pair's; with no day-range pair they are all that is drawn below
-    the tables.
+    The day-range pairs are one table (buy, sell, momentum confirmation) and
+    the rules under it -- the circuit breaker too, one for every pair -- are
+    theirs; the GoodMoments pairs are another (`signal_pair_params`), and keep
+    the rest of their own configuration. The size and the days off are every
+    pair's; with no day-range pair they are all that is drawn below the tables.
 
     Its own agent with its own settings: `copy` carries Orchestra's widget-key
     prefix, so nothing here is shared with Apple Trader's form. Every per-pair
@@ -1072,7 +1092,9 @@ def orchestra_params(
 
     `seed` is a running Orchestra's configuration, for the same reason as
     `params`' -- a running racer adopts what its two widgets hold, so they
-    reopen on its numbers rather than the pair's shipped ones.
+    reopen on its numbers rather than the pair's shipped ones. Its momentum
+    confirmation reopens on the running racer's too, though only ▶ Start
+    takes a change to it.
 
     `briefing_choices` are the (provider, model) pairs whose briefings SimLab
     has cached, for a replay to read; None live, where the app's own briefing
@@ -1138,22 +1160,17 @@ def orchestra_params(
         section("Levels", copy.sections.get("pairs"))
         level_unit = level_unit_param(defaults, copy)
         unit_label = UNIT_FORM_LABELS[level_unit]
-    seeded = {
-        racer_key(r): r for r in (seed.racers if seed is not None else [])
-        if r.level_unit == level_unit
-    }
-    # The min win's on/off box gets its own narrow column (columns cannot be
-    # nested in the sidebar, where the live app draws this), taken out of the
-    # pair's name so the numbers keep their width.
-    widths = [1.9, 1, 1, 0.3, 1, 1] if split else [1.9, 1, 1, 0.3, 1]
+    running = {racer_key(r): r for r in (seed.racers if seed is not None else [])}
+    seeded = {key: r for key, r in running.items() if r.level_unit == level_unit}
+    widths = [1.9, 1, 1, 1, 1] if split else [1.9, 1, 1, 1]
     if ranged:
         head = st.columns(widths)
         head[0].caption("Pair")
         head[1].caption("Buy", help=f"× {unit_label} below the pair's predicted high H.")
         head[2].caption("Sell", help=f"× {unit_label} below the pair's predicted high H.")
-        head[4].caption("Min win", help=copy.help.get("pair_min_win_k"))
+        head[3].caption("Confirm", help=copy.help.get("pair_confirmation_bars"))
         if split:
-            head[5].caption("Budget %", help=copy.help.get("pair_budget_pct"))
+            head[4].caption("Budget %", help=copy.help.get("pair_budget_pct"))
     for key in ranged:
         ticker, _, model_key = key.partition(":")
         # The pair's base configuration's numbers (`dayrange_levels` reads it
@@ -1163,6 +1180,11 @@ def orchestra_params(
         start_buy, start_sell = default_buy, default_sell
         if key in seeded:
             start_buy, start_sell = float(seeded[key].buy_k), float(seeded[key].sell_k)
+        # The pair's own period -- SimLab's tuning picks it per pair -- or a
+        # running racer's, which the row reopens on like its distances.
+        start_confirm = confirmation_for(ticker, model_key)
+        if key in running:
+            start_confirm = int(running[key].momentum_confirmation_bars)
         row = st.columns(widths, vertical_alignment="center")
         row[0].markdown(label(key))
         buy_k = row[1].number_input(
@@ -1175,36 +1197,21 @@ def orchestra_params(
             format="%.2f", key=copy.key(f"sell_k_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
-        min_win_default = min_win_for(ticker, model_key)
-        min_win_key = copy.key(f"min_win_k_{model_key}_{ticker}{suffix}")
-        min_win_on = row[3].checkbox(
-            f"{key} min win on",
-            value=breaker_opens_on(min_win_key, min_win_default, ticker),
-            key=copy.key(f"min_win_on_{model_key}_{ticker}{suffix}"),
+        confirm = row[3].number_input(
+            f"{key} confirmation", min_value=0, max_value=60, value=start_confirm, step=1,
+            key=copy.key(f"momentum_confirmation_bars_{model_key}_{ticker}{suffix}"),
             label_visibility="collapsed",
         )
-        min_win_k = row[4].number_input(
-            f"{key} min win", min_value=0.01, max_value=3.0,
-            value=min_win_default or min_win_for(ticker),
-            step=0.05, format="%.2f", key=min_win_key, disabled=not min_win_on,
-            label_visibility="collapsed",
-        )
-        min_win_k = float(min_win_k) if min_win_on else 0.0
         if split:
-            budget_pct[key] = float(row[5].number_input(
+            budget_pct[key] = float(row[4].number_input(
                 f"{key} budget %", min_value=0.5, max_value=100.0, value=even, step=5.0,
                 format="%.1f", key=copy.key(f"budget_pct_{model_key}_{ticker}"),
                 label_visibility="collapsed",
             ))
         sell_k = repaired_sell(float(buy_k), float(sell_k), racer_label(key))
-        if min_win_k and min_win_k >= float(buy_k) - sell_k:
-            st.warning(
-                f"{racer_label(key)}: the min win is at or above the "
-                f"{float(buy_k) - sell_k:.2f} its levels are apart, so every trade stands it "
-                "down — one trade a day for this pair.",
-                icon=":material/warning:",
-            )
-        levels[key] = (float(buy_k), float(sell_k), min_win_k)
+        levels[key] = {
+            "buy_k": float(buy_k), "sell_k": sell_k, "momentum_confirmation_bars": int(confirm),
+        }
     if signals:
         levels.update(signal_pair_params(signals, copy, label, split, even, budget_pct))
     if split:
@@ -1216,14 +1223,32 @@ def orchestra_params(
             )
 
     col_a, col_b = st.columns(2)
+    min_win_k = defaults.min_win_k
     if ranged:
-        sizing = position_params(defaults, unit_label, copy, col_a, col_b)
-        first_buy, first_sell, _ = levels[ranged[0]]
+        sizing = position_params(defaults, unit_label, copy, col_a, col_b, confirmation=False)
+        first = levels[ranged[0]]
         rules = rule_params(
-            defaults, first_buy, first_sell, unit_label, copy,
-            take_on=bool(sizing["momentum_confirmation_bars"]),
+            defaults, first["buy_k"], first["sell_k"], unit_label, copy,
+            take_on=any(levels[key]["momentum_confirmation_bars"] for key in ranged),
         )
         section("Circuit breaker", copy.sections.get("dayrange_breaker"))
+        # One threshold for every pair (the user's call, 2026-10-26; it was
+        # set per pair, beside the levels), opening on the shipped one rather
+        # than on any one pair's base.
+        min_win_k = min_win_inputs(
+            copy, unit_label, APPLE_TRADER_MIN_WIN_K, APPLE_TRADER_MIN_WIN_K,
+        )
+        weak = [
+            racer_label(key) for key in ranged
+            if min_win_k and min_win_k >= levels[key]["buy_k"] - levels[key]["sell_k"]
+        ]
+        if weak:
+            st.warning(
+                f"{', '.join(weak)}: the levels are no further apart than this, so every "
+                f"trade stands {'that pair' if len(weak) == 1 else 'those pairs'} down — "
+                "one trade a day.",
+                icon=":material/warning:",
+            )
         until_revised = breaker_until_param(defaults, copy, rules)
     else:
         # GoodMoments pairs alone: what every pair shares is the size and the
@@ -1237,7 +1262,8 @@ def orchestra_params(
         rules = {"skip_events": skip_param(defaults, copy)}
         until_revised = defaults.breaker_until_revised
     base = replace(
-        defaults, level_unit=level_unit, breaker_until_revised=until_revised, **sizing, **rules,
+        defaults, level_unit=level_unit, min_win_k=min_win_k,
+        breaker_until_revised=until_revised, **sizing, **rules,
     )
     try:
         return build_orchestra_config(
@@ -1254,7 +1280,8 @@ def signal_pair_params(
 ) -> "dict[str, dict]":
     """Orchestra's GoodMoments pairs, one row each: the numbers Orchestra sets
     on them (`orchestra.pair_fields`) -- the edge a buy needs, the take and the
-    stop in ADRs, and on a hybrid its levels model's buy distance -- each
+    stop in ADRs, the momentum confirmation period, and on a hybrid its levels
+    model's buy distance -- each
     opening on the pair's own configuration (`default_config`: its base, else
     the shipped defaults). Everything else a GoodMoments pair trades on is that
     configuration's. Under a split, the pair's share of the budget, written
@@ -1265,15 +1292,16 @@ def signal_pair_params(
     its row as it does the levels'."""
     hybrids = [key for key in keys if apple_models.levels_of(key.partition(":")[2])]
     section("Signal", copy.sections.get("signal_pairs"))
-    widths = [1.9, 1, 1, 1] + ([1] if hybrids else []) + ([1] if split else [])
+    widths = [1.9, 1, 1, 1, 1] + ([1] if hybrids else []) + ([1] if split else [])
     head = st.columns(widths)
     head[0].caption("Pair")
     head[1].caption("Entry", help=copy.help.get("pair_gm_enter"))
     head[2].caption("Take", help=copy.help.get("pair_gm_take_k"))
     head[3].caption("Stop", help=copy.help.get("pair_gm_stop_k"))
+    head[4].caption("Confirm", help=copy.help.get("pair_gm_confirm_bars"))
     if hybrids:
         parent = apple_models.levels_of(hybrids[0].partition(":")[2])
-        head[4].caption(
+        head[5].caption(
             f"{apple_models.get(parent).label.replace(' model', '')} buy",
             help=copy.help.get("pair_hybrid_buy_k"),
         )
@@ -1302,9 +1330,14 @@ def signal_pair_params(
                 step=0.05, format="%.2f", key=copy.key(f"gm_stop_k_{model_key}_{ticker}{suffix}"),
                 label_visibility="collapsed",
             ),
+            "gm_confirm_bars": row[4].number_input(
+                f"{key} confirmation", min_value=0, max_value=60, value=int(pair.gm_confirm_bars),
+                step=1, key=copy.key(f"gm_confirm_bars_{model_key}_{ticker}{suffix}"),
+                label_visibility="collapsed",
+            ),
         }
         if key in hybrids:
-            given["buy_k"] = row[4].number_input(
+            given["buy_k"] = row[5].number_input(
                 f"{key} buy", min_value=0.05, max_value=3.0, value=float(pair.buy_k),
                 step=0.05, format="%.2f", key=copy.key(f"buy_k_{model_key}_{ticker}{suffix}"),
                 label_visibility="collapsed",
@@ -1315,7 +1348,10 @@ def signal_pair_params(
                 format="%.1f", key=copy.key(f"budget_pct_{model_key}_{ticker}"),
                 label_visibility="collapsed",
             ))
-        numbers[key] = {name: float(value) for name, value in given.items()}
+        numbers[key] = {
+            name: int(value) if name == "gm_confirm_bars" else float(value)
+            for name, value in given.items()
+        }
     return numbers
 
 

@@ -121,10 +121,14 @@ class TestDefaults:
         from agent_stonks.orchestra import build_orchestra_config
 
         base_configs.set_base(asdict(_base()))
-        race = build_orchestra_config(["AAPL:highlow", "INTC:highlow"], AppleTraderConfig())
+        shared = AppleTraderConfig(min_win_k=0.2)
+        race = build_orchestra_config(["AAPL:highlow", "INTC:highlow"], shared)
         aapl, intc = race.racers
-        assert (aapl.buy_k, aapl.sell_k, aapl.min_win_k) == (0.85, 0.15, 0.05)
+        assert (aapl.buy_k, aapl.sell_k, aapl.momentum_confirmation_bars) == (0.85, 0.15, 7)
         assert (intc.buy_k, intc.sell_k) == at.dayrange_levels("INTC", "highlow", use_base=False)
+        assert intc.momentum_confirmation_bars == at.APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS
+        # The circuit breaker is Orchestra's, one for every pair.
+        assert aapl.min_win_k == intc.min_win_k == 0.2
 
 
 class TestBaseError:

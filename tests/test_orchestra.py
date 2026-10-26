@@ -407,10 +407,27 @@ class TestOrchestraConfig:
 
     def test_build_takes_edited_numbers_where_given(self):
         race = ar.build_orchestra_config(
-            ["MU:highlow"], at.AppleTraderConfig(), {"MU:highlow": (0.9, 0.2, 0.05)}
+            ["MU:highlow", "INTC:highlow"], at.AppleTraderConfig(min_win_k=0.05),
+            {"MU:highlow": {"buy_k": 0.9, "sell_k": 0.2, "momentum_confirmation_bars": 1.0},
+             "INTC:highlow": {"momentum_confirmation_bars": 0, "min_win_k": 0.3}},
         )
-        mu = race.racers[0]
-        assert (mu.buy_k, mu.sell_k, mu.min_win_k) == (0.9, 0.2, 0.05)
+        mu, intc = race.racers
+        assert (mu.buy_k, mu.sell_k, mu.momentum_confirmation_bars) == (0.9, 0.2, 1)
+        assert isinstance(mu.momentum_confirmation_bars, int)
+        # What is not given is the pair's own; the breaker is not a pair's.
+        assert (intc.buy_k, intc.sell_k) == at.dayrange_levels("INTC", "highlow")
+        assert intc.momentum_confirmation_bars == 0
+        assert mu.min_win_k == intc.min_win_k == 0.05
+
+    def test_pairs_may_differ_in_their_confirmation_and_breaker(self):
+        """The confirmation is each pair's own; the breaker is one setting
+        since 2026-10-26, but a record from before it has one per pair."""
+        ar.OrchestraConfig([
+            racer("AAPL", momentum_confirmation_bars=3, negative_momentum_bars=0, min_win_k=0.1),
+            racer("INTC", momentum_confirmation_bars=0, negative_momentum_bars=0, min_win_k=0.0),
+        ])
+        with pytest.raises(ValueError, match="stop_gain_fraction"):
+            ar.OrchestraConfig([racer("AAPL"), racer("INTC", stop_gain_fraction=0.9)])
 
     def test_signature_names_every_pair_and_the_shared_rules_once(self):
         race = ar.build_orchestra_config(["AAPL:highlow", "MU:highlow"], at.AppleTraderConfig())
@@ -419,6 +436,40 @@ class TestOrchestraConfig:
         assert ",highlow_MU@" in sig
         assert sig.count("size=") == 1
         assert "min_win=" not in sig
+
+    def test_one_confirmation_signs_with_the_rules_as_before(self):
+        """Every record from before the confirmation was set per pair keeps
+        the signature it was filed under."""
+        race = ar.OrchestraConfig([
+            racer("AAPL", momentum_confirmation_bars=3, negative_momentum_bars=0),
+            racer("INTC", momentum_confirmation_bars=3, negative_momentum_bars=0),
+        ])
+        sig = ar.orchestra_signature(race)
+        assert "/conf" not in sig
+        assert ",confirm=3b" in sig and "take=70%@conf" in sig
+
+    def test_confirmations_that_differ_sign_on_each_pair(self):
+        race = ar.OrchestraConfig([
+            racer("AAPL", momentum_confirmation_bars=0, negative_momentum_bars=0),
+            racer("INTC", momentum_confirmation_bars=2, negative_momentum_bars=0),
+            racer("MU", momentum_confirmation_bars=5, negative_momentum_bars=0),
+        ])
+        sig = ar.orchestra_signature(race)
+        pairs, rules = sig.split("](")
+        assert "highlow_AAPL@0.75/0.1A," in pairs
+        assert "highlow_INTC@0.75/0.1A/conf2b," in pairs and pairs.endswith("highlow_MU@0.75/0.1A/conf5b")
+        # The rules once, without the look-back -- and with the take it drives,
+        # though the first pair has none.
+        assert "confirm=" not in rules and "take=70%@conf" in rules
+
+    def test_the_log_lists_each_pairs_confirmation(self):
+        assert ar.racer_terms(racer("INTC", momentum_confirmation_bars=1)) == (
+            "buy 0.75 / sell 0.1 × ADR, momentum confirmed over 1 bar"
+        )
+        assert ar.racer_terms(racer("MU")).endswith(", no momentum confirmation")
+        assert ar.racer_terms(gm_racer("AMD", gm_confirm_bars=3)).endswith(
+            " ADR, momentum confirmed over 3 bars"
+        )
 
     def test_default_pairs_are_the_tuned_ones(self):
         assert set(ar.default_pairs()) == {
@@ -1003,6 +1054,66 @@ class TestASplitOfOneIsASingleRun:
         assert run(as_split=True) == run(as_split=False)
 
 
+class TestEachPairsOwnConfirmation:
+    """Each pair reads momentum over its own confirmation period (2026-10-26):
+    in a split of two on one tape, each trades exactly as an Apple Trader run
+    of it alone on its share would."""
+
+    PATH = [
+        dict(AAPL=104.0, INTC=104.0),
+        dict(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01)),
+        dict(AAPL=(103.5, BUY_LEVEL - 0.01), INTC=(103.5, BUY_LEVEL - 0.01)),
+        dict(AAPL=(104.0, BUY_LEVEL - 0.01), INTC=(104.0, BUY_LEVEL - 0.01)),
+        dict(AAPL=(109.5, 109.0, SELL_LEVEL + 0.5), INTC=(109.5, 109.0, SELL_LEVEL + 0.5)),
+        dict(AAPL=(108.0, 107.5, 109.5), INTC=(108.0, 107.5, 109.5)),
+        dict(AAPL=104.0, INTC=104.0),
+    ]
+    CONFIRM = {"AAPL": 0, "INTC": 2}
+
+    def _config(self, ticker):
+        return flat_racer(
+            ticker, momentum_confirmation_bars=self.CONFIRM[ticker], negative_momentum_bars=0,
+        )
+
+    def _run(self, monkeypatch, symbols, cash, cycle_for):
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=cash, broker=broker)
+        tapes = Tapes(monkeypatch, symbols, broker)
+        state = make_state(symbols)
+        for symbol in symbols:
+            state.sym(symbol).abs_mean_minute_momentum = 0.05
+        cycle = cycle_for(state, tracker)
+        cycle()
+        for bar in self.PATH:
+            tapes.bar(**{s: v for s, v in bar.items() if s in symbols})
+            cycle()
+        return [
+            (d.symbol, d.action, d.status, d.filled_quantity, d.price)
+            for d in tracker.decisions
+        ]
+
+    def test_each_pair_trades_as_its_own_run(self, market_open, monkeypatch):
+        def split(state, tracker):
+            race = make_split(
+                {"AAPL:highlow": 50.0, "INTC:highlow": 50.0},
+                self._config("AAPL"), self._config("INTC"),
+            )
+            return lambda: race.run_cycle(state, tracker)
+
+        both = self._run(monkeypatch, ["AAPL", "INTC"], 10_000.0, split)
+        for ticker in ("AAPL", "INTC"):
+            def single(state, tracker, ticker=ticker):
+                trader = at.DayRangeTrader(self._config(ticker))
+                return lambda: trader.run_cycle(BUNDLE, state, tracker)
+
+            alone = self._run(monkeypatch, [ticker], 5_000.0, single)
+            assert [d for d in both if d[0] == ticker] == alone
+        # The same tape, two periods, two different days.
+        aapl = [d[1:] for d in both if d[0] == "AAPL"]
+        intc = [d[1:] for d in both if d[0] == "INTC"]
+        assert aapl and intc and aapl != intc
+
+
 class TestSplitConfig:
     def test_refuses_shares_over_100(self):
         with pytest.raises(ValueError, match="at most 100%"):
@@ -1139,7 +1250,7 @@ class TestDefaultPairsSet:
         assert self._run(seed=running) == ["AAPL:highlow"]
 
 
-# --- the pair table's min win box ---------------------------------------------
+# --- the circuit breaker, and each pair's confirmation -------------------------
 
 
 def _orchestra_form() -> None:
@@ -1153,12 +1264,8 @@ def _orchestra_form() -> None:
     st.session_state["out"] = apple_trader_ui.orchestra_params(None, copy)
 
 
-class TestPairMinWinBox:
-    """Each pair's circuit breaker is switched off by its own box, like Apple
-    Trader's; the threshold is kept, greyed out."""
-
+class _PairForm:
     PAIRS = ["AAPL:highlow", "INTC:highlow"]
-    KEY, BOX = "o_min_win_k_highlow_INTC", "o_min_win_on_highlow_INTC"
 
     def _run(self, **state):
         from streamlit.testing.v1 import AppTest
@@ -1172,38 +1279,102 @@ class TestPairMinWinBox:
         return app
 
     @staticmethod
-    def _min_wins(app) -> "dict[str, float]":
-        return {r.ticker: r.min_win_k for r in app.session_state["out"].racers}
+    def _racers(app, name) -> "dict[str, float]":
+        return {r.ticker: getattr(r, name) for r in app.session_state["out"].racers}
 
-    def test_every_pair_is_on_by_default(self):
+
+class TestOneCircuitBreaker(_PairForm):
+    """One "stand down after a weak trade" for every day-range pair (the
+    user's request, 2026-10-26): its own box and threshold, under the shared
+    rules, rather than a box and a number on each pair's row."""
+
+    KEY, BOX = "o_min_win_k", "o_min_win_on"
+
+    def test_on_at_the_shipped_threshold_for_every_pair(self):
         app = self._run()
         assert app.checkbox(key=self.BOX).value is True
-        assert not app.number_input(key=self.KEY).disabled
-        assert self._min_wins(app) == {
-            "AAPL": pytest.approx(at.min_win_for("AAPL", "highlow")),
-            "INTC": pytest.approx(at.min_win_for("INTC", "highlow")),
+        assert self._racers(app, "min_win_k") == {
+            "AAPL": pytest.approx(at.APPLE_TRADER_MIN_WIN_K),
+            "INTC": pytest.approx(at.APPLE_TRADER_MIN_WIN_K),
         }
+        assert not [w for w in app.number_input if w.key.startswith("o_min_win_k_")]
 
-    def test_unticking_one_pair_leaves_the_other_on(self):
+    def test_one_threshold_and_one_box_for_all(self):
         app = self._run()
         app.number_input(key=self.KEY).set_value(0.07).run()
+        assert self._racers(app, "min_win_k") == {"AAPL": 0.07, "INTC": 0.07}
         app.checkbox(key=self.BOX).uncheck().run()
         assert app.number_input(key=self.KEY).disabled
-        wins = self._min_wins(app)
-        assert wins["INTC"] == 0.0
-        assert wins["AAPL"] == pytest.approx(at.min_win_for("AAPL", "highlow"))
-        sig = ar.orchestra_signature(app.session_state["out"])
-        assert "highlow_AAPL@" in sig and "/mw" in sig.split("highlow_INTC@")[0]
-        assert "/mw" not in sig.split("highlow_INTC@")[1].split(",")[0]
+        assert self._racers(app, "min_win_k") == {"AAPL": 0.0, "INTC": 0.0}
+        assert "/mw" not in ar.orchestra_signature(app.session_state["out"])
         app.checkbox(key=self.BOX).check().run()
-        assert self._min_wins(app)["INTC"] == pytest.approx(0.07)
+        assert self._racers(app, "min_win_k") == {"AAPL": 0.07, "INTC": 0.07}
 
     def test_a_kept_zero_opens_it_unticked(self):
         """A 0 remembered from before the box (`last_setup`) meant "off"."""
         app = self._run(**{self.KEY: 0.0})
         assert app.checkbox(key=self.BOX).value is False
-        assert app.number_input(key=self.KEY).value == pytest.approx(at.min_win_for("INTC"))
-        assert self._min_wins(app)["INTC"] == 0.0
+        assert app.number_input(key=self.KEY).value == pytest.approx(at.APPLE_TRADER_MIN_WIN_K)
+        assert self._racers(app, "min_win_k") == {"AAPL": 0.0, "INTC": 0.0}
+
+    def test_a_pair_it_stands_down_on_every_trade_is_named(self):
+        app = self._run()
+        app.number_input(key=self.KEY).set_value(0.7).run()
+        assert any("every trade stands" in w.value for w in app.warning)
+
+
+class TestConfirmationPerPair(_PairForm):
+    """Each pair's momentum confirmation period, on its row (the user's
+    request, 2026-10-26): it was one period for every pair."""
+
+    def test_each_row_opens_on_its_pairs_own(self):
+        from dataclasses import asdict
+
+        from agent_stonks import base_configs
+
+        base_configs.set_base(asdict(at.AppleTraderConfig(
+            ticker="INTC", model_key="highlow", momentum_confirmation_bars=1,
+        )))
+        app = self._run()
+        assert self._racers(app, "momentum_confirmation_bars") == {
+            "AAPL": at.APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS, "INTC": 1,
+        }
+        # No shared period any more.
+        assert not [w for w in app.number_input if w.key == "o_momentum_confirmation_bars"]
+
+    def test_setting_one_pair_leaves_the_other(self):
+        app = self._run()
+        app.number_input(key="o_momentum_confirmation_bars_highlow_INTC").set_value(0).run()
+        confirm = self._racers(app, "momentum_confirmation_bars")
+        assert confirm == {"AAPL": at.APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS, "INTC": 0}
+        sig = ar.orchestra_signature(app.session_state["out"])
+        assert "highlow_AAPL@" in sig and f"/conf{confirm['AAPL']}b," in sig
+        # The take stays on while any pair confirms.
+        assert not app.number_input(key="o_take_pct").disabled
+        app.number_input(key="o_momentum_confirmation_bars_highlow_AAPL").set_value(0).run()
+        assert app.number_input(key="o_take_pct").disabled
+
+    def test_a_running_racers_reopens_its_row(self):
+        from streamlit.testing.v1 import AppTest
+
+        running = ar.build_orchestra_config(
+            ["AAPL:highlow"], at.AppleTraderConfig(),
+            {"AAPL:highlow": {"momentum_confirmation_bars": 6}},
+        )
+        app = AppTest.from_function(_orchestra_form_seeded, default_timeout=30)
+        app.session_state["seed"] = running
+        app.run()
+        assert not app.exception, app.exception
+        assert app.session_state["out"].racers[0].momentum_confirmation_bars == 6
+
+    def test_a_goodmoments_row_has_its_own(self):
+        self.PAIRS = ["AAPL:highlow", "AMD:goodmoments"]
+        app = self._run()
+        assert app.session_state["out"].racers[1].gm_confirm_bars == 0
+        app.number_input(key="o_gm_confirm_bars_goodmoments_AMD").set_value(4).run()
+        amd = app.session_state["out"].racers[1]
+        assert amd.gm_confirm_bars == 4 and isinstance(amd.gm_confirm_bars, int)
+        assert ",confirm=4b)" in ar.orchestra_signature(app.session_state["out"])
 
 
 # --- GoodMoments pairs: an edge read every bar, beside the levels ---------------

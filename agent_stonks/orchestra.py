@@ -48,12 +48,13 @@ What a pair is given, and what it shares
 ----------------------------------------
 Every pair shares Orchestra's sizing, its closing flatten and its days off
 (`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
--- the unit, the ladder, the exits, the breach policy -- and each keeps its two
-distances and its circuit breaker (`PER_RACER_FIELDS`). A GoodMoments pair
-keeps its own configuration -- its pair's base, or the shipped defaults -- and
-Orchestra sets only the numbers that matter most (`SIGNAL_PAIR_FIELDS`): the
-edge a buy needs, the take and the stop, and on the hybrid HighLow2's buy
-distance. Fast&Furious is not offered: neither the race nor the 09:34
+-- the unit, the ladder, the exits, the breach policy, the circuit breaker --
+and each keeps its two distances and its momentum confirmation period
+(`DAYRANGE_PAIR_FIELDS`). A GoodMoments pair keeps its own configuration --
+its pair's base, or the shipped defaults -- and Orchestra sets only the
+numbers that matter most (`SIGNAL_PAIR_FIELDS`): the edge a buy needs, the
+take, the stop and its momentum confirmation, and on the hybrid HighLow2's
+buy distance. Fast&Furious is not offered: neither the race nor the 09:34
 selection is written for its rules.
 
 Split: every pair at once, each on its own share
@@ -136,21 +137,28 @@ MODE_LABELS = {
 # levels) and GoodMoments' probability rules (an edge read every bar).
 STRATEGIES = (apple_models.STRATEGY_DAYRANGE, apple_models.STRATEGY_PROBABILITY)
 
-# The fields every day-range racer must share. Orchestra is one rule set over
-# several instruments, not several rule sets: the pair (ticker, model) and the
-# numbers tuned per pair -- the two distances and the circuit breaker -- are the
-# racer's own, and everything else is Orchestra's.
-PER_RACER_FIELDS = (
-    "ticker", "model_key", "buy_k", "sell_k", "min_win_k",
-)
+# What Orchestra sets on each day-range racer, over the rules they share: the
+# two distances and the momentum confirmation period, tuned per pair (the
+# confirmation per pair since 2026-10-26, the user's request; it was shared).
+DAYRANGE_PAIR_FIELDS = ("buy_k", "sell_k", "momentum_confirmation_bars")
+# The fields a day-range racer need not share with the others. Orchestra is
+# one rule set over several instruments, not several rule sets: the pair
+# (ticker, model) and its own numbers are the racer's, and everything else is
+# Orchestra's. The circuit breaker is one setting for every pair since
+# 2026-10-26 (the user's request), but a record from before it has one per
+# pair, which still replays.
+PER_RACER_FIELDS = ("ticker", "model_key", "min_win_k") + DAYRANGE_PAIR_FIELDS
 # The fields every racer must share, whatever its rule set: Orchestra's sizing,
 # its closing flatten and the sessions it sits out.
 SHARED_BY_ALL = ("position_pct", "flatten_before_close_min", "skip_events")
 # What Orchestra sets on a GoodMoments racer, over its pair's own configuration
-# (`build_orchestra_config`): the edge a buy needs, the take and the stop -- and
-# on a hybrid the buy distance under its levels model's predicted high.
-SIGNAL_PAIR_FIELDS = ("gm_enter", "gm_take_k", "gm_stop_k")
+# (`build_orchestra_config`): the edge a buy needs, the take, the stop and the
+# momentum confirmation -- and on a hybrid the buy distance under its levels
+# model's predicted high.
+SIGNAL_PAIR_FIELDS = ("gm_enter", "gm_take_k", "gm_stop_k", "gm_confirm_bars")
 HYBRID_PAIR_FIELDS = SIGNAL_PAIR_FIELDS + ("buy_k",)
+# The pair numbers counted in bars rather than in units.
+_BAR_FIELDS = ("momentum_confirmation_bars", "gm_confirm_bars")
 
 
 def is_signal(config_or_key) -> bool:
@@ -166,9 +174,19 @@ def is_signal(config_or_key) -> bool:
 
 
 def pair_fields(model_key: str) -> "tuple[str, ...]":
-    """The numbers a GoodMoments racer is given by Orchestra (the hybrid's
-    buy distance too)."""
+    """The numbers a racer is given by Orchestra: a day-range one's, or a
+    GoodMoments one's (the hybrid's buy distance too)."""
+    if apple_models.strategy(model_key) != apple_models.STRATEGY_PROBABILITY:
+        return DAYRANGE_PAIR_FIELDS
     return HYBRID_PAIR_FIELDS if apple_models.levels_of(model_key) else SIGNAL_PAIR_FIELDS
+
+
+def _pair_numbers(model_key: str, numbers: "dict | None") -> dict:
+    """The pair numbers in `numbers` this model's racer is given, typed."""
+    return {
+        name: int(value) if name in _BAR_FIELDS else float(value)
+        for name, value in (numbers or {}).items() if name in pair_fields(model_key)
+    }
 
 
 def racer_key(config: AppleTraderConfig) -> str:
@@ -356,7 +374,7 @@ def signal_racer(
     flat, that is, until the take is raised again. A take of 0 is off, and so
     is its curve."""
     pair = at.default_config(ticker, model_key)
-    given = {k: float(v) for k, v in (numbers or {}).items() if k in pair_fields(model_key)}
+    given = _pair_numbers(model_key, numbers)
     take = given.get("gm_take_k", float(pair.gm_take_k))
     take_min = pair.gm_take_min_k
     if take_min is not None:
@@ -376,12 +394,13 @@ def build_orchestra_config(
     mode: str = MODE_RACE,
     budget_pct: "dict[str, float] | None" = None,
 ) -> OrchestraConfig:
-    """One racer per pair. A day-range pair is `base` with its own pair and
-    the numbers tuned for it: `levels[key]` = `(buy_k, sell_k, min_win_k)`
-    where given, the pair's shipped defaults otherwise. A GoodMoments pair is
-    its own configuration with `levels[key]` = `{field: value}` of the numbers
-    Orchestra sets on it (`signal_racer`). `selection`, `mode` and
-    `budget_pct` as `OrchestraConfig`'s."""
+    """One racer per pair, `levels[key]` = `{field: value}` of the numbers
+    Orchestra sets on it (`pair_fields`). A day-range pair is `base` -- its
+    circuit breaker too, one for every pair -- with its own two distances and
+    momentum confirmation period: those given, the pair's own for the rest
+    (its base configuration's, else the shipped ones). A GoodMoments pair is
+    its own configuration with the numbers given (`signal_racer`).
+    `selection`, `mode` and `budget_pct` as `OrchestraConfig`'s."""
     levels = levels or {}
     racers = []
     for key in pairs:
@@ -390,13 +409,12 @@ def build_orchestra_config(
             racers.append(signal_racer(ticker, model_key, base, levels.get(key)))
             continue
         buy_k, sell_k = at.dayrange_levels(ticker, model_key)
-        min_win_k = at.min_win_for(ticker, model_key)
-        if key in levels:
-            buy_k, sell_k, min_win_k = levels[key]
-        racers.append(replace(
-            base, ticker=ticker, model_key=model_key,
-            buy_k=float(buy_k), sell_k=float(sell_k), min_win_k=float(min_win_k),
-        ))
+        own = {
+            "buy_k": float(buy_k), "sell_k": float(sell_k),
+            "momentum_confirmation_bars": at.confirmation_for(ticker, model_key),
+        }
+        own.update(_pair_numbers(model_key, levels.get(key)))
+        racers.append(replace(base, ticker=ticker, model_key=model_key, **own))
     return OrchestraConfig(racers, selection=selection, mode=mode, budget_pct=budget_pct or {})
 
 
@@ -411,7 +429,16 @@ def orchestra_signature(race: OrchestraConfig) -> str:
     part removed, so a rule signs here exactly as it does in an Apple Trader
     run. A split says so up front and adds each pair's share of the budget
     ("=40%"); a race signs as it always has.
+
+    The day-range pairs' momentum confirmation is signed with the shared rules
+    (`confirm=3b`) while they all have the same one -- every record from before
+    it was set per pair -- and otherwise on each pair that has one ("/conf3b"),
+    with the rules then read off the first pair that has one, so the take it
+    drives is in them.
     """
+    ranged = [r for r in race.racers if not is_signal(r)]
+    own_confirmation = len({r.momentum_confirmation_bars for r in ranged}) > 1
+
     def pair(r: AppleTraderConfig) -> str:
         if is_signal(r):
             single = at.config_signature(r)
@@ -421,22 +448,34 @@ def orchestra_signature(race: OrchestraConfig) -> str:
                 f"{r.model_key}_{r.ticker}@{r.buy_k:g}/{r.sell_k:g}"
                 f"{LEVEL_UNIT_TOKENS[r.level_unit]}"
                 + (f"/mw{r.min_win_k:g}" if r.min_win_k else "")
+                + (
+                    f"/conf{r.momentum_confirmation_bars}b"
+                    if own_confirmation and r.momentum_confirmation_bars else ""
+                )
             )
         return token + (f"={race.budget_pct[racer_key(r)]:g}%" if race.split else "")
 
     pairs = ",".join(pair(r) for r in race.racers)
     head = "split:" if race.split else ""
-    first = next((r for r in race.racers if not is_signal(r)), race.racers[0])
+    first = next(
+        (r for r in ranged if r.momentum_confirmation_bars or not own_confirmation),
+        race.racers[0],
+    )
     single = at.config_signature(first)
     rules = single[single.index("size="):-1]
     rules = re.sub(r",min_win=[^,)]*", "", rules)
+    if own_confirmation:
+        rules = re.sub(r",confirm=\d+b", "", rules)
     return f"orchestra[{head}{pairs}]({rules}{candidates.rules_signature(race.selection)})"
 
 
 def racer_terms(config: AppleTraderConfig) -> str:
     """A racer's own numbers, as the log's opening line lists them."""
     if not is_signal(config):
-        return f"buy {config.buy_k:g} / sell {config.sell_k:g} × {config.unit_phrase}"
+        return (
+            f"buy {config.buy_k:g} / sell {config.sell_k:g} × {config.unit_phrase}, "
+            + _confirmation_terms(config.momentum_confirmation_bars)
+        )
     take = f"{config.gm_take_k:g}" if config.gm_take_k else "off"
     if config.gm_take_k and config.gm_take_min_k is not None:
         take = f"{config.gm_take_k:g}..{config.gm_take_min_k:g} with volatility"
@@ -444,6 +483,8 @@ def racer_terms(config: AppleTraderConfig) -> str:
         f"edge {config.gm_enter:+g}, take {take} / stop "
         + (f"{config.gm_stop_k:g}" if config.gm_stop_k else "off") + " ADR"
     )
+    if config.gm_confirm_bars:
+        text += ", " + _confirmation_terms(config.gm_confirm_bars)
     parent = apple_models.levels_of(config.model_key)
     if parent is not None:
         text += (
@@ -451,6 +492,13 @@ def racer_terms(config: AppleTraderConfig) -> str:
             f"{config.unit_phrase} after the opening window"
         )
     return text
+
+
+def _confirmation_terms(bars: int) -> str:
+    """A racer's momentum confirmation period, as `racer_terms` lists it."""
+    if not bars:
+        return "no momentum confirmation"
+    return f"momentum confirmed over {bars} bar{'' if bars == 1 else 's'}"
 
 
 # --- one racer's view of the shared state --------------------------------------

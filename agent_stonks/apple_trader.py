@@ -281,6 +281,15 @@ def min_win_for(
     return APPLE_TRADER_MIN_WIN.get(symbol, APPLE_TRADER_MIN_WIN_K)
 
 
+def confirmation_for(ticker: str, model_key: "str | None" = None) -> int:
+    """The momentum confirmation period, in bars, a run of this pair starts
+    from: its base configuration's (`base_configs`) when it has one -- SimLab's
+    tuning picks it per pair, 0 on some -- else the shipped default."""
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    bars = _base_number(model_key, symbol, "momentum_confirmation_bars") if model_key else None
+    return int(APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS if bars is None else bars)
+
+
 # Fields kept only so a stored record replays as it was run (see each one's
 # comment on `AppleTraderConfig`): the form has no knob for them, and next to
 # the knob that replaced them they make a config the dataclass refuses. A
