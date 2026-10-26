@@ -53,6 +53,8 @@ from .agent import stop_agent
 from .rule_agent import BaseTrader
 from .state import append_agent_log as _log
 from .config import (
+    APPLE_TRADER_BREACH_HOLD_BARS,
+    APPLE_TRADER_BREACH_HOLD_K,
     APPLE_TRADER_BREACH_UPDATE,
     APPLE_TRADER_BREACH_UPDATE_BY_TICKER,
     APPLE_TRADER_BREAKER_UNTIL_REVISED,
@@ -100,6 +102,8 @@ from .config import (
     APPLE_TRADER_TUNED_LEVELS,
     APPLE_TRADER_TUNED_STOP,
     BREACH_BROWNIAN,
+    BREACH_CONDITIONAL,
+    BREACH_KEEPS_WIDTH,
     BREACH_LABELS,
     BREACH_OFF,
     BREACH_POLICIES,
@@ -372,7 +376,10 @@ def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
 # What a hybrid's buy level is made of, and so what it takes from its levels
 # model when it has no base of its own: the distance, its unit, and how a
 # breach moves the forecast it hangs off.
-_HYBRID_LEVEL_FIELDS = ("buy_k", "level_unit", "breach_update", "keep_width", "contain_range")
+_HYBRID_LEVEL_FIELDS = (
+    "buy_k", "level_unit", "breach_update", "keep_width", "contain_range",
+    "breach_hold_bars", "breach_hold_k",
+)
 
 
 def _hybrid_default(symbol: str, model_key: str) -> "AppleTraderConfig":
@@ -510,11 +517,17 @@ class AppleTraderConfig:
     # are built on -- one of `config.BREACH_POLICIES`. "off" is the
     # notebook's rule (one forecast, held all day); "shift" moves both sides by
     # the breach, "brownian" past it by the expected excursion (both sides
-    # with `keep_width`, the breached one without), "extreme" the breached side
+    # with `keep_width`, the breached one without), "conditional" as "shift"
+    # until a breach holds and then as "brownian", "extreme" the breached side
     # only -- and the levels with it. See `_update_range`. None -> the pair's
-    # own (`breach_for`: "shift" on the thinly traded names, else "brownian"),
-    # filled in by `__post_init__`, so after construction it is one of them.
+    # own (`breach_for`: its base's, else "shift"), filled in by
+    # `__post_init__`, so after construction it is one of them.
     breach_update: Optional[str] = None
+    # When "conditional" calls a breach held: this many bars in a row, each
+    # trading at least `breach_hold_k` ADRs past the predicted level the breach
+    # broke (`DayRangeTrader._held_breaches`). Read only under it.
+    breach_hold_bars: int = APPLE_TRADER_BREACH_HOLD_BARS
+    breach_hold_k: float = APPLE_TRADER_BREACH_HOLD_K
     # Whether the forecast is always widened to hold what the session has
     # printed, whatever `breach_update` says (`day_range.contain_session`).
     # With it on, "off" no longer keeps a predicted high the tape has traded
@@ -659,7 +672,7 @@ class AppleTraderConfig:
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
             "momentum_confirmation_bars", "take_min_gain_fraction", "buy_step_k",
-            "take_after_minutes",
+            "take_after_minutes", "breach_hold_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -770,6 +783,14 @@ class AppleTraderConfig:
                 f"breach_update {self.breach_update!r} is not one of "
                 f"{', '.join(BREACH_POLICIES)}"
             )
+        # A breach that has to hold for no bars is "brownian" by another name.
+        if float(self.breach_hold_bars) != int(self.breach_hold_bars) or self.breach_hold_bars < 1:
+            raise ValueError(
+                f"breach_hold_bars {self.breach_hold_bars!r} is a number of bars and must be "
+                "a whole number of at least 1"
+            )
+        self.breach_hold_bars = int(self.breach_hold_bars)
+        self.breach_hold_k = float(self.breach_hold_k)
         self.level_unit = str(self.level_unit or UNIT_ADR)
         if self.level_unit not in LEVEL_UNITS:
             raise ValueError(
@@ -1002,7 +1023,7 @@ def breach_width(config: AppleTraderConfig, plan: "dict") -> "float | None":
     is off or the policy moves only one side (or nothing), which leaves
     `updated_range` doing what a stored record was run under.
     """
-    if not config.keep_width or config.breach_update not in (BREACH_SHIFT, BREACH_BROWNIAN):
+    if not config.keep_width or config.breach_update not in BREACH_KEEPS_WIDTH:
         return None
     adr = float(plan.get("adr14_abs") or 0.0)
     if config.level_unit != UNIT_PRED_RANGE:
@@ -1207,6 +1228,7 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     if c.momentum_confirmation_bars:
         adds += f",confirm={c.momentum_confirmation_bars}b"
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
+    breach += _held_token(c)
     # Both appear only while switched on, like every rule added since the
     # notebook's, so a record written before either existed keeps the signature
     # it was filed under. They are separate tokens because they are separate
@@ -1215,7 +1237,7 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # Only where it can change a trade (`breach_width`), so a run under "off"
     # signs the same either way -- and every record written before it existed,
     # which replays with it off, keeps the signature it was filed under.
-    if c.keep_width and c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+    if c.keep_width and c.breach_update in BREACH_KEEPS_WIDTH:
         breach += ",keep_width"
     if c.contain_range:
         breach += ",contain"
@@ -1280,12 +1302,27 @@ def _hybrid_levels_signature(c: AppleTraderConfig) -> str:
     unit = LEVEL_UNIT_TOKENS[c.level_unit]
     out = f",buy<=H-{c.buy_k:g}{unit}"
     if c.breach_update != BREACH_OFF:
-        out += f",breach={c.breach_update}"
-    if c.keep_width and c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+        out += f",breach={c.breach_update}" + _held_token(c)
+    if c.keep_width and c.breach_update in BREACH_KEEPS_WIDTH:
         out += ",keep_width"
     if c.contain_range:
         out += ",contain"
     return out
+
+
+def _held_token(c: AppleTraderConfig) -> str:
+    """When "conditional" extends a breach, in signature form: `held=0.05A/2b`
+    -- at least 0.05 ADR past the broken level, two bars in a row. Only under
+    it, the one policy that reads the two numbers."""
+    if c.breach_update != BREACH_CONDITIONAL:
+        return ""
+    return f",held={c.breach_hold_k:g}A/{c.breach_hold_bars}b"
+
+
+def _held_words(c: AppleTraderConfig) -> str:
+    """The same in words, for the settings table."""
+    bars = f"{c.breach_hold_bars} bars in a row" if c.breach_hold_bars > 1 else "1 bar"
+    return f"{bars}, each ≥ {c.breach_hold_k:g} × ADR past the level it broke"
 
 
 def config_settings(config: "AppleTraderConfig | None" = None) -> "list[tuple[str, str, str]]":
@@ -1351,7 +1388,9 @@ def _dayrange_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
     breach = "Forecast breach"
     rows.append((breach, "If the session trades outside the forecast",
                  BREACH_LABELS.get(c.breach_update, c.breach_update)))
-    if c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+    if c.breach_update == BREACH_CONDITIONAL:
+        rows.append((breach, "Extend only once the breach has held", _held_words(c)))
+    if c.breach_update in BREACH_KEEPS_WIDTH:
         rows.append((breach, "Keep the range's width", _yes(c.keep_width)))
     rows.append((breach, "Forecast must contain the session so far", _yes(c.contain_range)))
     rows.append((breach, "A breach of the predicted high sells", _yes(c.breach_exit)))
@@ -1461,7 +1500,9 @@ def _probability_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
             (section, "If the session trades outside the forecast",
              BREACH_LABELS.get(c.breach_update, c.breach_update)),
         ]
-        if c.breach_update in (BREACH_SHIFT, BREACH_BROWNIAN):
+        if c.breach_update == BREACH_CONDITIONAL:
+            rows.append((section, "Extend only once the breach has held", _held_words(c)))
+        if c.breach_update in BREACH_KEEPS_WIDTH:
             rows.append((section, "Keep the range's width", _yes(c.keep_width)))
         rows.append((section, "Forecast must contain the session so far", _yes(c.contain_range)))
     return rows
@@ -3161,6 +3202,12 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         )
         before = {k: float(plan[k]) for k in
                   ("pred_high", "pred_low", "buy_level", "sell_level")}
+        # Before the extremes are read: it reads the same new bars, and
+        # `_read_extremes` marks them read.
+        held_high, held_low = (
+            self._held_breaches(frame, ts)
+            if config.breach_update == BREACH_CONDITIONAL else (None, None)
+        )
         session_high, session_low = self._read_extremes(frame, ts)
         high, low = day_range.updated_range(
             plan,
@@ -3170,6 +3217,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             policy=config.breach_update,
             contain=config.contain_range,
             width=breach_width(config, plan),
+            extend=(held_high is not None, held_low is not None),
         )
         if high == before["pred_high"] and low == before["pred_low"]:
             return None
@@ -3181,7 +3229,65 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # under "shift" the other side follows without having been breached.
         before["breached_high"] = session_high > before["pred_high"]
         before["breached_low"] = session_low < before["pred_low"]
+        # And, under "conditional", the level each breach that has now held
+        # broke, which is what was extended.
+        before["held_high"], before["held_low"] = held_high, held_low
         return before
+
+    def _held_breaches(self, frame, ts) -> "tuple[float | None, float | None]":
+        """Which breaches "conditional" extends on this bar: for the high and
+        for the low, the predicted level a breach broke once it has held --
+        `breach_hold_bars` bars in a row, each trading at least `breach_hold_k`
+        ADRs past that level -- or None.
+
+        The user's rule (2026-10-26): a breach the tape takes back within a bar
+        or two is noise around a forecast that was about right, and moving to
+        the extreme is all it earns; one that keeps trading out there is a day
+        that has broken out, and gets the Brownian extension. So the first bar
+        through the range as it stands opens a count against the level it
+        broke -- the normal range -- and that level stays the yardstick however
+        far the range itself then moves to the extreme. Each bar at least the
+        margin past it counts; one outside it by less sets the count back to
+        nought; one back inside it ends the breach, and only a new breach of
+        the range starts another.
+
+        Reads the bars after `seen_to`, the ones `_read_extremes` is about to
+        fold in, so it runs first and sees each bar once. Within them the
+        range follows each breach to its extreme, as the range itself will; an
+        extended side cannot be breached again by a bar already read. The
+        breach in progress is the plan's `held` (`{"high": {"from": level,
+        "bars": n}}`), carried in the recorded rows so that a restart taking
+        the range back takes it too (`_resume_range`).
+        """
+        config, plan = self.config, self.plan
+        need = float(config.breach_hold_k) * float(plan.get("adr14_abs") or 0.0)
+        start = plan.get("seen_to")
+        if start is None:
+            start = plan["opening_end"]
+        new = frame[(frame.index > start) & (frame.index <= ts)]
+        runs = {side: dict(run) for side, run in (plan.get("held") or {}).items()}
+        out: "list[float | None]" = []
+        for side, sign in (("high", 1.0), ("low", -1.0)):
+            level = float(plan[f"pred_{side}"])
+            run, extended = runs.pop(side, None), None
+            for price in new[side].astype(float).tolist():
+                if run is None and sign * (price - level) > 0:
+                    run = {"from": level, "bars": 0}
+                if run is not None:
+                    past = sign * (price - run["from"])
+                    if past <= 0:
+                        run = None
+                    else:
+                        run["bars"] = run["bars"] + 1 if past >= need else 0
+                if sign * (price - level) > 0:
+                    level = price
+                if run is not None and run["bars"] >= config.breach_hold_bars:
+                    extended, run, level = run["from"], None, sign * math.inf
+            if run is not None:
+                runs[side] = run
+            out.append(extended)
+        plan["held"] = runs
+        return out[0], out[1]
 
     def _read_extremes(self, frame, ts) -> "tuple[float, float]":
         """The session's high and low through bar `ts`, as this run read them.
@@ -3250,6 +3356,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             "forecast_width", float(plan["pred_high"]) - float(plan["pred_low"])
         )
         plan["pred_high"], plan["pred_low"] = float(row["pred_high"]), float(row["pred_low"])
+        plan["held"] = {side: dict(run) for side, run in (row.get("held") or {}).items()}
         high, low = self._read_extremes(frame[frame.index <= ts], ts)
         plan["seen_high"] = min(high, plan["pred_high"])
         plan["seen_low"] = max(low, plan["pred_low"])
@@ -3272,17 +3379,47 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         moved = []
         breached_high = before.get("breached_high", plan["pred_high"] != before["pred_high"])
         breached_low = before.get("breached_low", plan["pred_low"] != before["pred_low"])
+        held_high, held_low = before.get("held_high"), before.get("held_low")
         if breached_high:
             moved.append(
                 f"the session has traded up through the ${before['pred_high']:,.2f} "
                 "predicted high"
             )
+        elif held_high is not None:
+            moved.append(f"its breach of the ${held_high:,.2f} predicted high has held")
         if breached_low:
             moved.append(
                 f"it has traded down through the ${before['pred_low']:,.2f} predicted low"
             )
+        elif held_low is not None:
+            moved.append(f"its breach of the ${held_low:,.2f} predicted low has held")
         width = breach_width(config, plan)
-        if config.breach_update == BREACH_BROWNIAN:
+        if config.breach_update == BREACH_CONDITIONAL:
+            margin = config.breach_hold_k * float(plan.get("adr14_abs") or 0.0)
+            bars = config.breach_hold_bars
+            hold = (
+                f"{bars} bar{'s in a row' if bars > 1 else ''}"
+                f"{', each' if bars > 1 else ''} at least ${margin:,.2f} "
+                f"({config.breach_hold_k:g} ADR) past the level it broke"
+            )
+            up = breached_high or held_high is not None
+            down = breached_low or held_low is not None
+            if held_high is not None or held_low is not None:
+                left = day_range.minutes_left_at(ts)
+                reach = day_range.brownian_reach(plan["adr14_abs"], left)
+                how = (
+                    f"the breach held {hold}, so the extreme so far is extended by the "
+                    f"${reach:,.2f} a driftless walk with this ADR's volatility is still "
+                    f"expected to add over the {left:.0f} min left"
+                )
+            else:
+                how = (
+                    f"the breached side moved to the extreme so far; extended past it only "
+                    f"if the breach holds {hold}"
+                )
+            if width and up != down:
+                how += f", and the other side ${width:,.2f} from it"
+        elif config.breach_update == BREACH_BROWNIAN:
             left = day_range.minutes_left_at(ts)
             reach = day_range.brownian_reach(plan["adr14_abs"], left)
             how = (
@@ -4086,7 +4223,10 @@ def _record_strategy(record: dict) -> str:
 # The settings that decide where the range goes once the tape has traded
 # outside it (`DayRangeTrader._move_range`): a restart under the same ones
 # continues the earlier run's range (`_take_back_range`).
-RANGE_RULES = ("breach_update", "keep_width", "contain_range", "level_unit")
+RANGE_RULES = (
+    "breach_update", "keep_width", "contain_range", "level_unit",
+    "breach_hold_bars", "breach_hold_k",
+)
 
 
 def _resumable_seed(record: "dict | None", model_key: str) -> "dict | None":
@@ -4128,8 +4268,11 @@ def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
     `stop` is None: a stop hangs under the actual fill, so before a buy there
     is none to draw. `_record_levels` fills it in while a position is open.
     `model_key` is the model the levels hang off, which a run can switch
-    mid-session (`_adopt_form_model`)."""
-    return {
+    mid-session (`_adopt_form_model`). `held`, only while "conditional" is
+    counting a breach towards its extension, is that count
+    (`DayRangeTrader._held_breaches`), so a restart from this row goes on
+    counting."""
+    row = {
         "t": ts,
         "model_key": config.model_key,
         "buy": float(plan["buy_level"]),
@@ -4139,6 +4282,9 @@ def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
         "pred_high": float(plan["pred_high"]),
         "pred_low": float(plan["pred_low"]),
     }
+    if plan.get("held"):
+        row["held"] = {side: dict(run) for side, run in plan["held"].items()}
+    return row
 
 
 def session_levels(
@@ -5669,7 +5815,7 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
 
 def _breach_side(config: AppleTraderConfig) -> str:
     """What a breach moves under this policy, for the log lines that say so."""
-    if config.breach_update == BREACH_SHIFT or (
+    if config.breach_update in (BREACH_SHIFT, BREACH_CONDITIONAL) or (
         config.keep_width and config.breach_update == BREACH_BROWNIAN
     ):
         return "both sides of it"

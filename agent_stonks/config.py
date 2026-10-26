@@ -487,6 +487,11 @@ APPLE_TRADER_ZONE_WIDTH = 3.0
 #               a driftless walk with ADR-implied volatility is still expected
 #               to add, ADR x sqrt(session left)/2; with APPLE_TRADER_KEEP_WIDTH
 #               the other side follows at the unit's width, without it it stays
+#   "conditional"  "shift" on every breach, and the Brownian extension on top
+#               only once the breach has held: APPLE_TRADER_BREACH_HOLD_BARS
+#               bars in a row, each trading at least APPLE_TRADER_BREACH_HOLD_K
+#               ADRs past the level it broke. A breach the tape takes back
+#               sooner leaves the range at the extreme (2026-10-26)
 #
 # The forecast already refuses to sit under the opening window's high (each
 # model clips its own at 9:35); the moving policies carry that same
@@ -496,16 +501,23 @@ BREACH_OFF = "off"
 BREACH_SHIFT = "shift"
 BREACH_EXTREME = "extreme"
 BREACH_BROWNIAN = "brownian"
+BREACH_CONDITIONAL = "conditional"
 # Every policy a config may carry -- including one a stored record carries
 # that is no longer offered.
-BREACH_POLICIES = (BREACH_OFF, BREACH_SHIFT, BREACH_EXTREME, BREACH_BROWNIAN)
+BREACH_POLICIES = (
+    BREACH_OFF, BREACH_SHIFT, BREACH_EXTREME, BREACH_BROWNIAN, BREACH_CONDITIONAL,
+)
 # What a form or a new sweep offers.
-BREACH_OFFERED = (BREACH_OFF, BREACH_SHIFT, BREACH_BROWNIAN)
+BREACH_OFFERED = (BREACH_OFF, BREACH_SHIFT, BREACH_BROWNIAN, BREACH_CONDITIONAL)
+# The policies a breach moves both sides under when APPLE_TRADER_KEEP_WIDTH is
+# on -- the ones `apple_trader.breach_width` hands a width to.
+BREACH_KEEPS_WIDTH = (BREACH_SHIFT, BREACH_BROWNIAN, BREACH_CONDITIONAL)
 BREACH_LABELS = {
     BREACH_OFF: "Hold the 9:35 forecast",
     BREACH_SHIFT: "Move to the extreme so far",
     BREACH_EXTREME: "Move only the breached side to the extreme (earlier rule)",
     BREACH_BROWNIAN: "Brownian extension, volatility implied by ADR",
+    BREACH_CONDITIONAL: "Conditional Brownian extension, if the breach holds",
 }
 # The default moves to the extreme because that is the weaker claim: "the
 # day's high is at least what has already traded" is arithmetic, not a
@@ -533,6 +545,19 @@ APPLE_TRADER_BREACH_UPDATE = BREACH_SHIFT
 # default. A pair's base configuration, once SimLab has set one, carries its
 # own and is read before this (`apple_trader.breach_for`).
 APPLE_TRADER_BREACH_UPDATE_BY_TICKER: "dict[str, str]" = {}
+
+# When "conditional" calls a breach serious enough for the Brownian extension
+# (the user's rule, 2026-10-26): at least this many bars in a row, each trading
+# at least this many ADRs (`adr14_abs`) past the predicted level the breach
+# broke -- the high for a breach up, the low for one down. Until then, and for
+# a breach the tape takes back sooner, the range only moves to the extreme so
+# far, as under "shift". The level broken stays the yardstick while the breach
+# lasts, however far the range moves: the breaching bar itself counts if it
+# clears the margin, a bar outside by less sets the count back to nought, and
+# a bar back inside the level ends the breach. In ADRs rather than the level
+# unit because the extension itself is ADR-implied. Not swept.
+APPLE_TRADER_BREACH_HOLD_BARS = 2
+APPLE_TRADER_BREACH_HOLD_K = 0.05
 
 # Whether the forecast is always widened to hold what the session has actually
 # printed (`day_range.contain_session`). The 9:35 forecast is already

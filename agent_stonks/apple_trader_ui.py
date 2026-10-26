@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 from .config import (
     APPLE_TRADER_GM_STOP_RAISE,
     APPLE_TRADER_MIN_WIN_K,
+    BREACH_CONDITIONAL,
     BREACH_LABELS,
     BREACH_OFF,
     BREACH_OFFERED,
@@ -328,9 +329,11 @@ def hybrid_levels_params(
             ticker=ticker, buy_k=f"{float(defaults.buy_k):g}", model=parent,
         ) or None,
     )
+    breach_update = breach_param(defaults, copy, scope=ticker)
     return {
         "buy_k": float(buy_k), "sell_k": 0.0,
-        "breach_update": breach_param(defaults, copy, scope=ticker),
+        "breach_update": breach_update,
+        **held_params(defaults, breach_update, copy),
     }
 
 
@@ -654,6 +657,7 @@ def rule_params(
     `buy_k` and `sell_k` only feed the stop's `?`, which says what the stop
     fraction comes to against them."""
     breach_update = breach_param(defaults, copy, scope=breach_scope)
+    held = held_params(defaults, breach_update, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     exits = exit_params(
         defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
@@ -662,6 +666,7 @@ def rule_params(
     skip_events = skip_param(defaults, copy)
     return {
         "breach_update": breach_update,
+        **held,
         "contain_range": contain_range,
         "breach_exit": breach_exit,
         **exits,
@@ -854,6 +859,33 @@ def breach_param(defaults: AppleTraderConfig, copy: FormCopy, scope: str = "") -
         help=copy.help.get("breach_update"),
     )
     return str(choice)
+
+
+def held_params(
+    defaults: AppleTraderConfig, breach_update: str, copy: FormCopy
+) -> dict:
+    """When the conditional Brownian extension calls a breach held: how many
+    bars in a row, each how far past the level it broke. Only under that
+    policy, the one that reads them -- otherwise nothing, and the config keeps
+    the numbers it had. Not keyed by ticker, like the containment rules below:
+    a rule about the tape, not a swept number."""
+    if breach_update != BREACH_CONDITIONAL:
+        return {}
+    col_a, col_b = st.columns(2)
+    bars = col_a.number_input(
+        "Breach holds for (bars)",
+        min_value=1, max_value=30, value=int(defaults.breach_hold_bars), step=1,
+        key=copy.key("breach_hold_bars"),
+        help=copy.help.get("breach_hold_bars"),
+    )
+    margin = col_b.number_input(
+        "…each past it by (× ADR)",
+        min_value=0.0, max_value=1.0, value=float(defaults.breach_hold_k), step=0.01,
+        format="%.2f",
+        key=copy.key("breach_hold_k"),
+        help=copy.help.get("breach_hold_k"),
+    )
+    return {"breach_hold_bars": int(bars), "breach_hold_k": float(margin)}
 
 
 def containment_params(

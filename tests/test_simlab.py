@@ -3212,5 +3212,5 @@ class TestBreachShiftRecords:
         choice = tu.CHOICES["breach_update"]
         assert "extreme" in choice.options
         assert "extreme" not in choice.pickable
-        assert choice.pickable == ("off", "shift", "brownian")
+        assert choice.pickable == ("off", "shift", "brownian", "conditional")
 

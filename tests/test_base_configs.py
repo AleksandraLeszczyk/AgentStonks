@@ -187,6 +187,20 @@ class TestForm:
         )
         assert app.session_state["out"] == AppleTraderConfig(ticker="AAPL", model_key="highlow")
 
+    def test_the_conditional_extension_brings_its_two_numbers(self, form):
+        """Only under "conditional", the one policy that reads them."""
+        app = self._pick_highlow(form)
+        assert not [n for n in app.number_input if n.key.startswith("t_breach_hold")]
+        app.selectbox(key="t_breach_update_AAPL").select("conditional").run()
+        assert not app.exception
+        assert app.number_input(key="t_breach_hold_bars").value == 2
+        assert app.number_input(key="t_breach_hold_k").value == pytest.approx(0.05)
+        app.number_input(key="t_breach_hold_bars").set_value(3).run()
+        out = app.session_state["out"]
+        assert (out.breach_update, out.breach_hold_bars, out.breach_hold_k) == (
+            "conditional", 3, pytest.approx(0.05)
+        )
+
     def test_the_form_opens_on_the_base_and_keeps_what_it_has_no_knob_for(self, form):
         base_configs.set_base(asdict(_base()))
         app = self._pick_highlow(form)

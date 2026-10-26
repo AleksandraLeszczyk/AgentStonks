@@ -3345,13 +3345,31 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "with this ADR's volatility would still cover before the close: half an ADR "
             "with the whole day left, nothing at the bell. It leads the tape, and pays "
             "for that with a sell level the day may never come back up to.\n\n"
-            "Both moving policies keep the range as wide as the unit the levels are "
+            "- **Conditional Brownian extension** — every breach moves to the extreme so "
+            "far, as above; only a breach that *holds* — 2 bars in a row, each at least "
+            "0.05 ADR past the level it broke (both numbers set below it) — is then "
+            "extended the Brownian way. A breach the price takes back sooner just leaves "
+            "the range at the extreme.\n\n"
+            "The moving policies keep the range as wide as the unit the levels are "
             "counted in — the 9:35 predicted range, or the ADR — and move the other side "
             "with the breached one. The range only widens when that would put the other "
             "side past a price the session has already traded. "
-            "Neither updating policy has been swept.\n\n"
+            "None of the updating policies has been swept.\n\n"
             "The default is the extreme so far, on every instrument — unless the pair's "
             "base configuration says otherwise."
+        ),
+        "breach_hold_bars": (
+            "How many bars in a row a breach has to keep trading past the predicted level "
+            "it broke before the conditional policy extends it. The first breaching bar "
+            "counts, so 2 means the breach and the bar after it; 1 extends any breach "
+            "deep enough on its own bar."
+        ),
+        "breach_hold_k": (
+            "How far past the broken level — in ADRs, like the extension itself — each of "
+            "those bars has to trade: its high above a broken high, its low under a "
+            "broken low. The level is the one the breach broke, however far the range "
+            "has since moved to the extreme. A bar still outside but by less starts the "
+            "count again; a bar back inside the level ends the breach."
         ),
         "contain_range": (
             "Keeps the forecast wide enough to hold what the session has printed.\n\n"

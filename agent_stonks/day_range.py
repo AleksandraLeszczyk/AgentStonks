@@ -27,7 +27,9 @@ from . import market_hours
 # meaning is below (`updated_range`), and that is what belongs here.
 from .config import (  # noqa: F401  -- BREACH_POLICIES is re-exported
     BREACH_BROWNIAN,
+    BREACH_CONDITIONAL,
     BREACH_EXTREME,
+    BREACH_KEEPS_WIDTH,
     BREACH_OFF,
     BREACH_POLICIES,
     BREACH_SHIFT,
@@ -169,6 +171,7 @@ def updated_range(
     policy: str = BREACH_OFF,
     contain: bool = False,
     width: "float | None" = None,
+    extend: "tuple[bool, bool]" = (False, False),
 ) -> "tuple[float, float]":
     """`(pred_high, pred_low)` after what the session has actually printed.
 
@@ -205,6 +208,15 @@ def updated_range(
     existed -- `shift` keeps the current width, `brownian` moves one side --
     which is what a stored record replays.
 
+    `conditional` is `shift`, plus the Brownian reach on a side `extend` names
+    (`(high, low)`): one whose breach the caller has seen hold
+    (`apple_trader.DayRangeTrader._held_breaches`). That side goes to the
+    session's extreme plus `brownian_reach` whether or not this bar printed a
+    new extreme -- the bar that confirms a breach need not be the one that
+    made it, and the extreme was already the range's from the breach itself.
+    It never pulls a side back in. Without `width` only that side moves, as
+    under `brownian`.
+
     An unknown policy reads as `off`. Callers get their policy from a stored
     record or a form, and a typo that silently traded a different strategy would
     be worse than one that traded the notebook's.
@@ -218,31 +230,37 @@ def updated_range(
     """
     high = float(forecast["pred_high"])
     low = float(forecast["pred_low"])
-    if width and width > 0 and policy in (BREACH_SHIFT, BREACH_BROWNIAN):
-        reach = (
-            brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
-            if policy == BREACH_BROWNIAN
-            else 0.0
-        )
+    reach = (
+        brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
+        if policy in (BREACH_BROWNIAN, BREACH_CONDITIONAL)
+        else 0.0
+    )
+    # Under "conditional" the reach is only a held breach's, and a held side
+    # is extended from the extreme even on a bar that printed no new one.
+    held_up = policy == BREACH_CONDITIONAL and extend[0] and session_high is not None
+    held_down = policy == BREACH_CONDITIONAL and extend[1] and session_low is not None
+    if width and width > 0 and policy in BREACH_KEEPS_WIDTH:
         up = session_high is not None and float(session_high) > high
         down = session_low is not None and float(session_low) < low
+        reach_up = reach if policy == BREACH_BROWNIAN or held_up else 0.0
+        reach_down = reach if policy == BREACH_BROWNIAN or held_down else 0.0
         # The breached side goes where the policy puts it and the other follows
         # at `width`. A bar through both sides leaves no side to follow: both go
         # to their extremes, which is already wider than the width.
-        if up:
-            high = float(session_high) + reach
-            if not down:
+        if up or held_up:
+            high = max(high, float(session_high) + reach_up)
+            if not (down or held_down):
                 low = high - float(width)
-        if down:
-            low = float(session_low) - reach
-            if not up:
+        if down or held_down:
+            low = min(low, float(session_low) - reach_down)
+            if not (up or held_up):
                 high = low + float(width)
         # A followed side that would exclude a price already printed is the
         # one reason the range may come out wider than `width`.
         high, low = contain_session(
             high, low, session_high=session_high, session_low=session_low
         )
-    elif policy == BREACH_SHIFT:
+    elif policy in (BREACH_SHIFT, BREACH_CONDITIONAL):
         # The breach on each side, as a distance past the forecast. A bar wide
         # enough to breach both sides moves the range by the difference.
         up = max(0.0, float(session_high) - high) if session_high is not None else 0.0
@@ -255,12 +273,12 @@ def updated_range(
         high, low = contain_session(
             high, low, session_high=session_high, session_low=session_low
         )
+        # And a held breach goes on past the extreme, that side alone.
+        if held_up:
+            high = max(high, float(session_high) + reach)
+        if held_down:
+            low = min(low, float(session_low) - reach)
     elif policy in (BREACH_EXTREME, BREACH_BROWNIAN):
-        reach = (
-            brownian_reach(float(forecast.get("adr14_abs") or 0.0), minutes_left)
-            if policy == BREACH_BROWNIAN
-            else 0.0
-        )
         if session_high is not None and float(session_high) > high:
             high = float(session_high) + reach
         if session_low is not None and float(session_low) < low:

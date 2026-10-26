@@ -2440,6 +2440,169 @@ class TestKeepWidth:
         assert "keep_width" not in config_signature(held)
 
 
+class TestConditionalBrownian:
+    """"Conditional Brownian extension" (2026-10-26): every breach moves the
+    range to the extreme, as "shift" does, and the Brownian reach is added only
+    once the breach has held -- 2 bars in a row, each at least 0.05 ADR past
+    the level it broke. FORECAST's $10 ADR makes that $0.50 over the $110
+    predicted high, or under the $95 low; under the ADR unit the other side
+    follows $10 away (held at the opening window's $101 low by containment)."""
+
+    def _config(self, **kwargs):
+        return dayrange_config(**{"breach_update": "conditional", "keep_width": True, **kwargs})
+
+    def _walk(self, state, monkeypatch, bars, side="high", **kwargs):
+        """One cycle per bar; `bars` are the bars' highs (or lows), each
+        closing $0.20 inside its extreme. The plan after each bar."""
+        tape = Tape(monkeypatch)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        trader = at.DayRangeTrader(self._config(**kwargs))
+        plans = []
+        for price in bars:
+            if side == "high":
+                tape.append(price - 0.2, high=price, low=price - 0.2)
+            else:
+                tape.append(price + 0.2, high=price + 0.2, low=price)
+            trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+            plans.append(dict(trader.plan))
+        return tape, trader, plans
+
+    @staticmethod
+    def _reach(ts) -> float:
+        return at.day_range.brownian_reach(10.0, at.day_range.minutes_left_at(ts))
+
+    @staticmethod
+    def _state() -> AppState:
+        """Another session's state: no record of the run in `state` to take back."""
+        fresh = AppState()
+        fresh.set_symbols([TICKER])
+        fresh.api_key, fresh.api_secret, fresh.feed = "k", "s", "iex"
+        return fresh
+
+    def test_a_breach_taken_back_only_moves_to_the_extreme(self, state, market_open, monkeypatch):
+        _, _, plans = self._walk(state, monkeypatch, [111.0, 109.8])
+
+        assert [p["pred_high"] for p in plans] == pytest.approx([111.0, 111.0])
+        assert plans[0]["held"] == {"high": {"from": 110.0, "bars": 1}}
+        assert plans[1]["held"] == {}
+        line = next(e["text"] for e in state.agent_log if "forecast updated" in e["text"])
+        assert "extended past it only if the breach holds 2 bars in a row" in line
+        assert "$0.50 (0.05 ADR)" in line
+
+    def test_a_breach_that_holds_two_bars_is_extended(self, state, market_open, monkeypatch):
+        """The second bar trades no higher than the first, but still $0.60
+        over the $110 it broke: the breach has held."""
+        tape, trader, plans = self._walk(state, monkeypatch, [111.0, 110.6])
+
+        assert plans[0]["pred_high"] == pytest.approx(111.0)
+        assert plans[1]["pred_high"] == pytest.approx(111.0 + self._reach(tape.index[-1]))
+        assert trader.plan["buy_level"] == pytest.approx(trader.plan["pred_high"] - 7.5)
+        line = [e["text"] for e in state.agent_log if "forecast updated" in e["text"]][-1]
+        assert "breach of the $110.00 predicted high has held" in line
+        assert "the breach held 2 bars in a row" in line
+
+    def test_a_shallow_first_bar_counts_from_the_level_it_broke(
+        self, state, market_open, monkeypatch
+    ):
+        """$110.30 is through $110 by less than the margin: it moves the range
+        and starts the breach, but does not count. $110.60 and $110.70 are
+        both $0.50 past $110 -- not past each other's highs -- and hold it."""
+        tape, _, plans = self._walk(state, monkeypatch, [110.3, 110.6, 110.7])
+
+        assert [p["pred_high"] for p in plans[:2]] == pytest.approx([110.3, 110.6])
+        assert plans[2]["pred_high"] == pytest.approx(110.7 + self._reach(tape.index[-1]))
+
+    def test_a_bar_short_of_the_margin_starts_the_count_again(
+        self, state, market_open, monkeypatch
+    ):
+        tape, _, plans = self._walk(state, monkeypatch, [111.0, 110.3, 110.8, 110.6])
+
+        assert [p["pred_high"] for p in plans[:3]] == pytest.approx([111.0] * 3)
+        assert plans[2]["held"] == {"high": {"from": 110.0, "bars": 1}}
+        assert plans[3]["pred_high"] == pytest.approx(111.0 + self._reach(tape.index[-1]))
+
+    def test_a_bar_back_inside_ends_the_breach(self, state, market_open, monkeypatch):
+        """Back under $110, then $110.60 again: over the old level, but not a
+        breach of the range, which is at $111 now."""
+        _, _, plans = self._walk(state, monkeypatch, [111.0, 109.5, 110.6, 110.6])
+
+        assert [p["pred_high"] for p in plans] == pytest.approx([111.0] * 4)
+        assert plans[1]["held"] == {}
+
+    def test_a_held_breach_of_the_low_is_extended_down(self, state, market_open, monkeypatch):
+        tape, _, plans = self._walk(state, monkeypatch, [94.0, 94.4], side="low")
+
+        assert plans[0]["pred_low"] == pytest.approx(94.0)
+        low = 94.0 - self._reach(tape.index[-1])
+        assert plans[1]["pred_low"] == pytest.approx(low)
+        # $10 over the low would be under the opening window's $103 high.
+        assert plans[1]["pred_high"] == pytest.approx(103.0)
+
+    def test_one_bar_extends_a_deep_enough_breach_at_once(self, state, market_open, monkeypatch):
+        tape, _, plans = self._walk(state, monkeypatch, [111.0], breach_hold_bars=1)
+        assert plans[0]["pred_high"] == pytest.approx(111.0 + self._reach(tape.index[-1]))
+        _, _, plans = self._walk(self._state(), monkeypatch, [110.3], breach_hold_bars=1)
+        assert plans[0]["pred_high"] == pytest.approx(110.3)
+
+    def test_the_margin_is_a_setting(self, state, market_open, monkeypatch):
+        _, _, plans = self._walk(state, monkeypatch, [111.0, 110.6], breach_hold_k=0.10)
+        assert plans[-1]["pred_high"] == pytest.approx(111.0)
+
+    def test_a_restart_between_the_two_bars_goes_on_counting(
+        self, state, market_open, monkeypatch
+    ):
+        tape, early, _ = self._walk(state, monkeypatch, [111.0])
+        assert state.apple_trader_levels["rows"][-1]["held"] == {
+            "high": {"from": 110.0, "bars": 1}
+        }
+        restarted = at.DayRangeTrader(self._config())
+        tape.append(110.4, high=110.6, low=110.4)
+        restarted.run_cycle(
+            DAYRANGE_BUNDLE, state,
+            DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0)),
+        )
+        assert restarted.plan["pred_high"] == pytest.approx(111.0 + self._reach(tape.index[-1]))
+
+    def test_a_late_start_moves_the_range_as_a_run_up_since_935(
+        self, state, market_open, monkeypatch
+    ):
+        bars = [110.3, 110.6, 110.7, 109.0, 113.0, 112.0]
+        _, always, _ = self._walk(state, monkeypatch, bars)
+        late_state = self._state()
+        tape = Tape(monkeypatch)
+        for price in bars:
+            tape.append(price - 0.2, high=price, low=price - 0.2)
+        late = at.DayRangeTrader(self._config())
+        late.run_cycle(
+            DAYRANGE_BUNDLE, late_state,
+            DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0)),
+        )
+        assert (late.plan["pred_high"], late.plan["pred_low"]) == pytest.approx(
+            (always.plan["pred_high"], always.plan["pred_low"])
+        )
+        assert late.plan["range_updates"] == always.plan["range_updates"]
+
+    def test_signature_and_settings(self):
+        config = AppleTraderConfig(model_key="highlow", breach_update="conditional")
+        assert ",breach=conditional,held=0.05A/2b," in config_signature(config)
+        assert ",keep_width" in config_signature(config)
+        rows = {(s, k): v for s, k, v in at.config_settings(config)}
+        assert rows[("Forecast breach", "Extend only once the breach has held")] == (
+            "2 bars in a row, each ≥ 0.05 × ADR past the level it broke"
+        )
+        brownian = AppleTraderConfig(model_key="highlow", breach_update="brownian")
+        assert "held=" not in config_signature(brownian)
+        # Nothing else reads the two numbers, so they do not tell runs apart.
+        assert config_signature(replace(brownian, breach_hold_k=0.2)) == config_signature(brownian)
+
+    @pytest.mark.parametrize(
+        "bad", [{"breach_hold_bars": 0}, {"breach_hold_bars": 1.5}, {"breach_hold_k": -0.1}]
+    )
+    def test_nonsense_thresholds_are_refused(self, bad):
+        with pytest.raises(ValueError):
+            AppleTraderConfig(model_key="highlow", breach_update="conditional", **bad)
+
+
 class TestOpeningWindowRevision:
     """The opening window is read as the forecast read it (`or_high`/`or_low`).
 

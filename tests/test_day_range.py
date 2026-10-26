@@ -213,6 +213,62 @@ class TestUpdatedRangeKeepsTheWidth:
         )
 
 
+class TestConditionalExtension:
+    """"conditional": "shift", plus the Brownian reach on a side whose breach
+    the caller has seen hold (`extend`)."""
+
+    FORECAST = {"pred_high": 110.0, "pred_low": 100.0, "adr14_abs": 10.0}
+    NOON = 240.0
+
+    def _update(self, policy, high, low, width=10.0, extend=(False, False), forecast=None):
+        return D.updated_range(
+            forecast or self.FORECAST,
+            session_high=high, session_low=low,
+            minutes_left=self.NOON, policy=policy, width=width, extend=extend,
+        )
+
+    @pytest.mark.parametrize("width", [10.0, 8.0, None])
+    def test_until_a_breach_holds_it_is_shift(self, width):
+        for high, low in ((112.5, 103.0), (104.0, 97.0), (109.0, 101.0)):
+            assert self._update(D.BREACH_CONDITIONAL, high, low, width) == self._update(
+                D.BREACH_SHIFT, high, low, width
+            )
+
+    def test_a_held_breach_is_extended_like_brownian(self):
+        held = self._update(D.BREACH_CONDITIONAL, 112.5, 107.0, extend=(True, False))
+        assert held == pytest.approx(self._update(D.BREACH_BROWNIAN, 112.5, 107.0))
+        held = self._update(D.BREACH_CONDITIONAL, 103.0, 99.0, extend=(False, True))
+        assert held == pytest.approx(self._update(D.BREACH_BROWNIAN, 103.0, 99.0))
+
+    def test_a_breach_confirmed_on_a_bar_with_no_new_extreme_is_extended_from_the_extreme(self):
+        """The range was moved to $112.50 when the breach printed it; the bar
+        that confirms the breach traded no higher, and is extended all the same."""
+        moved = {**self.FORECAST, "pred_high": 112.5, "pred_low": 102.5}
+        reach = D.brownian_reach(10.0, self.NOON)
+        high, low = self._update(
+            D.BREACH_CONDITIONAL, 112.5, 107.0, extend=(True, False), forecast=moved
+        )
+        assert high == pytest.approx(112.5 + reach)
+        assert high - low == pytest.approx(10.0)
+        # Without a width only the held side moves, as under "brownian".
+        high, low = self._update(
+            D.BREACH_CONDITIONAL, 112.5, 107.0, None, extend=(True, False), forecast=moved
+        )
+        assert (high, low) == pytest.approx((112.5 + reach, 102.5))
+
+    def test_it_never_pulls_a_side_back_in(self):
+        wide = {**self.FORECAST, "pred_high": 130.0, "pred_low": 120.0}
+        assert self._update(
+            D.BREACH_CONDITIONAL, 112.5, 107.0, extend=(True, False), forecast=wide
+        )[0] == 130.0
+
+    @pytest.mark.parametrize("policy", [D.BREACH_SHIFT, D.BREACH_BROWNIAN, D.BREACH_OFF])
+    def test_the_other_policies_ignore_extend(self, policy):
+        assert self._update(policy, 112.5, 107.0, extend=(True, True)) == self._update(
+            policy, 112.5, 107.0
+        )
+
+
 class TestMinutesLeft:
     @staticmethod
     def _et(stamp):

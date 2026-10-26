@@ -2028,8 +2028,12 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "a record signed `breach=extreme` moved only the breached side and replays "
             "that.\n"
             "- **Brownian extension** — past the extreme by ADR × √(session left) ÷ 2. "
-            "Wider than the extreme early in the day, converging on it by the close.\n\n"
-            "Both moving policies keep the range at the unit's width — the 9:35 predicted "
+            "Wider than the extreme early in the day, converging on it by the close.\n"
+            "- **Conditional Brownian extension** — the extreme so far on every breach, "
+            "and the Brownian reach on top only once the breach has held: 2 bars in a "
+            "row, each at least 0.05 ADR past the level it broke (both set below it). "
+            "Signs `breach=conditional,held=0.05A/2b`.\n\n"
+            "The moving policies keep the range at the unit's width — the 9:35 predicted "
             "range, or the ADR — and widen it only to hold what the session has printed "
             "(`keep_width` in the signature). A record without it replays as run: *shift* "
             "keeping the width it last had, *Brownian* moving the breached side only.\n\n"
@@ -2038,6 +2042,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the forecast fixed.\n\n"
             "The default is the extreme so far, on every instrument — unless the pair's "
             "base configuration says otherwise."
+        ),
+        "breach_hold_bars": (
+            "Under the conditional extension: how many bars in a row a breach has to "
+            "keep trading past the level it broke before it is extended. The breaching "
+            "bar counts. In the signature as the `/2b` of `held=`."
+        ),
+        "breach_hold_k": (
+            "Under the conditional extension: how far past the broken level each of "
+            "those bars has to trade, in ADRs. In the signature as the `0.05A` of "
+            "`held=`. Not swept."
         ),
         "contain_range": (
             "Whether the forecast is always widened to hold what the session has printed "
@@ -3768,6 +3782,8 @@ def _tuning_metric_text(metric: str, value) -> str:
 # since that is what they are called everywhere else in this app.
 _SHORT_FIELD_LABELS = {
     "breach_update": "breach",
+    "breach_hold_bars": "held bars",
+    "breach_hold_k": "held past",
     "level_unit": "unit",
     "contain_range": "contain",
     "breach_exit": "breach exit",
