@@ -1,4 +1,4 @@
-"""The Agent tab's log, which holds still while it is being read.
+"""The Portfolio tab's agent log, which holds still while it is being read.
 
 The log is newest-first in a scroll box, re-sent by a fragment every few
 seconds. Drawn with `st.html`, each new entry replaced the box and threw a

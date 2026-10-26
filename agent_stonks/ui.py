@@ -2333,7 +2333,7 @@ def _agent_log_html(log: list[dict]) -> str:
 
 
 def _current_tactics_html(state: AppState) -> str:
-    """The 'current tactics' card for the Agent tab: every armed conditional
+    """The 'current tactics' card for the Portfolio tab: every armed conditional
     action (across all symbols) with each plan's reasoning and arming time, or
     an explicit nothing-armed note while the agent runs (idle agent renders
     nothing)."""
@@ -4462,10 +4462,14 @@ def _agent_panel(
             f"{_venue_badge(state.trading_mode)} instead — {state.trading_status}"
         )
     _agent_identity_panel()
+    _agent_report_section(symbols)
 
+
+def _portfolio_panel(symbols: list[str]) -> None:
+    """The Portfolio tab: the run's value and its chart, then the ledger, the
+    armed tactics and the agent's log."""
     _agent_performance_panel(symbols)
     _agent_log_panel()
-    _agent_report_section(symbols)
 
 
 _BIAS_STYLE: dict[str, dict[str, str]] = {
@@ -5524,13 +5528,13 @@ def build_ui() -> None:
     symbols = _effective_symbols(state, symbols_input)
 
     (
-        tab_agent, tab_live, tab_news, tab_premarket, tab_candidates, tab_analysis,
-        tab_walls, tab_models, tab_notifications,
+        tab_agent, tab_portfolio, tab_live, tab_news, tab_premarket, tab_candidates,
+        tab_analysis, tab_walls, tab_models, tab_notifications,
     ) = st.tabs(
         [
-            "🤖 Agent", "📡 Live", "📰 News", "🌅 Pre-Market", "🎼 Candidates",
-            "🔬 Technical Analysis", "🧱 Put/Call Walls", "🧠 ML Models",
-            "🔔 Notifications",
+            "🤖 Agent", "💼 Portfolio", "📡 Live", "📰 News", "🌅 Pre-Market",
+            "🎼 Candidates", "🔬 Technical Analysis", "🧱 Put/Call Walls",
+            "🧠 ML Models", "🔔 Notifications",
         ]
     )
 
@@ -5653,6 +5657,11 @@ def build_ui() -> None:
             clicks=agent_clicks,
             feedback=agent_feedback,
         )
+
+    # After the Agent tab, which acts on this run's Start/Stop and picks the
+    # personality the Orchestra board is shown for.
+    with tab_portfolio, _panel_guard("The Portfolio tab"):
+        _portfolio_panel(symbols)
 
     # After the Agent tab: Orchestra's form there publishes the setup the
     # provisional pick is worked out from.

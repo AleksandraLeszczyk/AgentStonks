@@ -382,7 +382,7 @@ class AppState:
         self.orchestra_levels: dict = {}
         # The running (or last) race as a whole: its racers in order, which one
         # holds the position, and one board row per racer -- written by the
-        # coordinator every cycle, read by the Agent tab and the session file.
+        # coordinator every cycle, read by the Portfolio tab and the session file.
         self.orchestra: "dict | None" = None
         self.api_key: str = ""
         self.api_secret: str = ""
