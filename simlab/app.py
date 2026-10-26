@@ -4427,9 +4427,11 @@ def _tuning_hover_data(cell: "dict | None", metric: str = "per_session") -> list
         )
         if mean_of["of"] > mean_of["count"]:
             third += f" ({mean_of['of'] - mean_of['count']} refused or errored, left out)"
-    std = sim_tuning.session_std(cell)
-    value = _tuning_metric_text(metric, cell[metric]) + (
-        f" · std {std:,.0f}" if std is not None else ""
+    std, sharpe = sim_tuning.session_std(cell), sim_tuning.sharpe(cell)
+    value = (
+        _tuning_metric_text(metric, cell[metric])
+        + (f" · std {std:,.0f}" if std is not None else "")
+        + (f" · Sharpe {sharpe:+.2f}" if sharpe is not None else "")
     )
     total = f"Total {cell['profit']:+,.0f} · return {cell['return_pct']:+.2f}%"
     return [value, f"{total}<br>{note}", third]
@@ -4626,6 +4628,7 @@ def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
             scored = sim_tuning.is_scored(cell)
             out[f"{prefix}_profit"] = cell["profit"] if scored else None
             out[f"{prefix}_return"] = cell["return_pct"] if scored else None
+            out[f"{prefix}_sharpe"] = sim_tuning.sharpe(cell) if scored else None
         scored = sim_tuning.is_scored(shown)
         out["shown_days"] = (
             f"{shown['days_up']} up · {shown['days_traded']} traded / {shown['days']}"
@@ -4645,10 +4648,14 @@ def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
         for d in datasets
     ]
     if len(datasets) > 1:
+        # The pick summed afresh rather than as the record stored it: a pick
+        # stored before sums kept their sessions has no spread to read.
+        best = job.get("best")
+        overrides = chosen if chosen is not None else (best or {}).get("overrides")
         rows.append(row(
             f"Sum of {len(datasets)}", sum(len(d["days"]) for d in datasets),
             sim_tuning.summed_baseline(job),
-            job.get("best") if chosen is None else sim_tuning.summed_cell(job, chosen),
+            sim_tuning.summed_cell(job, overrides) if overrides is not None else None,
         ))
     return rows
 
@@ -4662,19 +4669,39 @@ _TUNING_CHANGED_TINT = {
 }
 
 
+def _tuning_default_origin(model_key: str, ticker: str) -> str:
+    """Where a pair's current default comes from (`apple_trader.default_config`),
+    in words: its base configuration and when it was set, or the shipped
+    defaults."""
+    current = base_configs.entry(model_key, ticker)
+    if current is None:
+        return "the shipped defaults"
+    source = current.get("source") or {}
+    origin = f" from job `{source['job_id']}`" if source.get("job_id") else ""
+    return f"its base configuration, set {str(current.get('set_at', ''))[:10]}{origin}"
+
+
 def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None") -> None:
-    """The base configuration and the shown one -- the pick, or the square
-    clicked -- side by side in words, setting by setting
-    (`tuning.compare_settings`), what the shown one changes tinted; then both
-    signatures, the form Results and the Simulate tab name runs by."""
+    """The pair's current default -- what a new run of it starts from now
+    (`apple_trader.default_config`): its base configuration, else the shipped
+    defaults -- and the shown one, the pick or the square clicked, side by side
+    in words, setting by setting (`tuning.compare_settings`), what the shown
+    one changes tinted; then both signatures, the form Results and the
+    Simulate tab name runs by.
+
+    The current default rather than the job's own base: it is what "Set as
+    base configuration" below would replace, and a job swept before the
+    pair's base last moved started from something else."""
     spec = job["spec"]
     try:
-        base = sim_tuning.make_config(spec["base"], {})
+        own_base = sim_tuning.make_config(spec["base"], {})
         other = sim_tuning.make_config(spec["base"], shown)
     except (TypeError, ValueError):
         return
+    model_key, ticker = other.model_key, other.ticker
+    default = default_config(ticker, model_key)
     who = "Pick" if chosen is None else "Selected"
-    rows = sim_tuning.compare_settings(base, other)
+    rows = sim_tuning.compare_settings(default, other)
     # The section once per group, as the form heads it, not on every row.
     for row, before in zip(rows, [None, *rows]):
         row["group"] = row["section"] if before is None or before["section"] != row["section"] else ""
@@ -4682,10 +4709,10 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
     frame = pd.DataFrame({
         "": [r["group"] for r in rows],
         "Setting": [r["setting"] for r in rows],
-        "Base": [r["base"] if r["base"] is not None else "—" for r in rows],
+        "Current default": [r["base"] if r["base"] is not None else "—" for r in rows],
         who: [r["other"] if r["other"] is not None else "—" for r in rows],
     })
-    st.markdown(f"**Configuration: base vs {who.lower()}**")
+    st.markdown(f"**Configuration: current default vs {who.lower()}**")
     # A static table rather than a dataframe: it wraps a long value instead of
     # cutting it off, and a comparison is read whole, never sorted or scrolled.
     st.table(
@@ -4695,11 +4722,19 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
         hide_index=True,
     )
     changed = [r["setting"].lower() for r in rows if r["changed"]]
+    drift = sum(1 for r in sim_tuning.compare_settings(default, own_base) if r["changed"])
     st.caption(
-        (
+        f"The current default is {_tuning_default_origin(model_key, ticker)}. "
+        + (
             f"The {who.lower()} changes {len(changed)} setting"
-            f"{'' if len(changed) == 1 else 's'} of the base, tinted: {', '.join(changed)}."
-            if changed else f"The {who.lower()} is the base configuration."
+            f"{'' if len(changed) == 1 else 's'} of it, tinted: {', '.join(changed)}."
+            if changed else f"The {who.lower()} is the current default."
+        )
+        + (
+            f" This job started from another configuration: its base differs from the "
+            f"current default in {drift} setting{'' if drift == 1 else 's'}, so the profits "
+            "above compare the pick with that base, not with the current default."
+            if drift else ""
         )
         + f" Set these in an Apple Trader setup on the Simulate tab to replay "
         f"{'the pick' if chosen is None else 'it'} with its full ledger, charts and decisions."
@@ -4707,8 +4742,8 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
     signature = rule_agent(APPLE_TRADER_KEY).signature
     col_base, col_other = st.columns(2)
     with col_base:
-        st.caption("Base as a signature")
-        st.code(signature(base), language=None, wrap_lines=True)
+        st.caption("Current default as a signature")
+        st.code(signature(default), language=None, wrap_lines=True)
     with col_other:
         st.caption(f"{who} as a signature")
         st.code(signature(other), language=None, wrap_lines=True)
@@ -4756,12 +4791,7 @@ def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> No
             help=f"Drop {pair}'s base configuration: new runs of it start from the "
             "defaults the code ships again.",
         )
-    if current is not None:
-        source = current.get("source") or {}
-        origin = f" from job `{source['job_id']}`" if source.get("job_id") else ""
-        starts = f"its base configuration, set {str(current.get('set_at', ''))[:10]}{origin}"
-    else:
-        starts = "the shipped defaults"
+    starts = _tuning_default_origin(model_key, ticker)
     if is_base:
         st.caption(
             f":material/check_circle: {what.capitalize()} is {pair}'s base configuration "
@@ -4868,6 +4898,11 @@ _TUNING_WIN_RATE_HELP = (
     "buy that opens a flat book to the sell that flattens it, however many rungs and "
     "partial takes it had. Blank for a cell replayed before round trips were counted."
 )
+_TUNING_SHARPE_HELP = (
+    f"Annualized Sharpe ratio: profit a session ÷ its std × √{sim_tuning.TRADING_DAYS}, every "
+    "session counted, traded or not, the risk-free rate taken as zero. On one week's five "
+    "sessions it is a rough read; the sum's is over every session of every dataset."
+)
 
 
 def _tuning_cell_rows(job: dict) -> list[dict]:
@@ -4886,7 +4921,8 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
             _tuning_param_label(name): value for name, value in cell["overrides"].items()
         }
         row.update(
-            profit=cell["profit"], return_pct=cell["return_pct"], trades=cell["trades"],
+            profit=cell["profit"], return_pct=cell["return_pct"],
+            sharpe=sim_tuning.sharpe(cell), trades=cell["trades"],
             win_rate=sim_tuning.win_rate(cell),
             days_up=cell["days_up"], days_traded=cell["days_traded"],
             worst_day=cell["worst_day"],
@@ -5493,13 +5529,16 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             )
     money = st.column_config.NumberColumn
     st.dataframe(
-        pd.DataFrame(_tuning_summary_rows(job, chosen)), hide_index=True, column_config={
+        pd.DataFrame(_tuning_summary_rows(job, chosen)), hide_index=True, placeholder="—",
+        column_config={
             "dataset": "Dataset",
             "sessions": "Sessions",
             "base_profit": money("Base profit ($)", format="%+.2f"),
             "base_return": money("Base return", format="%+.2f%%"),
+            "base_sharpe": money("Base Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
             "shown_profit": money(f"{who} profit ($)", format="%+.2f"),
             "shown_return": money(f"{who} return", format="%+.2f%%"),
+            "shown_sharpe": money(f"{who} Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
             "shown_days": f"{who} days",
             "shown_win_rate": money(
                 f"{who} win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP
@@ -5578,6 +5617,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={
                 "profit": money("Total profit ($)", format="%+.2f"),
                 "return_pct": money("Total return", format="%+.2f%%"),
+                "sharpe": money("Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
                 "trades": "Trades",
                 "win_rate": money("Win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP),
                 "days_up": "Days up",
@@ -5644,6 +5684,16 @@ def _ml_pair(model_key: str, ticker: str) -> str:
 
 def _ml_day(day: str) -> str:
     return date.fromisoformat(day).strftime("%a %d %b")
+
+
+def _ml_sharpe_column(whose: str):
+    """A table's Sharpe ratio column; `whose` opens its help ("The pair's ")."""
+    return st.column_config.NumberColumn(
+        "Sharpe", format="%+.2f",
+        help=f"{whose}annualized Sharpe ratio over the window: profit a session ÷ its std × "
+        f"√{sim_tuning.TRADING_DAYS}, every session counted, the risk-free rate taken as zero. "
+        "On a few weeks of sessions it is a rough read.",
+    )
 
 
 def _ml_usd(value: float) -> str:
@@ -5782,6 +5832,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "model": _apple_model_label(m["model_key"]),
             "per_session": m["per_session"],
             "session_std": m["session_std"],
+            "sharpe": m["sharpe"],
             "in_profit": f"{m['in_profit']} of {m['instruments']}",
             "best": m["best"],
             "worst": m["worst"],
@@ -5799,6 +5850,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             help="The mean over its instruments of each one's standard deviation of profit "
             "from session to session over the window.",
         ),
+        "sharpe": _ml_sharpe_column("The mean over its instruments of each one's "),
         "in_profit": "Instruments in profit",
         "best": "Best instrument",
         "worst": "Worst instrument",
@@ -5835,6 +5887,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "per_session": r["per_session"],
             "return_pct": r["return_pct"],
             "session_std": r["session_std"],
+            "sharpe": r["sharpe"],
             "sessions": r["sessions"],
             "days": f"{r['days_up']} up · {r['days_down']} down",
             "best_day": r["best_day"],
@@ -5859,6 +5912,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             help="The standard deviation of the profit from session to session over the "
             "window, every session counted, traded or not.",
         ),
+        "sharpe": _ml_sharpe_column("The pair's "),
         "sessions": "Sessions",
         "days": "Days",
         "best_day": money("Best day ($)", format="%+.2f"),
@@ -5934,6 +5988,7 @@ def _render_ml_best(best: "list[dict]", window: str) -> None:
             "model": _ml_model(b["model_key"]),
             "per_session": b["per_session"],
             "session_std": b["session_std"],
+            "sharpe": b["sharpe"],
             "days": f"{b['days_up']} up · {b['days_down']} down of {b['sessions']}",
             "runner_up": _ml_model(b["runner_up"]) if b["runner_up"] else None,
             "runner_up_per_session": b["runner_up_per_session"],
@@ -5950,6 +6005,7 @@ def _render_ml_best(best: "list[dict]", window: str) -> None:
             help="The standard deviation of the best model's profit from session to "
             "session over the window.",
         ),
+        "sharpe": _ml_sharpe_column("The best model's "),
         "days": "Days",
         "runner_up": "Runner-up",
         "runner_up_per_session": money("Runner-up a session ($)", format="%+.2f"),

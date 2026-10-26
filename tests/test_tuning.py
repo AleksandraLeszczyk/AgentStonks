@@ -595,6 +595,13 @@ class TestSessionStats:
         assert stats["per_session"] == pytest.approx(100.0)
         assert stats["session_std"] == pytest.approx(150.0)
 
+    def test_the_sharpe_ratio_is_the_annualized_profit_over_its_spread(self):
+        cell = with_daily(scored({"buy_k": 0.3}, 300.0), 100.0, -50.0, 250.0)
+        assert tu.sharpe(cell) == pytest.approx(100.0 / 150.0 * 252 ** 0.5)
+        assert tu.sharpe(with_daily(scored({}, 0.0), 0.0, 0.0)) is None  # never moved
+        assert tu.sharpe(scored({}, 10.0)) is None  # kept no sessions
+        assert tu.sharpe_ratio(None, 5.0) is None
+
     def test_no_spread_without_two_sessions_kept(self):
         assert tu.session_std(with_daily(scored({}, 10.0), 10.0)) is None
         assert tu.session_std(scored({}, 10.0)) is None  # kept no `daily`
@@ -934,7 +941,7 @@ class TestHeatmapLabels:
         [heatmap] = [t for t in fig.data if t.type == "heatmap"]
         assert heatmap.z[0][0] == pytest.approx(100.0) and heatmap.z[1][0] == pytest.approx(-8.0)
         assert heatmap.text[0][0] == "+100<br>±150" and heatmap.text[1][0] == "-8"
-        assert heatmap.customdata[0][0][0] == "+100 · std 150"
+        assert heatmap.customdata[0][0][0] == "+100 · std 150 · Sharpe +10.58"
         assert heatmap.customdata[0][0][1].startswith("Total +300 · return +3.00%")
         assert heatmap.colorbar.title.text == "Profit a session"
 
@@ -1041,6 +1048,63 @@ class TestSetBase:
         app = self.app(self.record(status=tu.RUNNING))
         assert app.button(key="tune_set_base_j").disabled is True
         assert "still running" in app.caption[0].value
+
+
+def _config_compare_app(record: dict, chosen) -> None:
+    from simlab import app as sim_app
+
+    shown = chosen if chosen is not None else record["best"]["overrides"]
+    sim_app._render_tuning_config_compare(record, shown, chosen)
+
+
+class TestConfigCompare:
+    """The configuration table on a job's results sets the shown one against
+    the pair's current default -- what a new run starts from now -- not the
+    job's own base."""
+
+    def app(self, record, chosen=None):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_config_compare_app, args=(record, chosen), default_timeout=30)
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    @staticmethod
+    def column(app, name: str) -> dict:
+        frame = app.table[0].value
+        return dict(zip(frame["Setting"], frame[name]))
+
+    def test_the_shipped_defaults_when_no_base_is_set(self):
+        from agent_stonks.apple_trader import default_config
+
+        record = TestSetBase().record()
+        app = self.app(record, chosen={"buy_k": 0.5})
+        assert "current default vs selected" in app.markdown[0].value
+        default = default_config(TICKER, record["spec"]["base"]["model_key"])
+        signatures = [c.value for c in app.code]
+        assert signatures[0] == rule_agent_signature(default)
+        assert "the shipped defaults" in app.caption[0].value
+
+    def test_a_base_set_since_the_job_is_what_it_is_set_against(self):
+        from agent_stonks import base_configs
+
+        record = TestSetBase().record()
+        base = tu.make_config(record["spec"]["base"], {"buy_k": 0.5})
+        base_configs.set_base(asdict(base), source={"job_id": "other"})
+        app = self.app(record, chosen={"buy_k": 0.5})
+        assert "is the current default" in app.caption[0].value
+        assert "from job `other`" in app.caption[0].value
+        # The job's own base (buy 0.3 -> its record's) is not the default.
+        assert "This job started from another configuration" in app.caption[0].value
+        left, right = self.column(app, "Current default"), self.column(app, "Selected")
+        assert left == right
+
+
+def rule_agent_signature(config) -> str:
+    from simlab.rule_agents import rule_agent
+
+    return rule_agent(APPLE_TRADER_KEY).signature(config)
 
 
 class TestPredictedRange:

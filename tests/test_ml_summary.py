@@ -190,6 +190,7 @@ class TestWindows:
         assert (week["days_up"], week["days_down"]) == (2, 1)
         assert week["return_pct"] == pytest.approx(0.0667)
         assert week["session_std"] == pytest.approx(251.66, abs=0.005)  # 300, 100, -200
+        assert week["sharpe"] == pytest.approx(200.0 / 3 / 251.661 * 252 ** 0.5, abs=0.005)
         whole = ms.pair_metrics(series, ms.window([series], ms.ALL))
         assert whole["sessions"] == 6 and whole["worst_day"] == -200.0
 
@@ -198,23 +199,23 @@ class TestWindows:
         instrument, the spread over the instruments that have one."""
         rows = [
             {"model_key": "highlow", "ticker": "AMD", "per_session": 100.0, "profit": 500.0,
-             "session_std": 300.0},
+             "session_std": 300.0, "sharpe": 5.0},
             {"model_key": "highlow", "ticker": "MU", "per_session": -20.0, "profit": -100.0,
-             "session_std": 100.0},
+             "session_std": 100.0, "sharpe": -3.0},
             {"model_key": "goodmoments", "ticker": "AAPL", "per_session": 50.0, "profit": 250.0,
-             "session_std": None},
+             "session_std": None, "sharpe": None},
         ]
         best, second = ms.model_metrics(rows)
         assert (best["model_key"], best["per_session"], best["profit"]) == ("goodmoments", 50.0, 250.0)
-        assert best["session_std"] is None
+        assert best["session_std"] is None and best["sharpe"] is None
         assert (second["per_session"], second["profit"], second["in_profit"]) == (40.0, 200.0, 1)
-        assert second["session_std"] == 200.0
+        assert (second["session_std"], second["sharpe"]) == (200.0, 1.0)
         assert (second["best"], second["worst"]) == ("AMD", "MU")
 
     def test_each_instrument_names_its_best_model_and_the_runner_up(self):
         def row(model, ticker, per_session):
             return {"model_key": model, "ticker": ticker, "per_session": per_session,
-                    "session_std": abs(per_session) * 2,
+                    "session_std": abs(per_session) * 2, "sharpe": per_session / 10,
                     "profit": per_session * 5, "sessions": 5, "days_up": 3, "days_down": 2}
 
         found = ms.best_per_instrument([
@@ -226,7 +227,7 @@ class TestWindows:
         ]
         aapl = found[1]
         assert (aapl["runner_up"], aapl["lead"], aapl["models"]) == ("highlow", 50.0, 3)
-        assert aapl["session_std"] == 180.0  # GoodMoments', the best model's
+        assert (aapl["session_std"], aapl["sharpe"]) == (180.0, 9.0)  # GoodMoments', the best's
         assert found[0]["runner_up"] is None and found[0]["lead"] is None
 
     def test_weeks_start_on_monday(self):
@@ -252,7 +253,7 @@ class TestSetOrchestra:
     @staticmethod
     def best(ticker: str, model: str) -> dict:
         return {"ticker": ticker, "model_key": model, "per_session": 10.0,
-                "session_std": 40.0, "profit": 50.0,
+                "session_std": 40.0, "sharpe": 3.97, "profit": 50.0,
                 "sessions": 5, "days_up": 3, "days_down": 2, "models": 1,
                 "runner_up": None, "runner_up_per_session": None, "lead": None}
 

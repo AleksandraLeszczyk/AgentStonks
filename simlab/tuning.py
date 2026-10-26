@@ -1614,6 +1614,28 @@ def session_std(cell: "dict | None") -> "float | None":
     return statistics.stdev(profits) if profits and len(profits) > 1 else None
 
 
+# Sessions in a trading year, what a session's Sharpe ratio is scaled up by.
+TRADING_DAYS = 252
+
+
+def sharpe_ratio(per_session: "float | None", std: "float | None") -> "float | None":
+    """The annualized Sharpe ratio of a profit a session and its standard
+    deviation: their ratio × √`TRADING_DAYS`, the risk-free rate taken as zero
+    -- every configuration ends the day flat in cash. Dollars rather than
+    returns: an account starts each dataset on the same cash and moves little
+    against it within one, so the two read alike. None without a spread to
+    divide by."""
+    if per_session is None or not std:
+        return None
+    return per_session / std * math.sqrt(TRADING_DAYS)
+
+
+def sharpe(cell: "dict | None") -> "float | None":
+    """A scored cell's annualized Sharpe ratio (`sharpe_ratio`) over its
+    sessions, every one counted, traded or not."""
+    return sharpe_ratio(daily_profit(cell), session_std(cell))
+
+
 def with_session_stats(cells: "list[dict]") -> "list[dict]":
     """`cells` with each scored one's profit a session (`per_session`,
     `daily_profit`) and its spread (`session_std`) set: what the heatmaps are

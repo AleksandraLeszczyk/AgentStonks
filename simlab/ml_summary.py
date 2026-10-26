@@ -310,6 +310,8 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
     profits = [s.daily[d] for d in days]
     total = sum(profits)
     per_session = total / len(days)
+    std = statistics.stdev(profits) if len(profits) > 1 else None
+    sharpe = tuning.sharpe_ratio(per_session, std)
     flat = tuning._FLAT_DAY_USD
     return {
         "model_key": s.model_key, "ticker": s.ticker, "job_ids": s.job_ids,
@@ -318,8 +320,10 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
         "profit": round(total, 2),
         "per_session": round(per_session, 2),
         # How much the profit moved from session to session: the sample
-        # standard deviation, as the Tuning tab's squares show it.
-        "session_std": round(statistics.stdev(profits), 2) if len(profits) > 1 else None,
+        # standard deviation, as the Tuning tab's squares show it; and the
+        # annualized Sharpe ratio of the two (`tuning.sharpe_ratio`).
+        "session_std": round(std, 2) if std is not None else None,
+        "sharpe": round(sharpe, 2) if sharpe is not None else None,
         "return_pct": round(100.0 * per_session / s.starting_cash, 4) if s.starting_cash else None,
         "days_up": sum(1 for p in profits if p > flat),
         "days_down": sum(1 for p in profits if p < -flat),
@@ -333,21 +337,26 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
 def model_metrics(rows: "list[dict]") -> "list[dict]":
     """`pair_metrics` rows by model: the mean over its instruments -- each its
     own account, so weighted alike -- of the profit a session, of its session
-    spread (`session_std`, over the instruments that have one) and of the
-    window's profit, how many made money, and the best and worst of them. Best
-    model first."""
+    spread (`session_std`) and Sharpe ratio (`sharpe`), each over the
+    instruments that have one, and of the window's profit, how many made money,
+    and the best and worst of them. Best model first."""
     by_model: "dict[str, list[dict]]" = {}
     for row in rows:
         by_model.setdefault(row["model_key"], []).append(row)
+
+    def mean_of(group: "list[dict]", name: str) -> "float | None":
+        found = [r[name] for r in group if r.get(name) is not None]
+        return round(statistics.fmean(found), 2) if found else None
+
     out = []
     for model_key, group in by_model.items():
         ranked = sorted(group, key=lambda r: r["per_session"], reverse=True)
-        stds = [r["session_std"] for r in group if r.get("session_std") is not None]
         out.append({
             "model_key": model_key,
             "instruments": len(group),
             "per_session": round(statistics.fmean(r["per_session"] for r in group), 2),
-            "session_std": round(statistics.fmean(stds), 2) if stds else None,
+            "session_std": mean_of(group, "session_std"),
+            "sharpe": mean_of(group, "sharpe"),
             "profit": round(statistics.fmean(r["profit"] for r in group), 2),
             "in_profit": sum(1 for r in group if r["profit"] > tuning._FLAT_DAY_USD),
             "best": ranked[0]["ticker"],
@@ -358,7 +367,8 @@ def model_metrics(rows: "list[dict]") -> "list[dict]":
 
 def best_per_instrument(rows: "list[dict]") -> "list[dict]":
     """`pair_metrics` rows by instrument: the model whose base made the most a
-    session over the window (and its session spread), the runner-up and by how
+    session over the window (and its session spread and Sharpe ratio), the
+    runner-up and by how
     much the winner leads it,
     and how many models the instrument was compared on. A session rate rather
     than the window's profit, since two models of one instrument may have been
@@ -375,6 +385,7 @@ def best_per_instrument(rows: "list[dict]") -> "list[dict]":
             "model_key": best["model_key"],
             "per_session": best["per_session"],
             "session_std": best.get("session_std"),
+            "sharpe": best.get("sharpe"),
             "profit": best["profit"],
             "sessions": best["sessions"],
             "days_up": best["days_up"],
