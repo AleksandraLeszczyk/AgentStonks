@@ -897,3 +897,51 @@ def test_the_sidebar_agent_line_names_the_venue_and_what_the_agent_does():
     assert _agent_status_text(state) == (
         "🟢 running · 📝 Alpaca paper — watching AAPL · 🟢 Agent holding AAPL"
     )
+
+
+def _chart_redraw_app():
+    """A chart fragment and a form fragment, as on the live page: the form's
+    edit asks for the chart to be drawn again (`_redraw_live_chart`)."""
+    import streamlit as st
+
+    from agent_stonks import ui
+
+    st.session_state.setdefault("chart_runs", 0)
+
+    @st.fragment
+    def chart():
+        ui._remember_chart_fragment()
+        st.session_state.chart_runs += 1
+
+    @st.fragment
+    def form():
+        if st.button("edit", key="edit"):
+            ui._redraw_live_chart()
+
+    chart()
+    form()
+
+
+def test_an_edit_in_a_rules_form_draws_the_live_chart_again():
+    """Queued behind the run that published the edit, not a poll later: the
+    chart fragment runs once more after it."""
+    from streamlit.testing.v1 import AppTest
+
+    app = AppTest.from_function(_chart_redraw_app).run()
+    assert not app.exception
+    assert app.session_state["chart_runs"] == 1
+    app.run()
+    assert app.session_state["chart_runs"] == 2
+    app.button(key="edit").click().run()
+    assert not app.exception
+    # The click's own run, then the chart alone.
+    assert app.session_state["chart_runs"] == 4
+
+
+def test_no_chart_drawn_yet_means_nothing_to_redraw(monkeypatch):
+    import streamlit as st
+
+    from agent_stonks import ui
+
+    monkeypatch.setattr(st, "session_state", {})
+    ui._redraw_live_chart()  # no fragment id kept: a no-op, outside a run too

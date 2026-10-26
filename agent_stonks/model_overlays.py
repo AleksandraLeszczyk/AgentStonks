@@ -107,7 +107,7 @@ never an exception and never a fabricated line.
 from __future__ import annotations
 
 import importlib
-from dataclasses import astuple, dataclass
+from dataclasses import astuple, dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -674,6 +674,11 @@ def compute(
         return {"forecast": None, "made_at": None, "problem": _not_a_range_model(model_key)}
 
     recorded = _recorded_levels(trader_history, symbol, day)
+    # What the bars after that record are drawn under: the form's settings
+    # where the run, or a ▶ Start, would take them (`_carried_config`).
+    carried = None if recorded is None else _carried_config(
+        recorded[1], trader_config, symbol, trader_running
+    )
 
     def range_items(key: str, forecast) -> "tuple[list[dict], str]":
         # Only the minutes the run spent on this overlay's model: a run switched
@@ -686,7 +691,10 @@ def compute(
             and row.get("pred_high") is not None
         ]
         if own and OVERLAYS[key].draws(recorded[1].model_key):
-            walked = own + _after_record(own, trader_history, session, recorded[1])
+            # Carried on under the levels' configuration while it is on this
+            # overlay's model: the levels hang off this range.
+            config = carried if carried.model_key == recorded[1].model_key else recorded[1]
+            walked = own + _after_record(own, trader_history, session, config, ran=recorded[1])
             return _day_range_items(_recorded_result(own), day, symbol, key=key, walked=walked)
         return _day_range_items(
             forecast(), day, symbol, session, None, trader_config, key=key,
@@ -715,16 +723,28 @@ def compute(
             )
         if recorded is not None:
             rows, config = recorded
-            # A stopped run: the bars since, as it would have carried on.
-            after = (
-                _after_record(rows, trader_history, session, config)
-                if trader_running is False
-                and getattr(config, "strategy", None) == apple_models.STRATEGY_DAYRANGE
-                else []
-            )
+            dayrange = getattr(config, "strategy", None) == apple_models.STRATEGY_DAYRANGE
+            after, pending = [], []
+            if trader_running is False and dayrange:
+                # A stopped run: the bars since, as ▶ Start would carry it on
+                # under the settings on screen.
+                after = _after_record(
+                    rows, trader_history, session, carried, ran=config,
+                    forecast=trader_forecast,
+                )
+            elif trader_running and dayrange and carried is not config:
+                # A running one the form has new distances for: it rests them
+                # from its next bar, the one forming now, so they are drawn
+                # from there rather than a minute after the edit. The open
+                # position keeps the stop it was filled with.
+                pending = [
+                    {**row, "stop": rows[-1].get("stop")}
+                    for row in _after_record(rows, trader_history, session, carried, ran=config)
+                ]
+                config = carried
             return _trader_levels_items(
                 symbol, session, day, open_price, _recorded_result(rows), config,
-                levels=rows, after=after,
+                levels=rows + pending, after=after, after_config=carried,
             )
         sat_out = _sat_out(symbol, day, trader_config)
         if sat_out:
@@ -1070,34 +1090,79 @@ def _recorded_levels(
     return rows, history["config"]
 
 
-def _after_record(rows: "list[dict]", history: dict, session: pd.DataFrame, config) -> "list[dict]":
+def _after_record(
+    rows: "list[dict]", history: dict, session: pd.DataFrame, config, ran=None, forecast=None,
+) -> "list[dict]":
     """The forecast carried on past the last bar a run recorded, or [].
 
     A run that has been stopped leaves a record ending at the minute it stopped,
     and the prediction is about the whole session so far. So the bars after it
-    are walked (`session_levels`) from the forecast the run itself started
-    from -- its `seed`, not a fresh model call -- under its configuration,
-    picking the range up where the run's last row left it, as a restart of the
-    run would. [] when the record predates the seed, or nothing has closed
-    after it.
+    are walked (`session_levels`) under `config` as a restart on it would carry
+    the run on (`DayRangeTrader._plan_session`): from the forecast the run
+    itself started from -- its `seed`, not a fresh model call -- when `config`
+    is on the same model, picking the range up where the run's last row left
+    it when the range rules (`RANGE_RULES`) are the ones the run had (`ran`,
+    its configuration; None is `config` itself) and walking it again from the
+    forecast when they are not; and from `forecast()` -- that model's own,
+    `_highlow_forecast`'s shape -- when `config` is another model's. [] when
+    there is nothing to start from, or nothing has closed after the record.
     """
-    seed = (history or {}).get("seed")
-    if not seed or not rows or not len(session):
+    if not rows or not len(session):
         return []
     last = pd.Timestamp(rows[-1]["t"])
     if session.index[-1] <= last:
         return []
-    from .apple_trader import session_levels  # heavy-ish, and only here
+    from .apple_trader import RANGE_RULES, session_levels  # heavy-ish, and only here
 
-    opening_end = pd.Timestamp(seed["opening_end"])
-    if opening_end.tzinfo is None:
-        opening_end = opening_end.tz_localize(market_hours.MARKET_TZ)
-    walk = session_levels(
-        config, dict(seed["forecast"]), session,
-        opening_end.tz_convert(session.index.tz), open_price=seed.get("open_price"),
-        resume={**history, "rows": rows},
-    )
+    ran = config if ran is None else ran
+    seed = (history or {}).get("seed")
+    # The model the seed was made with: named since 2026-10-22, the last row's
+    # before that, and the run's own before rows named one.
+    made_by = seed and (seed.get("model_key") or rows[-1].get("model_key") or ran.model_key)
+    if seed and made_by == config.model_key:
+        start, open_price = dict(seed["forecast"]), seed.get("open_price")
+        made_at = pd.Timestamp(seed["opening_end"])
+        if made_at.tzinfo is None:
+            made_at = made_at.tz_localize(market_hours.MARKET_TZ)
+        made_at = made_at.tz_convert(session.index.tz)
+        same_range = all(getattr(ran, name, None) == getattr(config, name, None) for name in RANGE_RULES)
+        resume = {**history, "rows": rows} if same_range else None
+    elif config is not ran and forecast is not None:
+        result = forecast()
+        if result.get("forecast") is None:
+            return []
+        start, made_at, open_price, resume = dict(result["forecast"]), result["made_at"], None, None
+    else:
+        return []
+    walk = session_levels(config, start, session, made_at, open_price=open_price, resume=resume)
     return [row for row in walk if pd.Timestamp(row["t"]) > last]
+
+
+def _carried_config(ran, form, symbol: str, running: "bool | None"):
+    """The configuration the bars after a live run's record are drawn under
+    (`_after_record`), so the chart moves the moment the form does.
+
+    Stopped (`running` False): the form's, when it is for this symbol and on
+    the day-range rules -- what ▶ Start would run now -- else the run's own.
+    Running: the run's own, with the form's buy and sell distances when the run
+    takes them at its next bar -- the same symbol, model and unit
+    (`DayRangeTrader._adopt_form_levels`); every other setting waits for ▶
+    Start. SimLab (None) has no form: the run's own.
+    """
+    if form is None or running is None or (form.ticker or "").upper() != symbol:
+        return ran
+    if not running:
+        dayrange = getattr(form, "strategy", None) == apple_models.STRATEGY_DAYRANGE
+        return form if dayrange else ran
+    if form.model_key != ran.model_key or form.level_unit != ran.level_unit:
+        return ran
+    distances = (float(form.buy_k), float(form.sell_k))
+    if distances == (float(ran.buy_k), float(ran.sell_k)):
+        return ran
+    try:
+        return replace(ran, buy_k=distances[0], sell_k=distances[1])
+    except ValueError:  # the run refuses a crossed pair too
+        return ran
 
 
 def _recorded_result(rows: "list[dict]") -> dict:
@@ -1244,6 +1309,7 @@ def _trader_levels_items(
     levels: "list[dict] | None" = None,
     after: "list[dict] | None" = None,
     idle: bool = False,
+    after_config=None,
 ) -> "tuple[list[dict], str]":
     """The buy, the sell and the stop, as the configured agent would rest them.
 
@@ -1259,8 +1325,8 @@ def _trader_levels_items(
 
     Gray for the minutes no running agent rested them (`compute`'s
     `trader_running`): the whole walk when `idle`, and `after`, a stopped
-    run's record carried on to the newest bar (`_after_record`), from where
-    the record ends.
+    run's record carried on to the newest bar (`_after_record`) under
+    `after_config` (None: `config`), from where the record ends.
     """
     from .apple_trader import (  # heavy-ish, and only here
         default_config, session_levels, stop_phrase,
@@ -1286,11 +1352,7 @@ def _trader_levels_items(
             "forecast yet, so there is nothing resting."
         )
 
-    how = (
-        f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
-        + "the predicted high"
-        + (f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else "")
-    )
+    how = _resting_how(config)
     # Only while a position is open: the stop hangs under the actual fill, so
     # before a buy there is none, and a walk (which fills nothing) never has one.
     stops = [row.get("stop") for row in levels]
@@ -1307,10 +1369,19 @@ def _trader_levels_items(
     stopped = levels[-1]["t"]
     return (
         _resting_items(levels, how, made_at, stopped, until="when it stopped")
-        + _resting_items([levels[-1], *after], how, stopped, close, idle=True,
-                         since="when it stopped")
+        + _resting_items([levels[-1], *after], _resting_how(after_config or config), stopped,
+                         close, idle=True, since="when it stopped")
         + stop_path,
         "",
+    )
+
+
+def _resting_how(config) -> str:
+    """Where a configuration rests its buy and sell, in a note's words."""
+    return (
+        f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
+        + "the predicted high"
+        + (f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else "")
     )
 
 
@@ -1934,10 +2005,10 @@ def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
     a symbol when it has two, so the chart of a symbol has to pick: the racer
     holding the position when it trades this symbol (under a split, the first
     pair on it with a position), otherwise the first racer on it in the race's
-    order. Its own record when it has one, otherwise the
-    form's configuration for it, walked like any configuration without a record.
-    A symbol the race does not trade gets neither, and draws the instrument's
-    shipped configuration.
+    order. The form's configuration for it (its record's when the form has
+    none), and its own record when it has one -- without one, the
+    configuration is walked like any other. A symbol the race does not trade
+    gets neither, and draws the instrument's shipped configuration.
     """
     if app is None:
         return None, None
@@ -1962,5 +2033,7 @@ def live_trader_view(app, symbol: str) -> "tuple[object, dict | None]":
     key = next((k for k in on_symbol if k in holders), on_symbol[0])
     record = records.get(key)
     if record:
-        return record.get("config") or configs.get(key), record
+        # The form's first, as for a single run: the record carries its own,
+        # and the chart draws the form's where the racer would take it.
+        return configs.get(key) or record.get("config"), record
     return configs.get(key), None

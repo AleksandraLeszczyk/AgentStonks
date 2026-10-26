@@ -829,6 +829,109 @@ class TestRecordedTraderLevels:
         levels = {i["label"]: i["value"] for i in items if i["kind"] == "level"}
         assert levels == {"Buy level": 207.0, "Sell level": 209.0}
 
+    def idle_and_ran(self, items):
+        from agent_stonks.config import MODEL_OVERLAY_COLORS
+
+        def of(color):
+            return [i for i in items if i["color"] == MODEL_OVERLAY_COLORS[color]]
+        return of("trader_idle"), of("trader_levels")
+
+    def test_a_stopped_runs_levels_carry_on_under_the_settings_on_screen(self, monkeypatch):
+        """Edited after the run stopped: from its last row the gray levels are
+        where ▶ Start would rest them now, and the orange ones are still what
+        it rested."""
+        from dataclasses import replace
+
+        bars = minute_bars()
+        history = self.stopped(bars)
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
+
+        def draw(form):
+            items = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                               session_date=SESSION, trader_config=form,
+                               trader_history=history, trader_running=False)["items"]
+            idle, ran = self.idle_and_ran(items)
+            band = next(i for i in idle if i["kind"] == "band")
+            return band, sorted((i["label"], i["value"]) for i in ran)
+
+        ran_config = history["config"]
+        before, ran_before = draw(ran_config)
+        after, ran_after = draw(replace(ran_config, buy_k=ran_config.buy_k + 0.1))
+        assert ran_after == ran_before
+        assert after["lower"][0] == before["lower"][0] == 207.0  # the run's last row
+        assert all(new < old for new, old in zip(after["lower"][1:], before["lower"][1:]))
+        assert after["upper"] == before["upper"]
+        assert after["t"] == before["t"]
+
+    def test_a_stopped_run_switched_to_another_model_carries_on_from_that_models_forecast(
+        self, monkeypatch,
+    ):
+        """▶ Start on another model forecasts the day again, so the gray levels
+        hang off that model's forecast rather than the run's seed."""
+        from dataclasses import replace
+
+        bars = minute_bars()
+        history = self.stopped(bars)
+        made_at = pd.Timestamp(f"{SESSION} 09:34", tz="America/New_York")
+        asked = []
+
+        def forecast(symbol, session, day, credentials, model_key):
+            asked.append(model_key)
+            return {"forecast": {"pred_high": 230.0, "pred_low": 190.0, "prev_avg": 200.0,
+                                 "adr14_abs": 3.0, "or_high": 201.0, "or_low": 199.0},
+                    "made_at": made_at, "problem": ""}
+
+        monkeypatch.setattr(mo, "_highlow_forecast", forecast)
+        form = replace(history["config"], model_key="highlow2")
+        items = mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                           session_date=SESSION, trader_config=form,
+                           trader_history=history, trader_running=False)["items"]
+        idle, _ = self.idle_and_ran(items)
+        assert asked == ["highlow2"]
+        from agent_stonks.apple_trader import session_levels
+
+        _, session, _ = mo._session_of(bars, SESSION)
+        stopped_at = pd.Timestamp(f"{SESSION} 09:36", tz="America/New_York")
+        walk = [row for row in session_levels(form, forecast(*[None] * 5)["forecast"],
+                                              session, made_at)
+                if pd.Timestamp(row["t"]) > stopped_at]
+        buy = next(i for i in idle if i["label"] in ("Buy level", "Buy/sell levels"))
+        drawn = buy["lower"][1:] if buy["kind"] == "band" else [buy["value"]] * len(walk)
+        assert drawn == [row["buy"] for row in walk]
+        assert drawn[0] != 207.0
+
+    def test_a_running_agent_shows_new_distances_from_the_forming_bar(self, monkeypatch):
+        """The run takes the form's buy and sell at its next bar, the one
+        forming now: drawn from there in the run's colour, under the stop the
+        position was filled with, not a minute later."""
+        from dataclasses import replace
+
+        bars = minute_bars(n=8)  # 09:30 – 09:37; the record ends at 09:36
+        history = self.stopped(bars)
+        monkeypatch.setattr(mo, "_highlow_forecast", lambda *a, **k: pytest.fail("forecast"))
+        ran = history["config"]
+
+        def draw(form):
+            return mo.compute([mo.TRADER_LEVELS_KEY], "AAPL", bars, daily_bars=[],
+                              session_date=SESSION, trader_config=form,
+                              trader_history=history, trader_running=True)["items"]
+
+        items = draw(replace(ran, buy_k=ran.buy_k + 0.1))
+        idle, drawn = self.idle_and_ran(items)
+        assert not idle
+        band = next(i for i in drawn if i["kind"] == "band")
+        stamps = [pd.Timestamp(t) for t in band["t"]]
+        assert stamps[-1] == pd.Timestamp(bars[-1]["t"])
+        assert band["lower"][:3] == [207.0] * 3 and band["lower"][-1] != 207.0
+        stop = next(i for i in items if i["label"] == "Stop level")
+        assert stop["values"][-1] == stop["values"][-2] == 206.0
+
+        # Unchanged, or in a unit the run does not count in: the record alone.
+        other_unit = next(u for u in ("adr", "pred_range") if u != ran.level_unit)
+        for form in (ran, replace(ran, buy_k=ran.buy_k + 0.1, level_unit=other_unit)):
+            levels = {i["label"]: i["value"] for i in draw(form) if i["kind"] == "level"}
+            assert levels == {"Buy level": 207.0, "Sell level": 209.0}
+
     def test_an_edit_is_drawn_as_a_step_at_the_minute_it_was_adopted(self, monkeypatch):
         items = self.compute([mo.TRADER_LEVELS_KEY],
                              self.history([207.0, 207.0, 205.5, 205.5]), monkeypatch)

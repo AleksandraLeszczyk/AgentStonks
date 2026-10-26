@@ -863,8 +863,55 @@ def _chart_start(bars: list[dict], pre_market: bool) -> datetime:
     return start.tz_convert("UTC").to_pydatetime()
 
 
+# Where `_chart_panel` keeps its own fragment id, for `_redraw_live_chart`.
+_CHART_FRAGMENT_KEY = "_live_chart_fragment_id"
+
+
+def _redraw_live_chart() -> None:
+    """Have the live chart drawn again as soon as this run is over.
+
+    The rules forms are fragments, so an edit reruns the form alone, and the
+    chart only polls every CHART_POLL_SEC -- in a full run it is even drawn
+    before the Agent tab publishes the form. Either way the buy and sell levels
+    trailed an edit by up to half a minute. This asks for the chart's fragment
+    the way its own poll timer does: queued behind the run in progress, not
+    interrupting it. Streamlit has no public call for running another
+    fragment, so this goes through its runtime; anything unexpected there
+    leaves the chart to its poll.
+    """
+    fragment_id = st.session_state.get(_CHART_FRAGMENT_KEY)
+    if not fragment_id:
+        return
+    try:
+        from streamlit.runtime.scriptrunner import RerunData, get_script_run_ctx
+
+        ctx = get_script_run_ctx()
+        if ctx is None or ctx.script_requests is None:
+            return
+        ctx.script_requests.request_rerun(RerunData(
+            query_string=ctx.query_string,
+            page_script_hash=ctx.page_script_hash,
+            fragment_id=fragment_id,
+            cached_message_hashes=ctx.cached_message_hashes,
+            context_info=ctx.context_info,
+        ))
+    except Exception:
+        logging.getLogger(__name__).debug("Queuing the live chart's redraw failed", exc_info=True)
+
+
+def _remember_chart_fragment() -> None:
+    """Keep the running fragment's id for `_redraw_live_chart`."""
+    try:
+        from streamlit.runtime.scriptrunner_utils.script_run_context import ThreadState
+
+        st.session_state[_CHART_FRAGMENT_KEY] = ThreadState.get().fragment_id
+    except Exception:
+        st.session_state.pop(_CHART_FRAGMENT_KEY, None)
+
+
 @st.fragment(run_every=CHART_POLL_SEC)
 def _chart_panel() -> None:
+    _remember_chart_fragment()
     state = _get_state()
     tracker = state.decision_tracker
     rendered = False
@@ -3639,7 +3686,10 @@ def _apple_trader_params(symbols: list[str]) -> AppleTraderConfig:
     # Published for the chart's buy/sell overlay, which is drawn from a
     # configuration rather than from a model and should show the one on screen,
     # and for the running agent, which reads the two distances back from it.
+    changed = config != getattr(state, "apple_trader_config", None)
     state.apple_trader_config = config
+    if changed:
+        _redraw_live_chart()
     # A knob change reruns this fragment alone, so the end of the full run
     # that would otherwise save it never comes.
     last_setup.remember()
@@ -3700,9 +3750,11 @@ def _orchestra_params(symbols: list[str]) -> "OrchestraConfig | None":
                     st.rerun(scope="app")
     # Published for the chart (each racer's levels) and for the running
     # Orchestra, whose racers read their two distances back from here.
-    state.orchestra_configs = (
-        {f"{r.ticker}:{r.model_key}": r for r in race.racers} if race is not None else {}
-    )
+    configs = {f"{r.ticker}:{r.model_key}": r for r in race.racers} if race is not None else {}
+    changed = configs != (getattr(state, "orchestra_configs", None) or {})
+    state.orchestra_configs = configs
+    if changed:
+        _redraw_live_chart()
     # And whole, for the Candidates tab's provisional pick.
     state.orchestra_form = race
     last_setup.remember()
@@ -4331,6 +4383,9 @@ def _agent_panel(
 
     # Each rule agent publishes its form for the chart; the other's is cleared,
     # so the chart never draws the levels of an agent that is not selected.
+    published = (
+        getattr(state, "apple_trader_config", None), getattr(state, "orchestra_configs", None)
+    )
     if personality == APPLE_TRADER_KEY:
         apple_config = _apple_trader_params(symbols)
         state.orchestra_configs, state.orchestra_form = {}, None
@@ -4341,6 +4396,8 @@ def _agent_panel(
         apple_config = None
         state.apple_trader_config = None
         state.orchestra_configs, state.orchestra_form = {}, None
+    if (state.apple_trader_config, state.orchestra_configs) != published:
+        _redraw_live_chart()
 
     # The sidebar's Order execution and Continue box (`_execution_controls`,
     # `_session_checkboxes`), drawn earlier in this run.

@@ -447,6 +447,19 @@ class TestTheChartAndTheSessionFile:
         assert config.ticker == "INTC" and record["memory"]["entry"] is not None
         assert model_overlays.live_trader_view(state, "MU") == (None, None)
 
+    def test_a_racers_chart_reads_the_form_before_its_record(self, market_open, monkeypatch):
+        """The racer takes the form's distances at its next bar, and the chart
+        draws them from the forming one -- so the form is what it hands over."""
+        from dataclasses import replace
+
+        state, _ = self._raced(monkeypatch)
+        record = state.orchestra_levels["INTC:highlow"]
+        edited = replace(record["config"], buy_k=record["config"].buy_k + 0.1)
+        state.orchestra_configs = {"INTC:highlow": edited}
+        assert model_overlays.live_trader_view(state, "INTC") == (edited, record)
+        state.orchestra_configs = {}
+        assert model_overlays.live_trader_view(state, "INTC") == (record["config"], record)
+
     def test_the_session_file_keeps_every_racer_and_the_holder(
         self, market_open, monkeypatch, tmp_path
     ):
