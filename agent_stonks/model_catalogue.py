@@ -870,6 +870,48 @@ def _fastfurious_spec(ticker: str) -> ModelSpec:
     )
 
 
+# Each GoodMoments notebook's verdict on its model and on the rules it chose
+# (FinNotebooks/GoodMoments/README.md), shown as the card's caveat.
+_GOODMOMENTS_CAVEATS = {
+    "AAPL": (
+        "A thin edge that holds out of sample: test AUC 0.685 against 0.672 for the clock "
+        "alone, 0.585 within the same half hour — most of what can be known is the time of "
+        "day and the volatility. Traded on its edge over the time-and-volatility twin it "
+        "made +$496 on the 199 test sessions at $10,000 a trade, beating two thirds of "
+        "placebos; holding AAPL made almost four times as much."
+    ),
+    "AMD": (
+        "Adds next to nothing to time and volatility: test AUC 0.712 against 0.710. Traded "
+        "on its edge (AAPL's rules, a 0.5 ADR stop) it made +$1,342 on the 199 test sessions, "
+        "beating 56% of placebos; holding AMD made +$6,465."
+    ),
+    "NVDA": (
+        "Its 12 own features help a little (test log loss 0.6131, 0.6146 without them), but "
+        "time and volatility alone forecast better out of sample (0.6082; AUC 0.713 against "
+        "0.706). Traded on its edge (enter +0.10, take and stop 0.2 ADR) it lost $341 on the "
+        "199 test sessions — 94 takes against 93 stops, a coin toss, negative at any cost "
+        "above about 0.2 bps a side."
+    ),
+    "MU": (
+        "A second look, not a clean test: MU's own features were designed after the first "
+        "pass's 2026 test had been seen. It beats time and volatility (test log loss 0.6072 "
+        "against 0.6127) and ties the unfitted last-hour random walk (0.6077). Traded on its "
+        "edge (enter +0.08, out under −0.02, stop 0.3, take 0.2 ADR) it lost $505 on the 199 "
+        "test sessions, beating 28% of placebos; the first pass's model had made +$1,874."
+    ),
+}
+# What NVDA's and MU's own features read beyond the shared inputs.
+_GOODMOMENTS_OWN_INPUTS = {
+    "NVDA": (
+        "; the same tapes of QQQ, SMH, AMD, AVGO, TSM and MU (their session so far, NVDA's "
+        "60-session beta and 20-session strength against SMH), SIP's trade counts (the "
+        "15-minute trade size, read 15 minutes back), Yahoo's earnings dates (sessions to and "
+        "since a report) and the nearest expiry's pin and the call volume from the option bars"
+    ),
+    "MU": "; SMH's tapes, for the volatility clock read off its session so far",
+}
+
+
 def _goodmoments_spec(ticker: str) -> ModelSpec:
     path = _saved_path("APPLE_GOODMOMENTS_MODEL", "goodmoments_{ticker}.joblib", ticker)
     twin = path.with_name(f"{path.stem}_timevol.joblib")
@@ -921,7 +963,7 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
             "three volume-profile POCs, same-minute volume and variance norms over 20 sessions); "
             "last night's option positioning (put/call volume, 30-day implied vol, dealer gamma "
             "re-read at the live price), from Alpaca's daily option bars; Yahoo's analyst price "
-            "targets stamped before the bar"
+            "targets stamped before the bar" + _GOODMOMENTS_OWN_INPUTS.get(ticker, "")
         ),
         metrics=metrics,
         headline=(
@@ -932,7 +974,7 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
         trained_at=str(window[-1]) if window else "",
         data_note=(
             f"Fitted {' – '.join(window)} · tested walk-forward 1 Jan – 16 Oct 2026 "
-            "(199 sessions, 77,411 bars)"
+            + ("(199 sessions, 77,411 bars)" if ticker == "AAPL" else "(199 sessions)")
             if window else ""
         ),
         versions={},
@@ -940,13 +982,7 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
         requires=model.requires,
         available=available,
         unavailable_reason=reason,
-        caveat=(
-            "A thin edge that holds out of sample: test AUC 0.685 against 0.672 for the clock "
-            "alone, 0.585 within the same half hour — most of what can be known is the time of "
-            "day and the volatility. Traded on its edge over the time-and-volatility twin it "
-            "made +$496 on the 199 test sessions at $10,000 a trade, beating two thirds of "
-            "placebos; holding AAPL made almost four times as much."
-        ),
+        caveat=_GOODMOMENTS_CAVEATS.get(ticker, ""),
     )
 
 

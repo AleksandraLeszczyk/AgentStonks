@@ -3184,6 +3184,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- It also reads last night's option table (rebuilt from the shared option "
             "cache under `data/option_positioning/`, priced the notebook's way, cached under "
             "`data/goodmoments/`) and Yahoo's analyst price targets (refreshed hourly).\n"
+            "- **NVDA** also reads QQQ, SMH, AMD, AVGO, TSM and MU the same way, SIP's trade "
+            "counts, Yahoo's earnings dates and the nearest expiry's pin; **MU** reads SMH. "
+            "A forecast takes about 1.6 s on NVDA, 1 s elsewhere.\n"
             "- At ▶ Start it needs ~130 days of SIP and IEX minute bars (shared with "
             "Fast&Furious under `data/fastfurious/`) — fetched in the background when the "
             "agent is started before the open.\n"
@@ -3196,8 +3199,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "gm_enter": (
             "How much likelier than the clock and volatility alone the model has to see the "
             "+0.2 ADR rise before buying, in probability points.\n\n"
-            "- **0.02** (the notebook's pick) — chosen on July–December 2025 among 0.02–0.10; "
-            "it buys about one and a half times a day.\n"
+            "- **0.02** (AAPL's and AMD's notebook pick) — chosen on July–December 2025 among "
+            "0.02–0.10; it buys about one and a half times a day.\n"
+            "- **0.10** is NVDA's pick (the top of the grid), **0.08** MU's.\n"
             "- Higher trades less often; the notebook found the result did not hang on this "
             "corner of its grid."
         ),
@@ -3256,14 +3260,14 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "(0.2–0.5) sat in the noise; from 0.75 on the result barely changed, and what the "
             "stop bought was a smaller worst drawdown.\n"
             "- **0.5** is AMD's, from the same grid — on a validation half where only one "
-            "candidate in nine made money.\n"
+            "candidate in nine made money; **0.2** NVDA's (as far as its take), **0.3** MU's.\n"
             "- After a stop no new entry for 15 minutes.\n"
             "- **0** switches it off."
         ),
         "gm_exit": (
             "Also sell when the edge falls under this number.\n\n"
-            "- **Off** is the notebook's pick: what neither the take nor the stop closes is "
-            "held to the close.\n"
+            "- **Off** is the notebook's pick on AAPL, AMD and NVDA: what neither the take nor "
+            "the stop closes is held to the close. MU's picked **−0.02**.\n"
             "- It has to sit below the entry."
         ),
         "model_highlow": (

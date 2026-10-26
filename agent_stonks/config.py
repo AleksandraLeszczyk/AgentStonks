@@ -848,7 +848,23 @@ APPLE_TRADER_GM_STOP_K = 0.75
 # +$1,342, beating 56% of placebos; holding AMD made +$6,465. Notebook 3 had
 # found AMD's model adds next to nothing to time and volatility (AUC 0.712 vs
 # 0.710), so the edge it trades carries no known information.
-APPLE_TRADER_GM_STOP_K_BY_TICKER = {"AMD": 0.5}
+# NVDA's grid (2026-10-22) chose enter +0.10 (the top of the grid), take and
+# stop both 0.2 ADR, no signal exit: +$1,513 on 164 validation trades, every
+# placebo beaten; on the test 208 trades, a coin toss (94 takes at +52 bps, 93
+# stops at -56), -$341, beating 82% of placebos only because they lost more.
+# MU's second pass (2026-10-26, its own volatility clocks) chose enter +0.08,
+# an exit once the edge is under -0.02, stop 0.3 ADR, take 0.2: +$1,409 on 147
+# validation trades, only half the grid positive; on the test 202 trades,
+# -$505, beating 28% of placebos -- the better forecast traded worse than the
+# first pass's (+$1,874).
+APPLE_TRADER_GM_STOP_K_BY_TICKER = {"AMD": 0.5, "NVDA": 0.2, "MU": 0.3}
+# The rest of those picks where they are not AAPL's (`apple_trader.gm_rules_for`),
+# what a new GoodMoments run on the symbol starts from; a pair's base
+# configuration, when SimLab set one, carries its own.
+APPLE_TRADER_GM_RULES_BY_TICKER = {
+    "NVDA": {"gm_enter": 0.10},
+    "MU": {"gm_enter": 0.08, "gm_exit": -0.02},
+}
 # HighLow's momentum confirmation, on GoodMoments' rules: the look-back in bars
 # of the same behaviour table (`apple_trader.MOMENTUM_TABLE`). A buy the edge
 # calls for waits for the table's "buy"; a take that is reached is held while

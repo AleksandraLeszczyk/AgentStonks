@@ -40,8 +40,11 @@ them:
                      (`STRATEGY_PROBABILITY`): buy when the model's *edge*
                      over that baseline is 2 points or more, a take-profit at
                      +0.2 ADR, a stop at -0.75 ADR, otherwise held to the
-                     close. Its bundle carries `kind="goodmoments"` and the
-                     forecasts come from `goodmoments_model`.
+                     close (each ticker's notebook picked its own entry, exit
+                     and stop: `apple_trader.gm_rules_for`). Its bundle carries
+                     `kind="goodmoments"` and the forecasts come from
+                     `goodmoments_model` (NVDA's and MU's own features from
+                     `goodmoments_context`).
 `highlow2_goodmoments`
                      A hybrid of the two (2026-10-21): GoodMoments' rules,
                      the edge alone buying in the opening window, and from
@@ -150,11 +153,17 @@ FASTFURIOUS_TICKERS = (DEFAULT_TICKER,)
 # through 2026-10-16, saved 2026-10-19; the twin written 2026-10-20 by
 # `GoodMoments/scripts/export_timevol.py`) and AMD (same window and recipe,
 # saved 2026-10-21 with its twin; 23 features of its own choosing, nine of
-# them not AAPL's, and a 0.5 ADR stop -- `config.APPLE_TRADER_GM_STOP_K_BY_TICKER`).
+# them not AAPL's, and a 0.5 ADR stop -- `config.APPLE_TRADER_GM_STOP_K_BY_TICKER`),
+# NVDA (saved 2026-10-22: 38 features, 12 of its own -- QQQ, SMH and four
+# peers, the earnings clock, the nearest expiry's pin, call volume, trade size)
+# and MU (saved 2026-10-26 by its second pass: the clock and two volatility
+# clocks of its own, one read off SMH), both wired 2026-10-26, each with its
+# notebook 4's rules (`config.APPLE_TRADER_GM_RULES_BY_TICKER`).
 # Adding one is this tuple plus its four files in `Code/Models` -- and a check
-# that every feature it reads is in `goodmoments_model.FEATURE_COLS`
-# (`_build_bundle` refuses one that is not).
-GOODMOMENTS_TICKERS = (DEFAULT_TICKER, "AMD")
+# that every feature it reads is in `goodmoments_model.FEATURE_COLS` or the
+# ticker's own in `goodmoments_context.OWN_FEATURES` (`_build_bundle` refuses
+# one that is not).
+GOODMOMENTS_TICKERS = (DEFAULT_TICKER, "AMD", "NVDA", "MU")
 
 # HighLow2 + GoodMoments: wherever both are fitted.
 HIGHLOW2_GOODMOMENTS_TICKERS = tuple(t for t in GOODMOMENTS_TICKERS if t in HIGHLOW2_TICKERS)
@@ -436,13 +445,23 @@ MODELS: "dict[str, AppleModel]" = {
             "signed flow, the session's relative volume and the volatility regime) and ranks "
             "at an AUC of 0.712 -- 0.710 on time and volatility alone, so it adds next to "
             "nothing to them; its rules are AAPL's with a 0.5 ADR stop, +$1,342 on the same "
-            "199 sessions (beating 56% of placebos), against +$6,465 for holding AMD."
+            "199 sessions (beating 56% of placebos), against +$6,465 for holding AMD. NVDA's "
+            "reads 38 features, 12 its own (QQQ's session and NVDA's volume against it, SMH "
+            "and four chip peers, the sessions to and since earnings, the nearest expiry's pin, "
+            "last night's call volume, the 15-minute trade size): AUC 0.706, against 0.713 for "
+            "time and volatility alone; its rules (enter at +0.10, take and stop 0.2 ADR) lost "
+            "$341 on the test, a coin toss of takes and stops. MU's, from its second pass, reads "
+            "the clock and two volatility clocks of its own -- the random walk's volatility read "
+            "off MU's last hour, or off SMH's session -- and ties the unfitted random walk "
+            "(test AUC 0.718); its rules (enter at +0.08, out under -0.02, stop 0.3, take 0.2 "
+            "ADR) lost $505 on the test, beating 28% of placebos."
         ),
         requires=(
             "LightGBM, SciPy and joblib, the saved model and its time-and-volatility twin, "
             "Alpaca credentials for ~130 days of SIP and IEX minute bars and today's live ones, "
             "the shared option cache (the contract list and daily option bars) and Yahoo's "
-            "analyst price targets"
+            "analyst price targets; for NVDA, the same tapes of QQQ, SMH, AMD, AVGO, TSM and "
+            "MU, SIP's trade counts and Yahoo's earnings dates; for MU, SMH's tapes"
         ),
         strategy=STRATEGY_PROBABILITY,
         tickers=GOODMOMENTS_TICKERS,

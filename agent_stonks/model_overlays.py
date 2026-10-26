@@ -1724,15 +1724,19 @@ def _goodmoments_forecast(
     (SIP to 15 minutes back, IEX since), so a past session is drawn with what
     the model said at each minute and a live one with what it has said so far.
     The thresholds are the configured run's when the chart's configuration is
-    a GoodMoments one, the notebook's otherwise -- the notebook has no circuit
-    breaker, so `raise` is then 0.
+    a GoodMoments one, the ticker's notebook's otherwise (NVDA's and MU's
+    entries are their own, `apple_trader.gm_rules_for`) -- the notebook has
+    no circuit breaker, so `raise` is then 0.
 
     Returns `{"fc", "stamps", "enter", "exit", "raise", "problem"}`.
     """
+    from .apple_trader import gm_rules_for
     from .config import APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT
 
     model_key = apple_models.GOODMOMENTS_KEY
-    enter, exit_, raise_ = APPLE_TRADER_GM_ENTER, APPLE_TRADER_GM_EXIT, 0.0
+    notebook = gm_rules_for(symbol, model_key)
+    enter = float(notebook.get("gm_enter", APPLE_TRADER_GM_ENTER))
+    exit_, raise_ = notebook.get("gm_exit", APPLE_TRADER_GM_EXIT), 0.0
     named = getattr(config, "model_key", None) if config is not None else None
     if named == model_key or (named and apple_models.signal_of(named) == model_key):
         # A run on GoodMoments' rules, alone or in a hybrid: that run's own.

@@ -17,6 +17,7 @@ import pandas as pd
 import pytest
 
 G = pytest.importorskip("agent_stonks.goodmoments_model")
+C = pytest.importorskip("agent_stonks.goodmoments_context")
 
 NOTEBOOK = Path("/Users/aleksandra/Documents/playground/Code/FinNotebooks/GoodMoments/data")
 TZ = "America/New_York"
@@ -38,6 +39,7 @@ def _bars(day: str, minutes, seed: int = 0, price: float = 100.0) -> pd.DataFram
     return pd.DataFrame({
         "open": open_, "high": high, "low": low, "close": close,
         "volume": rng.integers(1_000, 50_000, n).astype(float), "vwap": (high + low + close) / 3,
+        "trades": rng.integers(0, 400, n).astype(float),
     }, index=stamps)
 
 
@@ -48,6 +50,23 @@ class TestCleaning:
         grid, report = G.clean_sessions(pd.concat([full, short]))
         assert bool(report.loc["2026-09-15", "kept"]) and not bool(report.loc["2026-09-16", "kept"])
         assert grid[grid["date"] == "2026-09-16"]["minute"].max() == G.HALF_DAY_MINUTES - 1
+
+    def test_an_exchange_half_day_is_not_kept_however_busy_after_13_00(self):
+        """NVDA trades so much after a 13:00 close that a bar count alone
+        would keep the session (`data.early_closes`)."""
+        grid, report = G.clean_sessions(_bars("2025-11-28", range(390)))
+        assert not bool(report.loc["2025-11-28", "kept"])
+        assert grid["minute"].max() == G.HALF_DAY_MINUTES - 1
+
+    def test_a_context_series_keeps_a_thin_session_whole(self):
+        grid, report = G.clean_sessions(_bars("2026-09-16", range(0, 390, 2)), min_bars=0)
+        assert bool(report.loc["2026-09-16", "kept"]) and grid["minute"].max() == 389
+
+    def test_trade_counts_ride_along_and_a_missing_minute_has_none(self):
+        grid, _ = G.clean_sessions(_bars("2026-09-15", [m for m in range(390) if m != 100]))
+        assert grid[grid["minute"] == 100]["trades"].iloc[0] == 0
+        tape = G.session_tape(_bars("2026-09-15", [m for m in range(390) if m != 7]))
+        assert tape.trades is not None and tape.trades[7] == 0
 
     def test_a_missing_minute_takes_the_last_close_and_no_volume(self):
         bars = _bars("2026-09-15", [m for m in range(390) if m != 100])
@@ -85,8 +104,19 @@ class TestLiveSeam:
                           joined("volume", self.K), joined("vwap"))
             ref = G.session_stats(tape, None, self.K, self.SIGMA, seam=0)
             for name in ("c", "s_open", "hi", "lo", "ref_1h", "vwap", "cum_vol", "cum_var", "vol_15",
-                         "bvc_1h", "bvc_sess", "clv_sess", "dev_poc"):
+                         "var_60", "bvc_1h", "bvc_sess", "clv_sess", "dev_poc"):
                 assert live[name][t] == pytest.approx(ref[name][t], rel=1e-12, abs=1e-15), (name, t)
+
+    def test_the_trade_size_is_sips_own_15_bars_back(self):
+        """IEX's trade size is no guide to SIP's: the joined tape reads SIP's
+        last 15 bars through t-15, against that minute's norm."""
+        sip, iex = self._tapes()
+        live = G.session_stats(sip, iex, self.K, self.SIGMA, seam=G.L)
+        own = G.session_stats(sip, None, self.K, self.SIGMA, seam=0)
+        assert np.isnan(live["size_15"][:G.L]).all() and (live["size_at"][:G.L] == -1).all()
+        t = np.arange(G.L, 390)
+        np.testing.assert_array_equal(live["size_15"][t], own["size_15"][t - G.L])
+        np.testing.assert_array_equal(live["size_at"][t], t - G.L)
 
     def test_before_bar_15_the_session_is_iexs_alone(self):
         sip, iex = self._tapes()
@@ -101,6 +131,25 @@ class TestLiveSeam:
 
 
 class TestAnalysts:
+    def test_the_counts_read_the_last_30_and_7_days(self):
+        raw = pd.DataFrame(
+            {"currentPriceTarget": [200.0, 210.0, 190.0], "Action": ["up", "main", "down"],
+             "priceTargetAction": ["Raises", "Raises", "Lowers"]},
+            index=pd.DatetimeIndex(["2026-08-20 09:00", "2026-09-10 09:00", "2026-09-14 09:00"], name="GradeDate"),
+        )
+        events = G.analyst_events(raw)
+        counts = G.analyst_counts(G.bar_close_times(pd.Timestamp("2026-09-15"), np.array([0])), events)
+        # 30 days back reaches the August upgrade; 7 days, the last two notes.
+        assert counts["rating_30d"][0] == 0.0          # +1 in August, -1 on the 14th
+        assert counts["target_7d"][0] == 0.0           # raised on the 10th, lowered on the 14th
+        assert counts["n_actions_7d"][0] == 2.0
+
+    def test_nvda_targets_before_the_split_are_divided(self):
+        raw = pd.DataFrame({"currentPriceTarget": [1200.0, 150.0]},
+                           index=pd.DatetimeIndex(["2024-06-07 09:00", "2024-06-11 09:00"], name="GradeDate"))
+        assert G.analyst_events(raw, "NVDA")["price_target"].tolist() == [120.0, 150.0]
+        assert G.analyst_events(raw, "AAPL")["price_target"].tolist() == [1200.0, 150.0]
+
     def test_a_note_counts_from_its_stamp_for_ninety_days(self):
         raw = pd.DataFrame(
             {"currentPriceTarget": [200.0, 0.0, 300.0]},
@@ -157,6 +206,47 @@ class TestBundle:
                     G.timevol_path(path))
         assert G.load_bundle("AAPL") is None
 
+    def test_another_tickers_own_feature_is_refused(self, store):
+        """NVDA's own features are NVDA's definitions: AAPL has no peers
+        list, no QQQ beta of its own."""
+        path, booster, joblib = store
+        joblib.dump({"model": booster(["p_reach", "qqq_today"]), "features": ["p_reach", "qqq_today"]}, path)
+        joblib.dump({"model": booster(["frac_left", "p_reach"]), "features": ["frac_left", "p_reach"]},
+                    G.timevol_path(path))
+        assert G.load_bundle("AAPL") is None
+
+
+class TestNeeds:
+    def test_nvda_reads_the_market_the_peers_the_calendar_and_the_trades(self):
+        need = C.needs("NVDA", ["qqq_today", "resid_smh_today", "peers_today", "days_to_earn",
+                                "d_pin", "trade_size_15m", "p_reach"])
+        assert need.context == ("QQQ", "SMH", "AMD", "AVGO", "TSM", "MU")
+        assert need.earnings and need.surface and need.trades
+
+    def test_mus_clocks_read_smh_alone(self):
+        need = C.needs("MU", ["frac_left", "p_reach_60m", "p_reach_smh"])
+        assert need == C.Needs(context=("SMH",))
+
+    def test_the_shared_features_read_nothing_here(self):
+        assert not C.needs("AAPL", G.FEATURE_COLS[:3] + ["d_poc", "gex"]).any
+
+
+class TestEarningsClock:
+    SESSIONS = pd.DatetimeIndex(pd.bdate_range("2026-07-01", "2026-10-30")).as_unit("ns")
+
+    def test_a_report_after_the_close_is_the_next_sessions(self):
+        earn = C.report_sessions(["2026-08-26T16:20:00-04:00", "2026-10-28T08:00:00-04:00"], self.SESSIONS)
+        assert list(earn) == [pd.Timestamp("2026-08-27"), pd.Timestamp("2026-10-28")]
+
+    def test_sessions_to_and_since_are_capped(self):
+        earn = pd.DatetimeIndex(["2026-08-27", "2026-10-28"])
+        on = C.earnings_clock(earn, self.SESSIONS, pd.Timestamp("2026-08-27"))
+        assert on == {"days_to_earn": 0.0, "days_since_earn": 0.0}
+        later = C.earnings_clock(earn, self.SESSIONS, pd.Timestamp("2026-09-01"))
+        assert later == {"days_to_earn": 15.0, "days_since_earn": 3.0}
+        near = C.earnings_clock(earn, self.SESSIONS, pd.Timestamp("2026-10-26"))
+        assert near["days_to_earn"] == 2.0
+
 
 # --- against the notebook ----------------------------------------------------------
 
@@ -177,22 +267,61 @@ def notebook(ticker: str) -> dict:
         if not (folder / "panel.parquet").exists():
             pytest.skip(f"the GoodMoments notebook's {ticker} data is not on this machine")
         minutes = pd.read_parquet(folder / "minutes.parquet")
+        surface = folder / "options" / "surface.parquet"
+        earnings = folder / "earnings.parquet"
         _NOTEBOOKS[ticker] = {
             "folder": folder,
             "minutes": minutes,
             "sessions": pd.read_parquet(folder / "sessions.parquet"),
             "daily": G.daily_candles(minutes),
             "positioning": pd.read_parquet(folder / "options" / "positioning.parquet"),
-            "events": G.analyst_events(pd.read_parquet(folder / "analysts_raw.parquet")),
-            "panel": pd.read_parquet(folder / "panel.parquet"),
+            "surface": pd.read_parquet(surface) if surface.exists() else None,
+            "earnings": list(pd.read_parquet(earnings)["Earnings Date"]) if earnings.exists() else None,
+            "events": G.analyst_events(pd.read_parquet(folder / "analysts_raw.parquet"), ticker),
+            "panel": pd.read_parquet(folder / "panel.parquet", filters=[("date", "in", [pd.Timestamp(d) for d in DAYS[ticker]])]),
+            "context": {},
         }
     return _NOTEBOOKS[ticker]
 
 
-def _position_row(pos: pd.DataFrame, day: pd.Timestamp) -> dict:
-    p = pos.loc[day]
-    return {"spot": p["spot"], "call_wall": p["call_wall"], "iv_30d": p["iv_30d"],
-            "pc_volume": p["pc_volume"], "gex": [p[f"gex_{k}"] for k in range(len(G.GEX_GRID))]}
+def _context_minutes(nb: dict, symbol: str) -> pd.DataFrame:
+    if symbol not in nb["context"]:
+        nb["context"][symbol] = pd.read_parquet(nb["folder"] / "context" / f"{symbol}_minutes.parquet")
+    return nb["context"][symbol]
+
+
+def _position_row(nb: dict, day: pd.Timestamp) -> dict:
+    p = nb["positioning"].loc[day]
+    row = {"spot": p["spot"], "call_wall": p["call_wall"], "put_wall": p["put_wall"], "iv_30d": p["iv_30d"],
+           "pc_volume": p["pc_volume"], "gex": [p[f"gex_{k}"] for k in range(len(G.GEX_GRID))]}
+    if nb["surface"] is not None and day in nb["surface"].index:
+        row.update({k: nb["surface"].at[day, k] for k in ("pin", "call_vol_rel")})
+    return row
+
+
+def _own_session(bundle: dict, ticker: str, nb: dict, day: pd.Timestamp, row: dict):
+    """The own features' inputs from the notebook's own context grids,
+    earnings dates and session list -- what `goodmoments_context.own_day`
+    builds from the app's caches."""
+    need = bundle["needs"]
+    if not need.any:
+        return None
+    kept = pd.DatetimeIndex(nb["sessions"].index[nb["sessions"]["kept"]])
+    own = C.OwnDay(ticker=ticker, day=day)
+    for symbol in need.context:
+        m = _context_minutes(nb, symbol)
+        own.context[symbol] = C.context_day(symbol, m, G.daily_candles(m), kept, day)
+    if "SMH" in own.context and ticker in C.OWN_FEATURES:
+        daily = nb["daily"]
+        dly = pd.concat([daily[daily.index < day], pd.DataFrame(index=pd.DatetimeIndex([day], name="date"))])
+        own.values.update(C.smh_daily_values(dly, own.context["SMH"].daily, day))
+    if need.earnings:
+        # The notebook counts sessions on its own data's list (it ends 16 Oct 2026).
+        sessions = pd.DatetimeIndex(nb["sessions"].index).as_unit("ns")
+        own.values.update(C.earnings_clock(C.report_sessions(nb["earnings"], sessions), sessions, day))
+    stats = {s: C.context_stats(own.context[s], G._tape_of(_context_minutes(nb, s), day), None, 0)
+             for s in need.context}
+    return C.OwnSession(own=own, stats=stats, position=row)
 
 
 # Per ticker: AAPL's original six; AMD's first modelled month, results mornings
@@ -229,13 +358,18 @@ class TestAgainstTheNotebook:
         nb = notebook(ticker)
         d = pd.Timestamp(day)
         drow, norms = G.day_inputs(nb["minutes"], nb["sessions"], nb["daily"], d)
+        row = _position_row(nb, d)
         f = G.session_features(
-            G._tape_of(nb["minutes"], d), None, d, drow, norms,
-            _position_row(nb["positioning"], d), nb["events"], seam=0,
+            G._tape_of(nb["minutes"], d), None, d, drow, norms, row, nb["events"], seam=0,
+            own=_own_session(bundle, ticker, nb, d, row),
         )
         ref = nb["panel"][nb["panel"]["date"] == d].set_index("minute")
         mine = f.loc[ref.index]
-        for col in G.FEATURE_COLS:
+        # Every shared column the panel has (AAPL's and AMD's predate the two
+        # volatility clocks), and every column the model reads.
+        cols = [c for c in G.FEATURE_COLS if c in ref] + [c for c in bundle["features"] if c not in G.FEATURE_COLS]
+        assert set(bundle["features"]) <= set(cols)
+        for col in cols:
             np.testing.assert_array_equal(mine[col].to_numpy(float), ref[col].to_numpy(float), err_msg=col)
         for model, cols in (("model", "features"), ("timevol", "timevol_features")):
             np.testing.assert_array_equal(
@@ -260,10 +394,16 @@ class TestAgainstTheNotebook:
         ref = nb["positioning"].loc[d]
         assert row["spot"] == ref["spot"]
         assert row["call_wall"] == ref["call_wall"]
+        assert row["put_wall"] == ref["put_wall"]
         assert row["iv_30d"] == ref["iv_30d"]
         assert row["pc_volume"] == ref["pc_volume"]
         gex = np.array([ref[f"gex_{k}"] for k in range(len(G.GEX_GRID))])
         np.testing.assert_allclose(row["gex"], gex, rtol=1e-10)
+        if nb["surface"] is not None:
+            # `nvda.surface`'s pin and call-volume norm, on the same bars.
+            surface = C.surface_row(bars[bars["date"] <= prev], nb["daily"], sessions, prev, d, G.HALF_LIFE)
+            assert surface["pin"] == nb["surface"].at[d, "pin"]
+            assert surface["call_vol_rel"] == nb["surface"].at[d, "call_vol_rel"]
 
     def test_amd_reads_the_call_wall_and_the_hour(self):
         bundle = G.load_bundle("AMD")
@@ -272,3 +412,12 @@ class TestAgainstTheNotebook:
         assert bundle["ticker"] == "AMD" and bundle["reads_walls"]
         assert {"d_call_wall", "mom_1h", "bvc_1h", "rel_vol", "vol_regime"} <= set(bundle["features"])
         assert bundle["timevol_features"] == ["frac_left", "p_reach"]
+
+    def test_nvda_and_mu_read_what_their_notebooks_saved(self):
+        nvda, mu = G.load_bundle("NVDA"), G.load_bundle("MU")
+        if nvda is None or mu is None:
+            pytest.skip("the GoodMoments NVDA or MU bundle is not installed")
+        assert set(C.OWN_FEATURES["NVDA"]) <= set(nvda["features"]) and len(nvda["features"]) == 38
+        assert nvda["option_keys"] == ("call_vol_rel", "pin", "put_wall") and nvda["reads_analysts"]
+        assert mu["features"] == ["frac_left", "p_reach_60m", "p_reach_smh"]
+        assert mu["needs"] == C.Needs(context=("SMH",)) and not mu["reads_options"] and not mu["reads_analysts"]

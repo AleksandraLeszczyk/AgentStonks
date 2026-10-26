@@ -73,6 +73,7 @@ from .config import (
     APPLE_TRADER_GM_EXIT,
     APPLE_TRADER_GM_LAST_ENTRY_MINUTE,
     APPLE_TRADER_GM_STOP_K,
+    APPLE_TRADER_GM_RULES_BY_TICKER,
     APPLE_TRADER_GM_STOP_K_BY_TICKER,
     APPLE_TRADER_GM_STOP_RAISE,
     APPLE_TRADER_GM_TAKE_K,
@@ -256,10 +257,27 @@ def breach_for(ticker: str, model_key: "str | None" = None, use_base: bool = Tru
 def gm_stop_for(ticker: str) -> float:
     """GoodMoments' stop, in ADRs under the fill, a run on this symbol starts
     from: its notebook 4's pick (`config.APPLE_TRADER_GM_STOP_K_BY_TICKER`,
-    AMD's 0.5), else AAPL's 0.75. A pair's base configuration, when SimLab set
-    one, carries its own and is read before this (`default_config`)."""
+    AMD's 0.5, NVDA's 0.2, MU's 0.3), else AAPL's 0.75. A pair's base
+    configuration, when SimLab set one, carries its own and is read before
+    this (`default_config`)."""
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
     return APPLE_TRADER_GM_STOP_K_BY_TICKER.get(symbol, APPLE_TRADER_GM_STOP_K)
+
+
+def gm_rules_for(ticker: str, model_key: "str | None" = None) -> dict:
+    """The rest of GoodMoments' rules a new run of a probability model on this
+    symbol starts from where its notebook 4 picked other ones than AAPL's
+    (`config.APPLE_TRADER_GM_RULES_BY_TICKER`: NVDA's +0.10 entry, MU's +0.08
+    entry and -0.02 exit), as `AppleTraderConfig` fields; empty for any other
+    model or symbol, which keep the fields' defaults. The stop is
+    `gm_stop_for`'s. Not read by `AppleTraderConfig` itself: a stored record
+    carries every field, so only a fresh configuration (`default_config`,
+    `shipped_config`) asks."""
+    symbol = (ticker or DEFAULT_TICKER).strip().upper()
+    key = str(model_key or APPLE_TRADER_MODEL)
+    if key not in apple_models.MODELS or apple_models.strategy(key) != apple_models.STRATEGY_PROBABILITY:
+        return {}
+    return dict(APPLE_TRADER_GM_RULES_BY_TICKER.get(symbol, {}))
 
 
 def min_win_for(
@@ -322,6 +340,7 @@ def shipped_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
         stop_gain_fraction=stop_for(ticker, model_key, use_base=False),
         min_win_k=min_win_for(ticker, model_key, use_base=False),
         breach_update=breach_for(ticker, model_key, use_base=False),
+        **gm_rules_for(ticker, model_key),
     )
 
 
@@ -347,7 +366,7 @@ def default_config(ticker: str, model_key: "str | None" = None) -> "AppleTraderC
             logging.getLogger(__name__).warning(
                 "The base configuration of %s/%s is refused: %s", model_key, symbol, exc
             )
-    return AppleTraderConfig(ticker=symbol, model_key=model_key)
+    return AppleTraderConfig(ticker=symbol, model_key=model_key, **gm_rules_for(symbol, model_key))
 
 
 # What a hybrid's buy level is made of, and so what it takes from its levels

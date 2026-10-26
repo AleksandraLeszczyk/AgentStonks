@@ -351,9 +351,28 @@ class TestKeptApart:
         assert AppleTraderConfig(model_key=apple_models.GOODMOMENTS_KEY, ticker="AMD", gm_stop_k=0.75).gm_stop_k == 0.75
         assert "stop=0.5A" in config_signature(amd)
 
-    def test_amd_is_offered(self):
-        assert apple_models.GOODMOMENTS_KEY in apple_models.keys_for("AMD")
-        assert apple_models.HIGHLOW2_GOODMOMENTS_KEY not in apple_models.keys_for("AMD")
+    def test_nvda_and_mu_start_from_their_notebooks_rules(self, monkeypatch):
+        """NVDA's notebook 4 picked enter +0.10, take and stop 0.2; MU's
+        enter +0.08, an exit under -0.02, stop 0.3, take 0.2. Only a fresh
+        GoodMoments configuration asks: a typed or stored rule is kept, and
+        another model on the same symbol keeps the fields' defaults."""
+        monkeypatch.setattr(at.base_configs, "stored", lambda *a, **k: None)
+        nvda = at.default_config("NVDA", apple_models.GOODMOMENTS_KEY)
+        assert (nvda.gm_enter, nvda.gm_exit, nvda.gm_take_k, nvda.gm_stop_k) == (0.10, None, 0.2, 0.2)
+        mu = at.default_config("MU", apple_models.GOODMOMENTS_KEY)
+        assert (mu.gm_enter, mu.gm_exit, mu.gm_take_k, mu.gm_stop_k) == (0.08, -0.02, 0.2, 0.3)
+        assert config_signature(mu).startswith("goodmoments_MU(enter=+0.08,exit=-0.02,take=0.2A,stop=0.3A,")
+        assert at.shipped_config("MU", apple_models.GOODMOMENTS_KEY).gm_exit == -0.02
+        assert at.default_config("NVDA", apple_models.HIGHLOW_KEY).gm_enter == 0.02
+        assert AppleTraderConfig(model_key=apple_models.GOODMOMENTS_KEY, ticker="NVDA", gm_enter=0.04).gm_enter == 0.04
+        aapl = at.default_config("AAPL", apple_models.GOODMOMENTS_KEY)
+        assert (aapl.gm_enter, aapl.gm_exit, aapl.gm_take_k, aapl.gm_stop_k) == (0.02, None, 0.2, 0.75)
+
+    @pytest.mark.parametrize("ticker", ["AMD", "NVDA", "MU"])
+    def test_each_ticker_is_offered(self, ticker):
+        assert apple_models.GOODMOMENTS_KEY in apple_models.keys_for(ticker)
+        assert apple_models.HIGHLOW2_GOODMOMENTS_KEY not in apple_models.keys_for(ticker)
+        assert f"{ticker}:goodmoments" in orchestra.all_pairs()
 
     def test_orchestra_offers_and_takes_it_but_not_fast_and_furious(self):
         # Since 2026-10-25 Orchestra races GoodMoments pairs too
