@@ -1182,9 +1182,24 @@ def _render_run(record: dict) -> None:
 # The pipeline: queued experiments, a parallelism limit, and worker processes.
 # One process = one simulation (module-global sim clock), so parallel runs are
 # separate `python -m simlab.runner` subprocesses scheduled by
-# `sim_experiments.tick()`; this section is both the status bar and the tick.
+# `sim_experiments.tick()`. The Simulate tab shows the queue
+# (`_render_pipeline`); the tick runs above the tabs (`_tick_pipeline`), so it
+# keeps going whichever tab is open.
 
 MAX_PARALLEL_KEY = "pipeline_max_parallel"
+# The parallelism limit, kept apart from its widget's own state: the widget
+# lives in the Simulate tab, and Streamlit forgets a widget's value on a run
+# that does not draw it -- every run with another tab open -- while the tick
+# reads the limit on all of them.
+_MAX_PARALLEL_VALUE = "pipeline_max_parallel_value"
+
+
+def _max_parallel() -> int:
+    return int(st.session_state.get(_MAX_PARALLEL_VALUE, 2))
+
+
+def _keep_max_parallel() -> None:
+    st.session_state[_MAX_PARALLEL_VALUE] = int(st.session_state[MAX_PARALLEL_KEY])
 
 _STATUS_MARKUP = {
     sim_experiments.WAITING: ":orange[:material/hourglass_top: waiting]",
@@ -1226,19 +1241,17 @@ def _past_experiment_rows(past: list[dict]) -> list[dict]:
     return rows
 
 
-def _render_pipeline_body(auto_refresh: bool) -> None:
+def _render_pipeline_body() -> None:
     col_head, col_workers = st.columns([4, 1], vertical_alignment="bottom")
     col_head.markdown("##### :material/stacks: Experiment pipeline")
-    max_parallel = col_workers.number_input(
-        "Parallel workers", min_value=1, max_value=8, value=2, key=MAX_PARALLEL_KEY,
+    col_workers.number_input(
+        "Parallel workers", min_value=1, max_value=8, value=_max_parallel(),
+        key=MAX_PARALLEL_KEY, on_change=_keep_max_parallel,
         help="Experiments beyond this limit wait in the queue. Each experiment "
              "runs in its own worker process.",
     )
-    sim_experiments.tick(max_parallel)
     exps = sim_experiments.list_experiments()
     active = [e for e in exps if e["status"] in sim_experiments.ACTIVE_STATUSES]
-    if auto_refresh and not active:
-        st.rerun()  # pipeline just drained -- refresh the whole app once
 
     counts = {
         status: sum(1 for e in exps if e["status"] == status)
@@ -1303,12 +1316,27 @@ def _render_pipeline_body(auto_refresh: bool) -> None:
 
 
 def _render_pipeline() -> None:
-    # While experiments are active the section refreshes itself (which also
-    # ticks the scheduler); once idle it renders statically until the next
-    # full rerun.
+    """The queue, in the Simulate tab. While experiments are active it
+    refreshes itself; once idle it renders statically until the next full
+    rerun. It shows the scheduler's work, and `_tick_pipeline` does it."""
+    auto_refresh = sim_experiments.has_active()
+    st.fragment(run_every=2.5 if auto_refresh else None)(_render_pipeline_body)()
+
+
+def _tick_pipeline_body(auto_refresh: bool) -> None:
+    sim_experiments.tick(_max_parallel())
+    if auto_refresh and not sim_experiments.has_active():
+        st.rerun()  # pipeline just drained -- refresh the whole app once
+
+
+def _tick_pipeline() -> None:
+    """The scheduler's tick, above the tabs and drawing nothing: the tabs only
+    run while open (`build_ui`), and a tick that ran only with Simulate open
+    would stall a batch the moment anyone went to read a result. Every 2.5 s
+    while experiments are active, once a full rerun otherwise."""
     auto_refresh = sim_experiments.has_active()
     st.fragment(run_every=2.5 if auto_refresh else None)(
-        lambda: _render_pipeline_body(auto_refresh)
+        lambda: _tick_pipeline_body(auto_refresh)
     )()
 
 
@@ -2500,6 +2528,8 @@ def _render_briefing_coverage(race, prefix: str) -> None:
 
 
 def render_simulate_tab() -> None:
+    _render_pipeline()
+    st.divider()
     datasets = sim_data.list_datasets()
     if not datasets:
         st.info("Download a dataset first (Datasets tab).")
@@ -2726,7 +2756,7 @@ def render_simulate_tab() -> None:
                     "judge_model": judge_model or model,
                     "judge_api_key": judge_api_key or api_keys.get(provider, ""),
                 })
-            sim_experiments.tick(int(st.session_state.get(MAX_PARALLEL_KEY, 2)))
+            sim_experiments.tick(_max_parallel())
             st.toast(f"{len(to_queue)} experiment(s) queued",
                      icon=":material/rocket_launch:")
             st.rerun()
@@ -6194,15 +6224,12 @@ def build_ui() -> None:
         "Replay the trading agents against stored historical sessions: same prompts, same "
         "tools, same execution path as live — hours of tape in minutes of simulation."
     )
-    # Above the tabs, not inside Simulate, because the queue is the app's and
-    # not that tab's: `on_change="rerun"` below makes the tabs lazy, and a
-    # pipeline that only renders while Simulate is open is a scheduler that only
-    # ticks while Simulate is open -- so a batch would stall the moment anyone
-    # went to read a result. It is also the honest place for it: experiments run
-    # whatever is on screen.
+    # The experiment queue is shown in the Simulate tab, but its scheduler
+    # ticks here, above the tabs: `on_change="rerun"` below makes the tabs lazy,
+    # and a tick that only ran while Simulate is open would stall a batch the
+    # moment anyone went to read a result. Experiments run whatever is on screen.
     _repair_incomplete_store()
-    _render_pipeline()
-    st.divider()
+    _tick_pipeline()
     (
         tab_agents, tab_models, tab_tuning, tab_drift, tab_ml_summary, tab_datasets, tab_sim,
         tab_results, tab_summary,
