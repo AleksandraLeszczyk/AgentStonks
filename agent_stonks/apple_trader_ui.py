@@ -831,9 +831,10 @@ def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
 def breach_param(defaults: AppleTraderConfig, copy: FormCopy, scope: str = "") -> str:
     """What happens when the session trades outside the forecast.
 
-    Its default is per instrument since 2026-10-25 (`apple_trader.breach_for`:
-    "shift" on the thinly traded names), so a single run's form passes the
-    ticker as `scope` and switching symbol re-seeds it. Only where the key has
+    Its default can be per instrument (`apple_trader.breach_for`; from
+    2026-10-25 to 10-26 "shift" on the thinly traded names, Brownian on the
+    rest, and "shift" on all since), so a single run's form passes the ticker
+    as `scope` and switching symbol re-seeds it. Only where the key has
     no base digest on it, though: a base is one pair's, so its digest already
     makes the key the pair's own -- and keeps what the remembered setup holds
     under it. Orchestra's pairs share one policy and pass no scope.

@@ -240,18 +240,20 @@ def _two_symbol_form() -> None:
 
 
 class TestBreachPerInstrument:
-    """The breach policy's default follows the instrument (2026-10-25), so
+    """The breach policy's default can follow the instrument (per instrument
+    from 2026-10-25; one default for all since 10-26, the table kept), so
     switching symbol re-seeds it -- where no base digest scopes the key already."""
 
-    def test_switching_symbol_reseeds_the_policy(self, form):
+    def test_switching_symbol_reseeds_the_policy(self, form, monkeypatch):
+        monkeypatch.setitem(at.APPLE_TRADER_BREACH_UPDATE_BY_TICKER, "AMGN", "brownian")
         app = form(AppTest.from_function(_two_symbol_form, default_timeout=30))
-        assert app.session_state["out"].breach_update == "brownian"
+        assert app.session_state["out"].breach_update == "shift"
         app.selectbox(key="t_ticker").select("AMGN").run()
         assert not app.exception
-        assert app.selectbox(key="t_breach_update_AMGN").value == "shift"
-        assert app.session_state["out"].breach_update == "shift"
-        app.selectbox(key="t_ticker").select("AAPL").run()
+        assert app.selectbox(key="t_breach_update_AMGN").value == "brownian"
         assert app.session_state["out"].breach_update == "brownian"
+        app.selectbox(key="t_ticker").select("AAPL").run()
+        assert app.session_state["out"].breach_update == "shift"
 
     def test_a_pairs_base_keeps_its_key_and_its_policy(self, form):
         base_configs.set_base(asdict(_base(breach_update="shift")))

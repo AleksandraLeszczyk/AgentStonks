@@ -240,8 +240,8 @@ def breach_for(ticker: str, model_key: "str | None" = None, use_base: bool = Tru
     """What a breach of the forecast does on a run of this model on this
     symbol, as it starts: the pair's base configuration (`base_configs`) unless
     `use_base` is off, then the instrument's own policy
-    (`config.APPLE_TRADER_BREACH_UPDATE_BY_TICKER`: "shift" on the thinly
-    traded names), else the shared default, the Brownian extension. A base
+    (`config.APPLE_TRADER_BREACH_UPDATE_BY_TICKER`, empty since 2026-10-26),
+    else the shared default, the extreme so far ("shift"). A base
     naming a policy this app does not know is passed over, as `default_config`
     passes over the whole of such a base."""
     symbol = (ticker or DEFAULT_TICKER).strip().upper()

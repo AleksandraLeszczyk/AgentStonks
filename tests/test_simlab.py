@@ -1268,11 +1268,11 @@ class TestRuleAgentRecords:
         assert "breach" not in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="highlow")))
-        assert today.breach_update == "brownian"
+        assert today.breach_update == "shift"
         assert "levels=" not in agent.signature(today)   # the default source signs nothing
-        assert ",breach=brownian" in agent.signature(today)
+        assert ",breach=shift" in agent.signature(today)
         assert agent.signature(today) != agent.signature(
-            replace(today, breach_update="shift")
+            replace(today, breach_update="brownian")
         )
 
 

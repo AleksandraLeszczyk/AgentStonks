@@ -2124,10 +2124,11 @@ class TestStrategySelection:
             )
             assert signed == off[:-1] + f",breach={policy})"
 
-    def test_the_intraday_update_defaults_to_brownian(self):
+    def test_the_intraday_update_defaults_to_the_extreme_so_far(self):
         """`dayrange_config` pins it off; the app's own default does not. The
-        Brownian extension since 2026-09-29 ("shift" before)."""
-        assert AppleTraderConfig().breach_update == "brownian"
+        extreme so far since 2026-10-26 (the Brownian extension from 09-29,
+        "shift" before)."""
+        assert AppleTraderConfig().breach_update == "shift"
 
     def test_an_unknown_update_policy_is_refused(self):
         """Read as "off" once a record carries it, but refused while a config is
@@ -2242,25 +2243,27 @@ class TestStopDefaults:
 
 
 class TestBreachDefaults:
-    """What a breach of the forecast does starts per instrument (2026-10-25):
-    the Brownian extension on the heavily traded names, the extreme so far on
-    the thin ones."""
+    """What a breach of the forecast does starts at the extreme so far on every
+    instrument (2026-10-26; per instrument from 10-25, Brownian on the heavily
+    traded names)."""
 
-    @pytest.mark.parametrize("ticker", ["AAPL", "AMD", "INTC", "MU", "NVDA"])
-    def test_the_heavily_traded_names_extend_past_the_extreme(self, ticker):
-        assert AppleTraderConfig(model_key="highlow", ticker=ticker).breach_update == "brownian"
-
-    @pytest.mark.parametrize("ticker", ["AMGN", "TMO"])
-    def test_the_thin_names_move_to_the_extreme_so_far(self, ticker):
+    @pytest.mark.parametrize("ticker", ["AAPL", "AMD", "INTC", "MU", "NVDA", "AMGN", "TMO"])
+    def test_every_instrument_moves_to_the_extreme_so_far(self, ticker):
         config = AppleTraderConfig(model_key="highlow", ticker=ticker)
         assert config.breach_update == "shift"
         assert ",breach=shift" in config_signature(config)
 
-    def test_highlow2_follows_the_instrument_too(self):
-        assert AppleTraderConfig(model_key="highlow2", ticker="AAPL").breach_update == "brownian"
+    def test_highlow2_too(self):
+        assert AppleTraderConfig(model_key="highlow2", ticker="AAPL").breach_update == "shift"
 
     def test_a_symbol_with_no_entry_takes_the_shared_default(self):
-        assert at.breach_for("ZZZZ", "highlow") == at.APPLE_TRADER_BREACH_UPDATE == "brownian"
+        assert at.breach_for("ZZZZ", "highlow") == at.APPLE_TRADER_BREACH_UPDATE == "shift"
+
+    def test_an_instruments_own_policy_wins_over_the_shared_one(self, monkeypatch):
+        """The table is empty, but still read."""
+        monkeypatch.setitem(at.APPLE_TRADER_BREACH_UPDATE_BY_TICKER, "TMO", "brownian")
+        assert at.breach_for("TMO", "highlow") == "brownian"
+        assert at.breach_for("AMGN", "highlow") == "shift"
 
     def test_a_policy_given_explicitly_wins(self):
         assert AppleTraderConfig(
@@ -2270,7 +2273,7 @@ class TestBreachDefaults:
             model_key="highlow", ticker="AAPL", breach_update="off"
         ).breach_update == "off"
 
-    def test_the_pairs_base_configuration_wins_over_the_instrument(self):
+    def test_the_pairs_base_configuration_wins_over_the_default(self):
         from agent_stonks import base_configs
 
         base_configs.set_base(asdict(

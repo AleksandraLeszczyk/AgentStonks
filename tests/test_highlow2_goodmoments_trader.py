@@ -373,7 +373,7 @@ class TestWiring:
         config = hybrid_config(skip_events=())
         assert config_signature(config) == (
             "highlow2_goodmoments_AAPL(enter=+0.02,exit=off,take=0.2A,stop=0.75A,raise=0.05/stop,"
-            "buy<=H-0.6R,breach=brownian,keep_width,size=95%)"
+            "buy<=H-0.6R,breach=shift,keep_width,size=95%)"
         )
         assert config_signature(replace(config, buy_k=0.8)) != config_signature(config)
         assert config_signature(replace(config, sell_k=0.3, stop_gain_fraction=0.9)) == config_signature(config)

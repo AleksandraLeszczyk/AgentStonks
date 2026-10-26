@@ -286,14 +286,19 @@ class TestDayRangeOverlay:
         assert band["upper"][-1] == pytest.approx(208.80, abs=0.01)
         assert band["upper"][-1] - band["lower"][-1] == pytest.approx(12.0)
 
-    def test_the_default_brownian_revision_ends_at_the_last_bar(self, monkeypatch):
-        """Under the default Brownian update the breached low goes past the
-        session's own 196.80 by the reach still to come and the high follows at
-        the forecast's width -- and nothing is drawn past the newest bar."""
+    def test_the_brownian_revision_ends_at_the_last_bar(self, monkeypatch):
+        """Under the Brownian update (the default from 2026-09-29 to 10-26) the
+        breached low goes past the session's own 196.80 by the reach still to
+        come and the high follows at the forecast's width -- and nothing is
+        drawn past the newest bar."""
+        from agent_stonks.apple_trader import AppleTraderConfig
+
         self.stub_forecast(monkeypatch)
         bars = minute_bars()
         band = mo.compute([mo.HIGHLOW_RANGE_KEY], "AAPL", bars,
-                          daily_bars=[], session_date=SESSION)["items"][0]
+                          daily_bars=[], session_date=SESSION,
+                          trader_config=AppleTraderConfig(
+                              ticker="AAPL", breach_update="brownian"))["items"][0]
         assert band["kind"] == "band" and not band["forward"]
         assert band["lower"][-1] < 196.80
         assert band["upper"][-1] - band["lower"][-1] == pytest.approx(12.0)

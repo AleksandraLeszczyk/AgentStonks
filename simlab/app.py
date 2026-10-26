@@ -2031,9 +2031,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "In the signature unless held, so each queues as its own configuration — "
             "the only way to find out what it is worth, since the levels were swept with "
             "the forecast fixed.\n\n"
-            "The default is per instrument: Brownian on the heavily traded names (AAPL, "
-            "AMD, INTC, MU, NVDA), the extreme so far on the thinner AMGN and TMO — "
-            "unless the pair's base configuration says otherwise."
+            "The default is the extreme so far, on every instrument — unless the pair's "
+            "base configuration says otherwise."
         ),
         "contain_range": (
             "Whether the forecast is always widened to hold what the session has printed "
