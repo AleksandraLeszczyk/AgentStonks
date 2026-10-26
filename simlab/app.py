@@ -5781,22 +5781,23 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
         {
             "model": _apple_model_label(m["model_key"]),
             "per_session": m["per_session"],
-            "profit": m["profit"],
+            "session_std": m["session_std"],
             "in_profit": f"{m['in_profit']} of {m['instruments']}",
             "best": m["best"],
             "worst": m["worst"],
         }
         for m in models
-    ]), hide_index=True, column_config={
+    ]), hide_index=True, placeholder="—", column_config={
         "model": "Model",
         "per_session": money(
             "Profit a session ($)", format="%+.2f",
             help="The mean over its instruments of each one's profit a session: every "
             "instrument is its own account, so each counts alike.",
         ),
-        "profit": money(
-            "Profit per instrument ($)", format="%+.2f",
-            help="The mean over its instruments of each one's profit over the window.",
+        "session_std": money(
+            "Std a session ($)", format="%.2f",
+            help="The mean over its instruments of each one's standard deviation of profit "
+            "from session to session over the window.",
         ),
         "in_profit": "Instruments in profit",
         "best": "Best instrument",
@@ -5833,7 +5834,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "model": _apple_model_label(r["model_key"]),
             "per_session": r["per_session"],
             "return_pct": r["return_pct"],
-            "profit": r["profit"],
+            "session_std": r["session_std"],
             "sessions": r["sessions"],
             "days": f"{r['days_up']} up · {r['days_down']} down",
             "best_day": r["best_day"],
@@ -5847,13 +5848,17 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "jobs": ", ".join(r["job_ids"]),
         }
         for r in sorted(rows, key=lambda r: r["per_session"], reverse=True)
-    ]), hide_index=True, column_config={
+    ]), hide_index=True, placeholder="—", column_config={
         "ticker": "Instrument",
         "model": "Model",
         "per_session": money("Profit a session ($)", format="%+.2f"),
         "return_pct": money("Return a session", format="%+.3f%%",
                             help="Profit a session as a share of the starting cash."),
-        "profit": money("Total profit ($)", format="%+.2f"),
+        "session_std": money(
+            "Std a session ($)", format="%.2f",
+            help="The standard deviation of the profit from session to session over the "
+            "window, every session counted, traded or not.",
+        ),
         "sessions": "Sessions",
         "days": "Days",
         "best_day": money("Best day ($)", format="%+.2f"),
@@ -5928,7 +5933,7 @@ def _render_ml_best(best: "list[dict]", window: str) -> None:
             "ticker": b["ticker"],
             "model": _ml_model(b["model_key"]),
             "per_session": b["per_session"],
-            "profit": b["profit"],
+            "session_std": b["session_std"],
             "days": f"{b['days_up']} up · {b['days_down']} down of {b['sessions']}",
             "runner_up": _ml_model(b["runner_up"]) if b["runner_up"] else None,
             "runner_up_per_session": b["runner_up_per_session"],
@@ -5940,7 +5945,11 @@ def _render_ml_best(best: "list[dict]", window: str) -> None:
         "ticker": "Instrument",
         "model": "Best model",
         "per_session": money("Profit a session ($)", format="%+.2f"),
-        "profit": money("Profit ($)", format="%+.2f", help="Over the window."),
+        "session_std": money(
+            "Std a session ($)", format="%.2f",
+            help="The standard deviation of the best model's profit from session to "
+            "session over the window.",
+        ),
         "days": "Days",
         "runner_up": "Runner-up",
         "runner_up_per_session": money("Runner-up a session ($)", format="%+.2f"),
