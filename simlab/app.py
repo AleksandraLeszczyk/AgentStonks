@@ -484,6 +484,18 @@ def _incomplete_note(item: "sim_data.IncompleteFile") -> str:
     return "no longer downloadable on this feed"
 
 
+def _queue_add_symbols(name: str) -> None:
+    """A row's "Add symbol" submit: hand the symbols to this run's download
+    (above the list) and close the popover, which would otherwise sit open
+    over the download's progress."""
+    raw = st.session_state.get(f"add_sym_{name}", "")
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    if symbols:
+        st.session_state["ds_add_symbols"] = (name, symbols)
+        st.session_state[f"add_sym_{name}"] = ""
+        st.session_state[f"add_sym_pop_{name}"] = False
+
+
 def render_datasets_tab() -> None:
     st.caption(
         "Datasets are named bundles of symbols + a date range + a **feed**. Minute bars "
@@ -554,6 +566,22 @@ def render_datasets_tab() -> None:
                 except Exception as exc:
                     status.update(label=f"Download failed: {exc}", state="error")
 
+    # A row's "Add symbol" form, submitted on the run before: downloaded here,
+    # where the form above shows its download, so the list below is current.
+    adding = st.session_state.pop("ds_add_symbols", None)
+    if adding:
+        ds_name, new_symbols = adding
+        with st.status(f"Adding {', '.join(new_symbols)} to '{ds_name}'…", expanded=True) as status:
+            try:
+                ds = sim_data.add_symbols(ds_name, new_symbols, api_key, api_secret, progress=st.write)
+                status.update(
+                    label=f"Dataset '{ds.name}' now carries {', '.join(ds.symbols)} — "
+                    f"{len(ds.days)} trading day(s)",
+                    state="complete",
+                )
+            except Exception as exc:
+                status.update(label=f"Adding to '{ds_name}' failed: {exc}", state="error")
+
     datasets = sim_data.list_datasets()
     st.divider()
     if not datasets:
@@ -570,6 +598,23 @@ def render_datasets_tab() -> None:
                 f"**{ds.name}** — {', '.join(ds.symbols)} · {ds.start} → {ds.end} "
                 f"· {len(ds.days)} trading day(s) · `{ds.feed}`"
             )
+            with st.popover(
+                "Add symbol", icon=":material/add:", key=f"add_sym_pop_{ds.name}",
+                on_change="rerun",
+            ):
+                with st.form(f"add_sym_form_{ds.name}", border=False):
+                    st.text_input(
+                        "Symbols (comma-separated)", placeholder="MSFT, AMD",
+                        key=f"add_sym_{ds.name}",
+                    )
+                    st.caption(
+                        f"Downloaded over {ds.start} → {ds.end} on `{ds.feed}`, only what the "
+                        "store is missing. The symbols already in the dataset are left alone."
+                    )
+                    st.form_submit_button(
+                        "Download and add", icon=":material/download:", type="primary",
+                        on_click=_queue_add_symbols, args=(ds.name,),
+                    )
             if st.button("Delete", key=f"del_ds_{ds.name}", icon=":material/delete:"):
                 sim_data.delete_dataset(ds.name)
                 st.rerun()

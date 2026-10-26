@@ -939,18 +939,7 @@ def create_dataset(
     if feed != "yfinance" and not (key and secret):
         raise ValueError(f"the {feed!r} feed needs Alpaca credentials")
 
-    # Yahoo's 1-minute history stops ~30 days back. Say so up front rather than
-    # letting the run finish with a handful of silently empty days: those days
-    # are indistinguishable from holidays once stored.
-    if feed == "yfinance":
-        horizon = date.today() - timedelta(days=YF_MINUTE_WINDOW_DAYS)
-        if start < horizon:
-            progress(
-                f"warning: yfinance serves 1-minute bars only back to {horizon} "
-                f"({YF_MINUTE_WINDOW_DAYS} days); days before that will store empty. "
-                "Use the 'live' or 'sip' feed (Alpaca) for an older window."
-            )
-
+    _warn_yfinance_horizon(start, feed, progress)
     session_days = download_days(symbols, start, end, key, secret, feed, progress)
 
     dataset = Dataset(
@@ -966,6 +955,69 @@ def create_dataset(
         existing = [d for d in list_datasets() if d.name != name]
         _save_manifest([*existing, dataset])
     progress(f"dataset '{name}' ready: {len(session_days)} trading day(s)")
+    return dataset
+
+
+def _warn_yfinance_horizon(start: date, feed: str, progress: ProgressCb) -> None:
+    """Yahoo's 1-minute history stops ~30 days back. Say so up front rather than
+    letting the run finish with a handful of silently empty days: those days
+    are indistinguishable from holidays once stored."""
+    if feed != "yfinance":
+        return
+    horizon = date.today() - timedelta(days=YF_MINUTE_WINDOW_DAYS)
+    if start < horizon:
+        progress(
+            f"warning: yfinance serves 1-minute bars only back to {horizon} "
+            f"({YF_MINUTE_WINDOW_DAYS} days); days before that will store empty. "
+            "Use the 'live' or 'sip' feed (Alpaca) for an older window."
+        )
+
+
+def add_symbols(
+    name: str,
+    symbols: list[str],
+    key: str = "",
+    secret: str = "",
+    progress: ProgressCb = _noop_progress,
+) -> Dataset:
+    """Add symbols to an existing dataset: download them over its range on its
+    feed -- only what the store is missing -- and add them to its manifest
+    entry. The range, the feed and the symbols already in it are left alone,
+    and so is everything stored for them. Returns the updated entry.
+
+    A symbol the dataset already carries is skipped; nothing new to add is an
+    error, as is a dataset that does not exist (or is removed meanwhile).
+    """
+    dataset = get_dataset(name)
+    if dataset is None:
+        raise ValueError(f"no dataset named {name!r}")
+    have = {s.upper() for s in dataset.symbols}
+    added: list[str] = []
+    for sym in (s.strip().upper() for s in symbols):
+        if sym and sym not in have and sym not in added:
+            added.append(sym)
+    if not added:
+        raise ValueError(f"dataset {name!r} already carries every symbol given")
+    if dataset.feed != "yfinance" and not (key and secret):
+        raise ValueError(f"the {dataset.feed!r} feed needs Alpaca credentials")
+
+    start, end = dataset.date_range()
+    _warn_yfinance_horizon(start, dataset.feed, progress)
+    session_days = download_days(added, start, end, key, secret, dataset.feed, progress)
+
+    # Re-read under the lock: the download takes minutes, and the entry may
+    # have been refreshed (`reconcile_dataset_days`) or removed meanwhile.
+    with _manifest_lock:
+        datasets = list_datasets()
+        dataset = next((d for d in datasets if d.name == name), None)
+        if dataset is None:
+            raise ValueError(f"dataset {name!r} was removed during the download")
+        dataset.symbols = [*dataset.symbols, *(s for s in added if s not in dataset.symbols)]
+        # A day is a session if any symbol has bars that day -- the new ones
+        # can only add days, never take one away.
+        dataset.days = sorted(set(dataset.days) | set(session_days))
+        _save_manifest(datasets)
+    progress(f"dataset '{name}' now carries {', '.join(dataset.symbols)}: {len(dataset.days)} trading day(s)")
     return dataset
 
 

@@ -441,6 +441,66 @@ class TestDatasetStore:
         sim_data.delete_dataset("wk")
         assert sim_data.get_dataset("wk") is None
 
+    def _fetchers(self, monkeypatch, calls):
+        def fake_minute(symbol, day, key, secret, feed="iex"):
+            calls.append((symbol, day, feed))
+            return [_bar(OPEN_UTC + timedelta(days=(day - DAY).days), 100.0)]
+
+        monkeypatch.setattr(sim_data, "fetch_minute_bars_day", fake_minute)
+        monkeypatch.setattr(sim_data, "fetch_news_day", lambda *a, **k: [])
+        monkeypatch.setattr(sim_data, "fetch_daily_bars_range", lambda *a, **k: [_bar(OPEN_UTC, 99.0)])
+        monkeypatch.setattr(sim_data, "fetch_market_indicator_closes", lambda *a, **k: {"spy": [], "vix": [], "vix3m": []})
+
+    def test_add_symbols_downloads_only_the_new_symbol_on_the_datasets_feed(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        sim_data.create_dataset("wk", ["TEST"], date(2026, 6, 15), date(2026, 6, 16), "k", "s", feed="sip")
+        calls.clear()
+
+        ds = sim_data.add_symbols("wk", [" new ", "test", "NEW"], "k", "s")
+
+        assert {sym for sym, _, _ in calls} == {"NEW"}
+        assert {feed for _, _, feed in calls} == {"sip"}
+        assert ds.symbols == ["TEST", "NEW"]
+        assert ds.days == ["2026-06-15", "2026-06-16"]
+        stored = sim_data.get_dataset("wk")
+        assert (stored.symbols, stored.start, stored.end, stored.feed) == (
+            ["TEST", "NEW"], "2026-06-15", "2026-06-16", "sip",
+        )
+        assert sim_data.load_day_bars("NEW", date(2026, 6, 16), "sip")
+
+    def test_add_symbols_only_adds_days(self, store, monkeypatch):
+        """The dataset's days are where any symbol has bars: a new symbol with
+        a day the others lack adds it, one without a day never drops it."""
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        sim_data.create_dataset("wk", ["TEST"], date(2026, 6, 15), date(2026, 6, 16), "k", "s", feed="sip")
+        # TEST has no session on the 16th; NEW has none on the 15th.
+        sim_data._write_gz(sim_data.bars_path("TEST", date(2026, 6, 16), "sip"), [])
+        sim_data._write_gz(sim_data.bars_path("NEW", date(2026, 6, 15), "sip"), [])
+        sim_data.MANIFEST_PATH.write_text(json.dumps([{
+            **json.loads(sim_data.MANIFEST_PATH.read_text())[0], "days": ["2026-06-15"],
+        }]))
+
+        ds = sim_data.add_symbols("wk", ["NEW"], "k", "s")
+
+        assert ds.days == ["2026-06-15", "2026-06-16"]
+
+    def test_add_symbols_refuses_nothing_new_and_unknown_datasets(self, store, monkeypatch):
+        calls = []
+        self._fetchers(monkeypatch, calls)
+        sim_data.create_dataset("wk", ["TEST"], DAY, DAY, "k", "s", feed="sip")
+        calls.clear()
+
+        with pytest.raises(ValueError, match="already carries"):
+            sim_data.add_symbols("wk", ["test", " "], "k", "s")
+        with pytest.raises(ValueError, match="no dataset"):
+            sim_data.add_symbols("nope", ["NEW"], "k", "s")
+        with pytest.raises(ValueError, match="needs Alpaca credentials"):
+            sim_data.add_symbols("wk", ["NEW"])
+        assert calls == []
+        assert sim_data.get_dataset("wk").symbols == ["TEST"]
+
 
 class TestFeedIsPartOfTheData:
     """`iex` and `sip` are different bars for the same day, not two routes to
