@@ -4695,7 +4695,14 @@ def _tuning_heatmap(
 
 
 def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
-    """The base configuration and the shown one on each dataset, then summed.
+    """The base configuration and the shown one on each dataset, then on
+    average over every session of them all.
+
+    Profit and return are a session's (since 2026-10-27, the user's: datasets
+    of different lengths were not comparable as totals), every session
+    counted, traded or not -- the heatmaps' *Profit a session*
+    (`tuning.daily_profit`). The last row is the summed cell's, so its
+    average weighs each session alike, not each dataset.
 
     The shown configuration is the pick, or the square clicked on a heatmap
     (`chosen`); its columns are `shown_*` either way.
@@ -4706,9 +4713,9 @@ def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
     def row(label: str, sessions: int, base: "dict | None", shown: "dict | None") -> dict:
         out = {"dataset": label, "sessions": sessions}
         for prefix, cell in (("base", base), ("shown", shown)):
-            scored = sim_tuning.is_scored(cell)
-            out[f"{prefix}_profit"] = cell["profit"] if scored else None
-            out[f"{prefix}_return"] = cell["return_pct"] if scored else None
+            scored = sim_tuning.is_scored(cell) and bool(cell.get("days"))
+            out[f"{prefix}_profit"] = sim_tuning.daily_profit(cell) if scored else None
+            out[f"{prefix}_return"] = cell["return_pct"] / cell["days"] if scored else None
             out[f"{prefix}_sharpe"] = sim_tuning.sharpe(cell) if scored else None
         scored = sim_tuning.is_scored(shown)
         out["shown_days"] = (
@@ -4731,10 +4738,11 @@ def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
     if len(datasets) > 1:
         # The pick summed afresh rather than as the record stored it: a pick
         # stored before sums kept their sessions has no spread to read.
+        # Summed, then read a session: the average over every session.
         best = job.get("best")
         overrides = chosen if chosen is not None else (best or {}).get("overrides")
         rows.append(row(
-            f"Sum of {len(datasets)}", sum(len(d["days"]) for d in datasets),
+            f"Average of {len(datasets)}", sum(len(d["days"]) for d in datasets),
             sim_tuning.summed_baseline(job),
             sim_tuning.summed_cell(job, overrides) if overrides is not None else None,
         ))
@@ -4767,7 +4775,7 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
     (`apple_trader.default_config`): its base configuration, else the shipped
     defaults -- and the shown one, the pick or the square clicked, side by side
     in words, setting by setting (`tuning.compare_settings`), what the shown
-    one changes tinted; then both signatures, the form Results and the
+    one changes tinted; then both signatures, folded away -- the form Results and the
     Simulate tab name runs by.
 
     The current default rather than the job's own base: it is what "Set as
@@ -4820,14 +4828,17 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
         + f" Set these in an Apple Trader setup on the Simulate tab to replay "
         f"{'the pick' if chosen is None else 'it'} with its full ledger, charts and decisions."
     )
+    # Folded away: the table above says the same in words, and the signatures
+    # are only wanted to find a run in Results or the Simulate tab.
     signature = rule_agent(APPLE_TRADER_KEY).signature
-    col_base, col_other = st.columns(2)
-    with col_base:
-        st.caption("Current default as a signature")
-        st.code(signature(default), language=None, wrap_lines=True)
-    with col_other:
-        st.caption(f"{who} as a signature")
-        st.code(signature(other), language=None, wrap_lines=True)
+    with st.expander(f"Current default and {who.lower()} as signatures"):
+        col_base, col_other = st.columns(2)
+        with col_base:
+            st.caption("Current default")
+            st.code(signature(default), language=None, wrap_lines=True)
+        with col_other:
+            st.caption(who)
+            st.code(signature(other), language=None, wrap_lines=True)
 
 
 def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> None:
@@ -5571,9 +5582,10 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     elif sim_tuning.is_derived(job):
         _render_derived_header(job)
 
-    signature = rule_agent(APPLE_TRADER_KEY).signature(sim_tuning.make_config(spec["base"], {}))
+    # The configuration itself is said once, in the table under the profits
+    # (`_render_tuning_config_compare`), not again up here.
     st.caption(
-        f"Base `{signature}` · pick: best total profit"
+        "Pick: best total profit"
         + (f" over {len(names)} datasets" if len(names) > 1 else "")
         + f", {_PICK_LABELS.get(spec.get('rule'), spec.get('rule')).lower()}, trading on at "
         f"least {float(spec.get('min_traded_share') or 0):.0%} of days · starting cash "
@@ -5592,12 +5604,6 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     # the verdict above stays about the pick.
     chosen = _tuning_chosen(job)
     who = "Pick" if chosen is None else "Selected"
-    base_values = {a["name"]: spec["base"][a["name"]] for a in axes}
-    st.caption(
-        f"Base configuration: {_tuning_values_text(base_values)}"
-        + (f" · Pick: {_tuning_values_text(best['overrides'])}" if best else "")
-        + (f" · **Selected: {_tuning_values_text(chosen)}**" if chosen else "")
-    )
     if chosen is not None:
         with st.container(horizontal=True, vertical_alignment="center"):
             st.caption(
@@ -5614,11 +5620,11 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         column_config={
             "dataset": "Dataset",
             "sessions": "Sessions",
-            "base_profit": money("Base profit ($)", format="%+.2f"),
-            "base_return": money("Base return", format="%+.2f%%"),
+            "base_profit": money("Base profit / session ($)", format="%+.2f"),
+            "base_return": money("Base return / session", format="%+.3f%%"),
             "base_sharpe": money("Base Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
-            "shown_profit": money(f"{who} profit ($)", format="%+.2f"),
-            "shown_return": money(f"{who} return", format="%+.2f%%"),
+            "shown_profit": money(f"{who} profit / session ($)", format="%+.2f"),
+            "shown_return": money(f"{who} return / session", format="%+.3f%%"),
             "shown_sharpe": money(f"{who} Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
             "shown_days": f"{who} days",
             "shown_win_rate": money(

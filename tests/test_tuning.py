@@ -913,9 +913,14 @@ class TestClickedSquare:
         chosen = {"buy_k": 0.3}
         assert tu.summed_cell(record, chosen)["profit"] == 200.0
 
+        # A session's profit, 5 sessions each; the last row the average over
+        # all 10 of them.
         shown = lambda rows: [r["shown_profit"] for r in rows]  # noqa: E731
-        assert shown(sim_app._tuning_summary_rows(record)) == [400.0, 350.0, 750.0]
-        assert shown(sim_app._tuning_summary_rows(record, chosen)) == [900.0, -700.0, 200.0]
+        assert shown(sim_app._tuning_summary_rows(record)) == [80.0, 70.0, 75.0]
+        assert shown(sim_app._tuning_summary_rows(record, chosen)) == [180.0, -140.0, 20.0]
+        rows = sim_app._tuning_summary_rows(record, chosen)
+        assert rows[-1]["dataset"] == "Average of 2"
+        assert [r["shown_return"] for r in rows] == pytest.approx([1.8, -1.4, 0.2])
 
         monkeypatch.setattr(sim_app, "_tuning_session_bars", lambda sym, feed, days: {})
         fig = sim_app._tuning_daily_chart(record, chosen=chosen)
@@ -1084,6 +1089,8 @@ class TestConfigCompare:
         app = self.app(record, chosen={"buy_k": 0.5})
         assert "current default vs selected" in app.markdown[0].value
         default = default_config(TICKER, record["spec"]["base"]["model_key"])
+        # Folded away under the table, like "New tuning job".
+        assert app.expander[0].label == "Current default and selected as signatures"
         signatures = [c.value for c in app.code]
         assert signatures[0] == rule_agent_signature(default)
         assert "the shipped defaults" in app.caption[0].value
