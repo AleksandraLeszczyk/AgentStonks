@@ -21,6 +21,13 @@ together. A pair the app can trade with no base stored is not tuned -- no job
 has scored a replay of it, or none of its jobs' picks was set as its base --
 and is listed apart (`untuned_pairs`) rather than left to go missing.
 
+A replay that differs from the stored base only by sitting out fewer kinds of
+special session -- a job run with days off cleared, whose pick was saved with
+some kinds switched off (`tuning.without_days`) -- is the base's replay too. On
+the sessions the base leaves out it traded, so the event table shows what they
+made, while the profits and returns count them as the flat sessions the base's
+rule makes them (`BaseSeries.left_out`).
+
 Event days are classified after the fact (`events_by_day`), not as a trader
 would have had to that morning: the calendar's every row, known before the open
 or not, the day after a report from the earnings dates SimLab keeps, and a
@@ -33,7 +40,7 @@ from __future__ import annotations
 
 import csv
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -84,6 +91,10 @@ class BaseSeries:
     daily: "dict[str, float]" = field(default_factory=dict)
     sat_out: "set[str]" = field(default_factory=set)
     no_forecast: "set[str]" = field(default_factory=set)
+    # Sessions the configuration's days-off rule sits out that a replay of it
+    # with a looser rule traded, and the kinds of session why: `daily` holds
+    # what they made, `profit` the nothing the rule makes of them.
+    left_out: "dict[str, tuple[str, ...]]" = field(default_factory=dict)
 
     @property
     def last_day(self) -> str:
@@ -94,11 +105,33 @@ class BaseSeries:
         by its own rule, and with a forecast to trade on."""
         return day not in self.sat_out and day not in self.no_forecast
 
-    def add(self, cell: dict) -> None:
-        """One replay's sessions, over whatever an earlier one said of them."""
-        self.daily.update({str(d): float(p) for d, p in (cell.get("daily") or {}).items()})
-        self.sat_out |= {str(d) for d in cell.get("sat_out_days") or ()}
-        self.no_forecast |= {str(d) for d in cell.get("no_forecast_days") or ()}
+    def profit(self, day: str) -> float:
+        """What the configuration made on `day` by its own rule: nothing on a
+        session it leaves out, whatever the replay that traded it made."""
+        return 0.0 if day in self.left_out else self.daily[day]
+
+    def add(self, cell: dict, left_out: "dict[str, tuple[str, ...]] | None" = None) -> None:
+        """One replay's sessions, over whatever an earlier one said of them --
+        except that a session it sat out never replaces one an earlier replay
+        traded, the only answer to what that session made. `left_out`: this
+        replay's sessions the series' rule sits out, with the kinds why
+        (`_stored_base`)."""
+        sat = {str(d) for d in cell.get("sat_out_days") or ()}
+        unforecast = {str(d) for d in cell.get("no_forecast_days") or ()}
+        for day, made in (cell.get("daily") or {}).items():
+            day = str(day)
+            if day in sat and day in self.daily and day not in self.sat_out:
+                continue
+            self.daily[day] = float(made)
+            for found, days in ((self.sat_out, sat), (self.no_forecast, unforecast)):
+                if day in days:
+                    found.add(day)
+                else:
+                    found.discard(day)
+            if left_out and day in left_out and day not in sat:
+                self.left_out[day] = left_out[day]
+            else:
+                self.left_out.pop(day, None)
 
 
 def _new_series(config, job: dict, source: str) -> BaseSeries:
@@ -144,18 +177,53 @@ def _replays(job: dict):
                 yield decoded[key], cell
 
 
+def _trades_more_days(replayed, config) -> bool:
+    """Whether `replayed` is `config` but for sitting out fewer kinds of special
+    session -- a replay of it on every session `config` trades."""
+    return set(replayed.skip_events) < set(config.skip_events) and (
+        replace(replayed, skip_events=config.skip_events) == config
+    )
+
+
+def _special_kinds(job: dict) -> "dict[str, set[str]]":
+    """{ISO day: kinds of special session} over a job's datasets, as a
+    replay's days-off check finds them (`special_days.special_days`), on the
+    earnings dates SimLab keeps -- never a fetch."""
+    from . import special_days
+
+    found: "dict[str, set[str]]" = {}
+    for row in special_days.special_days(job["spec"], earnings=_kept_earnings):
+        found.setdefault(row["day"], set()).add(row["category"])
+    return found
+
+
 def _stored_base(jobs: "list[dict]", config, set_at: str) -> "BaseSeries | None":
-    """Every replay of `config` in `jobs`, the newest job's on a shared session."""
+    """Every replay of `config` in `jobs`, the newest job's on a shared session.
+
+    A replay sitting out fewer kinds of special session than `config`
+    (`_trades_more_days`) is one too, its sessions of the kinds `config` adds
+    marked as left out (`BaseSeries.left_out`).
+    """
     out = None
     for job in sorted(jobs, key=lambda j: str(j.get("created_at") or "")):
         matched = False
+        kinds = None
         for replayed, cell in _replays(job):
+            left_out = None
             if replayed != config:
-                continue
+                if not _trades_more_days(replayed, config):
+                    continue
+                if kinds is None:
+                    kinds = _special_kinds(job)
+                extra = set(config.skip_events) - set(replayed.skip_events)
+                left_out = {
+                    day: tuple(k for k in event_days.CATEGORIES if k in extra & found)
+                    for day, found in kinds.items() if extra & found
+                }
             if out is None:
                 out = _new_series(config, job, FROM_BASE)
                 out.job_ids = []
-            out.add(cell)
+            out.add(cell, left_out)
             matched = True
         if matched:
             out.job_ids.insert(0, job["job_id"])
@@ -307,7 +375,7 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
     days = _days(s, span)
     if not days:
         return None
-    profits = [s.daily[d] for d in days]
+    profits = [s.profit(d) for d in days]
     total = sum(profits)
     per_session = total / len(days)
     std = statistics.stdev(profits) if len(profits) > 1 else None
@@ -329,7 +397,7 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
         "days_down": sum(1 for p in profits if p < -flat),
         "best_day": max(profits),
         "worst_day": min(profits),
-        "sat_out": sum(1 for d in days if d in s.sat_out),
+        "sat_out": sum(1 for d in days if d in s.sat_out or d in s.left_out),
         "skip_events": s.skip_events,
     }
 
@@ -406,7 +474,7 @@ def weekly(series: "list[BaseSeries]", span: "tuple[str, str]") -> "list[dict]":
         for d in _days(s, span):
             day = date.fromisoformat(d)
             weeks.setdefault((day - timedelta(days=day.weekday())).isoformat(), []).append(
-                s.daily[d]
+                s.profit(d)
             )
         out += [
             {"model_key": s.model_key, "ticker": s.ticker, "week": week,
@@ -514,12 +582,19 @@ def event_impact(
     trade on), the difference, and that difference in the normal days' spread
     (None with fewer than two). A day the base sat out or had no forecast is a
     row with `profit` None, so a reader sees it was not counted.
+
+    A day the base's rule leaves out but a replay traded (`BaseSeries.left_out`)
+    is a row with what that replay made, `left_out` set -- whether or not
+    `events` dates it -- and never a normal day.
     """
     rows: "list[dict]" = []
     normals: "list[dict]" = []
     for s in series:
         days = _days(s, span)
-        normal = [s.daily[d] for d in days if s.counted(d) and not events.get((s.ticker, d))]
+        normal = [
+            s.daily[d] for d in days
+            if s.counted(d) and d not in s.left_out and not events.get((s.ticker, d))
+        ]
         mean = statistics.fmean(normal) if normal else None
         spread = statistics.pstdev(normal) if len(normal) > 1 else None
         normals.append({
@@ -527,7 +602,9 @@ def event_impact(
             "normal_days": len(normal), "normal_mean": mean, "normal_spread": spread,
         })
         for d in days:
-            day_events = events.get((s.ticker, d))
+            day_events = events.get((s.ticker, d)) or [
+                DayEvent(kind, "") for kind in s.left_out.get(d, ())
+            ]
             if not day_events:
                 continue
             counted = s.counted(d) and mean is not None
@@ -541,6 +618,7 @@ def event_impact(
                 "delta": delta,
                 "sigma": delta / spread if counted and spread else None,
                 "sat_out": d in s.sat_out,
+                "left_out": d in s.left_out,
             })
     return rows, normals
 

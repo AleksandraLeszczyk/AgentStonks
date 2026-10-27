@@ -359,3 +359,73 @@ class TestEventImpact:
         assert (day["better"], day["worse"]) == (1, 1)
         assert (day["best"]["ticker"], day["worst"]["ticker"]) == ("MU", "AMD")
         assert [i["ticker"] for i in ms.instrument_impact(rows)] == ["MU", "AMD"]
+
+
+class TestLeftOutDays:
+    """A stored base saved with special days switched off on a job that traded
+    them (`tuning.without_days`): its replays are that job's, the left-out
+    sessions flat in the profits and shown as replayed in the event table."""
+
+    CPI_DAY = "2026-10-14"
+
+    @pytest.fixture(autouse=True)
+    def _calendar(self, monkeypatch):
+        from simlab import special_days
+
+        monkeypatch.setattr(event_days, "load_calendar", lambda *a, **k: [{
+            "date": self.CPI_DAY, "category": event_days.CPI, "scope": "ALL",
+            "event": "BLS CPI", "source": "bls",
+        }])
+        monkeypatch.setattr(special_days.sim_data, "load_daily_bars", lambda *a, **k: [])
+        monkeypatch.setattr(ms, "_kept_earnings", lambda ticker: [])
+
+    def stored(self, skip=("cpi",)) -> dict:
+        record = asdict(AppleTraderConfig(ticker="AMD", model_key="highlow", skip_events=skip))
+        config = tu.make_config(record, {})
+        return {(config.model_key, config.ticker): (config, "2026-10-25T10:00")}
+
+    def series(self, jobs, skip=("cpi",)) -> ms.BaseSeries:
+        [series] = ms.base_series(jobs, bases=self.stored(skip))
+        return series
+
+    def test_a_replay_trading_more_special_days_is_the_bases(self):
+        s = self.series([job("a", WEEK2)])
+        assert s.source == ms.FROM_BASE and s.job_ids == ["a"]
+        assert s.skip_events == ("cpi",)
+        assert s.left_out == {self.CPI_DAY: ("cpi",)}
+        assert s.daily[self.CPI_DAY] == -200.0 and s.profit(self.CPI_DAY) == 0.0
+
+    def test_profits_and_returns_count_a_left_out_day_flat(self):
+        s = self.series([job("a", WEEK2)])
+        row = ms.pair_metrics(s, ms.window([s], ms.ALL))
+        assert row["profit"] == pytest.approx(400.0) and row["sessions"] == 3
+        assert row["per_session"] == pytest.approx(400.0 / 3, abs=0.01)
+        assert row["sat_out"] == 1 and row["worst_day"] == 0.0
+        [week] = ms.weekly([s], ms.window([s], ms.ALL))
+        assert week["per_session"] == pytest.approx(400.0 / 3, abs=0.01)
+
+    def test_the_event_table_shows_what_it_made_even_undated(self):
+        """`events` dates nothing here, and the left-out session is a row all
+        the same; it is never one of the normal days."""
+        s = self.series([job("a", {**WEEK1, **WEEK2})])
+        rows, normals = ms.event_impact([s], {}, ms.window([s], ms.ALL))
+        [row] = rows
+        assert row["day"] == self.CPI_DAY and row["left_out"] and not row["sat_out"]
+        assert row["profit"] == -200.0 and [e.category for e in row["events"]] == ["cpi"]
+        assert normals[0]["normal_days"] == 5
+        [summary] = ms.event_summaries(rows)
+        assert summary["rows"] == [row]
+
+    def test_a_replay_that_sat_it_out_never_hides_one_that_traded_it(self):
+        traded = job("old", WEEK2, created="2026-10-01T00:00")
+        sat = job("new", {**WEEK2, self.CPI_DAY: 0.0}, created="2026-10-20T00:00",
+                  skip=("cpi",), sat_out=[self.CPI_DAY])
+        s = self.series([traded, sat])
+        assert s.job_ids == ["new", "old"]
+        assert s.daily[self.CPI_DAY] == -200.0 and s.left_out == {self.CPI_DAY: ("cpi",)}
+        assert self.CPI_DAY not in s.sat_out
+
+    def test_a_replay_sitting_out_more_than_the_base_is_not_its(self):
+        """It has no answer for days the base trades."""
+        s = self.series([job("a", WEEK2, skip=("cpi", "nfp"))])
+        assert s.source == ms.FROM_JOB and s.left_out == {}

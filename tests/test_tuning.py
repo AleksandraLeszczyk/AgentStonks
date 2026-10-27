@@ -1276,11 +1276,28 @@ class TestSetBase:
         expected = tu.make_config(record["spec"]["base"], {"buy_k": 0.5})
         assert default_config(TICKER, expected.model_key) == expected
         found = base_configs.entry(expected.model_key, TICKER)
-        assert found["source"] == {"job_id": "j", "overrides": {"buy_k": 0.5}, "label": "selected"}
+        assert found["source"] == {
+            "job_id": "j", "overrides": {"buy_k": 0.5}, "label": "selected", "left_out_days": [],
+        }
         # Now it is the base: nothing left to set, and the way back is offered.
         assert app.button(key="tune_set_base_j").disabled is True
         app.button(key="tune_clear_base_j").click().run()
         assert base_configs.entry(expected.model_key, TICKER) is None
+
+    def test_special_days_left_out_go_into_the_base_configuration(self):
+        """The job as the special-days switches read it: its base sits the
+        kind out, and the days it took out are named in the source."""
+        from agent_stonks import base_configs
+
+        record = self.record()
+        record["spec"]["base"]["skip_events"] = []
+        read = tu.without_days(record, {str(TUNE_DAY)}, ["cpi"])
+        app = self.app(read)
+        app.button(key="tune_set_base_j").click().run()
+        assert not app.exception
+        found = base_configs.entry(record["spec"]["base"]["model_key"], TICKER)
+        assert found["config"]["skip_events"] == ["cpi"]
+        assert found["source"]["left_out_days"] == [str(TUNE_DAY)]
 
     def test_a_running_job_cannot_set_its_pick(self):
         app = self.app(self.record(status=tu.RUNNING))
@@ -1318,10 +1335,12 @@ class TestConfigCompare:
 
         record = TestSetBase().record()
         app = self.app(record, chosen={"buy_k": 0.5})
-        assert "current default vs selected" in app.markdown[0].value
         default = default_config(TICKER, record["spec"]["base"]["model_key"])
-        # Folded away under the table, like "New tuning job".
-        assert app.expander[0].label == "Current default and selected as signatures"
+        # Both folded away, like "New tuning job": the table, then the signatures.
+        assert [e.label for e in app.expander] == [
+            "Configuration: current default vs selected",
+            "Current default and selected as signatures",
+        ]
         signatures = [c.value for c in app.code]
         assert signatures[0] == rule_agent_signature(default)
         assert "the shipped defaults" in app.caption[0].value
@@ -1471,6 +1490,118 @@ class TestScore:
     def test_fills_without_cash_or_position_leave_round_trips_uncounted(self):
         scored = tu.score(self.result(), [TUNE_DAY, TEST_DAY])
         assert scored["round_trips"] is None and tu.win_rate(scored) is None
+
+    def test_each_days_fills_are_counted_on_their_day(self):
+        result = self.result()
+        cash = [9_000.0, 10_200.0, 1_000.0]
+        position = [10, 0, 90]
+        for decision, c, p in zip(result.decisions[:3], cash, position):
+            decision.update(cash_after=c, position_after=p)
+        scored = tu.score(result, [TUNE_DAY, TEST_DAY])
+        assert scored["day_counts"] == {
+            "2026-06-15": {"buys": 1, "sells": 1, "round_trips": 1, "wins": 1},
+            "2026-06-16": {"buys": 1, "sells": 0, "round_trips": 0, "wins": 0},
+        }
+
+    def test_day_counts_have_no_round_trips_where_none_are_counted(self):
+        scored = tu.score(self.result(), [TUNE_DAY, TEST_DAY])
+        assert scored["day_counts"]["2026-06-15"] == {
+            "buys": 1, "sells": 1, "round_trips": None, "wins": None,
+        }
+
+
+class TestSittingOut:
+    """A job read as if its configurations had sat some sessions out
+    (`exclude_days`, `without_days`): the special-days switches."""
+
+    DAYS = ("2026-06-15", "2026-06-16", "2026-06-17")
+
+    def cell(self, profits, counts=True, **fields):
+        daily = dict(zip(self.DAYS, profits))
+        cell = {
+            **scored({"buy_k": 0.3}, sum(profits)),
+            "return_pct": sum(profits) / 100.0, "days": 3,
+            "days_traded": sum(1 for p in profits if p), "trades": 4, "sells": 3,
+            "round_trips": 3, "wins": 2, "daily": daily,
+            "days_up": sum(1 for p in profits if p > 0),
+            "days_down": sum(1 for p in profits if p < 0),
+            "worst_day": min(profits), "best_day": max(profits), **fields,
+        }
+        if counts:
+            cell["day_counts"] = {
+                "2026-06-15": {"buys": 2, "sells": 1, "round_trips": 1, "wins": 1},
+                "2026-06-16": {"buys": 1, "sells": 1, "round_trips": 1, "wins": 0},
+                "2026-06-17": {"buys": 1, "sells": 1, "round_trips": 1, "wins": 1},
+            }
+        return cell
+
+    def test_a_day_left_out_makes_nothing_and_still_counts_as_a_session(self):
+        out = tu.exclude_days(self.cell([300.0, -500.0, 100.0]), ["2026-06-16"], 10_000.0)
+        assert out["profit"] == pytest.approx(400.0)
+        assert out["return_pct"] == pytest.approx(-1.0 + 5.0)
+        assert out["daily"] == {"2026-06-15": 300.0, "2026-06-16": 0.0, "2026-06-17": 100.0}
+        assert out["days"] == 3 and tu.daily_profit(out) == pytest.approx(400.0 / 3)
+        assert (out["days_up"], out["days_down"]) == (2, 0)
+        assert (out["worst_day"], out["best_day"]) == (0.0, 300.0)
+        assert out["excluded_days"] == ["2026-06-16"]
+
+    def test_its_fills_come_out_of_the_counts(self):
+        out = tu.exclude_days(self.cell([300.0, -500.0, 100.0]), ["2026-06-16"], 10_000.0)
+        assert (out["days_traded"], out["trades"], out["sells"]) == (2, 3, 2)
+        assert (out["round_trips"], out["wins"]) == (2, 2)
+        assert "2026-06-16" not in out["day_counts"]
+
+    def test_a_cell_without_day_counts_reads_days_traded_off_its_profits(self):
+        """Its trades and round trips on that day are not known, so they are
+        not guessed: the table leaves them blank."""
+        cell = self.cell([300.0, -500.0, 100.0], counts=False)
+        out = tu.exclude_days(cell, ["2026-06-16"], 10_000.0)
+        assert out["days_traded"] == 2 and out["profit"] == pytest.approx(400.0)
+        assert out["trades"] is None and out["round_trips"] is None and tu.win_rate(out) is None
+
+    def test_a_day_not_traded_changes_nothing(self):
+        cell = self.cell([300.0, 0.0, 100.0], counts=False)
+        assert tu.exclude_days(cell, ["2026-06-16"], 10_000.0) is cell
+        refused = {"overrides": {}, "invalid": "no"}
+        assert tu.exclude_days(refused, ["2026-06-16"], 10_000.0) is refused
+
+    def test_a_sum_with_unknown_trades_has_none(self):
+        total = tu.combine({"buy_k": 0.3}, [
+            {**scored({"buy_k": 0.3}, 10.0), "trades": None},
+            scored({"buy_k": 0.3}, 20.0),
+        ])
+        assert total["trades"] is None and total["profit"] == pytest.approx(30.0)
+
+    def test_the_job_is_reread_with_the_pick_and_the_days_off_rule(self):
+        """The 0.3 cell made its money on the day left out, so the pick moves
+        to 0.5; the base sits the kind out from then on, in the rule's order."""
+        bumpy = {**self.cell([900.0, -100.0, 0.0]), "overrides": {"buy_k": 0.3}}
+        steady = {**self.cell([200.0, 200.0, 100.0]), "overrides": {"buy_k": 0.5}}
+        record = job_record({"w1": [bumpy, steady]}, starting_cash=10_000.0)
+        record["spec"]["base"]["skip_events"] = ["geo"]
+        record = tu.refresh_pick(record)
+        assert record["best"]["overrides"] == {"buy_k": 0.3}
+        read = tu.without_days(record, {"2026-06-15"}, ["cpi"])
+        assert read["best"]["overrides"] == {"buy_k": 0.5}
+        assert read["best"]["profit"] == pytest.approx(300.0)
+        assert read["spec"]["base"]["skip_events"] == ["cpi", "geo"]
+        assert read["excluded_days"] == ["2026-06-15"]
+        # The stored record is left as it was.
+        assert record["best"]["overrides"] == {"buy_k": 0.3}
+        assert record["spec"]["base"]["skip_events"] == ["geo"]
+        assert record["cells"]["w1"][0]["profit"] == pytest.approx(800.0)
+
+    def test_nothing_left_out_is_the_job_itself(self):
+        record = job_record({"w1": [scored({"buy_k": 0.3}, 1.0)]})
+        assert tu.without_days(record, set(), []) is record
+
+    def test_the_configuration_shown_sits_the_kind_out(self):
+        record = job_record({"w1": [scored({"buy_k": 0.3}, 1.0)]}, starting_cash=10_000.0)
+        record["spec"]["base"]["skip_events"] = []
+        read = tu.without_days(record, {"2026-06-15"}, ["nfp", "earnings"])
+        assert tu.make_config(read["spec"]["base"], {"buy_k": 0.3}).skip_events == (
+            "earnings", "nfp",
+        )
 
 
 class TestReplayInputs:

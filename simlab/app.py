@@ -29,6 +29,7 @@ from agent_stonks import (
     base_configs,
     candle_patterns,
     clock,
+    event_days,
     minute_momentum,
     model_overlays,
     orchestra_defaults,
@@ -73,6 +74,7 @@ from . import ml_summary
 from . import prompts as sim_prompts
 from . import results as sim_results
 from . import session_context as sim_session
+from . import special_days as sim_special
 from . import tuning as sim_tuning
 from .engine import SimulationConfig, SimulationEngine
 from .market import SimMarket
@@ -4812,8 +4814,9 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
     (`apple_trader.default_config`): its base configuration, else the shipped
     defaults -- and the shown one, the pick or the square clicked, side by side
     in words, setting by setting (`tuning.compare_settings`), what the shown
-    one changes tinted; then both signatures, folded away -- the form Results and the
-    Simulate tab name runs by.
+    one changes tinted, folded away above a caption naming what changed; then
+    both signatures, folded away too -- the form Results and the Simulate tab
+    name runs by.
 
     The current default rather than the job's own base: it is what "Set as
     base configuration" below would replace, and a job swept before the
@@ -4838,15 +4841,18 @@ def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None")
         "Current default": [r["base"] if r["base"] is not None else "—" for r in rows],
         who: [r["other"] if r["other"] is not None else "—" for r in rows],
     })
-    st.markdown(f"**Configuration: current default vs {who.lower()}**")
-    # A static table rather than a dataframe: it wraps a long value instead of
-    # cutting it off, and a comparison is read whole, never sorted or scrolled.
-    st.table(
-        frame.style.apply(
-            lambda r: [tint if rows[r.name]["changed"] else ""] * len(r), axis=1
-        ),
-        hide_index=True,
-    )
+    # Folded away like the signatures under it: the caption below says what
+    # changed, and the whole table is wanted only to read a setting in full.
+    with st.expander(f"Configuration: current default vs {who.lower()}"):
+        # A static table rather than a dataframe: it wraps a long value instead
+        # of cutting it off, and a comparison is read whole, never sorted or
+        # scrolled.
+        st.table(
+            frame.style.apply(
+                lambda r: [tint if rows[r.name]["changed"] else ""] * len(r), axis=1
+            ),
+            hide_index=True,
+        )
     changed = [r["setting"].lower() for r in rows if r["changed"]]
     drift = sum(1 for r in sim_tuning.compare_settings(default, own_base) if r["changed"])
     st.caption(
@@ -4912,7 +4918,8 @@ def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> No
             help=f"Make {what} what every new run of {pair} starts from: the live app's "
             "Apple Trader and Orchestra forms and SimLab's Simulate and Tuning forms open "
             "on it, open pages included. The whole configuration is kept, not only the "
-            "values swept here. Nothing already running or already stored changes.",
+            "values swept here, its days-off rule included — with any kind of special day "
+            "unticked above. Nothing already running or already stored changes.",
         )
         clear_clicked = current is not None and st.button(
             "Restore shipped defaults", icon=":material/restart_alt:",
@@ -4944,6 +4951,9 @@ def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> No
         base_configs.set_base(record, source={
             "job_id": job_id, "overrides": shown,
             "label": "pick" if chosen is None else "selected",
+            # The special sessions switched off on the job's results, which
+            # the record's days-off rule (`skip_events`) now sits out.
+            "left_out_days": list(job.get("excluded_days") or ()),
         })
         st.toast(f"{pair} now starts from {what}.", icon=":material/push_pin:")
         st.rerun()
@@ -5404,6 +5414,198 @@ def _render_tuning_session_context(
         })
 
 
+def _tuning_special_key(job_id: str, kind: str) -> str:
+    """The widget key of one kind of special session's switch on one job."""
+    return f"tune_special_{job_id}_{kind}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _tuning_special_rows(spec_json: str) -> "tuple[list[dict], dict]":
+    """(`special_days.special_days`, each earnings row's result) for one job.
+
+    Cached ten minutes: a calendar row or a briefing verdict added meanwhile
+    shows by then. The CPI and jobs-report lookups are not in here -- they are
+    read on every run, so a lookup shows the moment it is kept.
+    """
+    spec = json.loads(spec_json)
+    rows = sim_special.special_days(spec)
+    reports = [r["report"] for r in rows if r.get("report")]
+    earnings = sim_special.earnings_results(spec["base"]["ticker"], reports) if reports else {}
+    return rows, earnings
+
+
+def _render_tuning_special_days(job: dict) -> dict:
+    """The job's special sessions -- earnings, CPI, jobs reports, shocks -- and
+    one switch per kind; returns the job as the rest of its results read it.
+
+    Each session shows what was expected, what came and the surprise
+    (`special_days.outcome_cells`), and what the base and the shown
+    configuration made on it as replayed. A kind switched off is left out of
+    everything under it: the job comes back as if every configuration had sat
+    those sessions out (`tuning.without_days`) -- profits, heatmaps and pick --
+    with the kind in its base's days-off rule, so the configuration shown, and
+    the one "Set as base configuration" keeps, sits them out too.
+
+    A kind the base already sat out has no replay to measure, so its switch is
+    off and cannot be turned on.
+    """
+    spec = job["spec"]
+    rows, earnings = _tuning_special_rows(json.dumps(
+        {"base": {"ticker": spec["base"]["ticker"]}, "datasets": spec["datasets"]},
+        sort_keys=True,
+    ))
+    if not rows:
+        return job
+    job_id = job["job_id"]
+    kinds = [k for k in event_days.CATEGORIES if any(r["category"] == k for r in rows)]
+    sat_out = set(spec["base"].get("skip_events") or ())
+    measured = [k for k in kinds if k not in sat_out]
+    # The switches are drawn below the numbers they change, so their state is
+    # read first: last run's, or on for a kind never switched.
+    for kind in measured:
+        st.session_state.setdefault(_tuning_special_key(job_id, kind), True)
+    left_out = [k for k in measured if not st.session_state[_tuning_special_key(job_id, k)]]
+    days_out = {r["day"] for r in rows if r["category"] in left_out}
+    read = sim_tuning.without_days(job, days_out, left_out)
+    chosen = _tuning_chosen(read)
+    shown = chosen if chosen is not None else (read.get("best") or {}).get("overrides")
+    who = "Pick" if chosen is None else "Selected"
+
+    def made(cell: "dict | None", day: str) -> "float | None":
+        if not sim_tuning.is_scored(cell) or day in (cell.get("sat_out_days") or ()):
+            return None
+        return (cell.get("daily") or {}).get(day)
+
+    table, impact = [], {}
+    for row in rows:
+        name, day, kind = row["datasets"][0], row["day"], row["category"]
+        base = made(job["baseline"].get(name), day)
+        mine = made(sim_tuning.cell_at(job, name, shown), day) if shown else None
+        status = (
+            "sat out by the base" if kind in sat_out
+            else "left out" if day in days_out else "counted"
+        )
+        release = sim_special.release_outcome(kind, day) if kind in sim_special.RELEASES else None
+        table.append({
+            "day": day, "datasets": ", ".join(row["datasets"]),
+            "kind": event_days.LABELS[kind], "event": row["what"],
+            **sim_special.outcome_cells(row, earnings),
+            "source": ((release or {}).get("sources") or [None])[0],
+            "base": base, "shown": mine, "status": status,
+        })
+        if kind in measured:
+            total = impact.setdefault(kind, [0.0, 0.0])
+            total[0] += mine or 0.0
+            total[1] += base or 0.0
+
+    sessions = len({r["day"] for r in rows})
+    with st.expander(
+        f"Special days — {sessions} session{'s' if sessions != 1 else ''} with earnings, "
+        "a CPI or jobs release, or a shock",
+        icon=":material/event:", expanded=bool(measured),
+    ):
+        st.caption(
+            "The sessions a days-off rule acts on, found as a replay finds them. Untick a "
+            "kind to read everything below — profits, heatmaps, the pick and its "
+            "configuration — as if every configuration had sat those sessions out: each "
+            "one's profit taken out, the session kept as one that did not trade. The "
+            "configuration then sits that kind out too, and **Set as base configuration** "
+            "keeps it so."
+        )
+        with st.container(horizontal=True):
+            for kind in kinds:
+                count = len({r["day"] for r in rows if r["category"] == kind})
+                label = f"{event_days.LABELS[kind]} ({count})"
+                if kind in sat_out:
+                    st.checkbox(
+                        label, value=False, disabled=True,
+                        key=f"tune_special_sat_{job_id}_{kind}",
+                        help="The base configuration sat these sessions out, so this job "
+                        "never traded them and there is nothing to put back.",
+                    )
+                else:
+                    st.checkbox(
+                        label, key=_tuning_special_key(job_id, kind),
+                        help="Ticked: counted like any other session. Unticked: every "
+                        "configuration below sits these sessions out, and so does the "
+                        "configuration shown.",
+                    )
+        money = st.column_config.NumberColumn
+        st.dataframe(
+            pd.DataFrame(table), hide_index=True,
+            # What the session made first; where it came from last.
+            column_order=[
+                "day", "kind", "shown", "base", "status", "measure", "expected", "actual",
+                "surprise", "more", "event", "datasets", "source",
+            ],
+            column_config={
+                "day": "Session", "datasets": "Dataset", "kind": "Kind", "event": "Event",
+                "measure": "Measure", "expected": "Expected", "actual": "Actual",
+                "surprise": "Surprise",
+                "more": st.column_config.TextColumn(
+                    "Also", help="The release's other figures: actual vs expected (surprise)."
+                ),
+                "source": st.column_config.LinkColumn(
+                    "Source", display_text="page",
+                    help="The first page the lookup read, for a CPI or jobs release.",
+                ),
+                "base": money("Base ($)", format="%+.2f"),
+                "shown": money(f"{who} ($)", format="%+.2f"),
+                "status": "Counted",
+            },
+        )
+        if impact:
+            st.caption(
+                "As replayed, these sessions made — "
+                + "; ".join(
+                    f"{event_days.LABELS[kind]}: {who.lower()} {_tuning_usd(mine)}, "
+                    f"base {_tuning_usd(base)}"
+                    for kind, (mine, base) in impact.items()
+                )
+                + ". Taking a session out leaves the days after it as replayed: sitting it "
+                "out would have sized them from slightly different cash."
+            )
+        never = [event_days.LABELS[k] for k in kinds if k in sat_out]
+        if never:
+            st.caption(
+                f":material/info: The base configuration sat out {', '.join(never)} "
+                "sessions, so this job never traded them. To measure them, run a job with "
+                "those taken out of **Sit out these sessions**."
+            )
+        errors_key = f"tune_special_errors_{job_id}"
+        for error in st.session_state.get(errors_key, ()):
+            st.warning(error)
+        missing = sim_special.missing_releases(rows)
+        if missing and st.button(
+            f"Look up expected and actual figures for {len(missing)} "
+            f"release{'s' if len(missing) != 1 else ''}",
+            icon=":material/travel_explore:", key=f"tune_special_lookup_{job_id}",
+            help=f"Claude ({sim_special.LOOKUP_MODEL}) searches the web for each CPI or "
+            "jobs report's consensus and actual figures — about half a minute and \\$0.20 "
+            "a release. Each answer is kept, with the pages it came from, and serves "
+            "every job.",
+        ):
+            errors = []
+            with st.status("Looking releases up…") as status:
+                for kind, day in missing:
+                    status.update(label=f"Looking up the {event_days.LABELS[kind]} of {day}…")
+                    try:
+                        sim_special.lookup_release(kind, day)
+                    except Exception as exc:  # noqa: BLE001 -- one failure, not the tab
+                        errors.append(f"{event_days.LABELS[kind]} of {day}: {exc}")
+            st.session_state[errors_key] = errors
+            st.rerun()
+    if left_out:
+        st.caption(
+            f":material/event_busy: Leaving out {len(days_out)} special "
+            f"session{'s' if len(days_out) != 1 else ''} "
+            f"({', '.join(event_days.LABELS[k] for k in left_out)}): everything below "
+            "reads the job as if every configuration had sat "
+            f"{'it' if len(days_out) == 1 else 'them'} out."
+        )
+    return read
+
+
 def _render_tuning_notes(job: dict) -> None:
     for dataset in sim_tuning.chronological(job["spec"]["datasets"]):
         name = dataset["name"]
@@ -5646,6 +5848,9 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     )
     if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED):
         _render_tuning_dataset_controls(job)
+    # From here on the job is read without the special sessions switched off
+    # there: the verdict, the tables, the heatmaps and the configuration.
+    job = _render_tuning_special_days(job)
 
     verdict = _tuning_verdict(job)
     if verdict:
@@ -5860,8 +6065,10 @@ def render_ml_summary_tab() -> None:
         "replayed here: each model and instrument is read off the tuning jobs' replays of "
         "its base configuration — the one *Set as base configuration* stored, a job's own "
         "base or any square of its grid — so setting another base updates everything "
-        "below. A pair with no base stored is read from the base of its job reaching the "
-        "latest session."
+        "below. A replay that differs from the base only by trading special days the base "
+        "leaves out counts too: those days are flat sessions in the profits and returns, "
+        "and show what they made in the event table. A pair with no base stored is read "
+        "from the base of its job reaching the latest session."
     )
     jobs = sim_tuning.list_jobs()
     series = ml_summary.base_series(jobs)
@@ -6071,7 +6278,8 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
         "skips": st.column_config.TextColumn(
             "Base sits out",
             help="The days its base configuration makes no trade on by rule (`skip_events`): "
-            "those count as flat sessions above and are left out of the event comparison.",
+            "those count as flat sessions above. Where a tuning job replayed the base trading "
+            "them anyway, the event table below shows what they made, marked *left out*.",
         ),
         "signature": st.column_config.TextColumn("Configuration", width="medium"),
         "source": st.column_config.TextColumn(
@@ -6276,7 +6484,8 @@ def _render_ml_events(series: "list[ml_summary.BaseSeries]", span: "tuple[str, s
             z_row.append(row["delta"] if row and row["delta"] is not None else None)
             text_row.append(
                 "" if row is None else "sat out" if row["sat_out"]
-                else "no forecast" if row["delta"] is None else _ml_usd(row["delta"])
+                else "no forecast" if row["delta"] is None
+                else _ml_usd(row["delta"]) + ("*" if row["left_out"] else "")
             )
         z.append(z_row)
         text.append(text_row)
@@ -6289,6 +6498,12 @@ def _render_ml_events(series: "list[ml_summary.BaseSeries]", span: "tuple[str, s
     ))
     fig.update_layout(title="What each event day made against a normal day ($)")
     st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(pairs) + 140)))
+    if any(r["left_out"] for r in impact):
+        st.caption(
+            "\\* Left out by the pair's base configuration: shown from a tuning job's replay "
+            "of it that traded the session, and counted as a flat session in the profits and "
+            "returns above, as the base's rule makes it."
+        )
 
     money = st.column_config.NumberColumn
     with st.expander(f"Every event session ({len(impact)})", icon=":material/table_rows:"):
@@ -6305,7 +6520,8 @@ def _render_ml_events(series: "list[ml_summary.BaseSeries]", span: "tuple[str, s
                 "delta": r["delta"],
                 "sigma": r["sigma"],
                 "note": "sat out by its base" if r["sat_out"]
-                else "no forecast" if r["delta"] is None else "",
+                else "no forecast" if r["delta"] is None
+                else "left out by its base; a replay traded it" if r["left_out"] else "",
             }
             for r in sorted(impact, key=lambda r: (r["day"], r["ticker"]), reverse=True)
         ]), hide_index=True, column_config={
@@ -6334,15 +6550,19 @@ def _ml_event_line(group: dict) -> str:
     head = f"**{_ml_day(group['day'])} · {what}**" + (f" ({', '.join(scopes)})" if scopes else "")
     rows = group["rows"]
     skipped = group["skipped"]
-    tail = ""
+    left = sum(1 for r in rows if r.get("left_out"))
+    parts = []
+    if left:
+        parts.append(
+            f"{left} left out by {'its' if left == 1 else 'their'} base, shown as replayed"
+        )
     if skipped:
         sat = sum(1 for r in skipped if r["sat_out"])
-        parts = []
         if sat:
             parts.append(f"{sat} sat it out by {'its' if sat == 1 else 'their'} base")
         if len(skipped) - sat:
             parts.append(f"{len(skipped) - sat} had no forecast")
-        tail = " (" + ", ".join(parts) + ")"
+    tail = " (" + ", ".join(parts) + ")" if parts else ""
     if not rows:
         return f"{head} — not traded{tail}."
     if len(rows) == 1:

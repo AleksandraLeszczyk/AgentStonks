@@ -85,7 +85,7 @@ from agent_stonks.config import (
     TAKE_TRIGGERS,
     TAKE_TRIGGER_LABELS,
 )
-from agent_stonks import apple_models, minute_momentum
+from agent_stonks import apple_models, event_days, minute_momentum
 from agent_stonks.apple_models import STRATEGY_DAYRANGE, STRATEGY_MOMENTUM, STRATEGY_PROBABILITY
 from agent_stonks.market_hours import MARKET_TZ
 
@@ -728,6 +728,9 @@ def score(result, days: "list[date]") -> dict:
     profit = float(result.final_value) - float(result.starting_cash)
     round_trips, wins = _round_trips(fills, float(result.starting_cash))
     return {
+        # Each session's share of the counts below, so a session can be taken
+        # back out of them (`exclude_days`).
+        "day_counts": _day_counts(fills, float(result.starting_cash)),
         "profit": round(profit, 2),
         "return_pct": round(100.0 * profit / result.starting_cash, 4)
         if result.starting_cash else 0.0,
@@ -762,9 +765,27 @@ def _round_trips(
     is flat when that ticker's position is. (None, None) when a fill does not
     say what it left behind.
     """
-    if any("cash_after" not in f or "position_after" not in f for f in fills):
+    closes = _round_trip_closes(fills, starting_cash)
+    if closes is None:
         return None, None
-    trips = wins = 0
+    return len(closes), sum(1 for _, won in closes if won)
+
+
+def _fill_day(fill: dict) -> "str | None":
+    """The ET session date a fill was made on, or None for one with no stamp."""
+    if not fill.get("ts"):
+        return None
+    return datetime.fromisoformat(str(fill["ts"])).astimezone(MARKET_TZ).date().isoformat()
+
+
+def _round_trip_closes(
+    fills: "list[dict]", starting_cash: float
+) -> "list[tuple[str | None, bool]] | None":
+    """(the day of the fill that closed it, whether it won) for every round trip
+    `_round_trips` counts, in order; None when it counts none."""
+    if any("cash_after" not in f or "position_after" not in f for f in fills):
+        return None
+    closes = []
     cash = starting_cash
     opened_with = None
     for fill in fills:
@@ -772,11 +793,33 @@ def _round_trips(
             opened_with = cash
         cash = float(fill["cash_after"])
         if opened_with is not None and float(fill.get("position_after") or 0.0) <= 0.0:
-            trips += 1
-            if cash - opened_with > _FLAT_DAY_USD:
-                wins += 1
+            closes.append((_fill_day(fill), cash - opened_with > _FLAT_DAY_USD))
             opened_with = None
-    return trips, wins
+    return closes
+
+
+def _day_counts(fills: "list[dict]", starting_cash: float) -> "dict[str, dict]":
+    """{day: {buys, sells, round_trips, wins}} for every session with a fill,
+    a round trip counted on the day of the fill that closed it -- the trader
+    flattens before every close, so that is the day it opened too. Round trips
+    are None where `_round_trips` counts none."""
+    counts: "dict[str, dict]" = {}
+
+    def on(day: "str | None") -> dict:
+        return counts.setdefault(day, {"buys": 0, "sells": 0, "round_trips": 0, "wins": 0})
+
+    for fill in fills:
+        if fill.get("action") in ("buy", "sell"):
+            on(_fill_day(fill))[f"{fill['action']}s"] += 1
+    closes = _round_trip_closes(fills, starting_cash)
+    for day, won in closes or ():
+        on(day)["round_trips"] += 1
+        on(day)["wins"] += int(won)
+    if closes is None:
+        for found in counts.values():
+            found["round_trips"] = found["wins"] = None
+    counts.pop(None, None)
+    return counts
 
 
 def win_rate(cell: "dict | None") -> "float | None":
@@ -1600,15 +1643,17 @@ def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
         return {"overrides": dict(overrides), "error": errored["error"]}
     total = lambda field: sum(p.get(field) or 0 for p in parts)  # noqa: E731
     # A dataset scored before round trips were counted leaves the sum without
-    # them, rather than a rate over the other datasets' trades only.
+    # them, rather than a rate over the other datasets' trades only. Likewise
+    # a dataset whose trades on a day taken out are not known (`exclude_days`).
     counted = all(p.get("round_trips") is not None for p in parts)
+    known = lambda field: total(field) if all(p.get(field) is not None for p in parts) else None  # noqa: E731
     sessions = [session_profits(p) for p in parts]
     return {
         "overrides": dict(overrides),
         "profit": round(total("profit"), 2),
         "return_pct": round(total("return_pct"), 4),
-        "trades": total("trades"),
-        "sells": total("sells"),
+        "trades": known("trades"),
+        "sells": known("sells"),
         "days": total("days"),
         "days_traded": total("days_traded"),
         "days_up": total("days_up"),
@@ -1625,6 +1670,105 @@ def combine(overrides: dict, parts: "list[dict | None]") -> "dict | None":
         "reused": sum(1 for p in parts if p.get("run_id")),
         "error": None,
     }
+
+
+# --- sessions sat out after the fact -----------------------------------------
+#
+# A job replayed with every special session traded (an empty days-off rule)
+# can be read as if its configurations had sat some of those sessions out: the
+# Tuning tab's special-days switches. Sitting a session out makes nothing that
+# day, so the question needs no replay.
+
+
+def exclude_days(cell: "dict | None", days, starting_cash: float) -> "dict | None":
+    """`cell` as if its configuration had sat `days` out: each one's profit
+    taken back out, and the session kept as one that did not trade -- what the
+    days-off rule does, so a profit a session still counts it.
+
+    Exact for the day itself. The days after it are kept as replayed, though
+    sitting one out would have left them a different cash to size from; the
+    trader flattens before every close, so that is the size of what is left,
+    not its direction.
+
+    The counts come off each day's fills (`day_counts`). A cell scored before
+    those were kept has its days traded read off its daily profits instead,
+    and its trades and round trips left unknown (None) once a day it traded is
+    taken out. A refused or errored cell is returned as it is.
+    """
+    if not is_scored(cell):
+        return cell
+    days = set(days)
+    daily = dict(cell.get("daily") or {})
+    counts = cell.get("day_counts")
+    gone = [
+        day for day in sorted(days & set(daily))
+        if float(daily[day]) != 0.0 or day in (counts or {})
+    ]
+    if not gone:
+        return cell
+    out = {**cell}
+    removed = sum(float(daily[day]) for day in gone)
+    for day in gone:
+        daily[day] = 0.0
+    profits = list(daily.values())
+    out.update(
+        profit=round(float(cell["profit"]) - removed, 2),
+        return_pct=round(
+            float(cell["return_pct"]) - (100.0 * removed / starting_cash if starting_cash else 0.0), 4
+        ),
+        daily=daily,
+        days_up=sum(1 for p in profits if p > _FLAT_DAY_USD),
+        days_down=sum(1 for p in profits if p < -_FLAT_DAY_USD),
+        worst_day=min(profits) if profits else 0.0,
+        best_day=max(profits) if profits else 0.0,
+        excluded_days=sorted(days & set(daily)),
+    )
+    if counts is not None:
+        lost = [counts[day] for day in gone if day in counts]
+        minus = lambda field, key: (  # noqa: E731
+            None if cell.get(field) is None or any(c[key] is None for c in lost)
+            else cell[field] - sum(c[key] for c in lost)
+        )
+        out.update(
+            days_traded=cell["days_traded"] - sum(1 for c in lost if c["buys"]),
+            trades=minus("trades", "buys"), sells=minus("sells", "sells"),
+            round_trips=minus("round_trips", "round_trips"), wins=minus("wins", "wins"),
+            day_counts={day: c for day, c in counts.items() if day not in days},
+        )
+    else:
+        traded = [day for day in gone if abs(float(cell["daily"][day])) > _FLAT_DAY_USD]
+        out.update(days_traded=max(int(cell["days_traded"]) - len(traded), 0))
+        if traded:
+            out.update(trades=None, sells=None, round_trips=None, wins=None)
+    return out
+
+
+def without_days(record: dict, days, skip_events=()) -> dict:
+    """The job as if its base had also sat out the `skip_events` categories,
+    which take `days` out of every replay (`exclude_days`): every dataset's
+    cells and baseline, the base configuration's days-off rule, and the pick
+    re-read off the new sum. The stored record is not touched; with no days
+    and no categories it comes back as it is.
+    """
+    days = set(days)
+    if not days and not skip_events:
+        return record
+    cash = float(record["spec"].get("starting_cash") or 0.0)
+    base = dict(record["spec"]["base"])
+    base["skip_events"] = list(event_days.normalise([*(base.get("skip_events") or ()), *skip_events]))
+    out = {
+        **record,
+        "spec": {**record["spec"], "base": base},
+        "cells": {
+            name: [exclude_days(c, days, cash) for c in found]
+            for name, found in record["cells"].items()
+        },
+        "baseline": {
+            name: exclude_days(cell, days, cash) for name, cell in record["baseline"].items()
+        },
+        "excluded_days": sorted(days),
+    }
+    return refresh_pick(out)
 
 
 def summed_cells(record: dict) -> "list[dict]":
