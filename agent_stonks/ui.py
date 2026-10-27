@@ -60,8 +60,10 @@ from .strategist import STRATEGIST_AVATAR, STRATEGIST_KEY, STRATEGIST_LABEL, lau
 from .charts import (
     build_analysis_gauges,
     build_chart,
+    build_exposure_chart,
     build_gamma_chart,
     build_performance_chart,
+    build_symbol_pnl_chart,
     empty_chart,
 )
 from .config import (
@@ -115,7 +117,13 @@ from .options import (
     gamma_flip,
     net_gamma_exposure,
 )
-from .performance import compute_equity_curve, decision_markers, summarize
+from .performance import (
+    compute_equity_curve,
+    compute_symbol_curves,
+    decision_markers,
+    holdings,
+    summarize,
+)
 from .profile_model import predicted_open_profile
 from .report import build_report_html
 from .rest import fetch_bars, fetch_daily_bars, fetch_trades
@@ -2610,17 +2618,6 @@ def _agent_log_panel() -> None:
     # keeps its place in the fragment, and an element whose place changes is
     # mounted afresh -- which would throw away the reader's scroll.
     with st.container():
-        tracker = state.decision_tracker
-        if tracker:
-            snap = tracker.snapshot()
-            positions = {s: q for s, q in snap["positions"].items() if q}
-            c1, c2, c3 = st.columns(3)
-            c1.metric(_cash_label(state), f"${snap['cash']:,.2f}")
-            c2.metric(
-                "Positions",
-                " · ".join(f"{s} {q:.2f} sh" for s, q in positions.items()) if positions else "flat",
-            )
-            c3.metric("Decisions", len(snap["decisions"]))
         tactics_html = _current_tactics_html(state)
         if tactics_html:
             st.html(tactics_html)
@@ -2781,9 +2778,228 @@ def _agent_performance_panel(symbols: list[str]) -> None:
     c2.metric("Fees paid", f"${stats['total_fees']:,.2f}")
     c3.metric(_starting_value_label(state), f"${stats['starting_cash']:,.2f}")
 
-    label = ", ".join(symbols or state.symbols)
-    fig = build_performance_chart(points, markers, label)
+    view = st.segmented_control(
+        "Chart",
+        list(_PORTFOLIO_CHART_VIEWS),
+        format_func=_PORTFOLIO_CHART_VIEWS.get,
+        default="value",
+        required=True,
+        key="portfolio_chart_view",
+        label_visibility="collapsed",
+    )
+    label = _basket_label(symbols or state.symbols)
+    if view == "value":
+        fig = build_performance_chart(points, markers, label)
+    else:
+        curves = compute_symbol_curves(
+            bars_by_symbol,
+            decisions,
+            state.starting_budget,
+            agent_start,
+            live_prices={sym: state.mark_price(sym) for sym in bars_by_symbol},
+        )
+        build = build_symbol_pnl_chart if view == "pnl" else build_exposure_chart
+        fig = build(curves, label)
     st.plotly_chart(fig, width='stretch')
+
+
+# The Portfolio chart's views: the whole basket's value, then the same session
+# split by instrument -- what each symbol made, and what each one held.
+_PORTFOLIO_CHART_VIEWS: dict[str, str] = {
+    "value": "Portfolio value",
+    "pnl": "P&L by symbol",
+    "exposure": "Exposure by symbol",
+}
+
+
+def _basket_label(symbols: list[str]) -> str:
+    """The basket as a chart title names it: every symbol up to four, past
+    that the first three and how many more."""
+    if len(symbols) <= 4:
+        return ", ".join(symbols)
+    return f"{', '.join(symbols[:3])} +{len(symbols) - 3}"
+
+
+def _signed_dollars(value: float) -> str:
+    return f"{'−' if value < 0 else '+'}${abs(value):,.2f}"
+
+
+def _pnl_color(value) -> str:
+    """A P&L cell's text colour: green for a gain, red for a loss."""
+    if not isinstance(value, (int, float)) or pd.isna(value) or not value:
+        return ""
+    return f"color: {PALETTE['up'] if value > 0 else PALETTE['down']}"
+
+
+@st.fragment(run_every=AGENT_LOG_POLL_SEC)
+def _holdings_panel() -> None:
+    """The basket by instrument: cash and what is invested, then per symbol
+    what is held, at what cost, its weight in the portfolio and its P&L, then
+    every fill. On the log's poll rather than the chart's minute, so a fill
+    shows here as it lands."""
+    state = _get_state()
+    tracker = state.decision_tracker
+    if not tracker:
+        return
+    snap = tracker.snapshot()
+    fills = [
+        asdict(d) for d in snap["decisions"]
+        if d.status == "filled" and d.action in ("buy", "sell")
+    ]
+    positions = {s: q for s, q in snap["positions"].items() if q}
+    prices = {
+        sym: state.mark_price(sym)
+        for sym in set(positions) | {f["symbol"] for f in fills}
+    }
+    invested = sum(q * prices[s] for s, q in positions.items() if prices[s] is not None)
+    # On a real venue the account says what the portfolio is worth (see
+    # `summarize`); the weights are shares of that.
+    value = snap["venue_value"] if snap["venue_value"] is not None else snap["cash"] + invested
+    rows = holdings(fills, positions, prices, value)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric(
+        _cash_label(state),
+        f"${snap['cash']:,.2f}",
+        f"{snap['cash'] / value:.0%} of value" if value else None,
+        delta_color="off",
+        delta_arrow="off",
+    )
+    c2.metric(
+        "Invested",
+        f"${invested:,.2f}",
+        f"{len(positions)} position{'' if len(positions) == 1 else 's'}",
+        delta_color="off",
+        delta_arrow="off",
+    )
+    c3.metric(
+        "Open P&L",
+        _signed_dollars(sum(r["open_pnl"] or 0.0 for r in rows)),
+        help="What the shares held now have gained or lost since they were bought, "
+        "on their average cost, before fees.",
+    )
+    c4.metric(
+        "Closed P&L",
+        _signed_dollars(sum(r["closed_pnl"] for r in rows)),
+        help="What the shares already sold gained or lost against their average "
+        "cost, before fees.",
+    )
+    c5.metric("Decisions", len(snap["decisions"]))
+
+    if not rows:
+        st.caption("Nothing held or traded yet.")
+        return
+    frame = pd.DataFrame(
+        [
+            {
+                "Symbol": r["symbol"],
+                "Shares": r["shares"],
+                "Avg cost": r["avg_cost"],
+                "Last": r["last"],
+                "Market value": r["market_value"],
+                "Weight": r["weight_pct"],
+                "Open P&L": r["open_pnl"],
+                "Open %": r["open_pct"],
+                "Closed P&L": r["closed_pnl"],
+                "Fees": r["fees"],
+                "Net P&L": r["net_pnl"],
+                "Buys": r["buys"],
+                "Sells": r["sells"],
+            }
+            for r in rows
+        ]
+    )
+    st.dataframe(
+        frame.style.map(_pnl_color, subset=["Open P&L", "Open %", "Closed P&L", "Net P&L"]),
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "Symbol": st.column_config.TextColumn(pinned=True),
+            "Shares": st.column_config.NumberColumn(format="%g"),
+            "Avg cost": st.column_config.NumberColumn(
+                format="$%.2f",
+                help="What the shares held cost each, on average, from this ledger's buys.",
+            ),
+            "Last": st.column_config.NumberColumn(format="$%.2f"),
+            "Market value": st.column_config.NumberColumn(format="dollar"),
+            "Weight": st.column_config.NumberColumn(
+                format="%.1f%%", help="Market value as a share of the portfolio's value."
+            ),
+            "Open P&L": st.column_config.NumberColumn(format="dollar"),
+            "Open %": st.column_config.NumberColumn(format="%+.2f%%"),
+            "Closed P&L": st.column_config.NumberColumn(format="dollar"),
+            "Fees": st.column_config.NumberColumn(format="dollar"),
+            "Net P&L": st.column_config.NumberColumn(
+                format="dollar", help="Closed + open P&L − fees: what the symbol has made."
+            ),
+            "Buys": st.column_config.NumberColumn(format="%d"),
+            "Sells": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+    untracked = [r for r in rows if r["untracked"]]
+    if untracked:
+        st.caption(
+            "Held before this ledger's fills, so outside its cost and open P&L: "
+            + ", ".join(f"{r['symbol']} {r['untracked']:g} sh" for r in untracked)
+            + "."
+        )
+    _fills_table(fills)
+
+
+def _et_clock(ts: str) -> str:
+    """A ledger timestamp (UTC, as `clock.now()` writes it) as an ET clock time."""
+    stamp = pd.Timestamp(ts)
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    return stamp.tz_convert(market_hours.MARKET_TZ).strftime("%H:%M:%S")
+
+
+def _fills_table(fills: list[dict]) -> None:
+    """Every fill, newest first, narrowed to the symbols picked -- the log
+    with one instrument's trades pulled out of the interleaving."""
+    with st.expander("Fills by symbol"):
+        if not fills:
+            st.caption("No fills yet.")
+            return
+        traded = sorted({f["symbol"] for f in fills})
+        picked = (
+            st.pills(
+                "Symbols",
+                traded,
+                selection_mode="multi",
+                key="portfolio_fill_symbols",
+                label_visibility="collapsed",
+            )
+            if len(traded) > 1
+            else None
+        )
+        shown = [f for f in fills if not picked or f["symbol"] in picked]
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Time (ET)": _et_clock(f["ts"]),
+                        "Symbol": f["symbol"],
+                        "Side": f["action"],
+                        "Shares": f["filled_quantity"],
+                        "Price": f["price"],
+                        "Amount": f["filled_quantity"] * f["price"],
+                        "Fee": f.get("fee") or 0.0,
+                        "Why": f.get("reasoning") or "",
+                    }
+                    for f in reversed(shown)
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Shares": st.column_config.NumberColumn(format="%g"),
+                "Price": st.column_config.NumberColumn(format="$%.2f"),
+                "Amount": st.column_config.NumberColumn(format="dollar"),
+                "Fee": st.column_config.NumberColumn(format="dollar"),
+                "Why": st.column_config.TextColumn(width="large"),
+            },
+        )
 
 
 def _report_briefing(state: AppState, syms: list[str]) -> dict:
@@ -3530,6 +3746,15 @@ _ORCHESTRA_COPY = dc_replace(
     prefix="orchestra",
     sections={
         **_APPLE_TRADER_COPY.sections,
+        "dayrange_breaker": (
+            "When a day-range pair stops buying for the day — that pair alone; the others "
+            "go on. Two things end it:\n\n"
+            "- **A stop** — the day has not gone the way the pair's forecast said.\n"
+            "- **A trade that barely paid** — the forecast said the day was wide enough "
+            "for the dip to be worth buying, and the trade says otherwise.\n\n"
+            "That breaker can instead hold the pair's entries only until its forecast is "
+            "revised — see the box below."
+        ),
         "selection": (
             "Once a session, at **09:34 ET** — four opening minutes in, one bar before "
             "the forecasts — Orchestra narrows its pairs to the day's candidates. The "
@@ -3576,8 +3801,8 @@ _ORCHESTRA_COPY = dc_replace(
         "mode": (
             "**Race** — every pair watches for its buy; the first whose buy fills takes "
             "the budget and is the only one that trades until its position is closed, "
-            "then the race is open again. A stop-out stops the agent (a GoodMoments "
-            "pair's stop only pauses that pair).\n\n"
+            "then the race is open again. A stop-out stands that pair down for the day and "
+            "the others race on (a GoodMoments pair's stop only pauses that pair).\n\n"
             "**Split** — every pair trades at once, each on its own share of the budget "
             "(the Budget % column). A pair sizes every buy off the cash its share has "
             "left, and holds only the shares it bought itself. The budget is what the "
@@ -3602,9 +3827,9 @@ _ORCHESTRA_COPY = dc_replace(
             "Per pair: sells everything when a bar's low reaches this share of the pair's "
             "predicted gain (`buy − sell`) under the fill — 0.5 risks \\$0.50 for every "
             "\\$1.00 the trade plays for. 0 switches it off for this pair. Starts from the "
-            "stop SimLab tuned with the pair's levels. In a race a stop-out stops the agent; "
-            "in a split it stands only that pair down. A running Orchestra takes a change "
-            "on ▶ Start."
+            "stop SimLab tuned with the pair's levels. A stop-out stands only this pair down "
+            "for the rest of the day; the other pairs go on. A running Orchestra takes a "
+            "change on ▶ Start."
         ),
         "pair_confirmation_bars": (
             "Per pair: the momentum confirmation period, in bars — the look-back over which "
@@ -3633,6 +3858,19 @@ _ORCHESTRA_COPY = dc_replace(
             "Unticked, a trade that barely paid stands no pair down: each pair's levels "
             "re-arm after every trade.\n\n"
             "- The threshold below is kept for when it is ticked again."
+        ),
+        "breaker_until_revised": (
+            "What the circuit breaker — a trade that barely paid — holds that pair's "
+            "entries for.\n\n"
+            "- **Unticked** — the rest of the session.\n"
+            "- **Ticked** — only until the session trades through the pair's predicted high "
+            "or low and its forecast is revised (by the breach rule above, or by "
+            "containment). The revised forecast is a new claim about the day, so the pair's "
+            "levels are armed again; a breaker that trips after that pauses it again.\n"
+            "- With the 9:35 forecast held all day and containment off nothing revises it, "
+            "so ticked or not the breaker holds for the day.\n"
+            "- A stop always ends that pair's buying for the day; the other pairs go on.\n"
+            "- Not swept."
         ),
         "pair_gm_enter": (
             "Per pair: the edge a buy needs — the model's probability of a +0.2 ADR rise "
@@ -4380,9 +4618,9 @@ def _agent_panel(
                 "**(ticker, model) pairs** at once — AAPL on the day-range model and AAPL "
                 "on HighLow are two pairs. Each forecasts its own day at 9:35. **Race:** "
                 "the first whose buy fills is followed alone until its position is closed, "
-                "then the others may buy again; a stop-out stops the agent. **Split:** "
-                "every pair trades in parallel on its own share of the budget; a stop-out "
-                "stands only that pair down."
+                "then the others may buy again. **Split:** every pair trades in parallel "
+                "on its own share of the budget. Either way a stop-out stands only that "
+                "pair down."
             )
         if personality in RULE_AGENT_KEYS:
             # No LLM in the loop, so no LLM settings on screen. The stored
@@ -4552,9 +4790,11 @@ def _agent_panel(
 
 
 def _portfolio_panel(symbols: list[str]) -> None:
-    """The Portfolio tab: the run's value and its chart, then the ledger, the
-    armed tactics and the agent's log."""
+    """The Portfolio tab: the run's value and its chart (whole, or by symbol),
+    then the holdings per instrument and their fills, the armed tactics and
+    the agent's log."""
     _agent_performance_panel(symbols)
+    _holdings_panel()
     _agent_log_panel()
 
 

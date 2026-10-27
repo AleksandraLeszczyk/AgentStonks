@@ -2,7 +2,15 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agent_stonks.performance import compute_equity_curve, decision_markers, summarize, total_fees_paid
+from agent_stonks.performance import (
+    compute_equity_curve,
+    compute_symbol_curves,
+    decision_markers,
+    holdings,
+    summarize,
+    symbol_books,
+    total_fees_paid,
+)
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
 
@@ -127,3 +135,165 @@ class TestSummarize:
     def test_no_override_falls_back_to_the_curve(self):
         points = [{"ts": "t", "price": 100.0, "cash": 0.0, "position": 10.0, "value": 1100.0}]
         assert summarize(points, [], 1000.0, None)["current_value"] == 1100.0
+
+
+# --- per instrument -------------------------------------------------------
+
+NVDA_BARS = [
+    {"t": "2024-01-15T14:00:00Z", "o": 50.0, "h": 51.0, "l": 49.0, "c": 50.0, "v": 9000},
+    {"t": "2024-01-15T14:01:00Z", "o": 50.0, "h": 52.0, "l": 50.0, "c": 51.0, "v": 8000},
+    {"t": "2024-01-15T14:02:00Z", "o": 51.0, "h": 51.0, "l": 48.0, "c": 49.0, "v": 7000},
+]
+
+
+def _fill(ts: str, symbol: str, action: str, qty: float, price: float,
+          cash_after: float = 0.0, positions_after: dict | None = None, fee: float = 1.0) -> dict:
+    positions_after = positions_after or {}
+    return {
+        "ts": ts,
+        "symbol": symbol,
+        "action": action,
+        "requested_quantity": qty,
+        "filled_quantity": qty,
+        "price": price,
+        "reasoning": "x",
+        "status": "filled",
+        "cash_after": cash_after,
+        "position_after": positions_after.get(symbol, 0.0),
+        "positions_after": positions_after,
+        "fee": fee,
+    }
+
+
+# Starting with $10,000 and a $1 fee a fill: AAPL bought and sold, NVDA bought.
+BASKET = [
+    _fill("2024-01-15T14:00:30Z", "AAPL", "buy", 10, 100.5, 8994.0, {"AAPL": 10.0}),
+    _fill("2024-01-15T14:00:40Z", "NVDA", "buy", 20, 50.5, 7983.0, {"AAPL": 10.0, "NVDA": 20.0}),
+    _fill("2024-01-15T14:01:30Z", "AAPL", "sell", 10, 103.0, 9012.0, {"AAPL": 0.0, "NVDA": 20.0}),
+]
+
+
+class TestSymbolBooks:
+    def test_average_cost_and_what_the_sells_realized(self):
+        book = symbol_books([
+            _fill("2024-01-15T14:00:10Z", "AAPL", "buy", 10, 100.0),
+            _fill("2024-01-15T14:00:20Z", "AAPL", "buy", 10, 110.0),
+            _fill("2024-01-15T14:00:30Z", "AAPL", "sell", 5, 120.0),
+        ])["AAPL"]
+        assert book.shares == 15
+        assert book.avg_cost == pytest.approx(105.0)
+        assert book.realized == pytest.approx(75.0)  # 5 × (120 − 105)
+        assert (book.fees, book.buys, book.sells) == (3.0, 2, 1)
+        assert book.open_pnl(100.0) == pytest.approx(-75.0)
+        assert book.pnl(100.0) == pytest.approx(75.0 - 75.0 - 3.0)
+
+    def test_selling_more_than_the_ledger_bought_realizes_only_what_it_bought(self):
+        # A real account can sell shares it held before the run; their cost is
+        # not in this ledger, so their sale realizes nothing here.
+        book = symbol_books([
+            _fill("2024-01-15T14:00:10Z", "AAPL", "buy", 5, 100.0, fee=0.0),
+            _fill("2024-01-15T14:00:20Z", "AAPL", "sell", 8, 110.0, fee=0.0),
+        ])["AAPL"]
+        assert book.realized == pytest.approx(50.0)
+        assert book.shares == 0 and book.avg_cost is None
+        assert book.open_pnl(120.0) is None
+
+    def test_only_fills_count(self):
+        rejected = {**_fill("2024-01-15T14:00:10Z", "AAPL", "buy", 5, 100.0), "status": "rejected"}
+        tactics = {**_fill("2024-01-15T14:00:20Z", "AAPL", "tactics", 0, 100.0), "status": "armed"}
+        assert symbol_books([rejected, tactics]) == {}
+
+
+class TestHoldings:
+    def test_held_first_by_market_value_then_the_symbols_traded_flat(self):
+        decisions = [
+            _fill("2024-01-15T14:00:10Z", "AAPL", "buy", 10, 100.0),
+            _fill("2024-01-15T14:00:20Z", "NVDA", "buy", 100, 50.0),
+            _fill("2024-01-15T14:00:30Z", "MU", "buy", 5, 20.0),
+            _fill("2024-01-15T14:00:40Z", "MU", "sell", 5, 22.0),
+        ]
+        rows = holdings(
+            decisions,
+            {"AAPL": 10.0, "NVDA": 100.0, "MU": 0.0},
+            {"AAPL": 110.0, "NVDA": 52.0, "MU": 21.0},
+            portfolio_value=10_000.0,
+        )
+        assert [r["symbol"] for r in rows] == ["NVDA", "AAPL", "MU"]
+        aapl = rows[1]
+        assert aapl["market_value"] == pytest.approx(1100.0)
+        assert aapl["weight_pct"] == pytest.approx(11.0)
+        assert aapl["avg_cost"] == pytest.approx(100.0)
+        assert aapl["open_pnl"] == pytest.approx(100.0)
+        assert aapl["open_pct"] == pytest.approx(10.0)
+        assert aapl["net_pnl"] == pytest.approx(99.0)
+        mu = rows[2]
+        assert mu["shares"] == 0 and mu["open_pnl"] is None and mu["avg_cost"] is None
+        assert mu["closed_pnl"] == pytest.approx(10.0)
+        assert mu["net_pnl"] == pytest.approx(8.0)
+        assert (mu["buys"], mu["sells"]) == (1, 1)
+
+    def test_shares_no_fill_bought_are_untracked(self):
+        # The account holds 15; this ledger bought 10 of them.
+        rows = holdings(
+            [_fill("2024-01-15T14:00:10Z", "AAPL", "buy", 10, 100.0, fee=0.0)],
+            {"AAPL": 15.0},
+            {"AAPL": 110.0},
+        )
+        (aapl,) = rows
+        assert aapl["shares"] == 15 and aapl["untracked"] == 5
+        assert aapl["market_value"] == pytest.approx(1650.0)
+        assert aapl["open_pnl"] == pytest.approx(100.0)  # on the 10 it bought
+        assert aapl["weight_pct"] is None  # no portfolio value given
+
+    def test_a_held_symbol_without_a_price_has_no_value(self):
+        (row,) = holdings([], {"TSLA": 3.0}, {"TSLA": None}, portfolio_value=1000.0)
+        assert row["market_value"] is None and row["weight_pct"] is None
+        assert row["untracked"] == 3
+
+
+class TestComputeSymbolCurves:
+    BARS_BY_SYMBOL = {"AAPL": BARS, "NVDA": NVDA_BARS}
+
+    def test_symbol_pnls_add_up_to_the_equity_curve(self):
+        curves = compute_symbol_curves(self.BARS_BY_SYMBOL, BASKET, 10_000.0, SESSION_START)
+        equity = compute_equity_curve(self.BARS_BY_SYMBOL, BASKET, 10_000.0, SESSION_START)
+        # The equity curve's value once every symbol's bar at a time is in.
+        value_at = {p["ts"]: p["value"] for p in equity}
+        bar_points = [p for p in curves["points"] if p["ts"] in value_at]
+        assert [p["ts"][11:16] for p in bar_points] == ["14:00", "14:01", "14:02"]
+        for point in bar_points:
+            assert sum(point["pnl"].values()) == pytest.approx(value_at[point["ts"]] - 10_000.0)
+        last = bar_points[-1]
+        assert last["pnl"] == pytest.approx({"AAPL": 23.0, "NVDA": -31.0})
+        assert last["market_value"] == pytest.approx({"AAPL": 0.0, "NVDA": 980.0})
+        assert last["cash"] == 9012.0
+
+    def test_a_point_at_every_fill_and_each_fill_on_its_own_line(self):
+        curves = compute_symbol_curves(self.BARS_BY_SYMBOL, BASKET, 10_000.0, SESSION_START)
+        assert len(curves["points"]) == 3 + 3  # three bar times, three fills
+        assert [(f["symbol"], f["action"]) for f in curves["fills"]] == [
+            ("AAPL", "buy"), ("NVDA", "buy"), ("AAPL", "sell"),
+        ]
+        # Right after a buy the symbol has lost only its fee.
+        assert curves["fills"][0]["pnl"] == pytest.approx(-1.0)
+        assert curves["fills"][2]["pnl"] == pytest.approx(10 * (103.0 - 100.5) - 2.0)
+
+    def test_fills_before_session_start_count_but_are_not_marked(self):
+        late_start = datetime(2024, 1, 15, 14, 0, 45, tzinfo=timezone.utc)
+        curves = compute_symbol_curves(self.BARS_BY_SYMBOL, BASKET, 10_000.0, late_start)
+        assert [f["action"] for f in curves["fills"]] == ["sell"]
+        first = curves["points"][0]
+        assert set(first["pnl"]) == {"AAPL", "NVDA"}
+
+    def test_live_prices_add_a_now_point(self):
+        curves = compute_symbol_curves(
+            self.BARS_BY_SYMBOL, BASKET, 10_000.0, SESSION_START, live_prices={"NVDA": 55.0},
+        )
+        now = curves["points"][-1]
+        assert now["pnl"]["NVDA"] == pytest.approx(20 * 55.0 - 1010.0 - 1.0)
+        assert now["market_value"]["NVDA"] == pytest.approx(1100.0)
+
+    def test_nothing_traded_is_empty_per_symbol(self):
+        curves = compute_symbol_curves(self.BARS_BY_SYMBOL, [], 10_000.0, SESSION_START)
+        assert all(p["pnl"] == {} and p["market_value"] == {} for p in curves["points"])
+        assert curves["fills"] == []

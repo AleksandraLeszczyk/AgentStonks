@@ -19,10 +19,11 @@ hold a position at a time. The pairs race for it:
   (`BaseTrader.entry_gate`), and a pair on the holder's own symbol sees the
   symbol as flat, so it never adopts a position that is not its own.
 * **Reopening.** Once the holder's position is closed -- at the target, by the
-  momentum take and its runner, or by the circuit breaker -- the race is open
-  again, to every pair that is still armed. The holder's own rules decide
-  whether *it* is: a breaker stand-down keeps that pair out for the day and
-  leaves the rest racing. (The user's choice, 2026-10-02.)
+  momentum take and its runner, by the circuit breaker or by its stop -- the
+  race is open again, to every pair that is still armed. The holder's own
+  rules decide whether *it* is: a breaker stand-down or a stop-out keeps that
+  pair out for the day and leaves the rest racing. (The user's choices,
+  2026-10-02 for the breaker, 2026-10-27 for the stop.)
 * **Picking.** With a selection (`OrchestraConfig.selection`, on by default),
   Orchestra first narrows its pairs to the day's candidates, once, at 09:34 --
   four opening minutes in, one bar before the forecasts -- from the
@@ -32,12 +33,18 @@ hold a position at a time. The pairs race for it:
   session, so a restart keeps it rather than picking again. Nothing is read
   before the pick, so a GoodMoments pair -- which could buy from 09:30 on
   its own -- trades from the 09:34 bar.
-* **Stopping.** A day-range stop-out ends the whole run, as it ends an Apple
-  Trader one: the live loop stops the agent and only ▶ Start re-arms it. A
-  replay has no ▶ Start, so there every pair's entries stay closed for the
-  rest of that session, while their levels are still read bar by bar. A
-  GoodMoments stop does not stop anything -- its own rules pause that pair's
-  entries for 15 bars, as they do on Apple Trader -- so the race reopens.
+* **Stopping.** A day-range stop-out stands that pair down for the rest of
+  the day -- through a restart too (`DayRangeTrader.rearm_after_stop`), since
+  the agent runs on and no ▶ Start is the say-so to re-arm it -- and the race
+  reopens to the others. Only a race of one stops, as an Apple Trader run
+  does: the live loop stops the agent and only ▶ Start re-arms it. A
+  GoodMoments stop does not stand anything down -- its own rules pause that
+  pair's entries for 15 bars, as they do on Apple Trader.
+
+  Until 2026-10-27 any pair's stop-out ended the whole run, and in a replay
+  closed every pair's entries for the rest of that session
+  (`OrchestraConfig.halt_on_stop`, which SimLab records from before then
+  replay with).
 
 Nothing about a pair's own rules changes. With one pair Orchestra *is* an
 Apple Trader run, decision for decision (`tests/test_orchestra.py`), which is
@@ -283,6 +290,13 @@ class OrchestraConfig:
     # racer key -- every pair's above 0, all of them together at most 100. The
     # rest of the budget stays in cash. Empty in a race.
     budget_pct: "dict[str, float]" = field(default_factory=dict)
+    # In a race of several pairs: whether one pair's stop-out ends every
+    # pair's buying for the day -- the live agent stops -- rather than standing
+    # only that pair down. What every record made before 2026-10-27 means,
+    # which SimLab decodes so (`simlab.rule_agents`); off since, the user's
+    # request. A race of one stops on its stop-out either way, as an Apple
+    # Trader run does, and a split never does.
+    halt_on_stop: bool = False
 
     def __post_init__(self) -> None:
         self.racers = [at.as_config(r) for r in self.racers]
@@ -438,6 +452,11 @@ def orchestra_signature(race: OrchestraConfig) -> str:
     otherwise on each pair that has one ("/conf3b", "/stop0.5G"). The rules
     are then read off the first pair that has the ones that differ, so what
     they drive -- the take, the stop under the fill on a ladder -- is in them.
+
+    A race of several pairs where a stop-out stands only that pair down adds
+    ",stop_out=pair" -- when a day-range pair has a stop at all -- so it is
+    not confused with a record from before, when a stop-out ended every
+    pair's day (`OrchestraConfig.halt_on_stop`), which signs as it did.
     """
     ranged = [r for r in race.racers if not is_signal(r)]
     own_confirmation = len({r.momentum_confirmation_bars for r in ranged}) > 1
@@ -477,6 +496,11 @@ def orchestra_signature(race: OrchestraConfig) -> str:
         rules = re.sub(r",confirm=\d+b", "", rules)
     if own_stop:
         rules = re.sub(r",stop=E-[^,)]*", "", rules)
+    if (
+        not race.split and len(race.racers) > 1 and not race.halt_on_stop
+        and any(r.has_stop for r in ranged)
+    ):
+        rules += ",stop_out=pair"
     return f"orchestra[{head}{pairs}]({rules}{candidates.rules_signature(race.selection)})"
 
 
@@ -672,12 +696,17 @@ class Orchestra:
         sources=None,
         mode: str = MODE_RACE,
         budget_pct: "dict[str, float] | None" = None,
+        halt_on_stop: bool = False,
     ) -> None:
         if not racers:
             raise ValueError("Orchestra needs at least one racer")
         self.racers = racers
         self.by_key = {r.key: r for r in racers}
         self.mode = mode
+        # Whether a stop-out ends the run (`OrchestraConfig.halt_on_stop`): a
+        # race of one always, as an Apple Trader run; otherwise it stands only
+        # that pair down.
+        self.stops = mode != MODE_SPLIT and (halt_on_stop or len(racers) == 1)
         # Under a split: each pair's share of the day's budget, the budget the
         # shares are of (the ledger's worth at the session's first open bar),
         # the day it is for, and each pair's account.
@@ -697,8 +726,9 @@ class Orchestra:
         # The racer holding the position, or None while the race is open.
         self.holder: "str | None" = None
         self.holder_since = None
-        # Set by a stop-out: the live loop stops the agent on it; a replay
-        # closes every racer's entries for the rest of `self._stopped_day`.
+        # Set by a stop-out that ends the run (`self.stops`): the live loop
+        # stops the agent on it; a replay closes every racer's entries for the
+        # rest of `self._stopped_day`.
         self.halt: "str | None" = None
         self._stopped_day = None
         self._day = None
@@ -707,12 +737,13 @@ class Orchestra:
         self._event = None
         for racer in racers:
             racer.trader.slot = RacerSlot(racer.key)
-            if self.split:
-                # Nobody waits for anybody. A stop-out stands the pair down
-                # for the day, and a restart must not undo that: the agent
-                # goes on running, so no ▶ Start is the say-so to re-arm it.
+            if not self.stops:
+                # A stop-out stands the pair down for the day, and a restart
+                # must not undo that: the agent goes on running, so no ▶ Start
+                # is the say-so to re-arm it.
                 racer.trader.rearm_after_stop = False
-            else:
+            if not self.split:
+                # In a split nobody waits for anybody.
                 racer.trader.entry_gate = (lambda key=racer.key: self._gate(key))
 
     @property
@@ -964,24 +995,28 @@ class Orchestra:
             ledger = self._ledger(racer.key, tracker)
             with agent_log_tag(racer=racer.label):
                 racer.outcome = racer.trader.run_cycle(racer.bundle, state, ledger)
-            if self._event is not None:
-                self._announce(state, tracker)
             halt = getattr(racer.trader, "halt", None)
-            if halt and self.split:
+            if halt and not self.stops:
                 # That pair's own stand-down already keeps it out today; the
-                # others go on, each with its own position to manage.
+                # others go on -- in a split each with its own position to
+                # manage, in a race to the position this one just gave up.
                 racer.trader.halt = None
                 if not alone:
                     with agent_log_tag(racer=racer.label):
                         _log(state, {"type": "analysis", "text": (
-                            f"{racer.label} {halt}: it sits out the rest of today. The "
-                            "other pairs keep trading their own shares of the budget."
+                            f"{racer.label} {halt}: it sits out the rest of today. "
+                            + (
+                                "The other pairs keep trading their own shares of the budget."
+                                if self.split else "The other pairs race on without it."
+                            )
                         )})
             elif halt and self._stopped_day != today:
                 # Every racer is still read for the rest of the session -- their
                 # levels stay current -- but none may buy (`_gate`).
                 self.halt = f"{racer.label} {halt}"
                 self._stopped_day = today
+            if self._event is not None:
+                self._announce(state, tracker)
         if not alone:
             self._race_line(state)
         self._publish(state)
@@ -1297,7 +1332,8 @@ def build_orchestra(
             bundle=bundles[racer_key(config)],
         )
         for config in race.racers
-    ], selection=race.selection, sources=sources, mode=race.mode, budget_pct=race.budget_pct)
+    ], selection=race.selection, sources=sources, mode=race.mode, budget_pct=race.budget_pct,
+        halt_on_stop=race.halt_on_stop)
 
 
 def load_racers(race: OrchestraConfig) -> "tuple[dict[str, dict], dict[str, str]]":
@@ -1343,6 +1379,7 @@ def _orchestra_loop(
     race_config = OrchestraConfig(
         kept, selection=race_config.selection,
         mode=race_config.mode, budget_pct=race_config.budget_pct,
+        halt_on_stop=race_config.halt_on_stop,
     )
     race = build_orchestra(race_config, bundles)
     if len(kept) > 1 and race_config.split:
@@ -1367,7 +1404,10 @@ def _orchestra_loop(
             + f". {_how_pairs_read(kept)}; the first "
             "whose buy fills is the only one that trades until its position is closed, then "
             "the race is open again. Ties go to the earlier pair in this list. A stop-out "
-            "stops the agent"
+            + (
+                "stops the agent" if race.stops
+                else "stands that pair down for the day, and the others race on"
+            )
             + (
                 " (a GoodMoments stop pauses only that pair, for "
                 f"{APPLE_TRADER_GM_COOLDOWN_BARS} bars)."
@@ -1384,7 +1424,8 @@ def _orchestra_loop(
         key = racer_key(config)
         with agent_log_tag(racer=racer_label(config)):
             _log(state, {"type": "status", "text": at._armed_summary(
-                config, apple_models.get(config.model_key), bundles[key]
+                config, apple_models.get(config.model_key), bundles[key],
+                stops_agent=race.stops,
             )})
 
     def cycle() -> str:

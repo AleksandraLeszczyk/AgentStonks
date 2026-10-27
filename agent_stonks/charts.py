@@ -3103,9 +3103,14 @@ def build_performance_chart(
     if markers:
         df_m = pd.DataFrame(markers)
         df_m["ts"] = pd.to_datetime(df_m["ts"], format="ISO8601")
-        for action, marker_symbol, color in (
-            ("buy", "triangle-up", PALETTE["up"]),
-            ("sell", "triangle-down", PALETTE["down"]),
+        traded = df_m[df_m["action"].isin(["buy", "sell"])].get("symbol", pd.Series(dtype=object)).dropna()
+        # With more than one symbol traded, each trade says which it was
+        # without a hover: a buy and a sell next to each other are otherwise
+        # read as one round trip when they may be two different instruments.
+        name_trades = traded.nunique() > 1
+        for action, marker_symbol, color, text_at in (
+            ("buy", "triangle-up", PALETTE["up"], "bottom center"),
+            ("sell", "triangle-down", PALETTE["down"], "top center"),
         ):
             sub = df_m[df_m["action"] == action]
             if sub.empty:
@@ -3123,7 +3128,10 @@ def build_performance_chart(
                 go.Scatter(
                     x=sub["ts"],
                     y=sub["value"],
-                    mode="markers",
+                    mode="markers+text" if name_trades else "markers",
+                    text=symbols if name_trades else None,
+                    textposition=text_at,
+                    textfont=dict(size=10, color=PALETTE["muted"]),
                     marker=dict(symbol=marker_symbol, size=12, color=color, line=dict(width=1.5, color="#ffffff")),
                     name=f"Agent {action}",
                     customdata=list(zip(qty_labels, reasons, prices, symbols)),
@@ -3151,18 +3159,213 @@ def build_performance_chart(
                 )
             )
 
+    _portfolio_chart_layout(fig, f"<b>{symbol}</b> agent portfolio value")
+    return fig
+
+
+def _portfolio_chart_layout(fig: go.Figure, title: str) -> None:
+    """The Portfolio tab's chart frame, shared by its value, P&L and exposure
+    views so switching between them changes only the data."""
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=PALETTE["bg"],
         plot_bgcolor=PALETTE["panel"],
         font=dict(color=PALETTE["text"], family="Inter, sans-serif"),
-        title=dict(text=f"<b>{symbol}</b> agent portfolio value", font=dict(size=16), x=0.02),
-        xaxis=dict(showgrid=True, gridcolor=PALETTE["grid"]),
-        yaxis=dict(showgrid=True, gridcolor=PALETTE["grid"], tickprefix="$"),
+        title=dict(text=title, font=dict(size=16), x=0.02),
         legend=dict(orientation="h", y=1.08, bgcolor="rgba(0,0,0,0)"),
         margin=dict(l=10, r=10, t=50, b=10),
         height=420,
     )
+    # Every axis, for the P&L view's panels.
+    fig.update_xaxes(showgrid=True, gridcolor=PALETTE["grid"])
+    fig.update_yaxes(showgrid=True, gridcolor=PALETTE["grid"], tickprefix="$")
+
+
+# One colour per instrument on the Portfolio tab's per-symbol views, handed
+# out in symbol order so a symbol wears the same colour in both. The hues are
+# the dataviz reference's dark categorical palette without its green and red
+# (here those mean a buy and a sell), ordered so that neighbouring slots stay
+# apart for colour-blind readers too -- adjacent ΔE 9.4 under CVD, 19.3 in
+# normal vision, on PALETTE["panel"] -- which is what a stack of bands needs.
+# Lines all cross one another, so there every pair must stay apart, and only
+# the first three do: past `_OVERLAID_SYMBOLS` the P&L view gives each symbol a
+# panel of its own instead of a colour to be told apart by.
+SYMBOL_COLORS: tuple[str, ...] = (
+    "#3987e5", "#d95926", "#199e70", "#9085e9", "#d55181", "#c98500",
+)
+OTHER_SYMBOLS = "Other"
+_OVERLAID_SYMBOLS = 3
+
+
+def _symbol_frame(points: list[dict], field: str) -> pd.DataFrame:
+    """`compute_symbol_curves` points as one column per symbol, 0 before the
+    symbol's first trade. Past len(SYMBOL_COLORS) symbols the ones smallest at
+    the end fold into "Other": a colour is never handed to a second symbol."""
+    index = pd.to_datetime([p["ts"] for p in points], format="ISO8601")
+    df = pd.DataFrame([p[field] for p in points], index=index).fillna(0.0)
+    df = df[sorted(df.columns)]
+    if df.shape[1] > len(SYMBOL_COLORS):
+        keep = df.iloc[-1].abs().sort_values(ascending=False).index[: len(SYMBOL_COLORS) - 1]
+        rest = [c for c in df.columns if c not in keep]
+        df = df[sorted(keep)].assign(**{OTHER_SYMBOLS: df[rest].sum(axis=1)})
+    return df
+
+
+def _symbol_colors(columns) -> dict[str, str]:
+    symbols = [c for c in columns if c != OTHER_SYMBOLS]
+    colors = dict(zip(symbols, SYMBOL_COLORS))
+    colors[OTHER_SYMBOLS] = PALETTE["muted"]
+    return colors
+
+
+def _symbol_fills(curves: dict, pnl: pd.DataFrame) -> pd.DataFrame:
+    """The curves' fills, each with the `line` it sits on: its symbol's, or
+    "Other" for a folded symbol -- at that line's P&L, not its own."""
+    fills = pd.DataFrame(curves.get("fills") or [])
+    if fills.empty:
+        return fills
+    fills["ts"] = pd.to_datetime(fills["ts"], format="ISO8601")
+    fills["line"] = fills["symbol"].where(fills["symbol"].isin(pnl.columns), OTHER_SYMBOLS)
+    folded = fills["line"] == OTHER_SYMBOLS
+    if folded.any():
+        other = pnl[OTHER_SYMBOLS]
+        other = other[~other.index.duplicated(keep="last")]
+        fills.loc[folded, "pnl"] = other.reindex(
+            fills.loc[folded, "ts"], method="nearest"
+        ).to_numpy()
+    return fills
+
+
+def _fill_traces(fills: pd.DataFrame, showlegend: bool = True) -> list[go.Scatter]:
+    """Buy and sell triangles at their P&L, with the value chart's hover."""
+    traces = []
+    for action, marker_symbol, color in (
+        ("buy", "triangle-up", PALETTE["up"]),
+        ("sell", "triangle-down", PALETTE["down"]),
+    ):
+        sub = fills[fills["action"] == action] if not fills.empty else fills
+        if sub.empty:
+            continue
+        qty_labels, reasons, why = _trade_hover_text(sub)
+        prices = [f"{float(p):.4f}" if pd.notna(p) else "\u2014" for p in sub["price"]]
+        traces.append(
+            go.Scatter(
+                x=sub["ts"],
+                y=sub["pnl"],
+                mode="markers",
+                marker=dict(symbol=marker_symbol, size=12, color=color, line=dict(width=1.5, color="#ffffff")),
+                name=f"Agent {action}",
+                showlegend=showlegend,
+                customdata=list(zip(qty_labels, reasons, prices, sub["symbol"])),
+                hoverlabel=_trade_hoverlabel(color),
+                hovertemplate=(
+                    f"<b>Agent {action} %{{customdata[3]}}</b><br>P&L: %{{y:$,.2f}}"
+                    f"<br>Price: %{{customdata[2]}}<br>Qty: %{{customdata[0]}}"
+                    f"{why}<extra></extra>"
+                ),
+            )
+        )
+    return traces
+
+
+def _pnl_line(x, y, name: str, color: str, **line) -> go.Scatter:
+    return go.Scatter(
+        x=x,
+        y=y,
+        mode="lines",
+        name=name,
+        line=dict(color=color, width=2, **line),
+        hovertemplate=f"<b>{name}</b> %{{x|%H:%M}}<br>P&L: %{{y:$,.2f}}<extra></extra>",
+    )
+
+
+def build_symbol_pnl_chart(curves: dict, label: str) -> go.Figure:
+    """Each symbol's P&L through the session (`compute_symbol_curves`) and
+    every buy and sell on its own symbol's line -- which instrument made the
+    day, and when. Up to `_OVERLAID_SYMBOLS` symbols share one plot with the
+    basket's total dashed over them; more get a panel each under the total."""
+    points = curves.get("points") or []
+    pnl = _symbol_frame(points, "pnl") if points else pd.DataFrame()
+    if pnl.empty:
+        return empty_chart("No trades yet — nothing to split by symbol")
+    colors = _symbol_colors(pnl.columns)
+    fills = _symbol_fills(curves, pnl)
+    title = f"<b>{label}</b> P&L by symbol"
+    if pnl.shape[1] > _OVERLAID_SYMBOLS:
+        return _symbol_pnl_panels(pnl, fills, colors, title)
+
+    fig = go.Figure()
+    fig.add_hline(y=0, line=dict(color=PALETTE["muted"], width=1, dash="dot"))
+    for sym in pnl.columns:
+        fig.add_trace(_pnl_line(pnl.index, pnl[sym], sym, colors[sym]))
+    if pnl.shape[1] > 1:
+        fig.add_trace(_pnl_line(pnl.index, pnl.sum(axis=1), "Total", PALETTE["text"], dash="dash"))
+    for trace in _fill_traces(fills):
+        fig.add_trace(trace)
+    _portfolio_chart_layout(fig, title)
+    return fig
+
+
+def _symbol_pnl_panels(
+    pnl: pd.DataFrame, fills: pd.DataFrame, colors: dict[str, str], title: str
+) -> go.Figure:
+    """The P&L view past `_OVERLAID_SYMBOLS` symbols: the total, then a panel
+    per symbol named by its title, all on one y scale so the panels compare."""
+    names = ["Total", *pnl.columns]
+    fig = make_subplots(
+        rows=len(names), cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        subplot_titles=names,
+    )
+    for row, name in enumerate(names, start=1):
+        total = name == "Total"
+        y = pnl.sum(axis=1) if total else pnl[name]
+        fig.add_trace(
+            _pnl_line(pnl.index, y, name, PALETTE["text"] if total else colors[name]),
+            row=row, col=1,
+        )
+        fig.add_hline(y=0, line=dict(color=PALETTE["muted"], width=1, dash="dot"), row=row, col=1)
+        if not total and not fills.empty:
+            for trace in _fill_traces(fills[fills["line"] == name], showlegend=False):
+                fig.add_trace(trace, row=row, col=1)
+    for row in range(2, len(names) + 1):
+        fig.update_yaxes(matches="y", row=row, col=1)
+    _portfolio_chart_layout(fig, title)
+    fig.update_layout(showlegend=False, height=60 + 130 * len(names))
+    fig.update_annotations(font=dict(size=12, color=PALETTE["text"]), x=0, xanchor="left")
+    return fig
+
+
+def build_exposure_chart(curves: dict, label: str) -> go.Figure:
+    """What the basket held through the session (`compute_symbol_curves`):
+    each symbol's market value stacked, with cash on top, so the top edge is
+    the portfolio's value and each band its share of it."""
+    points = curves.get("points") or []
+    held = _symbol_frame(points, "market_value") if points else pd.DataFrame()
+    if held.empty:
+        return empty_chart("Nothing held yet")
+    colors = _symbol_colors(held.columns)
+    cash = pd.Series([p["cash"] for p in points], index=held.index)
+
+    fig = go.Figure()
+    # Cash recedes: it is the room left, not a position.
+    for name, series, color, alpha in (
+        *((sym, held[sym], colors[sym], 0.6) for sym in held.columns),
+        ("Cash", cash, "#888888", 0.2),
+    ):
+        fig.add_trace(
+            go.Scatter(
+                x=held.index,
+                y=series,
+                mode="lines",
+                name=name,
+                stackgroup="value",
+                line=dict(color=color, width=1),
+                fillcolor=_rgba(color, alpha),
+                hovertemplate=f"<b>{name}</b> %{{x|%H:%M}}<br>%{{y:$,.2f}}<extra></extra>",
+            )
+        )
+
+    _portfolio_chart_layout(fig, f"<b>{label}</b> exposure by symbol")
     return fig
 
 

@@ -2083,8 +2083,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         self.halt: "str | None" = None
         # Whether a run started again today re-arms a session that was stopped
         # out (`_resume`). A single run stops on a stop-out, so being started
-        # again is the say-so; a split Orchestra (`orchestra`) runs on past one
-        # pair's stop-out, so for its pairs a restart is not.
+        # again is the say-so; an Orchestra of several pairs (`orchestra`) runs
+        # on past one pair's stop-out, so for its pairs a restart is not.
         self.rearm_after_stop = True
         # Where the published record and the sidebar form live (`TraderSlot`).
         self.slot: TraderSlot = SINGLE_SLOT
@@ -2753,7 +2753,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
 
         A stop-out's stand-down is the one thing not taken back: the stop ended
         that run, and pressing ▶ Start again is the say-so to trade again today
-        -- unless `rearm_after_stop` is off (a split Orchestra's pairs), when it
+        -- unless `rearm_after_stop` is off (an Orchestra's pairs), when it
         holds like any other. The breaker's stand-down (`_close_out`) did not
         stop the run, so it still holds, and so does a breaker's pause until the
         forecast is revised (`breaker_until_revised`)."""
@@ -5965,8 +5965,12 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
     )
 
 
-def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
-    """The one line the log opens a run with: which model, and what it will do."""
+def _armed_summary(
+    config: AppleTraderConfig, model, bundle: dict, stops_agent: bool = True,
+) -> str:
+    """The one line the log opens a run with: which model, and what it will do.
+    `stops_agent` off says a stop-out stands only this trader down for the day
+    -- an Orchestra pair's, when the others trade on."""
     if config.strategy == apple_models.STRATEGY_MOMENTUM:
         return _momentum_armed_summary(config, model, bundle)
     if config.strategy == apple_models.STRATEGY_PROBABILITY:
@@ -5980,8 +5984,11 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
     exits = []
     if config.has_stop:
         exits.append(
-            f"a stop {stop_phrase(config)} under the fill, after which the agent stops "
-            "until ▶ Start Agent is pressed again"
+            f"a stop {stop_phrase(config)} under the fill, after which "
+            + (
+                "the agent stops until ▶ Start Agent is pressed again" if stops_agent
+                else "this pair sits out the rest of the day"
+            )
         )
     if config.has_take:
         exits.append(

@@ -228,9 +228,10 @@ def _render_rule_agent(personality: str) -> None:
             "cash balance. Every pair forecasts its own session at 9:35 and rests its own "
             "levels. In a **race** the first whose buy fills is the only one that trades "
             "until its position is closed, and then the others may buy again; a stop-out "
-            "stands every pair down for the rest of that session. In a **split** every "
-            "pair trades at once on its own share of the session's budget, and a "
-            "stop-out stands only that pair down. Each pair's own rules are Apple "
+            "stands only that pair down for the rest of that session (runs stored before "
+            "27 Oct 2026, whose signatures lack `stop_out=pair`, stood every pair down). In "
+            "a **split** every pair trades at once on its own share of the session's "
+            "budget, and a stop-out stands only that pair down. Each pair's own rules are Apple "
             "Trader's, unchanged — Orchestra with one pair (at 100% in a split) replays "
             "exactly as Apple Trader."
         )

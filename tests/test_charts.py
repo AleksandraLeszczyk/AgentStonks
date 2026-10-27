@@ -6,7 +6,14 @@ import plotly.graph_objects as go
 import pytest
 
 from agent_stonks import charts
-from agent_stonks.charts import build_chart, build_performance_chart, empty_chart
+from agent_stonks.charts import (
+    SYMBOL_COLORS,
+    build_chart,
+    build_exposure_chart,
+    build_performance_chart,
+    build_symbol_pnl_chart,
+    empty_chart,
+)
 
 
 SESSION_START = datetime(2024, 1, 15, 13, 20, tzinfo=timezone.utc)
@@ -230,6 +237,114 @@ class TestBuildPerformanceChart:
         # No reasoning, no empty "Why" heading.
         (sell,) = [t for t in fig.data if t.name == "Agent sell"]
         assert "Why" not in sell.hovertemplate
+
+    def test_trades_name_their_symbol_once_more_than_one_is_traded(self):
+        points = [{"ts": "2024-01-15T14:00:00Z", "price": 100.0, "cash": 900.0, "position": 1.0, "value": 1000.0}]
+        one = [
+            {"ts": "2024-01-15T14:00:00Z", "action": "buy", "symbol": "AAPL", "value": 1000.0},
+            {"ts": "2024-01-15T14:00:30Z", "action": "sell", "symbol": "AAPL", "value": 1005.0},
+        ]
+        (buy,) = [t for t in build_performance_chart(points, one, "AAPL").data if t.name == "Agent buy"]
+        assert buy.mode == "markers" and buy.text is None
+        two = one + [{"ts": "2024-01-15T14:00:40Z", "action": "buy", "symbol": "NVDA", "value": 1004.0}]
+        (buy,) = [t for t in build_performance_chart(points, two, "AAPL, NVDA").data if t.name == "Agent buy"]
+        assert buy.mode == "markers+text" and list(buy.text) == ["AAPL", "NVDA"]
+
+
+def _symbol_point(ts: str, pnl: dict, market_value: dict | None = None, cash: float = 0.0) -> dict:
+    return {"ts": ts, "cash": cash, "pnl": pnl, "market_value": market_value or {}}
+
+
+class TestBuildSymbolPnlChart:
+    CURVES = {
+        "points": [
+            _symbol_point("2024-01-15T14:00:00+00:00", {}),
+            _symbol_point("2024-01-15T14:00:30+00:00", {"AAPL": -1.0}),
+            _symbol_point("2024-01-15T14:01:00+00:00", {"AAPL": 14.0, "NVDA": 9.0}),
+        ],
+        "fills": [
+            {"ts": "2024-01-15T14:00:30+00:00", "symbol": "AAPL", "action": "buy", "pnl": -1.0,
+             "price": 100.5, "filled_quantity": 10.0, "reasoning": "dip"},
+        ],
+    }
+
+    def test_nothing_traded_says_so(self):
+        fig = build_symbol_pnl_chart({"points": [_symbol_point("2024-01-15T14:00:00+00:00", {})], "fills": []}, "AAPL")
+        assert any("No trades yet" in a["text"] for a in fig.layout.annotations)
+
+    def test_a_line_per_symbol_a_dashed_total_and_fills_on_their_line(self):
+        fig = build_symbol_pnl_chart(self.CURVES, "AAPL, NVDA")
+        lines = {t.name: t for t in fig.data}
+        assert {"AAPL", "NVDA", "Total", "Agent buy"} <= set(lines)
+        # A symbol is at 0 before its first trade.
+        assert list(lines["NVDA"].y) == [0.0, 0.0, 9.0]
+        assert list(lines["Total"].y) == [0.0, -1.0, 23.0]
+        assert lines["Total"].line.dash == "dash"
+        assert list(lines["Agent buy"].y) == [-1.0]
+        assert lines["AAPL"].line.color == SYMBOL_COLORS[0]
+        assert lines["NVDA"].line.color == SYMBOL_COLORS[1]
+        assert "P&L by symbol" in fig.layout.title.text
+
+    def test_past_three_symbols_each_gets_a_panel(self):
+        # Four lines crossing need four colours every pair of which can be told
+        # apart, and the palette has only three; titles name the panels instead.
+        pnl = {"AAPL": 1.0, "AMD": -2.0, "MU": 3.0, "NVDA": 4.0}
+        curves = {
+            "points": [_symbol_point("2024-01-15T14:00:00+00:00", pnl)],
+            "fills": [{"ts": "2024-01-15T14:00:00+00:00", "symbol": "MU", "action": "buy", "pnl": 3.0,
+                       "price": 98.0, "filled_quantity": 10.0, "reasoning": None}],
+        }
+        fig = build_symbol_pnl_chart(curves, "basket")
+        assert [a.text for a in fig.layout.annotations] == ["Total", "AAPL", "AMD", "MU", "NVDA"]
+        lines = {t.name: t for t in fig.data if t.mode == "lines"}
+        assert list(lines["Total"].y) == [6.0]
+        (buy,) = [t for t in fig.data if t.name == "Agent buy"]
+        assert buy.yaxis == lines["MU"].yaxis  # on MU's own panel
+        assert fig.layout.yaxis2.matches == "y"  # one scale for every panel
+
+    def test_one_symbol_has_no_total(self):
+        curves = {"points": self.CURVES["points"][:2], "fills": []}
+        assert "Total" not in [t.name for t in build_symbol_pnl_chart(curves, "AAPL").data]
+
+    def test_past_the_palette_the_smallest_symbols_fold_into_other(self):
+        symbols = [f"S{i}" for i in range(len(SYMBOL_COLORS) + 2)]
+        pnl = {s: float(i + 1) for i, s in enumerate(symbols)}  # S0 and S1 smallest
+        curves = {
+            "points": [_symbol_point("2024-01-15T14:00:00+00:00", pnl)],
+            "fills": [{"ts": "2024-01-15T14:00:00+00:00", "symbol": "S0", "action": "sell", "pnl": 1.0,
+                       "price": 10.0, "filled_quantity": 1.0, "reasoning": None}],
+        }
+        fig = build_symbol_pnl_chart(curves, "basket")
+        names = [t.name for t in fig.data]
+        assert "S0" not in names and "S1" not in names and "S2" not in names
+        assert "Other" in names and len([n for n in names if n.startswith("S")]) == len(SYMBOL_COLORS) - 1
+        (other,) = [t for t in fig.data if t.name == "Other"]
+        assert list(other.y) == [1.0 + 2.0 + 3.0]
+        # A folded symbol's fill sits on the Other line.
+        (sell,) = [t for t in fig.data if t.name == "Agent sell"]
+        assert list(sell.y) == [6.0]
+
+
+class TestBuildExposureChart:
+    def test_nothing_held_says_so(self):
+        fig = build_exposure_chart({"points": [_symbol_point("2024-01-15T14:00:00+00:00", {})]}, "AAPL")
+        assert any("Nothing held yet" in a["text"] for a in fig.layout.annotations)
+
+    def test_symbols_stacked_under_cash(self):
+        curves = {
+            "points": [
+                _symbol_point("2024-01-15T14:00:00+00:00", {}, cash=1000.0),
+                _symbol_point(
+                    "2024-01-15T14:01:00+00:00", {"AAPL": 0.0, "NVDA": 0.0},
+                    {"AAPL": 500.0, "NVDA": 300.0}, cash=200.0,
+                ),
+            ],
+        }
+        fig = build_exposure_chart(curves, "AAPL, NVDA")
+        assert [t.name for t in fig.data] == ["AAPL", "NVDA", "Cash"]
+        assert {t.stackgroup for t in fig.data} == {"value"}
+        assert list(fig.data[0].y) == [0.0, 500.0]
+        assert list(fig.data[2].y) == [1000.0, 200.0]
 
 
 class TestFillIntradayGaps:

@@ -2,9 +2,13 @@ from agent_stonks import config
 from agent_stonks.state import AppState
 from agent_stonks.ui import (
     _agent_momentum,
+    _basket_label,
     _buy_time,
     _chart_start,
     _cash_label,
+    _et_clock,
+    _pnl_color,
+    _signed_dollars,
     _venue_badge,
     _portfolio_value_label,
     _quote_html,
@@ -945,3 +949,23 @@ def test_no_chart_drawn_yet_means_nothing_to_redraw(monkeypatch):
 
     monkeypatch.setattr(st, "session_state", {})
     ui._redraw_live_chart()  # no fragment id kept: a no-op, outside a run too
+
+
+class TestPortfolioFormatting:
+    def test_basket_label_names_up_to_four_symbols(self):
+        assert _basket_label(["AAPL", "NVDA"]) == "AAPL, NVDA"
+        assert _basket_label(["AAPL", "NVDA", "MU", "AMD"]) == "AAPL, NVDA, MU, AMD"
+        assert _basket_label(["AAPL", "NVDA", "MU", "AMD", "INTC"]) == "AAPL, NVDA, MU +2"
+
+    def test_signed_dollars(self):
+        assert _signed_dollars(1234.5) == "+$1,234.50"
+        assert _signed_dollars(-3.0) == "−$3.00"
+
+    def test_pnl_color(self):
+        assert config.PALETTE["up"] in _pnl_color(2.0)
+        assert config.PALETTE["down"] in _pnl_color(-0.5)
+        assert _pnl_color(0.0) == "" and _pnl_color(None) == "" and _pnl_color(float("nan")) == ""
+
+    def test_et_clock(self):
+        assert _et_clock("2024-01-15T14:00:30+00:00") == "09:00:30"
+        assert _et_clock("2024-07-15T14:00:30") == "10:00:30"  # naive = UTC

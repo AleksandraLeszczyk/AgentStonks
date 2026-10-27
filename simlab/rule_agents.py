@@ -323,11 +323,14 @@ def _orchestra_from_record(raw: "dict | None") -> OrchestraConfig:
         )
     # A record without `selection` was made before the 09:34 selection existed
     # and raced every pair all day; None replays it -- and signs it -- so. One
-    # without `mode` was made before the split existed, and is a race.
+    # without `mode` was made before the split existed, and is a race. One
+    # without `halt_on_stop` was made while any pair's stop-out ended every
+    # pair's day, before 2026-10-27.
     return OrchestraConfig(
         [_apple_from_record(r) for r in racers], selection=(raw or {}).get("selection"),
         mode=(raw or {}).get("mode") or "race",
         budget_pct=(raw or {}).get("budget_pct") or {},
+        halt_on_stop=bool((raw or {}).get("halt_on_stop", True)),
     )
 
 

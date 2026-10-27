@@ -122,8 +122,8 @@ def racer(ticker, model_key="highlow", **kwargs):
     return replace(dayrange_config(**kwargs), ticker=ticker, model_key=model_key)
 
 
-def make_race(*configs, selection=None, sources=None) -> ar.Orchestra:
-    race = ar.OrchestraConfig(list(configs), selection=selection)
+def make_race(*configs, selection=None, sources=None, halt_on_stop=False) -> ar.Orchestra:
+    race = ar.OrchestraConfig(list(configs), selection=selection, halt_on_stop=halt_on_stop)
     return ar.build_orchestra(race, {k: BUNDLE for k in race.keys}, sources=sources)
 
 
@@ -292,12 +292,72 @@ class TestOneSymbolTwoModels:
 
 
 class TestStopOut:
-    def test_a_stop_out_halts_the_race_for_the_day(self, market_open, monkeypatch):
+    def test_a_stop_out_stands_only_that_pair_down(self, market_open, monkeypatch):
+        """The user's request of 2026-10-27: the pair that stopped out sits the
+        day out, and the race goes on to the others."""
         broker = Broker2()
         tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
         tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
         state = make_state(["AAPL", "INTC"])
         race = make_race(racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5))
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(99.0, 98.0, 99.5))
+        assert race.run_cycle(state, tracker) == "sold"
+        # Nothing stops the agent, and the race is open again -- without AAPL.
+        assert race.halt is None and race.holder is None
+        texts = [e.get("text", "") for e in state.agent_log]
+        sat_out = next(
+            i for i, t in enumerate(texts)
+            if t.startswith("AAPL · HighLow stopped out: it sits out the rest of today.")
+        )
+        assert texts[sat_out + 1] == (
+            "AAPL · HighLow is flat again, so the race is open: INTC · HighLow can buy."
+        )
+        statuses = {row["key"]: row["status"] for row in state.orchestra["board"]}
+        assert statuses == {"AAPL:highlow": "stood down (stopped out)", "INTC:highlow": "racing"}
+
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "bought"
+        assert [f[:2] for f in fills(tracker)] == [("AAPL", "buy"), ("AAPL", "sell"), ("INTC", "buy")]
+        assert race.holder == "INTC:highlow"
+
+        # Started again the same day (a crash, a refresh, ▶ Stop and ▶ Start):
+        # the stopped pair stays out -- the run never stopped, so this is no
+        # say-so to re-arm it.
+        race.publish_memory(state)
+        again = make_race(racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5))
+        again.run_cycle(state, tracker)
+        assert again.holder == "INTC:highlow"
+        assert again.by_key["AAPL:highlow"].trader.plan["stand_down"] == "stopped out"
+
+    def test_a_race_of_one_still_stops(self, market_open, monkeypatch):
+        """Nobody is left to race on, and an Apple Trader run stops there too."""
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL"], broker)
+        state = make_state(["AAPL"])
+        race = make_race(racer("AAPL", stop_gain_fraction=0.5))
+        assert race.by_key["AAPL:highlow"].trader.rearm_after_stop is True
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(99.0, 98.0, 99.5))
+        assert race.run_cycle(state, tracker) == "sold"
+        assert race.halt == "AAPL · HighLow stopped out"
+
+    def test_a_record_from_before_halts_the_race_for_the_day(self, market_open, monkeypatch):
+        """`halt_on_stop`, what SimLab replays a record made before 2026-10-27
+        with: any pair's stop-out closes every pair's entries."""
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
+        state = make_state(["AAPL", "INTC"])
+        race = make_race(
+            racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5),
+            halt_on_stop=True,
+        )
         race.run_cycle(state, tracker)
         tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
         race.run_cycle(state, tracker)
@@ -496,6 +556,30 @@ class TestOrchestraConfig:
         # ladder, though the first pair has none.
         assert "stop=E-" not in rules and ",stop@fill" in rules
 
+    def test_a_stop_out_that_stands_one_pair_down_signs_so(self):
+        from simlab.rule_agents import rule_agent
+
+        agent = rule_agent(ar.ORCHESTRA_KEY)
+        pairs = [racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5)]
+        race = ar.OrchestraConfig(pairs)
+        assert ar.orchestra_signature(race).endswith(",stop_out=pair)")
+        assert agent.from_record(agent.to_record(race)) == race
+        # A record from before 2026-10-27: every pair's day ended on a stop-out,
+        # and it signs as it always did.
+        legacy = agent.to_record(race)
+        del legacy["halt_on_stop"]
+        old = agent.from_record(legacy)
+        assert old.halt_on_stop is True
+        assert ar.orchestra_signature(old) == ar.orchestra_signature(race)[:-len(",stop_out=pair)")] + ")"
+        # Nothing to tell apart: no stop, a race of one, a split.
+        no_stop = [replace(c, stop_gain_fraction=0.0) for c in pairs]
+        assert "stop_out" not in ar.orchestra_signature(ar.OrchestraConfig(no_stop))
+        assert "stop_out" not in ar.orchestra_signature(ar.OrchestraConfig(pairs[:1]))
+        split = ar.OrchestraConfig(
+            pairs, mode=ar.MODE_SPLIT, budget_pct={"AAPL:highlow": 50.0, "INTC:highlow": 50.0},
+        )
+        assert "stop_out" not in ar.orchestra_signature(split)
+
     def test_the_log_lists_each_pairs_stop_and_confirmation(self):
         assert ar.racer_terms(racer("INTC", momentum_confirmation_bars=1, stop_gain_fraction=0.4)) == (
             "buy 0.75 / sell 0.1 × ADR, stop 0.4 × the predicted gain, momentum confirmed over 1 bar"
@@ -595,8 +679,9 @@ class TestTheLiveLoop:
 
         return StoppedOut
 
-    def test_a_stop_out_stops_the_agent(self, market_open, monkeypatch):
+    def test_a_stop_out_stands_the_pair_down_and_the_agent_runs_on(self, market_open, monkeypatch):
         import threading
+        import time
 
         monkeypatch.setattr(ar.apple_models, "load", lambda key, ticker=None: BUNDLE)
         monkeypatch.setattr(at, "config_error", lambda config, bundle=None: None)
@@ -605,7 +690,46 @@ class TestTheLiveLoop:
         state.agent_running = True
         stop_event = threading.Event()
         state.agent_stop_event = stop_event
-        race = ar.OrchestraConfig([racer("AAPL"), racer("INTC")])
+        race = ar.OrchestraConfig([racer("AAPL", stop_gain_fraction=0.5), racer("INTC")])
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=Broker2())
+        loop = threading.Thread(
+            target=ar._orchestra_loop, args=(state, tracker, race, 60, stop_event), daemon=True,
+        )
+        loop.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not any(
+            "sits out the rest of today" in e.get("text", "") for e in state.agent_log
+        ):
+            time.sleep(0.01)
+        try:
+            assert loop.is_alive() and not stop_event.is_set()
+            texts = [e.get("text", "") for e in state.agent_log]
+            assert any(
+                t.startswith("AAPL · HighLow stopped out: it sits out the rest of today.")
+                for t in texts
+            )
+            assert not any("Press ▶ Start Agent" in t for t in texts)
+            # The opening lines say what a stop-out does now.
+            assert any("stands that pair down for the day, and the others race on" in t for t in texts)
+            assert any("after which this pair sits out the rest of the day" in t for t in texts)
+        finally:
+            stop_event.set()
+            loop.join(timeout=10)
+
+    @pytest.mark.parametrize("pairs, halt_on_stop", [(["AAPL"], False), (["AAPL", "INTC"], True)])
+    def test_a_stop_out_stops_the_agent(self, market_open, monkeypatch, pairs, halt_on_stop):
+        """A race of one, as an Apple Trader run -- and a race made with the
+        rule from before 2026-10-27."""
+        import threading
+
+        monkeypatch.setattr(ar.apple_models, "load", lambda key, ticker=None: BUNDLE)
+        monkeypatch.setattr(at, "config_error", lambda config, bundle=None: None)
+        monkeypatch.setattr(at, "build_trader", self._stub())
+        state = make_state(pairs)
+        state.agent_running = True
+        stop_event = threading.Event()
+        state.agent_stop_event = stop_event
+        race = ar.OrchestraConfig([racer(t) for t in pairs], halt_on_stop=halt_on_stop)
         tracker = DecisionTracker(starting_cash=10_000.0, broker=Broker2())
         loop = threading.Thread(
             target=ar._orchestra_loop, args=(state, tracker, race, 60, stop_event), daemon=True,
@@ -1725,8 +1849,9 @@ class TestGoodMomentsPairsConfig:
         assert sig.startswith("orchestra[highlow_AAPL@")
         assert ",goodmoments_AMD(enter=+0.02,exit=off,take=0.2A,stop=0.5A,raise=0.05/stop)](" in sig
         assert sig.count("size=") == 1
-        # The shared rules are the day-range pair's, as without it.
-        assert sig.split("](")[1] == ar.orchestra_signature(ranged).split("](")[1]
+        # The shared rules are the day-range pair's, as without it -- and, with
+        # someone left to race on, a stop-out stands only that pair down.
+        assert sig.split("](")[1] == ar.orchestra_signature(ranged).split("](")[1][:-1] + ",stop_out=pair)"
         alone = ar.orchestra_signature(ar.build_orchestra_config(["AMD:goodmoments"], base))
         assert alone.endswith("](size=95%,skip=earn+cpi+nfp+mkt+geo)")
         split = ar.build_orchestra_config(
