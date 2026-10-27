@@ -3786,6 +3786,7 @@ _TUNE_PREFIX = "tune"
 _PICK_LABELS = {
     sim_tuning.PICK_MAX: "Highest single cell",
     sim_tuning.PICK_PLATEAU: "Middle of the best plateau",
+    sim_tuning.PICK_SHARPE: "Highest Sharpe ratio",
 }
 
 
@@ -3929,7 +3930,7 @@ def render_tuning_tab() -> None:
     st.caption(
         "Sweep a grid of Apple Trader's parameters over one or more datasets — a heatmap "
         "per dataset, then their sum — and pick the combination with the best total "
-        "profit. Every cell is a full replay through the same engine and trader as "
+        "profit or Sharpe ratio. Every cell is a full replay through the same engine and trader as "
         "Simulate — market fills, the managed exit, the flatten — so a cell's number is "
         "what a Simulate run of that configuration would show. A square shows its profit "
         "a session, every session counted, traded or not, and under it (±) the standard "
@@ -4153,20 +4154,27 @@ def _render_tuning_form() -> None:
         "Sweep on", list(by_name), default=[newest], format_func=lambda n: _tuning_describe_dataset(by_name[n]),
         key=f"tune_datasets_{base.ticker}",
         help="The grid is swept on every dataset picked here, each drawn as its own "
-        "heatmap, and the pick is the best total profit over all of them. A finished job "
-        "takes more datasets later with the same settings.",
+        "heatmap, and the pick is read off their sum. A finished job takes more datasets "
+        "later with the same settings.",
     )
     picked = [by_name[name] for name in chosen]
     _render_tuning_overlaps([_tuning_dataset_spec(d) for d in picked])
 
     st.markdown("**How the pick is chosen**")
-    st.caption("On the sum of every dataset's heatmap: the best total profit.")
+    st.caption(
+        "On the sum of every dataset's heatmap: the best total profit, or the best "
+        "Sharpe ratio."
+    )
     col_rule, col_share, col_cash = st.columns(3)
     rule = col_rule.selectbox(
         "Pick", list(_PICK_LABELS), format_func=_PICK_LABELS.get, key="tune_rule",
         help="The highest cell of a small grid is usually the luckiest. The plateau pick "
         "takes the cell whose neighbourhood — itself and every adjacent cell — scores "
-        "best on average, which is how the shipped per-ticker levels were chosen.",
+        "best on average, which is how the shipped per-ticker levels were chosen. "
+        "**Highest Sharpe ratio** takes the cell whose profit a session is largest "
+        "against how much it swung from session to session, over every session of "
+        "every dataset: a steady earner over a bigger total carried by a day or two. "
+        "A cell that never traded has no Sharpe ratio and cannot be the pick.",
     )
     min_share = col_share.slider(
         "Must trade on at least", 0, 100, 50, step=5, format="%d%% of days",
@@ -4979,11 +4987,14 @@ def _tuning_verdict(job: dict) -> "str | None":
     spec = job["spec"]
     names = sim_tuning.dataset_names(spec)
     best, base = job.get("best"), sim_tuning.summed_baseline(job)
+    by_sharpe = spec.get("rule") == sim_tuning.PICK_SHARPE
     if not sim_tuning.is_scored(best):
         if job["status"] == sim_tuning.FINISHED:
             return (
                 ":orange[**No pick.**] No combination traded on enough of the days to be "
-                "eligible — lower the minimum share of days, or widen the grid."
+                "eligible"
+                + (", with a Sharpe ratio to rank it by," if by_sharpe else "")
+                + " — lower the minimum share of days, or widen the grid."
             )
         return None
     sessions = f"{best['days']} session{'s' if best['days'] != 1 else ''}"
@@ -5005,6 +5016,13 @@ def _tuning_verdict(job: dict) -> "str | None":
             f"({return_pct:+.3f}%)"
         )
     beat_base = not sim_tuning.is_scored(base) or best["profit"] >= base["profit"]
+    if by_sharpe and (mine := sim_tuning.sharpe(best)) is not None:
+        # Picked for its Sharpe ratio, so it is held to the base's on that.
+        theirs = sim_tuning.sharpe(base)
+        detail += f". Sharpe ratio {mine:+.2f}" + (
+            f" against the base configuration's {theirs:+.2f}" if theirs is not None else ""
+        )
+        beat_base = theirs is None or mine >= theirs
     if best["profit"] > 0 and beat_base:
         head = ":green[**Beats the base configuration.**]"
     elif best["profit"] > 0:
@@ -5027,7 +5045,8 @@ _TUNING_SHARPE_HELP = (
 
 
 def _tuning_cell_rows(job: dict) -> list[dict]:
-    """Every summed combination, best total first, with each dataset's share."""
+    """Every summed combination, best first by what the job picks on (total
+    profit, or Sharpe ratio with no ratio last), with each dataset's share."""
     names = sim_tuning.dataset_names(job["spec"], by_date=True)
     per_dataset = [
         {sim_tuning.overrides_key(c["overrides"]): c for c in job["cells"].get(name) or ()}
@@ -5056,7 +5075,10 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
             else "swept"
         )
         rows.append(row)
-    rows.sort(key=lambda r: r["profit"], reverse=True)
+    if job["spec"].get("rule") == sim_tuning.PICK_SHARPE:
+        rows.sort(key=lambda r: (r["sharpe"] is not None, r["sharpe"] or 0.0), reverse=True)
+    else:
+        rows.sort(key=lambda r: r["profit"], reverse=True)
     return rows
 
 
@@ -5613,12 +5635,14 @@ def _render_tuning_results(jobs: list[dict]) -> None:
 
     # The configuration itself is said once, in the table under the profits
     # (`_render_tuning_config_compare`), not again up here.
+    by_sharpe = spec.get("rule") == sim_tuning.PICK_SHARPE
     st.caption(
-        "Pick: best total profit"
+        ("Pick: highest Sharpe ratio" if by_sharpe else "Pick: best total profit")
         + (f" over {len(names)} datasets" if len(names) > 1 else "")
-        + f", {_PICK_LABELS.get(spec.get('rule'), spec.get('rule')).lower()}, trading on at "
-        f"least {float(spec.get('min_traded_share') or 0):.0%} of days · starting cash "
-        f"\\${float(spec['starting_cash']):,.0f} per dataset."
+        + ("" if by_sharpe
+           else f", {_PICK_LABELS.get(spec.get('rule'), spec.get('rule')).lower()}")
+        + f", trading on at least {float(spec.get('min_traded_share') or 0):.0%} of days "
+        f"· starting cash \\${float(spec['starting_cash']):,.0f} per dataset."
     )
     if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED):
         _render_tuning_dataset_controls(job)

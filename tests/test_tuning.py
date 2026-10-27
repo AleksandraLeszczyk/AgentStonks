@@ -383,6 +383,35 @@ class TestPick:
         spike = tu.pick_best(cells_from(profits), AXES, rule=tu.PICK_MAX)
         assert spike["overrides"] == {"buy_k": 0.7, "sell_k": 0.2}
 
+    def test_sharpe_takes_the_steadiest_profit_not_the_biggest(self):
+        axes = [{"name": "buy_k", "values": [0.3, 0.5]}]
+        spiky = with_daily(scored({"buy_k": 0.3}, 400.0), 900.0, -400.0, -100.0)
+        steady = with_daily(scored({"buy_k": 0.5}, 300.0), 100.0, 120.0, 80.0)
+        assert tu.pick_best([spiky, steady], axes)["overrides"] == {"buy_k": 0.3}
+        best = tu.pick_best([spiky, steady], axes, rule=tu.PICK_SHARPE)
+        assert best["overrides"] == {"buy_k": 0.5}
+        assert best["pick_score"] == pytest.approx(tu.sharpe(steady), abs=1e-4)
+
+    def test_a_cell_without_a_sharpe_ratio_cannot_be_the_sharpe_pick(self):
+        """Nothing to rank it by: one that never moved, or kept no sessions."""
+        axes = [{"name": "buy_k", "values": [0.3, 0.5, 0.7]}]
+        flat = with_daily(scored({"buy_k": 0.3}, 0.0), 0.0, 0.0, 0.0)
+        unkept = scored({"buy_k": 0.5}, 900.0)
+        losing = with_daily(scored({"buy_k": 0.7}, -30.0), -20.0, 0.0, -10.0)
+        best = tu.pick_best([flat, unkept, losing], axes, rule=tu.PICK_SHARPE)
+        assert best["overrides"] == {"buy_k": 0.7}
+        assert tu.pick_best([flat, unkept], axes, rule=tu.PICK_SHARPE) is None
+
+    def test_the_sharpe_pick_still_has_to_trade_on_enough_days(self):
+        axes = [{"name": "buy_k", "values": [0.3, 0.5]}]
+        rare = with_daily(scored({"buy_k": 0.3}, 50.0, traded=1), 50.0, 0.0, 0.0)
+        often = with_daily(scored({"buy_k": 0.5}, 10.0, traded=3), 30.0, -40.0, 20.0)
+        assert tu.pick_best([rare, often], axes, rule=tu.PICK_SHARPE)["overrides"] == {
+            "buy_k": 0.3,
+        }
+        best = tu.pick_best([rare, often], axes, rule=tu.PICK_SHARPE, min_traded_share=0.5)
+        assert best["overrides"] == {"buy_k": 0.5}
+
     def test_nothing_scored_is_no_pick(self):
         assert tu.pick_best(cells_from([None] * 9), AXES) is None
 
@@ -1167,6 +1196,47 @@ class TestVerdict:
         assert verdict.startswith(":red[")
         assert "**−\\$10.00 a day** (-0.100% of the starting cash) on average over " \
             "5 sessions of `w1`" in verdict
+
+    def test_a_sharpe_pick_is_held_to_the_bases_sharpe_ratio(self):
+        """It was picked for its Sharpe ratio, so that is what it has to beat --
+        not the base's profit."""
+        from simlab import app as sim_app
+
+        def record(*base_days: float) -> dict:
+            record = job_record({"w1": [
+                with_daily(scored({"buy_k": 0.3}, 400.0), 900.0, -400.0, -100.0),
+                with_daily(scored({"buy_k": 0.5}, 300.0), 100.0, 120.0, 80.0),
+            ]}, rule=tu.PICK_SHARPE)
+            record["baseline"]["w1"] = with_daily(scored({}, sum(base_days)), *base_days)
+            return tu.refresh_pick(record)
+
+        mine = tu.sharpe(record()["best"])
+        # More profit than the pick (330 against 300), but a worse Sharpe ratio.
+        verdict = sim_app._tuning_verdict(record(500.0, -400.0, 230.0))
+        theirs = tu.sharpe(tu.summed_baseline(record(500.0, -400.0, 230.0)))
+        assert verdict.startswith(":green[**Beats the base configuration.**]")
+        assert f"Sharpe ratio {mine:+.2f} against the base configuration's {theirs:+.2f}" \
+            in verdict
+        # Less profit than the pick, but steadier.
+        verdict = sim_app._tuning_verdict(record(90.0, 91.0, 89.0))
+        assert verdict.startswith(":orange[**Profitable, but no better")
+
+    def test_a_sharpe_jobs_combinations_are_listed_by_sharpe_ratio(self):
+        from simlab import app as sim_app
+
+        cells = [
+            scored({"buy_k": 0.3}, 900.0),  # kept no sessions: no ratio, listed last
+            with_daily(scored({"buy_k": 0.5}, 400.0), 900.0, -400.0, -100.0),
+            with_daily(scored({"buy_k": 0.7}, 300.0), 100.0, 120.0, 80.0),
+        ]
+        axes = [{"name": "buy_k", "values": [0.3, 0.5, 0.7]}]
+        buy = sim_app._tuning_param_label("buy_k")
+        by_profit = sim_app._tuning_cell_rows(job_record({"w1": cells}, axes=axes))
+        assert [r[buy] for r in by_profit] == [0.3, 0.5, 0.7]
+        by_sharpe = sim_app._tuning_cell_rows(
+            job_record({"w1": cells}, axes=axes, rule=tu.PICK_SHARPE)
+        )
+        assert [r[buy] for r in by_sharpe] == [0.7, 0.5, 0.3]
 
 
 def _set_base_app(record: dict, chosen) -> None:

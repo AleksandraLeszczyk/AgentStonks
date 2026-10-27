@@ -15,7 +15,8 @@ inside SimLab, with two differences that are the point of doing it here:
   their sum.** A grid always has a best cell, and on a handful of sessions it
   is mostly the luckiest one. One week's heatmap says little; the same grid
   over several weeks, heatmap by heatmap and then summed, shows which region
-  keeps paying. The pick is the best total profit on that sum.
+  keeps paying. The pick is the best total profit on that sum, or its best
+  Sharpe ratio (`PICK_SHARPE`).
 
 A job grows. Tuning is a weekly chore -- a new week of tape arrives, and the
 question is whether the pick still holds with it -- so a finished job takes a
@@ -102,7 +103,8 @@ TUNE = "tune"
 TEST = "test"
 BASELINE = "baseline"
 
-#: What the pick is chosen on: the total profit over every dataset of a job.
+#: What the pick is chosen on: the total profit over every dataset of a job
+#: (unless it picks by Sharpe ratio, `PICK_SHARPE`).
 PICK_METRIC = "profit"
 
 # How many parameters one job sweeps. A heatmap shows two; a third and a
@@ -121,6 +123,9 @@ MAX_SWEEP_CONFIGS = 64
 # How the best cell is chosen on the tuning dataset.
 PICK_MAX = "max"
 PICK_PLATEAU = "plateau"
+# Not the most profit but the most profit for how much it swung from session
+# to session (`sharpe`): a steady earner over a bigger total carried by a day.
+PICK_SHARPE = "sharpe"
 
 # What a cell is scored by. Every metric is "higher is better". The labels
 # carry no "$": they reach Streamlit markdown, where a bare dollar sign opens a
@@ -1349,6 +1354,10 @@ def pick_best(
     scores best on average, which is how `sweep_levels.py` chose
     the shipped defaults: the middle of a profitable region rather than its
     sharpest point, which on a few sessions is usually a fluke.
+    `PICK_SHARPE` takes the highest annualized Sharpe ratio (`sharpe`) over
+    every session, whatever `metric` says; a cell with none -- fewer than two
+    sessions kept, or one that never moved -- has nothing to rank it by and is
+    not eligible.
 
     A cell is eligible only if it traded on at least `min_traded_share` of the
     days, so a deep entry that filled once cannot win on that one fill.
@@ -1381,9 +1390,15 @@ def pick_best(
     eligible = [
         c for c in scored if c["days_traded"] >= min_traded_share * max(c["days"], 1)
     ]
+    if rule == PICK_SHARPE:
+        eligible = [c for c in eligible if sharpe(c) is not None]
     if not eligible:
         return None
-    rank = plateau if rule == PICK_PLATEAU else (lambda c: float(c[metric]))
+    rank = (
+        plateau if rule == PICK_PLATEAU
+        else sharpe if rule == PICK_SHARPE
+        else (lambda c: float(c[metric]))
+    )
     best = max(eligible, key=rank)  # max() keeps the first of equal keys
     return {**best, "pick_score": round(rank(best), 4)}
 
@@ -1742,8 +1757,9 @@ def pick_cell(record: dict, name: str) -> "dict | None":
 def refresh_pick(record: dict) -> dict:
     """Re-read the pick off the summed grid; returns the record.
 
-    The best total profit, under the job's pick rule and minimum share of days
-    traded -- counted over every session of every dataset.
+    The best total profit -- or Sharpe ratio, under `PICK_SHARPE` -- under the
+    job's pick rule and minimum share of days traded, counted over every
+    session of every dataset.
     """
     spec = record["spec"]
     record["best"] = pick_best(
