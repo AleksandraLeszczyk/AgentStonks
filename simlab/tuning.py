@@ -41,10 +41,10 @@ which is what the Tuning tab's progress bar reads. The worker replays whatever
 the record has no answer for yet, which is what makes adding a dataset or
 resuming a stopped job the same operation as running a new one.
 
-Up to three parameters are tuned at once. Two is what a heatmap can show, so a
-third is shown over the first two's heatmap one value at a time, or collapsed
-square by square to its best value or its average (`slice_cells`). Every
-other field comes from the base configuration. A combination the config refuses
+Up to four parameters are tuned at once. Two is what a heatmap can show, so a
+third and a fourth are each shown over the first two's heatmap one value at a
+time, or collapsed square by square to their best value or their average
+(`slice_cells`). Every other field comes from the base configuration. A combination the config refuses
 (a sell level at or under the buy level, a take fraction of 0) is recorded as
 an *invalid* cell rather than replayed or silently dropped, so the heatmap
 shows the hole where it is.
@@ -105,11 +105,12 @@ BASELINE = "baseline"
 #: What the pick is chosen on: the total profit over every dataset of a job.
 PICK_METRIC = "profit"
 
-# How many parameters one job sweeps. A heatmap shows two; a third is shown a
-# slice at a time over them, or collapsed (`slice_cells`).
-MAX_AXES = 3
+# How many parameters one job sweeps. A heatmap shows two; a third and a
+# fourth are each shown a slice at a time over them, or collapsed
+# (`slice_cells`).
+MAX_AXES = 4
 # A guard against a slip of the step size queueing hours of replays.
-MAX_CELLS = 400
+MAX_CELLS = 1200
 # The same guard for the Simulate tab's per-setup sweep, and much lower for a
 # reason: a tuning cell is a replay on a pooled worker inside one job, while a
 # swept configuration there is a queued *experiment* -- its own subprocess, its
@@ -1343,7 +1344,8 @@ def pick_best(
 
     `PICK_MAX` takes the highest metric. `PICK_PLATEAU` takes the cell whose
     neighbourhood -- itself and every adjacent cell on the grid, diagonals
-    included, along every axis (up to 27 cells on a three-axis grid) --
+    included, along every axis (up to 27 cells on a three-axis grid, 81 on a
+    four-axis one) --
     scores best on average, which is how `sweep_levels.py` chose
     the shipped defaults: the middle of a profitable region rather than its
     sharpest point, which on a few sessions is usually a fluke.
@@ -1391,42 +1393,96 @@ def overlapping_days(first: "list[str]", second: "list[str]") -> "list[str]":
     return sorted(set(first) & set(second))
 
 
-# --- a third axis -----------------------------------------------------------
+# --- a third and a fourth axis ----------------------------------------------
 #
-# A heatmap shows two parameters. A job may sweep a third, and every view of
-# it is still a heatmap over the first two: the grid at one value of the third,
-# or the third collapsed square by square -- its best value there, or the
-# average over all of its values.
+# A heatmap shows two parameters. A job may sweep a third and a fourth, and
+# every view of it is still a heatmap over the first two: each further axis
+# held at one of its values, or collapsed square by square -- to its best
+# value there, or to the average over all of its values.
 
-#: Each square at whichever value of the third parameter scores best there.
+#: Each square at whichever value of the parameter scores best there.
 SLICE_BEST = "best"
-#: Each square averaged over every value of the third parameter.
+#: Each square averaged over every value of the parameter.
 SLICE_MEAN = "mean"
+
+
+def slice_views(view, axes: "list[dict]") -> list:
+    """`view` as one entry per axis past the second.
+
+    A three-axis grid may take its one view as it is; any other grid takes a
+    list of them.
+    """
+    views = list(view) if isinstance(view, (list, tuple)) else [view]
+    if len(views) != max(len(axes) - 2, 0):
+        raise ValueError(f"{len(views)} views for {len(axes)} axes")
+    return views
+
+
+def _unscored(parts: "list[dict]") -> dict:
+    """What a square with nothing scored among `parts` is: refused if every
+    part is, else errored."""
+    errored = next((p for p in parts if "invalid" not in p), None)
+    if errored is None:
+        return {"invalid": parts[0]["invalid"]}
+    return {"error": errored.get("error") or "no score"}
+
+
+def _averaged(parts: "list[dict]", names: "list[str]", metric: str) -> dict:
+    """`parts` averaged over what the configuration accepts (`slice_cells`)."""
+    scored = [p for p in parts if is_scored(p)]
+    if not scored:
+        return _unscored(parts)
+    mean = lambda field: sum(float(p.get(field) or 0) for p in scored) / len(scored)  # noqa: E731
+    found = [float(p[metric]) for p in scored]
+    stds = [p.get("session_std") for p in scored]
+    return {
+        "return_pct": round(mean("return_pct"), 4),
+        "profit": round(mean("profit"), 2),
+        metric: round(mean(metric), 2),
+        "days": scored[0].get("days") or 0,
+        "days_traded": round(mean("days_traded"), 1),
+        # Cells drawn by `with_session_stats`: the average of their spreads.
+        **({"session_std": round(statistics.fmean(stds), 2)}
+           if all(s is not None for s in stds) else {}),
+        "error": None,
+        "mean_of": {
+            "names": list(names), "count": len(scored), "of": len(parts),
+            "low": min(found), "high": max(found),
+        },
+    }
 
 
 def slice_cells(
     cells: "list[dict]", axes: "list[dict]", view, metric: str = PICK_METRIC
 ) -> "list[dict]":
-    """A three-axis grid's cells as a grid over its first two axes.
+    """A grid of three or four axes as a grid over its first two.
 
-    `view` is an index into the third axis's values -- the grid at that value
-    -- or one of `SLICE_BEST` / `SLICE_MEAN`, which collapse the third axis:
+    `view` says what to show of each axis past the second (`slice_views`):
+    an index into the axis's values holds it at that value, and
+    `SLICE_BEST` / `SLICE_MEAN` collapse it:
 
-    * best: each square's cell with the highest `metric` over the third axis,
-      as it is, with `best_of` naming the value it won at. Ties go to the
-      earlier value. No minimum share of days traded applies: this is a
-      picture of the surface, not the pick.
     * mean: `metric`, the profit, the return, the days traded and -- when
-      every value has one -- the session spread (`session_std`) averaged over
-      the values of the third the configuration accepts, with `mean_of` saying
-      how many that was out of how many, and the lowest and highest `metric`
-      among them.
+      every part has one -- the session spread (`session_std`) averaged over
+      the combinations of the averaged axes the configuration accepts, with
+      `mean_of` naming those axes and saying how many combinations that was
+      out of how many, and the lowest and highest `metric` among them.
+    * best: each square's cell with the highest `metric` over the
+      combinations of the best axes, as it is, with `best_of` naming the
+      values it won at. Ties go to the earlier combination in grid order. No
+      minimum share of days traded applies: this is a picture of the surface,
+      not the pick.
 
-    A square collapses only once every value of the third has an answer, for
-    the reason `combine` waits for every dataset: the best or the average of
-    three values out of five would read as a finished square. A square whose
-    every value is refused is refused; one with nothing scored and a replay
-    that errored is errored.
+    With one axis on each, the average comes first and the best is chosen
+    among the averages: a square is at the value of the best axis whose
+    average over the other is highest -- one setting that holds up whatever
+    the other is, and so one that can be named, which an average of each
+    value's own best could not.
+
+    A square collapses only once every combination it needs has an answer,
+    for the reason `combine` waits for every dataset: the best or the average
+    of three values out of five would read as a finished square. A square
+    whose every combination is refused is refused; one with nothing scored and
+    a replay that errored is errored.
 
     The cells come back with only the first two axes in their overrides, so
     they draw as any two-axis grid. A grid of fewer than three axes is
@@ -1434,52 +1490,43 @@ def slice_cells(
     """
     if len(axes) < 3:
         return list(cells)
-    name, values = axes[2]["name"], axes[2]["values"]
+    further = list(zip(axes[2:], slice_views(view, axes)))
+    held = {
+        axis["name"]: axis["values"][int(v)]
+        for axis, v in further if v not in (SLICE_BEST, SLICE_MEAN)
+    }
+    averaged = [axis for axis, v in further if v == SLICE_MEAN]
+    best = [axis for axis, v in further if v == SLICE_BEST]
     by_key = {overrides_key(c["overrides"]): c for c in cells}
     out: "list[dict]" = []
     for overrides in grid(axes[:2]):
-        parts = [by_key.get(overrides_key({**overrides, name: v})) for v in values]
-        if view not in (SLICE_BEST, SLICE_MEAN):
-            cell = parts[int(view)]
-            if cell is not None:
-                out.append({**cell, "overrides": dict(overrides)})
+        # One (values of the best axes, cell) per combination of the best
+        # axes, each averaged over the averaged ones; None once one is missing.
+        groups: "list[tuple[dict, dict]] | None" = []
+        for chosen in grid(best):
+            parts = [
+                by_key.get(overrides_key({**overrides, **held, **chosen, **over}))
+                for over in grid(averaged)
+            ]
+            if any(p is None for p in parts):
+                groups = None
+                break
+            groups.append((chosen, _averaged(parts, [a["name"] for a in averaged], metric)
+                           if averaged else parts[0]))
+        if groups is None:
             continue
-        if any(p is None for p in parts):
+        if not best:
+            [(_, cell)] = groups
+            out.append({**cell, "overrides": dict(overrides)})
             continue
-        scored = [(v, p) for v, p in zip(values, parts) if is_scored(p)]
+        scored = [(chosen, cell) for chosen, cell in groups if is_scored(cell)]
         if not scored:
-            errored = next((p for p in parts if "invalid" not in p), None)
-            out.append(
-                {"overrides": dict(overrides), "invalid": parts[0]["invalid"]}
-                if errored is None
-                else {"overrides": dict(overrides), "error": errored.get("error") or "no score"}
-            )
+            out.append({"overrides": dict(overrides), **_unscored([c for _, c in groups])})
             continue
-        if view == SLICE_BEST:
-            value, winner = max(scored, key=lambda vp: float(vp[1][metric]))
-            out.append({
-                **winner, "overrides": dict(overrides),
-                "best_of": {"name": name, "value": value, "count": len(scored)},
-            })
-            continue
-        mean = lambda field: sum(float(p.get(field) or 0) for _, p in scored) / len(scored)  # noqa: E731
-        found = [float(p[metric]) for _, p in scored]
-        stds = [p.get("session_std") for _, p in scored]
+        chosen, winner = max(scored, key=lambda g: float(g[1][metric]))
         out.append({
-            "overrides": dict(overrides),
-            "return_pct": round(mean("return_pct"), 4),
-            "profit": round(mean("profit"), 2),
-            metric: round(mean(metric), 2),
-            "days": scored[0][1].get("days") or 0,
-            "days_traded": round(mean("days_traded"), 1),
-            # Cells drawn by `with_session_stats`: the average of their spreads.
-            **({"session_std": round(statistics.fmean(stds), 2)}
-               if all(s is not None for s in stds) else {}),
-            "error": None,
-            "mean_of": {
-                "name": name, "count": len(scored), "of": len(values),
-                "low": min(found), "high": max(found),
-            },
+            **winner, "overrides": dict(overrides),
+            "best_of": {"values": dict(chosen), "count": len(scored)},
         })
     return out
 

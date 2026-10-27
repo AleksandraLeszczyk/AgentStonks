@@ -4102,8 +4102,9 @@ def _render_tuning_form() -> None:
         format_func=sim_tuning.sweep_label,
         key=f"tune_axes_{sim_tuning.axes_family(base.model_key)}",
         help="One parameter draws a bar chart, two a heatmap — the first one is its rows. "
-             "A third is shown over that heatmap one value at a time, or collapsed: each "
-             "square at its best value of the third, or averaged over all of them. "
+             "A third and a fourth are each shown over that heatmap one value at a time, "
+             "or collapsed: each square at its best value of that parameter, or averaged "
+             "over all of them. "
              "A number is swept over a range; a rule is swept over the options you tick, "
              "so a grid can put the levels under each forecast policy side by side.",
     )
@@ -4383,7 +4384,7 @@ def _tuning_shown_cell(job: dict, name: str, chosen: "dict | None") -> "dict | N
     return sim_tuning.cell_at(job, name, chosen)
 
 
-# The two ways a three-axis grid's heatmap collapses its third parameter, as
+# The two ways a grid's heatmap collapses its third or fourth parameter, as
 # the switch beside its values names them.
 _SLICE_LABELS = {
     sim_tuning.SLICE_BEST: "Best of all",
@@ -4395,73 +4396,93 @@ _SLICE_LABELS = {
 _TUNING_SELECTED_COLOR = "#e040fb"
 
 
-def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> "int | str | None":
-    """Which view of the third parameter the heatmaps show; None with fewer axes.
+def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> list:
+    """Which view of each parameter past the first two the heatmaps show, one
+    switch each; empty with fewer axes.
 
-    An index into the third axis's values draws the grid at that value;
-    `SLICE_BEST` and `SLICE_MEAN` collapse the axis (`tuning.slice_cells`). It
-    starts on the slice the first of `marks` sits on -- the pick, on a job's
-    results -- so the heatmap opens on the outline it is about.
+    An index into an axis's values draws the grid at that value; `SLICE_BEST`
+    and `SLICE_MEAN` collapse the axis (`tuning.slice_cells`). Each starts on
+    the slice the first of `marks` sits on -- the pick, on a job's results --
+    so the heatmap opens on the outline it is about.
 
     The key carries the axis, so a form whose third parameter changes does not
     hand a new axis an index into the old one's values.
     """
-    if len(axes) < 3:
-        return None
-    name, values = axes[2]["name"], axes[2]["values"]
-    param = _tuning_param_label(name)
-    default = next(
-        (values.index(o[name]) for o in marks.values() if o and o.get(name) in values), 0
-    )
-    view = st.segmented_control(
-        param, [*range(len(values)), *_SLICE_LABELS], default=default, required=True,
-        format_func=lambda o: _SLICE_LABELS.get(o) or sim_tuning.axis_tick(name, values[o]),
-        key=f"{key}_{name}_{len(values)}",
-        help=f"The heatmaps show the first two parameters. A value of {param} draws the "
-        f"grid at that value. **Best of all** draws each square at whichever {param} "
-        "made the most there — the hover names it. **Average** draws each square's "
-        f"profit a session and its std averaged over every {param} the configuration "
-        "accepts.",
-    )
-    return default if view is None else view
+    views = []
+    for axis in axes[2:]:
+        name, values = axis["name"], axis["values"]
+        param = _tuning_param_label(name)
+        default = next(
+            (values.index(o[name]) for o in marks.values() if o and o.get(name) in values), 0
+        )
+        view = st.segmented_control(
+            param, [*range(len(values)), *_SLICE_LABELS], default=default, required=True,
+            format_func=lambda o, name=name, values=values: (
+                _SLICE_LABELS.get(o) or sim_tuning.axis_tick(name, values[o])
+            ),
+            key=f"{key}_{name}_{len(values)}",
+            help=f"The heatmaps show the first two parameters. A value of {param} draws "
+            f"the grid at that value. **Best of all** draws each square at whichever "
+            f"{param} made the most there — the hover names it. **Average** draws each "
+            f"square's profit a session and its std averaged over every {param} the "
+            "configuration accepts."
+            + (
+                " With one switch on Best of all and the other on Average, the average "
+                "comes first: each square is at the value whose average over the other "
+                "parameter is highest."
+                if len(axes) > 3 else ""
+            ),
+        )
+        views.append(default if view is None else view)
+    return views
 
 
 def _tuning_view_heatmap(
     cells: list[dict], axes: list[dict], marks: dict, title: str, view,
     clickable: bool = False,
 ) -> go.Figure:
-    """`_tuning_heatmap` for a grid of any size, a third axis drawn as `view` says.
+    """`_tuning_heatmap` for a grid of any size, a third and a fourth axis
+    drawn as `view` says (`tuning.slice_views`).
 
-    On a slice, a mark is outlined only if it sits on that slice. Collapsed,
-    every mark is outlined where it sits on the first two axes; its own value
-    of the third is in the caption above the charts.
+    On a slice, a mark is outlined only if it sits on that slice of every axis
+    held at a value. Collapsed, a mark is outlined wherever it sits on the
+    first two axes; its own value of the collapsed axes is in the caption
+    above the charts.
 
-    `clickable` lets a click name the square's configuration: on a slice, the
-    square at that value of the third; on Best of all, the value it won at.
-    An Average square is several configurations, so it names none.
+    `clickable` lets a click name the square's configuration: the values the
+    axes are held at, and on Best of all the values it won at. A square with an
+    axis on Average is several configurations, so it names none.
     """
     cells = sim_tuning.with_session_stats(cells)
     if len(axes) < 3:
         config_of = (lambda cell: cell["overrides"]) if clickable else None
         return _tuning_heatmap(cells, axes, marks, title, config_of=config_of)
-    name, values = axes[2]["name"], axes[2]["values"]
-    param = _tuning_param_label(name)
-    metric_label = None
-    if view == sim_tuning.SLICE_BEST:
-        title, shown = f"{title} · best {param}", marks
-        config_of = lambda cell: {**cell["overrides"], name: cell["best_of"]["value"]}  # noqa: E731
-    elif view == sim_tuning.SLICE_MEAN:
-        title, shown = f"{title} · average over {param}", marks
+    views = sim_tuning.slice_views(view, axes)
+    held: dict = {}
+    titles = [title]
+    for axis, v in zip(axes[2:], views):
+        name, param = axis["name"], _tuning_param_label(axis["name"])
+        if v == sim_tuning.SLICE_BEST:
+            titles.append(f"best {param}")
+        elif v == sim_tuning.SLICE_MEAN:
+            titles.append(f"average over {param}")
+        else:
+            held[name] = axis["values"][int(v)]
+            titles.append(f"{param} {sim_tuning.axis_tick(name, held[name])}")
+    shown = {
+        label: o for label, o in marks.items()
+        if all((o or {}).get(name) == value for name, value in held.items())
+    }
+    metric_label, config_of = None, None
+    if sim_tuning.SLICE_MEAN in views:
         metric_label = f"Average {sim_tuning.METRICS[_TUNING_HEAT_METRIC].lower()}"
-        config_of = None
-    else:
-        value = values[int(view)]
-        title = f"{title} · {param} {sim_tuning.axis_tick(name, value)}"
-        shown = {label: o for label, o in marks.items() if (o or {}).get(name) == value}
-        config_of = lambda cell: {**cell["overrides"], name: value}  # noqa: E731
+    elif clickable:
+        config_of = lambda cell: {  # noqa: E731
+            **cell["overrides"], **held, **(cell.get("best_of") or {}).get("values", {}),
+        }
     return _tuning_heatmap(
-        sim_tuning.slice_cells(cells, axes, view, _TUNING_HEAT_METRIC), axes[:2], shown,
-        title, metric_label=metric_label, config_of=config_of if clickable else None,
+        sim_tuning.slice_cells(cells, axes, views, _TUNING_HEAT_METRIC), axes[:2], shown,
+        " · ".join(titles), metric_label=metric_label, config_of=config_of,
     )
 
 
@@ -4475,11 +4496,11 @@ def _tuning_square_text(metric: str, cell: dict) -> str:
 
 def _tuning_hover_data(cell: "dict | None", metric: str = "per_session") -> list:
     """[`metric` and the session spread, the total and a line on days and
-    datasets, a line on the third parameter] for one cell's hover.
+    datasets, a line on the parameters past the second] for one cell's hover.
 
-    The third line is empty except on a collapsed three-axis view
-    (`tuning.slice_cells`): which value of the third parameter a square's best
-    is at, or what its average is over.
+    The third line is empty except on a collapsed view (`tuning.slice_cells`):
+    which values of the collapsed parameters a square's best is at, and what
+    its average is over.
 
     Formatted here rather than in the hovertemplate: plotly ignores a format
     spec on a heatmap's nested `customdata`.
@@ -4493,21 +4514,29 @@ def _tuning_hover_data(cell: "dict | None", metric: str = "per_session") -> list
         note = f"{cell['days_traded']}/{cell['days']} days traded"
     if "datasets" in cell:
         note += f" · in profit on {cell['datasets_up']}/{cell['datasets']} datasets"
-    third = ""
+    further = []
     if best_of:
-        third = (
-            f"Best at {_tuning_param_label(best_of['name'])} "
-            f"{sim_tuning.axis_tick(best_of['name'], best_of['value'])} "
-            f"(of {best_of['count']} values)"
+        won = best_of["values"]
+        further.append(
+            "Best at "
+            + ", ".join(
+                f"{_tuning_param_label(name)} {sim_tuning.axis_tick(name, value)}"
+                for name, value in won.items()
+            )
+            + f" (of {best_of['count']} {'values' if len(won) == 1 else 'combinations'})"
         )
-    elif mean_of:
-        third = (
-            f"Average of {mean_of['count']} {_tuning_param_label(mean_of['name'])} values: "
+    if mean_of:
+        over = " × ".join(_tuning_param_label(name) for name in mean_of["names"])
+        line = (
+            f"Average of {mean_of['count']} {over} "
+            f"{'values' if len(mean_of['names']) == 1 else 'combinations'}: "
             f"{_tuning_metric_text(metric, mean_of['low'])} to "
             f"{_tuning_metric_text(metric, mean_of['high'])}"
         )
         if mean_of["of"] > mean_of["count"]:
-            third += f" ({mean_of['of'] - mean_of['count']} refused or errored, left out)"
+            line += f" ({mean_of['of'] - mean_of['count']} refused or errored, left out)"
+        further.append(line)
+    third = "<br>".join(further)
     std, sharpe = sim_tuning.session_std(cell), sim_tuning.sharpe(cell)
     value = (
         _tuning_metric_text(metric, cell[metric])
@@ -4537,9 +4566,9 @@ def _tuning_heatmap(
     deviation of its sessions' profits -- a bar's is its error bar. The hover
     adds the total and the return: the total is what the pick is ranked on,
     the return is what it means against the cash.
-    A three-axis grid comes here already sliced to its first two axes
+    A grid of three or four axes comes here already sliced to its first two
     (`_tuning_view_heatmap`), and the hover then says what was done with the
-    third.
+    others.
 
     With `config_of`, a square can be clicked: each scored one carries its
     configuration (`config_of(cell)`, as JSON) as a fourth customdata entry,
@@ -5648,7 +5677,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     prefix = "From stored runs · " if sim_tuning.is_derived(job) else ""
     view = _tuning_view_picker(axes, marks, key=f"tune_view_{job_id}")
     # An Average square is several configurations at once, so it cannot be one.
-    clickable = view != sim_tuning.SLICE_MEAN
+    clickable = sim_tuning.SLICE_MEAN not in view
     _render_tuning_charts([
         (
             f"tune_heat_{job_id}_{index}",
@@ -5672,22 +5701,33 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             "best cell of this sum, so every dataset above is in sample: a pick worth "
             "keeping is in profit on most of them, not carried by one."
         )
-    if len(axes) > 2:
-        third = _tuning_param_label(axes[2]["name"])
+    further = " and ".join(_tuning_param_label(a["name"]) for a in axes[2:])
+    if len(axes) == 3:
         st.caption(
             f"The heatmaps are the first two parameters; the switch above picks what to "
-            f"show of {third}. On one of its values the outlines mark the pick and the "
+            f"show of {further}. On one of its values the outlines mark the pick and the "
             "base configuration only if they sit on it. Best of all and Average outline "
             "them where they sit on the first two, whatever their own value of "
-            f"{third}. A collapsed square fills in once every {third} has been replayed "
-            "there, and refused combinations are left out of its average."
+            f"{further}. A collapsed square fills in once every {further} has been "
+            "replayed there, and refused combinations are left out of its average."
+        )
+    elif len(axes) > 3:
+        st.caption(
+            f"The heatmaps are the first two parameters; the switches above pick what to "
+            f"show of {further}. Held at one value, the outlines mark the pick and the "
+            "base configuration only if they sit on it. Best of all and Average outline "
+            "them where they sit on the first two, whatever their own value there. With "
+            "one switch on Best of all and the other on Average, the average comes "
+            "first: each square is at the value whose average over the other parameter "
+            "is highest. A collapsed square fills in once every combination it needs "
+            "has been replayed there, and refused combinations are left out of its average."
         )
     st.caption(
         f":material/ads_click: Click a {'bar' if len(axes) == 1 else 'square'} to show "
         "that configuration in the table above and the session-by-session chart below; "
         "it is marked in magenta"
         + (
-            f" — on Best of all, at the {_tuning_param_label(axes[2]['name'])} it won at. "
+            f" — on Best of all, at the {further if len(axes) == 3 else 'value'} it won at. "
             "An Average square is several configurations, so it cannot be clicked."
             if len(axes) > 2 else "."
         )

@@ -272,13 +272,13 @@ class TestValidation:
     def test_a_sound_spec_passes(self):
         assert tu.validate(spec()) is None
 
-    def test_at_most_three_parameters(self):
+    def test_at_most_four_parameters(self):
         axes = [
             {"name": n, "values": [0.5]}
-            for n in ("buy_k", "sell_k", "stop_gain_fraction", "take_fraction")
+            for n in ("buy_k", "sell_k", "stop_gain_fraction", "take_fraction", "momentum_drop")
         ]
-        assert "one to 3" in tu.validate(spec(axes=axes))
-        assert tu.validate(spec(axes=axes[:3])) is None
+        assert "one to 4" in tu.validate(spec(axes=axes))
+        assert tu.validate(spec(axes=axes[:4])) is None
 
     def test_the_same_parameter_twice_is_refused(self):
         axes = [{"name": "buy_k", "values": [0.5]}, {"name": "buy_k", "values": [0.7]}]
@@ -315,9 +315,11 @@ class TestValidation:
         assert "telepathy" in tu.validate(spec(axes=axes))
 
     def test_too_many_cells_is_refused(self):
-        axes = [{"name": "buy_k", "values": list(range(30))},
-                {"name": "sell_k", "values": list(range(30))}]
-        assert "more than" in tu.validate(spec(axes=axes))
+        axes = [{"name": "buy_k", "values": list(range(40))},
+                {"name": "sell_k", "values": list(range(31))}]
+        assert "more than the 1200" in tu.validate(spec(axes=axes))
+        axes[1]["values"] = list(range(30))
+        assert tu.validate(spec(axes=axes)) is None
 
     def test_the_replay_count_is_the_grid_and_the_baseline_on_every_dataset(self):
         assert tu.total_replays(spec()) == (2 + 1) * 2
@@ -694,13 +696,15 @@ class TestThirdAxis:
             (0.3, 0.1): 400, (0.3, 0.2): -30, (0.5, 0.1): 50, (0.5, 0.2): 70,
         }
         assert found[(0.3, 0.1)]["best_of"] == {
-            "name": "take_fraction", "value": 0.75, "count": 3,
+            "values": {"take_fraction": 0.75}, "count": 3,
         }
         # The winning cell as it is, not a re-scored one.
         assert found[(0.3, 0.1)]["days_traded"] == 400 % 5
 
     def test_best_ties_go_to_the_earlier_value(self):
-        assert self.by_square(tu.SLICE_BEST)[(0.5, 0.1)]["best_of"]["value"] == 0.5
+        assert self.by_square(tu.SLICE_BEST)[(0.5, 0.1)]["best_of"]["values"] == {
+            "take_fraction": 0.5,
+        }
 
     def test_best_skips_a_refused_value(self):
         assert self.by_square(tu.SLICE_BEST)[(0.5, 0.2)]["best_of"]["count"] == 2
@@ -710,7 +714,7 @@ class TestThirdAxis:
         assert found[(0.3, 0.1)]["profit"] == pytest.approx(200.0)
         assert found[(0.3, 0.1)]["return_pct"] == pytest.approx(2.0)
         assert found[(0.3, 0.1)]["mean_of"] == {
-            "name": "take_fraction", "count": 3, "of": 3, "low": 100.0, "high": 400.0,
+            "names": ["take_fraction"], "count": 3, "of": 3, "low": 100.0, "high": 400.0,
         }
         # The refused value is left out, not counted as zero.
         assert found[(0.5, 0.2)]["profit"] == pytest.approx(40.0)
@@ -761,7 +765,7 @@ class TestThirdAxis:
             (c["overrides"]["buy_k"], c["overrides"]["sell_k"]): c
             for c in tu.slice_cells(tu.summed_cells(record), AXES3, tu.SLICE_BEST)
         }
-        assert found[(0.3, 0.1)]["best_of"]["value"] == 1.0
+        assert found[(0.3, 0.1)]["best_of"]["values"] == {"take_fraction": 1.0}
         assert found[(0.3, 0.1)]["profit"] == 500.0
         assert found[(0.3, 0.1)]["datasets"] == 2
 
@@ -774,6 +778,163 @@ class TestThirdAxis:
         assert best["overrides"] == {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 0.5}
         assert best["pick_score"] == pytest.approx((100 - 60 + 50 + 400 - 30 + 50 + 70) / 7)
         assert tu.pick_best(cells3(self.PROFITS), AXES3)["profit"] == 400
+
+
+# --- a fourth axis ----------------------------------------------------------
+
+
+AXES4 = [{"name": "buy_k", "values": [0.3, 0.5]},
+         {"name": "sell_k", "values": [0.1]},
+         {"name": "take_fraction", "values": [0.5, 1.0]},
+         {"name": "stop_gain_fraction", "values": [0.0, 0.2]}]
+
+
+def cells4(profits: dict) -> "list[dict]":
+    """A 2x1x2x2 grid from {(buy, take, stop): profit}; None is a refused cell."""
+    out = []
+    for overrides in tu.grid(AXES4):
+        o = overrides
+        profit = profits[(o["buy_k"], o["take_fraction"], o["stop_gain_fraction"])]
+        if profit is None:
+            out.append({"overrides": overrides, "invalid": "refused"})
+        else:
+            out.append(scored(overrides, profit))
+    return out
+
+
+class TestFourthAxis:
+    """A four-axis grid drawn as a heatmap of its first two, the third and the
+    fourth each held at a value or collapsed the way a third is alone."""
+
+    PROFITS = {
+        # At buy 0.3, take 1.0 has the spike (300) but take 0.5 the better
+        # average over the stops (80 vs 50).
+        (0.3, 0.5, 0.0): 100, (0.3, 0.5, 0.2): 60,
+        (0.3, 1.0, 0.0): 300, (0.3, 1.0, 0.2): -200,
+        (0.5, 0.5, 0.0): 10, (0.5, 0.5, 0.2): None,
+        (0.5, 1.0, 0.0): 30, (0.5, 1.0, 0.2): 20,
+    }
+
+    def by_buy(self, views, cells=None) -> dict:
+        out = tu.slice_cells(cells or cells4(self.PROFITS), AXES4, views)
+        assert all(set(c["overrides"]) == {"buy_k", "sell_k"} for c in out)
+        return {c["overrides"]["buy_k"]: c for c in out}
+
+    def test_a_view_per_axis_past_the_second(self):
+        assert tu.slice_views(1, AXES3) == [1]
+        assert tu.slice_views([0, tu.SLICE_BEST], AXES4) == [0, tu.SLICE_BEST]
+        with pytest.raises(ValueError):
+            tu.slice_views(1, AXES4)
+
+    def test_both_held_is_the_grid_at_those_values(self):
+        assert {b: c["profit"] for b, c in self.by_buy([1, 0]).items()} == {0.3: 300, 0.5: 30}
+        assert "invalid" in self.by_buy([0, 1])[0.5]
+
+    def test_both_best_is_the_best_of_every_combination(self):
+        found = self.by_buy([tu.SLICE_BEST, tu.SLICE_BEST])
+        assert found[0.3]["profit"] == 300
+        assert found[0.3]["best_of"] == {
+            "values": {"take_fraction": 1.0, "stop_gain_fraction": 0.0}, "count": 4,
+        }
+        assert found[0.5]["best_of"]["count"] == 3  # the refused one left out
+
+    def test_both_averaged_is_the_average_of_every_accepted_combination(self):
+        found = self.by_buy([tu.SLICE_MEAN, tu.SLICE_MEAN])
+        assert found[0.3]["profit"] == pytest.approx(65.0)
+        assert found[0.5]["profit"] == pytest.approx(20.0)
+        assert found[0.5]["mean_of"] == {
+            "names": ["take_fraction", "stop_gain_fraction"], "count": 3, "of": 4,
+            "low": 10.0, "high": 30.0,
+        }
+
+    def test_best_of_one_and_average_of_the_other_averages_first(self):
+        """The take whose average over the stops is highest (0.5: 80) -- not
+        the average of each stop's best take (300 and 60: 180), which is no
+        one setting."""
+        found = self.by_buy([tu.SLICE_BEST, tu.SLICE_MEAN])
+        assert found[0.3]["profit"] == pytest.approx(80.0)
+        assert found[0.3]["best_of"] == {"values": {"take_fraction": 0.5}, "count": 2}
+        assert found[0.3]["mean_of"]["names"] == ["stop_gain_fraction"]
+        # The other way round: the stop whose average over the takes is highest.
+        found = self.by_buy([tu.SLICE_MEAN, tu.SLICE_BEST])
+        assert found[0.3]["profit"] == pytest.approx(200.0)
+        assert found[0.3]["best_of"]["values"] == {"stop_gain_fraction": 0.0}
+        # A refused part is left out of its own average only.
+        assert found[0.5]["profit"] == pytest.approx(20.0)
+
+    def test_one_held_and_one_collapsed(self):
+        found = self.by_buy([0, tu.SLICE_BEST])
+        assert found[0.3]["profit"] == 100
+        assert found[0.3]["best_of"]["values"] == {"stop_gain_fraction": 0.0}
+        assert self.by_buy([1, tu.SLICE_MEAN])[0.3]["profit"] == pytest.approx(50.0)
+
+    def test_a_square_collapses_only_once_every_combination_it_needs_is_in(self):
+        cells = [c for c in cells4(self.PROFITS)
+                 if c["overrides"] != {"buy_k": 0.3, "sell_k": 0.1,
+                                       "take_fraction": 1.0, "stop_gain_fraction": 0.2}]
+        for views in ([tu.SLICE_BEST, tu.SLICE_BEST], [tu.SLICE_MEAN, tu.SLICE_BEST],
+                      [1, tu.SLICE_MEAN]):
+            assert set(self.by_buy(views, cells)) == {0.5}
+        # Views that never need the missing cell are unaffected.
+        assert set(self.by_buy([0, tu.SLICE_BEST], cells)) == {0.3, 0.5}
+
+    def test_the_pick_reads_a_plateau_along_all_four_axes(self):
+        """Every cell of a 2x1x2x2 neighbours every other, so every plateau is
+        the average of all seven scored cells and the first in grid order wins."""
+        best = tu.pick_best(cells4(self.PROFITS), AXES4, rule=tu.PICK_PLATEAU)
+        assert best["overrides"] == {
+            "buy_k": 0.3, "sell_k": 0.1, "take_fraction": 0.5, "stop_gain_fraction": 0.0,
+        }
+        assert best["pick_score"] == pytest.approx(320 / 7, abs=1e-4)
+        assert tu.pick_best(cells4(self.PROFITS), AXES4)["profit"] == 300
+
+    def test_a_click_names_the_held_values_and_the_ones_it_won_at(self):
+        from simlab import app as sim_app
+
+        def clicked(views) -> "dict | None":
+            fig = sim_app._tuning_view_heatmap(
+                cells4(self.PROFITS), AXES4, {}, "t", views, clickable=True
+            )
+            return clicked_configs(fig)[(tu.axis_tick("sell_k", 0.1), tu.axis_tick("buy_k", 0.3))]
+
+        assert clicked([1, tu.SLICE_BEST]) == {
+            "buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0, "stop_gain_fraction": 0.0,
+        }
+        assert clicked([tu.SLICE_BEST, tu.SLICE_BEST]) == {
+            "buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0, "stop_gain_fraction": 0.0,
+        }
+        fig = sim_app._tuning_view_heatmap(
+            cells4(self.PROFITS), AXES4, {}, "t", [tu.SLICE_BEST, tu.SLICE_MEAN], clickable=True
+        )
+        assert [t.type for t in fig.data] == ["heatmap"]
+
+    def test_a_mark_is_outlined_only_on_the_values_it_sits_on(self):
+        from simlab import app as sim_app
+
+        pick = {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0, "stop_gain_fraction": 0.2}
+
+        def outlined(views) -> bool:
+            fig = sim_app._tuning_view_heatmap(
+                cells4(self.PROFITS), AXES4, {"Pick": pick}, "t", views
+            )
+            return any(t.name == "Pick" for t in fig.data)
+
+        assert outlined([1, 1]) and outlined([1, tu.SLICE_MEAN])
+        assert outlined([tu.SLICE_BEST, tu.SLICE_MEAN])
+        assert not outlined([1, 0]) and not outlined([0, tu.SLICE_BEST])
+
+    def test_the_hover_says_what_was_done_with_both(self):
+        from simlab import app as sim_app
+
+        fig = sim_app._tuning_view_heatmap(
+            cells4(self.PROFITS), AXES4, {}, "t", [tu.SLICE_BEST, tu.SLICE_MEAN]
+        )
+        [heatmap] = [t for t in fig.data if t.type == "heatmap"]
+        best_line, mean_line = heatmap.customdata[0][0][2].split("<br>")
+        assert best_line.startswith("Best at ") and best_line.endswith("(of 2 values)")
+        assert mean_line.startswith("Average of 2 ")
+        assert heatmap.colorbar.title.text == "Average profit a session"
+        assert fig.layout.title.text.count(" · ") == 2
 
 
 # --- a square clicked on a heatmap ------------------------------------------
