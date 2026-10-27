@@ -163,7 +163,7 @@ class TestSessionChart:
             "vix": {"2026-09-14": 17.5},
             "biases": {"2026-09-14": {"bias": "bearish", "confidence": "high"}},
         }
-        fig = sim_app._tuning_daily_chart(job, context)
+        fig = sim_app._tuning_daily_chart(job, context, chosen={})
         ticks = dict(zip(fig.layout.xaxis2.tickvals, fig.layout.xaxis2.ticktext))
         assert "▼ bearish" in ticks["2026-09-14"] and "VIX 17.5" in ticks["2026-09-14"]
         assert "no bias" in ticks["2026-09-15"] and "VIX –" in ticks["2026-09-15"]
@@ -186,7 +186,7 @@ class TestSessionChart:
             "best": cell,
         }
         monkeypatch.setattr(sim_app.sim_tuning, "is_scored", lambda c: bool(c))
-        fig = sim_app._tuning_daily_chart(job)
+        fig = sim_app._tuning_daily_chart(job, chosen={})
         candles = [t for t in fig.data if t.type == "candlestick"]
         assert len(candles) == 1 and candles[0].xaxis == "x2"
         assert list(candles[0].x) == ["2026-09-14", "2026-09-15"]

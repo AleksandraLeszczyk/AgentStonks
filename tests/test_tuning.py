@@ -412,6 +412,29 @@ class TestPick:
         best = tu.pick_best([rare, often], axes, rule=tu.PICK_SHARPE, min_traded_share=0.5)
         assert best["overrides"] == {"buy_k": 0.5}
 
+    def test_win_rate_takes_the_most_winning_round_trips_ties_to_the_bigger_profit(self):
+        axes = [{"name": "buy_k", "values": [0.3, 0.5, 0.7, 0.9]}]
+        cells = [
+            {**scored({"buy_k": 0.3}, 900.0), "round_trips": 4, "wins": 2},
+            {**scored({"buy_k": 0.5}, 40.0), "round_trips": 2, "wins": 2},
+            {**scored({"buy_k": 0.7}, 60.0), "round_trips": 3, "wins": 3},
+            scored({"buy_k": 0.9}, 990.0),  # no round trips counted
+        ]
+        best = tu.pick_best(cells, axes, rule=tu.PICK_WIN_RATE)
+        assert best["overrides"] == {"buy_k": 0.7}
+        assert best["pick_score"] == 100.0
+        assert tu.pick_best(cells[3:], axes, rule=tu.PICK_WIN_RATE) is None
+
+    def test_the_win_rate_best_still_has_to_trade_on_enough_days(self):
+        axes = [{"name": "buy_k", "values": [0.3, 0.5]}]
+        rare = {**scored({"buy_k": 0.3}, 50.0, traded=1), "round_trips": 1, "wins": 1}
+        often = {**scored({"buy_k": 0.5}, 10.0, traded=4), "round_trips": 4, "wins": 3}
+        assert tu.pick_best([rare, often], axes, rule=tu.PICK_WIN_RATE)["overrides"] == {
+            "buy_k": 0.3,
+        }
+        best = tu.pick_best([rare, often], axes, rule=tu.PICK_WIN_RATE, min_traded_share=0.5)
+        assert best["overrides"] == {"buy_k": 0.5}
+
     def test_nothing_scored_is_no_pick(self):
         assert tu.pick_best(cells_from([None] * 9), AXES) is None
 
@@ -1071,7 +1094,11 @@ class TestClickedSquare:
         sim_app._tuning_on_click("j", "chart")
         assert state["tune_chosen_j"] == {"buy_k": 0.5}
 
-    def test_the_picks_own_square_or_one_off_the_grid_is_the_pick(self, monkeypatch):
+    def test_nothing_is_selected_for_the_user_and_one_off_the_grid_is_forgotten(
+        self, monkeypatch
+    ):
+        """No pick stands in for a selection: the best square is selected only
+        once clicked, like any other."""
         from simlab import app as sim_app
 
         record = job_record({
@@ -1081,14 +1108,25 @@ class TestClickedSquare:
         state: dict = {}
         monkeypatch.setattr(sim_app.st, "session_state", state)
         assert sim_app._tuning_chosen(record) is None
-        state["tune_chosen_j"] = {"buy_k": 0.5}
-        assert sim_app._tuning_chosen(record) == {"buy_k": 0.5}
         state["tune_chosen_j"] = {"buy_k": 0.3}
-        assert sim_app._tuning_chosen(record) is None
+        assert sim_app._tuning_chosen(record) == {"buy_k": 0.3}
         state["tune_chosen_j"] = {"buy_k": 0.9}
         assert sim_app._tuning_chosen(record) is None
 
-    def test_the_table_and_the_sessions_show_the_clicked_square(self, monkeypatch):
+    def test_a_row_clicked_in_the_options_table_is_selected(self, monkeypatch):
+        from simlab import app as sim_app
+
+        state: dict = {}
+        monkeypatch.setattr(sim_app.st, "session_state", state)
+        options = [{"buy_k": 0.3}, {"buy_k": 0.5}]
+        state["table"] = {"selection": {"rows": [1]}}
+        sim_app._tuning_on_option("j", "table", options)
+        assert state["tune_chosen_j"] == {"buy_k": 0.5}
+        state["table"] = {"selection": {"rows": []}}  # the row clicked off again
+        sim_app._tuning_on_option("j", "table", options)
+        assert state["tune_chosen_j"] == {"buy_k": 0.5}
+
+    def test_the_options_and_the_sessions_show_the_clicked_square(self, monkeypatch):
         from simlab import app as sim_app
 
         def cell(buy: float, profit: float, day: str) -> dict:
@@ -1099,18 +1137,20 @@ class TestClickedSquare:
             "w2": [cell(0.3, -700.0, "2026-06-22"), cell(0.5, 350.0, "2026-06-22")],
         })
         tu.refresh_pick(record)
-        assert record["best"]["overrides"] == {"buy_k": 0.5}
         chosen = {"buy_k": 0.3}
         assert tu.summed_cell(record, chosen)["profit"] == 200.0
 
-        # A session's profit, 5 sessions each; the last row the average over
-        # all 10 of them.
-        shown = lambda rows: [r["shown_profit"] for r in rows]  # noqa: E731
-        assert shown(sim_app._tuning_summary_rows(record)) == [80.0, 70.0, 75.0]
-        assert shown(sim_app._tuning_summary_rows(record, chosen)) == [180.0, -140.0, 20.0]
-        rows = sim_app._tuning_summary_rows(record, chosen)
-        assert rows[-1]["dataset"] == "Average of 2"
-        assert [r["shown_return"] for r in rows] == pytest.approx([1.8, -1.4, 0.2])
+        # A session's profit over all 10 sessions, then each dataset's 5.
+        rows, configs = sim_app._tuning_option_rows(record)
+        assert [r["option"] for r in rows] == ["Best profit"]
+        assert configs == [{"buy_k": 0.5}]
+        rows, configs = sim_app._tuning_option_rows(record, chosen)
+        assert [r["option"] for r in rows] == ["Best profit", "Selected"]
+        assert configs == [{"buy_k": 0.5}, chosen]
+        selected = rows[1]
+        assert (selected["profit"], selected["ds_0"], selected["ds_1"]) == (20.0, 180.0, -140.0)
+        assert selected["return_pct"] == pytest.approx(0.2)
+        assert selected["datasets_up"] == "1 of 2"
 
         monkeypatch.setattr(sim_app, "_tuning_session_bars", lambda sym, feed, days: {})
         fig = sim_app._tuning_daily_chart(record, chosen=chosen)
@@ -1118,9 +1158,7 @@ class TestClickedSquare:
             "Selected on w1": [900.0], "Selected on w2": [-700.0],
         }
         assert fig.layout.title.text.startswith("Selected")
-        assert sim_app._tuning_daily_chart(record).layout.title.text == (
-            "The pick, session by session"
-        )
+        assert not [t for t in sim_app._tuning_daily_chart(record).data if t.type == "bar"]
 
 
 class TestHeatmapLabels:
@@ -1165,97 +1203,40 @@ class TestHeatmapLabels:
         assert heatmap.z[0][0] == pytest.approx(40.0)
 
 
-class TestVerdict:
-    """The line above a job's results: the pick's average day, not its total
-    (simlab/app.py)."""
+class TestEveryCombination:
+    """The table of every combination under a job's heatmaps (simlab/app.py)."""
 
-    def record(self) -> dict:
-        record = job_record({
-            "w1": [scored({"buy_k": 0.3}, 900.0), scored({"buy_k": 0.5}, 400.0)],
-            "w2": [scored({"buy_k": 0.3}, -700.0), scored({"buy_k": 0.5}, 350.0)],
-        })
-        return tu.refresh_pick(record)
-
-    def test_profit_and_return_are_a_sessions_average(self):
-        from simlab import app as sim_app
-
-        # The pick, 0.5, made 750 over 2 datasets x 5 sessions; each dataset's
-        # return is on the same starting cash, so they add (`scored` writes a
-        # return of profit / 100).
-        verdict = sim_app._tuning_verdict(self.record())
-        assert verdict.startswith(":green[**Beats the base configuration.**]")
-        assert "**+\\$75.00 a day** (+0.750% of the starting cash) on average over " \
-            "10 sessions in 2 datasets, in profit on 2 of them" in verdict
-        assert "the base configuration made +\\$0.20 a day (+0.002%)" in verdict
-
-    def test_one_dataset_names_it(self):
-        from simlab import app as sim_app
-
-        record = tu.refresh_pick(job_record({"w1": [scored({"buy_k": 0.3}, -50.0)]}))
-        verdict = sim_app._tuning_verdict(record)
-        assert verdict.startswith(":red[")
-        assert "**−\\$10.00 a day** (-0.100% of the starting cash) on average over " \
-            "5 sessions of `w1`" in verdict
-
-    def test_a_sharpe_pick_is_held_to_the_bases_sharpe_ratio(self):
-        """It was picked for its Sharpe ratio, so that is what it has to beat --
-        not the base's profit."""
-        from simlab import app as sim_app
-
-        def record(*base_days: float) -> dict:
-            record = job_record({"w1": [
-                with_daily(scored({"buy_k": 0.3}, 400.0), 900.0, -400.0, -100.0),
-                with_daily(scored({"buy_k": 0.5}, 300.0), 100.0, 120.0, 80.0),
-            ]}, rule=tu.PICK_SHARPE)
-            record["baseline"]["w1"] = with_daily(scored({}, sum(base_days)), *base_days)
-            return tu.refresh_pick(record)
-
-        mine = tu.sharpe(record()["best"])
-        # More profit than the pick (330 against 300), but a worse Sharpe ratio.
-        verdict = sim_app._tuning_verdict(record(500.0, -400.0, 230.0))
-        theirs = tu.sharpe(tu.summed_baseline(record(500.0, -400.0, 230.0)))
-        assert verdict.startswith(":green[**Beats the base configuration.**]")
-        assert f"Sharpe ratio {mine:+.2f} against the base configuration's {theirs:+.2f}" \
-            in verdict
-        # Less profit than the pick, but steadier.
-        verdict = sim_app._tuning_verdict(record(90.0, 91.0, 89.0))
-        assert verdict.startswith(":orange[**Profitable, but no better")
-
-    def test_a_sharpe_jobs_combinations_are_listed_by_sharpe_ratio(self):
+    def test_combinations_are_listed_by_total_profit_whatever_the_jobs_rule(self):
         from simlab import app as sim_app
 
         cells = [
-            scored({"buy_k": 0.3}, 900.0),  # kept no sessions: no ratio, listed last
+            scored({"buy_k": 0.3}, 900.0),
             with_daily(scored({"buy_k": 0.5}, 400.0), 900.0, -400.0, -100.0),
             with_daily(scored({"buy_k": 0.7}, 300.0), 100.0, 120.0, 80.0),
         ]
         axes = [{"name": "buy_k", "values": [0.3, 0.5, 0.7]}]
         buy = sim_app._tuning_param_label("buy_k")
-        by_profit = sim_app._tuning_cell_rows(job_record({"w1": cells}, axes=axes))
-        assert [r[buy] for r in by_profit] == [0.3, 0.5, 0.7]
-        by_sharpe = sim_app._tuning_cell_rows(
-            job_record({"w1": cells}, axes=axes, rule=tu.PICK_SHARPE)
-        )
-        assert [r[buy] for r in by_sharpe] == [0.7, 0.5, 0.3]
+        for rule in (tu.PICK_MAX, tu.PICK_SHARPE):
+            rows = sim_app._tuning_cell_rows(job_record({"w1": cells}, axes=axes, rule=rule))
+            assert [r[buy] for r in rows] == [0.3, 0.5, 0.7]
 
 
 def _set_base_app(record: dict, chosen) -> None:
     from simlab import app as sim_app
 
-    shown = chosen if chosen is not None else record["best"]["overrides"]
-    sim_app._render_tuning_set_base(record, shown, chosen)
+    sim_app._render_tuning_set_base(record, chosen)
 
 
 class TestSetBase:
-    """"Set as base configuration" on a job's results: the configuration on
-    screen becomes its pair's default in both apps (`base_configs`)."""
+    """"Set as current configuration" on a job's results: the selected
+    configuration becomes its pair's default in both apps (`base_configs`)."""
 
     def record(self, status=tu.FINISHED) -> dict:
         record = job_record({"w1": [scored({"buy_k": 0.3}, 90.0), scored({"buy_k": 0.5}, 40.0)]})
         record["status"] = status
         return tu.refresh_pick(record)
 
-    def app(self, record, chosen=None):
+    def app(self, record, chosen):
         from streamlit.testing.v1 import AppTest
 
         app = AppTest.from_function(_set_base_app, args=(record, chosen), default_timeout=30)
@@ -1263,15 +1244,16 @@ class TestSetBase:
         assert not app.exception, app.exception
         return app
 
-    def test_the_shown_configuration_becomes_the_pairs_default(self):
+    def test_the_selected_configuration_becomes_the_pairs_default(self):
         from agent_stonks import base_configs
         from agent_stonks.apple_trader import default_config
 
         record = self.record()
         app = self.app(record, chosen={"buy_k": 0.5})
-        assert app.button(key="tune_set_base_j").disabled is False
+        button = app.button(key="tune_set_base_j")
+        assert button.label == "Set as current configuration" and button.disabled is False
         assert not [b for b in app.button if b.key == "tune_clear_base_j"]
-        app.button(key="tune_set_base_j").click().run()
+        button.click().run()
         assert not app.exception
         expected = tu.make_config(record["spec"]["base"], {"buy_k": 0.5})
         assert default_config(TICKER, expected.model_key) == expected
@@ -1279,28 +1261,29 @@ class TestSetBase:
         assert found["source"] == {
             "job_id": "j", "overrides": {"buy_k": 0.5}, "label": "selected", "left_out_days": [],
         }
-        # Now it is the base: nothing left to set, and the way back is offered.
+        # Now it is current: nothing left to set, and the way back is offered.
         assert app.button(key="tune_set_base_j").disabled is True
+        assert "current configuration" in app.caption[0].value
         app.button(key="tune_clear_base_j").click().run()
         assert base_configs.entry(expected.model_key, TICKER) is None
 
-    def test_special_days_left_out_go_into_the_base_configuration(self):
-        """The job as the special-days switches read it: its base sits the
-        kind out, and the days it took out are named in the source."""
+    def test_special_days_left_out_go_into_the_current_configuration(self):
+        """The job as the special-days switches read it: its configuration
+        sits the kind out, and the days it took out are named in the source."""
         from agent_stonks import base_configs
 
         record = self.record()
         record["spec"]["base"]["skip_events"] = []
         read = tu.without_days(record, {str(TUNE_DAY)}, ["cpi"])
-        app = self.app(read)
+        app = self.app(read, {"buy_k": 0.3})
         app.button(key="tune_set_base_j").click().run()
         assert not app.exception
         found = base_configs.entry(record["spec"]["base"]["model_key"], TICKER)
         assert found["config"]["skip_events"] == ["cpi"]
         assert found["source"]["left_out_days"] == [str(TUNE_DAY)]
 
-    def test_a_running_job_cannot_set_its_pick(self):
-        app = self.app(self.record(status=tu.RUNNING))
+    def test_a_running_job_cannot_set_a_configuration(self):
+        app = self.app(self.record(status=tu.RUNNING), {"buy_k": 0.3})
         assert app.button(key="tune_set_base_j").disabled is True
         assert "still running" in app.caption[0].value
 
@@ -1308,16 +1291,15 @@ class TestSetBase:
 def _config_compare_app(record: dict, chosen) -> None:
     from simlab import app as sim_app
 
-    shown = chosen if chosen is not None else record["best"]["overrides"]
-    sim_app._render_tuning_config_compare(record, shown, chosen)
+    sim_app._render_tuning_config_compare(record, chosen)
 
 
 class TestConfigCompare:
-    """The configuration table on a job's results sets the shown one against
-    the pair's current default -- what a new run starts from now -- not the
-    job's own base."""
+    """The configuration table on a job's results sets the selected one
+    against the pair's current configuration -- what a new run starts from
+    now."""
 
-    def app(self, record, chosen=None):
+    def app(self, record, chosen):
         from streamlit.testing.v1 import AppTest
 
         app = AppTest.from_function(_config_compare_app, args=(record, chosen), default_timeout=30)
@@ -1330,7 +1312,7 @@ class TestConfigCompare:
         frame = app.table[0].value
         return dict(zip(frame["Setting"], frame[name]))
 
-    def test_the_shipped_defaults_when_no_base_is_set(self):
+    def test_the_shipped_defaults_when_nothing_is_set(self):
         from agent_stonks.apple_trader import default_config
 
         record = TestSetBase().record()
@@ -1338,26 +1320,147 @@ class TestConfigCompare:
         default = default_config(TICKER, record["spec"]["base"]["model_key"])
         # Both folded away, like "New tuning job": the table, then the signatures.
         assert [e.label for e in app.expander] == [
-            "Configuration: current default vs selected",
-            "Current default and selected as signatures",
+            "Configuration: current vs selected",
+            "Current and selected as signatures",
         ]
         signatures = [c.value for c in app.code]
         assert signatures[0] == rule_agent_signature(default)
-        assert "the shipped defaults" in app.caption[0].value
+        assert "is the shipped defaults" in app.caption[0].value
 
-    def test_a_base_set_since_the_job_is_what_it_is_set_against(self):
+    def test_a_configuration_set_since_is_what_it_is_set_against(self):
         from agent_stonks import base_configs
 
         record = TestSetBase().record()
-        base = tu.make_config(record["spec"]["base"], {"buy_k": 0.5})
-        base_configs.set_base(asdict(base), source={"job_id": "other"})
+        current = tu.make_config(record["spec"]["base"], {"buy_k": 0.5})
+        base_configs.set_base(asdict(current), source={"job_id": "other"})
         app = self.app(record, chosen={"buy_k": 0.5})
-        assert "is the current default" in app.caption[0].value
-        assert "from job `other`" in app.caption[0].value
-        # The job's own base (buy 0.3 -> its record's) is not the default.
-        assert "This job started from another configuration" in app.caption[0].value
-        left, right = self.column(app, "Current default"), self.column(app, "Selected")
-        assert left == right
+        caption = app.caption[0].value
+        assert "The selected one is the current configuration." in caption
+        assert "from job `other`" in caption
+        assert "base" not in caption.lower()
+        assert self.column(app, "Current") == self.column(app, "Selected")
+
+
+class TestHeatmapMarks:
+    """What a job's heatmaps outline and its options table lists: the current
+    configuration, the best total profit, Sharpe ratio and win rate, and the
+    one selected (simlab/app.py)."""
+
+    def record(self, **spec_overrides) -> dict:
+        """Four combinations on two datasets, the job's configuration the
+        shipped default, whose buy distance (`home`) wins every round trip: 0.3 makes
+        the most, 0.5 the steadiest, 0.9 is none of those."""
+        from agent_stonks.apple_trader import default_config
+
+        base = asdict(default_config(TICKER))
+        self.home = home = base["buy_k"]
+        assert home not in (0.3, 0.5, 0.9)
+        self.axes = [{"name": "buy_k", "values": [0.3, 0.5, home, 0.9]}]
+
+        def cell(buy, profit, daily, trips, wins) -> dict:
+            return {**with_daily(scored({"buy_k": buy}, profit), *daily),
+                    "round_trips": trips, "wins": wins}
+
+        record = job_record({
+            "w1": [cell(0.3, 600.0, (900.0, -300.0), 4, 2),
+                   cell(0.5, 200.0, (90.0, 110.0), 4, 3),
+                   cell(home, 50.0, (10.0, 40.0), 2, 2),
+                   cell(0.9, 100.0, (60.0, 40.0), 2, 1)],
+            "w2": [cell(0.3, 300.0, (500.0, -200.0), 4, 2),
+                   cell(0.5, 150.0, (70.0, 80.0), 4, 3),
+                   cell(home, 30.0, (20.0, 10.0), 1, 1),
+                   cell(0.9, 100.0, (30.0, 70.0), 2, 1)],
+        }, axes=self.axes, **spec_overrides)
+        record["spec"]["base"] = base
+        return tu.refresh_pick(record)
+
+    def test_the_bests_are_read_off_the_sum(self):
+        found = tu.bests(self.record())
+        assert {name: cell["overrides"]["buy_k"] for name, cell in found.items()} == {
+            "profit": 0.3, "sharpe": 0.5, "win_rate": self.home,
+        }
+        assert found["profit"]["profit"] == 900.0
+
+    def test_the_current_configuration_and_every_best_are_marked_and_no_pick(self):
+        """Whatever rule the job was submitted with, nothing is labelled the
+        pick: the bests are options side by side."""
+        from simlab import app as sim_app
+
+        record = self.record()
+        expected = {
+            "Current configuration": {"buy_k": self.home},
+            "Best profit": {"buy_k": 0.3},
+            "Best Sharpe": {"buy_k": 0.5},
+            "Best win rate": {"buy_k": self.home},
+        }
+        assert sim_app._tuning_result_marks(record, None) == expected
+        for rule in (tu.PICK_SHARPE, tu.PICK_PLATEAU):
+            marks = sim_app._tuning_result_marks(self.record(rule=rule), {"buy_k": 0.9})
+            assert marks == {**expected, "Selected": {"buy_k": 0.9}}
+
+    def test_an_option_is_one_configuration_with_every_role_it_plays(self):
+        from simlab import app as sim_app
+
+        record = self.record()
+        options = sim_app._tuning_options(record, {"buy_k": self.home})
+        assert options == [
+            (["Current configuration", "Best win rate", "Selected"], {"buy_k": self.home}),
+            (["Best profit"], {"buy_k": 0.3}),
+            (["Best Sharpe"], {"buy_k": 0.5}),
+        ]
+        rows, configs = sim_app._tuning_option_rows(record, {"buy_k": self.home})
+        assert [r["option"] for r in rows] == [
+            "Current configuration · Best win rate · Selected", "Best profit", "Best Sharpe",
+        ]
+        assert configs == [o for _, o in options]
+        assert rows[0]["win_rate"] == 100.0 and rows[1]["profit"] == 900.0 / 4
+
+    def test_the_current_configuration_follows_the_pair_across_the_grid(self):
+        """Set from a square of the grid, the current configuration is
+        outlined there; changed in a setting the grid does not sweep, it is no
+        combination of it and is not outlined at all."""
+        from dataclasses import replace
+
+        from agent_stonks import base_configs
+        from simlab import app as sim_app
+
+        record = self.record()
+        spec = record["spec"]
+        base_configs.set_base(asdict(tu.make_config(spec["base"], {"buy_k": 0.5})))
+        assert sim_app._tuning_current_marks(spec, self.axes) == {
+            "Current configuration": {"buy_k": 0.5},
+        }
+        moved = tu.make_config(spec["base"], {})
+        base_configs.set_base(asdict(replace(moved, take_in_loss=not moved.take_in_loss)))
+        assert sim_app._tuning_current_marks(spec, self.axes) == {}
+
+    def test_a_mark_frames_its_square_and_marks_sharing_one_nest_inward(self):
+        from simlab import app as sim_app
+
+        record = self.record()
+        marks = sim_app._tuning_result_marks(record, {"buy_k": 0.5})
+        axes = [*self.axes, {"name": "sell_k", "values": [0.3]}]
+        on_2d = {label: {**o, "sell_k": 0.3} for label, o in marks.items()}
+        cells = [
+            {**cell, "overrides": {**cell["overrides"], "sell_k": 0.3}}
+            for cell in tu.summed_cells(record)
+        ]
+        fig = sim_app._tuning_view_heatmap(cells, axes, on_2d, "t", None)
+        legend = {
+            t.name: (t.line.color, t.line.dash)
+            for t in fig.data if t.type == "scatter" and t.mode == "lines"
+        }
+        assert list(legend) == [
+            "Current configuration", "Best profit", "Best Sharpe", "Best win rate", "Selected",
+        ]
+        assert len(set(legend.values())) == len(legend)
+        # Rows are buy 0.3, 0.5, home, 0.9 by index: home holds the current
+        # settings and the best win rate, 0.5 the best Sharpe and the click.
+        frames = [((s.y0 + s.y1) / 2, (s.y1 - s.y0) / 2, s.line.color) for s in fig.layout.shapes]
+        assert [(round(y, 6), round(h, 2)) for y, h, _ in frames] == [
+            (2, 0.47), (0, 0.47), (1, 0.47), (2, 0.34), (1, 0.34),
+        ]
+        assert [c for _, _, c in frames] == [c for c, _ in legend.values()]
 
 
 def rule_agent_signature(config) -> str:
@@ -1419,7 +1522,9 @@ class TestPredictedRange:
             "days": {"2026-06-15": {"high": 210.0, "low": 200.0, "made_at": "09:34"}},
             "overlay": "highlow_range", "notes": [],
         }
-        fig = sim_app._tuning_daily_chart(self.record(), forecasts=forecasts)
+        fig = sim_app._tuning_daily_chart(
+            self.record(), chosen={"buy_k": 0.5}, forecasts=forecasts
+        )
         [box] = [t for t in fig.data if t.name == "Predicted day range (HighLow)"]
         assert (list(box.x), list(box.base), list(box.y)) == (["2026-06-15"], [200.0], [10.0])
         assert box.yaxis == "y2"

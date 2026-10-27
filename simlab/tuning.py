@@ -126,6 +126,9 @@ PICK_PLATEAU = "plateau"
 # Not the most profit but the most profit for how much it swung from session
 # to session (`sharpe`): a steady earner over a bigger total carried by a day.
 PICK_SHARPE = "sharpe"
+# The highest share of winning round trips (`win_rate`): one of the best
+# options the Tuning tab lists and outlines (`bests`).
+PICK_WIN_RATE = "win_rate"
 
 # What a cell is scored by. Every metric is "higher is better". The labels
 # carry no "$": they reach Streamlit markdown, where a bare dollar sign opens a
@@ -1400,7 +1403,9 @@ def pick_best(
     `PICK_SHARPE` takes the highest annualized Sharpe ratio (`sharpe`) over
     every session, whatever `metric` says; a cell with none -- fewer than two
     sessions kept, or one that never moved -- has nothing to rank it by and is
-    not eligible.
+    not eligible. `PICK_WIN_RATE` takes the highest `win_rate`, a cell with no
+    round trips counted not eligible; a rate of a few round trips ties often
+    (every 2 of 2 is 100%), so its ties go to the higher `metric`.
 
     A cell is eligible only if it traded on at least `min_traded_share` of the
     days, so a deep entry that filled once cannot win on that one fill.
@@ -1435,15 +1440,39 @@ def pick_best(
     ]
     if rule == PICK_SHARPE:
         eligible = [c for c in eligible if sharpe(c) is not None]
+    elif rule == PICK_WIN_RATE:
+        eligible = [c for c in eligible if win_rate(c) is not None]
     if not eligible:
         return None
     rank = (
         plateau if rule == PICK_PLATEAU
         else sharpe if rule == PICK_SHARPE
+        else win_rate if rule == PICK_WIN_RATE
         else (lambda c: float(c[metric]))
     )
-    best = max(eligible, key=rank)  # max() keeps the first of equal keys
+    tie = (lambda c: float(c[metric])) if rule == PICK_WIN_RATE else (lambda c: 0.0)
+    best = max(eligible, key=lambda c: (rank(c), tie(c)))  # max() keeps the first of equal keys
     return {**best, "pick_score": round(rank(best), 4)}
+
+
+# What the heatmaps outline the best combination by, beside the pick, and the
+# rule each is ranked under (`bests`).
+BESTS = {"profit": PICK_MAX, "sharpe": PICK_SHARPE, "win_rate": PICK_WIN_RATE}
+
+
+def bests(record: dict) -> "dict[str, dict | None]":
+    """The combination of the summed grid with the best total profit, the best
+    Sharpe ratio and the best win rate (`BESTS`), whatever rule the job picks
+    by -- each under its minimum share of days traded, as the pick is, so the
+    first two are what the pick would be under `PICK_MAX` and `PICK_SHARPE`.
+    None for one with no eligible combination yet."""
+    spec = record["spec"]
+    cells = summed_cells(record)
+    share = float(spec.get("min_traded_share") or 0.0)
+    return {
+        name: pick_best(cells, spec["axes"], PICK_METRIC, rule, share)
+        for name, rule in BESTS.items()
+    }
 
 
 def overlapping_days(first: "list[str]", second: "list[str]") -> "list[str]":

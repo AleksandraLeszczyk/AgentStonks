@@ -3786,11 +3786,6 @@ def _drift_chart(entries: "list[dict]", metric, by: str, tickers: "list[str]") -
 # ---------------------------------------------------------------------------
 
 _TUNE_PREFIX = "tune"
-_PICK_LABELS = {
-    sim_tuning.PICK_MAX: "Highest single cell",
-    sim_tuning.PICK_PLATEAU: "Middle of the best plateau",
-    sim_tuning.PICK_SHARPE: "Highest Sharpe ratio",
-}
 
 
 def _tuning_param_label(name: str) -> str:
@@ -3804,7 +3799,7 @@ def _tuning_value(name: str, value) -> str:
 
 
 def _tuning_values_text(values: "dict | None") -> str:
-    """One cell's settings, for the summary table and the pick's caption.
+    """One cell's settings, for the selection's caption and chart title.
 
     In the chart's tick form rather than the form's: both of the places this
     appears sit next to a heatmap axis or a `config_signature`, and a cell that
@@ -3932,8 +3927,9 @@ def _tuning_job_label(
 def render_tuning_tab() -> None:
     st.caption(
         "Sweep a grid of Apple Trader's parameters over one or more datasets — a heatmap "
-        "per dataset, then their sum — and pick the combination with the best total "
-        "profit or Sharpe ratio. Every cell is a full replay through the same engine and trader as "
+        "per dataset, then their sum — and see where the current configuration sits and "
+        "which combinations made the most, the steadiest and the most often. Every cell "
+        "is a full replay through the same engine and trader as "
         "Simulate — market fills, the managed exit, the flatten — so a cell's number is "
         "what a Simulate run of that configuration would show. A square shows its profit "
         "a session, every session counted, traded or not, and under it (±) the standard "
@@ -4026,7 +4022,7 @@ def _render_tuning_overlaps(datasets: "list[dict]") -> None:
     """Warn about datasets that would be summed over the same sessions or tapes.
 
     A session two datasets share is replayed on both and so counted twice in
-    the sum -- it weighs double in the pick. Mixed tapes are allowed but said
+    the sum -- it weighs double in the best options. Mixed tapes are allowed but said
     out loud: fills differ between them, so part of any difference between
     two heatmaps is the tape.
     """
@@ -4037,7 +4033,7 @@ def _render_tuning_overlaps(datasets: "list[dict]") -> None:
                 f"`{first['name']}` and `{second['name']}` share {len(shared)} session"
                 f"{'s' if len(shared) != 1 else ''} ({', '.join(shared[:5])}"
                 f"{'…' if len(shared) > 5 else ''}). The sum counts those twice, so they "
-                "weigh double in the pick."
+                "weigh double in the best options."
             )
     feeds = sorted({d["feed"] for d in datasets})
     if len(feeds) > 1:
@@ -4087,10 +4083,10 @@ def _render_tuning_form() -> None:
         return
     symbols = sorted({str(s).upper() for d in datasets for s in (d.symbols or [])})
 
-    st.markdown("**Base configuration**")
+    st.markdown("**Configuration**")
     st.caption(
-        "Every parameter the grid does not sweep comes from here, and the grid is "
-        "compared against this configuration exactly as it stands."
+        "Every parameter the grid does not sweep comes from here. It opens on the pair's "
+        "current configuration."
     )
     base = _render_apple_params(symbols, _TUNE_PREFIX)
 
@@ -4135,7 +4131,7 @@ def _render_tuning_form() -> None:
         axes.append({"name": name, "values": values})
         st.caption(
             f"{len(values)} values: {', '.join(_tuning_value(name, v) for v in values)} — "
-            f"the base configuration has {_tuning_value(name, getattr(base, name))}."
+            f"the configuration above has {_tuning_value(name, getattr(base, name))}."
         )
 
     st.markdown("**Datasets**")
@@ -4157,33 +4153,23 @@ def _render_tuning_form() -> None:
         "Sweep on", list(by_name), default=[newest], format_func=lambda n: _tuning_describe_dataset(by_name[n]),
         key=f"tune_datasets_{base.ticker}",
         help="The grid is swept on every dataset picked here, each drawn as its own "
-        "heatmap, and the pick is read off their sum. A finished job takes more datasets "
+        "heatmap, and the best options are read off their sum. A finished job takes more datasets "
         "later with the same settings.",
     )
     picked = [by_name[name] for name in chosen]
     _render_tuning_overlaps([_tuning_dataset_spec(d) for d in picked])
 
-    st.markdown("**How the pick is chosen**")
+    st.markdown("**Best options**")
     st.caption(
-        "On the sum of every dataset's heatmap: the best total profit, or the best "
-        "Sharpe ratio."
+        "Read off the sum of every dataset's heatmap: the combinations with the best "
+        "total profit, Sharpe ratio and win rate, among those that trade often enough."
     )
-    col_rule, col_share, col_cash = st.columns(3)
-    rule = col_rule.selectbox(
-        "Pick", list(_PICK_LABELS), format_func=_PICK_LABELS.get, key="tune_rule",
-        help="The highest cell of a small grid is usually the luckiest. The plateau pick "
-        "takes the cell whose neighbourhood — itself and every adjacent cell — scores "
-        "best on average, which is how the shipped per-ticker levels were chosen. "
-        "**Highest Sharpe ratio** takes the cell whose profit a session is largest "
-        "against how much it swung from session to session, over every session of "
-        "every dataset: a steady earner over a bigger total carried by a day or two. "
-        "A cell that never traded has no Sharpe ratio and cannot be the pick.",
-    )
+    col_share, col_cash = st.columns(2)
     min_share = col_share.slider(
         "Must trade on at least", 0, 100, 50, step=5, format="%d%% of days",
         key="tune_min_traded",
         help="Counted over every session of every dataset. A deep entry that filled on "
-        "one lucky day cannot be the pick.",
+        "one lucky day cannot be a best option.",
     ) / 100.0
     starting_cash = col_cash.number_input(
         "Starting cash", value=100_000.0, step=10_000.0, key="tune_cash",
@@ -4210,7 +4196,6 @@ def _render_tuning_form() -> None:
         "axes": axes,
         "datasets": [_tuning_dataset_spec(d) for d in picked],
         "starting_cash": float(starting_cash),
-        "rule": rule,
         "min_traded_share": float(min_share),
         "reuse_runs": bool(reuse_runs),
         "workers": int(workers),
@@ -4250,9 +4235,65 @@ def _render_tuning_form() -> None:
         st.rerun()
 
 
-def _tuning_base_marks(spec: dict, axes: list[dict]) -> dict:
-    """Where the base configuration sits on the grid, for a heatmap's outline."""
-    return {"Base configuration": {a["name"]: spec["base"][a["name"]] for a in axes}}
+def _tuning_current_overrides(spec: dict, axes: list[dict]) -> "dict | None":
+    """Where the pair's current configuration sits on the grid -- what a new
+    run of it starts from now (`apple_trader.default_config`): the one set
+    from a tuning job, else the shipped defaults -- or None if it is no
+    combination of the grid.
+
+    A combination is the job's configuration with the swept values on top,
+    so the current one is a combination only if it agrees with the job's in
+    everything the grid does not sweep, the days-off rule as the job is read
+    included (`_render_tuning_special_days`). Compared as stored records, the
+    way "Set as current configuration" tells whether the selected one already
+    is current.
+    """
+    to_record = rule_agent(APPLE_TRADER_KEY).to_record
+    try:
+        own = sim_tuning.make_config(spec["base"], {})
+        current = default_config(own.ticker, own.model_key)
+        found = {a["name"]: getattr(current, a["name"]) for a in axes}
+        if any(found[a["name"]] not in a["values"] for a in axes):
+            return None
+        on_grid = sim_tuning.make_config(spec["base"], found)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    same = base_configs.digest(to_record(on_grid)) == base_configs.digest(to_record(current))
+    return found if same else None
+
+
+def _tuning_current_marks(spec: dict, axes: list[dict]) -> dict:
+    """{"Current configuration": its place on the grid}, for a heatmap's
+    outline, or nothing if it is no combination of the grid
+    (`_tuning_current_overrides`)."""
+    current = _tuning_current_overrides(spec, axes)
+    return {} if current is None else {"Current configuration": current}
+
+
+# A best combination's mark, by what it is best at (`tuning.bests`).
+_TUNING_BEST_LABELS = {
+    "profit": "Best profit",
+    "sharpe": "Best Sharpe",
+    "win_rate": "Best win rate",
+}
+
+
+def _tuning_result_marks(job: dict, chosen: "dict | None") -> dict:
+    """What a job's heatmaps outline, {label: configuration}: the current
+    configuration (`_tuning_current_marks`), the combinations with the best
+    total profit, Sharpe ratio and win rate over every dataset
+    (`tuning.bests`), and the square or option selected. Nothing is chosen for
+    the user (since 2026-10-27, the user's: no pick): the bests are options
+    side by side, and the configuration block and the session-by-session
+    chart show only what was selected."""
+    spec = job["spec"]
+    marks = _tuning_current_marks(spec, spec["axes"])
+    for name, cell in sim_tuning.bests(job).items():
+        if cell is not None:
+            marks[_TUNING_BEST_LABELS[name]] = cell["overrides"]
+    if chosen is not None:
+        marks["Selected"] = chosen
+    return marks
 
 
 def _render_tuning_prior(
@@ -4305,7 +4346,7 @@ def _render_tuning_prior(
         f"**Already run** — {sum(len(c) for c in swept.values())} of {total} "
         "combinations over the datasets picked"
     )
-    marks = _tuning_base_marks(spec, axes)
+    marks = _tuning_current_marks(spec, axes)
     view = _tuning_view_picker(axes, marks, key="tune_prior_view")
     _render_tuning_charts([
         (
@@ -4315,7 +4356,7 @@ def _render_tuning_prior(
         for index, (name, cells) in enumerate(swept.items())
     ])
     st.caption(
-        f"Stored {pair} runs matching this base configuration in everything the grid "
+        f"Stored {pair} runs matching this configuration in everything the grid "
         "does not sweep, and still current — same sessions, same tape, same starting "
         "cash, and nothing they read has changed since. Blank squares are combinations "
         "nobody has replayed, and they are what the job would run." + aged
@@ -4370,28 +4411,34 @@ def _tuning_on_click(job_id: str, chart_key: str) -> None:
             return
 
 
-def _tuning_chosen(job: dict) -> "dict | None":
-    """The configuration clicked on one of the job's heatmaps; None shows the pick.
+def _tuning_on_option(job_id: str, table_key: str, options: "list[dict]") -> None:
+    """Remember the configuration of the options-table row just clicked
+    (`_tuning_option_rows`, in the order `options` lists them). A click that
+    clears the row keeps whatever was selected before."""
+    state = st.session_state.get(table_key) or {}
+    for row in (state.get("selection") or {}).get("rows") or ():
+        if 0 <= row < len(options):
+            st.session_state[_tuning_chosen_key(job_id)] = options[row]
+            return
 
-    A click on the pick's own square is the pick, so it reads as one; a
-    configuration no longer on the job's grid is forgotten.
-    """
+
+def _tuning_chosen(job: dict) -> "dict | None":
+    """The configuration selected -- a square clicked on one of the job's
+    heatmaps, or a row of its options table -- or None while nothing is. A
+    configuration no longer on the job's grid is forgotten."""
     chosen = st.session_state.get(_tuning_chosen_key(job["job_id"]))
     if not chosen:
         return None
     key = sim_tuning.overrides_key(chosen)
-    best = job.get("best")
-    if best and key == sim_tuning.overrides_key(best["overrides"]):
-        return None
     if key not in {sim_tuning.overrides_key(o) for o in sim_tuning.grid(job["spec"]["axes"])}:
         return None
     return chosen
 
 
 def _tuning_shown_cell(job: dict, name: str, chosen: "dict | None") -> "dict | None":
-    """The shown configuration's cell on one dataset: the clicked one, else the pick's."""
+    """The selected configuration's cell on one dataset; None with nothing selected."""
     if chosen is None:
-        return sim_tuning.pick_cell(job, name)
+        return None
     return sim_tuning.cell_at(job, name, chosen)
 
 
@@ -4413,8 +4460,8 @@ def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> list:
 
     An index into an axis's values draws the grid at that value; `SLICE_BEST`
     and `SLICE_MEAN` collapse the axis (`tuning.slice_cells`). Each starts on
-    the slice the first of `marks` sits on -- the pick, on a job's results --
-    so the heatmap opens on the outline it is about.
+    the slice the first of `marks` sits on -- the current configuration, else
+    the best profit, on a job's results -- so the heatmap opens on an outline.
 
     The key carries the axis, so a form whose third parameter changes does not
     hand a new axis an index into the old one's values.
@@ -4562,6 +4609,32 @@ def _tuning_hover_data(cell: "dict | None", metric: str = "per_session") -> list
 # a grid of one week and the sum of five read in the same units.
 _TUNING_HEAT_METRIC = "per_session"
 
+# How each mark is drawn, by its label: (colour, dash, symbol, size). A
+# heatmap frames its square in the colour and dash; a one-parameter grid's bar
+# carries the open symbol, at its size, at its top. Colours off the heatmaps'
+# red-yellow-green scale, and a dash or a shape as well, because marks share a
+# square often -- the best profit and the best Sharpe ratio most of all. The
+# current configuration keeps the pink the job's base used to have, the best
+# profit the blue the pick used to have.
+_TUNING_MARK_STYLES = {
+    "Current configuration": ("#ffabab", "solid", "square-open", 22),
+    "Best profit": ("#0068c9", "solid", "square-open", 16),
+    "Best Sharpe": ("#7c4dff", "dash", "diamond-open", 20),
+    "Best win rate": ("#00e5ff", "dot", "circle-open", 13),
+    "Selected": (_TUNING_SELECTED_COLOR, "solid", "square-open", 10),
+}
+
+# A heatmap frame's half width and height, in squares, and how much further in
+# each frame sharing a square sits. Taller steps than wide: squares are wider
+# than they are tall.
+_TUNING_FRAME_HALF = 0.47
+_TUNING_FRAME_STEP = (0.07, 0.13)
+
+
+def _tuning_mark_style(label: str) -> tuple:
+    """A mark's (colour, dash, symbol, size)."""
+    return _TUNING_MARK_STYLES.get(label, (PALETTE["text"], "solid", "square-open", 16))
+
 
 def _tuning_heatmap(
     cells: list[dict], axes: list[dict], marks: dict, title: str,
@@ -4569,14 +4642,15 @@ def _tuning_heatmap(
     metric_label: "str | None" = None,
     config_of: "Callable[[dict], dict] | None" = None,
 ) -> go.Figure:
-    """The grid coloured by `metric`; `marks` outlines named cells (the pick, the
-    base, the square clicked).
+    """The grid coloured by `metric`; `marks` outlines named cells (the current
+    settings, the bests, the square clicked), each as `_tuning_mark_style`
+    draws its label.
 
     Cells come with their session stats (`tuning.with_session_stats`): each
     square is labelled with its profit a session and, under it, the standard
     deviation of its sessions' profits -- a bar's is its error bar. The hover
-    adds the total and the return: the total is what the pick is ranked on,
-    the return is what it means against the cash.
+    adds the total and the return: the total is what the best profit is
+    ranked on, the return is what it means against the cash.
     A grid of three or four axes comes here already sliced to its first two
     (`_tuning_view_heatmap`), and the hover then says what was done with the
     others.
@@ -4606,21 +4680,6 @@ def _tuning_heatmap(
         f"{metric_label}: %{{customdata[0]}}<br>%{{customdata[1]}}"
         + ("<br>%{customdata[2]}" if collapsed else "") + "<extra></extra>"
     )
-    # A bar chart's stars: (colour, size).
-    star_styles = {
-        "Pick": (PALETTE["text"], 16),
-        "Base configuration": (PALETTE["muted"], 16),
-        "Selected": (_TUNING_SELECTED_COLOR, 12),
-    }
-    # A heatmap's outlines: (colour, size). The pick's and the base's are the
-    # colours they always showed, which Streamlit's colorway used to hand out
-    # by trace order. The clicked square's sits inside the others, so it still
-    # shows on the pick's or the base's square.
-    outline_styles = {
-        "Pick": ("#0068c9", 30),
-        "Base configuration": ("#ffabab", 30),
-        "Selected": (_TUNING_SELECTED_COLOR, 22),
-    }
     # A click selects a point in plotly, which dims every other point of every
     # selectable trace until the next run redraws the chart; the outlines and
     # bars keep their look.
@@ -4647,11 +4706,12 @@ def _tuning_heatmap(
             value = (overrides or {}).get(axis["name"])
             if value in axis["values"]:
                 y = ys[axis["values"].index(value)]
-                color, size = star_styles.get(label, (PALETTE["text"], 16))
+                color, _, symbol, size = _tuning_mark_style(label)
                 fig.add_trace(go.Scatter(
                     x=[sim_tuning.axis_tick(axis["name"], value)], y=[y or 0], mode="markers",
                     name=label, hoverinfo="skip", unselected=undimmed,
-                    marker=dict(symbol="star", size=size, color=color),
+                    marker=dict(symbol=symbol, size=size, color=color, line=dict(
+                        width=2, color=color)),
                 ))
         fig.update_xaxes(title=_tuning_param_label(axis["name"]), type="category")
         fig.update_yaxes(title=metric_label)
@@ -4706,19 +4766,29 @@ def _tuning_heatmap(
                 text=point_text, customdata=point_custom, hovertemplate=point_hover,
             ))
             fig.update_layout(hoverdistance=-1, dragmode="zoom")
+        # A mark is a frame on its square's own border -- the square's size
+        # whatever the grid's, and clear of its numbers -- in the order `marks`
+        # lists them, each frame on a square already framed a step further in.
+        # A category axis places a shape by the category's index. The legend
+        # entry is an empty line trace in the frame's colour and dash.
+        framed: dict = {}
         for label, overrides in marks.items():
             overrides = overrides or {}
             row_value, col_value = overrides.get(row_axis["name"]), overrides.get(col_axis["name"])
             if row_value in row_axis["values"] and col_value in col_axis["values"]:
-                # An open symbol is stroked in the marker's own colour; left
-                # unset, Streamlit's colorway gives it one by trace order.
-                color, size = outline_styles.get(label, (PALETTE["text"], 30))
+                at = (col_axis["values"].index(col_value), row_axis["values"].index(row_value))
+                level = framed[at] = framed.get(at, -1) + 1
+                half_x = _TUNING_FRAME_HALF - _TUNING_FRAME_STEP[0] * level
+                half_y = _TUNING_FRAME_HALF - _TUNING_FRAME_STEP[1] * level
+                color, dash, _, _ = _tuning_mark_style(label)
+                fig.add_shape(
+                    type="rect", xref="x", yref="y",
+                    x0=at[0] - half_x, x1=at[0] + half_x, y0=at[1] - half_y, y1=at[1] + half_y,
+                    line=dict(color=color, width=3, dash=dash),
+                )
                 fig.add_trace(go.Scatter(
-                    x=[sim_tuning.axis_tick(col_axis["name"], col_value)],
-                    y=[sim_tuning.axis_tick(row_axis["name"], row_value)],
-                    mode="markers", name=label, hoverinfo="skip", unselected=undimmed,
-                    marker=dict(symbol="square-open", size=size, color=color, line=dict(
-                        width=3, color=color)),
+                    x=[None], y=[None], mode="lines", name=label, hoverinfo="skip",
+                    line=dict(color=color, width=3, dash=dash),
                 ))
         # The whole grid, in grid order, even while cells are still missing --
         # a category axis otherwise shows only the values something was drawn at.
@@ -4734,229 +4804,223 @@ def _tuning_heatmap(
     return _chart_layout(fig, height=440)
 
 
-def _tuning_summary_rows(job: dict, chosen: "dict | None" = None) -> list[dict]:
-    """The base configuration and the shown one on each dataset, then on
-    average over every session of them all.
+def _tuning_options(job: dict, chosen: "dict | None") -> "list[tuple[list[str], dict]]":
+    """The configurations worth a look, as (roles, configuration), in the
+    heatmaps' legend order (`_tuning_result_marks`): the current
+    configuration, the best profit, Sharpe ratio and win rate, and the one
+    selected. A configuration playing several roles is one option."""
+    options: dict = {}
+    for label, overrides in _tuning_result_marks(job, chosen).items():
+        key = sim_tuning.overrides_key(overrides)
+        options.setdefault(key, ([], overrides))[0].append(label)
+    return list(options.values())
 
-    Profit and return are a session's (since 2026-10-27, the user's: datasets
-    of different lengths were not comparable as totals), every session
-    counted, traded or not -- the heatmaps' *Profit a session*
-    (`tuning.daily_profit`). The last row is the summed cell's, so its
-    average weighs each session alike, not each dataset.
 
-    The shown configuration is the pick, or the square clicked on a heatmap
-    (`chosen`); its columns are `shown_*` either way.
+def _tuning_option_rows(
+    job: dict, chosen: "dict | None" = None
+) -> "tuple[list[dict], list[dict]]":
+    """The options table, a row per option (`_tuning_options`), and each
+    row's configuration in the same order.
+
+    A row is the option's swept values, then over every session of every
+    dataset (`tuning.summed_cell`) its profit and return a session, Sharpe
+    ratio, win rate, days and worst day, then its profit a session on each
+    dataset, oldest first. A session's rather than a total (since 2026-10-27,
+    the user's: datasets of different lengths were not comparable as totals),
+    every session counted, traded or not -- the heatmaps' *Profit a session*
+    (`tuning.daily_profit`). A combination not yet replayed on every dataset
+    has no sum, so its numbers are blank.
     """
     spec = job["spec"]
-    datasets = sim_tuning.chronological(spec["datasets"])
-
-    def row(label: str, sessions: int, base: "dict | None", shown: "dict | None") -> dict:
-        out = {"dataset": label, "sessions": sessions}
-        for prefix, cell in (("base", base), ("shown", shown)):
-            scored = sim_tuning.is_scored(cell) and bool(cell.get("days"))
-            out[f"{prefix}_profit"] = sim_tuning.daily_profit(cell) if scored else None
-            out[f"{prefix}_return"] = cell["return_pct"] / cell["days"] if scored else None
-            out[f"{prefix}_sharpe"] = sim_tuning.sharpe(cell) if scored else None
-        scored = sim_tuning.is_scored(shown)
-        out["shown_days"] = (
-            f"{shown['days_up']} up · {shown['days_traded']} traded / {shown['days']}"
-            if scored else "—"
+    names = sim_tuning.dataset_names(spec, by_date=True)
+    rows, configs = [], []
+    for roles, overrides in _tuning_options(job, chosen):
+        total = sim_tuning.summed_cell(job, overrides)
+        scored = sim_tuning.is_scored(total) and bool(total.get("days"))
+        row = {"option": " · ".join(roles)}
+        row.update({
+            _tuning_param_label(a["name"]): overrides.get(a["name"]) for a in spec["axes"]
+        })
+        row.update(
+            profit=sim_tuning.daily_profit(total) if scored else None,
+            return_pct=total["return_pct"] / total["days"] if scored else None,
+            sharpe=sim_tuning.sharpe(total) if scored else None,
+            win_rate=sim_tuning.win_rate(total) if scored else None,
+            wins=(
+                f"{total['wins']} of {total['round_trips']}"
+                if scored and total.get("round_trips") is not None else "—"
+            ),
+            days=(
+                f"{total['days_up']} up · {total['days_traded']} traded / {total['days']}"
+                if scored else "—"
+            ),
+            worst_day=total["worst_day"] if scored else None,
         )
-        out["shown_win_rate"] = sim_tuning.win_rate(shown) if scored else None
-        out["shown_round_trips"] = (
-            f"{shown['wins']} of {shown['round_trips']}"
-            if scored and shown.get("round_trips") is not None else "—"
-        )
-        out["shown_worst"] = shown["worst_day"] if scored else None
-        return out
-
-    rows = [
-        row(d["name"], len(d["days"]), job["baseline"].get(d["name"]),
-            _tuning_shown_cell(job, d["name"], chosen))
-        for d in datasets
-    ]
-    if len(datasets) > 1:
-        # The pick summed afresh rather than as the record stored it: a pick
-        # stored before sums kept their sessions has no spread to read.
-        # Summed, then read a session: the average over every session.
-        best = job.get("best")
-        overrides = chosen if chosen is not None else (best or {}).get("overrides")
-        rows.append(row(
-            f"Average of {len(datasets)}", sum(len(d["days"]) for d in datasets),
-            sim_tuning.summed_baseline(job),
-            sim_tuning.summed_cell(job, overrides) if overrides is not None else None,
-        ))
-    return rows
+        if len(names) > 1:
+            row["datasets_up"] = (
+                f"{total['datasets_up']} of {total['datasets']}" if scored else "—"
+            )
+        for index, name in enumerate(names):
+            part = sim_tuning.cell_at(job, name, overrides)
+            row[f"ds_{index}"] = (
+                sim_tuning.daily_profit(part)
+                if sim_tuning.is_scored(part) and part.get("days") else None
+            )
+        rows.append(row)
+        configs.append(overrides)
+    return rows, configs
 
 
-# What a changed setting is tinted in: the outline colour of the configuration
-# it belongs to on the heatmaps (`_tuning_view_heatmap`), faint enough to read
-# through in either theme.
-_TUNING_CHANGED_TINT = {
-    "Pick": "background-color: rgba(0, 104, 201, 0.25)",
-    "Selected": "background-color: rgba(224, 64, 251, 0.25)",
-}
+# What a setting the selected configuration changes is tinted in: its outline
+# colour on the heatmaps, faint enough to read through in either theme.
+_TUNING_CHANGED_TINT = "background-color: rgba(224, 64, 251, 0.25)"
 
 
-def _tuning_default_origin(model_key: str, ticker: str) -> str:
-    """Where a pair's current default comes from (`apple_trader.default_config`),
-    in words: its base configuration and when it was set, or the shipped
-    defaults."""
+def _tuning_current_origin(model_key: str, ticker: str) -> str:
+    """Where a pair's current configuration comes from
+    (`apple_trader.default_config`), in words: when it was set and from which
+    job, or the shipped defaults."""
     current = base_configs.entry(model_key, ticker)
     if current is None:
         return "the shipped defaults"
     source = current.get("source") or {}
     origin = f" from job `{source['job_id']}`" if source.get("job_id") else ""
-    return f"its base configuration, set {str(current.get('set_at', ''))[:10]}{origin}"
+    return f"the one set {str(current.get('set_at', ''))[:10]}{origin}"
 
 
-def _render_tuning_config_compare(job: dict, shown: dict, chosen: "dict | None") -> None:
-    """The pair's current default -- what a new run of it starts from now
-    (`apple_trader.default_config`): its base configuration, else the shipped
-    defaults -- and the shown one, the pick or the square clicked, side by side
-    in words, setting by setting (`tuning.compare_settings`), what the shown
-    one changes tinted, folded away above a caption naming what changed; then
-    both signatures, folded away too -- the form Results and the Simulate tab
-    name runs by.
-
-    The current default rather than the job's own base: it is what "Set as
-    base configuration" below would replace, and a job swept before the
-    pair's base last moved started from something else."""
+def _render_tuning_config_compare(job: dict, chosen: dict) -> None:
+    """The pair's current configuration -- what a new run of it starts from
+    now (`apple_trader.default_config`): the one set here, else the shipped
+    defaults -- and the selected one side by side in words, setting by
+    setting (`tuning.compare_settings`), what the selected one changes
+    tinted, folded away above a caption naming what changed; then both
+    signatures, folded away too -- the form Results and the Simulate tab name
+    runs by."""
     spec = job["spec"]
     try:
-        own_base = sim_tuning.make_config(spec["base"], {})
-        other = sim_tuning.make_config(spec["base"], shown)
+        other = sim_tuning.make_config(spec["base"], chosen)
     except (TypeError, ValueError):
         return
     model_key, ticker = other.model_key, other.ticker
-    default = default_config(ticker, model_key)
-    who = "Pick" if chosen is None else "Selected"
-    rows = sim_tuning.compare_settings(default, other)
+    current = default_config(ticker, model_key)
+    rows = sim_tuning.compare_settings(current, other)
     # The section once per group, as the form heads it, not on every row.
     for row, before in zip(rows, [None, *rows]):
         row["group"] = row["section"] if before is None or before["section"] != row["section"] else ""
-    tint = _TUNING_CHANGED_TINT[who]
     frame = pd.DataFrame({
         "": [r["group"] for r in rows],
         "Setting": [r["setting"] for r in rows],
-        "Current default": [r["base"] if r["base"] is not None else "—" for r in rows],
-        who: [r["other"] if r["other"] is not None else "—" for r in rows],
+        "Current": [r["base"] if r["base"] is not None else "—" for r in rows],
+        "Selected": [r["other"] if r["other"] is not None else "—" for r in rows],
     })
     # Folded away like the signatures under it: the caption below says what
     # changed, and the whole table is wanted only to read a setting in full.
-    with st.expander(f"Configuration: current default vs {who.lower()}"):
+    with st.expander("Configuration: current vs selected"):
         # A static table rather than a dataframe: it wraps a long value instead
         # of cutting it off, and a comparison is read whole, never sorted or
         # scrolled.
         st.table(
             frame.style.apply(
-                lambda r: [tint if rows[r.name]["changed"] else ""] * len(r), axis=1
+                lambda r: [_TUNING_CHANGED_TINT if rows[r.name]["changed"] else ""] * len(r),
+                axis=1,
             ),
             hide_index=True,
         )
     changed = [r["setting"].lower() for r in rows if r["changed"]]
-    drift = sum(1 for r in sim_tuning.compare_settings(default, own_base) if r["changed"])
     st.caption(
-        f"The current default is {_tuning_default_origin(model_key, ticker)}. "
+        f"The current configuration is {_tuning_current_origin(model_key, ticker)}. "
         + (
-            f"The {who.lower()} changes {len(changed)} setting"
+            f"The selected one changes {len(changed)} setting"
             f"{'' if len(changed) == 1 else 's'} of it, tinted: {', '.join(changed)}."
-            if changed else f"The {who.lower()} is the current default."
+            if changed else "The selected one is the current configuration."
         )
-        + (
-            f" This job started from another configuration: its base differs from the "
-            f"current default in {drift} setting{'' if drift == 1 else 's'}, so the profits "
-            "above compare the pick with that base, not with the current default."
-            if drift else ""
-        )
-        + f" Set these in an Apple Trader setup on the Simulate tab to replay "
-        f"{'the pick' if chosen is None else 'it'} with its full ledger, charts and decisions."
+        + " Set these in an Apple Trader setup on the Simulate tab to replay it with its "
+        "full ledger, charts and decisions."
     )
     # Folded away: the table above says the same in words, and the signatures
     # are only wanted to find a run in Results or the Simulate tab.
     signature = rule_agent(APPLE_TRADER_KEY).signature
-    with st.expander(f"Current default and {who.lower()} as signatures"):
-        col_base, col_other = st.columns(2)
-        with col_base:
-            st.caption("Current default")
-            st.code(signature(default), language=None, wrap_lines=True)
+    with st.expander("Current and selected as signatures"):
+        col_current, col_other = st.columns(2)
+        with col_current:
+            st.caption("Current")
+            st.code(signature(current), language=None, wrap_lines=True)
         with col_other:
-            st.caption(who)
+            st.caption("Selected")
             st.code(signature(other), language=None, wrap_lines=True)
 
 
-def _render_tuning_set_base(job: dict, shown: dict, chosen: "dict | None") -> None:
-    """"Set as base configuration": the configuration on screen -- the pick, or
-    the square clicked -- becomes what every new run of its (model, ticker)
-    pair starts from, in the live app's Apple Trader and Orchestra forms and in
-    SimLab's Simulate and Tuning forms (`base_configs`). Beside it, what that
-    would change, and the way back to the shipped defaults.
+def _render_tuning_set_base(job: dict, chosen: dict) -> None:
+    """"Set as current configuration": the selected configuration becomes what
+    every new run of its (model, ticker) pair starts from, in the live app's
+    Apple Trader and Orchestra forms and in SimLab's Simulate and Tuning forms
+    -- stored as the pair's base (`base_configs`). Beside it, what that would
+    change, and the way back to the shipped defaults.
 
-    The whole configuration is kept, not only the swept values: the pick was
-    measured under every other rule of the job's base too.
+    The whole configuration is kept, not only the swept values: the selected
+    combination was measured under every other setting of the job too.
     """
     job_id = job["job_id"]
     try:
-        config = sim_tuning.make_config(job["spec"]["base"], shown)
+        config = sim_tuning.make_config(job["spec"]["base"], chosen)
     except (TypeError, ValueError):
         return
     record = rule_agent(APPLE_TRADER_KEY).to_record(config)
     model_key, ticker = config.model_key, config.ticker
     pair = f"{_apple_model_label(model_key)} on {ticker}"
-    what = "the pick" if chosen is None else "the selected square"
     current = base_configs.entry(model_key, ticker)
-    is_base = current is not None and (
+    is_current = current is not None and (
         base_configs.digest(current["config"]) == base_configs.digest(record)
     )
     refusal = (
-        "The job is still running, so its pick can still move." if job["status"] == sim_tuning.RUNNING
+        "The job is still running." if job["status"] == sim_tuning.RUNNING
         else base_error(config)
     )
     with st.container(horizontal=True, vertical_alignment="center"):
         set_clicked = st.button(
-            "Set as base configuration", icon=":material/push_pin:",
-            key=f"tune_set_base_{job_id}", disabled=is_base or bool(refusal),
-            help=f"Make {what} what every new run of {pair} starts from: the live app's "
-            "Apple Trader and Orchestra forms and SimLab's Simulate and Tuning forms open "
-            "on it, open pages included. The whole configuration is kept, not only the "
-            "values swept here, its days-off rule included — with any kind of special day "
-            "unticked above. Nothing already running or already stored changes.",
+            "Set as current configuration", icon=":material/push_pin:",
+            key=f"tune_set_base_{job_id}", disabled=is_current or bool(refusal),
+            help=f"Make the selected configuration what every new run of {pair} starts "
+            "from: the live app's Apple Trader and Orchestra forms and SimLab's Simulate "
+            "and Tuning forms open on it, open pages included. The whole configuration is "
+            "kept, not only the values swept here, its days-off rule included — with any "
+            "kind of special day unticked above. Nothing already running or already "
+            "stored changes.",
         )
         clear_clicked = current is not None and st.button(
             "Restore shipped defaults", icon=":material/restart_alt:",
             key=f"tune_clear_base_{job_id}",
-            help=f"Drop {pair}'s base configuration: new runs of it start from the "
-            "defaults the code ships again.",
+            help=f"New runs of {pair} start from the defaults the code ships again.",
         )
-    starts = _tuning_default_origin(model_key, ticker)
-    if is_base:
+    starts = _tuning_current_origin(model_key, ticker)
+    if is_current:
         st.caption(
-            f":material/check_circle: {what.capitalize()} is {pair}'s base configuration "
-            f"(set {str(current.get('set_at', ''))[:10]}): new runs of the pair start from it."
+            f":material/check_circle: The selected configuration is {pair}'s current "
+            f"configuration (set {str(current.get('set_at', ''))[:10]}): new runs of the "
+            "pair start from it."
         )
     elif refusal:
         st.caption(
-            f":material/block: {what.capitalize()} cannot be set as the base "
-            f"configuration. {refusal} New runs of {pair} start from {starts}."
+            ":material/block: The selected configuration cannot be made current. "
+            f"{refusal} New runs of {pair} start from {starts}."
         )
     else:
         changes = apple_trader_ui.config_changes(config, default_config(ticker, model_key), "now")
         st.caption(
             f"New runs of {pair} start from {starts}. "
             + (
-                f"Setting {what} changes {'; '.join(changes)}." if changes
-                else f"{what.capitalize()} starts from the same configuration."
+                f"Setting the selected configuration changes {'; '.join(changes)}."
+                if changes else "The selected configuration starts from the same one."
             )
         )
     if set_clicked:
         base_configs.set_base(record, source={
-            "job_id": job_id, "overrides": shown,
-            "label": "pick" if chosen is None else "selected",
+            "job_id": job_id, "overrides": chosen, "label": "selected",
             # The special sessions switched off on the job's results, which
             # the record's days-off rule (`skip_events`) now sits out.
             "left_out_days": list(job.get("excluded_days") or ()),
         })
-        st.toast(f"{pair} now starts from {what}.", icon=":material/push_pin:")
+        st.toast(f"{pair} now starts from the selected configuration.", icon=":material/push_pin:")
         st.rerun()
     if clear_clicked:
         base_configs.clear(model_key, ticker)
@@ -4973,76 +5037,6 @@ def _tuning_usd(value: float, cents: bool = False) -> str:
     return f"{'+' if value >= 0 else '−'}\\${abs(value):,.{2 if cents else 0}f}"
 
 
-def _tuning_per_day(cell: dict) -> "tuple[float, float]":
-    """A scored cell's average profit a session: dollars, and percent of the
-    starting cash.
-
-    Every session counts, traded or not -- a configuration that sits a day out
-    earns nothing that day. A summed cell's return is its datasets' returns
-    added, each on the same starting cash, so dividing by every session of
-    every dataset is the average day's return on that cash.
-    """
-    days = max(int(cell.get("days") or 0), 1)
-    return cell["profit"] / days, cell["return_pct"] / days
-
-
-def _tuning_verdict(job: dict) -> "str | None":
-    """One line: how the pick did on an average day, and against the base
-    configuration.
-
-    A day's average rather than the total, so jobs over different numbers of
-    sessions read on one scale. Every dataset is in sample -- the pick is read off their
-    sum -- so the robustness read is how many of them it made money on, not one
-    held-out week.
-    """
-    spec = job["spec"]
-    names = sim_tuning.dataset_names(spec)
-    best, base = job.get("best"), sim_tuning.summed_baseline(job)
-    by_sharpe = spec.get("rule") == sim_tuning.PICK_SHARPE
-    if not sim_tuning.is_scored(best):
-        if job["status"] == sim_tuning.FINISHED:
-            return (
-                ":orange[**No pick.**] No combination traded on enough of the days to be "
-                "eligible"
-                + (", with a Sharpe ratio to rank it by," if by_sharpe else "")
-                + " — lower the minimum share of days, or widen the grid."
-            )
-        return None
-    sessions = f"{best['days']} session{'s' if best['days'] != 1 else ''}"
-    where = (
-        f"over {sessions} in {len(names)} datasets" if len(names) > 1
-        else f"over {sessions} of `{names[0]}`"
-    )
-    profit, return_pct = _tuning_per_day(best)
-    detail = (
-        f"The pick made **{_tuning_usd(profit, cents=True)} a day** ({return_pct:+.3f}% of "
-        f"the starting cash) on average {where}"
-    )
-    if len(names) > 1:
-        detail += f", in profit on {best['datasets_up']} of them"
-    if sim_tuning.is_scored(base):
-        profit, return_pct = _tuning_per_day(base)
-        detail += (
-            f"; the base configuration made {_tuning_usd(profit, cents=True)} a day "
-            f"({return_pct:+.3f}%)"
-        )
-    beat_base = not sim_tuning.is_scored(base) or best["profit"] >= base["profit"]
-    if by_sharpe and (mine := sim_tuning.sharpe(best)) is not None:
-        # Picked for its Sharpe ratio, so it is held to the base's on that.
-        theirs = sim_tuning.sharpe(base)
-        detail += f". Sharpe ratio {mine:+.2f}" + (
-            f" against the base configuration's {theirs:+.2f}" if theirs is not None else ""
-        )
-        beat_base = theirs is None or mine >= theirs
-    if best["profit"] > 0 and beat_base:
-        head = ":green[**Beats the base configuration.**]"
-    elif best["profit"] > 0:
-        head = ":orange[**Profitable, but no better than the base configuration.**]"
-    else:
-        head = ":red[**The pick lost money.**]"
-    return f"{head} {detail}."
-
-
 _TUNING_WIN_RATE_HELP = (
     "Share of round trips that made money, fees included. A round trip runs from the "
     "buy that opens a flat book to the sell that flattens it, however many rungs and "
@@ -5056,8 +5050,8 @@ _TUNING_SHARPE_HELP = (
 
 
 def _tuning_cell_rows(job: dict) -> list[dict]:
-    """Every summed combination, best first by what the job picks on (total
-    profit, or Sharpe ratio with no ratio last), with each dataset's share."""
+    """Every summed combination, the most total profit first, with each
+    dataset's share."""
     names = sim_tuning.dataset_names(job["spec"], by_date=True)
     per_dataset = [
         {sim_tuning.overrides_key(c["overrides"]): c for c in job["cells"].get(name) or ()}
@@ -5086,10 +5080,7 @@ def _tuning_cell_rows(job: dict) -> list[dict]:
             else "swept"
         )
         rows.append(row)
-    if job["spec"].get("rule") == sim_tuning.PICK_SHARPE:
-        rows.sort(key=lambda r: (r["sharpe"] is not None, r["sharpe"] or 0.0), reverse=True)
-    else:
-        rows.sort(key=lambda r: r["profit"], reverse=True)
+    rows.sort(key=lambda r: r["profit"], reverse=True)
     return rows
 
 
@@ -5122,8 +5113,8 @@ def _tuning_color(index: int) -> str:
 
 
 def _tuning_shown_days(job: dict, chosen: "dict | None" = None) -> dict[str, list[str]]:
-    """{feed: sessions the shown configuration was scored on} across every
-    dataset of the job -- the pick's, or `chosen`'s, the square clicked."""
+    """{feed: sessions the selected configuration (`chosen`) was scored on}
+    across every dataset of the job; empty with nothing selected."""
     by_feed: dict[str, list[str]] = {}
     for dataset in job["spec"]["datasets"]:
         cell = _tuning_shown_cell(job, dataset["name"], chosen)
@@ -5133,8 +5124,8 @@ def _tuning_shown_days(job: dict, chosen: "dict | None" = None) -> dict[str, lis
 
 
 def _tuning_session_context(job: dict, chosen: "dict | None" = None) -> dict:
-    """The VIX open and the pre-market bias of every session the shown
-    configuration was scored on (the pick's, or `chosen`'s).
+    """The VIX open and the pre-market bias of every session the selected
+    configuration (`chosen`) was scored on.
 
     Briefings are LLM calls, made once per session and cached on disk
     (`session_context`); a day that failed is remembered for this browser
@@ -5205,11 +5196,11 @@ def _tuning_forecast(symbol: str, model_key: str, feed: str, day: str, signature
 
 def _tuning_forecasts(job: dict, chosen: "dict | None" = None) -> dict:
     """{"days": {day: forecast}, "overlay", "notes"} for every session the
-    shown configuration was scored on (the pick's, or `chosen`'s), from the
-    model that configuration trades on."""
+    selected configuration (`chosen`) was scored on, from the model that
+    configuration trades on."""
     spec = job["spec"]
     symbol = spec["base"]["ticker"]
-    shown = chosen if chosen is not None else (job.get("best") or {}).get("overrides") or {}
+    shown = chosen or {}
     # The model whose forecast the levels hang off, which is also whose saved
     # file the cache key reads.
     model_key = model_overlays.trader_model(
@@ -5274,14 +5265,13 @@ def _tuning_daily_chart(
     chosen: "dict | None" = None,
     forecasts: "dict | None" = None,
 ) -> go.Figure:
-    """The pick's profit per session over the daily candles -- or, with
-    `chosen`, the profit of the square clicked on a heatmap. `forecasts`
+    """The selected configuration's (`chosen`'s) profit per session over the
+    daily candles; candles alone with nothing selected. `forecasts`
     (`_tuning_forecasts`) boxes each session's predicted high and low behind
     its candle."""
     spec = job["spec"]
     symbol = spec["base"]["ticker"]
     context = context or {"vix": {}, "biases": {}}
-    who = "Pick" if chosen is None else "Selected"
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
         row_heights=[0.6, 0.4],
@@ -5294,7 +5284,7 @@ def _tuning_daily_chart(
         days = list(cell["daily"])
         fig.add_trace(go.Bar(
             x=days, y=[cell["daily"][d] for d in days],
-            name=f"{who} on {dataset['name']}", marker_color=_tuning_color(index),
+            name=f"Selected on {dataset['name']}", marker_color=_tuning_color(index),
             hovertext=[_tuning_day_hover(d, context) for d in days],
         ), row=1, col=1)
         bars.update(_tuning_session_bars(symbol, dataset["feed"], days))
@@ -5345,7 +5335,7 @@ def _tuning_daily_chart(
     fig.update_yaxes(title=f"{symbol} ($)", row=2, col=1)
     fig.update_yaxes(gridcolor=PALETTE["grid"])
     title = (
-        "The pick, session by session" if chosen is None
+        "Session by session" if chosen is None
         else f"Selected — {_tuning_values_text(chosen)}, session by session"
     )
     fig.update_layout(title=title, barmode="group")
@@ -5358,7 +5348,7 @@ def _render_tuning_session_context(
     job: dict, context: dict, chosen: "dict | None" = None
 ) -> None:
     """Under the chart: where the labels come from, and each morning's briefing,
-    beside the shown configuration's profit that day (the pick's, or `chosen`'s)."""
+    beside the selected configuration's (`chosen`'s) profit that day."""
     if context["provider"] is None:
         st.caption(
             ":material/info: No LLM key in the environment (GEMINI_API_KEY, OPENAI_API_KEY "
@@ -5409,7 +5399,7 @@ def _render_tuning_session_context(
             "confidence": "Confidence",
             "vix_open": st.column_config.NumberColumn("VIX open", format="%.2f"),
             "profit": st.column_config.NumberColumn(
-                f"{'Pick' if chosen is None else 'Selected'} profit ($)", format="%+.2f"
+                "Selected profit ($)", format="%+.2f"
             ),
             "summary": st.column_config.TextColumn("Summary", width="large"),
         })
@@ -5440,15 +5430,15 @@ def _render_tuning_special_days(job: dict) -> dict:
     one switch per kind; returns the job as the rest of its results read it.
 
     Each session shows what was expected, what came and the surprise
-    (`special_days.outcome_cells`), and what the base and the shown
-    configuration made on it as replayed. A kind switched off is left out of
-    everything under it: the job comes back as if every configuration had sat
-    those sessions out (`tuning.without_days`) -- profits, heatmaps and pick --
-    with the kind in its base's days-off rule, so the configuration shown, and
-    the one "Set as base configuration" keeps, sits them out too.
+    (`special_days.outcome_cells`), and what the selected configuration made
+    on it as replayed. A kind switched off is left out of everything under it:
+    the job comes back as if every configuration had sat those sessions out
+    (`tuning.without_days`) -- profits, heatmaps and best options -- with the
+    kind in the job's days-off rule, so the selected configuration, and the
+    one "Set as current configuration" keeps, sits them out too.
 
-    A kind the base already sat out has no replay to measure, so its switch is
-    off and cannot be turned on.
+    A kind the job's configuration already sat out has no replay to measure,
+    so its switch is off and cannot be turned on.
     """
     spec = job["spec"]
     rows, earnings = _tuning_special_rows(json.dumps(
@@ -5469,8 +5459,6 @@ def _render_tuning_special_days(job: dict) -> dict:
     days_out = {r["day"] for r in rows if r["category"] in left_out}
     read = sim_tuning.without_days(job, days_out, left_out)
     chosen = _tuning_chosen(read)
-    shown = chosen if chosen is not None else (read.get("best") or {}).get("overrides")
-    who = "Pick" if chosen is None else "Selected"
 
     def made(cell: "dict | None", day: str) -> "float | None":
         if not sim_tuning.is_scored(cell) or day in (cell.get("sat_out_days") or ()):
@@ -5480,10 +5468,9 @@ def _render_tuning_special_days(job: dict) -> dict:
     table, impact = [], {}
     for row in rows:
         name, day, kind = row["datasets"][0], row["day"], row["category"]
-        base = made(job["baseline"].get(name), day)
-        mine = made(sim_tuning.cell_at(job, name, shown), day) if shown else None
+        mine = made(sim_tuning.cell_at(job, name, chosen), day) if chosen else None
         status = (
-            "sat out by the base" if kind in sat_out
+            "never traded" if kind in sat_out
             else "left out" if day in days_out else "counted"
         )
         release = sim_special.release_outcome(kind, day) if kind in sim_special.RELEASES else None
@@ -5492,12 +5479,10 @@ def _render_tuning_special_days(job: dict) -> dict:
             "kind": event_days.LABELS[kind], "event": row["what"],
             **sim_special.outcome_cells(row, earnings),
             "source": ((release or {}).get("sources") or [None])[0],
-            "base": base, "shown": mine, "status": status,
+            "shown": mine, "status": status,
         })
-        if kind in measured:
-            total = impact.setdefault(kind, [0.0, 0.0])
-            total[0] += mine or 0.0
-            total[1] += base or 0.0
+        if kind in measured and chosen:
+            impact[kind] = impact.get(kind, 0.0) + (mine or 0.0)
 
     sessions = len({r["day"] for r in rows})
     with st.expander(
@@ -5507,11 +5492,10 @@ def _render_tuning_special_days(job: dict) -> dict:
     ):
         st.caption(
             "The sessions a days-off rule acts on, found as a replay finds them. Untick a "
-            "kind to read everything below — profits, heatmaps, the pick and its "
-            "configuration — as if every configuration had sat those sessions out: each "
-            "one's profit taken out, the session kept as one that did not trade. The "
-            "configuration then sits that kind out too, and **Set as base configuration** "
-            "keeps it so."
+            "kind to read everything below — profits, heatmaps and best options — as if "
+            "every configuration had sat those sessions out: each one's profit taken out, "
+            "the session kept as one that did not trade. The selected configuration then "
+            "sits that kind out too, and **Set as current configuration** keeps it so."
         )
         with st.container(horizontal=True):
             for kind in kinds:
@@ -5521,7 +5505,7 @@ def _render_tuning_special_days(job: dict) -> dict:
                     st.checkbox(
                         label, value=False, disabled=True,
                         key=f"tune_special_sat_{job_id}_{kind}",
-                        help="The base configuration sat these sessions out, so this job "
+                        help="This job's configuration sat these sessions out, so it "
                         "never traded them and there is nothing to put back.",
                     )
                 else:
@@ -5529,14 +5513,14 @@ def _render_tuning_special_days(job: dict) -> dict:
                         label, key=_tuning_special_key(job_id, kind),
                         help="Ticked: counted like any other session. Unticked: every "
                         "configuration below sits these sessions out, and so does the "
-                        "configuration shown.",
+                        "selected one.",
                     )
         money = st.column_config.NumberColumn
         st.dataframe(
             pd.DataFrame(table), hide_index=True,
             # What the session made first; where it came from last.
             column_order=[
-                "day", "kind", "shown", "base", "status", "measure", "expected", "actual",
+                "day", "kind", "shown", "status", "measure", "expected", "actual",
                 "surprise", "more", "event", "datasets", "source",
             ],
             column_config={
@@ -5550,18 +5534,16 @@ def _render_tuning_special_days(job: dict) -> dict:
                     "Source", display_text="page",
                     help="The first page the lookup read, for a CPI or jobs release.",
                 ),
-                "base": money("Base ($)", format="%+.2f"),
-                "shown": money(f"{who} ($)", format="%+.2f"),
+                "shown": money("Selected ($)", format="%+.2f"),
                 "status": "Counted",
             },
         )
         if impact:
             st.caption(
-                "As replayed, these sessions made — "
+                "As replayed, these sessions made the selected configuration — "
                 + "; ".join(
-                    f"{event_days.LABELS[kind]}: {who.lower()} {_tuning_usd(mine)}, "
-                    f"base {_tuning_usd(base)}"
-                    for kind, (mine, base) in impact.items()
+                    f"{event_days.LABELS[kind]}: {_tuning_usd(mine)}"
+                    for kind, mine in impact.items()
                 )
                 + ". Taking a session out leaves the days after it as replayed: sitting it "
                 "out would have sized them from slightly different cash."
@@ -5569,8 +5551,8 @@ def _render_tuning_special_days(job: dict) -> dict:
         never = [event_days.LABELS[k] for k in kinds if k in sat_out]
         if never:
             st.caption(
-                f":material/info: The base configuration sat out {', '.join(never)} "
-                "sessions, so this job never traded them. To measure them, run a job with "
+                f":material/info: This job's configuration sat out {', '.join(never)} "
+                "sessions, so it never traded them. To measure them, run a job with "
                 "those taken out of **Sit out these sessions**."
             )
         errors_key = f"tune_special_errors_{job_id}"
@@ -5629,9 +5611,10 @@ def _render_tuning_notes(job: dict) -> None:
         sat_out = (base or {}).get("sat_out_days") or []
         if sat_out:
             st.caption(
-                f":material/event_busy: On `{name}` the base configuration sat out "
-                f"{len(sat_out)} of {base['days']} sessions ({', '.join(sat_out)}) under its "
-                "days-off rule — the day after earnings, a CPI or jobs release, or a shock."
+                f":material/event_busy: On `{name}` every configuration sat out "
+                f"{len(sat_out)} of {base['days']} sessions ({', '.join(sat_out)}) under the "
+                "job's days-off rule — the day after earnings, a CPI or jobs release, or a "
+                "shock."
             )
     reused = 0 if sim_tuning.is_derived(job) else sim_tuning.reused_count(job)
     if reused:
@@ -5655,8 +5638,8 @@ def _render_derived_header(job: dict) -> None:
 
     Nobody submitted this one: it is the stored runs that happen to agree on
     everything except its axes, read as the grid they describe. So it comes
-    with the caveats a submitted job does not have — one dataset, no base
-    configuration anyone nominated, no pick rule — and the one action worth
+    with the caveats a submitted job does not have — one dataset, no minimum
+    share of days traded anyone chose — and the one action worth
     offering is to turn it into a real job, which replays the holes and reuses
     every cell already on screen. Once it is a job, more datasets can be added.
     """
@@ -5679,10 +5662,9 @@ def _render_derived_header(job: dict) -> None:
         icon=":material/auto_awesome_mosaic:",
     )
     st.caption(
-        "Incomplete by construction: there is only the one dataset, the base configuration "
-        "marked on the grid is simply the most recent of these runs, and the pick is the "
-        "highest cell with no minimum share of days traded — nobody chose any of that. "
-        "Read it as what has been tried, not as a tuned answer."
+        "Incomplete by construction: there is only the one dataset, and the best options "
+        "are read with no minimum share of days traded — nobody chose any of that. Read "
+        "it as what has been tried, not as a tuned answer."
     )
     if not missing:
         return
@@ -5724,7 +5706,8 @@ def _render_tuning_dataset_controls(job: dict) -> None:
     """Add a dataset to a finished job, finish a stopped one, or drop a dataset.
 
     The weekly chore this tab is for: a new week of tape arrives, it is swept
-    with the job's own settings, and the sum and the pick are re-read with it.
+    with the job's own settings, and the sum and the best options are re-read
+    with it.
     """
     spec = job["spec"]
     job_id = job["job_id"]
@@ -5746,8 +5729,8 @@ def _render_tuning_dataset_controls(job: dict) -> None:
             "Add a dataset", list(by_name),
             format_func=lambda n: _tuning_describe_dataset(by_name[n]),
             key=f"tune_add_{job_id}",
-            help="Swept with this job's base configuration, grid, cash and pick rule, then "
-            "summed with the others.",
+            help="Swept with this job's configuration, grid and cash, then summed with "
+            "the others.",
         )]
     else:
         col_add.caption(f"Every stored dataset that carries {ticker} is already in this job.")
@@ -5776,8 +5759,8 @@ def _render_tuning_dataset_controls(job: dict) -> None:
             with st.popover("Remove a dataset", icon=":material/remove:"):
                 dropped = st.selectbox("Dataset", names, key=f"tune_remove_{job_id}")
                 st.caption(
-                    "Its cells are dropped and the sum and the pick are re-read from the "
-                    "rest; nothing is replayed. Adding it back sweeps it again, except "
+                    "Its cells are dropped and the sum and the best options are re-read "
+                    "from the rest; nothing is replayed. Adding it back sweeps it again, except "
                     "where the run store answers a cell."
                 )
                 if st.button(
@@ -5836,74 +5819,81 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     elif sim_tuning.is_derived(job):
         _render_derived_header(job)
 
-    # The configuration itself is said once, in the table under the profits
-    # (`_render_tuning_config_compare`), not again up here.
-    by_sharpe = spec.get("rule") == sim_tuning.PICK_SHARPE
+    share = float(spec.get("min_traded_share") or 0)
     st.caption(
-        ("Pick: highest Sharpe ratio" if by_sharpe else "Pick: best total profit")
-        + (f" over {len(names)} datasets" if len(names) > 1 else "")
-        + ("" if by_sharpe
-           else f", {_PICK_LABELS.get(spec.get('rule'), spec.get('rule')).lower()}")
-        + f", trading on at least {float(spec.get('min_traded_share') or 0):.0%} of days "
+        "Best options read off "
+        + (f"the sum of {len(names)} datasets" if len(names) > 1 else "the grid")
+        + f", among combinations trading on at least {share:.0%} of days "
         f"· starting cash \\${float(spec['starting_cash']):,.0f} per dataset."
     )
     if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED):
         _render_tuning_dataset_controls(job)
     # From here on the job is read without the special sessions switched off
-    # there: the verdict, the tables, the heatmaps and the configuration.
+    # there: the options, the heatmaps and the configuration.
     job = _render_tuning_special_days(job)
 
-    verdict = _tuning_verdict(job)
-    if verdict:
-        st.markdown(verdict)
-
-    best = job.get("best")
-    # A square clicked on any of the heatmaps below replaces the pick in the
-    # table, the session-by-session chart and the configuration at the bottom;
-    # the verdict above stays about the pick.
+    # Nothing is chosen for the user (since 2026-10-27, the user's: no pick,
+    # no comparison with the configuration the job swept from): the table
+    # lists the current configuration and the best options side by side, and
+    # a row or a heatmap square clicked is what the configuration block and
+    # the session-by-session chart show.
     chosen = _tuning_chosen(job)
-    who = "Pick" if chosen is None else "Selected"
+    money = st.column_config.NumberColumn
+    rows, configs = _tuning_option_rows(job, chosen)
+    if rows:
+        # Keyed on the selection, so a new one -- clicked here or on a heatmap
+        # -- draws a fresh table rather than one still ticking the row before.
+        table_key = (
+            f"tune_options_{job_id}_"
+            + hashlib.sha1(sim_tuning.overrides_key(chosen).encode()).hexdigest()[:8]
+        )
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, placeholder="—", key=table_key,
+            on_select=lambda: _tuning_on_option(job_id, table_key, configs),
+            selection_mode="single-row",
+            column_config={
+                "option": st.column_config.TextColumn(
+                    "Option",
+                    help="What this combination is: the current configuration — what a "
+                    "new run of the pair starts from now — or the best total profit, "
+                    "Sharpe ratio or win rate, or the one selected. Click a row to "
+                    "select it.",
+                ),
+                "profit": money("Profit / session ($)", format="%+.2f"),
+                "return_pct": money("Return / session", format="%+.3f%%"),
+                "sharpe": money("Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
+                "win_rate": money("Win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP),
+                "wins": st.column_config.TextColumn(
+                    "Wins", help="Winning round trips of all its round trips."
+                ),
+                "days": "Days",
+                "worst_day": money("Worst day ($)", format="%+.2f"),
+                "datasets_up": st.column_config.TextColumn(
+                    "In profit on", help="How many of the datasets it made money on."
+                ),
+                **{
+                    f"ds_{index}": money(f"{name} ($ / session)", format="%+.2f")
+                    for index, name in enumerate(names)
+                },
+            },
+        )
     if chosen is not None:
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(
-                ":material/ads_click: Showing the square clicked on a heatmap rather than "
-                "the pick, here and in the session-by-session chart below."
-            )
+            st.caption(f":material/ads_click: Selected: {_tuning_values_text(chosen)}.")
             st.button(
-                "Back to the pick", icon=":material/undo:", key=f"tune_unchoose_{job_id}",
+                "Clear selection", icon=":material/close:", key=f"tune_unchoose_{job_id}",
                 on_click=st.session_state.pop, args=(_tuning_chosen_key(job_id), None),
             )
-    money = st.column_config.NumberColumn
-    st.dataframe(
-        pd.DataFrame(_tuning_summary_rows(job, chosen)), hide_index=True, placeholder="—",
-        column_config={
-            "dataset": "Dataset",
-            "sessions": "Sessions",
-            "base_profit": money("Base profit / session ($)", format="%+.2f"),
-            "base_return": money("Base return / session", format="%+.3f%%"),
-            "base_sharpe": money("Base Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
-            "shown_profit": money(f"{who} profit / session ($)", format="%+.2f"),
-            "shown_return": money(f"{who} return / session", format="%+.3f%%"),
-            "shown_sharpe": money(f"{who} Sharpe", format="%+.2f", help=_TUNING_SHARPE_HELP),
-            "shown_days": f"{who} days",
-            "shown_win_rate": money(
-                f"{who} win rate", format="%.0f%%", help=_TUNING_WIN_RATE_HELP
-            ),
-            "shown_round_trips": st.column_config.TextColumn(
-                f"{who} wins",
-                help=f"Winning round trips of all the {who.lower()}'s round trips.",
-            ),
-            "shown_worst": money(f"{who} worst day ($)", format="%+.2f"),
-        },
-    )
-    shown = chosen if chosen is not None else (best or {}).get("overrides")
-    if shown is not None:
-        _render_tuning_config_compare(job, shown, chosen)
-        _render_tuning_set_base(job, shown, chosen)
+        _render_tuning_config_compare(job, chosen)
+        _render_tuning_set_base(job, chosen)
+    else:
+        st.caption(
+            ":material/ads_click: Click a row above or a square on a heatmap below to "
+            "select a configuration: its settings against the current ones, the button "
+            "that makes it current, and its sessions one by one."
+        )
 
-    marks = {"Pick": (best or {}).get("overrides"), **_tuning_base_marks(spec, axes)}
-    if chosen is not None:
-        marks["Selected"] = chosen
+    marks = _tuning_result_marks(job, chosen)
     prefix = "From stored runs · " if sim_tuning.is_derived(job) else ""
     view = _tuning_view_picker(axes, marks, key=f"tune_view_{job_id}")
     # An Average square is several configurations at once, so it cannot be one.
@@ -5927,34 +5917,47 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             ),
         )], job_id=job_id if clickable else None)
         st.caption(
-            "A combination is summed once every dataset has replayed it. The pick is the "
-            "best cell of this sum, so every dataset above is in sample: a pick worth "
-            "keeping is in profit on most of them, not carried by one."
+            "A combination is summed once every dataset has replayed it. The best options "
+            "are read off this sum, so every dataset above is in sample: one worth keeping "
+            "is in profit on most of them, not carried by one."
         )
     further = " and ".join(_tuning_param_label(a["name"]) for a in axes[2:])
     if len(axes) == 3:
         st.caption(
             f"The heatmaps are the first two parameters; the switch above picks what to "
-            f"show of {further}. On one of its values the outlines mark the pick and the "
-            "base configuration only if they sit on it. Best of all and Average outline "
-            "them where they sit on the first two, whatever their own value of "
-            f"{further}. A collapsed square fills in once every {further} has been "
-            "replayed there, and refused combinations are left out of its average."
+            f"show of {further}. On one of its values a combination is outlined only if "
+            "it sits on it. Best of all and Average outline each where it sits on the "
+            f"first two, whatever its own value of {further}. A collapsed square fills in "
+            f"once every {further} has been replayed there, and refused combinations are "
+            "left out of its average."
         )
     elif len(axes) > 3:
         st.caption(
             f"The heatmaps are the first two parameters; the switches above pick what to "
-            f"show of {further}. Held at one value, the outlines mark the pick and the "
-            "base configuration only if they sit on it. Best of all and Average outline "
-            "them where they sit on the first two, whatever their own value there. With "
-            "one switch on Best of all and the other on Average, the average comes "
-            "first: each square is at the value whose average over the other parameter "
-            "is highest. A collapsed square fills in once every combination it needs "
-            "has been replayed there, and refused combinations are left out of its average."
+            f"show of {further}. Held at one value, a combination is outlined only if it "
+            "sits on it. Best of all and Average outline each where it sits on the first "
+            "two, whatever its own value there. With one switch on Best of all and the "
+            "other on Average, the average comes first: each square is at the value whose "
+            "average over the other parameter is highest. A collapsed square fills in once "
+            "every combination it needs has been replayed there, and refused combinations "
+            "are left out of its average."
         )
     st.caption(
-        f":material/ads_click: Click a {'bar' if len(axes) == 1 else 'square'} to show "
-        "that configuration in the table above and the session-by-session chart below; "
+        ":material/crop_free: Outlined at the same combination on every heatmap: the "
+        "**current configuration** — what a new run of the pair starts from now — and the "
+        "best **total profit**, **Sharpe ratio** and **win rate** "
+        + (f"summed over all {len(names)} datasets" if len(names) > 1 else "of the grid")
+        + (f", each among combinations trading on at least {share:.0%} of days" if share else "")
+        + "; a win rate tie goes to the bigger profit."
+        + (
+            "" if "Current configuration" in marks
+            else " The current configuration is no combination of this grid: it differs "
+            "from what the job swept in a setting the grid does not sweep."
+        )
+    )
+    st.caption(
+        f":material/ads_click: Click a {'bar' if len(axes) == 1 else 'square'} to select "
+        "that configuration for the table above and the session-by-session chart below; "
         "it is marked in magenta"
         + (
             f" — on Best of all, at the {further if len(axes) == 3 else 'value'} it won at. "
@@ -5989,7 +5992,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
                 ),
             })
 
-    if _tuning_shown_days(job, chosen) and shown is not None:
+    if chosen is not None and _tuning_shown_days(job, chosen):
         context = _tuning_session_context(job, chosen)
         forecasts = _tuning_forecasts(job, chosen)
         st.plotly_chart(
@@ -6064,7 +6067,7 @@ def render_ml_summary_tab() -> None:
         "instrument, and how it did on event days — CPI and jobs reports, the day after "
         "earnings, geopolitical and market shocks — against a normal day. Nothing is "
         "replayed here: each model and instrument is read off the tuning jobs' replays of "
-        "its base configuration — the one *Set as base configuration* stored, a job's own "
+        "its base configuration — the one *Set as current configuration* stored, a job's own "
         "base or any square of its grid — so setting another base updates everything "
         "below. A replay that differs from the base only by trading special days the base "
         "leaves out counts too: those days are flat sessions in the profits and returns, "

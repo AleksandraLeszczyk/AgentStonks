@@ -288,13 +288,15 @@ class TestTuningSwitches:
     ROWS = [{"day": "2026-06-15", "category": "cpi", "what": "BLS CPI release",
              "source": "calendar", "datasets": ["w1"], "report": None}]
 
-    def app(self, monkeypatch, record):
+    def app(self, monkeypatch, record, chosen=None):
         from streamlit.testing.v1 import AppTest
 
         from simlab import app as sim_app
 
         monkeypatch.setattr(sim_app, "_tuning_special_rows", lambda spec_json: (self.ROWS, {}))
         app = AppTest.from_function(_switches_app, args=(record,), default_timeout=30)
+        if chosen is not None:
+            app.session_state["tune_chosen_j"] = chosen
         app.run()
         assert not app.exception, app.exception
         return app
@@ -302,22 +304,23 @@ class TestTuningSwitches:
     def read(self, app) -> dict:
         return json.loads(app.text[-1].value)
 
-    def test_a_kind_unticked_leaves_its_sessions_out_of_the_pick_and_into_the_rule(
+    def test_a_kind_unticked_leaves_its_sessions_out_of_the_sum_and_into_the_rule(
         self, monkeypatch
     ):
-        app = self.app(monkeypatch, job())
+        app = self.app(monkeypatch, job(), chosen={"buy_k": 0.3})
         assert self.read(app) == {"pick": {"buy_k": 0.3}, "skip_events": []}
         table = app.dataframe[0].value
         assert list(table["kind"]) == ["CPI release"] and list(table["shown"]) == [900.0]
-        assert list(table["base"]) == [100.0] and list(table["status"]) == ["counted"]
+        assert "base" not in table and list(table["status"]) == ["counted"]
         app.checkbox(key="tune_special_j_cpi").uncheck().run()
         assert self.read(app) == {"pick": {"buy_k": 0.5}, "skip_events": ["cpi"]}
         assert list(app.dataframe[0].value["status"]) == ["left out"]
         assert any("Leaving out 1 special session" in c.value for c in app.caption)
 
-    def test_a_kind_the_base_sat_out_cannot_be_put_back(self, monkeypatch):
+    def test_a_kind_the_job_sat_out_cannot_be_put_back(self, monkeypatch):
         app = self.app(monkeypatch, job(skip_events=["cpi"]))
         [box] = app.checkbox
         assert box.disabled and box.value is False
-        assert list(app.dataframe[0].value["status"]) == ["sat out by the base"]
+        assert list(app.dataframe[0].value["status"]) == ["never traded"]
+        assert list(app.dataframe[0].value["shown"]) == [None]  # nothing selected
         assert self.read(app)["skip_events"] == ["cpi"]
