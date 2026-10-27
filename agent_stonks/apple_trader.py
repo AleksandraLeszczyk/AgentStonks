@@ -115,6 +115,7 @@ from .config import (
     APPLE_TRADER_LEVEL_UNIT,
     APPLE_TRADER_ZONE_MIN_BARS,
     APPLE_TRADER_ZONE_WIDTH,
+    TAKE_EITHER,
     TAKE_MOMENTUM,
     TAKE_TRIGGER_LABELS,
     TAKE_TRIGGERS,
@@ -468,7 +469,9 @@ class AppleTraderConfig:
     # `stop_gain_fraction`.
     momentum_fade_bars: int = 0
     momentum_drop: float = 0.0
-    # The share of the position that take sells when a runner is kept.
+    # The share of the position that take sells when a runner is kept. 0 is
+    # the take off, in all its forms (2026-10-27: the form's "0 % switches it
+    # off"); a stored record always has more.
     take_fraction: float = APPLE_TRADER_TAKE_FRACTION
     # How many minutes after the last fill the take may fire at all, measured
     # between bar timestamps so a replay reads it as the live loop does. 0 is
@@ -507,6 +510,10 @@ class AppleTraderConfig:
     # period, which still gates the buy and the target; the share, the runner,
     # the wait and the loss rule are the same. "momentum" is every record made
     # before 2026-10-19, and the two zone settings are read only under "zone".
+    # "either" (since 2026-10-27, what the form writes) is both: the momentum
+    # fade while the confirmation is on, the zone while `zone_min_bars` is
+    # above 0, whichever fires first -- the same share, wait and runner. See
+    # `momentum_take_on` and `zone_take_on`.
     take_trigger: str = APPLE_TRADER_TAKE_TRIGGER
     zone_min_bars: int = APPLE_TRADER_ZONE_MIN_BARS
     zone_width: float = APPLE_TRADER_ZONE_WIDTH
@@ -742,31 +749,38 @@ class AppleTraderConfig:
                 "replays under and cannot be set beside momentum_confirmation_bars "
                 f"{self.momentum_confirmation_bars!r}, which decides entries itself"
             )
-        if not 0 < self.take_fraction <= 1:
+        if not 0 <= self.take_fraction <= 1:
             raise ValueError(
                 f"take_fraction {self.take_fraction!r} must be a share of the position, "
-                "above 0 and at most 1"
+                "from 0 (the take off) to 1"
             )
         self.take_trigger = str(self.take_trigger or TAKE_MOMENTUM)
         if self.take_trigger not in TAKE_TRIGGERS:
             raise ValueError(
                 f"take_trigger {self.take_trigger!r} is not one of {', '.join(TAKE_TRIGGERS)}"
             )
-        # The legacy takes are momentum rules: a zone beside one would be two
-        # takes, the same refusal as two momentum takes above.
-        if self.take_trigger == TAKE_ZONE and takes and takes != ["momentum_confirmation_bars"]:
-            raise ValueError(
-                f"take_trigger {TAKE_ZONE!r} cannot be set beside {' and '.join(takes)}, the "
-                "legacy momentum take a stored record replays under"
-            )
+        # 0 is the zone off under "either"; a zone of one bar is no zone.
         if (
             float(self.zone_min_bars) != int(self.zone_min_bars)
-            or int(self.zone_min_bars) < 2
+            or int(self.zone_min_bars) == 1
+            or int(self.zone_min_bars) < 0
+            or (self.take_trigger == TAKE_ZONE and int(self.zone_min_bars) < 2)
         ):
             raise ValueError(
                 f"zone_min_bars {self.zone_min_bars!r} is a whole number of bars, at least 2"
+                + ("" if self.take_trigger == TAKE_ZONE else ", or 0 for no zone")
             )
         self.zone_min_bars = int(self.zone_min_bars)
+        # The legacy takes are momentum rules: a zone beside one would be two
+        # takes, the same refusal as two momentum takes above.
+        zoned = self.take_trigger == TAKE_ZONE or (
+            self.take_trigger == TAKE_EITHER and self.zone_min_bars
+        )
+        if zoned and takes and takes != ["momentum_confirmation_bars"]:
+            raise ValueError(
+                f"take_trigger {self.take_trigger!r} with a zone cannot be set beside "
+                f"{' and '.join(takes)}, the legacy momentum take a stored record replays under"
+            )
         self.zone_width = float(self.zone_width)
         if not self.zone_width > 0:
             raise ValueError(
@@ -956,12 +970,34 @@ class AppleTraderConfig:
     def has_take(self) -> bool:
         """Whether the take is on, in any of its forms -- and with it the
         runner and the breakeven."""
+        return self.momentum_take_on or self.zone_take_on
+
+    @property
+    def momentum_take_on(self) -> bool:
+        """Whether a momentum read fires the take: the confirmation's table,
+        or the legacy rule a record carries. Not under "zone", which replaced
+        it, and not with no share to sell."""
         return bool(
-            self.take_trigger == TAKE_ZONE
-            or self.momentum_confirmation_bars
-            or self.negative_momentum_bars
-            or self.momentum_fade_bars
-            or self.momentum_drop
+            self.take_fraction > 0
+            and self.take_trigger != TAKE_ZONE
+            and (
+                self.momentum_confirmation_bars
+                or self.negative_momentum_bars
+                or self.momentum_fade_bars
+                or self.momentum_drop
+            )
+        )
+
+    @property
+    def zone_take_on(self) -> bool:
+        """Whether a stall zone forming fires the take: always under "zone",
+        under "either" while it has a length -- whatever the confirmation."""
+        return bool(
+            self.take_fraction > 0
+            and (
+                self.take_trigger == TAKE_ZONE
+                or (self.take_trigger == TAKE_EITHER and self.zone_min_bars)
+            )
         )
 
 
@@ -1084,12 +1120,20 @@ def stop_phrase(config: AppleTraderConfig) -> str:
 
 
 def fade_phrase(config: AppleTraderConfig) -> str:
-    """The take's trigger in words, in whichever form it is written."""
-    if config.take_trigger == TAKE_ZONE:
-        return (
-            f"a stall zone forming after the fill: {config.zone_min_bars} bars with every "
-            f"close inside a band {config.zone_width:g} × the typical minute move wide"
-        )
+    """The take's trigger in words, in whichever form it is written -- both,
+    under "either" with a zone."""
+    zone = (
+        f"a stall zone forming after the fill: {config.zone_min_bars} bars with every "
+        f"close inside a band {config.zone_width:g} × the typical minute move wide"
+    )
+    if not config.momentum_take_on and config.zone_take_on:
+        return zone
+    if config.zone_take_on:
+        return f"{_momentum_phrase(config)}, or {zone}"
+    return _momentum_phrase(config)
+
+
+def _momentum_phrase(config: AppleTraderConfig) -> str:
     if config.momentum_confirmation_bars:
         return (
             f"momentum over the last {config.momentum_confirmation_bars} bars negative "
@@ -1160,18 +1204,21 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # the older 1σ fall from the peak, which stored records keep. `@zone20b/3u`
     # is the forming-zone take: 20 bars inside a band 3 typical minute moves
     # wide, whatever the confirmation's look-back.
-    if c.take_trigger == TAKE_ZONE:
-        take = f"zone{c.zone_min_bars}b/{c.zone_width:g}u"
+    # Both triggers at once ("either" with a zone) sign as `@conf|zone20b/3u`;
+    # "either" with no zone signs as "momentum" does, since it trades the same.
+    # A share of 0 is the take off, and signs as no take.
+    if not c.momentum_take_on:
+        moment = ""
     elif c.momentum_confirmation_bars:
-        take = "conf"
+        moment = "conf"
     elif c.negative_momentum_bars:
-        take = f"neg{c.negative_momentum_bars}b/{c.negative_for_bars}b"
+        moment = f"neg{c.negative_momentum_bars}b/{c.negative_for_bars}b"
     elif c.momentum_fade_bars:
-        take = f"fade{c.momentum_fade_bars}b"
-    elif c.momentum_drop:
-        take = f"mom-{c.momentum_drop:g}"
+        moment = f"fade{c.momentum_fade_bars}b"
     else:
-        take = ""
+        moment = f"mom-{c.momentum_drop:g}"
+    zone = f"zone{c.zone_min_bars}b/{c.zone_width:g}u" if c.zone_take_on else ""
+    take = "|".join(t for t in (moment, zone) if t)
     if take:
         exits += f",take={c.take_fraction * 100:g}%@{take}"
         # The two gates, each only while set, so every record written before
@@ -1408,13 +1455,18 @@ def _dayrange_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
     else:
         stop = "off"
     rows.append((exits, "Stop loss", stop))
-    if c.take_trigger == TAKE_ZONE:
-        take = (
-            f"{TAKE_TRIGGER_LABELS[TAKE_ZONE]}: {c.zone_min_bars} bars inside "
-            f"{c.zone_width:g} × the minute move"
-        )
+    zone = (
+        f"{TAKE_TRIGGER_LABELS[TAKE_ZONE]}: {c.zone_min_bars} bars inside "
+        f"{c.zone_width:g} × the minute move"
+    )
+    if not c.has_take:
+        take = "off"
+    elif not c.momentum_take_on:
+        take = zone
     elif c.momentum_confirmation_bars:
-        take = TAKE_TRIGGER_LABELS[TAKE_MOMENTUM]
+        take = TAKE_TRIGGER_LABELS[TAKE_MOMENTUM] + (
+            f"; or {zone[0].lower()}{zone[1:]}" if c.zone_take_on else ""
+        )
     elif c.negative_momentum_bars:
         take = (
             f"{c.negative_momentum_bars}-bar momentum negative for "
@@ -1437,8 +1489,10 @@ def _dayrange_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
             rows.append((exits, "Take only once the gain is",
                          f"≥ {c.take_min_gain_fraction:g} × the predicted gain"))
         rows.append((exits, "Take in a loss too", _yes(c.take_in_loss)))
-        rows.append((exits, "No more buys after a take under the buy level",
-                     _yes(c.take_under_buy_stands_down)))
+        # Off the form since 2026-10-27; only a record made with it says so.
+        if c.take_under_buy_stands_down:
+            rows.append((exits, "No more buys after a take under the buy level",
+                         _yes(c.take_under_buy_stands_down)))
         rows.append((exits, "Keep a runner if the target is",
                      f"≥ {c.hold_min_gain_k:g} × {unit} above the fill"))
 
@@ -3653,8 +3707,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         ):
             return None
 
-        if config.take_trigger == TAKE_ZONE:
-            why = self._zone_formed(frame, since)
+        # Momentum first, then the zone: under "either" whichever fires first
+        # takes, and on a bar both would, the momentum read names it.
+        why, zoned = None, False
+        if not config.momentum_take_on:
+            pass
         elif config.momentum_confirmation_bars:
             read = self._momentum_read(frame)
             why = momentum_words(read) if read is not None and read["row"].take else None
@@ -3664,6 +3721,8 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             why = self._fade_turned(frame, since)
         else:
             why = self._fade_dropped(frame, since)
+        if why is None and config.zone_take_on:
+            why, zoned = self._zone_formed(frame, since), True
         if why is None:
             return None
 
@@ -3671,7 +3730,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         pnl_pct = (price / entry_price - 1) * 100
         in_loss = price <= entry_price
         fade = (
-            f"{'Zone take' if config.take_trigger == TAKE_ZONE else 'Momentum take'}: "
+            f"{'Zone take' if zoned else 'Momentum take'}: "
             f"{why}, with the price at ${price:,.2f} — "
             + (
                 f"at or under the ${entry_price:,.2f} fill"
@@ -3900,7 +3959,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         if config.has_take:
             exits.append(
                 f"a take if the price stalls short of it ({fade_phrase(config)})"
-                if config.take_trigger == TAKE_ZONE
+                if not config.momentum_take_on
+                else f"a take if the move gives out or stalls short of it ({fade_phrase(config)})"
+                if config.zone_take_on
                 else f"a momentum take if the move gives out short of it ({fade_phrase(config)})"
             )
         return (
@@ -3991,7 +4052,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         close = float(bar["close"])
         if close > level:
             return
-        take = "zone take" if config.take_trigger == TAKE_ZONE else "momentum take"
+        take = (
+            "zone take" if not config.momentum_take_on
+            else "take" if config.zone_take_on
+            else "momentum take"
+        )
         self._stand_down(
             state,
             f"{take} at ${close:,.2f}, at or under the ${level:,.2f} buy level",
@@ -4178,7 +4243,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 f"{self.entry['bars']} bars"
             )
             if (
-                self.config.take_trigger == TAKE_ZONE
+                self.config.zone_take_on
                 and frame is not None
                 and not self.entry.get("runner")
             ):
@@ -5932,7 +5997,9 @@ def _armed_summary(config: AppleTraderConfig, model, bundle: dict) -> str:
             )
             + (
                 " once the price stalls "
-                if config.take_trigger == TAKE_ZONE
+                if not config.momentum_take_on
+                else " once momentum gives out or the price stalls "
+                if config.zone_take_on
                 else " once momentum gives out "
             )
             + f"({fade_phrase(config)}), the rest kept for the sell level only if "

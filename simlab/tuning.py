@@ -200,11 +200,14 @@ TUNABLES: "dict[str, Tunable]" = {
             "momentum_drop", "Momentum fade, legacy (σ off its peak)", 0.0, 5.0, 0.1,
             (0.0, 2.0, 0.5), "%.1f",
         ),
-        Tunable("take_fraction", "Share taken on negative momentum", 0.05, 1.0, 0.05, (0.30, 1.0, 0.10)),
-        # The forming-zone take's zone (`take_trigger = "zone"`); nothing else
-        # reads them, and the signature leaves them out under "momentum".
+        # 0 is the take off -- the momentum fade and the zone alike, since the
+        # zone sells the same share.
+        Tunable("take_fraction", "Share taken on negative momentum", 0.0, 1.0, 0.05, (0.30, 1.0, 0.10)),
+        # The forming-zone take's zone; nothing else reads them, and the
+        # signature leaves them out while it is off. 0 is the zone off (the
+        # form's "either"); 1 is a refused cell.
         Tunable(
-            "zone_min_bars", "Zone length (bars)", 2, 120, 1,
+            "zone_min_bars", "Zone length (bars)", 0, 120, 1,
             (10, 30, 5), "%d", integer=True,
         ),
         Tunable(
@@ -360,12 +363,10 @@ SWEEPABLE: "tuple[str, ...]" = (
     "breach_update",
     "stop_gain_fraction",
     "momentum_confirmation_bars",
-    "take_trigger",
-    "zone_min_bars",
-    "zone_width",
     "take_fraction",
     "take_after_minutes",
-    "hold_min_gain_k",
+    "zone_min_bars",
+    "zone_width",
     "min_win_k",
     "position_pct",
     "ff_entry_quantile",
@@ -437,6 +438,10 @@ LEGACY_AXES: "tuple[str, ...]" = (
     "momentum_fade_bars", "momentum_drop",
     "negative_momentum_bars", "negative_for_bars", "max_fall_k",
     "take_min_gain_fraction",
+    # Off the form since 2026-10-27: the momentum fade and the zone are two
+    # exits now, each switched off by its own 0, and the runner threshold is
+    # a fixed rule.
+    "take_trigger", "hold_min_gain_k",
 )
 
 

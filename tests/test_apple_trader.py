@@ -2143,9 +2143,11 @@ class TestStrategySelection:
         ):
             with pytest.raises(ValueError, match=field):
                 dayrange_config(**{field: -0.1})
-        for fraction in (0.0, 1.5):
+        for fraction in (-0.1, 1.5):
             with pytest.raises(ValueError, match="take_fraction"):
                 dayrange_config(take_fraction=fraction)
+        # 0 is the take off (the form's "0 % switches it off"), not a refusal.
+        assert not dayrange_config(take_fraction=0.0).has_take
 
     def test_a_sell_level_below_the_buy_level_is_refused(self):
         """Both are distances *below* the predicted high, so the sell distance
@@ -4406,7 +4408,7 @@ class TestMomentumConfirmation:
         assert config.momentum_confirmation_bars == 3
         assert config.has_take
         signature = config_signature(config)
-        assert ",confirm=3b" in signature and "@conf>=15m+loss+end<buy," in signature
+        assert ",confirm=3b" in signature and "@conf>=15m+loss," in signature
 
     def test_it_cannot_sit_beside_a_legacy_take(self):
         with pytest.raises(ValueError, match="only one may be set"):
@@ -4540,7 +4542,7 @@ class TestMomentumConfirmation:
     def test_the_take_at_a_loss_is_on_by_default_and_signed(self):
         config = AppleTraderConfig()
         assert config.take_in_loss
-        assert "@conf>=15m+loss+end<buy," in config_signature(config)
+        assert "@conf>=15m+loss," in config_signature(config)
         assert "+loss" not in config_signature(replace(config, take_in_loss=False))
         assert "+loss" not in config_signature(
             AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
@@ -4615,9 +4617,11 @@ class TestMomentumConfirmation:
     def _stood_down(self, trader, tracker):
         return trader.activity("hold", tracker) == ("🟠", "Agent stood down for the day")
 
-    def test_the_take_under_buy_rule_is_on_by_default_and_signed(self):
-        config = AppleTraderConfig()
-        assert config.take_under_buy_stands_down
+    def test_the_take_under_buy_rule_is_off_by_default_and_signed_when_on(self):
+        """Off since 2026-10-27, when it left the form: the circuit breaker is
+        there for it. A record made with it on still signs and replays so."""
+        assert not AppleTraderConfig().take_under_buy_stands_down
+        config = AppleTraderConfig(take_under_buy_stands_down=True)
         assert "+end<buy," in config_signature(config)
         assert "+end<buy" not in config_signature(
             replace(config, take_under_buy_stands_down=False)
@@ -4734,7 +4738,7 @@ class TestMomentumConfirmation:
         config = AppleTraderConfig()
         assert config.take_after_minutes == 15
         assert config.take_min_gain_fraction == 0.0
-        assert "@conf>=15m+loss+end<buy," in config_signature(config)
+        assert "@conf>=15m+loss," in config_signature(config)
         assert ">=0m" not in config_signature(replace(config, take_after_minutes=0))
         assert ">=15m" not in config_signature(
             AppleTraderConfig(momentum_confirmation_bars=0, stop_gain_fraction=0.0)
@@ -4846,38 +4850,74 @@ class TestZoneTake:
 
     # --- config ---------------------------------------------------------
 
-    def test_momentum_by_default_and_the_zone_signed_in_its_place(self):
+    def test_no_zone_by_default_and_the_zone_signed_in_its_place(self):
+        """Since 2026-10-27 the default is "either" with a zone length of 0 --
+        the zone off, signing and trading as "momentum" does."""
         config = AppleTraderConfig()
-        assert config.take_trigger == "momentum"
-        assert "@conf>=15m+loss+end<buy," in config_signature(config)
-        zone = replace(config, take_trigger="zone")
+        assert (config.take_trigger, config.zone_min_bars) == ("either", 0)
+        assert config.momentum_take_on and not config.zone_take_on
+        assert "@conf>=15m+loss," in config_signature(config)
+        assert config_signature(config) == config_signature(
+            replace(config, take_trigger="momentum")
+        )
+        zone = replace(config, take_trigger="zone", zone_min_bars=20)
         signature = config_signature(zone)
-        assert "@zone20b/3u>=15m+loss+end<buy," in signature and "@conf" not in signature
+        assert "@zone20b/3u>=15m+loss," in signature and "@conf" not in signature
         # The confirmation still gates the buy and the sell level.
         assert ",confirm=3b" in signature
         assert "@zone25b/2.5u" in config_signature(
             replace(zone, zone_min_bars=25, zone_width=2.5)
         )
         # Read only under the zone: a momentum run signs the same whatever they say.
-        assert config_signature(replace(config, zone_min_bars=25)) == config_signature(config)
+        momentum = replace(config, take_trigger="momentum")
+        assert config_signature(replace(momentum, zone_min_bars=25)) == config_signature(config)
+
+    def test_either_with_a_zone_signs_both_and_a_share_of_0_signs_none(self):
+        both = AppleTraderConfig(zone_min_bars=20)
+        assert both.momentum_take_on and both.zone_take_on
+        assert "@conf|zone20b/3u>=15m+loss," in config_signature(both)
+        # Without the confirmation the zone alone, signed as the legacy zone is.
+        alone = replace(both, momentum_confirmation_bars=0)
+        assert not alone.momentum_take_on and alone.zone_take_on
+        assert config_signature(alone) == config_signature(
+            replace(alone, take_trigger="zone")
+        )
+        # A share of 0 is the take off, both triggers with it.
+        off = replace(both, take_fraction=0.0)
+        assert not off.has_take
+        assert "take=" not in config_signature(off) and "confirm=3b" in config_signature(off)
 
     def test_the_take_is_on_without_the_confirmation(self):
-        config = AppleTraderConfig(take_trigger="zone", momentum_confirmation_bars=0)
-        assert config.has_take
-        assert "@zone20b/3u" in config_signature(config)
-        assert "confirm=" not in config_signature(config)
+        for config in (
+            AppleTraderConfig(take_trigger="zone", zone_min_bars=20, momentum_confirmation_bars=0),
+            AppleTraderConfig(zone_min_bars=20, momentum_confirmation_bars=0),
+        ):
+            assert config.has_take
+            assert "@zone20b/3u" in config_signature(config)
+            assert "confirm=" not in config_signature(config)
 
     def test_refusals(self):
         with pytest.raises(ValueError, match="legacy momentum take"):
             AppleTraderConfig(
-                take_trigger="zone", momentum_confirmation_bars=0, negative_momentum_bars=15
+                take_trigger="zone", zone_min_bars=20, momentum_confirmation_bars=0,
+                negative_momentum_bars=15,
             )
+        with pytest.raises(ValueError, match="legacy momentum take"):
+            AppleTraderConfig(
+                zone_min_bars=20, momentum_confirmation_bars=0, negative_momentum_bars=15
+            )
+        # "either" with no zone is the momentum take, whichever form it takes.
+        assert AppleTraderConfig(
+            momentum_confirmation_bars=0, negative_momentum_bars=15
+        ).momentum_take_on
         with pytest.raises(ValueError, match="take_trigger"):
             AppleTraderConfig(take_trigger="vibes")
         # A record that carries no trigger at all reads the momentum take.
         assert AppleTraderConfig(take_trigger=None).take_trigger == "momentum"
         with pytest.raises(ValueError, match="zone_min_bars"):
             AppleTraderConfig(zone_min_bars=1)
+        with pytest.raises(ValueError, match="zone_min_bars"):
+            AppleTraderConfig(take_trigger="zone", zone_min_bars=0)
         with pytest.raises(ValueError, match="zone_min_bars"):
             AppleTraderConfig(zone_min_bars=2.5)
         with pytest.raises(ValueError, match="zone_width"):
@@ -4920,17 +4960,23 @@ class TestZoneTake:
             assert self._step(trader, tracker, tape, state, close) == "hold"
         assert tracker.position_for(TICKER) == shares
 
-    @pytest.mark.parametrize("trigger, outcome", [("momentum", "hold"), ("zone", "sold")])
+    @pytest.mark.parametrize("trigger, zone, outcome", [
+        ("momentum", 5, "hold"), ("zone", 5, "sold"), ("either", 5, "sold"), ("either", 0, "hold"),
+    ])
     def test_the_momentum_trigger_holds_the_same_stall(
-        self, state, market_open, monkeypatch, trigger, outcome
+        self, state, market_open, monkeypatch, trigger, zone, outcome
     ):
         """Flat after a rise reads neutral momentum -- no momentum take -- and
-        is exactly what the zone sells."""
+        is exactly what the zone sells: under "either" too, while it has a
+        length."""
         trader, tracker, tape = self._enter(
             state, monkeypatch, take_trigger=trigger, momentum_confirmation_bars=3,
+            zone_min_bars=zone,
         )
         outcomes = [self._step(trader, tracker, tape, state, 103.0) for _ in range(5)]
         assert outcomes == ["hold"] * 4 + [outcome]
+        if outcome == "sold":
+            assert self._reasoning(tracker).startswith("Zone take:")
 
     def test_a_zone_already_there_at_the_buy_is_not_sold_for(
         self, state, market_open, monkeypatch

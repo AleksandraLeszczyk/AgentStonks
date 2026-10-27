@@ -1073,7 +1073,7 @@ def _run_pattern_controls(
         # A run that sold at forming zones opens on its own zone, so the grey
         # boxes are the ones its takes read.
         config = _apple_config_from(_apple_config_key(record, symbol))
-        traded = config is not None and config.take_trigger == TAKE_ZONE
+        traded = config is not None and config.zone_take_on
         start_bars = (
             min(max(config.zone_min_bars, 5), 60) if traded
             else candle_patterns.DEFAULT_ZONE_MIN_BARS
@@ -1885,13 +1885,15 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "update is worth anything — neither has ever been swept."
         ),
         "dayrange_exits": (
-            "The managed exit, all of it measured from the fill.\n\n"
-            "- **Stop** — a share of what the trade is playing for.\n"
-            "- **Runner threshold** — in the same unit as the levels.\n"
-            "- Each switched-on knob is in the signature, so sweeping the stop or the "
-            "take queues its own configuration.\n"
-            "- 0 switches the stop or the take off. With both off a run files beside the "
-            "records made before the exit existed, which replay that way."
+            "Three exits, all measured from the fill, each switched off by a 0 in its "
+            "first box.\n\n"
+            "- **Stop loss** — a share of what the trade is playing for.\n"
+            "- **Momentum fade** — a share of the position, after a wait.\n"
+            "- **Sell at forming zone** — the same share after the same wait, on a stall "
+            "zone; both takes on means whichever fires first.\n"
+            "- Each switched-on knob is in the signature, so sweeping one queues its own "
+            "configuration. With all off a run files beside the records made before the "
+            "exit existed, which replay that way."
         ),
         "dayrange_skip": (
             "Sessions the replay does not trade: no forecast, no order. In the signature as "
@@ -2156,38 +2158,36 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "`@fade15b`, `@mom-1`) and any `nofall=` gate.\n"
             "- SimLab measures last week's mean move from the 5 stored sessions "
             "before each replayed day.\n"
-            "- Sweepable; 0 switches it off, and with it the take and the runner — "
-            "unless the take sells at a forming zone."
-        ),
-        "take_trigger": (
-            "What makes the take sell short of the sell level.\n\n"
-            "- **Sell at momentum fade** — the behaviour table's take row over the "
-            "confirmation period. Signs as `take=70%@conf`.\n"
-            "- **Sell at forming zone** — the last *Zone length* bars all closed inside "
-            "a band *Zone band* × the day's typical minute move wide (the week before's "
-            "mean |1-minute move|), and the zone reached that length after the last buy. "
-            "The same zone Results' **Stall-zone levels** pattern boxes grey. Signs as "
-            "`take=70%@zone20b/3u`.\n"
-            "- Same share, runner, wait and loss rule either way; the confirmation still "
-            "gates the buy and the sell level.\n"
-            "- Sweepable as a rule axis, like the breach policy. Every run before "
-            "2026-10-19 replays as momentum fade."
+            "- Sweepable; 0 switches it off, and with it the momentum fade exit — the "
+            "forming-zone exit needs no momentum read and stays on."
         ),
         "zone_min_bars": (
-            "The forming-zone take's zone length, in bars. 20 is the chart's default "
-            "(about 4 zones a session on the stored days). In the signature only under "
-            "the zone take; sweepable."
+            "The forming-zone exit: the last *Zone length* bars all closed inside a band "
+            "*Zone band* × the day's typical minute move wide (the week before's mean "
+            "|1-minute move|), and the zone reached that length after the last buy. "
+            "Sells the momentum fade's share, after its wait.\n\n"
+            "- The same zone Results' **Stall-zone levels** pattern boxes grey; 20 is its "
+            "default (about 4 zones a session on the stored days).\n"
+            "- Beside the momentum fade it signs as `take=70%@conf|zone20b/3u`, alone as "
+            "`take=70%@zone20b/3u` — whichever fires first sells.\n"
+            "- **0** switches it off (the default), and signs as no zone at all. A record "
+            "from 2026-10-19 to 10-26 that chose *Sell at forming zone* replays the zone "
+            "in place of the momentum fade.\n"
+            "- Sweepable from 0."
         ),
         "zone_width": (
-            "The forming-zone take's band, in typical minute moves. 3 is the chart's "
-            "default. In the signature only under the zone take; sweepable."
+            "The forming-zone exit's band, in typical minute moves. 3 is the chart's "
+            "default. In the signature only while the zone is on; sweepable."
         ),
         "position_pct": (
             "The share of available cash each entry spends. In the signature as `size=`."
         ),
         "take_fraction": (
-            "How much of the position a take sells when a runner is kept.\n\n"
-            "- In the signature only while the take is on.\n"
+            "The share the momentum fade sells — and the forming-zone exit too.\n\n"
+            "- The rest rides on as a runner, unless the sell level is under "
+            "{hold_min_gain_k} × {unit} above the fill (`runner>=` in the signature, no "
+            "longer on the form), when everything is sold.\n"
+            "- **0** switches both takes off, and signs as no take.\n"
             "- Whole shares, rounded down, and at least one."
         ),
         "take_after_minutes": (
@@ -2198,20 +2198,6 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- A record from 2026-09-29 to 10-02 replays the gain gate it was run "
             "under instead, `>=0.2G`: no take until 0.2 of the predicted gain is banked.\n"
             "- 0 takes from the first bar after the buy."
-        ),
-        "hold_min_gain_k": (
-            "Keep a runner only if the sell level is still this far above the fill; "
-            "otherwise the take sells everything.\n\n"
-            "- The gap is at most `buy − sell`, so on AAPL's default pair 0.30 never "
-            "keeps one.\n"
-            "- In the signature as `runner>=` while the take is on."
-        ),
-        "take_under_buy_stands_down": (
-            "After a take that sells at or under the buy level (the first buy's, not "
-            "the next rung), nothing else is bought that session; a runner it kept is "
-            "still sold by its own rules.\n\n"
-            "- In the signature as `+end<buy` while the take is on; a record from "
-            "before 2026-10-22 replays without it."
         ),
         "scale_in": (
             "Adds to an open position on the way down while the cash left can pay for "
@@ -2245,7 +2231,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "every trade, and only a stop stands the session down."
         ),
         "breaker_until_revised": (
-            "Ticked, a circuit breaker (a weak trade, or a take at or under the buy level) "
+            "Ticked, a circuit breaker (a weak trade, or on a record from 2026-10-22 to "
+            "10-26 a take at or under the buy level) "
             "holds the entries only until the session trades through a predicted boundary "
             "and the forecast is revised, rather than for the rest of the day. In the "
             "signature as `until_revised` while a breaker is on; a record from before it "

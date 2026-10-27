@@ -3028,18 +3028,18 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "live, including under a position that is already open."
         ),
         "dayrange_exits": (
-            "How a position gets out before the sell level. Everything is measured from "
-            "the fill.\n\n"
-            "- **Stop** — under the fill, as a share of what the trade is playing for.\n"
-            "- **Take** — part of the position, in profit or at a loss, on one of two "
-            "triggers: **momentum fade** (momentum has been negative for long enough) or "
-            "a **forming zone** (the price has stalled in a narrow band).\n"
-            "- **Runner** — the rest, kept for the sell level only if that is still far "
-            "enough away; sold if the price comes back to the fill (one kept from a take "
-            "at a loss is left to the stop).\n\n"
-            "A trade closes at the sell level, the stop, a take (its runner at "
-            "the sell level or back at the fill), or the closing flatten. None of this is "
-            "in the notebook's results."
+            "Three ways a position gets out before the sell level, each switched off by "
+            "a 0 in its first box. Everything is measured from the fill.\n\n"
+            "- **Stop loss** — sells everything under the fill.\n"
+            "- **Momentum fade** — sells part of the position once momentum turns "
+            "negative.\n"
+            "- **Sell at forming zone** — sells that same part once the price stalls in "
+            "a narrow band.\n\n"
+            "Both takes can be on: whichever comes first sells, once per position. The "
+            "rest is a **runner**, kept for the sell level if that is still far enough "
+            "away and sold if the price comes back to the fill (one kept from a take at "
+            "a loss is left to the stop). A trade also closes at the sell level or the "
+            "closing flatten. None of this is in the notebook's results."
         ),
         "dayrange_skip": (
             "Sessions the agent does not trade at all: no forecast, no order. The forecast "
@@ -3051,8 +3051,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- **A stop** — the day has not gone the way the forecast said.\n"
             "- **A trade that barely paid** — the forecast said the day was wide enough "
             "for the dip to be worth buying, and the trade says otherwise.\n\n"
-            "Either breaker (that one, or a take at or under the buy level) can instead hold "
-            "the entries only until the forecast is revised — see the box below."
+            "That breaker can instead hold the entries only until the forecast is revised "
+            "— see the box below."
         ),
         "momentum": (
             "At the close of every bar from 09:31 to 15:30 the model forecasts the average "
@@ -3421,8 +3421,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "(the predicted low, or one ADR under H). 0.40 → 0.70 → 0.85…"
         ),
         "stop_gain_fraction": (
-            "Sells everything when a bar's low reaches this share of the **predicted "
-            "gain** under the fill.\n\n"
+            "The stop loss: sells everything when a bar's low reaches this share of the "
+            "**predicted gain** under the fill.\n\n"
             "- Predicted gain = `buy − sell`: the gap between the levels, and the most a "
             "target exit can pay.\n"
             "- 0.5 risks \\$0.50 for every \\$1.00 the trade plays for — "
@@ -3452,67 +3452,41 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "flatten.\n"
             "- Until it can be read (the first N + 2 bars, or before last week's "
             "mean move is known) nothing is bought or sold at the levels.\n"
-            "- 0 switches it off, and with it the momentum take and the runner — "
-            "unless the take sells at a forming zone, which needs no momentum read."
-        ),
-        "take_trigger": (
-            "What makes the take sell short of the sell level.\n\n"
-            "- **Sell at momentum fade** — momentum over the *Momentum confirmation "
-            "period* is negative and its change neutral or negative: the price is "
-            "still dropping, or dropping faster.\n"
-            "- **Sell at forming zone** — the price has stalled: the last *Zone length* "
-            "bars all closed inside a band *Zone band* × the ticker's mean one-minute "
-            "move over last week wide. The chart's **Stall-zone levels** pattern draws "
-            "the same zone as a grey box at the same settings.\n"
-            "- A zone counts only if it reached its length **after the last buy** — "
-            "a buy into a stretch that was already flat is not sold for it.\n"
-            "- Either way the same share, runner, wait and loss rule; the momentum "
-            "confirmation still gates the buy and the sell level."
-        ),
-        "zone_min_bars": (
-            "How many bars the price must stay inside the band before it counts as a "
-            "stall.\n\n"
-            "- 20 is the chart's default: about 4 zones a session on the stored days, "
-            "almost none before 10:00.\n"
-            "- Only read when the take sells at a forming zone."
-        ),
-        "zone_width": (
-            "How far apart the zone's closes may be, in typical minute moves — the "
-            "ticker's mean |one-minute move| over last week.\n\n"
-            "- 3 is the chart's default. Wider finds more, longer zones.\n"
-            "- Only read when the take sells at a forming zone."
+            "- 0 switches it off, and with it the momentum fade exit — the forming-zone "
+            "exit needs no momentum read and stays on."
         ),
         "take_fraction": (
-            "How much of the position a take sells when the rest is kept as a "
-            "runner.\n\n"
-            "- The take fires below the sell level, in profit or at a loss, on the "
-            "trigger chosen above: momentum over the *Momentum confirmation period* "
-            "negative and its change neutral or negative, or a stall zone formed since "
-            "the last buy.\n"
-            "- Whole shares, rounded down, and at least one."
+            "How much of the position the momentum fade sells, below the sell level, in "
+            "profit or at a loss: once momentum over the *Momentum confirmation period* "
+            "is negative and its change neutral or negative — the price still dropping, "
+            "or dropping faster.\n\n"
+            "- The forming-zone exit sells this same share.\n"
+            "- The rest rides on as a runner — unless the sell level is under "
+            "{hold_min_gain_k} × {unit} above the fill, when everything is sold.\n"
+            "- Whole shares, rounded down, and at least one.\n"
+            "- **0** switches the momentum fade off, and the forming-zone exit with it."
         ),
         "take_after_minutes": (
-            "The take fires only once this many minutes have passed since the "
-            "last buy.\n\n"
+            "Neither take sells until this many minutes have passed since the last "
+            "buy.\n\n"
             "- Before that a negative momentum read or a zone is left alone; the stop "
             "covers the downside.\n"
             "- A buy lower down (scale-in) starts the wait again.\n"
             "- 0 takes from the first bar after the buy."
         ),
-        "hold_min_gain_k": (
-            "Keep a runner only if the sell level is still this many × {unit} above the fill; "
-            "otherwise a momentum take sells everything.\n\n"
-            "- The gap is at most `buy − sell`: 0.15 on AAPL's default pair, 0.60 on "
-            "GOOGL's — so 0.30 keeps a runner on GOOGL and INTC, never on AAPL.\n"
-            "- A runner is sold at the sell level, at the flatten, or back at the fill."
+        "zone_min_bars": (
+            "How many bars the price must stay inside the band before it counts as a "
+            "stall, and the exit sells the momentum fade's share.\n\n"
+            "- A zone counts only if it reached its length **after the last buy** — "
+            "a buy into a stretch that was already flat is not sold for it.\n"
+            "- The chart's **Stall-zone levels** pattern draws the same zone as a grey "
+            "box; 20 is its default, about 4 zones a session, almost none before 10:00.\n"
+            "- **0** switches this exit off."
         ),
-        "take_under_buy_stands_down": (
-            "After a take that sells at or under the buy level, nothing else is bought "
-            "today.\n\n"
-            "- Otherwise the buy level sits above the price just sold at, and the next "
-            "bar momentum allows buys the same shares back.\n"
-            "- Measured against the first buy's level, not the next rung lower.\n"
-            "- A runner the take kept is still sold by its own rules."
+        "zone_width": (
+            "How far apart the zone's closes may be, in typical minute moves — the "
+            "ticker's mean |one-minute move| over last week.\n\n"
+            "- 3 is the chart's default. Wider finds more, longer zones."
         ),
         "min_win_k": (
             "After a trade closes for no more than this many × {unit} **per share**, nothing "
@@ -3533,8 +3507,8 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- The threshold below is kept for when it is ticked again."
         ),
         "breaker_until_revised": (
-            "What a circuit breaker — a trade that barely paid, or a take at or under the "
-            "buy level — holds the entries for.\n\n"
+            "What the circuit breaker — a trade that barely paid — holds the entries "
+            "for.\n\n"
             "- **Unticked** — the rest of the session.\n"
             "- **Ticked** — only until the session trades through the predicted high or low "
             "and the forecast is revised (by the breach rule above, or by containment). The "

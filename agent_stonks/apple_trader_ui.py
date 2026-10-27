@@ -56,9 +56,8 @@ from .config import (
     BREACH_OFFERED,
     LEVEL_UNITS,
     LEVEL_UNIT_LABELS,
-    TAKE_TRIGGER_LABELS,
-    TAKE_TRIGGERS,
-    TAKE_ZONE,
+    TAKE_EITHER,
+    TAKE_MOMENTUM,
     UNIT_ADR,
     UNIT_PRED_RANGE,
 )
@@ -487,7 +486,14 @@ def base_help(model_key: str, ticker: str) -> str:
 
 
 def config_changes(new: AppleTraderConfig, old: AppleTraderConfig, word: str) -> "list[str]":
-    """Every field in which `new` differs from `old`, as "`field` new (word old)"."""
+    """Every field in which `new` differs from `old`, as "`field` new (word old)".
+
+    Each side read as the form opens on it (`as_form_writes`), since that is
+    what a run started from either would trade: a base set before 2026-10-27
+    carries "momentum" and an unread zone length the form writes as "either"
+    and 0, which is no difference at all.
+    """
+    new, old = as_form_writes(new), as_form_writes(old)
     return [
         f"`{f.name}` {_field_text(getattr(new, f.name))} "
         f"({word} {_field_text(getattr(old, f.name))})"
@@ -495,6 +501,21 @@ def config_changes(new: AppleTraderConfig, old: AppleTraderConfig, word: str) ->
         if f.name not in ("model_key", "ticker")
         and getattr(new, f.name) != getattr(old, f.name)
     ]
+
+
+def as_form_writes(config: AppleTraderConfig) -> AppleTraderConfig:
+    """`config` as `exit_params` writes it back: both takes under "either",
+    a zone "momentum" never read at 0, and no stand-down after a take under the
+    buy level."""
+    zone = int(config.zone_min_bars) if config.take_trigger != TAKE_MOMENTUM else 0
+    try:
+        return replace(
+            config, take_trigger=TAKE_EITHER, zone_min_bars=zone,
+            take_under_buy_stands_down=False,
+        )
+    except ValueError:
+        # A legacy momentum take beside a zone: no form writes it, so as it is.
+        return config
 
 
 def _field_text(value) -> str:
@@ -934,21 +955,28 @@ def exit_params(
     stop_seed: "float | None" = None,
     stop: bool = True,
 ) -> dict:
-    """The managed exit: a stop under the fill, a take, and a runner -- as the
-    config fields they set.
+    """The managed exit as three exits, each under its own small heading and
+    each switched off by a 0 in its first box -- as the config fields they set.
 
-    The take sells short of the sell level on one of two triggers
-    (`take_trigger`): momentum fading -- the behaviour table's take row, read
-    over the momentum confirmation period set beside the levels, with no knob
-    of its own here -- or a stall zone forming, whose length and band are the
-    two knobs under the choice, greyed out under the other. `take_on` is
-    whether the confirmation period is on; the take is on with it or with the
-    zone, and greys out the knobs that only mean something while it is.
+    - **Stop loss** -- a share of the predicted gain under the fill.
+    - **Momentum fade** -- the take: its share of the position, sold once the
+      behaviour table's take row reads (over the momentum confirmation period
+      set beside the levels, with no knob of its own here), and the wait
+      after the last fill. `take_on` is whether that period is on.
+    - **Sell at forming zone** -- a stall zone forming after the last fill,
+      its length and band. It sells the momentum fade's share after its
+      wait (the user's choice, 2026-10-27), so a share of 0 turns it off too.
+
+    Both takes are on at once, whichever fires first (`take_trigger`
+    "either", written whatever the defaults carried). The share of 0 and the
+    zone length of 0 are the two off switches; a knob whose exit is off is
+    greyed out rather than hidden, so switching it back on finds it where it
+    was. The runner threshold (`hold_min_gain_k`) has no knob since then and
+    keeps the defaults' value, and a take under the buy level no longer ends
+    the day's buying -- the circuit breaker is there for that.
 
     Not keyed by ticker, unlike the levels: none of these was swept per
-    instrument, so there is no per-symbol default for a switch to re-seed. The
-    knobs that only mean something once the take is on are greyed out while
-    it is off rather than hidden, so turning it back on finds them where they were.
+    instrument, so there is no per-symbol default for a switch to re-seed.
 
     The stop is the exception since 2026-10-04, when it was tuned per model and
     instrument with the levels: `defaults.stop_gain_fraction` is then the
@@ -966,16 +994,17 @@ def exit_params(
     the *fraction* travels between symbols and the distance does not.
     """
     section("Exits", copy.sections.get("dayrange_exits"))
-    col_a, col_b = st.columns(2)
     stopped = {}
     if stop:
+        exit_heading("Stop loss")
+        col_a, _ = st.columns(2)
         stop_key = copy.key(
             f"stop_gain_fraction_{stop_scope}" if stop_scope else "stop_gain_fraction"
         )
         start_stop = defaults.stop_gain_fraction if stop_seed is None else stop_seed
         shown = float(st.session_state.get(stop_key, start_stop))
         stopped["stop_gain_fraction"] = float(col_a.number_input(
-            "Stop loss (× the predicted gain, below the fill)",
+            "Below the fill (× the predicted gain)",
             min_value=0.0, max_value=3.0, value=start_stop, step=0.05,
             format="%.2f",
             key=stop_key,
@@ -987,25 +1016,42 @@ def exit_params(
             ) if p),
         ))
         stop_warning(col_a, stopped["stop_gain_fraction"])
-    # Before the knobs it greys out: the zone's two, and -- with the
-    # confirmation off -- the take's own.
-    take_trigger = col_b.selectbox(
-        "Take short of the sell level",
-        list(TAKE_TRIGGERS),
-        index=list(TAKE_TRIGGERS).index(defaults.take_trigger),
-        format_func=lambda key: TAKE_TRIGGER_LABELS[key],
-        key=copy.key("take_trigger"),
-        help=copy.help.get("take_trigger"),
+
+    # The zone's length decides whether the wait above it means anything, so
+    # it is read before it renders, as the stop's `?` reads the stop. Under
+    # "momentum" the length was never read, so it opens at 0, the zone off.
+    zone_key = copy.key("zone_length")
+    zone_seed = int(defaults.zone_min_bars) if defaults.take_trigger != TAKE_MOMENTUM else 0
+    zone_shown = int(st.session_state.get(zone_key, zone_seed))
+
+    exit_heading("Momentum fade")
+    col_a, col_b = st.columns(2)
+    take_pct = col_a.number_input(
+        "Take on negative momentum (% of shares)",
+        min_value=0.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
+        key=copy.key("take_pct"),
+        help=copy.help.get("take_fraction", "").format(
+            hold_min_gain_k=f"{defaults.hold_min_gain_k:g}", unit=unit_label
+        ) or None,
     )
-    zone = take_trigger == TAKE_ZONE
-    take_on = take_on or zone
+    selling = float(take_pct) > 0
+    zone_on = selling and zone_shown > 0
+    take_after_minutes = col_b.number_input(
+        "Take only after time (min)",
+        min_value=0, max_value=390, value=int(defaults.take_after_minutes), step=1,
+        key=copy.key("take_after_minutes"),
+        help=copy.help.get("take_after_minutes"),
+        disabled=not (selling and (take_on or zone_on)),
+    )
+
+    exit_heading("Sell at forming zone")
     col_a, col_b = st.columns(2)
     zone_min_bars = col_a.number_input(
         "Zone length (bars)",
-        min_value=2, max_value=120, value=int(defaults.zone_min_bars), step=1,
-        key=copy.key("zone_min_bars"),
+        min_value=0, max_value=120, value=zone_seed, step=1,
+        key=zone_key,
         help=copy.help.get("zone_min_bars"),
-        disabled=not zone,
+        disabled=not selling,
     )
     zone_width = col_b.number_input(
         "Zone band (× minute move)",
@@ -1013,50 +1059,28 @@ def exit_params(
         format="%.1f",
         key=copy.key("zone_width"),
         help=copy.help.get("zone_width"),
-        disabled=not zone,
+        disabled=not zone_on,
     )
-    col_a, col_b = st.columns(2)
-    # The label follows the trigger; the key does not, so the share is kept.
-    take_pct = col_a.number_input(
-        "Take at a forming zone (% of shares)" if zone
-        else "Take on negative momentum (% of shares)",
-        min_value=1.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
-        key=copy.key("take_pct"),
-        help=copy.help.get("take_fraction"),
-        disabled=not take_on,
-    )
-    take_after_minutes = col_b.number_input(
-        "Take only after time (min)",
-        min_value=0, max_value=390, value=int(defaults.take_after_minutes), step=1,
-        key=copy.key("take_after_minutes"),
-        help=copy.help.get("take_after_minutes"),
-        disabled=not take_on,
-    )
-    hold_min_gain_k = col_a.number_input(
-        f"Keep a runner if the target is ≥ (× {unit_label} above the fill)",
-        min_value=0.0, max_value=3.0, value=defaults.hold_min_gain_k, step=0.05,
-        format="%.2f",
-        key=copy.key("hold_min_gain_k"),
-        help=copy.help.get("hold_min_gain_k", "").format(unit=unit_label) or None,
-        disabled=not take_on,
-    )
-    take_under_buy_stands_down = col_b.checkbox(
-        "No more buys after a take under the buy level",
-        value=defaults.take_under_buy_stands_down,
-        key=copy.key("take_under_buy_stands_down"),
-        help=copy.help.get("take_under_buy_stands_down"),
-        disabled=not take_on,
-    )
+    if zone_min_bars == 1:
+        col_a.warning(
+            "A zone is at least 2 bars long — 1 reads as 0, the zone off.",
+            icon=":material/warning:",
+        )
     return {
         **stopped,
-        "take_trigger": str(take_trigger),
-        "zone_min_bars": int(zone_min_bars),
+        "take_trigger": TAKE_EITHER,
+        "zone_min_bars": int(zone_min_bars) if zone_min_bars >= 2 else 0,
         "zone_width": float(zone_width),
         "take_fraction": float(take_pct) / 100.0,
         "take_after_minutes": int(take_after_minutes),
-        "hold_min_gain_k": float(hold_min_gain_k),
-        "take_under_buy_stands_down": bool(take_under_buy_stands_down),
+        "take_under_buy_stands_down": False,
     }
+
+
+def exit_heading(title: str) -> None:
+    """One exit's name under the "Exits" heading, smaller than a section's:
+    what each exit does is on its boxes' `?` and the heading's."""
+    st.caption(f"**{title}**")
 
 
 def stop_note(

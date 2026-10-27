@@ -447,8 +447,10 @@ APPLE_TRADER_TAKE_IN_LOSS = True
 # ladder. The stand-down is the circuit breaker's: the run goes on, a runner the
 # take kept is still managed, nothing new is bought today. False is the rule
 # before, which is what every SimLab record written until then replays as
-# (`simlab.rule_agents._APPLE_LEGACY`). Not swept.
-APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN = True
+# (`simlab.rule_agents._APPLE_LEGACY`). Not swept. Off since 2026-10-27 and no
+# longer on the form (the user: "redundant - we have circuit breaker for this
+# purpose"); a record made with it on still replays with it.
+APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN = False
 APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # What fires that take short of the sell level (2026-10-19, at the user's
 # request: "add alternative to sell at momentum fade -- sell at forming zone").
@@ -456,19 +458,27 @@ APPLE_TRADER_HOLD_MIN_GAIN_K = 0.30
 # forming under the position -- APPLE_TRADER_ZONE_MIN_BARS bars whose closes all
 # sit inside a band APPLE_TRADER_ZONE_WIDTH x the ticker's typical minute move
 # wide, the chart's grey "forming" box of the Stall-zone levels pattern
-# (`candle_patterns.forming_zone`, whose own defaults these are). Either way the
-# take sells the same share, keeps the same runner and waits the same time.
-# "momentum" is every record made before it (`simlab.rule_agents._APPLE_LEGACY`).
-# Not swept.
+# (`candle_patterns.forming_zone`). Either way the take sells the same share,
+# keeps the same runner and waits the same time. "momentum" is every record
+# made before it (`simlab.rule_agents._APPLE_LEGACY`).
+#
+# "either" (2026-10-27, the user's: the form shows the two as separate exits)
+# is both at once, whichever fires first: the momentum fade while the
+# confirmation is on, the zone while `zone_min_bars` is above 0. It is what the
+# form writes now; "momentum" and "zone" stay so the records made under them
+# replay as run. Zone length 0 is the zone off, the new default -- "either"
+# with it signs and trades exactly as "momentum".
 TAKE_MOMENTUM = "momentum"
 TAKE_ZONE = "zone"
-TAKE_TRIGGERS = (TAKE_MOMENTUM, TAKE_ZONE)
+TAKE_EITHER = "either"
+TAKE_TRIGGERS = (TAKE_MOMENTUM, TAKE_ZONE, TAKE_EITHER)
 TAKE_TRIGGER_LABELS = {
     TAKE_MOMENTUM: "Sell at momentum fade",
     TAKE_ZONE: "Sell at forming zone",
+    TAKE_EITHER: "Sell at momentum fade or forming zone",
 }
-APPLE_TRADER_TAKE_TRIGGER = TAKE_MOMENTUM
-APPLE_TRADER_ZONE_MIN_BARS = 20
+APPLE_TRADER_TAKE_TRIGGER = TAKE_EITHER
+APPLE_TRADER_ZONE_MIN_BARS = 0
 APPLE_TRADER_ZONE_WIDTH = 3.0
 # What the agent does when the session trades through the forecast it was given
 # at 9:35 -- the vocabulary lives here and the arithmetic in `day_range`

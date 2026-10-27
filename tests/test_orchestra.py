@@ -1405,10 +1405,14 @@ class TestConfirmationPerPair(_PairForm):
         sig = ar.orchestra_signature(app.session_state["out"])
         aapl, intc = sig.split("](")[0].split(",highlow_INTC@")
         assert f"/conf{confirm['AAPL']}b" in aapl and "/conf" not in intc
-        # The take stays on while any pair confirms.
-        assert not app.number_input(key="o_take_pct").disabled
+        # The momentum fade stays on while any pair confirms: its wait greys
+        # out once none does (the share stays open, the zone sells it too).
+        assert not app.number_input(key="o_take_after_minutes").disabled
         app.number_input(key="o_momentum_confirmation_bars_highlow_AAPL").set_value(0).run()
-        assert app.number_input(key="o_take_pct").disabled
+        assert app.number_input(key="o_take_after_minutes").disabled
+        assert not app.number_input(key="o_take_pct").disabled
+        app.number_input(key="o_zone_length").set_value(20).run()
+        assert not app.number_input(key="o_take_after_minutes").disabled
 
     def test_a_running_racers_reopens_its_row(self):
         from streamlit.testing.v1 import AppTest

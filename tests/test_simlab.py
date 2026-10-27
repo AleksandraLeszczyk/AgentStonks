@@ -1239,7 +1239,7 @@ class TestRuleAgentRecords:
         assert "@mom-1," in agent.signature(old)
 
         today = agent.from_record(agent.to_record(AppleTraderConfig(model_key="highlow")))
-        assert "@conf>=15m+loss+end<buy," in agent.signature(today)
+        assert "@conf>=15m+loss," in agent.signature(today)
         assert ",confirm=3b" in agent.signature(today)
 
     def test_the_take_trigger_round_trips_and_old_records_read_momentum(self):

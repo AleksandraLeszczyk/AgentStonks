@@ -131,7 +131,9 @@ class TestSweepVocabulary:
     def test_a_choices_options_are_all_configurations_the_agent_accepts(self):
         for name, choice in tu.CHOICES.items():
             for option in choice.options:
-                assert getattr(AppleTraderConfig(**{name: option}), name) == option
+                # The legacy zone trigger always carried its length.
+                extra = {"zone_min_bars": 20} if name == "take_trigger" else {}
+                assert getattr(AppleTraderConfig(**{name: option}, **extra), name) == option
 
     def test_every_option_has_a_label(self):
         for choice in tu.CHOICES.values():

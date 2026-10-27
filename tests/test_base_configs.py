@@ -241,6 +241,67 @@ class TestForm:
         assert "`limit_entry` False (shipped True)" in text
         assert "`buy_k` 0.85" in text
 
+    def test_a_base_from_before_the_three_exits_differs_in_nothing_the_form_writes(self):
+        """A base set before 2026-10-27 carries "momentum", an unread zone
+        length and the stand-down after a take under the buy level -- all of
+        which the form writes as "either", 0 and off."""
+        from agent_stonks import apple_trader_ui
+
+        base_configs.set_base(asdict(_base(
+            take_trigger="momentum", zone_min_bars=20, take_under_buy_stands_down=True,
+        )))
+        text = apple_trader_ui.base_help("highlow", "AAPL")
+        assert "take_trigger" not in text and "zone_min_bars" not in text
+        assert "take_under_buy_stands_down" not in text
+
+
+class TestExits:
+    """The three exits (2026-10-27): stop loss, momentum fade, forming zone --
+    each switched off by a 0 in its first box, its other box greyed out."""
+
+    def _app(self, form):
+        app = form()
+        app.selectbox(key="t_model_AAPL").select("highlow").run()
+        assert not app.exception
+        return app
+
+    def test_the_zone_opens_off_and_the_removed_boxes_are_gone(self, form):
+        app = self._app(form)
+        assert app.number_input(key="t_zone_length").value == 0
+        assert app.number_input(key="t_zone_width").disabled
+        assert not app.number_input(key="t_take_after_minutes").disabled
+        keys = {w.key for w in [*app.number_input, *app.checkbox, *app.selectbox]}
+        assert not keys & {"t_hold_min_gain_k", "t_take_under_buy_stands_down", "t_take_trigger"}
+        out = app.session_state["out"]
+        assert (out.take_trigger, out.zone_min_bars, out.take_under_buy_stands_down) == (
+            "either", 0, False
+        )
+        assert out.momentum_take_on and not out.zone_take_on
+
+    def test_a_zone_length_switches_the_zone_on_beside_the_momentum_fade(self, form):
+        app = self._app(form)
+        app.number_input(key="t_zone_length").set_value(20).run()
+        assert not app.number_input(key="t_zone_width").disabled
+        out = app.session_state["out"]
+        assert out.momentum_take_on and out.zone_take_on
+        assert "@conf|zone20b/3u" in at.config_signature(out)
+
+    def test_a_share_of_0_switches_both_takes_off(self, form):
+        app = self._app(form)
+        app.number_input(key="t_zone_length").set_value(20).run()
+        app.number_input(key="t_take_pct").set_value(0.0).run()
+        assert app.number_input(key="t_take_after_minutes").disabled
+        assert app.number_input(key="t_zone_length").disabled
+        assert app.number_input(key="t_zone_width").disabled
+        out = app.session_state["out"]
+        assert not out.has_take and "take=" not in at.config_signature(out)
+
+    def test_a_one_bar_zone_reads_as_none(self, form):
+        app = self._app(form)
+        app.number_input(key="t_zone_length").set_value(1).run()
+        assert any("at least 2 bars" in w.value for w in app.warning)
+        assert app.session_state["out"].zone_min_bars == 0
+
 
 def _two_symbol_form() -> None:
     import streamlit as st
