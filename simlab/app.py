@@ -5882,7 +5882,8 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     names = sim_tuning.dataset_names(spec, by_date=True)
 
     if job["status"] == sim_tuning.RUNNING:
-        st.info("Still running — the heatmaps fill in as cells finish.",
+        st.info("Still running — the heatmap fills in as each combination finishes"
+                + (" on every dataset." if len(names) > 1 else "."),
                 icon=":material/hourglass_top:")
     elif job["status"] == sim_tuning.FAILED:
         st.error(
@@ -5971,33 +5972,37 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     view = _tuning_view_picker(axes, marks, key=f"tune_view_{job_id}")
     # An Average square is several configurations at once, so it cannot be one.
     clickable = sim_tuning.SLICE_MEAN not in view
-    _render_tuning_charts([
-        (
-            f"tune_heat_{job_id}_{index}",
-            _tuning_view_heatmap(
-                job["cells"].get(name) or [], axes, marks, f"{prefix}{name}", view,
-                clickable=clickable,
-            ),
-        )
-        for index, name in enumerate(names)
-    ], job_id=job_id if clickable else None)
+    # Only the sum (since 2026-10-28, the user's: a heatmap per dataset was too
+    # much to read); each dataset's own share is in the tables' per-dataset
+    # columns. A job of one dataset draws that dataset, which is its sum.
     if len(names) > 1:
-        _render_tuning_charts([(
+        heat = (
             f"tune_heat_sum_{job_id}",
             _tuning_view_heatmap(
                 sim_tuning.summed_cells(job), axes, marks,
                 f"Sum of all {len(names)} datasets", view, clickable=clickable,
             ),
-        )], job_id=job_id if clickable else None)
+        )
+    else:
+        heat = (
+            f"tune_heat_{job_id}_0",
+            _tuning_view_heatmap(
+                job["cells"].get(names[0]) or [], axes, marks, f"{prefix}{names[0]}", view,
+                clickable=clickable,
+            ),
+        )
+    _render_tuning_charts([heat], job_id=job_id if clickable else None)
+    if len(names) > 1:
         st.caption(
-            "A combination is summed once every dataset has replayed it. The best options "
-            "are read off this sum, so every dataset above is in sample: one worth keeping "
-            "is in profit on most of them, not carried by one."
+            "A combination is summed once every dataset has replayed it; what it made on "
+            "each one is in the tables' per-dataset columns. The best options are read off "
+            "this sum, so every dataset is in sample: one worth keeping is in profit on "
+            "most of them, not carried by one."
         )
     further = " and ".join(_tuning_param_label(a["name"]) for a in axes[2:])
     if len(axes) == 3:
         st.caption(
-            f"The heatmaps are the first two parameters; the switch above picks what to "
+            f"The heatmap is the first two parameters; the switch above picks what to "
             f"show of {further}. Every outline sits where its combination is on the first "
             f"two, whatever its own value of {further}; on one value, an outline at another "
             "names it in the legend, and the square's number is this value's, not its "
@@ -6007,7 +6012,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         )
     elif len(axes) > 3:
         st.caption(
-            f"The heatmaps are the first two parameters; the switches above pick what to "
+            f"The heatmap is the first two parameters; the switches above pick what to "
             f"show of {further}. Every outline sits where its combination is on the first "
             "two, whatever its own values there; held at one value, an outline at another "
             "names it in the legend, and the square's number is the view's, not its own — "
@@ -6018,7 +6023,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             "are left out of its average."
         )
     st.caption(
-        ":material/crop_free: Outlined at the same combination on every heatmap: the "
+        ":material/crop_free: Outlined: the "
         "**current configuration** — what a new run of the pair starts from now — and the "
         "best **total profit**, **Sharpe ratio** and **win rate** "
         + (f"summed over all {len(names)} datasets" if len(names) > 1 else "of the grid")
