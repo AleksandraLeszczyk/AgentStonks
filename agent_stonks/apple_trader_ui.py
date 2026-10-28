@@ -541,15 +541,25 @@ def dayrange_params(
     keys carry both so that switching either re-seeds them with that pair
     rather than carrying the last one's numbers across. So does the stop, which
     was tuned with them.
+
+    The sell can instead rest a distance above the fill (`sell_gain_k`): a box
+    and its distance under the two, the sell under H greyed out while it is
+    ticked -- and the other way round, so either comes back where it was.
+    Off a pair whose defaults sell under H, the distance opens on the gap
+    between its two levels: the same target, for a fill at the buy level.
     """
     section("Levels", copy.sections.get("dayrange"))
     default_buy, default_sell = float(defaults.buy_k), float(defaults.sell_k)
-    levels = dict(ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}")
+    default_gain = float(defaults.sell_gain_k) or round(default_buy - default_sell, 2)
+    levels = dict(
+        ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}",
+        sell_gain_k=f"{default_gain:g}",
+    )
     # Before the two distances, because it decides what they are counted in and
     # a label that named the wrong unit would be worse than no label at all.
     level_unit = level_unit_param(defaults, copy)
     unit_label = UNIT_FORM_LABELS[level_unit]
-    start_buy, start_sell = default_buy, default_sell
+    start_buy, start_sell, start_gain = default_buy, default_sell, float(defaults.sell_gain_k)
     same_pair = (
         seed is not None
         and (seed.ticker or "").upper() == ticker
@@ -557,8 +567,13 @@ def dayrange_params(
     )
     if same_pair and seed.level_unit == level_unit:
         start_buy, start_sell = float(seed.buy_k), float(seed.sell_k)
+        # By name: a run started before a code save carries the class as it was.
+        start_gain = float(getattr(seed, "sell_gain_k", 0.0))
     # A share of the gap between the levels, so it does not depend on the unit.
     stop_seed = float(seed.stop_gain_fraction) if same_pair else None
+    # Read before the sell under H renders, which it greys out.
+    above_key = copy.key(f"sell_above_fill_{model_key}_{ticker}")
+    above = bool(st.session_state.get(above_key, start_gain > 0))
     col_a, col_b = st.columns(2)
     buy_k = col_a.number_input(
         f"Buy distance (× {unit_label} below H)",
@@ -571,16 +586,37 @@ def dayrange_params(
         min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
         key=copy.key(f"sell_k_{model_key}_{ticker}"),
         help=copy.help.get("sell_k", "").format(**levels),
+        disabled=above,
     )
+    col_a, col_b = st.columns(2)
+    above = col_a.checkbox(
+        "Sell above the fill instead",
+        value=start_gain > 0,
+        key=above_key,
+        help=copy.help.get("sell_above_fill", "").format(**levels) or None,
+    )
+    sell_gain_k = col_b.number_input(
+        f"Sell distance (× {unit_label} above the fill)",
+        min_value=0.05, max_value=3.0, value=min(3.0, max(0.05, start_gain or default_gain)),
+        step=0.05, format="%.2f",
+        key=copy.key(f"sell_gain_k_{model_key}_{ticker}"),
+        help=copy.help.get("sell_gain_k", "").format(**levels) or None,
+        disabled=not above,
+    )
+    col_a, col_b = st.columns(2)
     sizing = position_params(defaults, unit_label, copy, col_a, col_b)
-    sell_k = repaired_sell(float(buy_k), float(sell_k))
+    # Above the fill the sell under H is not read, so not repaired either:
+    # the config keeps it valid itself.
+    sell_k = float(sell_k) if above else repaired_sell(float(buy_k), float(sell_k))
+    sell_gain_k = float(sell_gain_k) if above else 0.0
+    gain = sell_gain_k or float(buy_k) - sell_k
     rules = rule_params(
-        defaults, float(buy_k), float(sell_k), unit_label, copy,
+        defaults, gain, unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
         stop_scope=f"{model_key}_{ticker}", stop_seed=stop_seed, breach_scope=ticker,
     )
     min_win_k = min_win_param(
-        ticker, float(buy_k), float(sell_k), unit_label, copy, float(defaults.min_win_k)
+        ticker, gain, unit_label, copy, float(defaults.min_win_k)
     )
     until_revised = breaker_until_param(defaults, copy, rules)
     return replace(
@@ -588,7 +624,8 @@ def dayrange_params(
         model_key=model_key,
         ticker=ticker,
         buy_k=float(buy_k),
-        sell_k=float(sell_k),
+        sell_k=sell_k,
+        sell_gain_k=sell_gain_k,
         level_unit=level_unit,
         min_win_k=min_win_k,
         breaker_until_revised=until_revised,
@@ -668,7 +705,7 @@ def repaired_sell(buy_k: float, sell_k: float, label: str = "") -> float:
 
 
 def rule_params(
-    defaults: AppleTraderConfig, buy_k: float, sell_k: float, unit_label: str,
+    defaults: AppleTraderConfig, gain: float, unit_label: str,
     copy: FormCopy, take_on: bool, stop_scope: str = "",
     stop_seed: "float | None" = None, breach_scope: str = "", stop: bool = True,
 ) -> dict:
@@ -676,13 +713,14 @@ def rule_params(
     instrument, but for the stop -- see `exit_params` for `stop_scope`,
     `stop_seed` and `stop` -- and the breach policy (`breach_param`,
     `breach_scope`).
-    `buy_k` and `sell_k` only feed the stop's `?`, which says what the stop
-    fraction comes to against them."""
+    `gain` -- what a target exit pays, in level units (`target_gain_k`) --
+    only feeds the stop's `?`, which says what the stop fraction comes to
+    against it."""
     breach_update = breach_param(defaults, copy, scope=breach_scope)
     held = held_params(defaults, breach_update, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     exits = exit_params(
-        defaults, buy_k, sell_k, unit_label, copy, take_on=take_on,
+        defaults, gain, unit_label, copy, take_on=take_on,
         stop_scope=stop_scope, stop_seed=stop_seed, stop=stop,
     )
     skip_events = skip_param(defaults, copy)
@@ -712,12 +750,13 @@ def skip_param(defaults: AppleTraderConfig, copy: FormCopy) -> "tuple[str, ...]"
 
 
 def min_win_param(
-    ticker: str, buy_k: float, sell_k: float, unit_label: str, copy: FormCopy,
+    ticker: str, gain: float, unit_label: str, copy: FormCopy,
     default: "float | None" = None,
 ) -> float:
     """The session circuit breaker, and the one thing worth checking it against.
 
-    The most a target exit can net is `buy_k - sell_k` level units a share, so a
+    The most a target exit can net is `gain` level units a share
+    (`target_gain_k`: `buy_k - sell_k`, or the sell above the fill), so a
     threshold at or above that stands the session down after *every* completed
     trade however well it went. That is a legitimate setting -- one trade a day
     unless it runs past the target -- but it is not what "stop after a bad
@@ -739,11 +778,10 @@ def min_win_param(
     min_win_k = min_win_inputs(
         copy, unit_label, default, min_win_for(ticker), scope=f"_{ticker}", ticker=ticker,
     )
-    target_gain = buy_k - sell_k
-    if min_win_k and min_win_k >= target_gain:
+    if min_win_k and min_win_k >= gain:
         st.warning(
-            f"At or above the {target_gain:.2f} the levels are apart, every trade stands "
-            f"the session down — one trade a day. Set it below {target_gain:.2f} to stop "
+            f"At or above the {gain:.2f} a target exit pays, every trade stands "
+            f"the session down — one trade a day. Set it below {gain:.2f} to stop "
             "only after weak trades.",
             icon=":material/warning:",
         )
@@ -946,8 +984,7 @@ def containment_params(
 
 def exit_params(
     defaults: AppleTraderConfig,
-    buy_k: float,
-    sell_k: float,
+    gain: float,
     unit_label: str,
     copy: FormCopy,
     take_on: bool = True,
@@ -986,9 +1023,9 @@ def exit_params(
     left out: Orchestra sets one per pair, beside its levels (since
     2026-10-26; its pairs shared one before).
 
-    The stop is the one that takes the levels as an argument, because it is
-    written as a share of what they are playing for rather than as a distance
-    of its own. The number on screen therefore means a different stop on every
+    The stop is the one that takes the levels' gain as an argument, because it
+    is written as a share of what they are playing for rather than as a
+    distance of its own. The number on screen therefore means a different stop on every
     instrument, and what it comes to in level units is said in its `?` rather than
     left to be worked out -- the whole point of the reparameterisation is that
     the *fraction* travels between symbols and the distance does not.
@@ -1012,7 +1049,7 @@ def exit_params(
                 copy.help.get("stop_gain_fraction", "").format(
                     stop_gain_fraction=f"{defaults.stop_gain_fraction:g}"
                 ),
-                stop_note(shown, float(buy_k), float(sell_k), unit_label),
+                stop_note(shown, float(gain), unit_label),
             ) if p),
         ))
         stop_warning(col_a, stopped["stop_gain_fraction"])
@@ -1083,10 +1120,9 @@ def exit_heading(title: str) -> None:
     st.caption(f"**{title}**")
 
 
-def stop_note(
-    stop_gain_fraction: float, buy_k: float, sell_k: float, unit_label: str
-) -> str:
-    """What the stop fraction comes to against these levels, in their unit.
+def stop_note(stop_gain_fraction: float, gain: float, unit_label: str) -> str:
+    """What the stop fraction comes to against these levels, in their unit --
+    `gain` being what a target exit pays (`target_gain_k`).
 
     A fraction of the predicted gain is the right thing to *set* and the wrong
     thing to compare against the other exit knobs, which are all level-unit distances
@@ -1103,10 +1139,9 @@ def stop_note(
             "**At the current setting:** no stop — a position leaves at the sell level, "
             "on a momentum take, or at the closing flatten."
         )
-    gain = buy_k - sell_k
     return (
         f"**At the current levels:** {stop_gain_fraction:g} × the {gain:.2f} × "
-        f"{unit_label} between them = **{stop_gain_fraction * gain:.3f} × {unit_label}** "
+        f"{unit_label} a target exit pays = **{stop_gain_fraction * gain:.3f} × {unit_label}** "
         "under the fill, "
         f"risking \\${stop_gain_fraction:.2f} for every \\$1.00 a target exit pays."
     )
@@ -1310,7 +1345,7 @@ def orchestra_params(
         sizing = position_params(defaults, unit_label, copy, col_a, col_b, confirmation=False)
         first = levels[ranged[0]]
         rules = rule_params(
-            defaults, first["buy_k"], first["sell_k"], unit_label, copy,
+            defaults, first["buy_k"] - first["sell_k"], unit_label, copy,
             take_on=any(levels[key]["momentum_confirmation_bars"] for key in ranged),
             stop=False,
         )

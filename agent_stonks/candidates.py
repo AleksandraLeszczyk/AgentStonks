@@ -329,10 +329,13 @@ LIVE_SOURCES = LiveSources()
 
 def target_k(config) -> float:
     """What a target exit of this pair pays, in its level units (ADRs): the
-    gap between the two levels on the day-range rules, the take over the fill
+    gap between the two levels on the day-range rules -- or the sell above the
+    fill (`sell_gain_k`), as `target_gain_k` reads it -- the take over the fill
     on GoodMoments'."""
     if apple_models.strategy(config.model_key) == apple_models.STRATEGY_PROBABILITY:
         return float(config.gm_take_k)
+    if getattr(config, "sell_gain_k", 0.0):
+        return float(config.sell_gain_k)
     return float(config.buy_k) - float(config.sell_k)
 
 

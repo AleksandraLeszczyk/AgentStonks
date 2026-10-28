@@ -1156,12 +1156,18 @@ def _carried_config(ran, form, symbol: str, running: "bool | None"):
         return form if dayrange else ran
     if form.model_key != ran.model_key or form.level_unit != ran.level_unit:
         return ran
+    # Read by name: a run started before a code save carries the class as it
+    # was then, which may not have the sell above the fill yet.
+    gains = (float(getattr(form, "sell_gain_k", 0.0)), float(getattr(ran, "sell_gain_k", 0.0)))
     distances = (float(form.buy_k), float(form.sell_k))
-    if distances == (float(ran.buy_k), float(ran.sell_k)):
+    if distances == (float(ran.buy_k), float(ran.sell_k)) and gains[0] == gains[1]:
         return ran
+    changed = {"buy_k": distances[0], "sell_k": distances[1]}
+    if gains[0] != gains[1]:
+        changed["sell_gain_k"] = gains[0]
     try:
-        return replace(ran, buy_k=distances[0], sell_k=distances[1])
-    except ValueError:  # the run refuses a crossed pair too
+        return replace(ran, **changed)
+    except (TypeError, ValueError):  # the run refuses a crossed pair too
         return ran
 
 
@@ -1377,11 +1383,21 @@ def _trader_levels_items(
 
 
 def _resting_how(config) -> str:
-    """Where a configuration rests its buy and sell, in a note's words."""
+    """Where a configuration rests its buy and sell, in a note's words. A sell
+    above the fill (`sell_gain_k`) is drawn above the buy level until there is
+    a fill, and above the fill after."""
+    model = (
+        f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else ""
+    )
+    if getattr(config, "sell_gain_k", 0.0):
+        return (
+            f"buy {config.buy_k:g} × the {config.unit_phrase} under the predicted high{model}, "
+            f"sell {config.sell_gain_k:g} × above the fill (above the buy level before one)"
+        )
     return (
         f"buy {config.buy_k:g} × and sell {config.sell_k:g} × the {config.unit_phrase} under "
         + "the predicted high"
-        + (f" ({_HIGHLOW_NAMES[config.model_key]})" if config.model_key in _HIGHLOW_NAMES else "")
+        + model
     )
 
 

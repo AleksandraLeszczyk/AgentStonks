@@ -176,6 +176,13 @@ TUNABLES: "dict[str, Tunable]" = {
         # header has no room to and must not name the wrong one.
         Tunable("buy_k", "Buy distance (× unit below H)", 0.05, 3.0, 0.05, (0.30, 0.90, 0.10)),
         Tunable("sell_k", "Sell distance (× unit below H)", 0.0, 3.0, 0.05, (0.05, 0.45, 0.10)),
+        # The other sell level, over the fill rather than under H. Its 0 is the
+        # sell under H (`sell_k`), so one axis from 0 sets the two side by side;
+        # above 0 a `sell_k` axis is not read and collapses.
+        Tunable(
+            "sell_gain_k", "Sell above the fill (× unit, 0 = below H)", 0.0, 3.0, 0.05,
+            (0.0, 0.60, 0.10),
+        ),
         Tunable(
             "stop_gain_fraction", "Stop loss (× the predicted gain)", 0.0, 3.0, 0.05,
             (0.0, 1.0, 0.25),
@@ -369,6 +376,7 @@ CHOICES: "dict[str, Choice]" = {
 SWEEPABLE: "tuple[str, ...]" = (
     "buy_k",
     "sell_k",
+    "sell_gain_k",
     "breach_update",
     "stop_gain_fraction",
     "momentum_confirmation_bars",

@@ -593,6 +593,203 @@ class TestStopIsAShareOfThePredictedGain:
         assert at.stop_distance(config, 10.0) > TARGET_GAIN
 
 
+class TestSellAboveTheFill:
+    """The other sell level (`sell_gain_k`, 2026-10-28): a distance over the
+    price actually paid rather than under the predicted high.
+
+    At 0.5 ADR on the $10 ADR it is $5.00 over the fill: drawn at $107.50 while
+    flat (over the $102.50 buy level), $108.00 once filled at $103. The stop is
+    half of that gain, $2.50, under the fill.
+    """
+
+    GAIN = 0.5
+    FLAT_SELL = BUY_LEVEL + 5.0   # 107.50
+    SELL = 103.0 + 5.0            # 108.00
+
+    def _entered(self, state, tracker, tape, **kwargs):
+        kwargs.setdefault("sell_gain_k", self.GAIN)
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        state.apple_trader_config = trader.config
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        return trader
+
+    def _setup(self, monkeypatch):
+        broker = FakeBroker(103.0)
+        return DecisionTracker(starting_cash=10_000.0, broker=broker), Tape(monkeypatch, broker)
+
+    def test_what_a_target_pays_is_the_distance_and_the_stop_a_share_of_it(self):
+        config = dayrange_config(sell_gain_k=self.GAIN)
+        assert config.sells_above_fill
+        assert config.target_gain_k == pytest.approx(0.5)
+        assert at.stop_distance(config, 10.0) == pytest.approx(2.5)
+        assert not dayrange_config().sells_above_fill
+
+    def test_the_sell_under_h_is_not_read_so_a_crossed_one_is_not_refused(self):
+        """A grid sweeping the buy distance under it keeps every cell; the
+        unread distance is kept under the buy one (0) for whatever reads it."""
+        config = dayrange_config(sell_gain_k=self.GAIN, buy_k=0.3, sell_k=0.4)
+        assert config.sell_k == 0.0
+        assert dayrange_config(sell_gain_k=self.GAIN, sell_k=0.1).sell_k == 0.1
+        with pytest.raises(ValueError, match="sell_k"):
+            dayrange_config(buy_k=0.3, sell_k=0.4)
+
+    def test_a_negative_distance_is_refused(self):
+        with pytest.raises(ValueError, match="sell_gain_k"):
+            dayrange_config(sell_gain_k=-0.1)
+
+    def test_it_signs_off_the_entry_without_the_sell_under_h(self):
+        assert ",sell=H-0.1A," in config_signature(dayrange_config())
+        signed = config_signature(dayrange_config(sell_gain_k=self.GAIN))
+        assert ",sell=E+0.5A," in signed and "sell=H-" not in signed
+        assert "sell=E+0.5R" in config_signature(
+            dayrange_config(sell_gain_k=self.GAIN, level_unit=UNIT_PRED_RANGE)
+        )
+        # The stop it is a share of signs as before.
+        assert ",stop=E-0.5G" in signed
+
+    def test_the_settings_table_says_where_it_rests(self):
+        rows = {name: value for _, name, value in at.config_settings(
+            dayrange_config(sell_gain_k=self.GAIN)
+        )}
+        assert rows["Sell distance"] == "0.5 × ADR above the fill"
+        assert "(= 0.25 × ADR)" in rows["Stop loss"]
+
+    def test_while_flat_it_is_drawn_over_the_buy_level(self, state, market_open, monkeypatch):
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=FakeBroker(108.0))
+        tape = Tape(monkeypatch)
+        trader = at.DayRangeTrader(dayrange_config(sell_gain_k=self.GAIN))
+        tape.append(108.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert trader.plan["sell_level"] == pytest.approx(self.FLAT_SELL)
+        assert state.apple_trader_levels["rows"][-1]["sell"] == pytest.approx(self.FLAT_SELL)
+        assert any("above the fill" in e.get("text", "") for e in state.agent_log)
+
+    def test_the_chart_walk_draws_it_there_too(self, monkeypatch):
+        tape = Tape(monkeypatch)
+        opening_end = tape.index[-1]
+        tape.append(106.0)
+        rows = at.session_levels(
+            dayrange_config(sell_gain_k=self.GAIN), dict(FORECAST), tape.frame(), opening_end
+        )
+        assert [r["sell"] for r in rows] == pytest.approx([self.FLAT_SELL] * 2)
+
+    def test_once_filled_it_rests_over_the_fill(self, state, market_open, monkeypatch):
+        tracker, tape = self._setup(monkeypatch)
+        trader = self._entered(state, tracker, tape)
+        assert trader.plan["sell_level"] == pytest.approx(self.SELL)
+        assert trader._stop_price() == pytest.approx(103.0 - 2.5)
+        # Frozen with the position, so a restart takes it back.
+        assert trader.memory()["entry"]["gain_unit"] == pytest.approx(10.0)
+        entry = tracker.snapshot()["decisions"][-1].reasoning
+        assert "a resting sell 0.5 × ADR above the fill ($5.00)" in entry
+
+        tape.append(107.9, high=self.SELL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(107.9, high=self.SELL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        reasoning = tracker.snapshot()["decisions"][-1].reasoning
+        assert "Target" in reasoning and "0.5 × ADR above the fill at $103.00" in reasoning
+        # Flat again: back over the buy level.
+        tape.append(106.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["sell_level"] == pytest.approx(self.FLAT_SELL)
+
+    def test_the_stop_fires_at_its_share_of_the_distance(self, state, market_open, monkeypatch):
+        tracker, tape = self._setup(monkeypatch)
+        trader = self._entered(state, tracker, tape)
+        tape.append(100.6, low=100.51)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        tape.append(100.4, low=100.49)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert "Stop loss" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_a_breach_moves_the_buy_level_but_not_a_positions_sell(
+        self, state, market_open, monkeypatch
+    ):
+        """Under the predicted range the unit widens with a breach; the sell
+        keeps the unit of the fill, as the stop does. Range $15, buy 0.5 ×
+        that = $102.50, sell 0.4 × it = $6.00 over the $103 fill."""
+        tracker, tape = self._setup(monkeypatch)
+        trader = self._entered(
+            state, tracker, tape, level_unit=UNIT_PRED_RANGE, buy_k=0.5, sell_gain_k=0.4,
+            stop_gain_fraction=0.0, breach_update="extreme",
+        )
+        assert trader.plan["sell_level"] == pytest.approx(109.0)
+        tape.append(95.0, low=94.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.plan["pred_low"] == pytest.approx(94.0)
+        assert trader.plan["level_unit"] == pytest.approx(16.0)
+        assert trader.plan["sell_level"] == pytest.approx(109.0)
+        update = [
+            e["text"] for e in state.agent_log if "forecast updated" in e.get("text", "")
+        ][-1]
+        assert "The sell stays 0.4 × predicted range above the fill, at $109.00" in update
+
+    def test_after_an_add_it_rests_over_the_average_cost(self, state, market_open, monkeypatch):
+        """Half the cash a buy, the half-way rung at $101.25: the sell moves down
+        with what the position cost, still $5.00 over it."""
+        broker = FakeBroker(BUY_LEVEL)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config(
+            sell_gain_k=self.GAIN, scale_in=True, position_pct=50.0,
+        ))
+        tape.append(BUY_LEVEL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert trader.plan["sell_level"] == pytest.approx(BUY_LEVEL + 5.0)
+        tape.append(101.2)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        average = float(trader.entry["price"])
+        assert 101.2 < average < BUY_LEVEL
+        assert trader.plan["sell_level"] == pytest.approx(average + 5.0)
+
+    def test_a_sidebar_edit_moves_an_open_positions_sell(self, state, market_open, monkeypatch):
+        tracker, tape = self._setup(monkeypatch)
+        trader = self._entered(state, tracker, tape)
+        state.apple_trader_config = dayrange_config(sell_gain_k=0.8)
+        tape.append(104.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.config.sell_gain_k == 0.8
+        assert trader.plan["sell_level"] == pytest.approx(103.0 + 8.0)
+        changed = [e["text"] for e in state.agent_log if "from the sidebar" in e.get("text", "")]
+        assert "sell 0.5 → 0.8 × ADR above the fill" in changed[-1]
+
+    def test_switching_from_the_sidebar_says_both_forms(self, state, market_open, monkeypatch):
+        tracker, tape = self._setup(monkeypatch)
+        trader = self._entered(state, tracker, tape, sell_gain_k=0.0)
+        assert trader.plan["sell_level"] == pytest.approx(SELL_LEVEL)
+        state.apple_trader_config = dayrange_config(sell_gain_k=self.GAIN)
+        tape.append(104.0)
+        trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert trader.plan["sell_level"] == pytest.approx(self.SELL)
+        changed = [
+            e["text"] for e in state.agent_log if "from the sidebar" in e.get("text", "")
+        ][-1]
+        assert (
+            "sell 0.1 × ADR under the predicted high → 0.5 × ADR above the fill" in changed
+        )
+
+    def test_a_take_short_of_a_close_sell_sells_everything(
+        self, state, market_open, monkeypatch
+    ):
+        """What is left to the sell is the distance itself: under the 0.3
+        worth keeping a runner for, the take keeps none."""
+        tracker, tape = self._setup(monkeypatch)
+        trader = self._entered(
+            state, tracker, tape, sell_gain_k=0.2, negative_momentum_bars=2, negative_for_bars=1,
+        )
+        for close in (104.0, 104.5, 103.5):
+            tape.append(close)
+            outcome = trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+        assert outcome == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert "only $2.00 (0.20 × ADR) above the fill" in (
+            tracker.snapshot()["decisions"][-1].reasoning
+        )
+
+
 class TestDayRangeMomentumTake:
     """Banking gains short of the target once momentum has been negative for long enough.
 

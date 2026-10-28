@@ -91,6 +91,7 @@ from .config import (
     APPLE_TRADER_POSITION_PCT,
     MOMENTUM_NEUTRAL_FRACTION,
     APPLE_TRADER_SCALE_IN,
+    APPLE_TRADER_SELL_GAIN_K,
     APPLE_TRADER_SELL_K,
     APPLE_TRADER_SKIP_EVENTS,
     APPLE_TRADER_STOP_GAIN_FRACTION,
@@ -420,6 +421,13 @@ class AppleTraderConfig:
     # construction both are always floats.
     buy_k: Optional[float] = None
     sell_k: Optional[float] = None
+    # The other sell level (2026-10-28): this many level units above the price
+    # the position was bought at -- its average cost after an add -- with the
+    # unit frozen at the first fill, as the stop's is (`_sell_level`). While
+    # flat it is drawn above the buy level, where a fill at the level would put
+    # it. 0 is the sell `sell_k` under the reference, which every record made
+    # before it replays as; above 0 `sell_k` is not read.
+    sell_gain_k: float = APPLE_TRADER_SELL_GAIN_K
     position_pct: float = APPLE_TRADER_POSITION_PCT
     flatten_before_close_min: int = APPLE_TRADER_FLATTEN_BEFORE_CLOSE_MIN
     # The managed exit on top of the sell level and the flatten -- see
@@ -429,7 +437,8 @@ class AppleTraderConfig:
     # How far under the fill a bar's low may reach before the trade is taken to
     # have gone the wrong way, as a share of what the trade is playing for --
     # the predicted gain, `(buy_k - sell_k) x ADR`, which is the gap between the
-    # two levels at every minute of the session. 0.5 risks one dollar for every
+    # two levels at every minute of the session (`sell_gain_k` x ADR over the
+    # fill under the other sell level). 0.5 risks one dollar for every
     # two the target is worth. 0 switches the stop off. None -> the pair's own
     # tuned stop (`stop_for`), filled in by `__post_init__`.
     stop_gain_fraction: Optional[float] = None
@@ -679,7 +688,7 @@ class AppleTraderConfig:
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
             "momentum_confirmation_bars", "take_min_gain_fraction", "buy_step_k",
-            "take_after_minutes", "breach_hold_k",
+            "take_after_minutes", "breach_hold_k", "sell_gain_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -818,6 +827,16 @@ class AppleTraderConfig:
             self.buy_k = default_buy
         if self.sell_k is None:
             self.sell_k = default_sell
+        self.sell_gain_k = float(self.sell_gain_k)
+        # Above the fill, `sell_k` is not read -- so not refused either: a grid
+        # sweeping the buy distance under it would otherwise lose every cell
+        # at or under the base's sell. Kept under the buy distance all the
+        # same (0, the predicted high, where it was not), so whatever reads the
+        # pair's two distances -- a base read back by `dayrange_levels`, an
+        # Orchestra row, the form with the sell under H again -- is handed a
+        # pair the rule below accepts.
+        if self.sell_gain_k and self.sell_k >= self.buy_k:
+            self.sell_k = 0.0
         # The ordering is what makes the rule a rule (buy below, sell above),
         # and catching it here means a UI cannot hand the loop a pair that
         # would buy and sell on the same bar forever.
@@ -911,8 +930,19 @@ class AppleTraderConfig:
         The stop still becomes a fixed price at the fill because `_buy` converts it
         to dollars once, there and then, and `_risk` reads that back rather
         than re-deriving it.
+
+        Under the sell above the fill it is that distance, `sell_gain_k`: the
+        gap between the fill and its sell, whatever the buy level was.
         """
+        if self.sell_gain_k:
+            return float(self.sell_gain_k)
         return float(self.buy_k) - float(self.sell_k)
+
+    @property
+    def sells_above_fill(self) -> bool:
+        """Whether the sell level hangs over the fill (`sell_gain_k`) rather
+        than under the reference."""
+        return bool(self.sell_gain_k)
 
     @property
     def unit_phrase(self) -> str:
@@ -1119,6 +1149,27 @@ def stop_phrase(config: AppleTraderConfig) -> str:
     return f"{config.stop_k:g} × ADR"
 
 
+def sell_phrase(config: AppleTraderConfig) -> str:
+    """Where the sell rests, in the units it was written in: under the
+    predicted high, or over the fill (`sell_gain_k`)."""
+    if config.sells_above_fill:
+        return f"{config.sell_gain_k:g} × {config.unit_phrase} above the fill"
+    return f"{config.sell_k:g} × {config.unit_phrase} under the predicted high"
+
+
+def _distance_change(old: AppleTraderConfig, new: AppleTraderConfig) -> str:
+    """A change of the two distances in words, for the sidebar's log lines:
+    "buy 0.6 → 0.5 × ADR under the predicted high, sell 0.1 → 0.15" while the
+    sell stays in the same form, both forms spelled out when it switches."""
+    unit = new.unit_phrase
+    text = f"buy {old.buy_k:g} → {new.buy_k:g} × {unit} under the predicted high, sell "
+    if old.sells_above_fill != new.sells_above_fill:
+        return text + f"{sell_phrase(old)} → {sell_phrase(new)}"
+    if new.sells_above_fill:
+        return text + f"{old.sell_gain_k:g} → {new.sell_gain_k:g} × {unit} above the fill"
+    return text + f"{old.sell_k:g} → {new.sell_k:g} × {unit} under the predicted high"
+
+
 def fade_phrase(config: AppleTraderConfig) -> str:
     """The take's trigger in words, in whichever form it is written -- both,
     under "either" with a zone."""
@@ -1294,8 +1345,11 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # existed (which replays with none) keeps the signature it was filed under.
     if c.skip_events:
         breach += ",skip=" + "+".join(event_days.TOKENS[e] for e in c.skip_events)
+    # The sell above the fill signs as `sell=E+0.5R`, off the **E**ntry like
+    # the stop, with no `sell_k`, which it does not read.
+    sell = f"E+{c.sell_gain_k:g}" if c.sells_above_fill else f"H-{c.sell_k:g}"
     return (
-        f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}{unit},sell=H-{c.sell_k:g}{unit},"
+        f"{c.model_key}_{c.ticker}(buy=H-{c.buy_k:g}{unit},sell={sell}{unit},"
         f"size={c.position_pct:g}%{adds}{exits}{breach})"
     )
 
@@ -1411,7 +1465,10 @@ def _dayrange_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
     rows = [
         (levels, "Distances counted in", unit),
         (levels, "Buy distance", f"{c.buy_k:g} × {unit} below the predicted high"),
-        (levels, "Sell distance", f"{c.sell_k:g} × {unit} below the predicted high"),
+        (levels, "Sell distance", (
+            f"{c.sell_gain_k:g} × {unit} above the fill" if c.sells_above_fill
+            else f"{c.sell_k:g} × {unit} below the predicted high"
+        )),
         (levels, "Position size", f"{c.position_pct:g}% of cash"),
         (levels, "Buy order", "limit at the buy level" if c.limit_entry else "market"),
         (levels, "Momentum confirmation period",
@@ -2190,6 +2247,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 "risk": stop_distance(self.config, stop_unit(self.config, self.plan))
                 if self.plan
                 else None,
+                "gain_unit": level_unit(self.config, self.plan) if self.plan else None,
             }
         if position <= 0:
             self.entry = None
@@ -2551,6 +2609,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 new = replace(
                     config, model_key=form.model_key,
                     buy_k=float(form.buy_k), sell_k=float(form.sell_k),
+                    sell_gain_k=float(getattr(form, "sell_gain_k", 0.0)),
                 )
             except ValueError as exc:
                 refusal = str(exc)
@@ -2597,8 +2656,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         self._refused_model = None
         text = (
             f"{self.ticker} model switched from the sidebar at {pd.Timestamp(ts):%H:%M}: "
-            f"{was} → {now}, buy {config.buy_k:g} → {new.buy_k:g}, sell "
-            f"{config.sell_k:g} → {new.sell_k:g} × {new.unit_phrase}."
+            f"{was} → {now}, {_distance_change(config, new)}."
         )
         if self.plan is None:
             # Before 9:35 there is nothing to re-make: the forecast will simply
@@ -2630,6 +2688,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         its distances are counted in the same unit: 0.8 × ADR and 0.8 × the
         predicted range are different orders, and adopting the number without
         the unit would rest them somewhere nobody asked for.
+
+        The sell above the fill (`sell_gain_k`) is one of the distances, its
+        switch included: an open position's sell moves to the new distance
+        over the same fill and the same frozen unit (`_sell_level`).
         """
         form = self.slot.form(state)
         config = self.config
@@ -2639,8 +2701,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             or form.model_key != config.model_key
         ):
             return
-        new = (float(form.buy_k), float(form.sell_k))
-        old = (float(config.buy_k), float(config.sell_k))
+        # By name: a form published before a code save is the class as it was.
+        new = (float(form.buy_k), float(form.sell_k), float(getattr(form, "sell_gain_k", 0.0)))
+        old = (float(config.buy_k), float(config.sell_k), float(config.sell_gain_k))
         if new == old:
             return
         if form.level_unit != config.level_unit:
@@ -2655,21 +2718,20 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                             f"The sidebar's buy/sell distances are counted in "
                             f"{form.unit_phrase} but this run counts in "
                             f"{config.unit_phrase}; a new unit needs ▶ Start, so the "
-                            f"levels stay at {old[0]:g} / {old[1]:g} × "
-                            f"{config.unit_phrase}."
+                            f"levels stay at buy {old[0]:g} × {config.unit_phrase} under "
+                            f"the predicted high, sell {sell_phrase(config)}."
                         ),
                     },
                 )
             return
         try:
-            self.config = replace(config, buy_k=new[0], sell_k=new[1])
+            self.config = replace(config, buy_k=new[0], sell_k=new[1], sell_gain_k=new[2])
         except ValueError as exc:  # the form repairs a crossed pair; belt and braces
             _log(state, {"type": "error", "text": f"Sidebar levels not applied: {exc}"})
             return
         text = (
             f"{self.ticker} levels changed from the sidebar at {pd.Timestamp(ts):%H:%M}: "
-            f"buy {old[0]:g} → {new[0]:g}, sell {old[1]:g} → {new[1]:g} × "
-            f"{config.unit_phrase} below the predicted high."
+            + _distance_change(config, self.config) + "."
         )
         if self.plan is not None:
             was = (float(self.plan["buy_level"]), float(self.plan["sell_level"]))
@@ -2832,6 +2894,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         between the two levels grows over such a session, where under "adr" it
         is the same all day. The plan carries the current unit for the log
         lines and the chart, which must not compute a second one.
+
+        The sell above the fill (`sell_gain_k`) is the exception to all of
+        this while long: it hangs off the position, not off the forecast
+        (`_sell_level`).
         """
         plan, config = self.plan, self.config
         unit = level_unit(config, plan)
@@ -2839,7 +2905,30 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         plan["reference"] = reference
         plan["level_unit"] = unit
         plan["buy_level"] = reference - self._buy_k() * unit
-        plan["sell_level"] = reference - config.sell_k * unit
+        plan["sell_level"] = self._sell_level(reference, unit)
+
+    def _sell_level(self, reference: float, unit: float) -> float:
+        """Where the sell rests on this bar, in dollars.
+
+        `sell_k` units under the reference -- or, under `sell_gain_k`, that
+        many units over what the open position cost: its average fill, so an
+        add moves it down with the cost. The unit is the one the first fill
+        froze (`entry["gain_unit"]`), for the reason the stop's is (`_risk`):
+        under "pred_range" a breach widening the forecast would otherwise move
+        a position's target away from it. A position with no frozen unit -- one
+        adopted on a restart -- reads today's. While flat there is no fill to
+        hang it off, so it is drawn where a fill at the buy level would put it:
+        `sell_gain_k` units over the buy level.
+        """
+        config = self.config
+        if not config.sells_above_fill:
+            return reference - config.sell_k * unit
+        entry = self.entry or {}
+        if entry.get("price"):
+            return float(entry["price"]) + config.sell_gain_k * float(
+                entry.get("gain_unit") or unit
+            )
+        return reference - self._buy_k() * unit + config.sell_gain_k * unit
 
     # --- adding to a position on the way down --------------------------------
 
@@ -3498,7 +3587,17 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             # Containment alone, with nothing breached this bar, cannot move a
             # side -- but say something true rather than nothing if it ever does.
             moved.append("the forecast was widened to hold the session so far")
-        if plan["buy_level"] == before["buy_level"]:
+        if config.sells_above_fill and self.entry is not None:
+            # The sell hangs off the open position, which no forecast moves.
+            levels = (
+                f"The buy level is built from the predicted high: ${plan['buy_level']:,.2f}"
+                + (
+                    "" if plan["buy_level"] == before["buy_level"]
+                    else f" (was ${before['buy_level']:,.2f})"
+                )
+                + f". The sell stays {sell_phrase(config)}, at ${plan['sell_level']:,.2f}."
+            )
+        elif plan["buy_level"] == before["buy_level"]:
             # Only the low moved. Nothing this strategy rests on hangs off it.
             levels = (
                 f"The buy and sell levels are built from the predicted high, so they stay "
@@ -3607,11 +3706,15 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             )
 
         if held is None and high >= plan["sell_level"]:
+            where = (
+                f"{sell_phrase(config)} at ${entry_price:,.2f}"
+                if config.sells_above_fill
+                else f"{sell_phrase(config)}, ${plan['reference']:,.2f}"
+            )
             return position, (
                 f"Target: the bar traded up to ${high:,.2f}, at or through the "
-                f"${plan['sell_level']:,.2f} sell level "
-                f"({config.sell_k:g} × {config.unit_phrase} under the predicted high, "
-                f"${plan['reference']:,.2f}). Selling at market ({pnl_pct:+.2f}%)."
+                f"${plan['sell_level']:,.2f} sell level ({where}). Selling at market "
+                f"({pnl_pct:+.2f}%)."
             ), self.EXIT_TARGET
 
         # After the target, so a breach that also reached the sell level is
@@ -3913,6 +4016,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             self.entry["risk"] = stop_distance(
                 self.config, stop_unit(self.config, self.plan)
             )
+            # And what a unit of the sell above the fill is worth, the same
+            # way (`_sell_level`).
+            self.entry["gain_unit"] = level_unit(self.config, self.plan)
             # The first rung of the ladder `_add` climbs down.
             self.entry["fills"] = 1
             self.entry["last_fill"] = float(self.entry["price"])
@@ -3950,7 +4056,13 @@ class DayRangeTrader(_SitsOut, BaseTrader):
 
     def _entry_reasoning(self, bar) -> str:
         plan, config = self.plan, self.config
-        exits = [f"a resting sell at ${plan['sell_level']:,.2f}"]
+        exits = [
+            # Not a price yet: it hangs off a fill this order has not made.
+            f"a resting sell {sell_phrase(config)} "
+            f"(${config.sell_gain_k * plan['level_unit']:,.2f})"
+            if config.sells_above_fill
+            else f"a resting sell at ${plan['sell_level']:,.2f}"
+        ]
         risk = stop_distance(config, stop_unit(config, plan))
         if risk:
             exits.append(
@@ -4180,17 +4292,23 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     # --- logging -----------------------------------------------------------
 
     def _plan_summary(self) -> str:
-        plan = self.plan
+        plan, config = self.plan, self.config
+        # The sell above the fill hangs off the position, so only the buy
+        # level rests under the forecast.
+        above = config.sells_above_fill
         held = (
-            "Both are held all day."
-            if self.config.breach_update == BREACH_OFF
+            ("It is held all day." if above else "Both are held all day.")
+            if config.breach_update == BREACH_OFF
             else (
-                f"If the session trades outside that range it moves {_breach_side(self.config)} "
-                f"({BREACH_LABELS[self.config.breach_update].lower()}) and both levels "
-                "follow it."
+                f"If the session trades outside that range it moves {_breach_side(config)} "
+                f"({BREACH_LABELS[config.breach_update].lower()}) and "
+                + ("the buy level follows it." if above else "both levels follow it.")
             )
         )
-        rests = "The levels rest under the predicted high, which is flat all session."
+        rests = (
+            f"The {'buy level rests' if above else 'levels rest'} under the predicted high, "
+            "which is flat all session."
+        )
         # A forecast of the range after the opening window (HighLow2's rest
         # head) is not the session's, and says so; it also carries the whole
         # day's pair, which nothing here trades on.
@@ -4202,13 +4320,20 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             f"${float(plan['day_low']):,.2f}"
             if plan.get("day_high") is not None and plan.get("day_low") is not None else ""
         )
+        sell = (
+            f"sell {sell_phrase(config)} (${plan['sell_level']:,.2f} on a fill at the "
+            "buy level)"
+            if above
+            else f"sell at ${plan['sell_level']:,.2f} (ref − {config.sell_k:g} × "
+            f"{config.unit_phrase})"
+        )
         return (
             f"{self.ticker} forecast for {span}, from the first "
             f"{plan['opening_end']:%H:%M} minutes: high ${plan['pred_high']:,.2f}, low "
             f"${plan['pred_low']:,.2f}{day} (yesterday's average ${plan['prev_avg']:,.2f}, "
             f"14-day average range ${plan['adr14_abs']:,.2f}). {rests} Buy at "
-            f"${plan['buy_level']:,.2f} (ref − {self.config.buy_k:g} × {self.config.unit_phrase}), sell at "
-            f"${plan['sell_level']:,.2f} (ref − {self.config.sell_k:g} × {self.config.unit_phrase}). {held}"
+            f"${plan['buy_level']:,.2f} (ref − {config.buy_k:g} × {config.unit_phrase}), "
+            f"{sell}. {held}"
         )
 
     def _read_summary(self, bar, ts, position: float, frame=None) -> str:
@@ -6046,7 +6171,8 @@ def _armed_summary(
         if config.breach_update == BREACH_OFF
         else (
             f" A session that trades outside the forecast moves {_breach_side(config)} "
-            f"({BREACH_LABELS[config.breach_update].lower()}) and both levels with it."
+            f"({BREACH_LABELS[config.breach_update].lower()}) and "
+            + ("the buy level" if config.sells_above_fill else "both levels") + " with it."
         )
     )
     reference = "the predicted high"
@@ -6064,7 +6190,11 @@ def _armed_summary(
         f"{bundle.get('trained_at', 'unknown')}{quality}): at 9:{made:02d} it forecasts where "
         f"{extremes} will land, then rests a buy "
         f"{config.buy_k:g} × the {config.unit_phrase} below {reference} and a sell "
-        f"{config.sell_k:g} below it, until the closing flatten.{breach}{no_fall}"
+        + (
+            f"{config.sell_gain_k:g} × the {config.unit_phrase} above the price it fills at"
+            if config.sells_above_fill else f"{config.sell_k:g} below it"
+        )
+        + f", until the closing flatten.{breach}{no_fall}"
         f"{managed}{breaker}"
     )
 

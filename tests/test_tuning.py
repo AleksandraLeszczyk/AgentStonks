@@ -235,6 +235,26 @@ class TestExpand:
         overrides, reason = refused[0]
         assert overrides == {"buy_k": 0.1} and "must sit above the buy level" in reason
 
+    def test_the_sell_above_the_fill_from_0_sets_both_sells_side_by_side(self):
+        """Its 0 is the sell under H; above it the sell under H is not read,
+        so a buy distance at or under it is a cell like any other there."""
+        configs, refused = tu.expand(self.base(sell_k=0.25), [
+            {"name": "buy_k", "values": [0.1, 0.5]},
+            {"name": "sell_gain_k", "values": [0.0, 0.4]},
+        ])
+        assert [(c.buy_k, c.sell_gain_k) for c in configs] == [
+            (0.1, 0.4), (0.5, 0.0), (0.5, 0.4)
+        ]
+        assert [overrides for overrides, _ in refused] == [{"buy_k": 0.1, "sell_gain_k": 0.0}]
+        assert ",sell=H-0.25R," in tu.config_signature(configs[1])
+        assert ",sell=E+0.4R," in tu.config_signature(configs[2])
+
+    def test_a_sell_under_h_swept_above_the_fill_is_queued_once(self):
+        configs, _ = tu.expand(
+            self.base(sell_gain_k=0.4), [{"name": "sell_k", "values": [0.1, 0.2, 0.3]}]
+        )
+        assert len(configs) == 1
+
     def test_cells_that_sign_the_same_are_queued_once(self):
         """`take_fraction` is not in the signature while the momentum take is
         off, so varying it there is one configuration however many values."""

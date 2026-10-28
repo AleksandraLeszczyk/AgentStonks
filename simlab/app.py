@@ -2054,7 +2054,24 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Where the exit rests below the same predicted high.\n\n"
             "- **{sell_k}** on {ticker} for this model, from the same tuning job.\n"
             "- The smaller of the two numbers, since it is the higher price.\n"
-            "- A day that never reaches it is held to the closing flatten."
+            "- A day that never reaches it is held to the closing flatten.\n"
+            "- Greyed out while the sell rests above the fill instead."
+        ),
+        "sell_above_fill": (
+            "Rest the sell a fixed distance above the fill instead of under the "
+            "predicted high.\n\n"
+            "- Signs as `sell=E+0.5A` rather than `sell=H-0.15A`.\n"
+            "- Above the average cost after a buy again lower.\n"
+            "- The stop's share of the predicted gain becomes a share of this distance.\n"
+            "- Sweep it on the Tuning tab as \"Sell above the fill\": its 0 is the sell "
+            "under H, so one axis compares the two."
+        ),
+        "sell_gain_k": (
+            "How far above the fill the sell rests, in the levels' unit.\n\n"
+            "- Opens on **{sell_gain_k}**, the gap between {ticker}'s two levels: the "
+            "same target for a fill at the buy level.\n"
+            "- Under the predicted range, the unit at the first fill.\n"
+            "- Drawn this far above the buy level before a fill."
         ),
         "level_unit": (
             "The yardstick `buy` and `sell` are counted in.\n\n"

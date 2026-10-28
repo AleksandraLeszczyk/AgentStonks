@@ -3534,7 +3534,28 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Where the exit rests, below the same predicted high.\n\n"
             "- {ticker} starts at **{sell_k}** on this model, from the same sweep.\n"
             "- It must be the smaller of the two numbers — the higher price.\n"
-            "- A day that never reaches it is held to the closing flatten."
+            "- A day that never reaches it is held to the closing flatten.\n"
+            "- Greyed out while the sell rests above the fill instead."
+        ),
+        "sell_above_fill": (
+            "Rest the sell a fixed distance above the price actually paid, instead of "
+            "under the predicted high.\n\n"
+            "- The target is then the same for every trade, however deep the fill — "
+            "under the predicted high it is whatever the gap to H happens to be.\n"
+            "- After a buy again lower it sits above the average cost, so it moves "
+            "down with each add.\n"
+            "- The stop, a share of the predicted gain, becomes a share of this distance.\n"
+            "- A breach of the forecast moves the buy level, not this sell.\n"
+            "- Never swept on {ticker}: compare it on SimLab's Tuning tab first."
+        ),
+        "sell_gain_k": (
+            "How far above the fill the sell rests, in the same unit as the buy.\n\n"
+            "- With the box ticked it replaces the sell distance under H.\n"
+            "- It opens on **{sell_gain_k}**, the gap between {ticker}'s two levels, so "
+            "a fill at the buy level has the same target either way.\n"
+            "- Under the predicted range the unit is the one at the first fill: a "
+            "breach widening the range later does not move it.\n"
+            "- Before a fill the chart draws it this far above the buy level."
         ),
         "level_unit": (
             "What one unit of `buy` and `sell` is worth in dollars.\n\n"

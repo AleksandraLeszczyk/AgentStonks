@@ -258,6 +258,15 @@ STRATEGIST_BRIEFING_POLL_SEC = 2.0
 APPLE_TRADER_MODEL = "highlow"
 APPLE_TRADER_BUY_K = 0.75
 APPLE_TRADER_SELL_K = 0.10
+# The other sell level (2026-10-28, the user's request): this many level units
+# above the price the position was actually bought at rather than SELL_K under
+# H --
+#
+#     sell_level = fill + SELL_GAIN_K * U
+#
+# with U frozen at the first fill, like the stop. 0 is the sell under H, which
+# is every pair's default and what every record made before it replays as.
+APPLE_TRADER_SELL_GAIN_K = 0.0
 # (buy_k, sell_k) per (model, instrument): the pick of SimLab's Tuning tab, one
 # job per pair, each a buy × sell grid (buy 0.45..0.95, sell 0.05..0.45, step
 # 0.10) replayed through the real engine -- market fills, the managed exit --

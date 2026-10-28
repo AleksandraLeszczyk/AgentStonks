@@ -221,6 +221,37 @@ class TestForm:
         assert not app.exception
         assert app.session_state["out"] == _base()
 
+    def test_the_sell_above_the_fill_opens_on_the_gap_between_the_levels(self, form):
+        """Off, its distance waits greyed out at the pair's buy − sell, so
+        ticking the box keeps the target of a fill at the buy level; the sell
+        under H is greyed out instead, and comes back as it was."""
+        app = self._pick_highlow(form)
+        buy, sell = at.dayrange_levels("AAPL", "highlow")
+        gain = app.number_input(key="t_sell_gain_k_highlow_AAPL")
+        assert gain.disabled and gain.value == pytest.approx(round(buy - sell, 2))
+        assert app.session_state["out"].sell_gain_k == 0.0
+
+        app.checkbox(key="t_sell_above_fill_highlow_AAPL").check().run()
+        assert not app.exception
+        assert app.number_input(key="t_sell_k_highlow_AAPL").disabled
+        out = app.session_state["out"]
+        assert out.sell_gain_k == pytest.approx(round(buy - sell, 2))
+        assert out.target_gain_k == pytest.approx(round(buy - sell, 2))
+
+        app.number_input(key="t_sell_gain_k_highlow_AAPL").set_value(0.5).run()
+        assert app.session_state["out"].sell_gain_k == pytest.approx(0.5)
+        app.checkbox(key="t_sell_above_fill_highlow_AAPL").uncheck().run()
+        out = app.session_state["out"]
+        assert (out.sell_gain_k, out.sell_k) == (0.0, pytest.approx(sell))
+
+    def test_a_base_selling_above_the_fill_opens_ticked(self, form):
+        base_configs.set_base(asdict(_base(sell_gain_k=0.4)))
+        app = self._pick_highlow(form)
+        suffix = base_configs.key_suffix("highlow", "AAPL")
+        assert app.checkbox(key=f"t_sell_above_fill_highlow_AAPL{suffix}").value
+        assert app.number_input(key=f"t_sell_gain_k_highlow_AAPL{suffix}").value == 0.4
+        assert app.session_state["out"] == _base(sell_gain_k=0.4)
+
     def test_other_pairs_keep_the_form_as_it_was(self, form):
         base_configs.set_base(asdict(_base()))
         app = form()
