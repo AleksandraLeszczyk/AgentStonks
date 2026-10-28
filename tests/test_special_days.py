@@ -288,11 +288,22 @@ class TestTuningSwitches:
     ROWS = [{"day": "2026-06-15", "category": "cpi", "what": "BLS CPI release",
              "source": "calendar", "datasets": ["w1"], "report": None}]
 
-    def app(self, monkeypatch, record, chosen=None):
+    def app(self, monkeypatch, record, chosen=None, current_skips=None):
+        """The switches over `record`, the pair's current configuration
+        the job's own with `current_skips` as its days-off rule (the job's
+        own when None)."""
+        from dataclasses import asdict, replace
+
         from streamlit.testing.v1 import AppTest
 
+        from agent_stonks import base_configs
         from simlab import app as sim_app
+        from simlab import tuning as tu
 
+        own = tu.make_config(record["spec"]["base"], {})
+        if current_skips is not None:
+            own = replace(own, skip_events=tuple(current_skips))
+        base_configs.set_base(asdict(own))
         monkeypatch.setattr(sim_app, "_tuning_special_rows", lambda spec_json: (self.ROWS, {}))
         app = AppTest.from_function(_switches_app, args=(record,), default_timeout=30)
         if chosen is not None:
@@ -316,6 +327,16 @@ class TestTuningSwitches:
         assert self.read(app) == {"pick": {"buy_k": 0.5}, "skip_events": ["cpi"]}
         assert list(app.dataframe[0].value["status"]) == ["left out"]
         assert any("Leaving out 1 special session" in c.value for c in app.caption)
+
+    def test_a_kind_the_current_configuration_sits_out_starts_unticked(self, monkeypatch):
+        """The job opens as the current configuration trades, so a square
+        made current with the kind switched off is on the grid again."""
+        app = self.app(monkeypatch, job(), current_skips=["cpi"])
+        assert app.checkbox(key="tune_special_j_cpi").value is False
+        assert self.read(app)["skip_events"] == ["cpi"]
+        assert list(app.dataframe[0].value["status"]) == ["left out"]
+        app.checkbox(key="tune_special_j_cpi").check().run()
+        assert self.read(app)["skip_events"] == []
 
     def test_a_kind_the_job_sat_out_cannot_be_put_back(self, monkeypatch):
         app = self.app(monkeypatch, job(skip_events=["cpi"]))

@@ -960,20 +960,31 @@ class TestFourthAxis:
         )
         assert [t.type for t in fig.data] == ["heatmap"]
 
-    def test_a_mark_is_outlined_only_on_the_values_it_sits_on(self):
+    def test_a_mark_is_outlined_on_every_view_and_names_a_value_it_is_not_on(self):
+        """A best at another value of a held axis still gets its frame, at
+        its place on the first two axes, its legend naming where it is."""
         from simlab import app as sim_app
 
-        pick = {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0, "stop_gain_fraction": 0.2}
+        best = {"buy_k": 0.3, "sell_k": 0.1, "take_fraction": 1.0, "stop_gain_fraction": 0.2}
+        take = sim_app._tuning_param_label("take_fraction")
+        stop = sim_app._tuning_param_label("stop_gain_fraction")
 
-        def outlined(views) -> bool:
+        def outlined(views) -> "list[str]":
             fig = sim_app._tuning_view_heatmap(
-                cells4(self.PROFITS), AXES4, {"Pick": pick}, "t", views
+                cells4(self.PROFITS), AXES4, {"Best Sharpe": best}, "t", views
             )
-            return any(t.name == "Pick" for t in fig.data)
+            frames = [
+                s for s in fig.layout.shapes if s.line.color != sim_app._TUNING_FRAME_UNDERLAY
+            ]
+            assert [(s.x0 + s.x1) / 2 for s in frames] == [0]
+            assert [round((s.y0 + s.y1) / 2, 6) for s in frames] == [0]
+            return [t.name for t in fig.data if t.type == "scatter" and t.mode == "lines"]
 
-        assert outlined([1, 1]) and outlined([1, tu.SLICE_MEAN])
-        assert outlined([tu.SLICE_BEST, tu.SLICE_MEAN])
-        assert not outlined([1, 0]) and not outlined([0, tu.SLICE_BEST])
+        assert outlined([1, 1]) == outlined([1, tu.SLICE_MEAN]) == ["Best Sharpe"]
+        assert outlined([tu.SLICE_BEST, tu.SLICE_MEAN]) == ["Best Sharpe"]
+        assert outlined([1, 0]) == [f"Best Sharpe ({stop} 0.20)"]
+        assert outlined([0, tu.SLICE_BEST]) == [f"Best Sharpe ({take} 1.00)"]
+        assert outlined([0, 0]) == [f"Best Sharpe ({take} 1.00, {stop} 0.20)"]
 
     def test_the_hover_says_what_was_done_with_both(self):
         from simlab import app as sim_app
@@ -1417,8 +1428,10 @@ class TestHeatmapMarks:
 
     def test_the_current_configuration_follows_the_pair_across_the_grid(self):
         """Set from a square of the grid, the current configuration is
-        outlined there; changed in a setting the grid does not sweep, it is no
-        combination of it and is not outlined at all."""
+        outlined there. Changed in a setting the grid does not sweep it is
+        still outlined at its values, starred; changed only in a field its
+        model never reads, it is the square itself; with a value the grid does
+        not have, it is nowhere."""
         from dataclasses import replace
 
         from agent_stonks import base_configs
@@ -1432,7 +1445,23 @@ class TestHeatmapMarks:
         }
         moved = tu.make_config(spec["base"], {})
         base_configs.set_base(asdict(replace(moved, take_in_loss=not moved.take_in_loss)))
+        assert sim_app._tuning_current_marks(spec, self.axes) == {
+            "Current configuration*": {"buy_k": self.home},
+        }
+        place = sim_app._tuning_current_place(spec, self.axes)
+        assert place["differ"] and "differs from this job in" in (
+            sim_app._tuning_current_note(place)
+        )
+        assert moved.model_key == "highlow"  # GoodMoments settings mean nothing to it
+        base_configs.set_base(asdict(replace(moved, gm_stop_raise=moved.gm_stop_raise + 0.05)))
+        assert sim_app._tuning_current_marks(spec, self.axes) == {
+            "Current configuration": {"buy_k": self.home},
+        }
+        base_configs.set_base(asdict(replace(moved, buy_k=0.4)))
         assert sim_app._tuning_current_marks(spec, self.axes) == {}
+        assert "is not on this grid" in sim_app._tuning_current_note(
+            sim_app._tuning_current_place(spec, self.axes)
+        )
 
     def test_a_mark_frames_its_square_and_marks_sharing_one_nest_inward(self):
         from simlab import app as sim_app
@@ -1456,11 +1485,18 @@ class TestHeatmapMarks:
         assert len(set(legend.values())) == len(legend)
         # Rows are buy 0.3, 0.5, home, 0.9 by index: home holds the current
         # settings and the best win rate, 0.5 the best Sharpe and the click.
-        frames = [((s.y0 + s.y1) / 2, (s.y1 - s.y0) / 2, s.line.color) for s in fig.layout.shapes]
+        shapes = list(fig.layout.shapes)
+        under, over = shapes[:len(shapes) // 2], shapes[len(shapes) // 2:]
+        frames = [((s.y0 + s.y1) / 2, (s.y1 - s.y0) / 2, s.line.color) for s in over]
         assert [(round(y, 6), round(h, 2)) for y, h, _ in frames] == [
             (2, 0.47), (0, 0.47), (1, 0.47), (2, 0.34), (1, 0.34),
         ]
         assert [c for _, _, c in frames] == [c for c, _ in legend.values()]
+        # Under every frame, first, a dark one a little wider: a pale frame
+        # still shows on a pale square.
+        assert {s.line.color for s in under} == {sim_app._TUNING_FRAME_UNDERLAY}
+        assert [(s.x0, s.y0, s.x1, s.y1) for s in under] == [(s.x0, s.y0, s.x1, s.y1) for s in over]
+        assert all(u.line.width > o.line.width for u, o in zip(under, over))
 
 
 def rule_agent_signature(config) -> str:

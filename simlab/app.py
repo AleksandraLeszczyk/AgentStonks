@@ -4235,39 +4235,78 @@ def _render_tuning_form() -> None:
         st.rerun()
 
 
-def _tuning_current_overrides(spec: dict, axes: list[dict]) -> "dict | None":
+def _tuning_current_place(spec: dict, axes: list[dict]) -> "dict | None":
     """Where the pair's current configuration sits on the grid -- what a new
     run of it starts from now (`apple_trader.default_config`): the one set
-    from a tuning job, else the shipped defaults -- or None if it is no
-    combination of the grid.
+    from a tuning job, else the shipped defaults. None if it cannot be read.
+
+    `{"overrides": its values of the swept parameters, "off": [(name, value)]
+    of those the grid does not have, "differ": [settings, as the form names
+    them, it has otherwise than the grid's combination at its values]}`.
 
     A combination is the job's configuration with the swept values on top,
-    so the current one is a combination only if it agrees with the job's in
-    everything the grid does not sweep, the days-off rule as the job is read
-    included (`_render_tuning_special_days`). Compared as stored records, the
-    way "Set as current configuration" tells whether the selected one already
-    is current.
+    so the current one *is* a combination only if nothing differs, the
+    days-off rule as the job is read included (`_render_tuning_special_days`).
+    Compared setting by setting as the form shows them
+    (`tuning.compare_settings`) rather than as stored records: a field the
+    model never reads -- a GoodMoments setting on a HighLow pair, say --
+    changes the record and not one trade.
     """
-    to_record = rule_agent(APPLE_TRADER_KEY).to_record
     try:
         own = sim_tuning.make_config(spec["base"], {})
         current = default_config(own.ticker, own.model_key)
         found = {a["name"]: getattr(current, a["name"]) for a in axes}
-        if any(found[a["name"]] not in a["values"] for a in axes):
-            return None
-        on_grid = sim_tuning.make_config(spec["base"], found)
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
-    same = base_configs.digest(to_record(on_grid)) == base_configs.digest(to_record(current))
-    return found if same else None
+    off = [(a["name"], found[a["name"]]) for a in axes if found[a["name"]] not in a["values"]]
+    if off:
+        return {"overrides": found, "off": off, "differ": []}
+    try:
+        on_grid = sim_tuning.make_config(spec["base"], found)
+    except (TypeError, ValueError):
+        return None
+    differ = [r["setting"] for r in sim_tuning.compare_settings(current, on_grid) if r["changed"]]
+    return {"overrides": found, "off": [], "differ": differ}
 
 
 def _tuning_current_marks(spec: dict, axes: list[dict]) -> dict:
-    """{"Current configuration": its place on the grid}, for a heatmap's
-    outline, or nothing if it is no combination of the grid
-    (`_tuning_current_overrides`)."""
-    current = _tuning_current_overrides(spec, axes)
-    return {} if current is None else {"Current configuration": current}
+    """The current configuration's mark, {label: its place on the grid}
+    (`_tuning_current_place`), or nothing if one of its values is not on the
+    grid. "Current configuration*" when it differs in a setting the grid
+    does not sweep: the frame marks its values, the squares stay the job's."""
+    place = _tuning_current_place(spec, axes)
+    if place is None or place["off"]:
+        return {}
+    label = "Current configuration" + ("*" if place["differ"] else "")
+    return {label: place["overrides"]}
+
+
+def _tuning_current_note(place: "dict | None") -> str:
+    """The heatmaps caption's sentence on the current configuration when it is
+    not simply a square of the grid (`_tuning_current_place`), else ""."""
+    if place is None:
+        return ""
+    if place["off"]:
+        values = " and ".join(
+            f"{_tuning_param_label(name)} {sim_tuning.axis_tick(name, value)}"
+            for name, value in place["off"]
+        )
+        return (
+            f" The current configuration is not on this grid: its {values} is not among "
+            "the values swept."
+        )
+    if not place["differ"]:
+        return ""
+    return (
+        " \\* The current configuration differs from this job in "
+        + ", ".join(d.lower() for d in place["differ"])
+        + ": its frame marks its values, but the squares are this job's configuration "
+        "there."
+        + (
+            " Special days above set which sessions the grid counts."
+            if "Sit out these sessions" in place["differ"] else ""
+        )
+    )
 
 
 # A best combination's mark, by what it is best at (`tuning.bests`).
@@ -4502,10 +4541,12 @@ def _tuning_view_heatmap(
     """`_tuning_heatmap` for a grid of any size, a third and a fourth axis
     drawn as `view` says (`tuning.slice_views`).
 
-    On a slice, a mark is outlined only if it sits on that slice of every axis
-    held at a value. Collapsed, a mark is outlined wherever it sits on the
-    first two axes; its own value of the collapsed axes is in the caption
-    above the charts.
+    Every mark is outlined wherever it sits on the first two axes, whatever
+    the view (since 2026-10-28, the user's: the best Sharpe ratio and win
+    rate mostly sit at another value of the third parameter than the one the
+    heatmaps open on, and went unseen). On a slice, a mark held at another
+    value of an axis says which in its legend label, "Best Sharpe (Stop loss
+    0.30)": its square's number is the slice's, not its own.
 
     `clickable` lets a click name the square's configuration: the values the
     axes are held at, and on Best of all the values it won at. A square with an
@@ -4527,10 +4568,16 @@ def _tuning_view_heatmap(
         else:
             held[name] = axis["values"][int(v)]
             titles.append(f"{param} {sim_tuning.axis_tick(name, held[name])}")
-    shown = {
-        label: o for label, o in marks.items()
-        if all((o or {}).get(name) == value for name, value in held.items())
-    }
+    shown = {}
+    for label, o in marks.items():
+        o = o or {}
+        if any(name not in o for name in held):
+            continue
+        away = [
+            f"{_tuning_param_label(name)} {sim_tuning.axis_tick(name, o[name])}"
+            for name, value in held.items() if o[name] != value
+        ]
+        shown[f"{label} ({', '.join(away)})" if away else label] = o
     metric_label, config_of = None, None
     if sim_tuning.SLICE_MEAN in views:
         metric_label = f"Average {sim_tuning.METRICS[_TUNING_HEAT_METRIC].lower()}"
@@ -4629,11 +4676,18 @@ _TUNING_MARK_STYLES = {
 # than they are tall.
 _TUNING_FRAME_HALF = 0.47
 _TUNING_FRAME_STEP = (0.07, 0.13)
+# What every frame is drawn over, so a pale one still shows on a pale square:
+# the page's own background.
+_TUNING_FRAME_UNDERLAY = PALETTE["bg"]
 
 
 def _tuning_mark_style(label: str) -> tuple:
-    """A mark's (colour, dash, symbol, size)."""
-    return _TUNING_MARK_STYLES.get(label, (PALETTE["text"], "solid", "square-open", 16))
+    """A mark's (colour, dash, symbol, size): "Best Sharpe (Stop loss 0.30)",
+    a mark on another slice (`_tuning_view_heatmap`), is drawn as its mark."""
+    return next(
+        (style for name, style in _TUNING_MARK_STYLES.items() if label.startswith(name)),
+        (PALETTE["text"], "solid", "square-open", 16),
+    )
 
 
 def _tuning_heatmap(
@@ -4769,9 +4823,14 @@ def _tuning_heatmap(
         # A mark is a frame on its square's own border -- the square's size
         # whatever the grid's, and clear of its numbers -- in the order `marks`
         # lists them, each frame on a square already framed a step further in.
-        # A category axis places a shape by the category's index. The legend
-        # entry is an empty line trace in the frame's colour and dash.
+        # A category axis places a shape by the category's index. Every frame
+        # first gets a solid dark underlay a little wider than itself, then
+        # every frame its colour on top: the pale ones (the current
+        # configuration's pink, the win rate's cyan) were lost on the scale's
+        # pale yellows and greens. The legend entry is an empty line trace in
+        # the frame's colour and dash.
         framed: dict = {}
+        frames = []
         for label, overrides in marks.items():
             overrides = overrides or {}
             row_value, col_value = overrides.get(row_axis["name"]), overrides.get(col_axis["name"])
@@ -4780,16 +4839,20 @@ def _tuning_heatmap(
                 level = framed[at] = framed.get(at, -1) + 1
                 half_x = _TUNING_FRAME_HALF - _TUNING_FRAME_STEP[0] * level
                 half_y = _TUNING_FRAME_HALF - _TUNING_FRAME_STEP[1] * level
-                color, dash, _, _ = _tuning_mark_style(label)
-                fig.add_shape(
+                box = dict(
                     type="rect", xref="x", yref="y",
                     x0=at[0] - half_x, x1=at[0] + half_x, y0=at[1] - half_y, y1=at[1] + half_y,
-                    line=dict(color=color, width=3, dash=dash),
                 )
-                fig.add_trace(go.Scatter(
-                    x=[None], y=[None], mode="lines", name=label, hoverinfo="skip",
-                    line=dict(color=color, width=3, dash=dash),
-                ))
+                frames.append((label, box))
+        for _, box in frames:
+            fig.add_shape(**box, line=dict(color=_TUNING_FRAME_UNDERLAY, width=5))
+        for label, box in frames:
+            color, dash, _, _ = _tuning_mark_style(label)
+            fig.add_shape(**box, line=dict(color=color, width=3, dash=dash))
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode="lines", name=label, hoverinfo="skip",
+                line=dict(color=color, width=3, dash=dash),
+            ))
         # The whole grid, in grid order, even while cells are still missing --
         # a category axis otherwise shows only the values something was drawn at.
         fig.update_xaxes(
@@ -5452,9 +5515,17 @@ def _render_tuning_special_days(job: dict) -> dict:
     sat_out = set(spec["base"].get("skip_events") or ())
     measured = [k for k in kinds if k not in sat_out]
     # The switches are drawn below the numbers they change, so their state is
-    # read first: last run's, or on for a kind never switched.
+    # read first: last run's, or for a kind never switched, as the pair's
+    # current configuration trades -- off for a kind it sits out (since
+    # 2026-10-28, the user's: a square made current with a kind switched off
+    # came back ticked, so the current configuration was not on the grid).
+    try:
+        own = sim_tuning.make_config(spec["base"], {})
+        current_skips = set(default_config(own.ticker, own.model_key).skip_events or ())
+    except (TypeError, ValueError):
+        current_skips = set()
     for kind in measured:
-        st.session_state.setdefault(_tuning_special_key(job_id, kind), True)
+        st.session_state.setdefault(_tuning_special_key(job_id, kind), kind not in current_skips)
     left_out = [k for k in measured if not st.session_state[_tuning_special_key(job_id, k)]]
     days_out = {r["day"] for r in rows if r["category"] in left_out}
     read = sim_tuning.without_days(job, days_out, left_out)
@@ -5495,7 +5566,9 @@ def _render_tuning_special_days(job: dict) -> dict:
             "kind to read everything below — profits, heatmaps and best options — as if "
             "every configuration had sat those sessions out: each one's profit taken out, "
             "the session kept as one that did not trade. The selected configuration then "
-            "sits that kind out too, and **Set as current configuration** keeps it so."
+            "sits that kind out too, and **Set as current configuration** keeps it so. A "
+            "kind the current configuration sits out starts unticked, so the grid opens "
+            "as it trades."
         )
         with st.container(horizontal=True):
             for kind in kinds:
@@ -5925,18 +5998,20 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     if len(axes) == 3:
         st.caption(
             f"The heatmaps are the first two parameters; the switch above picks what to "
-            f"show of {further}. On one of its values a combination is outlined only if "
-            "it sits on it. Best of all and Average outline each where it sits on the "
-            f"first two, whatever its own value of {further}. A collapsed square fills in "
+            f"show of {further}. Every outline sits where its combination is on the first "
+            f"two, whatever its own value of {further}; on one value, an outline at another "
+            "names it in the legend, and the square's number is this value's, not its "
+            "own — the table above has its own. A collapsed square fills in "
             f"once every {further} has been replayed there, and refused combinations are "
             "left out of its average."
         )
     elif len(axes) > 3:
         st.caption(
             f"The heatmaps are the first two parameters; the switches above pick what to "
-            f"show of {further}. Held at one value, a combination is outlined only if it "
-            "sits on it. Best of all and Average outline each where it sits on the first "
-            "two, whatever its own value there. With one switch on Best of all and the "
+            f"show of {further}. Every outline sits where its combination is on the first "
+            "two, whatever its own values there; held at one value, an outline at another "
+            "names it in the legend, and the square's number is the view's, not its own — "
+            "the table above has its own. With one switch on Best of all and the "
             "other on Average, the average comes first: each square is at the value whose "
             "average over the other parameter is highest. A collapsed square fills in once "
             "every combination it needs has been replayed there, and refused combinations "
@@ -5949,11 +6024,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         + (f"summed over all {len(names)} datasets" if len(names) > 1 else "of the grid")
         + (f", each among combinations trading on at least {share:.0%} of days" if share else "")
         + "; a win rate tie goes to the bigger profit."
-        + (
-            "" if "Current configuration" in marks
-            else " The current configuration is no combination of this grid: it differs "
-            "from what the job swept in a setting the grid does not sweep."
-        )
+        + _tuning_current_note(_tuning_current_place(job["spec"], axes))
     )
     st.caption(
         f":material/ads_click: Click a {'bar' if len(axes) == 1 else 'square'} to select "
