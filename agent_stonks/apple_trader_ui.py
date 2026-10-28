@@ -1201,8 +1201,8 @@ def orchestra_params(
     """
     from .orchestra import (
         MODE_LABELS, MODE_SPLIT,
-        build_orchestra_config, default_pairs, all_pairs, is_signal, pairs_widget, racer_key,
-        racer_label,
+        build_orchestra_config, default_pairs, all_pairs, is_signal, pairs_widget, rank_pairs,
+        racer_key, racer_label, tuning_profits,
     )
 
     available = {str(s).strip().upper() for s in (symbols or [])}
@@ -1240,6 +1240,11 @@ def orchestra_params(
     if not pairs:
         st.info("Pick at least one (ticker, model) pair.", icon=":material/info:")
         return None
+    # A race offers buys the most profitable pair first; a split has nobody
+    # to offer them to before anybody else.
+    profits = None if split else tuning_profits()
+    if profits is not None and len(pairs) > 1:
+        st.caption(profit_order_caption(pairs, profits, rank_pairs, racer_label))
     # The 09:34 pick narrows a race; a split trades every pair it is given.
     selection = None if split else selection_params(copy, briefing_choices)
 
@@ -1386,11 +1391,33 @@ def orchestra_params(
     try:
         return build_orchestra_config(
             list(pairs), base, levels, selection=selection,
-            mode=mode, budget_pct=budget_pct if split else None,
+            mode=mode, budget_pct=budget_pct if split else None, profits=profits,
         )
     except ValueError as exc:
         st.error(str(exc), icon=":material/error:")
         return None
+
+
+def profit_order_caption(pairs: "list[str]", profits: "dict[str, float]", rank, label) -> str:
+    """The order a race offers its buys in, for under the pair picker: each
+    pair's tuning profit a session, the most profitable first (`rank`), and
+    the pairs without one after them."""
+    ranked = rank(list(pairs), profits)
+    known = [key for key in ranked if key in profits]
+    unknown = [label(key) for key in ranked if key not in profits]
+    if not known:
+        return (
+            "No pair has a tuning profit a session in SimLab yet, so buys on the same bar "
+            "go in the order the pairs were picked."
+        )
+    text = (
+        "Buys on the same bar go to the most profitable pair first — its average profit "
+        "a session in SimLab's tuning: "
+        + " · ".join(f"{label(key)} ${profits[key]:,.2f}" for key in known)
+    )
+    if unknown:
+        text += ". Then, never tuned: " + ", ".join(unknown)
+    return text + "."
 
 
 def signal_pair_params(

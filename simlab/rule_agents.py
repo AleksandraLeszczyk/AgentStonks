@@ -57,6 +57,7 @@ from agent_stonks.orchestra import (
     load_racers,
     orchestra_signature,
     racer_label,
+    tuning_profits,
 )
 
 
@@ -320,17 +321,22 @@ def _orchestra_from_record(raw: "dict | None") -> OrchestraConfig:
     if not racers:
         return build_orchestra_config(
             default_pairs(), AppleTraderConfig(), selection=SelectionRules(),
+            profits=tuning_profits(),
         )
     # A record without `selection` was made before the 09:34 selection existed
     # and raced every pair all day; None replays it -- and signs it -- so. One
     # without `mode` was made before the split existed, and is a race. One
     # without `halt_on_stop` was made while any pair's stop-out ended every
-    # pair's day, before 2026-10-27.
+    # pair's day, before 2026-10-27. One without `one_holder` was made while
+    # the first pair to fill was the only one to hold, before 2026-10-28 --
+    # its pairs in the order they were picked in, not by their profit.
     return OrchestraConfig(
         [_apple_from_record(r) for r in racers], selection=(raw or {}).get("selection"),
         mode=(raw or {}).get("mode") or "race",
         budget_pct=(raw or {}).get("budget_pct") or {},
         halt_on_stop=bool((raw or {}).get("halt_on_stop", True)),
+        one_holder=bool((raw or {}).get("one_holder", True)),
+        profit_per_session=(raw or {}).get("profit_per_session") or {},
     )
 
 

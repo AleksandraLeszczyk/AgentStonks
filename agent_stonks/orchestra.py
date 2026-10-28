@@ -2,28 +2,39 @@
 
 Apple Trader trades one symbol on one model. Orchestra is its own agent: it
 runs one Apple Trader state machine per pair -- AAPL on HighLow and AAPL on
-HighLow2 are two pairs -- over one shared ledger, and lets exactly one of them
-hold a position at a time. The pairs race for it:
+HighLow2 are two pairs -- over one shared ledger, and the pairs race for its
+cash:
 
 * **Racing.** Every pair trades on its own rules, exactly as Apple Trader
   would on it alone: a day-range pair (HighLow, HighLow2) forecasts its
   session at 9:35 and rests its own levels; a GoodMoments pair (GoodMoments,
   HighLow2 + GoodMoments -- the probability rules, since 2026-10-25) reads its
   edge at the close of every bar. Each bar the pairs are read in Orchestra's
-  order, and the first whose buy *fills* takes the position. A buy level
-  touched is not enough, and neither is a limit order the price had already
-  left: those leave the race open.
-* **Following.** While a pair holds, it is the only one that may trade. The
-  others are still read every bar -- their forecasts move with the session
-  and their levels stay current on the chart -- but their entries are closed
-  (`BaseTrader.entry_gate`), and a pair on the holder's own symbol sees the
-  symbol as flat, so it never adopts a position that is not its own.
-* **Reopening.** Once the holder's position is closed -- at the target, by the
-  momentum take and its runner, by the circuit breaker or by its stop -- the
-  race is open again, to every pair that is still armed. The holder's own
-  rules decide whether *it* is: a breaker stand-down or a stop-out keeps that
-  pair out for the day and leaves the rest racing. (The user's choices,
-  2026-10-02 for the breaker, 2026-10-27 for the stop.)
+  order -- the most profitable a session in SimLab's tuning first
+  (`tuning_profits`, `rank_pairs`) -- and the first whose buy *fills* takes
+  its share of the cash: `position_pct` of it, as Apple Trader sizes. A buy
+  level touched is not enough, and neither is a limit order the price had
+  already left: those leave the race open.
+* **Holding several.** While a pair holds, the others are still read every
+  bar, and one whose buy fills too takes `position_pct` of the cash that is
+  left -- whenever a share of it fits in what is left, on the same bar or
+  later. So when two pairs buy on one bar the more profitable one gets the
+  cash, and the next one the rest. Only one pair may hold a symbol: a pair on
+  a held symbol sees it as flat, so it never adopts a position that is not
+  its own, and its entries are closed (`BaseTrader.entry_gate`) until the
+  holder sells, as they are while the cash left buys none of its shares.
+  (For a few hours on 2026-10-28 a share also had to be cheaper than every
+  held one; the user went back on it. No SimLab run was stored under it.)
+  (The user's request of 2026-10-28. Until then the first pair to fill was
+  the only one to trade until its position closed --
+  `OrchestraConfig.one_holder`, which SimLab records from before replay
+  with.)
+* **Reopening.** Once a holder's position is closed -- at the target, by the
+  momentum take and its runner, by the circuit breaker or by its stop -- its
+  cash is back in the race, open to every pair that is still armed. The
+  holder's own rules decide whether *it* is: a breaker stand-down or a
+  stop-out keeps that pair out for the day and leaves the rest racing. (The
+  user's choices, 2026-10-02 for the breaker, 2026-10-27 for the stop.)
 * **Picking.** With a selection (`OrchestraConfig.selection`, on by default),
   Orchestra first narrows its pairs to the day's candidates, once, at 09:34 --
   four opening minutes in, one bar before the forecasts -- from the
@@ -105,6 +116,7 @@ the first racer on it (`model_overlays.live_trader_view`).
 """
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -126,6 +138,8 @@ from .decisions import DecisionTracker
 from .state import AppState, agent_log_tag
 from .state import append_agent_log as _log
 
+logger = logging.getLogger(__name__)
+
 # The agent's identity: its personality key (also every SimLab run's), what
 # the pickers call it and its face.
 ORCHESTRA_KEY = "orchestra"
@@ -136,7 +150,7 @@ ORCHESTRA_AVATAR = "Multiavatar-2d21d8b739482562eb.png"
 MODE_RACE = "race"
 MODE_SPLIT = "split"
 MODE_LABELS = {
-    MODE_RACE: "Race — the first buy to fill takes the budget",
+    MODE_RACE: "Race — the most profitable buy first, the rest with what is left",
     MODE_SPLIT: "Split — each pair trades its own share, all at once",
 }
 
@@ -271,13 +285,75 @@ def pairs_widget() -> str:
     return f"pairs{orchestra_defaults.key_suffix()}"
 
 
+# --- the order buys are offered in ---------------------------------------------
+
+# `tuning_profits`' last answer, and the state of the stores it was read off.
+_profits_cache: "tuple[tuple, dict[str, float]] | None" = None
+
+
+def _profits_stamp(tuning_dir) -> tuple:
+    """What `tuning_profits` depends on, cheaply: every tuning job file's name
+    and mtime, and the base configurations' store's."""
+    from . import base_configs
+
+    def mtime(path) -> "int | None":
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    jobs = tuple(sorted((p.name, mtime(p)) for p in tuning_dir.glob("*.json")))
+    return jobs, mtime(base_configs.BASE_PATH)
+
+
+def tuning_profits() -> "dict[str, float]":
+    """Each pair's average profit a session in SimLab's tuning, by racer key:
+    what SimLab's ML summary reads for it over all its tuning data
+    (`simlab.ml_summary.pair_metrics`) -- every replay of the pair's current
+    configuration (the one "Set as current configuration" stored), every
+    session counted, traded or not; for a pair with none stored, its latest
+    job's base. A pair no tuning job has replayed is not in it.
+
+    Read again only when a job file or the stored configurations change, so a
+    form can ask on every rerun. Empty, never an error, if the store cannot be
+    read: the order buys are offered in is not worth failing a start over."""
+    global _profits_cache
+    try:
+        from simlab import ml_summary
+        from simlab import tuning as sim_tuning
+
+        stamp = _profits_stamp(sim_tuning.TUNING_DIR)
+        if _profits_cache is not None and _profits_cache[0] == stamp:
+            return dict(_profits_cache[1])
+        found: "dict[str, float]" = {}
+        for series in ml_summary.base_series(sim_tuning.list_jobs()):
+            days = sorted(series.daily)
+            row = ml_summary.pair_metrics(series, (days[0], days[-1])) if days else None
+            if row is not None:
+                found[f"{series.ticker}:{series.model_key}"] = float(row["per_session"])
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        logger.warning("Could not read the pairs' tuning profits: %s", exc)
+        return {}
+    _profits_cache = (stamp, found)
+    return dict(found)
+
+
+def rank_pairs(pairs: "list[str]", profits: "dict[str, float]") -> "list[str]":
+    """`pairs` (racer keys) the most profitable a session first; a pair with no
+    tuning profit after every one with one, in the order given."""
+    return sorted(pairs, key=lambda key: (key not in profits, -profits.get(key, 0.0)))
+
+
 # --- the configuration --------------------------------------------------------
 
 
 @dataclass
 class OrchestraConfig:
-    """The racers, in the order ties are broken in: when two buys fill on the
-    same bar the earlier racer is read first and takes the position."""
+    """The racers, in the order they are read every bar -- in a race the order
+    buys are offered in: when two fill on the same bar the earlier racer takes
+    its share of the cash first, and the next one what is left.
+    `build_orchestra_config` puts a race's in the order of their tuning profit
+    a session (`profit_per_session`)."""
 
     racers: "list[AppleTraderConfig]" = field(default_factory=list)
     # How the day's candidates are picked at 09:34, or None to race every pair
@@ -297,6 +373,18 @@ class OrchestraConfig:
     # request. A race of one stops on its stop-out either way, as an Apple
     # Trader run does, and a split never does.
     halt_on_stop: bool = False
+    # In a race: whether only one pair may hold at a time -- the first to fill,
+    # until its position closes -- rather than every pair whose buy fills while
+    # a share of it fits in the cash left (one pair a symbol). What every
+    # record made before 2026-10-28 means, which SimLab decodes so; off since,
+    # the user's request.
+    one_holder: bool = False
+    # In a race: each pair's average profit a session in SimLab's tuning
+    # (`tuning_profits`), by racer key, as the racers were put in order by
+    # when the race was built -- what the form and the board show beside each.
+    # A pair without one is not in it. Empty in a split, and in a record made
+    # before 2026-10-28 (raced in the order its pairs were picked in).
+    profit_per_session: "dict[str, float]" = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.racers = [at.as_config(r) for r in self.racers]
@@ -335,7 +423,12 @@ class OrchestraConfig:
                     )
         if self.mode != MODE_SPLIT:
             self.budget_pct = {}
+            given = self.profit_per_session or {}
+            self.profit_per_session = {
+                key: float(given[key]) for key in keys if given.get(key) is not None
+            }
             return
+        self.profit_per_session = {}
         if self.selection is not None:
             raise ValueError(
                 "a split Orchestra trades every pair it is given; the 09:34 candidate "
@@ -408,6 +501,7 @@ def build_orchestra_config(
     selection: "candidates.SelectionRules | None" = None,
     mode: str = MODE_RACE,
     budget_pct: "dict[str, float] | None" = None,
+    profits: "dict[str, float] | None" = None,
 ) -> OrchestraConfig:
     """One racer per pair, `levels[key]` = `{field: value}` of the numbers
     Orchestra sets on it (`pair_fields`). A day-range pair is `base` -- its
@@ -415,8 +509,16 @@ def build_orchestra_config(
     stop and momentum confirmation period: those given, the pair's own for the
     rest (its base configuration's, else the shipped ones). A GoodMoments pair is
     its own configuration with the numbers given (`signal_racer`).
-    `selection`, `mode` and `budget_pct` as `OrchestraConfig`'s."""
+    `selection`, `mode` and `budget_pct` as `OrchestraConfig`'s.
+
+    A race's pairs are put in the order of `profits` -- each pair's tuning
+    profit a session (`tuning_profits`), the most profitable first
+    (`rank_pairs`) -- which is the order its buys are offered in; a split's
+    keep the order given, where nobody waits for anybody."""
     levels = levels or {}
+    profits = {k: float(v) for k, v in (profits or {}).items() if v is not None}
+    if mode != MODE_SPLIT:
+        pairs = rank_pairs(list(pairs), profits)
     racers = []
     for key in pairs:
         ticker, model_key = split_key(key)
@@ -431,7 +533,10 @@ def build_orchestra_config(
         }
         own.update(_pair_numbers(model_key, levels.get(key)))
         racers.append(replace(base, ticker=ticker, model_key=model_key, **own))
-    return OrchestraConfig(racers, selection=selection, mode=mode, budget_pct=budget_pct or {})
+    return OrchestraConfig(
+        racers, selection=selection, mode=mode, budget_pct=budget_pct or {},
+        profit_per_session=profits,
+    )
 
 
 def orchestra_signature(race: OrchestraConfig) -> str:
@@ -457,6 +562,12 @@ def orchestra_signature(race: OrchestraConfig) -> str:
     ",stop_out=pair" -- when a day-range pair has a stop at all -- so it is
     not confused with a record from before, when a stop-out ended every
     pair's day (`OrchestraConfig.halt_on_stop`), which signs as it did.
+
+    A race of pairs on more than one symbol where several may hold at once adds
+    ",hold=several" after that, for the same reason: a record from before
+    2026-10-28 let only the first to fill hold (`OrchestraConfig.one_holder`),
+    and signs as it did. The order of the pairs is the order buys are offered
+    in, so it is signed already.
     """
     ranged = [r for r in race.racers if not is_signal(r)]
     own_confirmation = len({r.momentum_confirmation_bars for r in ranged}) > 1
@@ -501,6 +612,8 @@ def orchestra_signature(race: OrchestraConfig) -> str:
         and any(r.has_stop for r in ranged)
     ):
         rules += ",stop_out=pair"
+    if not race.split and not race.one_holder and len(race.tickers) > 1:
+        rules += ",hold=several"
     return f"orchestra[{head}{pairs}]({rules}{candidates.rules_signature(race.selection)})"
 
 
@@ -571,13 +684,14 @@ class RacerSlot(TraderSlot):
 
 
 class _RacerLedger:
-    """The shared ledger as one racer sees it.
+    """The shared ledger as one racer of a race sees it.
 
-    The holder sees the ledger as it is. Every other racer sees no position at
-    all -- a racer on the holder's own symbol would otherwise take that
-    position for its own and manage it with its own stop. Fills are reported
-    to Orchestra, which is how it learns who holds and when the position is
-    closed. Everything else (cash, the snapshot) is the ledger's.
+    A holder sees its symbol's position as it is -- only one racer holds a
+    symbol. Every other racer sees no position at all -- a racer on a
+    holder's symbol would otherwise take that position for its own and manage
+    it with its own stop. Fills are reported to Orchestra, which is how it
+    learns who holds and when a position is closed. Everything else (cash --
+    what is left of it, while others hold -- and the snapshot) is the ledger's.
     """
 
     def __init__(self, race: "Orchestra", key: str, tracker: DecisionTracker) -> None:
@@ -586,7 +700,7 @@ class _RacerLedger:
         self._tracker = tracker
 
     def position_for(self, symbol: str) -> float:
-        if self._race.holder != self._key:
+        if not self._race.holds(self._key):
             return 0.0
         return self._tracker.position_for(symbol)
 
@@ -682,8 +796,9 @@ class Racer:
 
 
 class Orchestra:
-    """The coordinator: one trader per racer, and in a race one position
-    between them -- in a split, one account each (`PairAccount`).
+    """The coordinator: one trader per racer, and in a race one cash balance
+    between them, one holder a symbol -- in a split, one account each
+    (`PairAccount`).
 
     `run_cycle(state, tracker)` is the whole interface -- the live loop calls
     it once a closed bar, SimLab's rule day loop once a replayed one.
@@ -697,6 +812,8 @@ class Orchestra:
         mode: str = MODE_RACE,
         budget_pct: "dict[str, float] | None" = None,
         halt_on_stop: bool = False,
+        one_holder: bool = False,
+        profit_per_session: "dict[str, float] | None" = None,
     ) -> None:
         if not racers:
             raise ValueError("Orchestra needs at least one racer")
@@ -707,6 +824,11 @@ class Orchestra:
         # race of one always, as an Apple Trader run; otherwise it stands only
         # that pair down.
         self.stops = mode != MODE_SPLIT and (halt_on_stop or len(racers) == 1)
+        # In a race, whether the first pair to fill holds alone
+        # (`OrchestraConfig.one_holder`); and each pair's tuning profit a
+        # session, for the board.
+        self.one_holder = mode != MODE_SPLIT and one_holder
+        self.profit_per_session = dict(profit_per_session or {})
         # Under a split: each pair's share of the day's budget, the budget the
         # shares are of (the ledger's worth at the session's first open bar),
         # the day it is for, and each pair's account.
@@ -723,9 +845,11 @@ class Orchestra:
         self._selected_day = None
         self.selection_rows: "list[dict]" = []
         self.benched: "dict[str, str]" = {}
-        # The racer holding the position, or None while the race is open.
-        self.holder: "str | None" = None
-        self.holder_since = None
+        # In a race, the racers holding a position, in the order they bought,
+        # each with when (None for one adopted from an earlier run).
+        self.held: "dict[str, object]" = {}
+        # The ledger this cycle runs on, for the entry gate's cash check.
+        self._tracker: "DecisionTracker | None" = None
         # Set by a stop-out that ends the run (`self.stops`): the live loop
         # stops the agent on it; a replay closes every racer's entries for the
         # rest of `self._stopped_day`.
@@ -734,7 +858,11 @@ class Orchestra:
         self._day = None
         self._adopted = False
         self._last_line = None
-        self._event = None
+        self._events: "list[tuple[str, str]]" = []
+        # Whether this bar changed what a race holds while others still hold:
+        # what the cash left may buy is then said once the bar is read
+        # (`_cash_left_text`).
+        self._cash_note = False
         for racer in racers:
             racer.trader.slot = RacerSlot(racer.key)
             if not self.stops:
@@ -754,13 +882,19 @@ class Orchestra:
     def split(self) -> bool:
         return self.mode == MODE_SPLIT
 
+    @property
+    def holder(self) -> "str | None":
+        """In a race, the racer that has held longest -- the only one, with
+        `one_holder` -- or None while nobody holds."""
+        return next(iter(self.held), None)
+
     def holds(self, key: str) -> bool:
-        """Whether this racer has a position: the race's holder, or under a
-        split a pair whose account holds shares."""
+        """Whether this racer has a position: one of the race's holders, or
+        under a split a pair whose account holds shares."""
         if self.split:
             account = self.accounts.get(key)
             return account is not None and account.shares > 0
-        return key == self.holder
+        return key in self.held
 
     def holders(self) -> "list[str]":
         return [key for key in self.keys if self.holds(key)]
@@ -772,44 +906,80 @@ class Orchestra:
 
     # --- who holds -----------------------------------------------------
 
+    def _waits_on(self, key: str) -> "tuple[str, object] | None":
+        """What keeps a racer of a race from buying while others hold:
+        ("holder", key) for the racer holding its symbol -- with `one_holder`,
+        the one holding at all -- or ("cash", cash) for cash left that buys
+        none of its shares at its last close, sized as its buy would be
+        (`rule_agent.order_quantity`). None while it may buy, or holds."""
+        if self.split or not self.held or key in self.held:
+            return None
+        racer = self.by_key[key]
+        if self.one_holder:
+            return "holder", self.holder
+        ticker = racer.trader.ticker
+        same = next((k for k in self.held if self.by_key[k].trader.ticker == ticker), None)
+        if same is not None:
+            return "holder", same
+        price = racer.trader.last_close
+        if self._tracker is not None and price:
+            cash = float(self._tracker.snapshot()["cash"])
+            if rule_agent.order_quantity(cash, float(price), racer.config.position_pct) <= 0:
+                return "cash", cash
+        return None
+
     def _gate(self, key: str) -> "str | None":
         if self._stopped_day is not None and self._stopped_day == self._day:
             return f"Orchestra stopped for the day when {self.halt}"
-        if self.holder is None or self.holder == key:
+        waits = self._waits_on(key)
+        if waits is None:
             return None
-        since = f", bought {self.holder_since:%H:%M}" if self.holder_since is not None else ""
-        return f"Orchestra is following {self.by_key[self.holder].label}{since}"
+        kind, what = waits
+        if kind == "cash":
+            holding = ", ".join(self.by_key[k].label for k in self.held)
+            return f"the ${what:,.2f} cash left while Orchestra holds {holding} buys not one share"
+        holder = self.by_key[what]
+        if not self.one_holder:
+            return f"{holder.label} holds {holder.trader.ticker} already"
+        since = self.held.get(what)
+        since = f", bought {since:%H:%M}" if since is not None else ""
+        return f"Orchestra is following {holder.label}{since}"
 
     def _took(self, key: str, decision) -> None:
-        if self.holder == key:
+        if key in self.held:
             return
-        self.holder = key
-        self.holder_since = at.clock.now().astimezone(market_hours.MARKET_TZ)
-        self._event = ("took", key)
+        self.held[key] = at.clock.now().astimezone(market_hours.MARKET_TZ)
+        self._events.append(("took", key))
 
     def _released(self, key: str) -> None:
-        if self.holder != key:
+        if key not in self.held:
             return
-        self.holder = None
-        self.holder_since = None
-        self._event = ("released", key)
+        del self.held[key]
+        self._events.append(("released", key))
 
     def _adopt(self, state: AppState, tracker: DecisionTracker) -> None:
-        """Who holds when Orchestra starts onto a ledger that is not flat: the
-        racer an earlier run today recorded as holding, while the ledger still
-        has its symbol; else the first racer on a symbol the ledger holds."""
+        """Who holds when Orchestra starts onto a ledger that is not flat: on
+        each symbol the ledger holds, the racer an earlier run today recorded
+        as holding it, else the first racer on it -- with `one_holder`, on the
+        first such symbol only."""
         self._adopted = True
         prior = getattr(state, "orchestra", None) or {}
+        recorded = list(prior.get("holders") or []) + [prior.get("holder")]
         held = [r for r in self.racers if tracker.position_for(r.trader.ticker) > 0]
-        if not held:
-            return
-        recorded = prior.get("holder")
-        racer = next((r for r in held if r.key == recorded), held[0])
-        self.holder = racer.key
-        _log(state, {"type": "status", "text": (
-            f"The ledger holds {tracker.position_for(racer.trader.ticker):g} "
-            f"{racer.trader.ticker}; Orchestra follows {racer.label} until it is sold."
-        )})
+        adopted: "dict[str, Racer]" = {}
+        if self.one_holder and held:
+            first = next((r for r in held if r.key in recorded), held[0])
+            adopted[first.trader.ticker] = first
+        elif held:
+            for ticker in dict.fromkeys(r.trader.ticker for r in held):
+                on_it = [r for r in held if r.trader.ticker == ticker]
+                adopted[ticker] = next((r for r in on_it if r.key in recorded), on_it[0])
+        for ticker, racer in adopted.items():
+            self.held[racer.key] = None
+            _log(state, {"type": "status", "text": (
+                f"The ledger holds {tracker.position_for(ticker):g} "
+                f"{ticker}; Orchestra follows {racer.label} until it is sold."
+            )})
 
     # --- a split's accounts ----------------------------------------------
 
@@ -976,17 +1146,20 @@ class Orchestra:
                 self._select(state, today)
 
         alone = len(self.racers) == 1
-        # The holder first: its exit decides whether the race is open on this
-        # very bar, and a racer read before it would be refused for a
-        # position that is about to close. A pair the selection left out is
-        # not read at all -- unless it holds a position from before it. (A
-        # split has neither: every pair is read, in order.)
+        # The ledger the entry gate reads the cash left off (`_waits_on`).
+        self._tracker = tracker
+        # The holders first: their exits decide how much cash is in the race
+        # on this very bar, and a racer read before them would be refused, or
+        # sized, for a position that is about to close. Then the rest in
+        # Orchestra's order, the most profitable first. A pair the selection
+        # left out is not read at all -- unless it holds a position from
+        # before it. (A split has neither: every pair is read, in order.)
         order = sorted(
-            (r for r in self.racers if r.key not in self.benched or r.key == self.holder),
-            key=lambda r: r.key != self.holder,
+            (r for r in self.racers if r.key not in self.benched or r.key in self.held),
+            key=lambda r: r.key not in self.held,
         )
         for racer in self.racers:
-            if racer.key in self.benched and racer.key != self.holder:
+            if racer.key in self.benched and racer.key not in self.held:
                 racer.outcome = rule_agent.HOLD
         for racer in order:
             # A pair with a position writes its own read line; the rest share
@@ -999,7 +1172,7 @@ class Orchestra:
             if halt and not self.stops:
                 # That pair's own stand-down already keeps it out today; the
                 # others go on -- in a split each with its own position to
-                # manage, in a race to the position this one just gave up.
+                # manage, in a race to the cash this one just gave back.
                 racer.trader.halt = None
                 if not alone:
                     with agent_log_tag(racer=racer.label):
@@ -1015,8 +1188,13 @@ class Orchestra:
                 # levels stay current -- but none may buy (`_gate`).
                 self.halt = f"{racer.label} {halt}"
                 self._stopped_day = today
-            if self._event is not None:
+            if self._events:
                 self._announce(state, tracker)
+        if self._cash_note:
+            self._cash_note = False
+            text = self._cash_left_text(tracker)
+            if text:
+                _log(state, {"type": "analysis", "text": text})
         if not alone:
             self._race_line(state)
         self._publish(state)
@@ -1024,7 +1202,7 @@ class Orchestra:
         for tag in (rule_agent.BOUGHT, rule_agent.SOLD):
             if tag in outcomes:
                 return tag
-        if self.holder is not None:
+        if self.held:
             return self.by_key[self.holder].outcome or rule_agent.HOLD
         for tag in (rule_agent.HOLD, rule_agent.WARMING_UP, rule_agent.NO_DATA):
             if tag in outcomes:
@@ -1075,24 +1253,63 @@ class Orchestra:
         self.benched = {r["key"]: r.get("reason") or "" for r in rows if not r.get("selected")}
 
     def _announce(self, state: AppState, tracker: DecisionTracker) -> None:
-        kind, key = self._event
-        self._event = None
+        events, self._events = self._events, []
         if len(self.racers) == 1:
             return
+        for kind, key in events:
+            _log(state, {"type": "analysis", "text": self._event_text(kind, key, tracker)})
+
+    def _event_text(self, kind: str, key: str, tracker: DecisionTracker) -> str:
+        """A racer bought (`kind` "took") or sold out ("released"), in words:
+        who holds now -- or, with nobody left holding, who may buy. Who may
+        still buy beside a holding is said once the whole bar is read
+        (`_cash_left_text`): a pair read after this one may not have its
+        levels yet, or this bar's price."""
         racer = self.by_key[key]
-        if kind == "took":
+        if kind == "took" and self.one_holder:
             others = [r.label for r in self.racers if r.key != key]
-            text = (
+            return (
                 f"{racer.label} filled first: Orchestra follows it alone until its "
                 f"position is closed. Waiting: {', '.join(others)}."
             )
-        else:
+        held = [self.by_key[k].label for k in self.held if k != key]
+        if kind != "took" and not held:
             armed = [r.label for r in self.racers if self._armed(r) and not self._benched(r)]
-            text = (
+            return (
                 f"{racer.label} is flat again, so the race is open: "
                 + (f"{', '.join(armed)} can buy." if armed else "no pair is still armed today.")
             )
-        _log(state, {"type": "analysis", "text": text})
+        self._cash_note = True
+        if kind == "took":
+            beside = f" beside {', '.join(held)}" if held else ""
+            return f"{racer.label} filled: Orchestra holds it{beside}."
+        return f"{racer.label} is flat again; Orchestra still holds {', '.join(held)}."
+
+    def _cash_left_text(self, tracker: DecisionTracker) -> "str | None":
+        """Who may still buy with the cash left beside what Orchestra holds,
+        in the order buys go in -- or why no pair may. None with nobody
+        holding, or no pair left to buy."""
+        others = [r for r in self.racers if r.key not in self.held and not self._benched(r)]
+        if not self.held or not others:
+            return None
+        head = f"The ${float(tracker.snapshot()['cash']):,.2f} cash left"
+        armed = [r for r in others if self._armed(r)]
+        free = [r.label for r in armed if self._waits_on(r.key) is None]
+        if free:
+            return f"{head} is open to {', '.join(free)}, in that order."
+        if not armed:
+            return f"{head} waits: no other pair is armed to buy now."
+        return f"{head} goes to no other pair — " + "; ".join(
+            self._why_not(r) for r in armed
+        ) + "."
+
+    def _why_not(self, racer: Racer) -> str:
+        """Why an armed racer may not buy beside a holding, for
+        `_cash_left_text`."""
+        kind, what = self._waits_on(racer.key)
+        if kind == "cash":
+            return f"{racer.label}: a share costs more than that"
+        return f"{racer.label}: {self.by_key[what].label} holds {racer.trader.ticker}"
 
     # --- what Orchestra looks like -------------------------------------
 
@@ -1116,14 +1333,15 @@ class Orchestra:
         )
 
     def _benched(self, racer: Racer) -> bool:
-        return racer.key in self.benched and racer.key != self.holder
+        return racer.key in self.benched and racer.key not in self.held
 
     def board(self) -> "list[dict]":
         """One row per racer: where it stands against its buy level, in its
         own level unit, which is what makes racers on different symbols and
         different prices comparable -- for a GoodMoments pair, where its edge
         stands against the edge a buy needs (and on the hybrid its levels
-        model's buy level too) -- and under a split, its account."""
+        model's buy level too) -- in a race, its tuning profit a session, and
+        under a split, its account."""
         rows = []
         for racer in self.racers:
             trader = racer.trader
@@ -1156,6 +1374,7 @@ class Orchestra:
                 "unit": unit or None,
                 "edge": None if edge is None else float(edge),
                 "entry": entry,
+                "profit_per_session": self.profit_per_session.get(racer.key),
                 "budget_pct": self.budget_pct.get(racer.key),
                 "cash": None if account is None else account.cash,
                 "shares": None if account is None else account.shares,
@@ -1194,8 +1413,14 @@ class Orchestra:
                 return f"stood down ({plan['stand_down']})"
             if plan.get("paused"):
                 return f"paused until the forecast is revised ({plan['paused']['headline']})"
-        if self.holder is not None:
-            return "waiting for the holder"
+        waits = self._waits_on(racer.key)
+        if waits is not None:
+            kind, what = waits
+            if kind == "cash":
+                return "waiting for cash"
+            if self.one_holder:
+                return "waiting for the holder"
+            return f"waiting for {self.by_key[what].label} to sell"
         return "watching" if self.split else "racing"
 
     @staticmethod
@@ -1208,11 +1433,11 @@ class Orchestra:
         return text
 
     def _race_line(self, state: AppState) -> None:
-        """One log line per bar for every racer not holding -- in place of the
-        read line each would write on its own -- nearest to its buy first: the
-        day-range pairs by their distance to the buy level, the GoodMoments
-        pairs by how far their edge is from the entry."""
-        if self.holder is not None:
+        """One log line per bar for every racer not holding that may still buy
+        -- in place of the read line each would write on its own -- nearest to
+        its buy first: the day-range pairs by their distance to the buy level,
+        the GoodMoments pairs by how far their edge is from the entry."""
+        if self.held and self.one_holder:
             return
         stamps = [r.trader.last_bar_ts for r in self.racers if r.trader.last_bar_ts is not None]
         if not stamps:
@@ -1243,7 +1468,7 @@ class Orchestra:
             )
         if not parts:
             return
-        head = "the pairs without a position" if self.split else "flat"
+        head = "the pairs without a position" if self.split or self.held else "flat"
         _log(state, {"type": "analysis", "text": (
             f"Orchestra at {newest:%H:%M}, {head} — {'; '.join(parts)}"
         )})
@@ -1274,10 +1499,10 @@ class Orchestra:
             racer.trader.publish_memory(state)
 
     def activity(self, outcome: str, tracker: DecisionTracker) -> "tuple[str, str]":
-        """The status line: the holder's own, else how the race stands."""
+        """The status line: a lone holder's own, else how the race stands."""
         if outcome == rule_agent.CLOSED:
             return rule_agent.WAITING, "Agent waiting for session start"
-        if self.holder is not None:
+        if len(self.held) == 1:
             racer = self.by_key[self.holder]
             dot, phrase = racer.trader.activity(racer.outcome or rule_agent.HOLD, _RacerLedger(self, racer.key, tracker))
             return dot, f"{phrase} ({racer.label})"
@@ -1287,7 +1512,7 @@ class Orchestra:
         holding = [row["label"] for row in board if row["status"] == "holding"]
         racing = [row for row in board if row["status"] in ("racing", "watching")]
         if holding:
-            # Only a split gets here with a position: a race has its holder.
+            # A split, or a race with several holders.
             more = f" — watching {len(racing)} more" if racing else ""
             return rule_agent.TRADING, f"Agent holding {', '.join(holding)}{more}"
         if racing:
@@ -1333,7 +1558,8 @@ def build_orchestra(
         )
         for config in race.racers
     ], selection=race.selection, sources=sources, mode=race.mode, budget_pct=race.budget_pct,
-        halt_on_stop=race.halt_on_stop)
+        halt_on_stop=race.halt_on_stop, one_holder=race.one_holder,
+        profit_per_session=race.profit_per_session)
 
 
 def load_racers(race: OrchestraConfig) -> "tuple[dict[str, dict], dict[str, str]]":
@@ -1379,7 +1605,8 @@ def _orchestra_loop(
     race_config = OrchestraConfig(
         kept, selection=race_config.selection,
         mode=race_config.mode, budget_pct=race_config.budget_pct,
-        halt_on_stop=race_config.halt_on_stop,
+        halt_on_stop=race_config.halt_on_stop, one_holder=race_config.one_holder,
+        profit_per_session=race_config.profit_per_session,
     )
     race = build_orchestra(race_config, bundles)
     if len(kept) > 1 and race_config.split:
@@ -1400,10 +1627,24 @@ def _orchestra_loop(
     elif len(kept) > 1:
         _log(state, {"type": "status", "text": (
             f"Orchestra watching {len(kept)} pairs: "
-            + ", ".join(f"{racer_label(c)} ({racer_terms(c)})" for c in kept)
-            + f". {_how_pairs_read(kept)}; the first "
-            "whose buy fills is the only one that trades until its position is closed, then "
-            "the race is open again. Ties go to the earlier pair in this list. A stop-out "
+            + ", ".join(
+                f"{racer_label(c)} ({racer_terms(c)}{_profit_terms(race_config, c)})" for c in kept
+            )
+            + f". {_how_pairs_read(kept)}; "
+            + (
+                "the first whose buy fills is the only one that trades until its position is "
+                "closed, then the race is open again. Ties go to the earlier pair in this list."
+                if race_config.one_holder else
+                f"the first whose buy fills buys {kept[0].position_pct:g}% of the cash, and "
+                "any other whose buy fills while a share fits in what is left buys "
+                f"{kept[0].position_pct:g}% of that, one pair a symbol. Buys on the same bar "
+                "go in this list's order"
+                + (
+                    ", the most profitable a session in SimLab's tuning first."
+                    if race_config.profit_per_session else "."
+                )
+            )
+            + " A stop-out "
             + (
                 "stops the agent" if race.stops
                 else "stands that pair down for the day, and the others race on"
@@ -1448,6 +1689,12 @@ def _orchestra_loop(
             state.orchestra = {**state.orchestra, "running": False}
 
 
+def _profit_terms(race: OrchestraConfig, config: AppleTraderConfig) -> str:
+    """A racer's tuning profit a session, for the opening line's list."""
+    made = race.profit_per_session.get(racer_key(config))
+    return "" if made is None else f"; ${made:,.2f} a session in tuning"
+
+
 def _how_pairs_read(kept: "list[AppleTraderConfig]", split: bool = False) -> str:
     """How the pairs find their buys, for the loop's opening line: each
     day-range pair's levels from its 9:35 forecast, each GoodMoments pair's
@@ -1481,8 +1728,10 @@ def launch_orchestra(
         "mode": race_config.mode,
         "order": race_config.keys,
         "labels": {racer_key(c): racer_label(c) for c in race_config.racers},
+        # Who held when an earlier run today stopped: whom a race follows on
+        # a ledger that still holds their symbols (`Orchestra._adopt`).
         "holder": prior.get("holder"),
-        "holders": [],
+        "holders": list(prior.get("holders") or []),
         # Today's budget and each pair's account, if an earlier split run
         # today kept them: continued, not re-read off an invested ledger.
         "budget": prior.get("budget"),

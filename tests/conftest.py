@@ -113,6 +113,18 @@ def _orchestra_defaults_in_tmp(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _tuning_jobs_in_tmp(monkeypatch, tmp_path):
+    """Keep SimLab's tuning jobs out of the real data/simlab/tuning/, so
+    Orchestra's race order (`orchestra.tuning_profits`) is the order its pairs
+    are given in, whatever SimLab has tuned on this machine."""
+    from agent_stonks import orchestra
+    from simlab import tuning
+
+    monkeypatch.setattr(tuning, "TUNING_DIR", tmp_path / "tuning")
+    monkeypatch.setattr(orchestra, "_profits_cache", None)
+
+
+@pytest.fixture(autouse=True)
 def _notification_settings_in_tmp(monkeypatch, tmp_path):
     """Keep the email settings out of the real data/notifications.json, so no
     test that fills a trade can email whoever is set there."""

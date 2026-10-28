@@ -2639,6 +2639,9 @@ def _orchestra_board(state: AppState) -> None:
     split = race.get("mode") == "split"
     signals = any(row.get("kind") == "signal" for row in board)
     holder = race.get("holder")
+    labels = race.get("labels") or {}
+    holders = [labels.get(k, k) for k in race.get("holders") or []]
+    profits = not split and any(row.get("profit_per_session") is not None for row in board)
     if split:
         budget = race.get("budget") or {}
         held = len(race.get("holders") or [])
@@ -2646,10 +2649,12 @@ def _orchestra_board(state: AppState) -> None:
             f"🎼 Orchestra — split, {held} of {len(board)} pairs holding"
             + (f", budget ${budget['base']:,.2f}" if budget.get("base") is not None else "")
         )
+    elif len(holders) > 1:
+        title = f"🎼 Orchestra — holding **{'**, **'.join(holders)}**"
     else:
         title = (
-            f"🎼 Orchestra — following **{(race.get('labels') or {}).get(holder, holder)}**"
-            if holder else "🎼 Orchestra — open, the first buy to fill takes it"
+            f"🎼 Orchestra — following **{labels.get(holder, holder)}**"
+            if holder else "🎼 Orchestra — open, the most profitable buy to fill takes it"
         )
     if not race.get("running"):
         title += " (stopped)"
@@ -2664,6 +2669,7 @@ def _orchestra_board(state: AppState) -> None:
                 "Buy": row["buy"],
                 "Sell": row["sell"],
                 **({"Edge": row.get("edge"), "Entry": row.get("entry")} if signals else {}),
+                **({"Tuning $/session": row.get("profit_per_session")} if profits else {}),
                 **(
                     {
                         "Budget %": row.get("budget_pct"),
@@ -2687,6 +2693,12 @@ def _orchestra_board(state: AppState) -> None:
                 help="What the pair's share of today's budget has left to buy with.",
             ),
             "Shares": st.column_config.NumberColumn(format="%g"),
+            "Tuning $/session": st.column_config.NumberColumn(
+                format="$%.2f",
+                help="The pair's average profit a session in SimLab's tuning (ML summary, "
+                "all tuning data). Buys on the same bar go to the higher one first; the "
+                "rows are in that order.",
+            ),
             "Above buy (units)": st.column_config.NumberColumn(
                 format="%+.2f",
                 help="(last close − buy level) ÷ the pair's level unit. The pair "
@@ -3820,10 +3832,13 @@ _ORCHESTRA_COPY = dc_replace(
     help={
         **_APPLE_TRADER_COPY.help,
         "mode": (
-            "**Race** — every pair watches for its buy; the first whose buy fills takes "
-            "the budget and is the only one that trades until its position is closed, "
-            "then the race is open again. A stop-out stands that pair down for the day and "
-            "the others race on (a GoodMoments pair's stop only pauses that pair).\n\n"
+            "**Race** — every pair watches for its buy, and the first whose buy fills buys "
+            "with the position size below. Another pair whose buy fills while it holds buys "
+            "too, with the same share of the cash left — as long as a share fits in it, and "
+            "only one pair per symbol. When two buys fill on the same bar, the pair with the "
+            "higher average profit a session in SimLab's tuning goes first. A stop-out stands "
+            "that pair down for the day and the others race on (a GoodMoments pair's stop "
+            "only pauses that pair).\n\n"
             "**Split** — every pair trades at once, each on its own share of the budget "
             "(the Budget % column). A pair sizes every buy off the cash its share has "
             "left, and holds only the shares it bought itself. The budget is what the "
@@ -3840,9 +3855,10 @@ _ORCHESTRA_COPY = dc_replace(
             "HighLow2 are two pairs. Day-range pairs (HighLow, HighLow2) rest levels under "
             "their 9:35 forecast; GoodMoments pairs (GoodMoments, HighLow2 + GoodMoments) "
             "buy on their edge. The defaults are the pairs SimLab's "
-            "tuning has picked levels for. The order is the tie-break: when two buys "
-            "would fill on the same bar, the pair listed first takes it. Every pair's "
-            "ticker must be streamed."
+            "tuning has picked levels for. In a race, buys that fill on the same bar go "
+            "to the pair with the higher average profit a session in SimLab's tuning "
+            "first (listed under the picker), whatever order they are picked in. Every "
+            "pair's ticker must be streamed."
         ),
         "pair_stop_gain_fraction": (
             "Per pair: sells everything when a bar's low reaches this share of the pair's "
@@ -4638,8 +4654,9 @@ def _agent_panel(
                 "🎼 Orchestra runs no LLM. It plays Apple Trader's rules on several "
                 "**(ticker, model) pairs** at once — AAPL on the day-range model and AAPL "
                 "on HighLow are two pairs. Each forecasts its own day at 9:35. **Race:** "
-                "the first whose buy fills is followed alone until its position is closed, "
-                "then the others may buy again. **Split:** every pair trades in parallel "
+                "the first whose buy fills takes its share of the cash, the most profitable "
+                "in SimLab's tuning first on a tie, and any other on another symbol may buy "
+                "with what is left. **Split:** every pair trades in parallel "
                 "on its own share of the budget. Either way a stop-out stands only that "
                 "pair down."
             )
@@ -5506,6 +5523,9 @@ def _apple_config_from(raw: "dict | None") -> "AppleTraderConfig | OrchestraConf
             selection=raw.get("selection"),
             mode=raw.get("mode") or "race",
             budget_pct=raw.get("budget_pct") or {},
+            halt_on_stop=bool(raw.get("halt_on_stop", False)),
+            one_holder=bool(raw.get("one_holder", False)),
+            profit_per_session=raw.get("profit_per_session") or {},
         )
     return AppleTraderConfig(**{k: v for k, v in raw.items() if k in known})
 

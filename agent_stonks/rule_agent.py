@@ -124,7 +124,8 @@ class BaseTrader:
         # Whether something outside this trader forbids opening a position now:
         # a callable returning the reason, or None while entries are open. A
         # trader running alone has none. A race (`orchestra`) sets one on
-        # every racer, closed while another racer holds the cash.
+        # every racer, closed while another racer holds its symbol or the
+        # cash left buys none of it.
         self.entry_gate = None
         # The reason the gate last gave, so a level touched bar after bar while
         # the gate is closed is reported once rather than every minute.
