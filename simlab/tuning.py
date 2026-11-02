@@ -1853,6 +1853,21 @@ def session_profits(cell: "dict | None") -> "list[float] | None":
     return [float(daily[day]) for day in sorted(daily)]
 
 
+def traded_sessions(cell: "dict | None") -> "set[str]":
+    """The sessions a scored cell bought on: off its fills (`day_counts`), or,
+    for a cell scored before those were kept, the ones whose profit was not
+    flat. A session sat out (`exclude_days`) is in neither."""
+    if not is_scored(cell):
+        return set()
+    counts = cell.get("day_counts")
+    if counts is not None:
+        return {day for day, found in counts.items() if found.get("buys")}
+    return {
+        day for day, profit in (cell.get("daily") or {}).items()
+        if abs(float(profit)) > _FLAT_DAY_USD
+    }
+
+
 def session_std(cell: "dict | None") -> "float | None":
     """How much a scored cell's profit moved from session to session: the
     sample standard deviation over every session, traded or not, as

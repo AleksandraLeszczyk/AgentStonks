@@ -9,7 +9,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
+import statistics
 import textwrap
 import threading
 import uuid
@@ -5439,6 +5441,129 @@ def _tuning_daily_chart(
     return fig
 
 
+def _tuning_session_spread(job: dict, chosen: dict) -> "list[tuple[str, float, bool]]":
+    """(day, profit, traded) for every session the selected configuration
+    (`chosen`) was scored on, dataset by dataset: a session two datasets share
+    is in it once for each, as the sum's profit a session and Sharpe ratio
+    count it."""
+    out = []
+    for dataset in sim_tuning.chronological(job["spec"]["datasets"]):
+        cell = _tuning_shown_cell(job, dataset["name"], chosen)
+        if not sim_tuning.is_scored(cell):
+            continue
+        traded = sim_tuning.traded_sessions(cell)
+        out.extend(
+            (day, float(profit), day in traded) for day, profit in sorted(cell["daily"].items())
+        )
+    return out
+
+
+def _tuning_bin_width(span: float, count: int) -> float:
+    """The round bin width -- 1, 2, 2.5 or 5 × a power of ten dollars --
+    nearest to 2√`count` bins (8 to 30) over `span` dollars."""
+    target = min(max(round(2 * math.sqrt(count)), 8), 30)
+    raw = max(span / target, 0.01)
+    power = 10 ** math.floor(math.log10(raw))
+    return min((m * power for m in (1, 2, 2.5, 5, 10)), key=lambda w: abs(math.log(w / raw)))
+
+
+def _tuning_profit_histogram(job: dict, chosen: dict) -> "go.Figure | None":
+    """How the selected configuration's (`chosen`'s) session profits spread:
+    sessions that bought, binned by their profit with $0 on a bin edge, red
+    under it and green over it; the sessions without a trade as a grey bar of
+    their own at $0, between the two; the mean and median of every session.
+    None with no session scored."""
+    spread = _tuning_session_spread(job, chosen)
+    if not spread:
+        return None
+    profits = [profit for _, profit, _ in spread]
+    idle = [day for day, _, traded in spread if not traded]
+    width = _tuning_bin_width(
+        max(0.0, *profits) - min(0.0, *profits), max(len(spread) - len(idle), 1)
+    )
+    cents = width != round(width)
+    usd = lambda v: f"{'+' if v >= 0 else '−'}${abs(v):,.{2 if cents else 0}f}"  # noqa: E731
+
+    def listed(days: "list[str]") -> str:
+        """Up to eight of `days`, four to a hover line."""
+        lines = [", ".join(days[i:i + 4]) for i in range(0, min(len(days), 8), 4)]
+        return "<br>".join(lines) + (f"<br>and {len(days) - 8} more" if len(days) > 8 else "")
+
+    # Rounded before the floor: 0.3 / 0.1 is 2.999… and would land a bin low.
+    bins: dict[int, list[str]] = {}
+    for day, profit, traded in spread:
+        if traded:
+            bins.setdefault(math.floor(round(profit / width, 9)), []).append(day)
+    fig = go.Figure()
+    for name, color, keys in (
+        ("Losing sessions", PALETTE["down"], [k for k in sorted(bins) if k < 0]),
+        ("Winning sessions", PALETTE["up"], [k for k in sorted(bins) if k >= 0]),
+    ):
+        if not keys:
+            continue
+        # Bars narrower than their bin leave a gap at every edge; the one at
+        # $0 holds the no-trade bar, so nothing overlaps.
+        fig.add_trace(go.Bar(
+            x=[(k + 0.5) * width for k in keys], y=[len(bins[k]) for k in keys],
+            width=0.7 * width, name=name, marker_color=color,
+            customdata=[[f"{usd(k * width)} to {usd((k + 1) * width)}", listed(bins[k])]
+                        for k in keys],
+            hovertemplate="%{customdata[0]}<br>%{y} session(s):<br>%{customdata[1]}"
+            "<extra></extra>",
+        ))
+    if idle:
+        fig.add_trace(go.Bar(
+            x=[0.0], y=[len(idle)], width=0.24 * width, name="No trade",
+            marker_color=PALETTE["muted"], customdata=[[listed(idle)]],
+            hovertemplate="No trade<br>%{y} session(s):<br>%{customdata[0]}<extra></extra>",
+        ))
+    top = max([len(days) for days in bins.values()] + [len(idle)])
+    for name, value, color, dash in (
+        ("Mean", statistics.fmean(profits), PALETTE["accent"], "solid"),
+        ("Median", statistics.median(profits), PALETTE["orange"], "dash"),
+    ):
+        fig.add_trace(go.Scatter(
+            x=[value, value], y=[0, top * 1.08], mode="lines", name=f"{name} {usd(value)}",
+            line=dict(color=color, width=2, dash=dash),
+            hovertemplate=f"{name} of every session: {usd(value)}<extra></extra>",
+        ))
+    fig.add_vline(x=0, line=dict(color=PALETTE["muted"], width=1), layer="below")
+    fig.update_layout(
+        title=dict(
+            text="Selected — profit per session",
+            subtitle=dict(text=_tuning_values_text(chosen)),
+        ),
+        barmode="overlay",
+    )
+    _chart_layout(fig, height=360)
+    fig.update_layout(margin=dict(t=70))
+    # Plotly.js 3.6 drops a format with a sign in it ("+$,.0f") as a bad one.
+    fig.update_xaxes(title="Profit in the session ($)", tickformat="$,.2~f", zeroline=False)
+    fig.update_yaxes(
+        title="Sessions", rangemode="tozero", tickformat=",d", dtick=1 if top <= 10 else None,
+    )
+    return fig
+
+
+def _tuning_spread_caption(job: dict, chosen: dict) -> str:
+    """Under the histogram: the session counts it is drawn from, the best and
+    the worst, and how they were counted."""
+    spread = _tuning_session_spread(job, chosen)
+    profits = [profit for _, profit, _ in spread]
+    traded = [profit for _, profit, done in spread if done]
+    up = sum(1 for p in traded if p > 0.005)
+    down = sum(1 for p in traded if p < -0.005)
+    idle = len(spread) - len(traded)
+    return (
+        f"{len(spread)} sessions: {up} up, {down} down"
+        + (f", {idle} without a trade" if idle else "")
+        + f" · best {_tuning_usd(max(profits), cents=True)}, "
+        f"worst {_tuning_usd(min(profits), cents=True)}. Fees included; every session "
+        "counted, traded or not, and one that two datasets share once for each — as the "
+        "profit a session and the Sharpe ratio count them."
+    )
+
+
 def _render_tuning_session_context(
     job: dict, context: dict, chosen: "dict | None" = None
 ) -> None:
@@ -5996,7 +6121,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         st.caption(
             ":material/ads_click: Click a row above or a square on a heatmap below to "
             "select a configuration: its settings against the current ones, the button "
-            "that makes it current, and its sessions one by one."
+            "that makes it current, its sessions one by one and how their profits spread."
         )
 
     marks = _tuning_result_marks(job, chosen)
@@ -6109,6 +6234,10 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         for note in forecasts["notes"]:
             st.caption(f":material/info: {note}")
         _render_tuning_session_context(job, context, chosen)
+        histogram = _tuning_profit_histogram(job, chosen)
+        if histogram is not None:
+            st.plotly_chart(histogram, key=f"tune_spread_{job_id}")
+            st.caption(_tuning_spread_caption(job, chosen))
 
     # A derived grid has no record to delete -- it is the runs themselves, and
     # they are Results' to remove.

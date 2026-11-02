@@ -1590,6 +1590,68 @@ class TestPredictedRange:
         assert names.index(box.name) < names.index("AAPL daily")
 
 
+class TestProfitSpread:
+    """The histogram of the selected configuration's session profits, under
+    its session-by-session chart (simlab/app.py)."""
+
+    def record(self):
+        def cell(buy: float, daily: dict, bought: set) -> dict:
+            return {**scored({"buy_k": buy}, sum(daily.values()), days=len(daily)),
+                    "daily": daily,
+                    "day_counts": {d: {"buys": 1, "sells": 1, "round_trips": 1, "wins": 1}
+                                   for d in bought}}
+
+        return tu.refresh_pick(job_record({
+            "w1": [cell(0.3, {"2026-06-15": 120.0, "2026-06-16": 0.0, "2026-06-17": -35.0},
+                        {"2026-06-15", "2026-06-17"}),
+                   cell(0.5, {"2026-06-15": 10.0}, {"2026-06-15"})],
+            "w2": [cell(0.3, {"2026-06-22": 60.0, "2026-06-23": -0.0}, {"2026-06-22"}),
+                   cell(0.5, {"2026-06-22": 5.0}, {"2026-06-22"})],
+        }))
+
+    def test_a_session_bought_on_is_read_off_its_fills_or_else_its_profit(self):
+        cell = {**scored({}, 10.0), "daily": {"a": 0.0, "b": 10.0},
+                "day_counts": {"a": {"buys": 1}, "b": {"buys": 1}}}
+        assert tu.traded_sessions(cell) == {"a", "b"}  # bought and closed flat
+        del cell["day_counts"]
+        assert tu.traded_sessions(cell) == {"b"}
+        assert tu.traded_sessions({"overrides": {}, "invalid": "no"}) == set()
+
+    def test_every_session_of_every_dataset_is_binned_with_no_trades_apart(self):
+        from simlab import app as sim_app
+
+        fig = sim_app._tuning_profit_histogram(self.record(), {"buy_k": 0.3})
+        bars = {t.name: t for t in fig.data if t.type == "bar"}
+        assert set(bars) == {"Losing sessions", "Winning sessions", "No trade"}
+        # $155 over 3 sessions bought on: $20 bins, $0 on an edge -- the loss
+        # in the bin under it, the wins over it.
+        assert list(bars["Losing sessions"].x) == [-30.0]
+        assert list(bars["Winning sessions"].x) == [70.0, 130.0]
+        assert list(bars["Winning sessions"].y) == [1, 1]
+        assert bars["Winning sessions"].customdata[1][0] == "+$120 to +$140"
+        assert (list(bars["No trade"].x), list(bars["No trade"].y)) == ([0.0], [2])
+        assert {"2026-06-16", "2026-06-23"} <= set(
+            bars["No trade"].customdata[0][0].split(", ")
+        )
+        # Mean and median over every session, the idle ones too.
+        lines = {t.name.split()[0]: t.x[0] for t in fig.data if t.type == "scatter"}
+        assert lines == {"Mean": pytest.approx(29.0), "Median": 0.0}
+
+    def test_bin_widths_are_round_numbers(self):
+        from simlab import app as sim_app
+
+        assert sim_app._tuning_bin_width(155.0, 3) == 20.0     # 8 bins at least
+        assert sim_app._tuning_bin_width(2000.0, 25) == 200.0  # 10 bins
+        assert sim_app._tuning_bin_width(1000.0, 100) == 50.0  # 20 bins
+        assert sim_app._tuning_bin_width(30.0, 9) == 5.0       # 3.75 is nearer 5 than 2.5
+        assert sim_app._tuning_bin_width(0.0, 1) == 0.01
+
+    def test_nothing_scored_draws_nothing(self):
+        from simlab import app as sim_app
+
+        assert sim_app._tuning_profit_histogram(self.record(), {"buy_k": 0.9}) is None
+
+
 # --- scoring ----------------------------------------------------------------
 
 
