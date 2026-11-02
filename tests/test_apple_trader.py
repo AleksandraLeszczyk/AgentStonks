@@ -5400,3 +5400,26 @@ class TestConfigSettings:
         assert "Entry: edge at least" in gm and "Buy distance" not in gm
         ff = self.as_dict(AppleTraderConfig(model_key="fastfurious"))
         assert "Entry threshold" in ff and "Buy distance" not in ff
+
+
+class TestBreakerHold:
+    """What the Portfolio tab says holds a pair back, off its record."""
+
+    def test_nothing_holds_a_fresh_record(self):
+        assert at.breaker_hold(None) is None
+        assert at.breaker_hold({"memory": {"entry": None, "stand_down": None, "paused": None}}) is None
+
+    def test_a_pause_names_its_breaker(self):
+        record = {"memory": {"paused": {"headline": "closed for +0.05 × ADR", "pred_high": 1, "pred_low": 0}}}
+        assert at.breaker_hold(record) == (
+            "paused until the forecast is revised (closed for +0.05 × ADR)"
+        )
+
+    def test_a_restored_record_holds_its_config_as_a_dict(self):
+        record = {"config": {"gm_enter": 0.02, "gm_stop_raise": 0.05}, "memory": {"stops": 2}}
+        assert at.breaker_hold(record) == "entry raised to +0.120 after 2 stops"
+        record["config"]["gm_stop_raise"] = 0.0
+        assert at.breaker_hold(record) is None
+
+    def test_a_single_runs_key_names_the_default_model(self):
+        assert at.breaker_key("MU", None) == f"MU:{at.APPLE_TRADER_MODEL}"

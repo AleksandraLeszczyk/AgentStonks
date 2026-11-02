@@ -606,6 +606,67 @@ class TestStopOut:
         assert again.holder == "INTC:highlow"
         assert again.by_key["AAPL:highlow"].trader.plan["stand_down"] == "stopped out"
 
+    def _stopped_out(self, monkeypatch):
+        """AAPL stopped out of a race with INTC, which races on."""
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
+        state = make_state(["AAPL", "INTC"])
+        race = make_race(racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5))
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(99.0, 98.0, 99.5))
+        assert race.run_cycle(state, tracker) == "sold"
+        race.publish_memory(state)
+        return state, tracker, tapes, race
+
+    def test_a_lift_from_the_portfolio_tab_arms_the_pair_again(self, market_open, monkeypatch):
+        """The user's request of 2026-11-02: a button per instrument lifts the
+        circuit breaker, and the pair trades again from its next bar."""
+        state, tracker, tapes, race = self._stopped_out(monkeypatch)
+        assert at.breaker_hold(state.orchestra_levels["AAPL:highlow"]) == (
+            "stood down for the day (stopped out)"
+        )
+        at.ask_breaker_lift(state, "AAPL:highlow")
+        assert at.breaker_lift_asked(state, "AAPL:highlow") is not None
+
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "bought"
+        assert race.holder == "AAPL:highlow"
+        assert at.breaker_lift_asked(state, "AAPL:highlow") is None
+        assert at.breaker_hold(state.orchestra_levels["AAPL:highlow"]) is None
+        assert any(
+            (e.get("text") or "").startswith(
+                "AAPL: circuit breaker lifted by hand from the Portfolio tab (stopped out)"
+            )
+            for e in state.agent_log
+        )
+        assert {row["key"]: row["status"] for row in state.orchestra["board"]}["INTC:highlow"] == "racing"
+
+    def test_a_lift_asked_while_stopped_holds_through_the_next_start(self, market_open, monkeypatch):
+        """Asked between ▶ Stop and ▶ Start: the restart takes the stand-down
+        back from the record first, and the ask lifts it on the first bar."""
+        state, tracker, tapes, race = self._stopped_out(monkeypatch)
+        at.ask_breaker_lift(state, "AAPL:highlow")
+        again = make_race(racer("AAPL", stop_gain_fraction=0.5), racer("INTC", stop_gain_fraction=0.5))
+        again.run_cycle(state, tracker)
+        assert "stand_down" not in again.by_key["AAPL:highlow"].trader.plan
+        texts = [e.get("text") or "" for e in state.agent_log]
+        resumed = next(i for i, t in enumerate(texts) if "which had stood down (stopped out)" in t)
+        lifted = next(i for i, t in enumerate(texts) if "circuit breaker lifted by hand" in t)
+        assert lifted > resumed
+
+    def test_an_ask_from_another_day_lifts_nothing(self, market_open, monkeypatch):
+        state, tracker, tapes, race = self._stopped_out(monkeypatch)
+        at.ask_breaker_lift(state, "AAPL:highlow")
+        state.breaker_lifts["AAPL:highlow"]["day"] = "2026-07-20"
+        assert at.breaker_lift_asked(state, "AAPL:highlow") is None
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        assert race.by_key["AAPL:highlow"].trader.plan["stand_down"] == "stopped out"
+        assert state.breaker_lifts == {}
+
     def test_a_race_of_one_still_stops(self, market_open, monkeypatch):
         """Nobody is left to race on, and an Apple Trader run stops there too."""
         broker = Broker2()

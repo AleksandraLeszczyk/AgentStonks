@@ -45,7 +45,12 @@ from .apple_trader import (
     APPLE_TRADER_KEY,
     APPLE_TRADER_LABEL,
     AppleTraderConfig,
+    ask_breaker_lift,
+    breaker_hold,
+    breaker_key,
+    breaker_lift_asked,
     launch_apple_trader,
+    record_config_field,
 )
 from .apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from .orchestra import (
@@ -2916,6 +2921,7 @@ def _holdings_panel() -> None:
 
     if not rows:
         st.caption("Nothing held or traded yet.")
+        _breaker_controls(state)
         return
     frame = pd.DataFrame(
         [
@@ -2971,7 +2977,88 @@ def _holdings_panel() -> None:
             + ", ".join(f"{r['symbol']} {r['untracked']:g} sh" for r in untracked)
             + "."
         )
+    _breaker_controls(state)
     _fills_table(fills)
+
+
+# How long a lift may wait untaken while the session is open before the row
+# says why: a running trader takes it within a bar of its forecast.
+_LIFT_UNTAKEN_SEC = 3 * APPLE_TRADER_CYCLE_SEC
+
+
+def _breaker_pairs(state: AppState) -> "list[tuple[str, str, dict]]":
+    """`(key, label, record)` for each pair the rule agent picked in the
+    sidebar trades today: Orchestra's racers in its order, or Apple Trader's
+    one pair. Only pairs with today's record -- a pair that has not made its
+    forecast yet has nothing a breaker could have stopped."""
+    today = clock.now().astimezone(market_hours.MARKET_TZ).date()
+
+    def todays(record) -> bool:
+        return bool(record) and pd.Timestamp(record.get("date")).date() == today
+
+    if state.llm_personality == ORCHESTRA_KEY:
+        race = getattr(state, "orchestra", None) or {}
+        records = getattr(state, "orchestra_levels", None) or {}
+        labels = race.get("labels") or {}
+        return [
+            (key, labels.get(key) or racer_label(key), records[key])
+            for key in race.get("order") or []
+            if todays(records.get(key))
+        ]
+    if state.llm_personality == APPLE_TRADER_KEY:
+        record = getattr(state, "apple_trader_levels", None)
+        if todays(record):
+            key = breaker_key(record["ticker"], record_config_field(record, "model_key"))
+            return [(key, racer_label(key), record)]
+    return []
+
+
+def _breaker_status(state: AppState, hold: "str | None", asked: "dict | None") -> str:
+    """One pair's breaker line: trading, held back and why, or lifted and
+    waiting for its trader to take it."""
+    if hold is None:
+        return ":material/check_circle: Trading — no circuit breaker holds it."
+    held = hold[0].upper() + hold[1:]
+    if asked is None:
+        return f":material/block: {held}."
+    if not state.agent_running:
+        return f":material/schedule: {held} — lifted when ▶ Start Agent starts it again."
+    if market_hours.is_market_open() and time.time() - float(asked["at"]) > _LIFT_UNTAKEN_SEC:
+        return (
+            f":material/schedule: {held} — the lift has not been taken yet. An agent "
+            "started before the app was last updated cannot take it: 🔄 Refresh Agent "
+            "(keeps today's ledger) restarts it on the new code, which does."
+        )
+    return f":material/schedule: {held} — lifted on its trader's next bar."
+
+
+def _breaker_controls(state: AppState) -> None:
+    """Per pair the rule agent trades today, whether a circuit breaker holds it
+    back -- a stand-down, a pause until the forecast is revised, a raised
+    entry -- and a button that lifts it. The trader does the lifting, on its
+    next bar (`apple_trader.ask_breaker_lift`); a stopped agent's, when it is
+    next started."""
+    pairs = _breaker_pairs(state)
+    if not pairs:
+        return
+    st.markdown("**Circuit breakers**")
+    for key, label, record in pairs:
+        hold = breaker_hold(record)
+        asked = breaker_lift_asked(state, key)
+        name, status, action = st.columns([2, 6, 2], vertical_alignment="center")
+        name.markdown(label)
+        status.caption(_breaker_status(state, hold, asked))
+        if action.button(
+            "Trade again",
+            key=f"breaker_lift_{key}",
+            icon=":material/play_arrow:",
+            disabled=hold is None or asked is not None,
+            width="stretch",
+            help="Lift this pair's circuit breaker for the rest of today: its "
+            "entries are armed again. It can trip again on a later trade.",
+        ):
+            ask_breaker_lift(state, key)
+            st.rerun(scope="fragment")
 
 
 def _et_clock(ts: str) -> str:

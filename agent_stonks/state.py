@@ -384,6 +384,10 @@ class AppState:
         # holds the position, and one board row per racer -- written by the
         # coordinator every cycle, read by the Portfolio tab and the session file.
         self.orchestra: "dict | None" = None
+        # A circuit breaker the Portfolio tab asked to lift, per pair
+        # ("MU:highlow" -> {"day", "at"}), until the pair's trader takes the
+        # ask on its next bar (`apple_trader.ask_breaker_lift`).
+        self.breaker_lifts: dict = {}
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"

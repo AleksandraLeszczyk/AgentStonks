@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import timedelta, timezone
 from typing import Optional
@@ -168,6 +169,82 @@ class TraderSlot:
 
 
 SINGLE_SLOT = TraderSlot()
+
+
+# --- a circuit breaker lifted by hand -------------------------------------------
+#
+# The Portfolio tab's "Trade again" asks (`ui._breaker_controls`); the trader
+# lifts it itself, on its next bar (`_lift_breaker`), since the stand-down lives
+# in its plan and only its own thread writes that. The ask waits in the state
+# until then -- through a stopped agent's next ▶ Start too, whose restart takes
+# the stand-down back from the session file before the ask is read. It is good
+# only for the day it was made: the next session starts with no breaker.
+
+
+def breaker_key(ticker: str, model_key: "str | None") -> str:
+    """The pair a lift is asked for: "MU:highlow" -- Orchestra's racer key, and
+    a single run's the same way."""
+    return f"{ticker}:{model_key or APPLE_TRADER_MODEL}"
+
+
+def _market_day() -> str:
+    return str(day_range.market_date().date())
+
+
+def ask_breaker_lift(state: AppState, key: str) -> None:
+    """Ask the trader of pair `key` to lift its circuit breaker on its next bar."""
+    with state.lock:
+        lifts = dict(getattr(state, "breaker_lifts", None) or {})
+        lifts[key] = {"day": _market_day(), "at": time.time()}
+        # Replaced rather than mutated, like the published records.
+        state.breaker_lifts = lifts
+
+
+def breaker_lift_asked(state: AppState, key: str) -> "dict | None":
+    """Today's ask to lift pair `key`'s breaker, while its trader has not
+    taken it yet."""
+    asked = (getattr(state, "breaker_lifts", None) or {}).get(key)
+    return asked if asked and asked.get("day") == _market_day() else None
+
+
+def take_breaker_lift(state: AppState, key: str, today) -> bool:
+    """Whether pair `key`'s breaker was asked to be lifted on `today`. The ask
+    is used up either way: one from an earlier day has nothing left to lift."""
+    if key not in (getattr(state, "breaker_lifts", None) or {}):
+        return False
+    with state.lock:
+        lifts = dict(state.breaker_lifts)
+        asked = lifts.pop(key, None)
+        state.breaker_lifts = lifts
+    return bool(asked) and asked.get("day") == str(pd.Timestamp(today).date())
+
+
+def record_config_field(record: "dict | None", name: str):
+    """One field of a published record's config: a config while the run is
+    live, a dict once the record has come back from the session file."""
+    config = (record or {}).get("config")
+    return config.get(name) if isinstance(config, dict) else getattr(config, name, None)
+
+
+def breaker_hold(record: "dict | None") -> "str | None":
+    """What a circuit breaker holds a pair's entries back with, read off its
+    published record (`memory`), in the Portfolio tab's words; None when none
+    does. A day-range pair's stand-down -- a weak trade, a take under the buy
+    level, a stop-out that sat only this pair out -- or its pause until the
+    forecast is revised; a GoodMoments pair's entry raised by today's stops."""
+    record = record or {}
+    memory = record.get("memory") or {}
+    if memory.get("stand_down"):
+        return f"stood down for the day ({memory['stand_down']})"
+    paused = memory.get("paused")
+    if paused:
+        return f"paused until the forecast is revised ({paused.get('headline')})"
+    stops = int(memory.get("stops") or 0)
+    raise_by = float(record_config_field(record, "gm_stop_raise") or 0.0)
+    if stops and raise_by:
+        enter = float(record_config_field(record, "gm_enter") or 0.0) + stops * raise_by
+        return f"entry raised to {enter:+.3f} after {stops} stop{'s' if stops > 1 else ''}"
+    return None
 
 
 def base_record(model_key: "str | None", ticker: str) -> "tuple[dict | None, str]":
@@ -2225,6 +2302,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 return "warming_up"
             if not self._plan_session(bundle, state, frame, today, want):
                 return "no_data"
+        # Once today's plan is in place -- a restart's stand-down taken back
+        # into it -- so a lift asked before that still finds what to lift.
+        self._lift_breaker(state, today)
 
         last = frame.iloc[-1]
         ts = frame.index[-1]
@@ -4176,6 +4256,28 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             "would only buy back the shares just sold.",
         )
 
+    def _lift_breaker(self, state: AppState, today) -> None:
+        """Arm the levels again when the Portfolio tab has lifted this pair's
+        circuit breaker (`ask_breaker_lift`): its stand-down, or its pause
+        until the forecast is revised."""
+        if not take_breaker_lift(state, breaker_key(self.ticker, self.config.model_key), today):
+            return
+        held = self.plan.get("stand_down") or (self.plan.get("paused") or {}).get("headline")
+        if not held:
+            return
+        self.plan.pop("stand_down", None)
+        self.plan.pop("paused", None)
+        _log(
+            state,
+            {
+                "type": "analysis",
+                "text": (
+                    f"{self.ticker}: circuit breaker lifted by hand from the Portfolio tab "
+                    f"({held}) — the levels are armed again."
+                ),
+            },
+        )
+
     def _stand_down(self, state: AppState, headline: str, why: str) -> None:
         """Take no further entry this session, and say once why.
 
@@ -5228,6 +5330,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
                 return rule_agent.NO_DATA if self.blocked is not None else rule_agent.WARMING_UP
             if not self._plan_session(bundle, state, today):
                 return rule_agent.NO_DATA
+        # After a restart's stops are taken back (`_resume`), as on Apple Trader.
+        self._lift_breaker(state, today)
 
         last = frame.iloc[-1]
         ts = frame.index[-1]
@@ -5372,6 +5476,25 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         every stop the session has taken."""
         stops = int((self.session or {}).get("stops") or 0)
         return float(self.config.gm_enter) + stops * float(self.config.gm_stop_raise)
+
+    def _lift_breaker(self, state: AppState, today) -> None:
+        """Bring the entry back to `gm_enter` when the Portfolio tab has lifted
+        the circuit breaker (`ask_breaker_lift`): today's stops are forgotten,
+        so the next one raises it from there again. The pause after a stop is
+        the strategy's own rule, not the breaker, and runs on."""
+        if not take_breaker_lift(state, breaker_key(self.ticker, self.config.model_key), today):
+            return
+        stops = int(self.session.get("stops") or 0)
+        if not (stops and self.config.gm_stop_raise):
+            return
+        raised = self.enter_at()
+        self.session["stops"] = 0
+        self._breaker_note = None
+        _log(state, {"type": "analysis", "text": (
+            f"{self.ticker}: circuit breaker lifted by hand from the Portfolio tab — a buy "
+            f"needs the {self.config.gm_enter:+g} entry again, not the {raised:+.3f} "
+            f"{stops} stop{'s' if stops > 1 else ''} had raised it to."
+        )})
 
     def _refuse_on_breaker(self, state: AppState, ts) -> bool:
         """Whether the circuit breaker refuses an entry the edge alone would

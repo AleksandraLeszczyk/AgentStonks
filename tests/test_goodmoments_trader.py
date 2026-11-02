@@ -663,6 +663,36 @@ class TestCircuitBreaker:
         tape.append(98.6, edge=ENTER)
         assert cycle(trader, state, tracker) == "bought"
 
+    def test_a_lift_from_the_portfolio_tab_brings_the_entry_back(self, monkeypatch, state):
+        """The user's request of 2026-11-02: lifted by hand, a buy needs only
+        `gm_enter` again; the next stop raises it from there."""
+        trader, tracker, tape = self._stopped(monkeypatch, state)
+        assert at.breaker_hold(state.apple_trader_levels) == (
+            f"entry raised to {ENTER + self.RAISE:+.3f} after 1 stop"
+        )
+        at.ask_breaker_lift(state, at.breaker_key(TICKER, trader.config.model_key))
+        tape.append(98.6, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+        assert at.breaker_hold(state.apple_trader_levels) is None
+        assert any(
+            "circuit breaker lifted by hand from the Portfolio tab" in (e.get("text") or "")
+            for e in state.agent_log
+        )
+        tape.append(96.0, low=98.6 * math.exp(-0.75 * ADR) - 0.01)
+        assert cycle(trader, state, tracker) == "sold"
+        assert trader.enter_at() == pytest.approx(ENTER + self.RAISE)
+
+    def test_the_pause_after_a_stop_is_not_the_breakers(self, monkeypatch, state):
+        trader, tracker, tape = _setup(monkeypatch, state)
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+        tape.append(98.6, low=STOP - 0.01)
+        assert cycle(trader, state, tracker) == "sold"
+        at.ask_breaker_lift(state, at.breaker_key(TICKER, trader.config.model_key))
+        tape.append(98.6, edge=0.2)
+        assert cycle(trader, state, tracker) == "hold"
+        assert trader.enter_at() == pytest.approx(ENTER)
+
     def test_a_new_session_starts_from_the_entry(self, monkeypatch, state):
         trader, tracker, tape = self._stopped(monkeypatch, state)
         trader._roll_session(pd.Timestamp("2026-07-22"))
