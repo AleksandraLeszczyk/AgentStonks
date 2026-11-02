@@ -142,6 +142,7 @@ from . import aggressiveness, bar_history, gamma_history, minute_momentum, newsi
 from .trade_sound import next_trade_cue, play_trade_sound
 from .page_watchdog import WATCHDOG_BEAT_SEC, describe_reload, page_watchdog
 from .quote_card import quote_card
+from .session_timer import SYNC_SEC as SESSION_TIMER_SYNC_SEC, session_timer
 from .agent_log_view import agent_log_view
 from .trading_mode import (
     ENV_KEYS as TRADING_ENV_KEYS,
@@ -2472,6 +2473,21 @@ def _sidebar_status() -> None:
     if state.news_status not in ("Idle", state.status):
         st.caption(f"News: {state.news_status}")
     st.caption(f"Agent: {_agent_status_text(state)}")
+
+
+@st.fragment(run_every=SESSION_TIMER_SYNC_SEC)
+def _session_timer() -> None:
+    """How far into the session it is, or how long until it opens, on top of
+    the sidebar (see session_timer). The browser counts the seconds; this
+    re-sends the time now and then -- the replayed clock's under Dummy data,
+    which stands still until ▶ Start Agent."""
+    state = _get_state()
+    replayed = replay.session_of(state)
+    session_timer(
+        clock.now(),
+        ticking=replayed is None or replayed.running,
+        key="sidebar_session_timer",
+    )
 
 
 def _agent_status_text(state: AppState) -> str:
@@ -5758,6 +5774,9 @@ def build_ui() -> None:
     last_setup.restore()
 
     with st.sidebar:
+        # The session timer, on top; filled once there is a state to read
+        # the clock from.
+        timer_slot = st.container()
         # What ▶ Start streams, above it.
         symbols_input = st.text_input(
             "Symbols",
@@ -5777,6 +5796,8 @@ def build_ui() -> None:
         status_slot = st.container()
         # The agent's run settings, ahead of the Agent tab that reads them.
         run_state = _get_state()
+        with timer_slot:
+            _session_timer()
         _execution_controls()
         _trade_sound_control(run_state)
         _session_checkboxes(run_state)
