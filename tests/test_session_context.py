@@ -164,12 +164,41 @@ class TestSessionChart:
             "biases": {"2026-09-14": {"bias": "bearish", "confidence": "high"}},
         }
         fig = sim_app._tuning_daily_chart(job, context, chosen={})
-        ticks = dict(zip(fig.layout.xaxis2.tickvals, fig.layout.xaxis2.ticktext))
+        ticks = dict(zip(fig.layout.xaxis4.tickvals, fig.layout.xaxis4.ticktext))
         assert "▼ bearish" in ticks["2026-09-14"] and "VIX 17.5" in ticks["2026-09-14"]
         assert "no bias" in ticks["2026-09-15"] and "VIX –" in ticks["2026-09-15"]
         assert "bearish (high confidence)" in fig.data[0].hovertext[0]
 
-    def test_bottom_panel_is_one_daily_candle_per_session(self, monkeypatch):
+    def test_under_the_candles_each_sessions_move_and_range(self, monkeypatch):
+        from simlab import app as sim_app
+
+        monkeypatch.setattr(
+            sim_app, "_tuning_session_bars",
+            lambda sym, feed, days: {
+                "2026-09-14": {"o": 230.0, "h": 234.0, "l": 229.0, "c": 233.0},
+                "2026-09-15": {"o": 233.0, "h": 233.5, "l": 228.0, "c": 229.0},
+            },
+        )
+        cell = {"overrides": {}, "profit": 10.0,
+                "daily": {"2026-09-14": 12.0, "2026-09-15": -2.0}}
+        job = {
+            "spec": {"base": {"ticker": "AAPL"}, "datasets": [{"name": "wk", "feed": "sip"}]},
+            "cells": {"wk": [cell]},
+            "best": cell,
+        }
+        monkeypatch.setattr(sim_app.sim_tuning, "is_scored", lambda c: bool(c))
+        fig = sim_app._tuning_daily_chart(job, chosen={})
+        traces = {t.name: t for t in fig.data}
+        move, span = traces["Open → close"], traces["High − low"]
+        assert (move.xaxis, move.yaxis, span.yaxis) == ("x3", "y3", "y4")
+        assert list(move.y) == [3.0, -4.0] and list(span.y) == [5.0, 5.5]
+        assert list(move.marker.color) == [sim_app.PALETTE["up"], sim_app.PALETTE["down"]]
+        assert "open 233.00 → close 229.00: -4.00 (-1.72%)" in move.customdata[1]
+        # A profit's hover carries its session's move and range too.
+        profit = traces["Selected on wk"]
+        assert "high 234.00 − low 229.00: 5.00" in profit.hovertext[0]
+
+    def test_the_price_panel_is_one_daily_candle_per_session(self, monkeypatch):
         from simlab import app as sim_app
 
         stored = [

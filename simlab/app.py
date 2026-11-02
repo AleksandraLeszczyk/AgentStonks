@@ -5356,6 +5356,16 @@ def _tuning_forecast_hover(forecast: dict, bar: "dict | None") -> str:
     return "<br>".join(lines)
 
 
+def _tuning_move_hover(bar: dict) -> str:
+    """A session's open → close and high − low, in dollars and against its open."""
+    move, span = bar["c"] - bar["o"], bar["h"] - bar["l"]
+    return (
+        f"open {bar['o']:.2f} → close {bar['c']:.2f}: {move:+.2f} ({move / bar['o']:+.2%})"
+        f"<br>high {bar['h']:.2f} − low {bar['l']:.2f}: {span:.2f} "
+        f"({span / bar['o']:.2%} of the open)"
+    )
+
+
 def _tuning_daily_chart(
     job: dict,
     context: "dict | None" = None,
@@ -5363,15 +5373,16 @@ def _tuning_daily_chart(
     forecasts: "dict | None" = None,
 ) -> go.Figure:
     """The selected configuration's (`chosen`'s) profit per session over the
-    daily candles; candles alone with nothing selected. `forecasts`
+    daily candles, and under them each session's open → close and high − low;
+    the market panels alone with nothing selected. `forecasts`
     (`_tuning_forecasts`) boxes each session's predicted high and low behind
     its candle."""
     spec = job["spec"]
     symbol = spec["base"]["ticker"]
     context = context or {"vix": {}, "biases": {}}
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        row_heights=[0.6, 0.4],
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.34, 0.34, 0.16, 0.16],
     )
     bars: dict[str, dict] = {}
     for index, dataset in enumerate(sim_tuning.chronological(spec["datasets"])):
@@ -5379,12 +5390,19 @@ def _tuning_daily_chart(
         if not sim_tuning.is_scored(cell):
             continue
         days = list(cell["daily"])
+        found = _tuning_session_bars(symbol, dataset["feed"], days)
+        bars.update(found)
+        # The day's move and range ride along, so one hover on a profit
+        # reads it against what the market did.
         fig.add_trace(go.Bar(
             x=days, y=[cell["daily"][d] for d in days],
             name=f"Selected on {dataset['name']}", marker_color=_tuning_color(index),
-            hovertext=[_tuning_day_hover(d, context) for d in days],
+            hovertext=[
+                _tuning_day_hover(d, context)
+                + (f"<br>{_tuning_move_hover(found[d])}" if d in found else "")
+                for d in days
+            ],
         ), row=1, col=1)
-        bars.update(_tuning_session_bars(symbol, dataset["feed"], days))
     predicted = (forecasts or {}).get("days") or {}
     if predicted:
         # A box from the predicted low to the predicted high, behind the candle:
@@ -5415,6 +5433,20 @@ def _tuning_daily_chart(
             increasing_line_color=PALETTE["up"],
             decreasing_line_color=PALETTE["down"],
         ), row=2, col=1)
+        # The candle's body and its whole length as bars of their own, read
+        # off a zero line rather than off the price.
+        moves = [bars[d]["c"] - bars[d]["o"] for d in days]
+        hover = [_tuning_move_hover(bars[d]) for d in days]
+        fig.add_trace(go.Bar(
+            x=days, y=moves, name="Open → close", showlegend=False,
+            marker_color=[PALETTE["up"] if m >= 0 else PALETTE["down"] for m in moves],
+            customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+        ), row=3, col=1)
+        fig.add_trace(go.Bar(
+            x=days, y=[bars[d]["h"] - bars[d]["l"] for d in days], name="High − low",
+            showlegend=False, marker_color=PALETTE["muted"],
+            customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+        ), row=4, col=1)
     fig.update_xaxes(
         type="category", categoryorder="category ascending", gridcolor=PALETTE["grid"],
         rangeslider_visible=False,
@@ -5426,18 +5458,25 @@ def _tuning_daily_chart(
     all_days = sorted({d for ds in shown_days for d in ds} | set(bars))
     fig.update_xaxes(
         tickvals=all_days, ticktext=[_tuning_day_label(d, context) for d in all_days],
-        row=2, col=1,
+        row=4, col=1,
     )
     fig.update_yaxes(title="Profit ($)", row=1, col=1)
     fig.update_yaxes(title=f"{symbol} ($)", row=2, col=1)
+    fig.update_yaxes(title="Open→close", row=3, col=1)
+    fig.update_yaxes(title="High−low", rangemode="tozero", row=4, col=1)
     fig.update_yaxes(gridcolor=PALETTE["grid"])
-    title = (
-        "Session by session" if chosen is None
-        else f"Selected — {_tuning_values_text(chosen)}, session by session"
+    fig.update_yaxes(zeroline=True, zerolinecolor=PALETTE["muted"], row=3, col=1)
+    # The configuration as a subtitle: on the title's line it ran under the
+    # chart's toolbar.
+    fig.update_layout(
+        title=dict(text="Session by session") if chosen is None else dict(
+            text="Selected — session by session",
+            subtitle=dict(text=_tuning_values_text(chosen)),
+        ),
+        barmode="group",
     )
-    fig.update_layout(title=title, barmode="group")
-    _chart_layout(fig, height=520)
-    fig.update_layout(margin=dict(b=80))
+    _chart_layout(fig, height=760)
+    fig.update_layout(margin=dict(t=70, b=80))
     return fig
 
 
