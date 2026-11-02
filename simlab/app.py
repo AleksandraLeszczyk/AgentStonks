@@ -1892,12 +1892,14 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "update is worth anything — neither has ever been swept."
         ),
         "dayrange_exits": (
-            "Three exits, all measured from the fill, each switched off by a 0 in its "
+            "Four exits, all measured from the fill, each switched off by a 0 in its "
             "first box.\n\n"
             "- **Stop loss** — a share of what the trade is playing for.\n"
             "- **Momentum fade** — a share of the position, after a wait.\n"
             "- **Sell at forming zone** — the same share after the same wait, on a stall "
             "zone; both takes on means whichever fires first.\n"
+            "- **Time limit** — everything, on the first bar in profit once the position "
+            "is that old.\n"
             "- Each switched-on knob is in the signature, so sweeping one queues its own "
             "configuration. With all off a run files beside the records made before the "
             "exit existed, which replay that way."
@@ -2214,6 +2216,15 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- **0** switches both takes off, and signs as no take.\n"
             "- Whole shares, rounded down, and at least one."
         ),
+        "time_limit_minutes": (
+            "Minutes after the first buy from which a position that has not reached the "
+            "sell level (on GoodMoments, the take) is sold on the first bar that closes above "
+            "the fill; under it the position is held for that bar, the stop or the flatten. "
+            "An add does not restart the clock.\n\n"
+            "- In the signature as `time=30m@profit`; a record from before it replays "
+            "without one.\n"
+            "- 0 switches it off."
+        ),
         "take_after_minutes": (
             "The take fires only once this many minutes of bars have passed "
             "since the last buy; a buy lower down starts the wait again.\n\n"
@@ -2529,8 +2540,8 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
         "signal_pairs": (
             "The GoodMoments pairs: each replays on its own configuration (its base, else "
             "the shipped defaults) with the entry, take, stop and momentum confirmation set "
-            "here — and on the hybrid HighLow2's buy distance. The position size and the days off are "
-            "Orchestra's. A race of one GoodMoments pair replays exactly as Apple Trader on it."
+            "here — and on the hybrid HighLow2's buy distance. The position size, the time limit "
+            "and the days off are Orchestra's. A race of one GoodMoments pair replays exactly as Apple Trader on it."
         ),
         "selection": (
             "Replays Orchestra's 09:34 pick of the day's candidates from what the "

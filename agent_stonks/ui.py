@@ -3359,13 +3359,15 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "live, including under a position that is already open."
         ),
         "dayrange_exits": (
-            "Three ways a position gets out before the sell level, each switched off by "
+            "Four ways a position gets out before the sell level, each switched off by "
             "a 0 in its first box. Everything is measured from the fill.\n\n"
             "- **Stop loss** — sells everything under the fill.\n"
             "- **Momentum fade** — sells part of the position once momentum turns "
             "negative.\n"
             "- **Sell at forming zone** — sells that same part once the price stalls in "
-            "a narrow band.\n\n"
+            "a narrow band.\n"
+            "- **Time limit** — sells everything on the first bar in profit once the "
+            "position has been open that long.\n\n"
             "Both takes can be on: whichever comes first sells, once per position. The "
             "rest is a **runner**, kept for the sell level if that is still far enough "
             "away and sold if the price comes back to the fill (one kept from a take at "
@@ -3818,6 +3820,16 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- Whole shares, rounded down, and at least one.\n"
             "- **0** switches the momentum fade off, and the forming-zone exit with it."
         ),
+        "time_limit_minutes": (
+            "A position still open this many minutes after the first buy — the sell level "
+            "(on GoodMoments, the take) not reached — is sold on the first bar that closes "
+            "above the fill, whatever the gain.\n\n"
+            "- Under the fill it is held, and sold on the first bar back above it — or at "
+            "the stop or the closing flatten.\n"
+            "- A buy lower down (scale-in) does not restart the clock; the fill it must "
+            "beat is then the average cost.\n"
+            "- 0 switches it off."
+        ),
         "take_after_minutes": (
             "Neither take sells until this many minutes have passed since the last "
             "buy.\n\n"
@@ -3914,7 +3926,8 @@ _ORCHESTRA_COPY = dc_replace(
             "starting from its base configuration: SimLab's tuning picks it per pair.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
             "- Everything below the tables is shared by every day-range pair — the "
-            "circuit breaker too; the position size and the days off by every pair."
+            "circuit breaker too; the position size, the time limit and the days off by "
+            "every pair."
         ),
         "signal_pairs": (
             "The GoodMoments pairs — GoodMoments, and HighLow2 + GoodMoments — read their "
@@ -3927,7 +3940,7 @@ _ORCHESTRA_COPY = dc_replace(
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
             "- Everything else — the take's fall with volatility, the sale on a fading edge, "
             "the circuit breaker — is the pair's own configuration. "
-            "The position size and the days off below are Orchestra's.\n"
+            "The position size, the time limit and the days off below are Orchestra's.\n"
             "- A stop pauses only that pair's buys for 15 bars; it does not stop the agent.\n"
             "- Read once, at ▶ Start."
         ),

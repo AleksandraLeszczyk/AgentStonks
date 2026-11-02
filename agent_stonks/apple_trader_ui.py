@@ -253,6 +253,7 @@ def probability_params(
         key=copy.key(f"gm_confirm_bars_{model_key}_{ticker}"),
         help=copy.help.get("gm_confirm_bars"),
     )
+    time_limit = time_limit_param(defaults, copy, col_b)
     if gm_exit is not None and gm_exit >= float(enter):
         st.warning(
             f"The exit ({gm_exit:+.3f}) has to sit below the entry ({float(enter):+.3f}), or every "
@@ -277,6 +278,7 @@ def probability_params(
         gm_stop_k=float(stop_k),
         gm_confirm_bars=int(confirm_bars),
         gm_stop_raise=gm_stop_raise,
+        time_limit_minutes=time_limit,
         skip_events=skip_events,
         **levels,
     )
@@ -1103,8 +1105,12 @@ def exit_params(
             "A zone is at least 2 bars long — 1 reads as 0, the zone off.",
             icon=":material/warning:",
         )
+    exit_heading("Time limit")
+    col_a, _ = st.columns(2)
+    time_limit = time_limit_param(defaults, copy, col_a)
     return {
         **stopped,
+        "time_limit_minutes": time_limit,
         "take_trigger": TAKE_EITHER,
         "zone_min_bars": int(zone_min_bars) if zone_min_bars >= 2 else 0,
         "zone_width": float(zone_width),
@@ -1112,6 +1118,19 @@ def exit_params(
         "take_after_minutes": int(take_after_minutes),
         "take_under_buy_stands_down": False,
     }
+
+
+def time_limit_param(defaults: AppleTraderConfig, copy: FormCopy, column) -> int:
+    """The time limit (`time_limit_minutes`): minutes after the first buy from
+    which a position that has not reached its sell level -- or GoodMoments'
+    take -- is sold on the first bar above its fill. 0 is off. One box for
+    every rule set that reads it, and in Orchestra for every pair."""
+    return int(column.number_input(
+        "Sell in profit after (min, 0 = off)",
+        min_value=0, max_value=390, value=int(defaults.time_limit_minutes), step=5,
+        key=copy.key("time_limit_minutes"),
+        help=copy.help.get("time_limit_minutes"),
+    ))
 
 
 def exit_heading(title: str) -> None:
@@ -1374,14 +1393,18 @@ def orchestra_params(
             )
         until_revised = breaker_until_param(defaults, copy, rules)
     else:
-        # GoodMoments pairs alone: what every pair shares is the size and the
-        # days off (`orchestra.SHARED_BY_ALL`); the rest is each pair's own.
-        sizing = {"position_pct": float(col_a.number_input(
-            "Position size (% of cash)",
-            min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
-            key=copy.key("dayrange_size"),
-            help=copy.help.get("position_pct"),
-        ))}
+        # GoodMoments pairs alone: what every pair shares is the size, the
+        # time limit and the days off (`orchestra.SHARED_BY_ALL`); the rest is
+        # each pair's own.
+        sizing = {
+            "position_pct": float(col_a.number_input(
+                "Position size (% of cash)",
+                min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
+                key=copy.key("dayrange_size"),
+                help=copy.help.get("position_pct"),
+            )),
+            "time_limit_minutes": time_limit_param(defaults, copy, col_b),
+        }
         rules = {"skip_events": skip_param(defaults, copy)}
         until_revised = defaults.breaker_until_revised
     base = replace(

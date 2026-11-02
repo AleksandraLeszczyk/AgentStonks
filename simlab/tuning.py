@@ -234,6 +234,10 @@ TUNABLES: "dict[str, Tunable]" = {
             "take_after_minutes", "Take only after time (min)", 0, 390, 1,
             (0, 30, 5), "%d", integer=True,
         ),
+        Tunable(
+            "time_limit_minutes", "Time limit: sell in profit after (min)", 0, 390, 5,
+            (0, 120, 30), "%d", integer=True,
+        ),
         # The gate the time above replaced (2026-09-29 to 10-02). Still a
         # tunable so a stored sweep over it reads back as the grid it was; not
         # offered for a new one (`LEGACY_AXES`).
@@ -384,6 +388,7 @@ SWEEPABLE: "tuple[str, ...]" = (
     "take_after_minutes",
     "zone_min_bars",
     "zone_width",
+    "time_limit_minutes",
     "min_win_k",
     "position_pct",
     "ff_entry_quantile",
@@ -412,7 +417,7 @@ MOMENTUM_AXES: "tuple[str, ...]" = (
 # GoodMoments' fields, for the same reason.
 PROBABILITY_AXES: "tuple[str, ...]" = (
     "gm_enter", "gm_take_k", "gm_take_min_k", "gm_stop_k", "gm_confirm_bars", "gm_stop_raise",
-    "position_pct",
+    "time_limit_minutes", "position_pct",
 )
 # A hybrid on GoodMoments' rules (`apple_models.levels_of`) reads those, plus
 # the buy level its second vote is made at and how a breach moves it.

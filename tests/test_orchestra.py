@@ -2309,3 +2309,25 @@ class TestGoodMomentsPairsForm:
     def test_split_gives_each_its_share(self):
         app = self._run(["AAPL:highlow", "AMD:goodmoments"], o_mode=ar.MODE_SPLIT)
         assert app.session_state["out"].budget_pct == {"AAPL:highlow": 50.0, "AMD:goodmoments": 50.0}
+
+
+class TestTimeLimitIsShared:
+    """One time limit for every pair (2026-11-02), GoodMoments pairs too."""
+
+    def test_every_pair_gets_it(self):
+        base = replace(at.AppleTraderConfig(), time_limit_minutes=30)
+        race = ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], base)
+        assert {r.time_limit_minutes for r in race.racers} == {30}
+
+    def test_signed_once_with_the_shared_rules(self):
+        base = replace(at.AppleTraderConfig(), time_limit_minutes=30)
+        mixed = ar.orchestra_signature(
+            ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], base)
+        )
+        assert mixed.count(",time=30m@profit") == 1
+        alone = ar.orchestra_signature(ar.build_orchestra_config(["AAPL:goodmoments"], base))
+        assert alone.count(",time=30m@profit") == 1
+        off = ar.orchestra_signature(
+            ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], at.AppleTraderConfig())
+        )
+        assert ",time=" not in off

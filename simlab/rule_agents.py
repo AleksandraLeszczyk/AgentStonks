@@ -237,6 +237,10 @@ _APPLE_LEGACY = {
     # And before 2026-10-02 the take fired from the first bar after the fill.
     # 0 is that rule, and it is left out of the signature.
     "take_after_minutes": 0,
+    # And before 2026-11-02 nothing sold a position on a clock: it waited for
+    # the sell level, the take, the stop or the flatten. 0 is that rule, and it
+    # is left out of the signature.
+    "time_limit_minutes": 0,
     # And before 2026-10-06 the take fired in profit only, leaving a losing
     # position to the stop. False is that rule, and it is left out of the
     # signature.

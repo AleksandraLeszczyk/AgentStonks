@@ -5423,3 +5423,78 @@ class TestBreakerHold:
 
     def test_a_single_runs_key_names_the_default_model(self):
         assert at.breaker_key("MU", None) == f"MU:{at.APPLE_TRADER_MODEL}"
+
+
+class TestTimeLimit:
+    """The time limit (2026-11-02, the user's request): this many minutes after
+    the first buy, a position the sell level has not taken is sold on the first
+    bar that closes above its fill -- held under it ("hold until in profit")."""
+
+    def _setup(self, state, monkeypatch, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        return trader, tracker, tape
+
+    @staticmethod
+    def _step(trader, tracker, tape, state, close, **bar):
+        tape.append(close, **bar)
+        return trader.run_cycle(DAYRANGE_BUNDLE, state, tracker)
+
+    def test_off_by_default_and_signed_only_while_on(self):
+        config = AppleTraderConfig()
+        assert config.time_limit_minutes == 0
+        assert ",time=" not in config_signature(config)
+        assert ",time=30m@profit," in config_signature(replace(config, time_limit_minutes=30))
+        with pytest.raises(ValueError, match="time_limit_minutes"):
+            AppleTraderConfig(time_limit_minutes=-5)
+        with pytest.raises(ValueError, match="must be whole"):
+            AppleTraderConfig(time_limit_minutes=2.5)
+
+    def test_sold_in_profit_once_the_time_is_up(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, time_limit_minutes=3)
+        assert self._step(trader, tracker, tape, state, 103.4) == "hold"   # 1 min
+        assert self._step(trader, tracker, tape, state, 103.4) == "hold"   # 2 min
+        assert self._step(trader, tracker, tape, state, 103.4) == "sold"   # 3 min
+        assert tracker.position_for(TICKER) == 0
+        sale = tracker.snapshot()["decisions"][-1]
+        assert sale.reasoning.startswith("Time limit: 3 min since the 10:35 buy")
+        assert any(e.get("exit") == "time_limit" for e in state.agent_log if e.get("type") == "decision")
+
+    def test_under_the_fill_it_holds_for_the_first_bar_above(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, time_limit_minutes=2)
+        assert self._step(trader, tracker, tape, state, 102.8) == "hold"
+        assert self._step(trader, tracker, tape, state, 102.8) == "hold"   # due, under the fill
+        assert self._step(trader, tracker, tape, state, 103.0) == "hold"   # at the fill
+        assert self._step(trader, tracker, tape, state, 103.1) == "sold"
+        held = [e for e in state.agent_log if "Holding; sold on the first bar that closes" in (e.get("text") or "")]
+        assert len(held) == 1
+
+    def test_the_sell_level_comes_first(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, time_limit_minutes=60)
+        assert self._step(trader, tracker, tape, state, 108.8, high=SELL_LEVEL + 0.05) == "sold"
+        assert "Target" in tracker.snapshot()["decisions"][-1].reasoning
+
+    def test_an_add_does_not_restart_the_clock(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, time_limit_minutes=3, scale_in=True, position_pct=50.0,
+            buy_step_k=0.1,
+        )
+        first = tracker.position_for(TICKER)
+        assert self._step(trader, tracker, tape, state, 101.6, low=101.4) == "bought"   # 1 min
+        assert tracker.position_for(TICKER) > first
+        assert self._step(trader, tracker, tape, state, 101.6) == "hold"                # 2 min
+        # 3 minutes after the first buy, 2 after the add: over the average cost.
+        assert trader.entry["price"] < 102.6
+        assert self._step(trader, tracker, tape, state, 102.6) == "sold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_announced(self):
+        config = dayrange_config(time_limit_minutes=45)
+        summary = at._armed_summary(config, at.apple_models.get(config.model_key), DAYRANGE_BUNDLE)
+        assert "a time limit: 45 min after the first buy" in summary
+        rows = at.config_settings(config)
+        assert ("Exits", "Time limit", "after 45 min, sell on the first bar above the fill") in rows

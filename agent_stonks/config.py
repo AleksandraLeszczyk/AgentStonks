@@ -436,6 +436,13 @@ APPLE_TRADER_TAKE_FRACTION = 0.70
 # what every SimLab record written before then replays as
 # (`simlab.rule_agents._APPLE_LEGACY`).
 APPLE_TRADER_TAKE_AFTER_MINUTES = 15
+# The time limit (2026-11-02, the user's request): this many minutes after the
+# first fill, a position the sell level (or GoodMoments' take) has not taken
+# is sold on the first bar that closes above its fill -- at once if it already
+# does. Under the fill it is held: the user's choice, "hold until in profit",
+# over a time stop. 0 is off, the rule before it existed, which every SimLab
+# record written before then replays as.
+APPLE_TRADER_TIME_LIMIT_MINUTES = 0
 # Whether the momentum take also fires on a position under its fill (2026-10-06,
 # at the user's request: "remove only in profit -- it should trigger on momentum
 # once the timer has passed"). Before then it banked gains only and left a

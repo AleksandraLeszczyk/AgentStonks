@@ -897,3 +897,35 @@ class TestMomentumConfirmation:
         state.llm_personality = at.APPLE_TRADER_KEY
         state.apple_trader_config = gm_config(gm_confirm_bars=4)
         assert ui._agent_momentum(state, state.sym(TICKER))[0] == 4
+
+
+class TestTimeLimit:
+    """GoodMoments reads the time limit too: the take not reached in time, the
+    position goes on the first bar above the fill."""
+
+    def test_sold_in_profit_once_the_time_is_up(self, monkeypatch, state):
+        trader, tracker, tape = _setup(monkeypatch, state, time_limit_minutes=3)
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+        for _ in range(2):
+            tape.append(100.1)
+            assert cycle(trader, state, tracker) == "hold"
+        tape.append(100.1)
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == ["time_limit"]
+
+    def test_under_the_fill_it_holds(self, monkeypatch, state):
+        trader, tracker, tape = _setup(monkeypatch, state, time_limit_minutes=2)
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+        for close in (99.9, 99.9, 99.95):
+            tape.append(close)
+            assert cycle(trader, state, tracker) == "hold"
+        tape.append(100.05)
+        assert cycle(trader, state, tracker) == "sold"
+        assert _exits(state) == ["time_limit"]
+
+    def test_signed_after_the_size(self):
+        sig = config_signature(gm_config(time_limit_minutes=30))
+        assert ",size=" in sig and sig.index(",time=30m@profit") > sig.index(",size=")
+        assert ",time=" not in config_signature(gm_config())

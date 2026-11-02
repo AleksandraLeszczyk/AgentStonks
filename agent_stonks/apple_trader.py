@@ -98,6 +98,7 @@ from .config import (
     APPLE_TRADER_STOP_GAIN_FRACTION,
     APPLE_TRADER_TAKE_FRACTION,
     APPLE_TRADER_TAKE_AFTER_MINUTES,
+    APPLE_TRADER_TIME_LIMIT_MINUTES,
     APPLE_TRADER_TAKE_IN_LOSS,
     APPLE_TRADER_TAKE_TRIGGER,
     APPLE_TRADER_TAKE_UNDER_BUY_STANDS_DOWN,
@@ -563,6 +564,14 @@ class AppleTraderConfig:
     # between bar timestamps so a replay reads it as the live loop does. 0 is
     # the take from the first bar, the rule before it existed.
     take_after_minutes: int = APPLE_TRADER_TAKE_AFTER_MINUTES
+    # The time limit: this many minutes after the first fill (bar time, an add
+    # does not restart it), a position still open -- the sell level, or
+    # GoodMoments' take, not reached -- is sold on the first bar that closes
+    # above its fill, whatever the gain; under the fill it is held for that
+    # bar, the stop or the flatten (`DayRangeTrader._time_limit`). 0 is off,
+    # which every record made before 2026-11-02 replays as. Read by the
+    # day-range and GoodMoments rules; Fast&Furious has its own clock.
+    time_limit_minutes: int = APPLE_TRADER_TIME_LIMIT_MINUTES
     # The gate the time above replaced (2026-09-29 to 2026-10-02), kept only so
     # a stored record replays and signs exactly as the run it describes: no take
     # until the close is this share of the predicted gain (`target_gain_k`
@@ -765,7 +774,7 @@ class AppleTraderConfig:
             "stop_k", "stop_gain_fraction", "momentum_drop", "momentum_fade_bars",
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
             "momentum_confirmation_bars", "take_min_gain_fraction", "buy_step_k",
-            "take_after_minutes", "breach_hold_k", "sell_gain_k",
+            "take_after_minutes", "breach_hold_k", "sell_gain_k", "time_limit_minutes",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -799,6 +808,12 @@ class AppleTraderConfig:
                 "and must be whole"
             )
         self.take_after_minutes = int(self.take_after_minutes)
+        if float(self.time_limit_minutes) != int(self.time_limit_minutes):
+            raise ValueError(
+                f"time_limit_minutes {self.time_limit_minutes!r} is a number of minutes "
+                "and must be whole"
+            )
+        self.time_limit_minutes = int(self.time_limit_minutes)
         # A tuple in canonical order, whatever a form (a list) or a JSON record
         # handed over, so the same days always sign the same way.
         self.skip_events = event_days.normalise(self.skip_events)
@@ -1364,6 +1379,9 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
         if c.take_under_buy_stands_down:
             exits += "+end<buy"
         exits += f",runner>={c.hold_min_gain_k:g}{unit}"
+    # Only while on, so every record written before it existed (which replays
+    # without one) keeps its filed signature.
+    exits += _time_limit_token(c)
     if c.min_win_k:
         exits += f",min_win={c.min_win_k:g}{unit}"
     # Only while a breaker it applies to can trip, so a run with neither signs
@@ -1468,8 +1486,22 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     levels = _hybrid_levels_signature(c) if apple_models.levels_of(c.model_key) else ""
     return (
         f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop}"
-        f"{raise_}{confirm}{levels},size={c.position_pct:g}%{skip})"
+        f"{raise_}{confirm}{levels},size={c.position_pct:g}%{_time_limit_token(c)}{skip})"
     )
+
+
+def _time_limit_token(c: AppleTraderConfig) -> str:
+    """The time limit in signature form, `,time=30m@profit`: sold after 30
+    minutes on the first bar in profit. Nothing while off. GoodMoments writes
+    it after the size, with the rules an Orchestra shares."""
+    return f",time={c.time_limit_minutes}m@profit" if c.time_limit_minutes else ""
+
+
+def _time_limit_words(c: AppleTraderConfig) -> str:
+    """The same in words, for the settings table."""
+    if not c.time_limit_minutes:
+        return "off"
+    return f"after {c.time_limit_minutes} min, sell on the first bar above the fill"
 
 
 def _hybrid_levels_signature(c: AppleTraderConfig) -> str:
@@ -1629,6 +1661,7 @@ def _dayrange_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
                          _yes(c.take_under_buy_stands_down)))
         rows.append((exits, "Keep a runner if the target is",
                      f"≥ {c.hold_min_gain_k:g} × {unit} above the fill"))
+    rows.append((exits, "Time limit", _time_limit_words(c)))
 
     breaker = "Circuit breaker"
     rows.append((breaker, "Stand down after a trade under", (
@@ -1670,6 +1703,7 @@ def _probability_settings(c: AppleTraderConfig) -> "list[tuple[str, str, str]]":
         (signal, "Position size", f"{c.position_pct:g}% of cash"),
         (signal, "Take-profit", take),
         (signal, "Stop", f"{c.gm_stop_k:g} ADR under the fill" if c.gm_stop_k else "off"),
+        (signal, "Time limit", _time_limit_words(c)),
         (signal, "Sell when the edge fades",
          f"under {c.gm_exit:+g}" if c.gm_exit is not None else "no"),
         (signal, "Momentum confirmation period",
@@ -2324,6 +2358,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 "price": float(last["close"]),
                 "bars": 0,
                 "ts": ts,
+                "opened": ts,
                 "risk": stop_distance(self.config, stop_unit(self.config, self.plan))
                 if self.plan
                 else None,
@@ -3704,6 +3739,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
     EXIT_BREACH = "breach"
     EXIT_FLATTEN = "flatten"
     EXIT_TAKE = "momentum_take"
+    EXIT_TIME_LIMIT = "time_limit"
 
     def _exit(self, frame, position: float) -> "tuple[float, str, str] | None":
         """What to sell on this bar, why, and under which rule -- or None to hold.
@@ -3823,10 +3859,53 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             ), self.EXIT_FLATTEN
 
         # A bar held at the sell level is above the target, where the take (a
-        # sale *short* of it) does not apply.
+        # sale *short* of it) does not apply -- nor the time limit, which is
+        # for a price that never got there.
         if in_reach:
             return None
+        # Before the take: it sells everything, the take only a share.
+        timed = self._time_limit(frame, entry_price, price, pnl_pct)
+        if timed is not None:
+            return position, timed, self.EXIT_TIME_LIMIT
         return self._momentum_take(frame, position, entry_price, price)
+
+    def _time_limit(
+        self, frame, entry_price: float, price: float, pnl_pct: float
+    ) -> "str | None":
+        """Why the time limit sells this bar, or None.
+
+        Once `time_limit_minutes` have passed since the first fill (bar time,
+        so a replay waits as the live loop does; an add does not restart it),
+        on the first close above the fill -- the average cost after an add --
+        however small the gain. A close at or under it is held, and said
+        once (`_held_note`): the user's choice was to hold until in profit
+        rather than sell at a loss, leaving the downside to the stop and
+        the flatten."""
+        limit = self.config.time_limit_minutes
+        entry = self.entry or {}
+        if not limit or not entry_price:
+            return None
+        opened = pd.Timestamp(entry.get("opened") or entry.get("ts") or frame.index[-1])
+        held = frame.index[-1] - opened
+        if held < timedelta(minutes=limit):
+            return None
+        if price <= entry_price:
+            if not entry.get("time_noted"):
+                entry["time_noted"] = True
+                self._held_note = (
+                    f"{limit} min since the {opened:%H:%M} buy and the price has not reached "
+                    f"the ${self.plan['sell_level']:,.2f} sell level, but the "
+                    f"${price:,.2f} close is not above the ${entry_price:,.2f} fill "
+                    f"({pnl_pct:+.2f}%). Holding; sold on the first bar that closes "
+                    "above it."
+                )
+            return None
+        return (
+            f"Time limit: {held.total_seconds() / 60:.0f} min since the {opened:%H:%M} buy "
+            f"and the price has not reached the ${self.plan['sell_level']:,.2f} sell level. "
+            f"The ${price:,.2f} close is above the ${entry_price:,.2f} fill, so the "
+            f"position is sold at market for what it has made ({pnl_pct:+.2f}%)."
+        )
 
     def _momentum_take(
         self, frame, position: float, entry_price: float, price: float
@@ -4089,8 +4168,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         if not bought:
             self._note_limit_miss(state, "buy level")
         else:
-            # Where the momentum take starts counting for this position.
+            # Where the momentum take starts counting for this position, and
+            # the time limit -- which an add does not move.
             self.entry["ts"] = bar.name
+            self.entry["opened"] = bar.name
             # And how far under it the stop sits, in dollars, decided once here.
             # See `_risk`.
             self.entry["risk"] = stop_distance(
@@ -4155,6 +4236,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 else f"a take if the move gives out or stalls short of it ({fade_phrase(config)})"
                 if config.zone_take_on
                 else f"a momentum take if the move gives out short of it ({fade_phrase(config)})"
+            )
+        if config.time_limit_minutes:
+            exits.append(
+                f"a sale on the first bar in profit {config.time_limit_minutes} min after "
+                "the buy if it has not got there"
             )
         return (
             f"The bar traded down to ${float(bar['low']):,.2f}, at or through the "
@@ -5265,6 +5351,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
     EXIT_STOP = "stop"
     EXIT_TAKE = "take"
     EXIT_SIGNAL = "signal"
+    EXIT_TIME_LIMIT = "time_limit"
     EXIT_FLATTEN = "flatten"
 
     def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
@@ -5436,6 +5523,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
                     "the model no longer sees the rise as likelier than the clock and volatility do."
                 ))
                 return rule_agent.SOLD
+            if self._time_limit(state, tracker, position, last, ts):
+                return rule_agent.SOLD
             return rule_agent.HOLD
         if fc is None or fc["edge"] < self.config.gm_enter:
             return sold
@@ -5452,6 +5541,40 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         if self.entry_refused(state, ts):
             return sold
         return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else sold
+
+    def _time_limit(self, state: AppState, tracker: DecisionTracker, position: float,
+                    bar, ts) -> bool:
+        """Sell on the time limit (`time_limit_minutes`), as the day-range rules
+        do: once that long has passed since the fill without the take, on the
+        first close above the fill; under it, held and said once. A take reached
+        and held by the momentum confirmation is past the time limit's case.
+        Whether it sold."""
+        limit = self.config.time_limit_minutes
+        entry = self.entry or {}
+        fill = float(entry.get("price") or 0.0)
+        if not limit or not fill or entry.get("take_reached"):
+            return False
+        opened = pd.Timestamp(entry.get("ts") or ts)
+        held = pd.Timestamp(ts) - opened
+        if held < timedelta(minutes=limit):
+            return False
+        close = float(bar["close"])
+        pnl = (close / fill - 1) * 100
+        if close <= fill:
+            if not entry.get("time_noted"):
+                entry["time_noted"] = True
+                _log(state, {"type": "status", "text": (
+                    f"{limit} min since the {opened:%H:%M} buy without the take, but the "
+                    f"${close:,.2f} close is not above the ${fill:,.2f} fill ({pnl:+.2f}%). "
+                    "Holding; sold on the first bar that closes above it."
+                )})
+            return False
+        self._sell(state, tracker, position, self.EXIT_TIME_LIMIT, (
+            f"Time limit: {held.total_seconds() / 60:.0f} min since the {opened:%H:%M} buy "
+            f"without the take. The ${close:,.2f} close is above the ${fill:,.2f} fill, so "
+            f"the position is sold at market for what it has made ({pnl:+.2f}%)."
+        ))
+        return True
 
     # --- what a hybrid adds (`HighLow2GoodMomentsTrader`) ---------------------
 
@@ -5744,6 +5867,11 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             exits.append(f"a stop {self.config.gm_stop_k:g} ADR under it")
         if self.config.gm_exit is not None:
             exits.append(f"a sale once the edge is under {self.config.gm_exit:+g}")
+        if self.config.time_limit_minutes:
+            exits.append(
+                f"a sale on the first bar in profit {self.config.time_limit_minutes} min "
+                "after the buy if the take has not come"
+            )
         reasoning = (
             f"The model puts the chance of a {math.exp(_goodmoments().TARGET_ADR * adr) - 1:.2%} rise before the "
             f"close at {fc['p']:.1%}, against {fc['p_tv']:.1%} from the clock and today's volatility "
@@ -6184,6 +6312,11 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         )
     if config.gm_exit is not None:
         exits.append(f"once the edge is under {config.gm_exit:+g}")
+    if config.time_limit_minutes:
+        exits.append(
+            f"on the first bar above the fill once {config.time_limit_minutes} min have "
+            "passed without the take"
+        )
     exits.append("at the closing flatten")
     target = _goodmoments().TARGET_ADR
     confirm = (
@@ -6265,6 +6398,12 @@ def _armed_summary(
                 ", and a take at or under the buy level ends the day's buying"
                 if config.take_under_buy_stands_down else ""
             )
+        )
+    if config.time_limit_minutes:
+        exits.append(
+            f"a time limit: {config.time_limit_minutes} min after the first buy, a position "
+            "that has not reached the sell level is sold on the first bar that closes above "
+            "its fill"
         )
     managed = f" The exit adds {'; and '.join(exits)}." if exits else ""
     if config.momentum_confirmation_bars:

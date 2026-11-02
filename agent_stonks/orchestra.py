@@ -64,8 +64,8 @@ In the code a pair Orchestra is running is a "racer".
 
 What a pair is given, and what it shares
 ----------------------------------------
-Every pair shares Orchestra's sizing, its closing flatten and its days off
-(`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
+Every pair shares Orchestra's sizing, its closing flatten, its time limit and
+its days off (`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
 -- the unit, the ladder, the exits, the breach policy, the circuit breaker --
 and each keeps its two distances, its stop and its momentum confirmation
 period (`DAYRANGE_PAIR_FIELDS`). A GoodMoments pair keeps its own configuration --
@@ -171,8 +171,11 @@ DAYRANGE_PAIR_FIELDS = ("buy_k", "sell_k", "stop_gain_fraction", "momentum_confi
 # pair, which still replays.
 PER_RACER_FIELDS = ("ticker", "model_key", "min_win_k") + DAYRANGE_PAIR_FIELDS
 # The fields every racer must share, whatever its rule set: Orchestra's sizing,
-# its closing flatten and the sessions it sits out.
-SHARED_BY_ALL = ("position_pct", "flatten_before_close_min", "skip_events")
+# its closing flatten, its time limit (one for every pair, the user's request
+# of 2026-11-02) and the sessions it sits out.
+SHARED_BY_ALL = (
+    "position_pct", "flatten_before_close_min", "time_limit_minutes", "skip_events",
+)
 # What Orchestra sets on a GoodMoments racer, over its pair's own configuration
 # (`build_orchestra_config`): the edge a buy needs, the take, the stop and the
 # momentum confirmation -- and on a hybrid the buy distance under its levels
@@ -474,7 +477,7 @@ def signal_racer(
     """A GoodMoments racer: its pair's own configuration (`default_config`:
     the pair's base, else the shipped defaults; a hybrid's from both its
     models), with Orchestra's sizing, flatten and days off from `base`
-    (`SHARED_BY_ALL`) and the numbers Orchestra sets on it (`pair_fields`)
+    and time limit (`SHARED_BY_ALL`) and the numbers Orchestra sets on it (`pair_fields`)
     from `numbers`, where given.
 
     A take that follows the intraday volatility curve keeps its quietest-minute
