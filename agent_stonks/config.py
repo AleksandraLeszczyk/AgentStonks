@@ -393,7 +393,7 @@ APPLE_TRADER_TUNED_STOP: "dict[tuple[str, str], float]" = {
 # 0 switches the stop off, which is what every record written before the
 # managed exit existed replays as.
 # Since 2026-10-04 only the default of a pair with no tuned stop
-# (APPLE_TRADER_TUNED_STOP): today HighLow on AMGN, TMO and AMD.
+# (APPLE_TRADER_TUNED_STOP): today HighLow on AMGN, TMO, AMD and MCD.
 APPLE_TRADER_STOP_GAIN_FRACTION = 0.50
 # The momentum take as it was 2026-09-23 to -24 (`DayRangeTrader._momentum_negative`),
 # kept so the records made then replay; a new config uses the momentum

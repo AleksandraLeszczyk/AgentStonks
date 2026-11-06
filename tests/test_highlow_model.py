@@ -139,22 +139,46 @@ AMD_FORECASTS = {
     "2026-09-21": (597.2305497450348, 575.8652508515241, 17.738742857142828),
     "2026-10-02": (645.1264286419882, 625.8618001952129, 21.23724285714283),
 }
+# MCD, saved 2026-11-06 on the same recipe (0.25 N-BEATS + 0.75 N-HiTS),
+# reading its theme on SIP peers YUM (lead), QSR and CMG and `or_vwap_pos`.
+# 2023-07-11, the panel's first row, reads a 126-session window from which
+# 24 January 2023 (NYSE's broken opening auctions) is dropped: kept, the
+# $236.77 print moves the high $0.08. 2024-10-11 reads MCD's thinnest kept
+# session (365 bars), 2023-12-26 CMG's (90), 2026-04-14 YUM's (304), 2024-04-11
+# YUM's 2024-04-10, kept with its first bar after the window; on 2026-02-18
+# YUM's first bar printed at 09:33. 2025-11-05, 2026-02-12 and 2026-08-04 are
+# results mornings (reported before the open).
+MCD_FORECASTS = {
+    "2023-07-11": (295.8006138651166, 293.37862213307073, 3.2530357142857276),
+    "2023-12-26": (293.0776026072042, 290.89, 3.560928571428572),
+    "2024-04-11": (270.3076381484996, 267.2778951354894, 3.3536857142857173),
+    "2024-10-11": (305.6148185703119, 302.3433674338503, 3.5092714285714277),
+    "2025-11-05": (309.044435187231, 299.21, 3.647714285714289),
+    "2026-02-12": (333.38, 324.93337906407106, 4.980114285714279),
+    "2026-02-18": (328.97459751895417, 323.467345699215, 6.222257142857144),
+    "2026-03-02": (341.9682794272046, 335.8732961342095, 5.755571428571431),
+    "2026-04-14": (304.5458916782496, 300.677872396579, 4.9087785714285745),
+    "2026-08-04": (272.1771302375109, 264.7879010821467, 5.498757142857146),
+    "2026-09-14": (258.6225669625564, 254.28, 3.596742857142857),
+    "2026-09-21": (250.68203467222523, 247.718393310895, 3.5126999999999953),
+    "2026-10-02": (233.09560387010245, 229.8945642438603, 4.749178571428566),
+}
 NOTEBOOK_FORECASTS = {
     "AAPL": AAPL_FORECASTS, "INTC": INTC_FORECASTS, "MU": MU_FORECASTS,
     "NVDA": NVDA_FORECASTS, "AMGN": AMGN_FORECASTS, "TMO": TMO_FORECASTS,
-    "AMD": AMD_FORECASTS,
+    "AMD": AMD_FORECASTS, "MCD": MCD_FORECASTS,
 }
 # The candidates each bundle ships with non-zero weight.
 SHIPPED = {
     "AAPL": ["lgbm", "nbeats"], "INTC": ["nhits"], "MU": ["lgbm", "nbeats", "nhits"],
     "NVDA": ["lgbm", "nhits"], "AMGN": ["nbeats"], "TMO": ["lgbm", "nbeats", "nhits"],
-    "AMD": ["lgbm", "nbeats", "nhits"],
+    "AMD": ["lgbm", "nbeats", "nhits"], "MCD": ["nbeats", "nhits"],
 }
 # The tape each bundle reads the opening from.
 OPENING_FEEDS = {"AAPL": "sip", "INTC": "sip", "MU": "iex", "NVDA": "sip", "AMGN": "sip",
-                 "TMO": "sip", "AMD": "sip"}
+                 "TMO": "sip", "AMD": "sip", "MCD": "sip"}
 # The last session of each notebook's tape the mirror test reads.
-NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "AMGN", "TMO", "AMD")}
+NOTEBOOK_TAPE_END = {t: "2026-10-02" for t in ("NVDA", "AMGN", "TMO", "AMD", "MCD")}
 
 
 # --- synthetic sessions -------------------------------------------------------
@@ -199,11 +223,11 @@ class FakeSip:
         self.calls: "list[tuple[date, date]]" = []
 
     def __call__(self, symbol, first, before, key, secret, opening_feed="sip",
-                 min_bars=H.MIN_BARS_PER_SESSION, max_first_minute=0):
+                 min_bars=H.MIN_BARS_PER_SESSION, max_first_minute=0, broken_dates=()):
         self.calls.append((first, before))
         bars = [b for d, day_bars in self.tape.items() if first <= d < before for b in day_bars]
         return H.session_rollups(H.minute_frame_from_bars(bars), min_bars=min_bars,
-                                 max_first_minute=max_first_minute)
+                                 max_first_minute=max_first_minute, broken_dates=broken_dates)
 
 
 @pytest.fixture
@@ -214,7 +238,7 @@ def cache_dir(tmp_path, monkeypatch):
 
 class TestRegistry:
     def test_highlow_is_offered_where_a_bundle_was_saved(self):
-        for symbol in ("AAPL", "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD"):
+        for symbol in ("AAPL", "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD", "MCD"):
             assert apple_models.HIGHLOW_KEY in apple_models.keys_for(symbol)
         # GOOGL was never run through it; the other five lost their bundles
         # on 2026-10-25.
@@ -399,19 +423,39 @@ class TestThemePeers:
         assert rollups.loc["2026-03-03", "open"] == pytest.approx(late[0]["o"])
         assert not rollups.loc[["2026-03-02", "2026-03-04"], "open5"].isna().any()
 
-    def test_a_peer_that_had_not_opened_by_9_35_has_no_gap_that_morning(self):
-        """WAT's 2024-04-10 auction printed at 09:35. The notebook counts its gap
-        from that open in `theme_gap`; at 9:35 it has not printed, so the mirror
-        reads the group without it -- the one place TMO's forecast is not the
-        notebook's, and by under a cent."""
-        bundle, raw, thin, history, peer_tapes, extras = notebook_inputs("TMO")
-        stamp = pd.Timestamp("2024-04-10")
+    @pytest.mark.parametrize("ticker,day,peer,high,low,bound", [
+        ("TMO", "2024-04-10", "WAT", 580.0539016862726, 573.1150669494203, 0.01),
+        ("MCD", "2023-11-03", "CMG", 268.4902297600439, 264.5786648683708, 0.02),
+    ])
+    def test_a_peer_that_had_not_opened_by_9_35_has_no_gap_that_morning(
+        self, ticker, day, peer, high, low, bound
+    ):
+        """WAT's 2024-04-10 auction printed at 09:35, and pre-split CMG's on ten
+        mornings of 2023-24 (2023-11-03 the furthest off). The notebook counts
+        the peer's gap from that open in `theme_gap`; at 9:35 it has not
+        printed, so the mirror reads the group without it -- the one place
+        TMO's and MCD's forecasts are not the notebook's, by about a cent."""
+        bundle, raw, thin, history, peer_tapes, extras = notebook_inputs(ticker)
+        stamp = pd.Timestamp(day)
         peer_data = _peer_data(peer_tapes, stamp)
-        assert peer_data["WAT"][1].empty and stamp in peer_data["WAT"][0].index
-        out = H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp, None, peer_data)
-        high, low = 580.0539016862726, 573.1150669494203        # the notebook's
-        miss = max(abs(out["pred_high"] - high), abs(out["pred_low"] - low))
-        assert 1e-5 < miss < 0.01
+        assert peer_data[peer][1].empty and stamp in peer_data[peer][0].index
+        out = H.forecast_from(bundle, history, _one_day(raw, stamp).iloc[:5], stamp, None, peer_data,
+                              **_extra_inputs(extras, stamp))
+        miss = max(abs(out["pred_high"] - high), abs(out["pred_low"] - low))   # the notebook's
+        assert 1e-5 < miss < bound
+
+    def test_mcd_keeps_its_notebooks_settings_and_each_peer_its_own(self):
+        bundle = H.load_bundle("MCD")
+        if bundle is None:
+            pytest.skip("the HighLow MCD bundle is not installed")
+        assert H.min_bars(bundle) == 360 and H.max_first_minute(bundle) == 0
+        assert H.broken_dates(bundle) == ("2023-01-24",)
+        assert H.peers(bundle) == ("YUM", "QSR", "CMG") and H.peer_feed(bundle) == "sip"
+        kept = [H.peer_kept(p) for p in H.peers(bundle)]
+        assert [k["min_bars"] for k in kept] == [300, 315, 85]
+        assert [k["max_first_minute"] for k in kept] == [6, 1, 8]
+        assert not any(k["broken_dates"] for k in kept)
+        assert H.groups(bundle) == ("theme", "microstructure")
 
     def test_amds_peer_avgo_keeps_avgos_threshold(self):
         """AMD itself is cleaned at 385 bars; its peer AVGO at AVGO's own 320."""
@@ -663,7 +707,7 @@ class TestMicrostructure:
         monkeypatch.setattr(
             H, "history_frame",
             lambda symbol, before, key=None, secret=None, opening_feed="sip", min_bars=385,
-            extended=False, micro=False, max_first_minute=0:
+            extended=False, micro=False, max_first_minute=0, broken_dates=():
                 asked.append(("history", symbol, opening_feed, micro, max_first_minute))
                 or pd.DataFrame({"s": [symbol]}),
         )
@@ -719,6 +763,32 @@ class TestLateFirstPrint:
         assert len(sip.calls) == 2
         assert H._read_cache("ORCL", max_first_minute=2)["max_first_minute"] == 2
         assert H._read_cache("ORCL")["sessions"] == {}
+
+
+class TestBrokenDates:
+    """A session whose tape still holds prints the exchange later broke (NYSE's
+    failed opening auctions of 24 January 2023) is dropped like a half day,
+    where the notebook names it (MCD)."""
+
+    def test_a_broken_session_is_dropped_and_remembered(self):
+        tape = _tape(date(2026, 3, 2), date(2026, 3, 4))
+        frame = H.minute_frame_from_bars([b for bars in tape.values() for b in bars])
+        rollups, dropped = H.session_rollups(frame, broken_dates=("2026-03-03",))
+        assert list(rollups.index.strftime("%Y-%m-%d")) == ["2026-03-02", "2026-03-04"]
+        assert [pd.Timestamp(d) for d in dropped] == [pd.Timestamp("2026-03-03")]
+        assert len(H.session_rollups(frame)[0]) == 3
+
+    def test_a_cache_written_without_them_is_rebuilt(self, cache_dir, monkeypatch):
+        sip = FakeSip(_tape(date(2025, 12, 1), date(2026, 9, 30)))
+        monkeypatch.setattr(H, "_fetch_rollups", sip)
+        H.history_frame("MCD", date(2026, 9, 14), "k", "s", min_bars=360)
+        frame = H.history_frame("MCD", date(2026, 9, 14), "k", "s", min_bars=360,
+                                broken_dates=("2026-03-03",))
+        assert len(sip.calls) == 2 and pd.Timestamp("2026-03-03") not in frame.index
+        assert H._read_cache("MCD", min_bars=360, broken_dates=("2026-03-03",))["sessions"]
+        assert H._read_cache("MCD", min_bars=360)["sessions"] == {}
+        H.history_frame("MCD", date(2026, 9, 14), "k", "s", min_bars=360, broken_dates=("2026-03-03",))
+        assert len(sip.calls) == 2
 
 
 class TestHalfDays:
@@ -864,7 +934,8 @@ def notebook_inputs(ticker: str):
         extras["pre"] = tape(sorted(folder.glob(f"{ticker}_20??_pre.parquet")), ("00:00", "23:59"))
         post = tape(sorted(folder.glob(f"{ticker}_20??_post.parquet")), ("00:00", "23:59"))
         all_hours = pd.concat([raw, extras["pre"], post]).sort_index()
-    history, _ = H.session_rollups(raw, thin, H.min_bars(bundle), all_hours, H.max_first_minute(bundle))
+    history, _ = H.session_rollups(raw, thin, H.min_bars(bundle), all_hours, H.max_first_minute(bundle),
+                                   H.broken_dates(bundle))
     if H.reads_microstructure(bundle):
         extras["micro"] = raw
     proxy = H.market_proxy(bundle)
@@ -884,7 +955,8 @@ def notebook_inputs(ticker: str):
             p_thin = tape(sorted(peer_raw.glob(f"{peer}_20??_{H.peer_feed(bundle)}.parquet")))
         kept = H.peer_kept(peer)
         p_history, _ = H.session_rollups(p_sip, p_thin, kept["min_bars"],
-                                         max_first_minute=kept["max_first_minute"])
+                                         max_first_minute=kept["max_first_minute"],
+                                         broken_dates=kept["broken_dates"])
         p_open = p_sip if p_thin is None else p_thin
         peer_tapes[peer] = (p_history, H.opening_minute_frame(p_open, p_history.index)[H.OHLCV], p_open)
     _NOTEBOOK_INPUTS[ticker] = (bundle, raw, thin, history, peer_tapes, extras)

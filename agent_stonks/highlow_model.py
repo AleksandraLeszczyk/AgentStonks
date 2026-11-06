@@ -15,7 +15,8 @@ mean `log(high/low)` of the previous 14 sessions. The blend is picked per ticker
 on validation and the bundle records it: AAPL ships 0.5 LightGBM + 0.5
 N-BEATS, INTC N-HiTS alone, MU 0.25 LightGBM + 0.5 N-BEATS + 0.25 N-HiTS, NVDA
 0.5 LightGBM + 0.5 N-HiTS, TMO 0.25 LightGBM + 0.25 N-BEATS + 0.5 N-HiTS, AMD
-0.5 LightGBM + 0.25 N-BEATS + 0.25 N-HiTS, AMGN N-BEATS alone; every other
+0.5 LightGBM + 0.25 N-BEATS + 0.25 N-HiTS, AMGN N-BEATS alone, MCD 0.25
+N-BEATS + 0.75 N-HiTS; every other
 candidate is in the bundle at weight 0 and is not loaded. (BE, AVGO, QCOM, ORCL
 and META had bundles too until 2026-10-25; the mirror machinery they brought
 in -- the theme peers, the trade counts -- is still read by the ones left.) On the 129-session
@@ -24,7 +25,7 @@ against TimeToChange3's 0.0077, INTC 0.0150 ($1.22) against 0.0216.
 
 Each notebook may build custom feature groups beside the base 48 and keep
 whichever earn their place on validation. Mirrored here (`GROUP_COLS`): the
-"theme" peers (below; TMO, AMGN, AMD), the five NVDA reads (further below) --
+"theme" peers (below; TMO, AMGN, AMD, MCD), the five NVDA reads (further below) --
 market, regime, premarket, afterhours, opening_shape -- and the
 microstructure (last; AMGN). Not mirrored: calendar (only weight-0 linear medians
 read it so far). `_build_bundle` refuses a bundle whose weighted candidates
@@ -201,6 +202,20 @@ bars a session, 169 of 2026's 189 under 385), VRTX 240. None is in the sidecar
 (`NOTEBOOK_MIN_BARS`); a peer's history is cleaned at its own entry
 (`peer_kept`), as `load_peers` reads each peer's own cleaned tape. At 385,
 REGN's history would lose most of its sessions and its 14-day ADR with them.
+
+Restaurant peers and a broken session (MCD)
+-------------------------------------------
+MCD's bundle (saved 2026-11-06, 0.25 N-BEATS + 0.75 N-HiTS) is the same
+recipe on NYSE, of which the blend kept the theme on SIP peers YUM (the lead),
+QSR and CMG and the opening's VWAP (`or_vwap_pos`). Nothing new to mirror but
+the notebook's settings, none in the sidecar: MCD keeps sessions from 360
+bars, YUM from 300, QSR 315, CMG 85 (pre-split, a median 150-200 bars a
+session), and the peers' first bars may print as late as 09:36, 09:31 and
+09:38 (`NOTEBOOK_MIN_BARS`, `NOTEBOOK_MAX_FIRST_MINUTE`). And one session is
+dropped outright: on 24 January 2023 NYSE's opening auctions failed and the
+exchange later broke the trades, but SIP's minute bars still hold them
+(`NOTEBOOK_BROKEN_DATES`; the notebook's `Settings.broken_dates`). Like the
+thresholds, the cache records the list and is rebuilt when it changes.
 """
 
 from __future__ import annotations
@@ -280,9 +295,13 @@ MIN_BARS_PER_SESSION = 385
 # DHR, A and WAT likewise (WAT a median 230-270 bars a session before 2026).
 # AMD's peer AVGO keeps its 320 too: at 385 its 14-day ADR in 2023-24 moves
 # AMD's `theme_range` and the forecast with it (up to $0.18, 2024-05-31).
+# MCD (360; 56 quiet sessions under 385) and its restaurant peers: YUM (300, 662
+# of 933 sessions under 385), QSR (315) and CMG (85: a median 150-200 bars a
+# session at $1,350-3,460 before its 50-for-1 split of June 2024).
 NOTEBOOK_MIN_BARS: "dict[str, int]" = {
     "AVGO": 320, "AMGN": 310, "GILD": 370, "REGN": 130, "VRTX": 240,
     "TMO": 260, "DHR": 340, "A": 270, "WAT": 100,
+    "MCD": 360, "YUM": 300, "QSR": 315, "CMG": 85,
 }
 # The same for the first bar (`config._TICKERS[...]["max_first_minute"]`): on
 # two quiet TMO sessions of 2023 the opening auction printed in the 09:31 bar
@@ -291,8 +310,18 @@ NOTEBOOK_MIN_BARS: "dict[str, int]" = {
 # NYSE peers' auctions print later still -- DHR's up to 09:36, A's 09:35, WAT's
 # 09:37 -- and those sessions are kept too: with no bar in the opening window
 # the peer has no opening summary that day and the theme group reads the
-# others (`theme_from`). Everywhere else the first bar must be 09:30's.
-NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {"TMO": 1, "DHR": 6, "A": 5, "WAT": 7}
+# others (`theme_from`). MCD's NYSE peers likewise: YUM's up to 09:36, QSR's
+# 09:31, pre-split CMG's 09:38. Everywhere else the first bar must be 09:30's.
+NOTEBOOK_MAX_FIRST_MINUTE: "dict[str, int]" = {
+    "TMO": 1, "DHR": 6, "A": 5, "WAT": 7, "YUM": 6, "QSR": 1, "CMG": 8,
+}
+# Sessions whose tape still holds prints the exchange later broke, dropped like
+# a half day (`config._TICKERS[...]["broken_dates"]`, not in the sidecar). 24
+# January 2023, NYSE's failed opening auctions: MCD's 09:30 bar printed
+# $236.77-268.80 and the stock halted to 09:40; the official low is $261.22.
+# Kept, that bar would sit in the ADR and the 126-day high and low of the
+# first months' rows.
+NOTEBOOK_BROKEN_DATES: "dict[str, tuple[str, ...]]" = {"MCD": ("2023-01-24",)}
 
 # Prior sessions the feature row needs: 126-day momentum and volatility read
 # `mid.shift(126)` of a series that is itself shifted a day.
@@ -791,7 +820,7 @@ def sane_bars(minute: pd.DataFrame) -> pd.Series:
 
 
 def session_report(minute: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION,
-                   max_first_minute: int = 0) -> pd.DataFrame:
+                   max_first_minute: int = 0, broken_dates=()) -> pd.DataFrame:
     """One row per session: bar count, first and last minute, and whether it is kept."""
     rep = minute.groupby("date").agg(
         n_bars=("close", "size"), first_minute=("minute", "min"),
@@ -805,7 +834,8 @@ def session_report(minute: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION,
     rep["short"] = rep["n_bars"] < min_bars
     rep["no_open_bar"] = rep["first_minute"] > max_first_minute
     rep["early_end"] = rep["last_minute"] < SESSION_MINUTES - 5
-    rep["kept"] = ~(rep["half_day"] | rep["short"] | rep["no_open_bar"] | rep["early_end"])
+    rep["broken"] = rep.index.isin(pd.to_datetime(list(broken_dates)))
+    rep["kept"] = ~(rep["half_day"] | rep["short"] | rep["no_open_bar"] | rep["early_end"] | rep["broken"])
     return rep
 
 
@@ -815,13 +845,13 @@ TRADE_COLS = ["trades", "vwap"]
 
 
 def clean_minute(raw: pd.DataFrame, min_bars: int = MIN_BARS_PER_SESSION,
-                 max_first_minute: int = 0) -> "tuple[pd.DataFrame, pd.DataFrame]":
-    """Drop broken bars and incomplete sessions (half days, feed gaps)."""
+                 max_first_minute: int = 0, broken_dates=()) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    """Drop broken bars and incomplete sessions (half days, feed gaps, broken dates)."""
     minute = raw[sane_bars(raw)]
     extra = [c for c in TRADE_COLS if c in minute]
     minute = add_session_columns(minute[OHLCV + extra])
     minute["volume"] = minute["volume"].astype("int64")
-    rep = session_report(minute, min_bars, max_first_minute)
+    rep = session_report(minute, min_bars, max_first_minute, broken_dates)
     kept = rep.index[rep["kept"]]
     return minute[minute["date"].isin(kept)], rep
 
@@ -907,15 +937,15 @@ def extended_summaries(all_hours: pd.DataFrame, keep_dates) -> pd.DataFrame:
 def session_rollups(
     raw: pd.DataFrame, opening_raw: "pd.DataFrame | None" = None,
     min_bars: int = MIN_BARS_PER_SESSION, all_hours: "pd.DataFrame | None" = None,
-    max_first_minute: int = 0,
+    max_first_minute: int = 0, broken_dates=(),
 ) -> "tuple[pd.DataFrame, list[pd.Timestamp]]":
     """Raw regular-hours minute bars -> `(rollups, dropped_dates)`.
 
     `rollups` has one row per kept session with `_ROLLUP_COLS`, the opening
     summary and the opening's trade summary (`_MICRO_SUMMARY`, NaN where the
     bars carry no trade counts); `dropped_dates` are the sessions `clean_minute`
-    refused (half days, feed gaps, an opening print after `max_first_minute`),
-    remembered so the cache knows it has already looked at them.
+    refused (half days, feed gaps, an opening print after `max_first_minute`,
+    `broken_dates`), remembered so the cache knows it has already looked at them.
     Every step groups by date, so rolling up in chunks gives the same rows as
     rolling up the whole history at once.
 
@@ -936,7 +966,7 @@ def session_rollups(
             + (_EXTENDED_COLS if all_hours is not None else []))
     if raw.empty:
         return pd.DataFrame(columns=cols), []
-    minute, rep = clean_minute(raw, min_bars, max_first_minute)
+    minute, rep = clean_minute(raw, min_bars, max_first_minute, broken_dates)
     dropped = list(rep.index[~rep["kept"]])
     if minute.empty:
         return pd.DataFrame(columns=cols), dropped
@@ -1296,8 +1326,9 @@ reset_bundle_cache = _STORE.reset
 
 def history_settings(ticker: "str | None", metadata: "dict | None" = None) -> dict:
     """How one ticker's own SIP history is kept: which feed its openings are
-    read from and the thresholds its sessions are cleaned at -- the sidecar's,
-    else the notebook's (`NOTEBOOK_MIN_BARS`, `NOTEBOOK_MAX_FIRST_MINUTE`).
+    read from, the thresholds its sessions are cleaned at and the sessions
+    dropped outright -- the sidecar's, else the notebook's
+    (`NOTEBOOK_MIN_BARS`, `NOTEBOOK_MAX_FIRST_MINUTE`, `NOTEBOOK_BROKEN_DATES`).
 
     `metadata` is the sidecar's contents; without it the sidecar is read from
     disk, so a caller sharing this ticker's cache (MedianMove's
@@ -1317,6 +1348,8 @@ def history_settings(ticker: "str | None", metadata: "dict | None" = None) -> di
                         or NOTEBOOK_MIN_BARS.get(symbol, MIN_BARS_PER_SESSION)),
         "max_first_minute": int(metadata.get("max_first_minute")
                                 or NOTEBOOK_MAX_FIRST_MINUTE.get(symbol, 0)),
+        "broken_dates": tuple(metadata.get("broken_dates")
+                              or NOTEBOOK_BROKEN_DATES.get(symbol, ())),
     }
 
 
@@ -1349,6 +1382,11 @@ def max_first_minute(bundle: "dict | None" = None) -> int:
         return 0
 
 
+def broken_dates(bundle: "dict | None" = None) -> "tuple[str, ...]":
+    """Sessions the notebook drops like a half day (MCD's 2023-01-24); () for most."""
+    return tuple((bundle or {}).get("broken_dates") or ())
+
+
 def peers(bundle: "dict | None" = None) -> "tuple[str, ...]":
     """The theme peers the shipped blend reads, lead first; () for most bundles."""
     return tuple((bundle or {}).get("peers") or ())
@@ -1365,7 +1403,8 @@ def peer_kept(peer: str) -> dict:
     `NOTEBOOK_MAX_FIRST_MINUTE` names it -- AMGN's REGN keeps 130)."""
     peer = peer.upper()
     return {"min_bars": NOTEBOOK_MIN_BARS.get(peer, MIN_BARS_PER_SESSION),
-            "max_first_minute": NOTEBOOK_MAX_FIRST_MINUTE.get(peer, 0)}
+            "max_first_minute": NOTEBOOK_MAX_FIRST_MINUTE.get(peer, 0),
+            "broken_dates": NOTEBOOK_BROKEN_DATES.get(peer, ())}
 
 
 def reads_microstructure(bundle: "dict | None" = None) -> bool:
@@ -1400,28 +1439,32 @@ def history_path(symbol: str) -> Path:
 def _read_cache(
     symbol: str, opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
     extended: bool = False, micro: bool = False, max_first_minute: int = 0,
+    broken_dates=(),
 ) -> dict:
     """The symbol's cache, or an empty one if it holds another feed's openings
-    or sessions cleaned at another bar count or first-bar limit (a file written
-    before those keys existed holds SIP's, at 385 and 09:30) -- or, when
-    `extended` or `micro` is asked for, if any of its sessions lacks the
-    extended-hours summaries (every file written before 2026-10-04) or the
-    opening's trade summary (before 2026-10-13)."""
+    or sessions cleaned at another bar count, first-bar limit or list of broken
+    dates (a file written before those keys existed holds SIP's, at 385 and
+    09:30, none dropped) -- or, when `extended` or `micro` is asked for, if any
+    of its sessions lacks the extended-hours summaries (every file written
+    before 2026-10-04) or the opening's trade summary (before 2026-10-13)."""
+    broken = sorted(broken_dates)
     try:
         payload = json.loads(history_path(symbol).read_text())
     except (OSError, ValueError):
-        return _empty_cache(opening_feed, min_bars, max_first_minute)
+        return _empty_cache(opening_feed, min_bars, max_first_minute, broken)
     if (payload.get("opening_feed", OPENING_FEED_SIP) != opening_feed
             or int(payload.get("min_bars", MIN_BARS_PER_SESSION)) != min_bars
             or int(payload.get("max_first_minute", 0)) != max_first_minute
+            or sorted(payload.get("broken_dates", [])) != broken
             or (extended and not payload.get("extended", False))
             or (micro and not payload.get("micro", False))):
-        return _empty_cache(opening_feed, min_bars, max_first_minute)
+        return _empty_cache(opening_feed, min_bars, max_first_minute, broken)
     payload.setdefault("sessions", {})
     payload.setdefault("dropped", [])
     payload["opening_feed"] = opening_feed
     payload["min_bars"] = min_bars
     payload["max_first_minute"] = max_first_minute
+    payload["broken_dates"] = broken
     return payload
 
 
@@ -1449,7 +1492,7 @@ def _credentials(key: "str | None", secret: "str | None") -> "tuple[str, str]":
 def _fetch_rollups(
     symbol: str, first: date, before: date, key: str, secret: str,
     opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
-    max_first_minute: int = 0,
+    max_first_minute: int = 0, broken_dates=(),
 ):
     """Rollups for the sessions in [first, before), straight from Alpaca SIP --
     with the opening summaries from `opening_feed` when that is not SIP, and
@@ -1468,7 +1511,8 @@ def _fetch_rollups(
         ))
     all_hours = all_hours_frame_from_bars(bars)
     rth = all_hours.between_time(model_store.RTH_START, model_store.RTH_END)
-    rollups, dropped = session_rollups(rth, opening_raw, min_bars, all_hours, max_first_minute)
+    rollups, dropped = session_rollups(rth, opening_raw, min_bars, all_hours, max_first_minute,
+                                       broken_dates)
     log_fetch(
         "minute bars (HighLow history)",
         "Alpaca REST (SIP, split-adjusted)" if opening_raw is None
@@ -1486,12 +1530,13 @@ def _rows(frame: pd.DataFrame) -> dict:
 
 
 def _empty_cache(opening_feed: str = OPENING_FEED_SIP, min_bars: int = MIN_BARS_PER_SESSION,
-                 max_first_minute: int = 0) -> dict:
+                 max_first_minute: int = 0, broken_dates=()) -> dict:
     # `extended` / `micro`: every session carries `_EXTENDED_COLS` /
     # `_MICRO_SUMMARY`. True until a fetch without them is merged in.
     return {"sessions": {}, "dropped": [], "from": None, "through": None,
             "opening_feed": opening_feed, "min_bars": min_bars,
-            "max_first_minute": max_first_minute, "extended": True, "micro": True}
+            "max_first_minute": max_first_minute, "broken_dates": sorted(broken_dates),
+            "extended": True, "micro": True}
 
 
 def _merge(cache: dict, rollups: pd.DataFrame, dropped, seam: "str | None") -> bool:
@@ -1523,14 +1568,15 @@ def history_frame(
     extended: bool = False,
     micro: bool = False,
     max_first_minute: int = 0,
+    broken_dates=(),
 ) -> pd.DataFrame:
     """Per-session rollups of the SIP tape for the sessions strictly before
     `before`, oldest first: `_ROLLUP_COLS` plus the opening summary, read from
     `opening_feed` (NaN on a session that feed printed nothing in), sessions
-    kept at `min_bars` and `max_first_minute` -- with `extended`, each
-    session's pre-market and evening summaries (`_EXTENDED_COLS`), and with
-    `micro` its opening's trade summary (`_MICRO_SUMMARY`), rebuilding a cache
-    written without them.
+    kept at `min_bars` and `max_first_minute` and `broken_dates` dropped --
+    with `extended`, each session's pre-market and evening summaries
+    (`_EXTENDED_COLS`), and with `micro` its opening's trade summary
+    (`_MICRO_SUMMARY`), rebuilding a cache written without them.
 
     The cache remembers which calendar days it has looked at (`from` ..
     `through`), and only the days outside that stretch are fetched -- so a live
@@ -1544,23 +1590,25 @@ def history_frame(
     first_wanted = before - timedelta(days=HISTORY_CALENDAR_DAYS)
     last_wanted = before - timedelta(days=1)
     with _history_lock:
-        cache = _read_cache(symbol, opening_feed, min_bars, extended, micro, max_first_minute)
+        cache = _read_cache(symbol, opening_feed, min_bars, extended, micro, max_first_minute,
+                            broken_dates)
         lo = date.fromisoformat(cache["from"]) if cache.get("from") else None
         hi = date.fromisoformat(cache["through"]) if cache.get("through") else None
         if lo is None or hi is None or not cache["sessions"]:
-            cache, lo, hi = _empty_cache(opening_feed, min_bars, max_first_minute), None, None
+            cache = _empty_cache(opening_feed, min_bars, max_first_minute, broken_dates)
+            lo, hi = None, None
 
         if lo is None or lo > first_wanted or hi < last_wanted:
             key, secret = _credentials(key, secret)
 
             def fetch(first: date, upto: date):
                 return _fetch_rollups(symbol, first, upto, key, secret, opening_feed, min_bars,
-                                      max_first_minute=max_first_minute)
+                                      max_first_minute=max_first_minute, broken_dates=broken_dates)
 
             ok = True
             if lo is None or hi < first_wanted or lo > last_wanted:
                 # Nothing usable overlaps: fetch the whole window.
-                cache = _empty_cache(opening_feed, min_bars, max_first_minute)
+                cache = _empty_cache(opening_feed, min_bars, max_first_minute, broken_dates)
                 _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             else:
@@ -1574,7 +1622,7 @@ def history_frame(
                     ok = _merge(cache, *fetch(date.fromisoformat(seam), before), seam)
                     hi = last_wanted
             if not ok:
-                cache = _empty_cache(opening_feed, min_bars, max_first_minute)
+                cache = _empty_cache(opening_feed, min_bars, max_first_minute, broken_dates)
                 _merge(cache, *fetch(first_wanted, before), None)
                 lo, hi = first_wanted, last_wanted
             cache["from"], cache["through"] = lo.isoformat(), hi.isoformat()
@@ -1885,7 +1933,7 @@ def _own_history(bundle: dict, ticker: str, before, key: "str | None", secret: "
     """The ticker's own `history_frame`, with whatever the bundle reads of it."""
     return history_frame(ticker, before, key, secret, opening_feed(bundle), min_bars(bundle),
                          extended=reads_extended_hours(bundle), micro=reads_microstructure(bundle),
-                         max_first_minute=max_first_minute(bundle))
+                         max_first_minute=max_first_minute(bundle), broken_dates=broken_dates(bundle))
 
 
 def warm_history(

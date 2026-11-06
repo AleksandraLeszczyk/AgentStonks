@@ -138,14 +138,17 @@ DEFAULT_TICKER = "AAPL"
 # DHR, A and WAT; sessions kept from 260 bars, the peers' with first bars as
 # late as 09:37), and AMD (2026-10-21, the same recipe: SPY, the previous
 # evening, the opening's shape, the volatility regime and its chip peers NVDA,
-# INTC and AVGO -- AVGO's history cleaned at AVGO's own 320 bars). BE, AVGO,
+# INTC and AVGO -- AVGO's history cleaned at AVGO's own 320 bars), and MCD
+# (2026-11-06, the same recipe, of which the blend kept its restaurant peers
+# YUM, QSR and CMG and the opening's VWAP; sessions kept from 360 bars, the
+# peers' with first bars as late as 09:38, 24 January 2023 dropped). BE, AVGO,
 # QCOM, ORCL and META had bundles of their own until 2026-10-25, when they were
 # removed at the user's request.
 # Adding one is this tuple plus its files in `Code/Models` -- and a check that
 # the bundle's shipped candidates read only the base features and the custom
 # groups `highlow_model` mirrors (`GROUP_COLS`; `_build_bundle` refuses
 # anything else).
-HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD")
+HIGHLOW_TICKERS = (DEFAULT_TICKER, "INTC", "MU", "NVDA", "AMGN", "TMO", "AMD", "MCD")
 
 # Which symbols HighLow2_5m is wired up for (`highlow2_5m_<TICKER>.*`): AAPL
 # (saved 2026-10-04) and GOOG (Alphabet's class C line, 2026-10-26: AAPL's
@@ -461,17 +464,20 @@ MODELS: "dict[str, AppleModel]" = {
             "of the 14-day average range, by a blend picked per ticker on validation "
             "(AAPL: LightGBM + N-BEATS; INTC: N-HiTS alone; MU: LightGBM + N-BEATS + "
             "N-HiTS; NVDA: LightGBM + N-HiTS; TMO and AMD: LightGBM + N-BEATS + "
-            "N-HiTS; AMGN: N-BEATS alone), fitted on every session since 2023 with its "
+            "N-HiTS; AMGN: N-BEATS alone; MCD: N-BEATS + N-HiTS), fitted on every "
+            "session since 2023 with its "
             "first five minutes (MU's read from IEX, the only tape there is at 9:35 on "
             "a basic plan; NVDA's with SPY's opening, the pre-market to 9:19 and the "
             "previous evening's after-hours; AMGN's with SPY, the pre-market, the "
             "previous evening, the opening's trade counts and its biotech peers GILD, "
             "REGN and VRTX; TMO's with its life-science tools peers DHR, A and WAT; "
             "AMD's with SPY, the previous evening and its chip peers NVDA, INTC and "
-            "AVGO). On the 129-session test window its error is 35% below "
+            "AVGO; MCD's with the opening's VWAP and its restaurant peers YUM, QSR and "
+            "CMG). On the 129-session test window its error is 35% below "
             "TimeToChange3's on AAPL ($1.37 per extreme against $2.11) and 31% below on "
             "INTC; MU has no TimeToChange3 bundle and beats that approach retrained on "
-            "it by 25%, AMGN by 34%, TMO by 42% (AMD's notebook ran no such comparison). "
+            "it by 25%, AMGN by 34%, TMO by 42% (AMD's and MCD's notebooks ran no such "
+            "comparison). "
             "Only the forecast changes: the "
             "levels, exits and breach rules are the day-range strategy's, hung off "
             "this predicted high and predicted range."
@@ -481,7 +487,8 @@ MODELS: "dict[str, AppleModel]" = {
             "checkpoints, and Alpaca credentials for ~150 sessions of SIP minute history "
             "(plus IEX openings on MU, on NVDA, AMGN and AMD SPY's history, on AMGN "
             "GILD, REGN and VRTX, on TMO DHR, A and WAT, on AMD NVDA, INTC and AVGO, "
-            "and on NVDA and AMGN this morning's SIP pre-market)"
+            "on MCD YUM, QSR and CMG, and on NVDA and AMGN this morning's SIP "
+            "pre-market)"
         ),
         strategy=STRATEGY_DAYRANGE,
         tickers=HIGHLOW_TICKERS,

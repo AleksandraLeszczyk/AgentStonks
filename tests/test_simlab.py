@@ -1510,7 +1510,7 @@ class TestDayRangeEngine:
             rule_config={"model_key": "highlow", "ticker": "MSFT"},
         )
         error = SimulationEngine(market, config).run().error or ""
-        assert "cannot trade MSFT" in error and "AAPL, INTC, MU, NVDA, AMGN, TMO, AMD only" in error
+        assert "cannot trade MSFT" in error and "AAPL, INTC, MU, NVDA, AMGN, TMO, AMD, MCD only" in error
 
     def test_the_dataset_is_checked_against_the_configured_symbol(
         self, dayrange_store, monkeypatch

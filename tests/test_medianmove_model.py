@@ -29,7 +29,7 @@ from tests.test_apple_trader import (  # noqa: F401 -- fixtures
 from tests.test_base_configs import _base, form  # noqa: F401 -- fixture
 
 DAY = pd.Timestamp("2026-07-21")
-SIP = {"opening_feed": "sip", "min_bars": 385, "max_first_minute": 0}
+SIP = {"opening_feed": "sip", "min_bars": 385, "max_first_minute": 0, "broken_dates": ()}
 
 
 def bundle(**overrides) -> dict:
@@ -211,11 +211,12 @@ class TestHistory:
         monkeypatch.setattr(H, "model_path", lambda ticker=None: tmp_path / f"highlow15m_{ticker}.joblib")
         monkeypatch.setattr(H, "metadata_path", lambda path=None: path.with_suffix(".json"))
 
-        assert H.history_settings("MU") == {"opening_feed": "iex", "min_bars": 385, "max_first_minute": 0}
+        assert H.history_settings("MU") == {**SIP, "opening_feed": "iex"}
         # No sidecar: the notebook's thresholds, SIP openings.
-        assert H.history_settings("TMO") == {"opening_feed": "sip", "min_bars": 260, "max_first_minute": 1}
+        assert H.history_settings("TMO") == {**SIP, "min_bars": 260, "max_first_minute": 1}
         assert H.history_settings("AMGN")["min_bars"] == 310
-        assert H.history_settings("GOOG") == {"opening_feed": "sip", "min_bars": 385, "max_first_minute": 0}
+        assert H.history_settings("MCD") == {**SIP, "min_bars": 360, "broken_dates": ("2023-01-24",)}
+        assert H.history_settings("GOOG") == SIP
         assert mm.load_bundle("mu")["opening_feed"] == "iex"
 
         asked = []
@@ -230,7 +231,7 @@ class TestHistory:
         first = mm.forecast_session(tmo, "TMO", opening(), DAY)
         again = mm.forecast_session(tmo, "TMO", opening(), DAY)
 
-        assert asked == [("TMO", {"opening_feed": "sip", "min_bars": 260, "max_first_minute": 1})]
+        assert asked == [("TMO", {**SIP, "min_bars": 260, "max_first_minute": 1})]
         assert again == first and again is not first
 
     def test_a_missing_credential_says_whose_history_it_is(self, monkeypatch):

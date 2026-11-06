@@ -135,6 +135,7 @@ def _history_kwargs(bundle: "dict | None") -> dict:
         "opening_feed": opening_feed(bundle),
         "min_bars": int(bundle.get("min_bars") or 385),
         "max_first_minute": int(bundle.get("max_first_minute") or 0),
+        "broken_dates": tuple(bundle.get("broken_dates") or ()),
     }
 
 
