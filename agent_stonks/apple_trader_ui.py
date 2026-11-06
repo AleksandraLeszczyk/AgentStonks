@@ -90,6 +90,10 @@ class FormCopy:
     #: Appended to every key past the model picker: the pair's base
     #: configuration's digest (`base_configs.key_suffix`), set by `params`.
     suffix: str = ""
+    #: False drops the days-off knob and sits no session out (`skip_param`):
+    #: SimLab's Tuning replays every session and leaves special days out on
+    #: the job's results instead.
+    days_off: bool = True
 
     def key(self, name: str) -> str:
         return f"{self.prefix}_{name}{self.suffix}"
@@ -750,7 +754,10 @@ def rule_params(
 
 def skip_param(defaults: AppleTraderConfig, copy: FormCopy) -> "tuple[str, ...]":
     """The sessions the run sits out (`event_days`): no forecast and no order
-    on the day after earnings, a CPI or jobs release, or a shock."""
+    on the day after earnings, a CPI or jobs release, or a shock. None, and
+    nothing drawn, without `copy.days_off`."""
+    if not copy.days_off:
+        return ()
     section("Days off", copy.sections.get("dayrange_skip"))
     picked = st.multiselect(
         "Sit out these sessions",
@@ -766,7 +773,10 @@ def skip_param(defaults: AppleTraderConfig, copy: FormCopy) -> "tuple[str, ...]"
 def down_gamma_param(defaults: AppleTraderConfig, copy: FormCopy) -> bool:
     """No buy on a falling, negative-gamma day (`no_buy_down_negative_gamma`):
     under the days off, as the other "not today" rule, and like them one box
-    for every rule set that reads it -- in Orchestra for every pair."""
+    for every rule set that reads it -- in Orchestra for every pair. With no
+    days off drawn it has a heading of its own, not the section above's."""
+    if not copy.days_off:
+        section("Net gamma", copy.sections.get("down_gamma"))
     return bool(st.checkbox(
         DOWN_GAMMA_LABEL,
         value=bool(defaults.no_buy_down_negative_gamma),

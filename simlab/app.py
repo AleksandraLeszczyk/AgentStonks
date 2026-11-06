@@ -2496,6 +2496,7 @@ def _render_apple_setup(
 
 def _render_apple_params(
     symbols: list[str], prefix: str, template: "AppleTraderConfig | None" = None,
+    days_off: bool = True,
 ) -> AppleTraderConfig:
     """One Apple Trader setup: its instrument and rules.
 
@@ -2508,9 +2509,11 @@ def _render_apple_params(
     The prefix is per setup, not per app: SimLab renders several of these on
     one page and their widgets must not collide. `template` is a configuration
     the form opens on in place of the pair's current one (`apple_trader_ui.params`).
+    Without `days_off` the form has no days-off knob and sits no session out.
     """
     return apple_trader_ui.params(
-        symbols, apple_trader_ui.FormCopy(prefix=prefix, **_APPLE_TRADER_COPY_FIELDS),
+        symbols,
+        apple_trader_ui.FormCopy(prefix=prefix, days_off=days_off, **_APPLE_TRADER_COPY_FIELDS),
         template=template,
     )
 
@@ -4254,8 +4257,12 @@ def _render_tuning_form() -> None:
         "Every parameter the grid does not sweep comes from here. It opens on the pair's "
         "current configuration"
         + (", filled from the job above while its pair is picked." if filled else ".")
+        + " Every session is replayed, special days included: a job's results leave "
+        "earnings, CPI, jobs-report and shock sessions out, kind by kind."
     )
-    base = _render_apple_params(symbols, _TUNE_PREFIX + suffix, template)
+    # No days off (since 2026-11-06, the user's): a job replays every session
+    # and its special-days switches sit kinds out afterwards.
+    base = _render_apple_params(symbols, _TUNE_PREFIX + suffix, template, days_off=False)
 
     st.markdown("**Parameters to tune**")
     offered = sim_tuning.axes_for(
@@ -5867,15 +5874,17 @@ def _render_tuning_special_days(job: dict) -> dict:
     one "Set as current configuration" keeps, sits them out too.
 
     A kind the job's configuration already sat out has no replay to measure,
-    so its switch is off and cannot be turned on.
+    so its switch is off and cannot be turned on. A kind none of the job's
+    sessions is has nothing to measure either, and no switch: the job reads
+    as the pair's current configuration has it, so a job replayed with no
+    days off -- every new one since 2026-11-06 -- does not drop it from the
+    configuration "Set as current configuration" keeps.
     """
     spec = job["spec"]
     rows, earnings = _tuning_special_rows(json.dumps(
         {"base": {"ticker": spec["base"]["ticker"]}, "datasets": spec["datasets"]},
         sort_keys=True,
     ))
-    if not rows:
-        return job
     job_id = job["job_id"]
     kinds = [k for k in event_days.CATEGORIES if any(r["category"] == k for r in rows)]
     sat_out = set(spec["base"].get("skip_events") or ())
@@ -5890,11 +5899,14 @@ def _render_tuning_special_days(job: dict) -> dict:
         current_skips = set(default_config(own.ticker, own.model_key).skip_events or ())
     except (TypeError, ValueError):
         current_skips = set()
+    unmet = [k for k in event_days.CATEGORIES if k in current_skips and k not in kinds]
+    if not rows:
+        return sim_tuning.without_days(job, (), unmet)
     for kind in measured:
         st.session_state.setdefault(_tuning_special_key(job_id, kind), kind not in current_skips)
     left_out = [k for k in measured if not st.session_state[_tuning_special_key(job_id, k)]]
     days_out = {r["day"] for r in rows if r["category"] in left_out}
-    read = sim_tuning.without_days(job, days_out, left_out)
+    read = sim_tuning.without_days(job, days_out, [*left_out, *unmet])
     chosen = _tuning_chosen(read)
 
     def made(cell: "dict | None", day: str) -> "float | None":
@@ -5991,8 +6003,14 @@ def _render_tuning_special_days(job: dict) -> dict:
         if never:
             st.caption(
                 f":material/info: This job's configuration sat out {', '.join(never)} "
-                "sessions, so it never traded them. To measure them, run a job with "
-                "those taken out of **Sit out these sessions**."
+                "sessions, so it never traded them. A new job replays every session, so "
+                "its results measure them."
+            )
+        if unmet:
+            st.caption(
+                ":material/info: No session here is a "
+                f"{', '.join(event_days.LABELS[k] for k in unmet)}: the job reads as "
+                "the current configuration has it, sitting them out."
             )
         errors_key = f"tune_special_errors_{job_id}"
         for error in st.session_state.get(errors_key, ()):

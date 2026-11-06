@@ -338,6 +338,24 @@ class TestTuningSwitches:
         app.checkbox(key="tune_special_j_cpi").check().run()
         assert self.read(app)["skip_events"] == []
 
+    def test_a_kind_no_session_is_follows_the_current_configuration(self, monkeypatch):
+        """A job replayed with no days off keeps the current configuration's
+        rule for a kind it never met, so Set as current does not drop it."""
+        app = self.app(monkeypatch, job(), current_skips=["geo"])
+        assert [box.key for box in app.checkbox] == ["tune_special_j_cpi"]
+        assert self.read(app)["skip_events"] == ["geo"]
+        assert any("No session here is a Geopolitical shock" in c.value for c in app.caption)
+        app.checkbox(key="tune_special_j_cpi").uncheck().run()
+        assert self.read(app)["skip_events"] == ["cpi", "geo"]
+
+    def test_a_job_with_no_special_session_reads_as_the_current_configuration(
+        self, monkeypatch
+    ):
+        self.ROWS = []
+        app = self.app(monkeypatch, job(), current_skips=["cpi", "geo"])
+        assert not app.checkbox
+        assert self.read(app)["skip_events"] == ["cpi", "geo"]
+
     def test_a_kind_the_job_sat_out_cannot_be_put_back(self, monkeypatch):
         app = self.app(monkeypatch, job(skip_events=["cpi"]))
         [box] = app.checkbox

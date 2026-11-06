@@ -1392,6 +1392,19 @@ class TestFillForm:
         assert app.number_input(key="tune_workers_from1").value == 1
         assert app.button(key="tune_run").disabled is False
 
+    def test_every_session_is_replayed(self, app, monkeypatch):
+        """No days off on the form (since 2026-11-06): a job replays every
+        session, even filled from one that sat some out, and its results
+        leave special days out instead. The negative-gamma box stays."""
+        specs = []
+        monkeypatch.setattr(tu, "validate", lambda spec: specs.append(spec))
+        app.button(key="fill").click().run()
+        assert not app.exception, app.exception
+        assert self.CONFIG.skip_events
+        assert "Sit out these sessions" not in [m.label for m in app.multiselect]
+        assert DOWN_GAMMA_LABEL in [c.label for c in app.checkbox]
+        assert list(specs[-1]["base"]["skip_events"]) == []
+
     def test_a_second_fill_redraws_what_was_changed_since(self, app):
         app.button(key="fill").click().run()
         app.number_input(key="tune_from1_buy_k_highlow_AAPL").set_value(0.8).run()
