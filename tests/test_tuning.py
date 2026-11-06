@@ -1321,6 +1321,121 @@ class TestSetBase:
         assert "still running" in app.caption[0].value
 
 
+def _fill_form_app(job_spec: dict) -> None:
+    import streamlit as st
+
+    from simlab import app as sim_app
+
+    st.button(
+        "Fill new job form", key="fill",
+        on_click=sim_app._tuning_fill_form, args=("j", "AAPL · HighLow job", job_spec),
+    )
+    sim_app._render_tuning_form()
+
+
+class TestFillForm:
+    """"Fill new job form" on a job's results: the New tuning job form opens
+    on that job's configuration, swept ranges, datasets and run settings."""
+
+    CONFIG = AppleTraderConfig(
+        ticker=TICKER, model_key="highlow", buy_k=0.55, sell_k=0.25, position_pct=40.0,
+        momentum_confirmation_bars=3,
+    )
+
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        from agent_stonks import apple_models
+        from simlab import app as sim_app
+
+        # No bundle is loaded to draw a form, and no store is read.
+        monkeypatch.setattr(apple_models, "load", lambda *a, **k: {"model": "stub"})
+        stored = [
+            SimpleNamespace(name=name, days=[str(day)], feed=sim_data.DEFAULT_FEED,
+                            symbols=[TICKER], start=str(day), end=str(day))
+            for name, day in (("w1", TUNE_DAY), ("w2", TEST_DAY))
+        ]
+        monkeypatch.setattr(sim_app.sim_data, "list_datasets", lambda: stored)
+        monkeypatch.setattr(sim_app, "_runs", lambda: [])
+        job_spec = {
+            "base": rule_agent_record(self.CONFIG),
+            "axes": [{"name": "buy_k", "values": [0.4, 0.5, 0.6]},
+                     {"name": "breach_update", "values": ["off", "shift"]}],
+            "datasets": [dataset("w1", TUNE_DAY), dataset("gone", TEST_DAY)],
+            "starting_cash": 50_000.0, "min_traded_share": 0.2,
+            "reuse_runs": False, "workers": 1,
+        }
+        app = AppTest.from_function(_fill_form_app, args=(job_spec,), default_timeout=30)
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_the_form_opens_on_the_jobs_settings(self, app):
+        app.button(key="fill").click().run()
+        assert not app.exception, app.exception
+        assert app.selectbox(key="tune_from1_ticker").value == TICKER
+        assert app.selectbox(key="tune_from1_model_AAPL").value == "highlow"
+        assert app.number_input(key="tune_from1_buy_k_highlow_AAPL").value == pytest.approx(0.55)
+        assert app.number_input(key="tune_from1_dayrange_size").value == pytest.approx(40.0)
+        assert app.multiselect(key="tune_axes_dayrange_from1").value == ["buy_k", "breach_update"]
+        assert [app.number_input(key=f"tune_buy_k_{box}_from1").value for box in (
+            "from", "to", "step"
+        )] == [pytest.approx(0.4), pytest.approx(0.6), pytest.approx(0.1)]
+        assert app.multiselect(key="tune_breach_update_options_from1").value == ["off", "shift"]
+        # The dataset no longer stored is named and left out.
+        assert app.multiselect(key="tune_datasets_AAPL_from1").value == ["w1"]
+        assert any("`gone`" in c.value for c in app.caption)
+        assert app.slider(key="tune_min_traded_from1").value == 20
+        assert app.number_input(key="tune_cash_from1").value == pytest.approx(50_000.0)
+        assert app.checkbox(key="tune_reuse_runs_from1").value is False
+        assert app.number_input(key="tune_workers_from1").value == 1
+        assert app.button(key="tune_run").disabled is False
+
+    def test_a_second_fill_redraws_what_was_changed_since(self, app):
+        app.button(key="fill").click().run()
+        app.number_input(key="tune_from1_buy_k_highlow_AAPL").set_value(0.8).run()
+        app.button(key="fill").click().run()
+        assert not app.exception, app.exception
+        assert app.number_input(key="tune_from2_buy_k_highlow_AAPL").value == pytest.approx(0.55)
+
+    def test_the_way_back_opens_on_the_current_configuration(self, app):
+        app.button(key="fill").click().run()
+        app.button(key="tune_form_reset").click().run()
+        assert not app.exception, app.exception
+        assert app.selectbox(key="tune_from2_model_AAPL").value == AppleTraderConfig().model_key
+        assert app.number_input(key="tune_cash_from2").value == pytest.approx(100_000.0)
+        # The newest dataset, as a fresh form picks.
+        assert app.multiselect(key="tune_datasets_AAPL_from2").value == ["w2"]
+        assert not any("Filled from" in c.value for c in app.caption)
+
+
+def rule_agent_record(config: AppleTraderConfig) -> dict:
+    from simlab.rule_agents import rule_agent
+
+    return rule_agent(APPLE_TRADER_KEY).to_record(config)
+
+
+class TestFillRefusal:
+    def test_a_job_on_a_retired_rule_cannot_fill_the_form(self):
+        from simlab import app as sim_app
+
+        record = rule_agent_record(AppleTraderConfig(ticker=TICKER, model_key="highlow"))
+        assert sim_app._tuning_fill_refusal({"base": record}) is None
+        assert "old records" in sim_app._tuning_fill_refusal(
+            {"base": {**record, "take_min_gain_fraction": 0.2}}
+        )
+
+    def test_a_range_outside_the_boxes_is_kept_inside_them(self):
+        from simlab import app as sim_app
+
+        assert sim_app._tuning_filled_range("buy_k", [0.02, 0.5, 0.98]) == (
+            0.05, 0.98, pytest.approx(0.48)
+        )
+        assert sim_app._tuning_filled_range("buy_k", [0.4]) == (0.4, 0.4, 0.1)
+        assert sim_app._tuning_filled_range("buy_k", None) == (0.3, 0.9, 0.1)
+
+
 def _config_compare_app(record: dict, chosen) -> None:
     from simlab import app as sim_app
 

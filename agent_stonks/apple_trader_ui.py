@@ -99,6 +99,7 @@ def params(
     symbols: "list[str] | None",
     copy: FormCopy,
     seed: "AppleTraderConfig | None" = None,
+    template: "AppleTraderConfig | None" = None,
 ) -> AppleTraderConfig:
     """Apple Trader's instrument and tunables, as one config.
 
@@ -116,8 +117,14 @@ def params(
     SimLab has set one (`default_config`), and keeps what the form has no knob
     for -- a level source, the fill rule -- from it too. Every key past the
     model carries the base's digest, so a new base re-seeds the whole form.
+
+    `template` is a whole configuration to open on instead -- SimLab's Tuning
+    form filled from a past job: the instrument and the model open on its
+    pair, and while that pair is picked, everything past the model opens on
+    it in place of the base. Only widgets drawn fresh open on it, so the
+    caller gives them keys of their own (`copy.prefix`).
     """
-    start = AppleTraderConfig()
+    start = template if template is not None else AppleTraderConfig()
     ticker = instrument_row(start, symbols, copy)
     keys = apple_models.keys_for(ticker)
     default_key = start.model_key if start.model_key in keys else keys[0]
@@ -140,6 +147,8 @@ def params(
     if bundle is None:
         st.error(apple_models.unavailable_reason(model_key, ticker))
     defaults = default_config(ticker, model_key)
+    if template is not None and (template.model_key, template.ticker.upper()) == (model_key, ticker):
+        defaults = template
     copy = replace(copy, suffix=pair_suffix(model_key, ticker))
     if apple_models.strategy(model_key) == apple_models.STRATEGY_MOMENTUM:
         return momentum_params(defaults, model_key, ticker, copy)

@@ -2494,7 +2494,9 @@ def _render_apple_setup(
     return _render_apple_sweep(_render_apple_params(symbols, prefix), prefix)
 
 
-def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
+def _render_apple_params(
+    symbols: list[str], prefix: str, template: "AppleTraderConfig | None" = None,
+) -> AppleTraderConfig:
     """One Apple Trader setup: its instrument and rules.
 
     `symbols` is what the selected datasets carry, used only to mark the
@@ -2504,10 +2506,12 @@ def _render_apple_params(symbols: list[str], prefix: str) -> AppleTraderConfig:
     anything is queued (see `_rule_agents_missing_ticker`).
 
     The prefix is per setup, not per app: SimLab renders several of these on
-    one page and their widgets must not collide.
+    one page and their widgets must not collide. `template` is a configuration
+    the form opens on in place of the pair's current one (`apple_trader_ui.params`).
     """
     return apple_trader_ui.params(
-        symbols, apple_trader_ui.FormCopy(prefix=prefix, **_APPLE_TRADER_COPY_FIELDS)
+        symbols, apple_trader_ui.FormCopy(prefix=prefix, **_APPLE_TRADER_COPY_FIELDS),
+        template=template,
     )
 
 
@@ -3868,6 +3872,57 @@ def _drift_chart(entries: "list[dict]", metric, by: str, tickers: "list[str]") -
 # ---------------------------------------------------------------------------
 
 _TUNE_PREFIX = "tune"
+# The New tuning job form filled from a past job ("Fill new job form" on its
+# results): {"count", "job_id", "label", "spec"}, spec None once "Start from
+# the current configuration" is clicked. Every widget key of the form ends with
+# the count (`_tuning_form_suffix`), so each fill draws fresh widgets, which
+# open on the job's values -- widgets already drawn would keep what they hold.
+_TUNE_FORM_FROM = "tune_form_from"
+
+
+def _tuning_form_suffix() -> str:
+    found = st.session_state.get(_TUNE_FORM_FROM)
+    return f"_from{found['count']}" if found else ""
+
+
+def _tuning_fill_form(job_id: str, label: str, spec: "dict | None") -> None:
+    """on_click of "Fill new job form" (and, with no spec, of "Start from the
+    current configuration"): the form opens on `spec` on this run."""
+    count = int((st.session_state.get(_TUNE_FORM_FROM) or {}).get("count", 0)) + 1
+    st.session_state[_TUNE_FORM_FROM] = {
+        "count": count, "job_id": job_id, "label": label, "spec": spec,
+    }
+    if spec is not None:
+        st.toast(
+            "The New tuning job form at the top of the tab is filled from this job.",
+            icon=":material/edit_note:",
+        )
+
+
+def _tuning_fill_refusal(spec: dict) -> "str | None":
+    """Why the form cannot open on a job's configuration, or None if it can:
+    the same configurations "Set as current configuration" refuses -- a rule
+    kept only so old records replay has no knob, and the form would carry it
+    into the new job unseen."""
+    try:
+        return base_error(sim_tuning.make_config(spec["base"], {}))
+    except (KeyError, TypeError, ValueError) as exc:
+        return f"Its configuration does not decode ({exc})."
+
+
+def _tuning_filled_range(name: str, values: "list | None") -> tuple:
+    """A past job's values of one numeric axis as from/to/step, inside what the
+    boxes take; the axis's default range without them."""
+    tunable = sim_tuning.TUNABLES[name]
+    if not values:
+        return tunable.default_range
+    ordered = sorted(values)
+    step = round(ordered[1] - ordered[0], 6) if len(ordered) > 1 else tunable.default_range[2]
+
+    def inside(value: float) -> float:
+        return min(max(value, tunable.minimum), tunable.maximum)
+
+    return inside(ordered[0]), inside(ordered[-1]), min(max(step, tunable.step), tunable.maximum)
 
 
 def _tuning_param_label(name: str) -> str:
@@ -4021,7 +4076,12 @@ def render_tuning_tab() -> None:
     )
     _render_tuning_jobs()
     submitted = sim_tuning.list_jobs()
-    with st.expander("New tuning job", icon=":material/tune:", expanded=not submitted):
+    # Keyed by the fill, so a fill opens the form even if it was collapsed.
+    with st.expander(
+        "New tuning job", icon=":material/tune:",
+        expanded=not submitted or _TUNE_FORM_FROM in st.session_state,
+        key=f"tune_new_job{_tuning_form_suffix()}",
+    ):
         _render_tuning_form()
     # Derived grids are offered beside the submitted jobs rather than in their
     # own section: they answer the same question in the same shape, and the
@@ -4125,7 +4185,9 @@ def _render_tuning_overlaps(datasets: "list[dict]") -> None:
         )
 
 
-def _tuning_range(name: str) -> "tuple[list, str]":
+def _tuning_range(
+    name: str, suffix: str = "", filled: "list | None" = None
+) -> "tuple[list, str]":
     """One numeric axis from a from/to/step row: (values, "") or ([], why not).
 
     The Simulate tab's sweep asks the same three boxes (`_sweep_range`) and
@@ -4133,24 +4195,25 @@ def _tuning_range(name: str) -> "tuple[list, str]":
     thing in both places. The problem comes back rather than being shown here
     because the Tuning tab reports one problem at a time, above the button it
     disables -- a red box under each bad row and a live button is the arrangement
-    that gets a broken grid queued.
+    that gets a broken grid queued. `filled` is a past job's values of the
+    axis, which the row opens on (`_tuning_filled_range`).
     """
     tunable = sim_tuning.TUNABLES[name]
     cast = int if tunable.integer else float
-    start0, stop0, step0 = tunable.default_range
+    start0, stop0, step0 = _tuning_filled_range(name, filled)
     bounds = dict(
         min_value=cast(tunable.minimum), max_value=cast(tunable.maximum),
         step=cast(tunable.step), format=tunable.fmt,
     )
     col_from, col_to, col_step = st.columns(3)
     start = col_from.number_input(
-        f"{tunable.label}: from", value=cast(start0), key=f"tune_{name}_from", **bounds
+        f"{tunable.label}: from", value=cast(start0), key=f"tune_{name}_from{suffix}", **bounds
     )
-    stop = col_to.number_input("to", value=cast(stop0), key=f"tune_{name}_to", **bounds)
+    stop = col_to.number_input("to", value=cast(stop0), key=f"tune_{name}_to{suffix}", **bounds)
     step = col_step.number_input(
         "step", min_value=cast(tunable.step), max_value=cast(tunable.maximum),
         value=cast(step0), step=cast(tunable.step), format=tunable.fmt,
-        key=f"tune_{name}_step",
+        key=f"tune_{name}_step{suffix}",
     )
     try:
         return sim_tuning.axis_values(name, start, stop, step), ""
@@ -4164,25 +4227,52 @@ def _render_tuning_form() -> None:
         st.info("Download a dataset first (Datasets tab).")
         return
     symbols = sorted({str(s).upper() for d in datasets for s in (d.symbols or [])})
+    # A past job's settings ("Fill new job form" on its results), which every
+    # widget below opens on; keys end with `suffix` so they are drawn fresh.
+    suffix = _tuning_form_suffix()
+    filled = (st.session_state.get(_TUNE_FORM_FROM) or {}).get("spec") or {}
+    template = None
+    if filled:
+        try:
+            template = sim_tuning.make_config(filled["base"], {})
+        except (TypeError, ValueError):
+            pass  # refused by the button already (`_tuning_fill_refusal`)
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption(
+                f":material/edit_note: Filled from **{st.session_state[_TUNE_FORM_FROM]['label']}**"
+                " — its configuration, the parameters it swept and their ranges, its "
+                "datasets and run settings. Change what you want to compare and run it as "
+                "a new job."
+            )
+            st.button(
+                "Start from the current configuration", icon=":material/restart_alt:",
+                key="tune_form_reset", on_click=_tuning_fill_form, args=("", "", None),
+            )
 
     st.markdown("**Configuration**")
     st.caption(
         "Every parameter the grid does not sweep comes from here. It opens on the pair's "
-        "current configuration."
+        "current configuration"
+        + (", filled from the job above while its pair is picked." if filled else ".")
     )
-    base = _render_apple_params(symbols, _TUNE_PREFIX)
+    base = _render_apple_params(symbols, _TUNE_PREFIX + suffix, template)
 
     st.markdown("**Parameters to tune**")
+    offered = sim_tuning.axes_for(
+        base.model_key, [a for a in sim_tuning.AXES if a not in sim_tuning.LEGACY_AXES]
+    )
+    filled_axes = {a["name"]: a["values"] for a in filled.get("axes", ())}
     names = st.multiselect(
         "Tune",
-        sim_tuning.axes_for(
-            base.model_key, [a for a in sim_tuning.AXES if a not in sim_tuning.LEGACY_AXES]
+        offered,
+        default=(
+            [n for n in filled_axes if n in offered][:sim_tuning.MAX_AXES]
+            or list(sim_tuning.default_axes(base.model_key))
         ),
-        default=list(sim_tuning.default_axes(base.model_key)),
         max_selections=sim_tuning.MAX_AXES,
         # Per rule set (and window): each offers different parameters.
         format_func=sim_tuning.sweep_label,
-        key=f"tune_axes_{sim_tuning.axes_family(base.model_key)}",
+        key=f"tune_axes_{sim_tuning.axes_family(base.model_key)}{suffix}",
         help="One parameter draws a bar chart, two a heatmap — the first one is its rows. "
              "A third and a fourth are each shown over that heatmap one value at a time, "
              "or collapsed: each square at its best value of that parameter, or averaged "
@@ -4196,9 +4286,13 @@ def _render_tuning_form() -> None:
         choice = sim_tuning.CHOICES.get(name)
         if choice is not None:
             values = st.multiselect(
-                choice.label, list(choice.pickable), default=list(choice.pickable),
+                choice.label, list(choice.pickable),
+                default=(
+                    [v for v in filled_axes.get(name, ()) if v in choice.pickable]
+                    or list(choice.pickable)
+                ),
                 format_func=lambda key, c=choice: c.labels.get(key, key),
-                key=f"tune_{name}_options",
+                key=f"tune_{name}_options{suffix}",
                 help="Each ticked option is a row (or a column) of the grid: the same "
                      "sweep replayed under that rule.",
             )
@@ -4206,7 +4300,7 @@ def _render_tuning_form() -> None:
                 problems.append(f"{choice.label}: no values to try.")
                 continue
         else:
-            values, problem = _tuning_range(name)
+            values, problem = _tuning_range(name, suffix, filled_axes.get(name))
             if problem:
                 problems.append(problem)
                 continue
@@ -4231,9 +4325,21 @@ def _render_tuning_form() -> None:
         for d in sim_tuning.chronological([_tuning_dataset_spec(d) for d in carrying])
     }
     newest = max(carrying, key=lambda d: str(d.end)).name
+    # A filled job's datasets on its own instrument only: another's are not its.
+    filled_names = (
+        [d["name"] for d in filled.get("datasets", ())]
+        if template is not None and template.ticker.upper() == base.ticker else []
+    )
+    gone = [n for n in filled_names if n not in by_name]
+    if gone:
+        st.caption(
+            f":material/info: Not stored any more, so left out: {', '.join(f'`{n}`' for n in gone)}."
+        )
     chosen = st.multiselect(
-        "Sweep on", list(by_name), default=[newest], format_func=lambda n: _tuning_describe_dataset(by_name[n]),
-        key=f"tune_datasets_{base.ticker}",
+        "Sweep on", list(by_name),
+        default=[n for n in filled_names if n in by_name] or [newest],
+        format_func=lambda n: _tuning_describe_dataset(by_name[n]),
+        key=f"tune_datasets_{base.ticker}{suffix}",
         help="The grid is swept on every dataset picked here, each drawn as its own "
         "heatmap, and the best options are read off their sum. A finished job takes more datasets "
         "later with the same settings.",
@@ -4248,19 +4354,23 @@ def _render_tuning_form() -> None:
     )
     col_share, col_cash = st.columns(2)
     min_share = col_share.slider(
-        "Must trade on at least", 0, 100, 50, step=5, format="%d%% of days",
-        key="tune_min_traded",
+        "Must trade on at least", 0, 100,
+        min(100, max(0, round(100 * float(filled.get("min_traded_share", 0.5))))),
+        step=5, format="%d%% of days",
+        key=f"tune_min_traded{suffix}",
         help="Counted over every session of every dataset. A deep entry that filled on "
         "one lucky day cannot be a best option.",
     ) / 100.0
     starting_cash = col_cash.number_input(
-        "Starting cash", value=100_000.0, step=10_000.0, key="tune_cash",
+        "Starting cash", value=float(filled.get("starting_cash") or 100_000.0), step=10_000.0,
+        key=f"tune_cash{suffix}",
         help="Each dataset is replayed from this cash, so a cell's summed return is its "
         "total profit as a share of it.",
     )
     col_reuse, col_workers = st.columns([3, 1], vertical_alignment="bottom")
     reuse_runs = col_reuse.checkbox(
-        "Reuse stored runs", value=True, key="tune_reuse_runs",
+        "Reuse stored runs", value=bool(filled.get("reuse_runs", True)),
+        key=f"tune_reuse_runs{suffix}",
         help="A cell is the same replay a Simulate run of that configuration is, so a "
         "matching run already in the store answers it — same rules, same sessions, same "
         "tape, same starting cash. Those cells fill in below before anything is queued "
@@ -4269,7 +4379,8 @@ def _render_tuning_form() -> None:
     cpus = os.cpu_count() or 2
     workers = col_workers.number_input(
         "Parallel workers", min_value=1, max_value=max(1, cpus),
-        value=min(4, max(1, cpus - 1)), key="tune_workers",
+        value=min(max(1, cpus), max(1, int(filled.get("workers") or min(4, max(1, cpus - 1))))),
+        key=f"tune_workers{suffix}",
         help="Replays run in separate processes, each loading the day-range model once.",
     )
 
@@ -6337,14 +6448,27 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             st.plotly_chart(histogram, key=f"tune_spread_{job_id}")
             st.caption(_tuning_spread_caption(job, chosen))
 
-    # A derived grid has no record to delete -- it is the runs themselves, and
-    # they are Results' to remove.
-    if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED) and st.button(
-        "Delete this tuning job", icon=":material/delete:", key=f"tune_delete_{job_id}"
-    ):
-        sim_tuning.delete_job(job_id)
-        st.session_state.pop("tune_selected_job", None)
-        st.rerun()
+    with st.container(horizontal=True):
+        # The job as submitted (`spec`), not as the special-days switches read it.
+        refusal = _tuning_fill_refusal(spec)
+        st.button(
+            "Fill new job form", icon=":material/edit_note:", key=f"tune_form_from_{job_id}",
+            on_click=_tuning_fill_form, args=(job_id, labels[job_id], spec),
+            disabled=bool(refusal),
+            help=refusal or "Fill the **New tuning job** form at the top of the tab with "
+            "this job's settings — its configuration, the parameters it swept and their "
+            "ranges, its datasets and run settings — to change what you want to compare. "
+            "The days off are the job's own, not the special days switched off here. "
+            "Nothing runs until **Run tuning**.",
+        )
+        # A derived grid has no record to delete -- it is the runs themselves, and
+        # they are Results' to remove.
+        if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED) and st.button(
+            "Delete this tuning job", icon=":material/delete:", key=f"tune_delete_{job_id}"
+        ):
+            sim_tuning.delete_job(job_id)
+            st.session_state.pop("tune_selected_job", None)
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
