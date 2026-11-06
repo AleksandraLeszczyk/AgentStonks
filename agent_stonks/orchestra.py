@@ -8,8 +8,8 @@ cash:
 * **Racing.** Every pair trades on its own rules, exactly as Apple Trader
   would on it alone: a day-range pair (HighLow, HighLow2) forecasts its
   session at 9:35 and rests its own levels; a GoodMoments pair (GoodMoments,
-  HighLow2 + GoodMoments -- the probability rules, since 2026-10-25) reads its
-  edge at the close of every bar. Each bar the pairs are read in Orchestra's
+  HighLow2 + GoodMoments, HighLow + GoodMoments -- the probability rules,
+  since 2026-10-25) reads its edge at the close of every bar. Each bar the pairs are read in Orchestra's
   order -- the most profitable a session in SimLab's tuning first
   (`tuning_profits`, `rank_pairs`) -- and the first whose buy *fills* takes
   its share of the cash: `position_pct` of it, as Apple Trader sizes. A buy
@@ -64,8 +64,9 @@ In the code a pair Orchestra is running is a "racer".
 
 What a pair is given, and what it shares
 ----------------------------------------
-Every pair shares Orchestra's sizing, its closing flatten, its time limit and
-its days off (`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
+Every pair shares Orchestra's sizing, its closing flatten, its time limit, its
+days off and its no-buy rule on a falling, negative-gamma day
+(`SHARED_BY_ALL`). The day-range pairs also share every other rule of theirs
 -- the unit, the ladder, the exits, the breach policy, the circuit breaker --
 and each keeps its two distances, its stop and its momentum confirmation
 period (`DAYRANGE_PAIR_FIELDS`). A GoodMoments pair keeps its own configuration --
@@ -172,9 +173,11 @@ DAYRANGE_PAIR_FIELDS = ("buy_k", "sell_k", "stop_gain_fraction", "momentum_confi
 PER_RACER_FIELDS = ("ticker", "model_key", "min_win_k") + DAYRANGE_PAIR_FIELDS
 # The fields every racer must share, whatever its rule set: Orchestra's sizing,
 # its closing flatten, its time limit (one for every pair, the user's request
-# of 2026-11-02) and the sessions it sits out.
+# of 2026-11-02), the sessions it sits out and the no-buy rule on a falling,
+# negative-gamma day (2026-11-05).
 SHARED_BY_ALL = (
     "position_pct", "flatten_before_close_min", "time_limit_minutes", "skip_events",
+    "no_buy_down_negative_gamma",
 )
 # What Orchestra sets on a GoodMoments racer, over its pair's own configuration
 # (`build_orchestra_config`): the edge a buy needs, the take, the stop and the
@@ -231,9 +234,12 @@ def split_key(key: str) -> "tuple[str, str]":
 SHORT_MODEL_NAMES = {
     "highlow": "HighLow",
     "highlow2": "HighLow2",
+    "highlow_chain": "HighLow Chain",
+    "medianmove": "MedianMove",
     "fastfurious": "Fast&Furious",
     "goodmoments": "GoodMoments",
     "highlow2_goodmoments": "HighLow2 + GoodMoments",
+    "highlow_goodmoments": "HighLow + GoodMoments",
 }
 
 
@@ -476,8 +482,8 @@ def signal_racer(
 ) -> AppleTraderConfig:
     """A GoodMoments racer: its pair's own configuration (`default_config`:
     the pair's base, else the shipped defaults; a hybrid's from both its
-    models), with Orchestra's sizing, flatten and days off from `base`
-    and time limit (`SHARED_BY_ALL`) and the numbers Orchestra sets on it (`pair_fields`)
+    models), with Orchestra's sizing, flatten, days off, time limit and
+    negative-gamma rule from `base` (`SHARED_BY_ALL`) and the numbers Orchestra sets on it (`pair_fields`)
     from `numbers`, where given.
 
     A take that follows the intraday volatility curve keeps its quietest-minute

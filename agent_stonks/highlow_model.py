@@ -1242,8 +1242,9 @@ def _build_bundle(path: Path) -> "dict | None":
     except (OSError, ValueError):
         metadata = {}
     peers = tuple(str(t).upper() for t in (metadata.get("peers") or ()))
-    feed = str(metadata.get("opening_feed") or OPENING_FEED_SIP).lower()
     ticker = str(metadata.get("ticker") or "").upper() or None
+    settings = history_settings(ticker, metadata)
+    feed = settings["opening_feed"]
 
     # The base features are mirrored, and the custom groups in `GROUP_COLS`.
     # A weighted candidate reading anything else (the calendar group) would
@@ -1274,11 +1275,7 @@ def _build_bundle(path: Path) -> "dict | None":
         "metadata": metadata,
         "daily_models": list(models),
         "opening_minutes": int(metadata.get("opening_minutes") or OPENING_MINUTES),
-        "opening_feed": feed,
-        "min_bars": int(metadata.get("min_bars_per_session")
-                        or NOTEBOOK_MIN_BARS.get(ticker or "", MIN_BARS_PER_SESSION)),
-        "max_first_minute": int(metadata.get("max_first_minute")
-                                or NOTEBOOK_MAX_FIRST_MINUTE.get(ticker or "", 0)),
+        **settings,
         "peers": peers,
         # An IEX-opening notebook reads its peers' openings on IEX (`load_peers`'
         # default), a SIP-opening one on SIP: the bundle's own opening feed.
@@ -1295,6 +1292,32 @@ def _build_bundle(path: Path) -> "dict | None":
 
 load_bundle = _STORE.load
 reset_bundle_cache = _STORE.reset
+
+
+def history_settings(ticker: "str | None", metadata: "dict | None" = None) -> dict:
+    """How one ticker's own SIP history is kept: which feed its openings are
+    read from and the thresholds its sessions are cleaned at -- the sidecar's,
+    else the notebook's (`NOTEBOOK_MIN_BARS`, `NOTEBOOK_MAX_FIRST_MINUTE`).
+
+    `metadata` is the sidecar's contents; without it the sidecar is read from
+    disk, so a caller sharing this ticker's cache (MedianMove's
+    `medianmove_model`) keeps it as HighLow does without loading the model --
+    a cache asked for under other settings is rebuilt, and two readers that
+    disagree would rebuild it in turn.
+    """
+    symbol = (ticker or "").upper()
+    if metadata is None:
+        try:
+            metadata = json.loads(metadata_path(model_path(symbol or None)).read_text())
+        except (OSError, ValueError):
+            metadata = {}
+    return {
+        "opening_feed": str(metadata.get("opening_feed") or OPENING_FEED_SIP).lower(),
+        "min_bars": int(metadata.get("min_bars_per_session")
+                        or NOTEBOOK_MIN_BARS.get(symbol, MIN_BARS_PER_SESSION)),
+        "max_first_minute": int(metadata.get("max_first_minute")
+                                or NOTEBOOK_MAX_FIRST_MINUTE.get(symbol, 0)),
+    }
 
 
 def opening_minutes(bundle: "dict | None" = None) -> int:

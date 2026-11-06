@@ -23,6 +23,14 @@ at its close, with the chain the app had at that moment, and kept.
   it already had rather than re-pricing them with a newer chain.
 - **Only the latest bar's ET day.** Earlier days' bars are not drawn, and
   today's chain says nothing about them.
+
+Apple Trader's "no buy on a falling, negative-gamma day" reads the same values,
+one bar at a time (`at_close`): a bar the panel already took is read back, and
+one it has not is taken by the trader, by the same rule. A SimLab replay or
+the live app's replay of a past session has no chain of that day, only what
+the live app kept then. The chain itself is refreshed here (`refresh_chain`)
+for the panel and the trader alike, so a trader running with no page open
+still reads a current one.
 """
 from __future__ import annotations
 
@@ -30,13 +38,15 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
+from .config import OPTIONS_POLL_SEC
 from .market_hours import MARKET_TZ
-from .options import net_gamma_exposure
+from .options import fetch_options_walls_data, net_gamma_exposure
 from .stream_common import TF_MINUTES
 
 logger = logging.getLogger(__name__)
@@ -47,18 +57,25 @@ _lock = threading.Lock()
 # (symbol, timeframe, ET date) -> {bar time, UTC ISO: net gamma at its close}.
 _kept: dict[tuple[str, str, str], dict[str, float]] = {}
 
+# The background chain refresh (`refresh_chain`): one fetch at a time per
+# symbol, at most once per OPTIONS_POLL_SEC.
+_fetch_lock = threading.Lock()
+_fetch_running: set[str] = set()
+_fetch_tried: dict[str, float] = {}
+
 
 def _utc(t) -> pd.Timestamp:
     stamp = pd.Timestamp(t)
     return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
 
 
-def _path(symbol: str, timeframe: str, day: str) -> Path:
+def kept_path(symbol: str, timeframe: str, day: str) -> Path:
+    """The file one symbol, timeframe and ET day's kept values live in."""
     return CACHE_DIR / f"{symbol}_{timeframe}_{day}.json"
 
 
 def _load(symbol: str, timeframe: str, day: str) -> dict[str, float]:
-    path = _path(symbol, timeframe, day)
+    path = kept_path(symbol, timeframe, day)
     if not path.exists():
         return {}
     try:
@@ -70,7 +87,7 @@ def _load(symbol: str, timeframe: str, day: str) -> dict[str, float]:
 
 
 def _save(symbol: str, timeframe: str, day: str, values: dict[str, float]) -> None:
-    path = _path(symbol, timeframe, day)
+    path = kept_path(symbol, timeframe, day)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
@@ -78,6 +95,18 @@ def _save(symbol: str, timeframe: str, day: str, values: dict[str, float]) -> No
         os.replace(tmp, path)
     except OSError as exc:  # the panel still draws from memory
         logger.warning("Kept net gamma %s not written: %s", path, exc)
+
+
+def _day_values(key: "tuple[str, str, str]") -> dict[str, float]:
+    """The values kept for (symbol, timeframe, ET date), read from disk the
+    first time. Called under `_lock`."""
+    kept = _kept.get(key)
+    if kept is None:
+        # A new day: the symbol's earlier days are not drawn any more.
+        for old in [k for k in _kept if k[:2] == key[:2]]:
+            del _kept[old]
+        kept = _kept[key] = _load(*key)
+    return kept
 
 
 def series(
@@ -110,12 +139,7 @@ def series(
 
     key = (symbol, timeframe, day)
     with _lock:
-        kept = _kept.get(key)
-        if kept is None:
-            # A new day: the symbol's earlier days are not drawn any more.
-            for old in [k for k in _kept if k[:2] == key[:2]]:
-                del _kept[old]
-            kept = _kept[key] = _load(symbol, timeframe, day)
+        kept = _day_values(key)
         # Every bar without a kept value, and the one still forming: the
         # complete ones are kept, the forming one is only drawn.
         todo = [
@@ -149,3 +173,70 @@ def series(
     else:
         note = "Waiting for the next options chain refresh (within a minute)"
     return {"t": t, "value": value, "note": note}
+
+
+def at_close(
+    symbol: str,
+    timeframe: str,
+    t,
+    close: float,
+    chain: "dict | None",
+) -> "float | None":
+    """The net gamma of the complete bar that opened at `t`: the value kept
+    for it, else priced now at its `close` with `chain` and kept -- what the
+    panel would take for it -- else None, with neither a kept value nor a
+    usable chain."""
+    stamp = _utc(t)
+    day = stamp.tz_convert(MARKET_TZ).date().isoformat()
+    iso = stamp.isoformat()
+    with _lock:
+        kept = _day_values((symbol, timeframe, day))
+        if iso in kept:
+            return kept[iso]
+        values = net_gamma_exposure(chain, [close]) if chain else None
+        if values is None:
+            return None
+        kept[iso] = float(values[0])
+        _save(symbol, timeframe, day, kept)
+        return kept[iso]
+
+
+def refresh_chain(sym_state) -> None:
+    """Refresh `sym_state.options_chain` in a background thread, at most once
+    per OPTIONS_POLL_SEC per symbol.
+
+    The chart fragment re-runs every few seconds and a yfinance chain fetch
+    takes a second or two, so fetching inline would stall the live chart. A
+    failure is logged by `fetch_option_chain` and simply retried on the next
+    interval; the chart keeps drawing the last chain it had.
+
+    Nothing is fetched for the live app's replay of a past session (nor in
+    SimLab, which patches this out): today's chain over a past session's tape
+    would be a made-up read, so a replay reads only the net gamma the live
+    app kept that day.
+    """
+    if getattr(getattr(sym_state, "app", None), "replay", None) is not None:
+        return
+    sym = sym_state.symbol
+    now = time.monotonic()
+    with _fetch_lock:
+        if sym in _fetch_running or now - _fetch_tried.get(sym, -1e9) < OPTIONS_POLL_SEC:
+            return
+        _fetch_running.add(sym)
+        _fetch_tried[sym] = now
+
+    def fetch() -> None:
+        try:
+            with sym_state.lock:
+                spot = sym_state.last_price
+            data = fetch_options_walls_data(sym, spot=spot)
+        except Exception:
+            pass
+        else:
+            with sym_state.lock:
+                sym_state.options_chain = data
+        finally:
+            with _fetch_lock:
+                _fetch_running.discard(sym)
+
+    threading.Thread(target=fetch, name=f"option-walls-{sym}", daemon=True).start()

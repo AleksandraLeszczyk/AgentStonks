@@ -530,6 +530,23 @@ def _highlow_group_inputs(meta: dict) -> "list[str]":
     return out
 
 
+def _hybrid_consumers(key: str, ticker: str) -> "tuple[str, ...]":
+    """The hybrids on `ticker` that `key` is half of, as consumer lines: a
+    hybrid has no card of its own (`specs`), so its parts' cards name it."""
+    out = []
+    for hybrid in apple_models.MODELS.values():
+        if not hybrid.covers(ticker) or key not in (hybrid.signal_of, hybrid.levels_of):
+            continue
+        voter = apple_models.get(hybrid.levels_of).label.replace(" model", "")
+        out.append(
+            f"Apple Trader — {hybrid.label} (its buy level votes on GoodMoments' buys after 9:35)"
+            if key == hybrid.levels_of
+            else f"Apple Trader — {hybrid.label} (GoodMoments' rules, {voter} voting on buys "
+            "after 9:35)"
+        )
+    return tuple(out)
+
+
 def _highlow_spec(ticker: str) -> ModelSpec:
     path = _saved_path("APPLE_HIGHLOW_MODEL", "highlow15m_{ticker}.joblib", ticker)
     meta = _read_json(path.with_suffix(".json"))
@@ -576,7 +593,11 @@ def _highlow_spec(ticker: str) -> ModelSpec:
             + ", L1 loss, clipped to contain the observed 5-minute range"
         ),
         family="LightGBM + N-BEATS blend",
-        consumers=("Apple Trader — day-range strategy", "Chart overlay — predicted day range (HighLow)"),
+        consumers=(
+            ("Apple Trader — day-range strategy",)
+            + _hybrid_consumers(apple_models.HIGHLOW_KEY, ticker)
+            + ("Chart overlay — predicted day range (HighLow)",)
+        ),
         features=tuple(list(meta.get("features") or []) + list(meta.get("sequence_channels") or [])),
         inputs=(
             f"~127 sessions of SIP minute bars rolled up to daily (a "
@@ -715,11 +736,10 @@ def _highlow2_spec(ticker: str) -> ModelSpec:
         ),
         family="LightGBM (3 seeds)",
         consumers=(
-            "Apple Trader — day-range strategy",
-            "Apple Trader — HighLow2 + GoodMoments (its buy level votes on GoodMoments' buys "
-            "after 9:35)",
-            "Chart overlay — predicted range after 9:35 (HighLow2)" if rest
-            else "Chart overlay — predicted day range (HighLow2)",
+            ("Apple Trader — day-range strategy",)
+            + _hybrid_consumers(apple_models.HIGHLOW2_KEY, ticker)
+            + ("Chart overlay — predicted range after 9:35 (HighLow2)" if rest
+               else "Chart overlay — predicted day range (HighLow2)",)
         ),
         features=tuple(meta.get("features") or []),
         inputs=(
@@ -950,10 +970,9 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
         ),
         family="LightGBM classifier + time/vol twin",
         consumers=(
-            "Apple Trader — probability strategy (GoodMoments rules)",
-            "Apple Trader — HighLow2 + GoodMoments (GoodMoments' rules, HighLow2 voting on "
-            "buys after 9:35)",
-            "Chart overlay — GoodMoments edge and buy signals",
+            ("Apple Trader — probability strategy (GoodMoments rules)",)
+            + _hybrid_consumers(apple_models.GOODMOMENTS_KEY, ticker)
+            + ("Chart overlay — GoodMoments edge and buy signals",)
         ),
         features=tuple(meta.get("features") or []),
         inputs=(
@@ -986,9 +1005,179 @@ def _goodmoments_spec(ticker: str) -> ModelSpec:
     )
 
 
+def _highlow_chain_spec(ticker: str) -> ModelSpec:
+    """HighLow Chain: HighLow2's card is its own; this one describes the two
+    window models it hands the forecast to and how the three are strung."""
+    day = _saved_path("APPLE_HIGHLOW2_MODEL", "highlow2_5m_{ticker}.joblib", ticker)
+    one = _saved_path("APPLE_HIGHLOW_1H_MODEL", "highlow_1h_{ticker}.joblib", ticker)
+    four = _saved_path("APPLE_HIGHLOW_4H_MODEL", "highlow_4h_{ticker}.joblib", ticker)
+    files = (
+        ModelFile("HighLow2 bundle", day),
+        ModelFile("HighLow_1h bundle", one),
+        ModelFile("HighLow_1h metadata", one.with_suffix(".json")),
+        ModelFile("HighLow_4h bundle", four),
+        ModelFile("HighLow_4h metadata", four.with_suffix(".json")),
+    )
+    available, reason = _availability(files, "lightgbm", "joblib")
+    metas = {"1h": _read_json(one.with_suffix(".json")), "4h": _read_json(four.with_suffix(".json"))}
+    metrics: "dict[str, object]" = {}
+    for head, meta in metas.items():
+        for name, value in (meta.get("walk_forward") or {}).items():
+            metrics[f"{head} · {name}"] = value
+    holdout = {
+        head: (meta.get("walk_forward") or {}).get(f"2026 to 4 Sep (holdout) | HighLow_{head}")
+        for head, meta in metas.items()
+    }
+    features = tuple(dict.fromkeys(
+        f for meta in metas.values() for f in ((meta.get("recipe") or {}).get("features") or [])
+    ))
+    model = apple_models.get(apple_models.HIGHLOW_CHAIN_KEY)
+    return ModelSpec(
+        key=apple_models.HIGHLOW_CHAIN_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note=(
+            f"Each window model trained on {ticker} with "
+            f"{', '.join((metas['1h'].get('recipe') or {}).get('pool') or []) or 'five mega-caps'} "
+            "pooled in at half weight"
+        ),
+        project="HighLow2_5m + HighLow_1h + HighLow_4h, mirrors `highlow2`, `highlow1h`, `highlow4h`",
+        predicts=(
+            "Where the high and low will land, asked three times over: at 9:35 of the **whole "
+            "session** (HighLow2), and every five minutes of **what is left of a window** — from "
+            "10:30 to 13:25 of the bars until 13:30 (HighLow_1h), from 13:30 to 15:55 of the "
+            "bars until the close (HighLow_4h). Each window forecast replaces the last in Apple "
+            "Trader's day range, and the levels are rebuilt from it."
+        ),
+        target=(
+            "up = log(win_high / price) / scale, down = log(price / win_low) / scale, "
+            "scale = adr14 × √(minutes left / 390), price = the last print a basic plan sees "
+            "(SIP to 15 minutes back, IEX since); the 4h model's trees correct the median past "
+            "excursion at this minute"
+        ),
+        algorithm=(
+            "LightGBM, L1 loss weighted by the scale (the metric itself), three seeds averaged: "
+            "depth-2 trees on 28 features (1h), depth-3 on 50 (4h); HighLow2's day forecast "
+            "before 10:30"
+        ),
+        family="LightGBM chain (3 models)",
+        consumers=(
+            "Apple Trader — day-range strategy",
+            "Chart overlay — predicted range (HighLow Chain)",
+        ),
+        features=features,
+        inputs=(
+            "Per decision, today's tape as a basic plan sees it (SIP to 15 minutes back, IEX "
+            "since; the SIP pre-market for the 1h model's two-hour momentum before 11:31), the "
+            "SIP daily rollups of ~127 sessions, the minute tape of the last 60 (the median past "
+            "excursion at this minute, the 14-session volatility curve); for the 4h model, last "
+            "night's HighLow2_5m option table and on an FOMC day every FOMC afternoon since 2024"
+        ),
+        metrics=metrics,
+        headline=(
+            ("Holdout MAE 1h / 4h (log)", f"{holdout['1h']:.5f} / {holdout['4h']:.5f}")
+            if holdout["1h"] is not None and holdout["4h"] is not None else None
+        ),
+        files=files,
+        trained_at=str(metas["4h"].get("fit_through") or ""),
+        data_note=(
+            f"Both fitted through {metas['1h'].get('fit_through', '?')} "
+            f"({metas['1h'].get('training_sessions', '?')} / {metas['4h'].get('training_sessions', '?')} "
+            "sessions) · chosen on 2025 · held out 1 Jan – 4 Sep 2026 · tested 7–18 Sep 2026"
+        ),
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            "Each window model beats HighLow2 read for its window by about three quarters, and "
+            "the model-free median excursion by under 3%. The chain itself was never measured "
+            "as one, its three parts were fitted and scored apart, and both window notebooks' "
+            "own trading rules failed their holdouts. Its levels are the shared defaults until "
+            "a SimLab Tuning pick is made for it."
+        ),
+    )
+
+
+def _medianmove_spec(ticker: str) -> ModelSpec:
+    """MedianMove: nothing saved, so the card is the rule and the history it reads."""
+    rule = ModelFile("rule (nothing fitted)", Path(__file__).resolve().parent / "medianmove_model.py")
+    files = (
+        rule,
+        ModelFile(
+            "SIP history, shared with HighLow (fetched on first use)",
+            HIGHLOW_HISTORY_DIR / f"{ticker.upper()}_sip_sessions.json",
+        ),
+    )
+    # Only the rule has to be there: a missing history is fetched at 9:35.
+    available, reason = _availability((rule,), "torch")
+    if not available:
+        reason = f"{reason} (HighLow's module, whose history it reads, imports it)"
+    model = apple_models.get(apple_models.MEDIANMOVE_KEY)
+    return ModelSpec(
+        key=apple_models.MEDIANMOVE_KEY,
+        label=model.label,
+        summary=model.summary,
+        ticker=ticker,
+        ticker_note="",
+        project="none (the HighLow_1h / HighLow_4h notebooks' no-model forecast, asked at 9:35)",
+        predicts=(
+            "Where the **whole session's** high and low will land, said once at 9:35 with no "
+            "model: the 9:35 price plus the median of how far the last 60 sessions' highs "
+            "landed above their own 9:35 prices (and lows below), each in that session's "
+            "14-day average range, scaled by today's. The forecast every HighLow notebook "
+            "scores and trades its model against, so a replay of the two side by side is "
+            "the notebooks' comparison."
+        ),
+        target=(
+            "pred_high = max(close5 · exp(median₆₀(up) · adr14), high5), "
+            "pred_low = min(close5 · exp(−median₆₀(down) · adr14), low5); "
+            "up = log(high / close5) / adr14, down = log(close5 / low) / adr14 per past session"
+        ),
+        algorithm=(
+            "No fitted model: per-side median of HighLow's targets over the previous 60 "
+            "sessions (at least 20), decoded and clipped to the opening range as HighLow "
+            "decodes its predictions"
+        ),
+        family="Rule (median, no model)",
+        consumers=(
+            "Apple Trader — day-range strategy",
+            "Chart overlay — predicted day range (MedianMove)",
+        ),
+        features=("up", "down", "adr14", "close5", "high5", "low5"),
+        inputs=(
+            "HighLow's cached SIP session rollups (`data/highlow/`): each of the last 74 "
+            "sessions' high, low and 9:35 price, for 60 excursions and their 14-day ranges; "
+            "today's first five minutes from the caller's tape (MU: IEX, as HighLow)"
+        ),
+        metrics={},
+        headline=None,
+        files=files,
+        trained_at="",
+        data_note="Nothing fitted: re-read every morning from the 60 sessions before it",
+        versions={},
+        threshold=None,
+        requires=model.requires,
+        available=available,
+        unavailable_reason=reason,
+        caveat=(
+            "A baseline, not a forecast anyone claims is good: it knows the price and the "
+            "typical width of recent days, and nothing about today. HighLow_1h's and "
+            "HighLow_4h's models beat it by under 3% on their holdouts; at 9:35 the HighLow_5m "
+            "and HighLow2_5m notebooks scored a 14-day *mean* excursion instead, and it was "
+            "never measured at 9:35 in this form. Its levels are the shared defaults until a "
+            "SimLab Tuning pick is made for it."
+        ),
+    )
+
+
 _BUILDERS = {
     apple_models.HIGHLOW_KEY: _highlow_spec,
     apple_models.HIGHLOW2_KEY: _highlow2_spec,
+    apple_models.HIGHLOW_CHAIN_KEY: _highlow_chain_spec,
+    apple_models.MEDIANMOVE_KEY: _medianmove_spec,
     apple_models.FASTFURIOUS_KEY: _fastfurious_spec,
     apple_models.GOODMOMENTS_KEY: _goodmoments_spec,
     INTRADAY_VOL_KEY: _intraday_vol_spec,

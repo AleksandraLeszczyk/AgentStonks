@@ -3,7 +3,7 @@
 *Which* saved model the agent trades on is a choice, and this module is where
 that choice lives, so the trader, the loop, SimLab and the UI ask for "the model
 named X" and never branch on which one they got. Today there are four saved
-models, the first two of which share a rule set, and one hybrid of two of
+models, the first two of which share a rule set, and two hybrids of two of
 them:
 
 `highlow`            HighLow_5m's forecast of where the *whole session's* high
@@ -45,6 +45,22 @@ them:
                      `kind="goodmoments"` and the forecasts come from
                      `goodmoments_model` (NVDA's and MU's own features from
                      `goodmoments_context`).
+`highlow_chain`      HighLow Chain (2026-11-04): HighLow2's forecast at 9:35,
+                     then re-made every five minutes by the model whose hour it
+                     is -- HighLow_1h from 10:30 (the high and low from now to
+                     13:30) and HighLow_4h from 13:30 (from now to the close).
+                     The day-range rules, unchanged, hang off whichever is the
+                     latest. Its bundle carries `kind="highlow_chain"` and the
+                     forecasts come from `highlow_chain_model`.
+`medianmove`         MedianMove (2026-11-04): HighLow's question with no model
+                     in it -- the 9:35 price plus the median of HighLow's own
+                     targets over the last 60 sessions, the "no model" every
+                     HighLow notebook measures and trades its model against.
+                     The day-range rules, unchanged; nothing is fitted, so its
+                     "bundle" is the rule's settings (`kind="medianmove"`) and
+                     the forecast comes from `medianmove_model`, off HighLow's
+                     SIP history. A pair with no base of its own trades its
+                     HighLow model's (`AppleModel.rules_of`).
 `highlow2_goodmoments`
                      A hybrid of the two (2026-10-21): GoodMoments' rules,
                      the edge alone buying in the opening window, and from
@@ -53,6 +69,13 @@ them:
                      bundle is GoodMoments' with HighLow2's under
                      `HIGHLOW2_KEY`; `apple_trader.HighLow2GoodMomentsTrader`
                      trades it.
+`highlow_goodmoments`
+                     The same hybrid on HighLow (2026-11-05: AMD, then AAPL,
+                     NVDA and MU): from 09:35
+                     a GoodMoments buy also needs the close at or under
+                     HighLow's buy level. Its bundle is GoodMoments' with
+                     HighLow's under `HIGHLOW_KEY`;
+                     `apple_trader.HighLowGoodMomentsTrader` trades it.
 
 Every model that used to sit beside them has been removed -- most recently
 TimeToChange3's day-range forecast (`dayrange`, 2026-10-25), whose arithmetic
@@ -168,6 +191,25 @@ GOODMOMENTS_TICKERS = (DEFAULT_TICKER, "AMD", "NVDA", "MU")
 # HighLow2 + GoodMoments: wherever both are fitted.
 HIGHLOW2_GOODMOMENTS_TICKERS = tuple(t for t in GOODMOMENTS_TICKERS if t in HIGHLOW2_TICKERS)
 
+# HighLow + GoodMoments: wherever both are fitted -- AMD first (2026-11-05),
+# then AAPL, NVDA and MU the same day.
+HIGHLOW_GOODMOMENTS_TICKERS = tuple(t for t in GOODMOMENTS_TICKERS if t in HIGHLOW_TICKERS)
+
+# Which symbols HighLow Chain is wired up for: where HighLow2 and both window
+# models (`highlow_1h_<TICKER>.*`, saved 2026-11-02, and `highlow_4h_<TICKER>.*`,
+# 2026-11-04) are fitted -- AAPL only. Adding one is this tuple plus the two
+# window bundles in `Code/Models` -- `highlow_window_model._build_bundle`
+# refuses a bundle reading a feature it does not compute -- and, as the 4h
+# model reads the option table, the ticker's entry in
+# `highlow2_options.NOTEBOOK_OPTIONS`.
+HIGHLOW_CHAIN_TICKERS = (DEFAULT_TICKER,)
+
+# Which symbols MedianMove is offered on: every one a HighLow model trades, so
+# each has its no-model baseline. It is fitted on nothing and would run on any
+# symbol with ~150 sessions of SIP history; adding one is this tuple, and a
+# HighLow model on the symbol for its rules (`_medianmove_rules_of`).
+MEDIANMOVE_TICKERS = tuple(dict.fromkeys(HIGHLOW_TICKERS + HIGHLOW2_TICKERS + HIGHLOW_CHAIN_TICKERS))
+
 
 @dataclass(frozen=True)
 class AppleModel:
@@ -205,6 +247,12 @@ class AppleModel:
     # `levels_of`'s key. None for every model that is its own forecast.
     signal_of: "str | None" = None
     levels_of: "str | None" = None
+    # For a model tuned on nothing of its own: per symbol, the model whose
+    # rules a pair with no base configuration of its own trades -- its base,
+    # else its shipped tuning (`apple_trader.base_record`, `_tuned`) -- so the
+    # two differ only in the forecast. None for every model with rules of its
+    # own.
+    rules_of: "Callable[[str], str] | None" = None
 
     def covers(self, ticker: "str | None") -> bool:
         return (ticker or DEFAULT_TICKER).upper() in self.tickers
@@ -296,6 +344,62 @@ def _goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
     return goodmoments_model.unavailable_reason(ticker)
 
 
+def _load_highlow_chain(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """HighLow2's bundle and the two window models', imported late (LightGBM)."""
+    try:
+        from . import highlow_chain_model
+    except ImportError:
+        return None
+    return highlow_chain_model.load_bundle(ticker)
+
+
+def _highlow_chain_path(ticker: str = DEFAULT_TICKER) -> Path:
+    """The 4h model's file: the newest of the three, and the one a missing
+    window bundle most likely is. `chain_paths` lists all three."""
+    try:
+        from . import highlow_window_model
+    except ImportError:
+        return Path(f"highlow_4h_{(ticker or DEFAULT_TICKER).upper()}.joblib")
+    return highlow_window_model.model_path(ticker, "4h")
+
+
+def _highlow_chain_unavailable(ticker: str = DEFAULT_TICKER) -> str:
+    """Which of the three models is missing, by name."""
+    try:
+        from . import highlow_chain_model
+    except ImportError:
+        return "HighLow Chain needs LightGBM and joblib, which are not installed."
+    return highlow_chain_model.unavailable_reason(ticker)
+
+
+def _load_medianmove(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """MedianMove's settings for one ticker -- there is no saved model --
+    imported late: the history it reads is `highlow_model`'s (torch)."""
+    try:
+        from . import medianmove_model
+    except ImportError:
+        return None
+    return medianmove_model.load_bundle(ticker)
+
+
+def _medianmove_path(ticker: str = DEFAULT_TICKER) -> Path:
+    """The rule's own source file, which is what a replay of it was made from."""
+    return Path(__file__).resolve().parent / "medianmove_model.py"
+
+
+def _medianmove_unavailable(ticker: str = DEFAULT_TICKER) -> str:
+    return (
+        "MedianMove fits nothing, but reads the SIP history HighLow keeps, and HighLow's "
+        "module (PyTorch, LightGBM, joblib) cannot be imported."
+    )
+
+
+def _medianmove_rules_of(ticker: str = DEFAULT_TICKER) -> str:
+    """The HighLow model whose rules MedianMove trades on this symbol: HighLow
+    where it is fitted, else HighLow2 (GOOG)."""
+    return HIGHLOW_KEY if (ticker or DEFAULT_TICKER).upper() in HIGHLOW_TICKERS else HIGHLOW2_KEY
+
+
 def _load_highlow2_goodmoments(ticker: str = DEFAULT_TICKER) -> "dict | None":
     """GoodMoments' bundle with HighLow2's beside it under `HIGHLOW2_KEY`, or
     None when either cannot be assembled. GoodMoments' own keys are left as
@@ -318,11 +422,34 @@ def _highlow2_goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
     return " ".join(missing) or "Both halves loaded; try again."
 
 
+def _load_highlow_goodmoments(ticker: str = DEFAULT_TICKER) -> "dict | None":
+    """GoodMoments' bundle with HighLow's beside it under `HIGHLOW_KEY`, as
+    `_load_highlow2_goodmoments` assembles HighLow2's."""
+    goodmoments = _load_goodmoments(ticker)
+    highlow = _load_highlow(ticker)
+    if goodmoments is None or highlow is None:
+        return None
+    return {**goodmoments, HIGHLOW_KEY: highlow}
+
+
+def _highlow_goodmoments_unavailable(ticker: str = DEFAULT_TICKER) -> str:
+    """Which half of the hybrid is missing, in that model's own words."""
+    missing = [
+        unavailable_reason(key, ticker)
+        for key, load_part in ((GOODMOMENTS_KEY, _load_goodmoments), (HIGHLOW_KEY, _load_highlow))
+        if load_part(ticker) is None
+    ]
+    return " ".join(missing) or "Both halves loaded; try again."
+
+
 HIGHLOW_KEY = "highlow"
 HIGHLOW2_KEY = "highlow2"
 FASTFURIOUS_KEY = "fastfurious"
 GOODMOMENTS_KEY = "goodmoments"
+HIGHLOW_CHAIN_KEY = "highlow_chain"
+MEDIANMOVE_KEY = "medianmove"
 HIGHLOW2_GOODMOMENTS_KEY = "highlow2_goodmoments"
+HIGHLOW_GOODMOMENTS_KEY = "highlow_goodmoments"
 
 MODELS: "dict[str, AppleModel]" = {
     HIGHLOW_KEY: AppleModel(
@@ -387,6 +514,64 @@ MODELS: "dict[str, AppleModel]" = {
         tickers=HIGHLOW2_TICKERS,
         load=_load_highlow2,
         path=_highlow2_path,
+    ),
+    HIGHLOW_CHAIN_KEY: AppleModel(
+        key=HIGHLOW_CHAIN_KEY,
+        label="HighLow Chain",
+        summary=(
+            "Three FinNotebooks forecasts of where the high and low will land, each used for "
+            "the stretch of the day it was fitted on: HighLow2_5m's of the whole session at "
+            "9:35; from 10:30, HighLow_1h's of the high and low from now to 13:30, made again "
+            "every five minutes; from 13:30, HighLow_4h's from now to the close, every five "
+            "minutes. The window models read the session as a basic plan shows it (SIP to 15 "
+            "minutes back, IEX since) -- today's volatility against the same minutes of recent "
+            "sessions, the range so far, momentum, the median past excursion at this minute, "
+            "and for the afternoon last night's option walls and implied moves and past FOMC "
+            "afternoons. On their 2026 holdouts each beats HighLow2 read for its window by "
+            "three quarters ($0.63 against $2.41 per extreme at 1h, $0.63 against $2.49 at 4h) "
+            "and the model-free median excursion by under 3%. Only the forecast changes: the "
+            "levels, exits and breach rules are the day-range strategy's, hung off the latest "
+            "forecast. Never measured as a chain, and its levels are untuned."
+        ),
+        requires=(
+            "LightGBM and joblib, HighLow2's bundle and both window models', Alpaca credentials "
+            "for ~150 sessions of SIP and IEX minute history (extended hours for HighLow2) and "
+            "today's live bars, the shared option cache (the contract list and daily option "
+            "bars, Yahoo's ^IRX) and, on an FOMC day, the SIP tape of every FOMC session since "
+            "2024"
+        ),
+        strategy=STRATEGY_DAYRANGE,
+        tickers=HIGHLOW_CHAIN_TICKERS,
+        load=_load_highlow_chain,
+        path=_highlow_chain_path,
+        unavailable=_highlow_chain_unavailable,
+    ),
+    MEDIANMOVE_KEY: AppleModel(
+        key=MEDIANMOVE_KEY,
+        label="MedianMove",
+        summary=(
+            "No model: the baseline the HighLow notebooks measure and trade their models "
+            "against. At 9:35, the session's high and low are the 9:35 price plus the median "
+            "move of the last 60 sessions -- how far each session's high landed above its own "
+            "9:35 price and its low below, in that session's 14-day average range -- scaled by "
+            "today's 14-day range and clipped to contain the first five minutes, as HighLow "
+            "decodes its forecast. HighLow's question with the model taken out, so replaying "
+            "the two side by side measures what the model adds. Only the forecast changes: it "
+            "trades the day-range strategy as HighLow is set up on the instrument (HighLow2 on "
+            "GOOG) -- its base configuration, the levels, exits, breach rule and days off -- "
+            "until a SimLab Tuning pick is set for MedianMove itself."
+        ),
+        requires=(
+            "nothing fitted -- HighLow's module (PyTorch, LightGBM, joblib), whose SIP history "
+            "it reads, and Alpaca credentials for ~150 sessions of SIP minute history (on MU, "
+            "IEX openings too)"
+        ),
+        strategy=STRATEGY_DAYRANGE,
+        tickers=MEDIANMOVE_TICKERS,
+        load=_load_medianmove,
+        path=_medianmove_path,
+        unavailable=_medianmove_unavailable,
+        rules_of=_medianmove_rules_of,
     ),
     FASTFURIOUS_KEY: AppleModel(
         key=FASTFURIOUS_KEY,
@@ -497,6 +682,36 @@ MODELS: "dict[str, AppleModel]" = {
         signal_of=GOODMOMENTS_KEY,
         levels_of=HIGHLOW2_KEY,
     ),
+    HIGHLOW_GOODMOMENTS_KEY: AppleModel(
+        key=HIGHLOW_GOODMOMENTS_KEY,
+        label="HighLow + GoodMoments",
+        summary=(
+            "GoodMoments' rules with HighLow as a second vote on every buy after the opening "
+            "window -- HighLow2 + GoodMoments' design on HighLow. In the session's first five "
+            "minutes, the bars HighLow's forecast is made from, a buy is GoodMoments' alone: "
+            "its edge over the time-and-volatility model at the entry threshold. From the 09:35 "
+            "bar on a buy needs both: the edge, and the bar's close at or under the buy level "
+            "HighLow's day-range rules would rest under its predicted high, moved with that "
+            "forecast whenever the session trades outside it. Every exit is GoodMoments': the "
+            "take and the stop in ADRs from the fill, the pause after a stop, the optional sale "
+            "on a fading edge, the closing flatten. Never measured as a pair: each model's own "
+            "record is in its card."
+        ),
+        requires=(
+            "everything GoodMoments needs (LightGBM, SciPy, both its saved files, ~130 days of "
+            "Alpaca SIP and IEX minute bars, the option cache, Yahoo's analyst targets) and "
+            "everything HighLow needs (PyTorch, its bundle, ~220 days of SIP minute history for "
+            "the ticker and, where its HighLow reads them, SPY, its peers and the pre-market; "
+            "MU's opening from IEX)"
+        ),
+        strategy=STRATEGY_PROBABILITY,
+        tickers=HIGHLOW_GOODMOMENTS_TICKERS,
+        load=_load_highlow_goodmoments,
+        path=_goodmoments_path,
+        unavailable=_highlow_goodmoments_unavailable,
+        signal_of=GOODMOMENTS_KEY,
+        levels_of=HIGHLOW_KEY,
+    ),
 }
 
 DEFAULT_MODEL = APPLE_TRADER_MODEL if APPLE_TRADER_MODEL in MODELS else HIGHLOW_KEY
@@ -586,6 +801,29 @@ def strategy(key: "str | None") -> str:
     return get(key).strategy
 
 
+def bundle_files(key: "str | None", ticker: "str | None" = None) -> "list[Path]":
+    """Every saved file the named model's forecast reads for one symbol -- its
+    bundle with the sidecars sharing its stem, for HighLow Chain all three
+    models' and for a hybrid its levels model's too -- for a caller that
+    fingerprints them (SimLab's tuning)."""
+    symbol = (ticker or DEFAULT_TICKER).upper()
+    model = get(key)
+    stems = [model.path(symbol)]
+    if model.levels_of is not None:
+        stems.append(get(model.levels_of).path(symbol))
+    if model.key == HIGHLOW_CHAIN_KEY:
+        try:
+            from . import highlow_chain_model
+
+            stems = highlow_chain_model.paths(symbol)
+        except ImportError:
+            pass
+    out: "list[Path]" = []
+    for stem in stems:
+        out.extend(sorted(stem.parent.glob(f"{stem.stem}*")))
+    return out
+
+
 def levels_of(key: "str | None") -> "str | None":
     """The day-range model whose buy level the named hybrid's entries also
     need (`AppleModel.levels_of`), or None for a model that is its own
@@ -597,6 +835,14 @@ def signal_of(key: "str | None") -> "str | None":
     """The model whose signal and exits the named hybrid trades
     (`AppleModel.signal_of`), or None for a model that is its own forecast."""
     return get(key).signal_of
+
+
+def rules_of(key: "str | None", ticker: "str | None" = None) -> "str | None":
+    """The model whose rules the named one trades on this symbol until it has
+    a base of its own (`AppleModel.rules_of`), or None for a model with rules
+    of its own."""
+    model = get(key)
+    return model.rules_of((ticker or DEFAULT_TICKER).upper()) if model.rules_of else None
 
 
 def keys_for_strategy(ticker: "str | None", rule_set: str) -> "list[str]":

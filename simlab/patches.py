@@ -33,6 +33,9 @@ duration of a simulation:
   the Orchestra selection's copy), and only the briefing verdicts the live app
   recorded before 09:35 on the replayed day -- what a run that morning could
   have read; the calendar itself is a file and needs no patch
+- ``gamma_history.refresh_chain`` (Apple Trader's negative-gamma rule keeps
+  today's options chain fresh) -> nothing: there is no chain of a past day,
+  so the rule reads only the net gamma the live app kept for each bar
 - ``momentum_regime.minute_frame`` (not a fetch: a faster route to the same
   answer) -> today's frame sliced out of one frame per replayed day, instead
   of rebuilt from the bar buffer on every cycle. Same rows; it is what makes a
@@ -83,7 +86,7 @@ import numpy as np
 import pandas as pd
 
 from agent_stonks import agent as agent_mod
-from agent_stonks import clock, event_days, historical, momentum_regime
+from agent_stonks import clock, event_days, gamma_history, historical, momentum_regime
 from agent_stonks.market_hours import MARKET_TZ
 
 from .market import BAR_SEC, SimMarket
@@ -233,10 +236,14 @@ def patch_table(market: SimMarket, original=getattr) -> "list[tuple[object, str,
     def verdict_before_the_open(symbol, day):
         return event_days.recorded_verdict(symbol, day, before_cutoff=True)
 
+    def no_chain_refresh(sym_state):
+        return None
+
     patches = [
         (momentum_regime, "minute_frame", fast_minute_frame),
         (event_days, "fetch_earnings_stamps", kept_earnings_stamps),
         (event_days, "briefing_verdict", verdict_before_the_open),
+        (gamma_history, "refresh_chain", no_chain_refresh),
         (agent_mod, "fetch_bars_window", fake_bars_window),
         (agent_mod, "fetch_corporate_actions", fake_corporate_actions),
         (historical, "fetch_market_indicators", fake_market_indicators),

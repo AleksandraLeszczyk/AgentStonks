@@ -262,6 +262,10 @@ _APPLE_LEGACY = {
     # or a shock (before 2026-10-04). Empty is that rule, and it is left out of
     # the signature.
     "skip_events": (),
+    # And no buy was refused for a falling day with negative net gamma (before
+    # 2026-11-05). False is that rule, also today's default, kept here so it
+    # means the same if the default moves; it is left out of the signature.
+    "no_buy_down_negative_gamma": False,
     # And GoodMoments' take was one distance all day, whatever the time of
     # day's volatility (before 2026-10-21). None is that rule, also today's
     # default, kept here so it means the same if the default moves; a flat take

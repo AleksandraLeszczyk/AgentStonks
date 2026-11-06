@@ -176,3 +176,41 @@ class TestOnlyTheLatestDay:
         gamma_history.series("AAPL", "1Min", history, CHAIN_A, now=at(1, 30))
         other = gamma_history.series("MSFT", "1Min", history, CHAIN_B, now=at(1, 40))
         assert other["value"][0] == pytest.approx(priced(100.0, CHAIN_B))
+
+
+class TestAtClose:
+    """One bar's value for Apple Trader's negative-gamma rule: the panel's,
+    kept once, and in a replay only what the live app kept."""
+
+    def test_priced_once_at_the_close_and_kept(self):
+        t = bars([100.0])[0]["t"]
+        first = gamma_history.at_close("AAPL", "1Min", t, 100.0, CHAIN_A)
+        assert first == pytest.approx(priced(100.0, CHAIN_A))
+        # A newer chain does not move it, and it is on disk for a restart.
+        assert gamma_history.at_close("AAPL", "1Min", t, 100.0, CHAIN_B) == first
+        path = gamma_history.kept_path("AAPL", "1Min", "2026-10-01")
+        assert json.loads(path.read_text()) == {pd.Timestamp(t).isoformat(): first}
+
+    def test_a_replay_reads_what_was_kept_and_nothing_else(self, monkeypatch):
+        history = bars([100.0, 101.0])
+        gamma_history.series("AAPL", "1Min", history, CHAIN_A, now=at(2))
+        monkeypatch.setattr(gamma_history, "_kept", {})
+        kept = gamma_history.at_close("AAPL", "1Min", history[0]["t"], 100.0, None)
+        assert kept == pytest.approx(priced(100.0, CHAIN_A))
+        assert gamma_history.at_close("AAPL", "1Min", at(5), 99.0, None) is None
+
+    def test_the_panel_draws_the_value_the_rule_took(self):
+        history = bars([100.0, 101.0])
+        taken = gamma_history.at_close("AAPL", "1Min", history[0]["t"], 100.0, CHAIN_A)
+        drawn = gamma_history.series("AAPL", "1Min", history, CHAIN_B, now=at(2))
+        assert value(drawn, history[0]["t"]) == taken
+
+    def test_a_replays_state_fetches_no_chain(self, monkeypatch):
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            gamma_history, "fetch_options_walls_data",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched")),
+        )
+        sym_state = SimpleNamespace(symbol="AAPL", app=SimpleNamespace(replay=object()))
+        gamma_history.refresh_chain(sym_state)

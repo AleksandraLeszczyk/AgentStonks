@@ -3247,12 +3247,18 @@ class TestInstrument:
     def test_the_symbols_on_offer_are_the_ones_a_model_covers(self):
         # HighLow_5m has been run on AAPL and INTC among others; HighLow2_5m
         # (its INTC bundle removed 2026-10-20) and Fast&Furious on AAPL alone,
-        # GoodMoments on AAPL and AMD, and their hybrid where both are.
+        # GoodMoments on AAPL and AMD, and their hybrid where both are;
+        # HighLow Chain where HighLow2 and both window models are (AAPL);
+        # MedianMove, which fits nothing, wherever a HighLow model trades;
+        # HighLow + GoodMoments wherever HighLow and GoodMoments both are.
         assert apple_models.keys_for(TICKER) == [
-            "highlow", "highlow2", "fastfurious", "goodmoments", "highlow2_goodmoments",
+            "highlow", "highlow2", "highlow_chain", "medianmove", "fastfurious",
+            "goodmoments", "highlow2_goodmoments", "highlow_goodmoments",
         ]
-        assert apple_models.keys_for(NON_AAPL) == ["highlow"]
-        assert apple_models.keys_for("AMD") == ["highlow", "goodmoments"]
+        assert apple_models.keys_for(NON_AAPL) == ["highlow", "medianmove"]
+        assert apple_models.keys_for("AMD") == [
+            "highlow", "medianmove", "goodmoments", "highlow_goodmoments",
+        ]
         assert apple_models.keys_for(UNMODELLED) == []
 
     def test_a_model_cannot_be_pointed_at_a_symbol_it_was_not_fitted_on(
@@ -5498,3 +5504,183 @@ class TestTimeLimit:
         assert "a time limit: 45 min after the first buy" in summary
         rows = at.config_settings(config)
         assert ("Exits", "Time limit", "after 45 min, sell on the first bar above the fill") in rows
+
+
+def gamma_chain(calls_oi: float, puts_oi: float) -> dict:
+    """An options chain whose net gamma is the sign of `calls_oi - puts_oi`
+    at any price near 100."""
+    return {
+        "strikes": [95.0, 100.0, 105.0],
+        "calls_oi": [calls_oi] * 3, "puts_oi": [puts_oi] * 3,
+        "calls_iv": [0.3] * 3, "puts_iv": [0.3] * 3, "t_years": 10 / 365,
+    }
+
+
+NEGATIVE_GAMMA = gamma_chain(0.0, 1000.0)
+POSITIVE_GAMMA = gamma_chain(1000.0, 0.0)
+
+
+class TestDownNegativeGamma:
+    """No buy on a falling, negative-gamma day (2026-11-05, the user's
+    request): the bar's close under the session's open (the tape's first bar,
+    $101.00) and net gamma at that close negative -- both, the user's choice. A
+    net gamma not known lets the buy through."""
+
+    def _setup(self, state, monkeypatch, chain=None, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        self.refreshed = []
+        monkeypatch.setattr(at.gamma_history, "refresh_chain", self.refreshed.append)
+        state.sym(TICKER).options_chain = chain
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        return trader, tracker, tape
+
+    @staticmethod
+    def _refusals(state):
+        return [
+            e["text"] for e in state.agent_log
+            if "net gamma is negative" in (e.get("text") or "")
+        ]
+
+    def test_off_by_default_and_signed_only_while_on(self):
+        config = AppleTraderConfig()
+        assert config.no_buy_down_negative_gamma is False
+        assert "nobuy" not in config_signature(config)
+        on = config_signature(replace(config, no_buy_down_negative_gamma=True))
+        assert ",nobuy=day<0&gamma<0" in on and on.index(",nobuy=") > on.index(",size=")
+
+    def test_a_down_day_with_negative_gamma_buys_nothing(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, NEGATIVE_GAMMA, no_buy_down_negative_gamma=True,
+        )
+        tape.append(100.8, low=100.7)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        [refused] = self._refusals(state)
+        assert "the day is down (-0.20% from the $101.00 open)" in refused
+        assert "Not buying yet; the next bar is judged again." in refused
+        # Back over the open, the same chain: the day is not down, so it buys.
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_either_one_positive_lets_the_buy_through(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, POSITIVE_GAMMA, no_buy_down_negative_gamma=True,
+        )
+        tape.append(100.8, low=100.7)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert self._refusals(state) == []
+
+    def test_off_it_buys_the_same_bar(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, NEGATIVE_GAMMA)
+        tape.append(100.8, low=100.7)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        # Nor is a chain kept fresh for a rule that is off.
+        assert self.refreshed == []
+
+    def test_no_gamma_known_lets_the_buy_through_and_says_so_once(
+        self, state, market_open, monkeypatch,
+    ):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, None, no_buy_down_negative_gamma=True,
+            scale_in=True, position_pct=50.0, buy_step_k=0.1,
+        )
+        tape.append(100.8, low=100.7)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        tape.append(99.9, low=99.8)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        unknown = [e for e in state.agent_log if "net gamma is not known" in (e.get("text") or "")]
+        assert len(unknown) == 1
+        # The chain is asked for every cycle while the rule is on.
+        assert len(self.refreshed) == 2
+
+    def test_the_kept_value_decides_a_replay(self, state, market_open, monkeypatch):
+        # No chain, as in a replay: the value the live app kept for the bar.
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, None, no_buy_down_negative_gamma=True,
+        )
+        tape.append(100.8, low=100.7)
+        at.gamma_history.at_close(TICKER, "1Min", tape.index[-1], 100.8, NEGATIVE_GAMMA)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert len(self._refusals(state)) == 1
+
+    def test_an_add_is_refused_too(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, NEGATIVE_GAMMA, no_buy_down_negative_gamma=True,
+            scale_in=True, position_pct=50.0, buy_step_k=0.1,
+        )
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        first = tracker.position_for(TICKER)
+        tape.append(100.8, low=100.7)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == first
+        assert len(self._refusals(state)) == 1
+
+    def test_after_the_momentum_confirmation(self, state, market_open, monkeypatch):
+        # The table reads a buy (a rising tape), and the rule still refuses.
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, NEGATIVE_GAMMA, no_buy_down_negative_gamma=True,
+            momentum_confirmation_bars=1, negative_momentum_bars=0, take_fraction=0.7,
+        )
+        trader.minute_move = None
+        monkeypatch.setattr(
+            at, "momentum_read",
+            lambda *a, **k: {"row": types.SimpleNamespace(buy=True), "mom": 0.1,
+                             "mom_class": "positive", "change": 0.0, "change_class": "neutral"},
+        )
+        tape.append(100.8, low=100.7)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert len(self._refusals(state)) == 1
+
+    def test_announced(self):
+        config = dayrange_config(no_buy_down_negative_gamma=True)
+        summary = at._armed_summary(config, at.apple_models.get(config.model_key), DAYRANGE_BUNDLE)
+        assert "No buy while the price is under the session's open and net gamma" in summary
+        assert ("Days off", at.DOWN_GAMMA_LABEL, "yes") in at.config_settings(config)
+        assert ("Days off", at.DOWN_GAMMA_LABEL, "no") in at.config_settings(dayrange_config())
+
+
+def _down_gamma_form() -> None:
+    import streamlit as st
+
+    from agent_stonks import apple_trader_ui
+
+    copy = apple_trader_ui.FormCopy(
+        prefix="t", unavailable_suffix="", instrument_help="", model_help=""
+    )
+    st.session_state["out"] = apple_trader_ui.params(["AAPL"], copy)
+
+
+class TestDownNegativeGammaForm:
+    """The box under the days off, in the form both apps render: the day-range
+    rules and GoodMoments write it, Fast&Furious has none."""
+
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        monkeypatch.setattr(apple_models, "load", lambda *a, **k: {"model": "stub"})
+        app = AppTest.from_function(_down_gamma_form, default_timeout=30)
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    @staticmethod
+    def _box(app):
+        return [c for c in app.checkbox if c.label == at.DOWN_GAMMA_LABEL]
+
+    @pytest.mark.parametrize("model_key", ["highlow", apple_models.GOODMOMENTS_KEY])
+    def test_off_and_ticked_it_is_on(self, app, model_key):
+        app.selectbox(key="t_model_AAPL").select(model_key).run()
+        [box] = self._box(app)
+        assert box.value is False and app.session_state["out"].no_buy_down_negative_gamma is False
+        box.check().run()
+        assert not app.exception, app.exception
+        assert app.session_state["out"].no_buy_down_negative_gamma is True
+
+    def test_fast_and_furious_has_no_box(self, app):
+        app.selectbox(key="t_model_AAPL").select(apple_models.FASTFURIOUS_KEY).run()
+        assert not app.exception, app.exception
+        assert self._box(app) == []

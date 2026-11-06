@@ -1506,49 +1506,9 @@ def _live_prior_profile(sym_state: SymbolState, bars: "list[dict]", parts: "list
     }
 
 
-# Symbols whose options chain is being fetched for the live chart right now,
-# and when each was last tried -- see `_live_option_walls`.
-_option_fetch_lock = threading.Lock()
-_option_fetch_running: set[str] = set()
-_option_fetch_tried: dict[str, float] = {}
-
-
-def _refresh_option_chain(sym_state: SymbolState) -> None:
-    """Refresh `sym_state.options_chain` in a background thread, at most once
-    per OPTIONS_POLL_SEC per symbol.
-
-    The chart fragment re-runs every few seconds and a yfinance chain fetch
-    takes a second or two, so fetching inline would stall the live chart. A
-    failure is logged by `fetch_option_chain` and simply retried on the next
-    interval; the chart keeps drawing the last chain it had.
-    """
-    if replay.is_replay(sym_state.app):
-        # Today's chain over a past session's tape would be a made-up read; a
-        # replay draws only the net gamma the live app kept that day.
-        return
-    sym = sym_state.symbol
-    now = time.monotonic()
-    with _option_fetch_lock:
-        if sym in _option_fetch_running or now - _option_fetch_tried.get(sym, -1e9) < OPTIONS_POLL_SEC:
-            return
-        _option_fetch_running.add(sym)
-        _option_fetch_tried[sym] = now
-
-    def fetch() -> None:
-        try:
-            with sym_state.lock:
-                spot = sym_state.last_price
-            data = fetch_options_walls_data(sym, spot=spot)
-        except Exception:
-            pass
-        else:
-            with sym_state.lock:
-                sym_state.options_chain = data
-        finally:
-            with _option_fetch_lock:
-                _option_fetch_running.discard(sym)
-
-    threading.Thread(target=fetch, name=f"option-walls-{sym}", daemon=True).start()
+# The background chain refresh lives with the net gamma it prices, so Apple
+# Trader's negative-gamma rule can keep the chain fresh with no page open.
+_refresh_option_chain = gamma_history.refresh_chain
 
 
 def _live_option_walls(sym_state: SymbolState, keys: "list[str]") -> "dict | None":
@@ -3377,7 +3337,9 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         "dayrange_skip": (
             "Sessions the agent does not trade at all: no forecast, no order. The forecast "
             "is built for an ordinary day, and on these the news sets the range — "
-            "HighLow2 was fitted with most of them left out."
+            "HighLow2 was fitted with most of them left out.\n\n"
+            "The box under them holds back buys within any session instead: while the day "
+            "is down and net gamma is negative."
         ),
         "dayrange_breaker": (
             "When to stop buying for the day. Two things end it:\n\n"
@@ -3423,11 +3385,11 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
         ),
         "hybrid_levels": (
             "The second vote. From 09:35 a GoodMoments buy also needs the bar to close at or "
-            "under the buy level HighLow2's rules would rest — this far under its predicted "
-            "high. Before 09:35 HighLow2 has no forecast yet, and the edge alone buys.\n\n"
-            "- It only votes: HighLow2's sell, stop, take and breaker do not apply — every "
+            "under the buy level {model}'s rules would rest — this far under its predicted "
+            "high. Before 09:35 {model} has no forecast yet, and the edge alone buys.\n\n"
+            "- It only votes: {model}'s sell, stop, take and breaker do not apply — every "
             "exit is GoodMoments'.\n"
-            "- The level moves through a breach under the rule below, as a HighLow2 run's "
+            "- The level moves through a breach under the rule below, as a {model} run's "
             "would."
         ),
     },
@@ -3454,6 +3416,21 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- With no base configuration of its own it opens on GoodMoments' settings and "
             "HighLow2's buy distance. If HighLow2 cannot forecast the day, nothing is bought "
             "after 09:35."
+        ),
+        "model_highlow_goodmoments": (
+            "HighLow2 + GoodMoments' design with HighLow voting: GoodMoments' rules, HighLow "
+            "as a second vote on every buy after the opening window.\n\n"
+            "- **09:30–09:34**: a buy on GoodMoments' edge alone (HighLow's forecast is made "
+            "from these bars).\n"
+            "- **From 09:35**: a buy needs the edge *and* the bar's close at or under HighLow's "
+            "buy level.\n"
+            "- **Selling** is GoodMoments' throughout: take, stop (then 15 minutes without "
+            "entries), the optional sale on a fading edge and momentum hold, the closing "
+            "flatten.\n"
+            "- With no base configuration of its own it opens on GoodMoments' settings and "
+            "HighLow's buy distance, unit and breach rule. If HighLow cannot forecast the day, "
+            "nothing is bought after 09:35. A restart the same day votes with the forecast the "
+            "earlier run made at 9:35, not a new one."
         ),
         "model_fastfurious": (
             "A different strategy from the range models: no levels, a signal every minute.\n\n"
@@ -3638,6 +3615,39 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "extended hours included: the first run fetches it (tens of seconds) and "
             "caches it under `data/highlow2/`."
         ),
+        "model_highlow_chain": (
+            "The day-range rules, unchanged, on a forecast that is made again through the "
+            "day.\n\n"
+            "- At 9:35 it is HighLow2's (see that model). From 10:30, at every fifth minute, "
+            "HighLow_1h forecasts the high and low **from then to 13:30**; from 13:30, "
+            "HighLow_4h **from then to the close**. Each replaces the last, and the buy and "
+            "sell levels are rebuilt from it; between them the breach rules move it as usual.\n"
+            "- A window forecast is narrower than a day's — at 13:25 it covers five minutes — "
+            "so the levels under it close in on the price as its window runs out.\n"
+            "- Its distances were never swept: they start from the shared defaults. Sweep "
+            "them on SimLab's Tuning tab before trusting a number.\n"
+            "- From 10:30 it reads the session as a basic plan shows it (SIP to 15 minutes "
+            "back, IEX since) from Alpaca every five minutes, and for the afternoon last "
+            "night's option table and, on an FOMC day, every FOMC session since 2024 (fetched "
+            "once and cached under `data/highlow_window/`). These are warmed in the background "
+            "at 9:35.\n"
+            "- On a 13:00 half day there are no window forecasts: HighLow2's stands all day."
+        ),
+        "model_medianmove": (
+            "The day-range rules, unchanged, on no model at all — the baseline the HighLow "
+            "models are measured against.\n\n"
+            "- At 9:35 the predicted high is the 9:35 price plus the **median** move up of the "
+            "last 60 sessions (each session's high over its own 9:35 price, in its 14-day "
+            "range), the low that price less the median move down — scaled by today's 14-day "
+            "range and widened where needed to the first five minutes' high and low.\n"
+            "- Run it on the same instrument and days as a HighLow model to see what the "
+            "model adds.\n"
+            "- Its distances were never swept: they start from the shared defaults. Sweep "
+            "them on SimLab's Tuning tab, as the notebooks tune every baseline's rule on its "
+            "own.\n"
+            "- It reads HighLow's SIP history, cached under `data/highlow/` (the first run "
+            "fetches it, tens of seconds) — on MU, IEX openings, as HighLow does."
+        ),
         "buy_k": (
             "How far under the predicted high the entry rests.\n\n"
             "- {ticker} starts at **{buy_k}** on this model — the most profitable cell of "
@@ -3820,6 +3830,17 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "- Whole shares, rounded down, and at least one.\n"
             "- **0** switches the momentum fade off, and the forming-zone exit with it."
         ),
+        "no_buy_down_negative_gamma": (
+            "No buy — the first or one lower down — on a bar that closes under the session's "
+            "open while net gamma at that close is negative too: the quote's **Momentum (day)** "
+            "and **Net Gamma** cards both red. Dealers short gamma sell into a fall rather "
+            "than buy it.\n\n"
+            "- Either one positive lets the buy through; each bar is judged again.\n"
+            "- Net gamma is the chart panel's value for that bar: the nearest expiry's options "
+            "chain (yfinance) priced at the bar's close. Until the first chain arrives the buy "
+            "is not stopped, and the log says so once.\n"
+            "- Sells are never held back."
+        ),
         "time_limit_minutes": (
             "A position still open this many minutes after the first buy — the sell level "
             "(on GoodMoments, the take) not reached — is sold on the first bar that closes "
@@ -3926,21 +3947,24 @@ _ORCHESTRA_COPY = dc_replace(
             "starting from its base configuration: SimLab's tuning picks it per pair.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
             "- Everything below the tables is shared by every day-range pair — the "
-            "circuit breaker too; the position size, the time limit and the days off by "
-            "every pair."
+            "circuit breaker too; the position size, the time limit, the days off and the "
+            "negative-gamma rule by every pair."
         ),
         "signal_pairs": (
-            "The GoodMoments pairs — GoodMoments, and HighLow2 + GoodMoments — read their "
+            "The GoodMoments pairs — GoodMoments, HighLow2 + GoodMoments and HighLow + "
+            "GoodMoments — read their "
             "edge at the close of every bar and buy at the market when it is at the entry.\n\n"
             "- **Entry / Take / Stop / Confirm** — each pair's own, starting from its base "
             "configuration (or the shipped defaults). Confirm is the momentum confirmation "
             "period in bars, 0 = off.\n"
-            "- **HighLow2 buy** (the hybrid only) — after the opening window a buy also needs "
-            "the close at or under HighLow2's buy level, this × its unit under the predicted high.\n"
+            "- **HighLow2 buy / HighLow buy** (the hybrids only) — after the opening window a "
+            "buy also needs the close at or under the voting model's buy level, this × its unit "
+            "under the predicted high.\n"
             "- **Budget %** (Split only) — the pair's share of the budget.\n"
             "- Everything else — the take's fall with volatility, the sale on a fading edge, "
             "the circuit breaker — is the pair's own configuration. "
-            "The position size, the time limit and the days off below are Orchestra's.\n"
+            "The position size, the time limit, the days off and the negative-gamma rule "
+            "below are Orchestra's.\n"
             "- A stop pauses only that pair's buys for 15 bars; it does not stop the agent.\n"
             "- Read once, at ▶ Start."
         ),
@@ -3969,7 +3993,7 @@ _ORCHESTRA_COPY = dc_replace(
         "pairs": (
             "The (ticker, model) pairs Orchestra watches — AAPL on HighLow and AAPL on "
             "HighLow2 are two pairs. Day-range pairs (HighLow, HighLow2) rest levels under "
-            "their 9:35 forecast; GoodMoments pairs (GoodMoments, HighLow2 + GoodMoments) "
+            "their 9:35 forecast; GoodMoments pairs (GoodMoments and the two hybrids on it) "
             "buy on their edge. The defaults are the pairs SimLab's "
             "tuning has picked levels for. In a race, buys that fill on the same bar go "
             "to the pair with the higher average profit a session in SimLab's tuning "
@@ -4041,9 +4065,10 @@ _ORCHESTRA_COPY = dc_replace(
             "entry for the day); it does not stop the agent."
         ),
         "pair_hybrid_buy_k": (
-            "HighLow2 + GoodMoments only: from the bar after the opening window a buy also "
-            "needs the bar's close at or under HighLow2's buy level — this × the pair's level "
-            "unit under HighLow2's predicted high, moved with the forecast through a breach."
+            "The hybrids only (HighLow2 + GoodMoments, HighLow + GoodMoments): from the bar "
+            "after the opening window a buy also needs the bar's close at or under the voting "
+            "model's buy level — this × the pair's level unit under that model's predicted "
+            "high, moved with the forecast through a breach."
         ),
         "select_on": (
             "Off, Orchestra races every pair all day. On, it picks the day's "

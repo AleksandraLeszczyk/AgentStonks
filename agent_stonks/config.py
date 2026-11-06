@@ -443,6 +443,14 @@ APPLE_TRADER_TAKE_AFTER_MINUTES = 15
 # over a time stop. 0 is off, the rule before it existed, which every SimLab
 # record written before then replays as.
 APPLE_TRADER_TIME_LIMIT_MINUTES = 0
+# No buy on a falling, negative-gamma day (2026-11-05, the user's request):
+# while the bar's close is under the session's open -- the quote's "Momentum
+# (day)" card below zero -- and net dealer gamma at that close is negative too,
+# where dealers sell into a fall rather than buy it. Both at once, the user's
+# choice; a net gamma not known (no options chain yet live, a SimLab day the
+# live app never kept one for) lets the buy through. Off by default, the rule
+# before it existed, which every SimLab record written before then replays as.
+APPLE_TRADER_NO_BUY_DOWN_NEGATIVE_GAMMA = False
 # Whether the momentum take also fires on a position under its fill (2026-10-06,
 # at the user's request: "remove only in profit -- it should trigger on momentum
 # once the timer has passed"). Before then it banked gains only and left a
@@ -1003,6 +1011,11 @@ MODEL_OVERLAY_COLORS: dict[str, str] = {
     "highlow_range": "#60a5fa",
     # HighLow2's: the same family, a step further toward indigo.
     "highlow2_range": "#818cf8",
+    # HighLow Chain's: the same family the other way, toward sky.
+    "highlow_chain_range": "#38bdf8",
+    # MedianMove's no-model range: teal, off the blue family, so a model's
+    # band and the baseline it is measured against tell apart when both show.
+    "medianmove_range": "#2dd4bf",
     # Apple Trader's two resting levels. Deliberately not a sibling of the cyan
     # above: these are an *agent's* orders, not a model's forecast, and reading
     # the chart means telling the two apart at a glance.

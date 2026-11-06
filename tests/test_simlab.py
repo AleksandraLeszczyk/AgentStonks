@@ -1805,6 +1805,14 @@ class TestPatches:
             assert set(bars[0]) == {"t", "o", "h", "l", "c", "v"}
             assert historical.fetch_session_open("TEST") == pytest.approx(122.95)
 
+    def test_no_options_chain_is_fetched_for_a_past_day(self, store):
+        from agent_stonks import gamma_history
+
+        with simulation_context(SimMarket(["TEST"], [DAY])):
+            # Apple Trader's negative-gamma rule asks for a fresh chain each
+            # cycle; a replay reads only the net gamma the live app kept.
+            assert gamma_history.refresh_chain(object()) is None
+
     def test_patches_are_restored(self, store):
         from agent_stonks import historical
 

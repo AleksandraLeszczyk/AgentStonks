@@ -8,8 +8,8 @@ the other way round: it asks each model its question about a session and
 returns the answer as **drawing instructions**, so the live chart and SimLab's
 replay chart can show the prediction beside the tape that tested it.
 
-Nine overlays
--------------
+Ten overlays
+------------
 `profile_range`      the LevelsML density model's predicted price profile,
                      reduced to the three numbers a price axis can carry: its
                      outer quantiles and its point of control. The curve itself
@@ -31,6 +31,14 @@ Nine overlays
                      `highlow_model`. (TimeToChange3's `day_range` was drawn
                      the same way until that model was removed, 2026-10-25.)
 `highlow2_range`     HighLow2's, drawn the same way. See `highlow2_model`.
+`highlow_chain_range` HighLow Chain's: HighLow2's from 9:35, then from 10:30
+                     the window models' forecasts made every five minutes
+                     (HighLow_1h to 13:30, HighLow_4h to the close), stepped
+                     at each, off the same walk. See `highlow_chain_model`.
+`medianmove_range`   MedianMove's: no model, the 9:35 price plus the median
+                     move of the last 60 sessions -- the baseline the HighLow
+                     ranges are measured against, drawn the same way. See
+                     `medianmove_model`.
 `fastfurious_signal` Fast&Furious's forecast of the next 30 minutes' average
                      momentum, read at the close of every bar: a line in bps
                      per minute on the momentum panel, drawn 30 minutes
@@ -127,6 +135,8 @@ INTRADAY_RANGE_KEY = "intraday_range"
 TRADER_LEVELS_KEY = "trader_levels"
 HIGHLOW_RANGE_KEY = "highlow_range"
 HIGHLOW2_RANGE_KEY = "highlow2_range"
+HIGHLOW_CHAIN_RANGE_KEY = "highlow_chain_range"
+MEDIANMOVE_RANGE_KEY = "medianmove_range"
 FASTFURIOUS_SIGNAL_KEY = "fastfurious_signal"
 FASTFURIOUS_RANGE_KEY = "fastfurious_range"
 GOODMOMENTS_SIGNAL_KEY = "goodmoments_signal"
@@ -204,7 +214,8 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         ),
         requires="PyTorch, LightGBM, the HighLow bundle and Alpaca SIP minute history",
         tickers=apple_models.HIGHLOW_TICKERS,
-        models=(apple_models.HIGHLOW_KEY,),
+        # The hybrid's buy level hangs off this forecast too.
+        models=(apple_models.HIGHLOW_KEY, apple_models.HIGHLOW_GOODMOMENTS_KEY),
     ),
     HIGHLOW2_RANGE_KEY: ModelOverlay(
         key=HIGHLOW2_RANGE_KEY,
@@ -222,6 +233,38 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
         tickers=apple_models.HIGHLOW2_TICKERS,
         # The hybrid's buy level hangs off this forecast too.
         models=(apple_models.HIGHLOW2_KEY, apple_models.HIGHLOW2_GOODMOMENTS_KEY),
+    ),
+    HIGHLOW_CHAIN_RANGE_KEY: ModelOverlay(
+        key=HIGHLOW_CHAIN_RANGE_KEY,
+        label="Predicted range (HighLow Chain)",
+        name="HighLow Chain",
+        summary=(
+            "HighLow Chain's forecast: HighLow2's of the session's high and low at 9:35, then "
+            "from 10:30 HighLow_1h's of the high and low from that minute to 13:30, and from "
+            "13:30 HighLow_4h's from that minute to the close, each made again every five "
+            "minutes. A stepped band: it moves at every one of those, and where the session "
+            "trades outside it in between."
+        ),
+        requires=(
+            "LightGBM, the HighLow2, HighLow_1h and HighLow_4h bundles, Alpaca SIP and IEX "
+            "minute history and today's bars, and last night's option table"
+        ),
+        tickers=apple_models.HIGHLOW_CHAIN_TICKERS,
+        models=(apple_models.HIGHLOW_CHAIN_KEY,),
+    ),
+    MEDIANMOVE_RANGE_KEY: ModelOverlay(
+        key=MEDIANMOVE_RANGE_KEY,
+        label="Predicted day range (MedianMove, no model)",
+        name="MedianMove",
+        summary=(
+            "No model: the session's high and low as the 9:35 price plus the median move of "
+            "the last 60 sessions, in 14-day ranges -- the baseline the HighLow ranges are "
+            "measured against. Drawn like them: flat while the session stays inside it, "
+            "stepped once it trades outside."
+        ),
+        requires="HighLow's module (PyTorch) and Alpaca SIP minute history",
+        tickers=apple_models.MEDIANMOVE_TICKERS,
+        models=(apple_models.MEDIANMOVE_KEY,),
     ),
     FASTFURIOUS_SIGNAL_KEY: ModelOverlay(
         key=FASTFURIOUS_SIGNAL_KEY,
@@ -273,7 +316,10 @@ OVERLAYS: "dict[str, ModelOverlay]" = {
             "and IEX minute bars, the shared option cache and Yahoo's analyst targets"
         ),
         tickers=apple_models.GOODMOMENTS_TICKERS,
-        models=(apple_models.GOODMOMENTS_KEY, apple_models.HIGHLOW2_GOODMOMENTS_KEY),
+        models=(
+            apple_models.GOODMOMENTS_KEY, apple_models.HIGHLOW2_GOODMOMENTS_KEY,
+            apple_models.HIGHLOW_GOODMOMENTS_KEY,
+        ),
     ),
     TRADER_LEVELS_KEY: ModelOverlay(
         key=TRADER_LEVELS_KEY,
@@ -765,6 +811,12 @@ def compute(
         HIGHLOW2_RANGE_KEY: lambda: range_items(
             HIGHLOW2_RANGE_KEY, lambda: highlow_forecast(apple_models.HIGHLOW2_KEY)
         ),
+        HIGHLOW_CHAIN_RANGE_KEY: lambda: range_items(
+            HIGHLOW_CHAIN_RANGE_KEY, lambda: highlow_forecast(apple_models.HIGHLOW_CHAIN_KEY)
+        ),
+        MEDIANMOVE_RANGE_KEY: lambda: range_items(
+            MEDIANMOVE_RANGE_KEY, lambda: highlow_forecast(apple_models.MEDIANMOVE_KEY)
+        ),
         FASTFURIOUS_SIGNAL_KEY: lambda: _fastfurious_signal_items(fastfurious_forecast()),
         FASTFURIOUS_RANGE_KEY: lambda: _fastfurious_range_items(fastfurious_forecast()),
         GOODMOMENTS_SIGNAL_KEY: lambda: _goodmoments_signal_items(
@@ -818,6 +870,8 @@ def _session_of(
 _RANGE_OVERLAYS = {
     apple_models.HIGHLOW_KEY: HIGHLOW_RANGE_KEY,
     apple_models.HIGHLOW2_KEY: HIGHLOW2_RANGE_KEY,
+    apple_models.HIGHLOW_CHAIN_KEY: HIGHLOW_CHAIN_RANGE_KEY,
+    apple_models.MEDIANMOVE_KEY: MEDIANMOVE_RANGE_KEY,
 }
 
 
@@ -894,11 +948,16 @@ def _not_a_range_model(model_key: "str | None") -> str:
 _HIGHLOW_MODULES = {
     apple_models.HIGHLOW_KEY: "highlow_model",
     apple_models.HIGHLOW2_KEY: "highlow2_model",
+    apple_models.HIGHLOW_CHAIN_KEY: "highlow_chain_model",
+    # No model, but the same pair: torch only through HighLow's history.
+    apple_models.MEDIANMOVE_KEY: "medianmove_model",
 }
 # What the trader-levels note calls the forecast its levels hang off.
 _HIGHLOW_NAMES = {
     apple_models.HIGHLOW_KEY: OVERLAYS[HIGHLOW_RANGE_KEY].name,
     apple_models.HIGHLOW2_KEY: OVERLAYS[HIGHLOW2_RANGE_KEY].name,
+    apple_models.HIGHLOW_CHAIN_KEY: OVERLAYS[HIGHLOW_CHAIN_RANGE_KEY].name,
+    apple_models.MEDIANMOVE_KEY: OVERLAYS[MEDIANMOVE_RANGE_KEY].name,
 }
 
 
@@ -941,7 +1000,15 @@ def _highlow_forecast(
                 f"the first {want} minutes the forecast needs are not here."
             )
         key, secret = credentials or (None, None)
-        forecast = module.forecast_session(bundle, symbol, opening, day, key, secret)
+        if model_key == apple_models.HIGHLOW_CHAIN_KEY:
+            # And the window forecasts made through the last closed bar (a live
+            # buffer's newest row can be the minute still trading), which the
+            # walk swaps in at their decision bars.
+            closed = session[session.index + pd.Timedelta(minutes=1) <= pd.Timestamp(clock.now())]
+            through = int(round(float(closed["minutes_from_open"].iloc[-1]))) if len(closed) else -1
+            forecast = module.forecast_session(bundle, symbol, opening, day, key, secret, through=through)
+        else:
+            forecast = module.forecast_session(bundle, symbol, opening, day, key, secret)
     except Exception as exc:  # a decoration must never take the chart down
         return failed(str(exc))
     return {"forecast": forecast, "made_at": opening.index[-1], "problem": ""}
@@ -1019,6 +1086,12 @@ def _day_range_items(
     # One band rather than a span plus two levels: the span's whole job was to
     # tint between the two lines, which is what a band already does, and three
     # items that must agree bar by bar are three chances to disagree.
+    how = (
+        f"HighLow2's {made_at}, made again every five minutes from 10:30 (HighLow_1h, the "
+        "high and low to 13:30; from 13:30 HighLow_4h, to the close) and revised where the "
+        "session traded outside it"
+        if forecast.get("chain") else f"the {made_at}, revised where the session traded outside it"
+    )
     return (
         [
             _band(
@@ -1026,8 +1099,7 @@ def _day_range_items(
                 [row["t"] for row in walked], lows, highs, color,
                 lower_label="Pred. low", upper_label="Pred. high", step=True,
                 note=(
-                    f"the {made_at}, revised where the session traded outside it "
-                    f"({low:.2f} – {high:.2f} at {pd.Timestamp(x0):%H:%M}, "
+                    f"{how} ({low:.2f} – {high:.2f} at {pd.Timestamp(x0):%H:%M}, "
                     f"{lows[-1]:.2f} – {highs[-1]:.2f} now)"
                 ),
             )

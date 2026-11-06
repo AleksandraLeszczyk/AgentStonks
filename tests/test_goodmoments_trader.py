@@ -929,3 +929,32 @@ class TestTimeLimit:
         sig = config_signature(gm_config(time_limit_minutes=30))
         assert ",size=" in sig and sig.index(",time=30m@profit") > sig.index(",size=")
         assert ",time=" not in config_signature(gm_config())
+
+
+class TestDownNegativeGamma:
+    """GoodMoments reads the negative-gamma rule too: an edge at the entry on a
+    bar under the session's open with net gamma negative buys nothing."""
+
+    NEGATIVE = {
+        "strikes": [95.0, 100.0, 105.0], "calls_oi": [0.0] * 3, "puts_oi": [1000.0] * 3,
+        "calls_iv": [0.3] * 3, "puts_iv": [0.3] * 3, "t_years": 10 / 365,
+    }
+
+    def test_refused_while_both_are_negative(self, monkeypatch, state):
+        monkeypatch.setattr(at.gamma_history, "refresh_chain", lambda sym_state: None)
+        state.sym(TICKER).options_chain = self.NEGATIVE
+        trader, tracker, tape = _setup(monkeypatch, state, no_buy_down_negative_gamma=True)
+        tape.append(100.0)
+        assert cycle(trader, state, tracker) == "hold"
+        for _ in range(2):
+            tape.append(99.8, edge=ENTER)
+            assert cycle(trader, state, tracker) == "hold"
+        refused = [e for e in state.agent_log if "net gamma is negative" in (e.get("text") or "")]
+        assert len(refused) == 1                      # once per stretch
+        tape.append(100.1, edge=ENTER)                # back over the open
+        assert cycle(trader, state, tracker) == "bought"
+
+    def test_signed_after_the_size(self):
+        sig = config_signature(gm_config(no_buy_down_negative_gamma=True))
+        assert sig.index(",nobuy=day<0&gamma<0") > sig.index(",size=")
+        assert "nobuy" not in config_signature(gm_config())

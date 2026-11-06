@@ -17,7 +17,9 @@ import pandas as pd
 import pytest
 
 from agent_stonks import momentum_regime
-from agent_stonks.apple_trader import APPLE_TRADER_KEY, AppleTraderConfig, config_settings
+from agent_stonks.apple_trader import (
+    APPLE_TRADER_KEY, DOWN_GAMMA_LABEL, AppleTraderConfig, config_settings,
+)
 from agent_stonks.config import UNIT_ADR
 from agent_stonks.market_hours import MARKET_TZ
 from dataclasses import asdict, fields
@@ -1840,6 +1842,18 @@ class TestReplayInputs:
         # Only its own sessions': a verdict written this morning stales no old run.
         assert event_days.verdicts_path(date(2026, 10, 5)) not in added
 
+    def test_the_gamma_rule_makes_a_run_read_its_days_kept_net_gamma(self):
+        from agent_stonks import gamma_history
+
+        days = [str(TUNE_DAY), str(TEST_DAY)]
+        off = AppleTraderConfig(ticker=TICKER, skip_events=())
+        on = AppleTraderConfig(ticker=TICKER, skip_events=(), no_buy_down_negative_gamma=True)
+        added = set(tu._replay_inputs(on, days, "yfinance")) - set(tu._replay_inputs(off, days, "yfinance"))
+        assert added == {
+            gamma_history.kept_path(TICKER, "1Min", str(TUNE_DAY)),
+            gamma_history.kept_path(TICKER, "1Min", str(TEST_DAY)),
+        }
+
 
 class TestRoundTrips:
     """A round trip is flat to flat, fees included, however many fills it took."""
@@ -2785,4 +2799,4 @@ class TestCompareSettings:
         step = next(r for r in rows if r["setting"] == "Next buy")
         assert step["base"] is None and step["changed"]
         assert names.index("Next buy") == names.index("Buy again lower while cash allows") + 1
-        assert names[-1] == "Sit out these sessions"
+        assert names[-2:] == ["Sit out these sessions", DOWN_GAMMA_LABEL]

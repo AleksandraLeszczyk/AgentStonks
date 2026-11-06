@@ -40,8 +40,8 @@ import streamlit as st
 
 from . import apple_models, base_configs, event_days, intraday_vol_model
 from .apple_trader import (
-    AppleTraderConfig, base_record, confirmation_for, dayrange_levels, default_config,
-    min_win_for, shipped_config, stop_for,
+    DOWN_GAMMA_LABEL, AppleTraderConfig, base_record, confirmation_for, dayrange_levels,
+    default_config, min_win_for, shipped_config, stop_for,
 )
 
 if TYPE_CHECKING:
@@ -266,6 +266,7 @@ def probability_params(
         if apple_models.levels_of(model_key) is not None else {}
     )
     skip_events = skip_param(defaults, copy)
+    down_gamma = down_gamma_param(defaults, copy)
     return replace(
         defaults,
         model_key=model_key,
@@ -280,6 +281,7 @@ def probability_params(
         gm_stop_raise=gm_stop_raise,
         time_limit_minutes=time_limit,
         skip_events=skip_events,
+        no_buy_down_negative_gamma=down_gamma,
         **levels,
     )
 
@@ -320,7 +322,7 @@ def hybrid_levels_params(
     width and the containment come from the levels model's configuration
     (`apple_trader.default_config`); the sell is 0, since nothing sells there."""
     parent = apple_models.get(apple_models.levels_of(model_key)).label.replace(" model", "")
-    section(f"{parent} buy level", copy.sections.get("hybrid_levels"))
+    section(f"{parent} buy level", (copy.sections.get("hybrid_levels") or "").format(model=parent))
     unit_label = UNIT_FORM_LABELS[defaults.level_unit]
     buy_k = st.number_input(
         f"Buy at or under (× {unit_label} below {parent}'s predicted high)",
@@ -459,8 +461,8 @@ def base_help(model_key: str, ticker: str) -> str:
     configuration (`base_configs`): when it was set, from what, and every field
     in which it differs from the shipped defaults -- the ones without a knob
     here included, since nothing else on the form shows them. Empty without one.
-    A combined model with no base of its own names its forecast model's, which
-    it opens on (`base_record`).
+    A model with no rules of its own and no base (MedianMove) names the base of
+    the model whose rules it trades, which it opens on (`base_record`).
     """
     _, based_on = base_record(model_key, ticker)
     found = base_configs.entry(based_on, ticker) if based_on else None
@@ -473,8 +475,8 @@ def base_help(model_key: str, ticker: str) -> str:
     origin = f" from tuning job `{source['job_id']}`" if source.get("job_id") else ""
     whose = (
         "" if based_on == model_key
-        else f" — {apple_models.get(based_on).label}'s, whose rules this model trades after "
-        "the opening window"
+        else f" — {apple_models.get(based_on).label}'s, whose rules this model trades until "
+        "it has a base of its own"
     )
     lines = [
         f"**Base configuration{whose}.** Set {str(found.get('set_at', ''))[:10]}{origin}: "
@@ -733,6 +735,7 @@ def rule_params(
         "breach_exit": breach_exit,
         **exits,
         "skip_events": skip_events,
+        "no_buy_down_negative_gamma": down_gamma_param(defaults, copy),
     }
 
 
@@ -749,6 +752,18 @@ def skip_param(defaults: AppleTraderConfig, copy: FormCopy) -> "tuple[str, ...]"
         help=copy.help.get("skip_events"),
     )
     return tuple(picked)
+
+
+def down_gamma_param(defaults: AppleTraderConfig, copy: FormCopy) -> bool:
+    """No buy on a falling, negative-gamma day (`no_buy_down_negative_gamma`):
+    under the days off, as the other "not today" rule, and like them one box
+    for every rule set that reads it -- in Orchestra for every pair."""
+    return bool(st.checkbox(
+        DOWN_GAMMA_LABEL,
+        value=bool(defaults.no_buy_down_negative_gamma),
+        key=copy.key("no_buy_down_negative_gamma"),
+        help=copy.help.get("no_buy_down_negative_gamma"),
+    ))
 
 
 def min_win_param(
@@ -1298,9 +1313,10 @@ def orchestra_params(
     for key in ranged:
         ticker, _, model_key = key.partition(":")
         # The pair's base configuration's numbers (`dayrange_levels` reads it
-        # first), and its digest on the row's keys so a new base re-seeds them.
+        # first), and its digest on the row's keys so a new base re-seeds them
+        # -- MedianMove's HighLow model's, which it opens on (`pair_suffix`).
         default_buy, default_sell = dayrange_levels(ticker, model_key)
-        suffix = base_configs.key_suffix(model_key, ticker)
+        suffix = pair_suffix(model_key, ticker)
         start_buy, start_sell = default_buy, default_sell
         if key in seeded:
             start_buy, start_sell = float(seeded[key].buy_k), float(seeded[key].sell_k)
@@ -1394,8 +1410,8 @@ def orchestra_params(
         until_revised = breaker_until_param(defaults, copy, rules)
     else:
         # GoodMoments pairs alone: what every pair shares is the size, the
-        # time limit and the days off (`orchestra.SHARED_BY_ALL`); the rest is
-        # each pair's own.
+        # time limit, the days off and the negative-gamma rule
+        # (`orchestra.SHARED_BY_ALL`); the rest is each pair's own.
         sizing = {
             "position_pct": float(col_a.number_input(
                 "Position size (% of cash)",
@@ -1405,7 +1421,10 @@ def orchestra_params(
             )),
             "time_limit_minutes": time_limit_param(defaults, copy, col_b),
         }
-        rules = {"skip_events": skip_param(defaults, copy)}
+        rules = {
+            "skip_events": skip_param(defaults, copy),
+            "no_buy_down_negative_gamma": down_gamma_param(defaults, copy),
+        }
         until_revised = defaults.breaker_until_revised
     base = replace(
         defaults, level_unit=level_unit, min_win_k=min_win_k,
@@ -1468,9 +1487,11 @@ def signal_pair_params(
     head[3].caption("Stop", help=copy.help.get("pair_gm_stop_k"))
     head[4].caption("Confirm", help=copy.help.get("pair_gm_confirm_bars"))
     if hybrids:
-        parent = apple_models.levels_of(hybrids[0].partition(":")[2])
+        # Named after the model that votes, unless the hybrids picked have two.
+        parents = {apple_models.levels_of(key.partition(":")[2]) for key in hybrids}
         head[5].caption(
-            f"{apple_models.get(parent).label.replace(' model', '')} buy",
+            f"{apple_models.get(parents.pop()).label.replace(' model', '')} buy"
+            if len(parents) == 1 else "Buy level",
             help=copy.help.get("pair_hybrid_buy_k"),
         )
     if split:

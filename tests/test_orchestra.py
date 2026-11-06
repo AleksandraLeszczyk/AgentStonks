@@ -2331,3 +2331,34 @@ class TestTimeLimitIsShared:
             ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], at.AppleTraderConfig())
         )
         assert ",time=" not in off
+
+
+class TestDownGammaRuleIsShared:
+    """One negative-gamma rule for every pair (2026-11-05), GoodMoments pairs too."""
+
+    def test_every_pair_gets_it(self):
+        base = replace(at.AppleTraderConfig(), no_buy_down_negative_gamma=True)
+        race = ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], base)
+        assert {r.no_buy_down_negative_gamma for r in race.racers} == {True}
+
+    def test_signed_once_with_the_shared_rules(self):
+        base = replace(at.AppleTraderConfig(), no_buy_down_negative_gamma=True)
+        for pairs in (["MU:highlow", "AAPL:goodmoments"], ["AAPL:goodmoments"]):
+            sig = ar.orchestra_signature(ar.build_orchestra_config(pairs, base))
+            assert sig.count(",nobuy=day<0&gamma<0") == 1
+        off = ar.orchestra_signature(
+            ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], at.AppleTraderConfig())
+        )
+        assert "nobuy" not in off
+
+    def test_the_form_box_reaches_every_pair(self):
+        from streamlit.testing.v1 import AppTest
+
+        for pairs in (["AAPL:highlow", "AMD:goodmoments"], ["AAPL:goodmoments", "AMD:goodmoments"]):
+            app = AppTest.from_function(_orchestra_form, default_timeout=30)
+            app.session_state["o_pairs"] = pairs
+            app.run()
+            [box] = [c for c in app.checkbox if c.label == at.DOWN_GAMMA_LABEL]
+            box.check().run()
+            assert not app.exception, app.exception
+            assert {r.no_buy_down_negative_gamma for r in app.session_state["out"].racers} == {True}

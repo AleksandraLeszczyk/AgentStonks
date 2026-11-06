@@ -48,6 +48,7 @@ from agent_stonks.apple_trader import (
     RULE_PROVIDER,
     AppleTraderConfig,
     base_error,
+    base_record,
     default_config,
 )
 from agent_stonks import apple_trader_ui
@@ -1908,7 +1909,9 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
         "dayrange_skip": (
             "Sessions the replay does not trade: no forecast, no order. In the signature as "
-            "`skip=...`; a record from before the rule replays with none."
+            "`skip=...`; a record from before the rule replays with none.\n\n"
+            "The box under them holds back buys within a session instead: while the day is "
+            "down and net gamma is negative."
         ),
         "dayrange_breaker": (
             "When to stop for the day.\n\n"
@@ -1960,7 +1963,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         ),
         "hybrid_levels": (
             "The second vote: from 09:35 a GoodMoments buy also needs the bar to close at or "
-            "under HighLow2's buy level, this far under its predicted high, moved through a "
+            "under {model}'s buy level, this far under its predicted high, moved through a "
             "breach under the rule below. It only votes — every exit is GoodMoments'.\n\n"
             "- In the signature as `buy<=H-0.6R` (plus `breach=…`, `keep_width`) after "
             "GoodMoments' own tokens."
@@ -1980,6 +1983,17 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "every minute, HighLow2's at 09:35 from the IEX opening and pre-market.\n"
             "- With no base configuration of its own it starts from GoodMoments' pair (its "
             "base, if set) and HighLow2's buy distance."
+        ),
+        "model_highlow_goodmoments": (
+            "HighLow2 + GoodMoments' design with HighLow voting: 09:30–09:34 the edge alone "
+            "buys, from 09:35 the bar also has to close at or under HighLow's buy level. Every "
+            "exit is GoodMoments'.\n\n"
+            "- Reads both models' inputs (see each one's note): GoodMoments' from Alpaca at "
+            "every minute, HighLow's at 09:35 from ~220 days of the ticker's SIP history (with "
+            "SPY's, its peers' and the pre-market where its HighLow reads them; MU's opening from "
+            "IEX), cached under `data/highlow/`, and the dataset's opening.\n"
+            "- With no base configuration of its own it starts from GoodMoments' pair (its "
+            "base, if set) and HighLow's buy distance, unit and breach rule."
         ),
         "model_fastfurious": (
             "Its own rules, not the day-range levels: a buy when the 30-minute momentum "
@@ -2046,6 +2060,29 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "the first replay fetches it.\n"
             "- Fitted without shock days, so a replay through earnings scores a forecast "
             "of an ordinary day."
+        ),
+        "model_highlow_chain": (
+            "The day-range rules on HighLow2's 9:35 forecast, made again every five minutes "
+            "from 10:30 by HighLow_1h (the high and low to 13:30) and from 13:30 by HighLow_4h "
+            "(to the close); the levels are rebuilt from each. Never tuned: it starts from the "
+            "shared defaults, so sweep it on the Tuning tab.\n\n"
+            "- Reads every input from Alpaca, whatever the dataset's tape: HighLow2's history "
+            "and morning (`data/highlow2/`), the SIP and IEX minute tape before and of each "
+            "replayed day, cut at each decision as a basic plan would see it "
+            "(`data/fastfurious/`), last night's option table (`data/option_positioning/`) and, "
+            "on an FOMC day, every FOMC session since 2024 (`data/highlow_window/`) — "
+            "ALPACA_API_KEY / ALPACA_SECRET; the first replay fetches what is missing.\n"
+            "- No window forecasts on a 13:00 half day: HighLow2's stands all session."
+        ),
+        "model_medianmove": (
+            "The day-range rules on no model: the 9:35 price plus the median move of the last "
+            "60 sessions, in 14-day ranges — the baseline the HighLow notebooks trade their "
+            "models against. Replay or tune it on the same days as a HighLow model to see "
+            "what the model adds. Never tuned: it starts from the shared defaults.\n\n"
+            "- Reads Alpaca SIP minute history *before* each replayed day (ALPACA_API_KEY / "
+            "ALPACA_SECRET) from HighLow's cache under `data/highlow/`; today's price and "
+            "opening range are the dataset's first five bars (on MU, that morning's IEX "
+            "window, as HighLow reads it)."
         ),
         "buy_k": (
             "Starts at **{buy_k}** on {ticker}, for this model.\n\n"
@@ -2226,6 +2263,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- In the signature as `time=30m@profit`; a record from before it replays "
             "without one.\n"
             "- 0 switches it off."
+        ),
+        "no_buy_down_negative_gamma": (
+            "No buy while the bar's close is under the session's open and net gamma at that "
+            "close is negative too.\n\n"
+            "- Net gamma is what the live app kept for that bar (`data/net_gamma/`, written "
+            "while its net gamma panel was drawn or this rule traded live). There is no "
+            "options-chain history to price a past day with, so a day it never kept — most "
+            "of them — replays as if the rule were off.\n"
+            "- In the signature as `nobuy=day<0&gamma<0`; a record from before it replays "
+            "without it."
         ),
         "take_after_minutes": (
             "The take fires only once this many minutes of bars have passed "
@@ -2478,7 +2525,7 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
         "pairs": (
             "The (ticker, model) pairs Orchestra watches: day-range pairs (HighLow, "
             "HighLow2) rest levels under their 9:35 forecast, GoodMoments pairs "
-            "(GoodMoments, HighLow2 + GoodMoments) buy on their edge. Every pair's symbol "
+            "(GoodMoments and the two hybrids on it) buy on their edge. Every pair's symbol "
             "must be in the datasets. The order is the tie-break when two buys fill on one "
             "bar. Each Orchestra setup is one row in Results; compare it with Apple Trader "
             "setups on the same pairs."
@@ -2533,8 +2580,9 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
             "for 15 bars; it never stops the replay's other pairs."
         ),
         "pair_hybrid_buy_k": (
-            "HighLow2 + GoodMoments only: after the opening window a buy also needs the "
-            "close at or under HighLow2's buy level, this × its unit under the predicted high."
+            "The hybrids only (HighLow2 + GoodMoments, HighLow + GoodMoments): after the "
+            "opening window a buy also needs the close at or under the voting model's buy "
+            "level, this × its unit under the predicted high."
         ),
     }
     fields["sections"] = {
@@ -2542,8 +2590,8 @@ def _render_orchestra_setup(symbols: list[str], prefix: str) -> list:
         "signal_pairs": (
             "The GoodMoments pairs: each replays on its own configuration (its base, else "
             "the shipped defaults) with the entry, take, stop and momentum confirmation set "
-            "here — and on the hybrid HighLow2's buy distance. The position size, the time limit "
-            "and the days off are Orchestra's. A race of one GoodMoments pair replays exactly as Apple Trader on it."
+            "here — and on a hybrid its voting model's buy distance. The position size, the time limit, "
+            "the days off and the negative-gamma rule are Orchestra's. A race of one GoodMoments pair replays exactly as Apple Trader on it."
         ),
         "selection": (
             "Replays Orchestra's 09:34 pick of the day's candidates from what the "
@@ -4976,13 +5024,16 @@ _TUNING_CHANGED_TINT = "background-color: rgba(224, 64, 251, 0.25)"
 def _tuning_current_origin(model_key: str, ticker: str) -> str:
     """Where a pair's current configuration comes from
     (`apple_trader.default_config`), in words: when it was set and from which
-    job, or the shipped defaults."""
-    current = base_configs.entry(model_key, ticker)
+    job -- for MedianMove with none of its own, its HighLow model's
+    (`base_record`) -- or the shipped defaults."""
+    _, based_on = base_record(model_key, ticker)
+    current = base_configs.entry(based_on, ticker) if based_on else None
     if current is None:
         return "the shipped defaults"
     source = current.get("source") or {}
     origin = f" from job `{source['job_id']}`" if source.get("job_id") else ""
-    return f"the one set {str(current.get('set_at', ''))[:10]}{origin}"
+    whose = "" if based_on == model_key else f"{_apple_model_label(based_on)}'s current configuration, "
+    return f"{whose}the one set {str(current.get('set_at', ''))[:10]}{origin}"
 
 
 def _render_tuning_config_compare(job: dict, chosen: dict) -> None:
@@ -5087,7 +5138,12 @@ def _render_tuning_set_base(job: dict, chosen: dict) -> None:
         clear_clicked = current is not None and st.button(
             "Restore shipped defaults", icon=":material/restart_alt:",
             key=f"tune_clear_base_{job_id}",
-            help=f"New runs of {pair} start from the defaults the code ships again.",
+            help=f"New runs of {pair} start from "
+            + (
+                f"{_apple_model_label(parent)}'s configuration on {ticker} again."
+                if (parent := apple_models.rules_of(model_key, ticker))
+                else "the defaults the code ships again."
+            ),
         )
     starts = _tuning_current_origin(model_key, ticker)
     if is_current:
@@ -5121,7 +5177,10 @@ def _render_tuning_set_base(job: dict, chosen: dict) -> None:
         st.rerun()
     if clear_clicked:
         base_configs.clear(model_key, ticker)
-        st.toast(f"{pair} starts from the shipped defaults again.", icon=":material/restart_alt:")
+        st.toast(
+            f"{pair} starts from {_tuning_current_origin(model_key, ticker)} again.",
+            icon=":material/restart_alt:",
+        )
         st.rerun()
 
 
@@ -6407,7 +6466,8 @@ def _render_ml_untuned(pairs: "list[dict]") -> None:
     st.caption(
         "Model × instrument pairs the app can trade with no base configuration set: a new "
         "run of one starts from the shipped defaults (a hybrid, from its two models' "
-        "bases). A pair no tuning job has replayed is missing above: "
+        "bases; MedianMove, from its HighLow model's). A pair no tuning job has replayed "
+        "is missing above: "
         "start one in the Tuning tab, on a dataset that carries the instrument. A tuned "
         "one is above, read off its job's base: pick a configuration in the Tuning tab "
         "and *Set as base configuration*."

@@ -48,7 +48,7 @@ from . import agent as agent_mod
 from . import state as state_mod
 from . import (
     apple_models, bar_history, base_configs, candle_patterns, clock, day_range, event_days,
-    historical, intraday_vol_model, market_hours, momentum_regime, rule_agent,
+    gamma_history, historical, intraday_vol_model, market_hours, momentum_regime, rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -89,6 +89,7 @@ from .config import (
     APPLE_TRADER_MOMENTUM_CONFIRMATION_BARS,
     APPLE_TRADER_NEGATIVE_FOR_BARS,
     APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
+    APPLE_TRADER_NO_BUY_DOWN_NEGATIVE_GAMMA,
     APPLE_TRADER_POSITION_PCT,
     MOMENTUM_NEUTRAL_FRACTION,
     APPLE_TRADER_SCALE_IN,
@@ -250,13 +251,25 @@ def breaker_hold(record: "dict | None") -> "str | None":
 
 def base_record(model_key: "str | None", ticker: str) -> "tuple[dict | None, str]":
     """The pair's base configuration as a record, and the model it was set for,
-    or `(None, "")` when it has none."""
+    or `(None, "")` when it has none.
+
+    A pair's own base first. A model with no rules of its own (MedianMove,
+    `apple_models.rules_of`) and no base starts from the base of the model
+    whose rules it trades on the symbol, re-keyed to itself, so the two open on
+    the same levels, exits, breach rule and days off and differ only in the
+    forecast.
+    """
     model_key = str(model_key or APPLE_TRADER_MODEL)
     symbol = (ticker or DEFAULT_TICKER).strip().upper()
     record = base_configs.stored(model_key, symbol)
+    if record is not None:
+        return record, model_key
+    parent = apple_models.rules_of(model_key, symbol) if model_key in apple_models.MODELS else None
+    record = base_configs.stored(parent, symbol) if parent else None
     if record is None:
         return None, ""
-    return record, model_key
+    record["model_key"] = model_key
+    return record, parent
 
 
 def _base_number(model_key: "str | None", ticker: str, name: str) -> "float | None":
@@ -268,8 +281,14 @@ def _base_number(model_key: "str | None", ticker: str, name: str) -> "float | No
 
 
 def _tuned(table: dict, model_key: "str | None", symbol: str):
-    """The pair's entry in a tuned table, or None."""
-    return table.get((str(model_key or APPLE_TRADER_MODEL), symbol))
+    """The pair's entry in a tuned table, else the entry of the model whose
+    rules it trades (`apple_models.rules_of`), or None."""
+    model_key = str(model_key or APPLE_TRADER_MODEL)
+    found = table.get((model_key, symbol))
+    if found is None and model_key in apple_models.MODELS:
+        parent = apple_models.rules_of(model_key, symbol)
+        found = table.get((parent, symbol)) if parent else None
+    return found
 
 
 def dayrange_levels(
@@ -706,6 +725,13 @@ class AppleTraderConfig:
     # (`DayRangeTrader._sit_out`). Empty, what every record made before
     # 2026-10-04 replays as, trades every session.
     skip_events: "tuple[str, ...]" = APPLE_TRADER_SKIP_EVENTS
+    # No buy -- first entry or add -- on a bar that closes under the session's
+    # open while net dealer gamma at that close is negative too: the quote's
+    # "Momentum (day)" and "Net Gamma" cards both red (`_DownGammaRule`). A
+    # net gamma not known lets the buy through. Read by the day-range and
+    # GoodMoments rules; False, what every record made before 2026-11-05
+    # replays as, buys whatever the day and the gamma.
+    no_buy_down_negative_gamma: bool = APPLE_TRADER_NO_BUY_DOWN_NEGATIVE_GAMMA
     # Fast&Furious's rules (`FastFuriousTrader`, the momentum strategy), read by
     # no other model. Every day-range field above is ignored under it, and
     # these are ignored under the day-range models. See the block in `config`.
@@ -817,6 +843,7 @@ class AppleTraderConfig:
         # A tuple in canonical order, whatever a form (a list) or a JSON record
         # handed over, so the same days always sign the same way.
         self.skip_events = event_days.normalise(self.skip_events)
+        self.no_buy_down_negative_gamma = bool(self.no_buy_down_negative_gamma)
         # A streak of no bars would fire on the first bar in profit, which is
         # not "negative for long enough" but no rule at all.
         if self.negative_momentum_bars and self.negative_for_bars < 1:
@@ -1420,6 +1447,7 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # so every record written before it existed keeps its filed signature.
     if c.momentum_confirmation_bars:
         adds += f",confirm={c.momentum_confirmation_bars}b"
+    adds += _down_gamma_token(c)
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     breach += _held_token(c)
     # Both appear only while switched on, like every rule added since the
@@ -1486,7 +1514,8 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     levels = _hybrid_levels_signature(c) if apple_models.levels_of(c.model_key) else ""
     return (
         f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop}"
-        f"{raise_}{confirm}{levels},size={c.position_pct:g}%{_time_limit_token(c)}{skip})"
+        f"{raise_}{confirm}{levels},size={c.position_pct:g}%{_time_limit_token(c)}"
+        f"{_down_gamma_token(c)}{skip})"
     )
 
 
@@ -1502,6 +1531,24 @@ def _time_limit_words(c: AppleTraderConfig) -> str:
     if not c.time_limit_minutes:
         return "off"
     return f"after {c.time_limit_minutes} min, sell on the first bar above the fill"
+
+
+def _down_gamma_token(c: AppleTraderConfig) -> str:
+    """No buy on a falling, negative-gamma day in signature form,
+    `,nobuy=day<0&gamma<0`. Nothing while off, so every record made before it
+    keeps its filed signature. GoodMoments writes it after the size, with the
+    rules an Orchestra shares."""
+    return ",nobuy=day<0&gamma<0" if c.no_buy_down_negative_gamma else ""
+
+
+def _down_gamma_sentence(c: AppleTraderConfig) -> str:
+    """The same for the log's opening line: a sentence, or nothing while off."""
+    if not c.no_buy_down_negative_gamma:
+        return ""
+    return (
+        " No buy while the price is under the session's open and net gamma is negative "
+        "as well; with no net gamma known, the buy is not stopped."
+    )
 
 
 def _hybrid_levels_signature(c: AppleTraderConfig) -> str:
@@ -1561,7 +1608,13 @@ def config_settings(config: "AppleTraderConfig | None" = None) -> "list[tuple[st
         rows += _dayrange_settings(c)
     days = ", ".join(event_days.LABELS[e] for e in c.skip_events) or "none"
     rows.append(("Days off", "Sit out these sessions", days))
+    if c.strategy != apple_models.STRATEGY_MOMENTUM:
+        rows.append(("Days off", DOWN_GAMMA_LABEL, _yes(c.no_buy_down_negative_gamma)))
     return rows
+
+
+# The rule's name wherever it is shown: the form's box, the settings table.
+DOWN_GAMMA_LABEL = "No buys while the day is down and net gamma is negative"
 
 
 def _yes(flag: bool) -> str:
@@ -1809,6 +1862,21 @@ def _fastfurious():
     return fastfurious_model
 
 
+def _chain():
+    """`agent_stonks.highlow_chain_model`, imported on first use (LightGBM)."""
+    from . import highlow_chain_model
+
+    return highlow_chain_model
+
+
+def _medianmove():
+    """`agent_stonks.medianmove_model`, imported on first use (its history is
+    HighLow's, which brings torch)."""
+    from . import medianmove_model
+
+    return medianmove_model
+
+
 def session_forecast(
     bundle: dict,
     ticker: str,
@@ -1840,9 +1908,22 @@ def session_forecast(
             _highlow2().forecast_session(bundle, ticker, opening, today, key, secret),
             None,
         )
+    if bundle.get("kind") == "highlow_chain":
+        # HighLow2's 9:35 forecast; the window models' later ones are asked
+        # for bar by bar (`DayRangeTrader._extend_windows`).
+        return (
+            _chain().forecast_session(bundle, ticker, opening, today, key, secret),
+            None,
+        )
+    if bundle.get("kind") == "medianmove":
+        # No model: the 9:35 price plus the median move of recent sessions.
+        return (
+            _medianmove().forecast_session(bundle, ticker, opening, today, key, secret),
+            None,
+        )
     raise ValueError(
         f"no day-range forecast for a bundle of kind {bundle.get('kind')!r} -- "
-        "HighLow and HighLow2 are the models that make one."
+        "HighLow, HighLow2, HighLow Chain and MedianMove are the models that make one."
     )
 
 
@@ -2131,7 +2212,80 @@ class _SitsOut:
         return False
 
 
-class DayRangeTrader(_SitsOut, BaseTrader):
+def _compact_dollars(value: float) -> str:
+    """A signed dollar amount the way the Net Gamma card writes it: -$1.23B."""
+    sign = "+" if value >= 0 else "-"
+    mag = abs(value)
+    for div, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if mag >= div:
+            return f"{sign}${mag / div:,.2f}{suffix}"
+    return f"{sign}${mag:,.0f}"
+
+
+class _DownGammaRule:
+    """No buy on a falling, negative-gamma day (`no_buy_down_negative_gamma`),
+    the same for every rule set that reads it: a statement about the tape, not
+    about the levels or the edge. Expects `config`, `ticker` and a
+    `_gamma_unknown_noted` (None, or the day the note below was last said) on
+    the trader.
+
+    "Down" is the bar's close under the session's open -- the first
+    regular-session bar's, so a replay reads it as the live loop does -- which
+    is the quote's "Momentum (day)" card below zero. Net gamma is that bar's
+    on the live chart's panel (`gamma_history.at_close`): taken at its close
+    with the options chain the app had then, or, replaying a past session,
+    what the live app kept that day. Only both negative refuse (the user's
+    choice); a net gamma not known lets the buy through, said once a session.
+    """
+
+    def _warm_chain(self, sym_state) -> None:
+        """Keep the options chain fresh while the rule is on: with no page
+        open nothing else refreshes it. A replay fetches nothing."""
+        if self.config.no_buy_down_negative_gamma:
+            gamma_history.refresh_chain(sym_state)
+
+    def _down_negative_gamma(self, state: AppState, frame) -> "str | None":
+        """Why the newest bar is no bar to buy on, or None to let the buy go."""
+        if not self.config.no_buy_down_negative_gamma or not len(frame):
+            return None
+        opened = float(frame["open"].iloc[0])
+        close = float(frame["close"].iloc[-1])
+        if not opened or close >= opened:
+            return None
+        ts = frame.index[-1]
+        day = f"{(close / opened - 1) * 100:+.2f}% from the ${opened:,.2f} open"
+        gamma = self._bar_net_gamma(state, ts, close)
+        if gamma is None:
+            if self._gamma_unknown_noted != ts.date():
+                self._gamma_unknown_noted = ts.date()
+                _log(state, {"type": "status", "text": (
+                    f"The day is down ({day}) at {ts:%H:%M}, but {self.ticker}'s net gamma is "
+                    "not known for that bar (no options chain to price it with), so the "
+                    "negative-gamma rule does not stop a buy until it is."
+                )})
+            return None
+        if gamma >= 0:
+            return None
+        return (
+            f"the day is down ({day}) and net gamma is negative "
+            f"({_compact_dollars(gamma)} per 1% move), where dealers sell into a fall"
+        )
+
+    def _bar_net_gamma(self, state: AppState, ts, close: float) -> "float | None":
+        """The net gamma of the bar at `ts`, or None when it cannot be known.
+        A replay, SimLab's or the live app's, never has a chain
+        (`gamma_history.refresh_chain` does not fetch one there), so it reads
+        only what the live app kept."""
+        sym_state = state.sym(self.ticker)
+        chain = None
+        if sym_state is not None:
+            with sym_state.lock:
+                chain = sym_state.options_chain
+        timeframe = getattr(state, "timeframe", None) or "1Min"
+        return gamma_history.at_close(self.ticker, timeframe, ts, close, chain)
+
+
+class DayRangeTrader(_DownGammaRule, _SitsOut, BaseTrader):
     """The day-range rules: one forecast at 9:35, then two resting levels.
 
     The model (HighLow or HighLow2) says where the session's high and low will
@@ -2245,6 +2399,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # The session `_sit_out` last wrote about, so its notes and its wait for
         # the briefing are each logged once a day rather than every minute.
         self._sit_out_noted: "dict" = {}
+        # The day a net gamma not known was last said to let a buy through
+        # (`_down_negative_gamma`), so it is said once a session.
+        self._gamma_unknown_noted = None
         # Set by a stop-out: the live loop stops the agent on it, and only a
         # fresh ▶ Start trades again. SimLab never reads it -- a replay has no
         # ▶ Start, so there the stand-down simply lasts the session.
@@ -2307,6 +2464,7 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             )
             return "no_data"
         self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
+        self._warm_chain(sym_state)
 
         # Before anything reads the levels, so an edit made in the sidebar
         # during the last minute is what this bar is judged against. The model
@@ -2376,6 +2534,9 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # A forecast just re-made for a switched model is the 9:35 one and has
         # not yet seen this bar, so it is moved even when the bar is not new.
         if (fresh_bar or replanned) and self.plan is not None:
+            # HighLow Chain's window forecast made at this bar's close, if this
+            # is a decision bar; `_update_range` swaps it in.
+            self._extend_windows(state, bundle, frame)
             # The high this bar is judged a breach of, recorded before the bar
             # is allowed to move it. Testing against the updated number would
             # be testing the bar against a level it had just pushed out of its
@@ -2558,15 +2719,22 @@ class DayRangeTrader(_SitsOut, BaseTrader):
 
         # A HighLow bundle fitted on IEX openings (MU, every HighLow2 one)
         # fetched its own IEX window and was fitted on IEX volume, so the IEX
-        # caveat does not describe it. A forecast taken back had its caveat
-        # logged by the run that made it.
+        # caveat does not describe it; nor one that reads no volume at all
+        # (MedianMove). A forecast taken back had its caveat logged by the run
+        # that made it.
         warning = (
             None if tape is None or (bundle.get("opening_feed") or "sip") != "sip"
+            or not bundle.get("reads_volume", True)
             else day_range.volume_scale_warning(tape)
         )
         if warning:
             _log(state, {"type": "status", "text": f"Forecast caveat: {warning}"})
         _log(state, {"type": "analysis", "text": self._plan_summary()})
+        # HighLow Chain: the window forecasts a run started after 10:30 has
+        # missed, so the restart's range and the catch-up below swap each in at
+        # its own bar; and the afternoon's inputs warmed ahead of 10:30.
+        self._extend_windows(state, bundle, frame)
+        self._prewarm_windows(state, bundle)
         if seed is not None:
             self._take_back_range(state, prior, frame)
         self._catch_up(state, frame)
@@ -2638,10 +2806,11 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             return
         history = plan.setdefault("history", [])
         recorded_to = pd.Timestamp(history[-1]["t"]) if history else None
-        revised, added = [], False
+        revised, remade, added = [], [], False
         for ts in missed:
-            if self._move_range(frame[frame.index <= ts], ts) is not None:
-                revised.append(ts)
+            before = self._move_range(frame[frame.index <= ts], ts)
+            if before is not None:
+                (remade if before.get("window") else revised).append(ts)
             self._set_levels(ts)
             if recorded_to is None or ts > recorded_to:
                 history.append(_levels_row(self.config, plan, ts))
@@ -2650,19 +2819,34 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             # Re-writes the last caught-up row (with an open position's stop, if
             # a restart resumed one) and publishes the record for the chart.
             self._record_levels(state, missed[-1])
-        if revised:
-            times = ", ".join(f"{ts:%H:%M}" for ts in revised[:8])
-            if len(revised) > 8:
-                times += f" and {len(revised) - 8} more"
+
+        def times(stamps: list) -> str:
+            out = ", ".join(f"{ts:%H:%M}" for ts in stamps[:8])
+            return out + (f" and {len(stamps) - 8} more" if len(stamps) > 8 else "")
+
+        if revised or remade:
+            what = []
+            if remade:
+                # A window forecast is made at a decision bar's close and read
+                # from the next bar: stamped with the minute it was made.
+                made = [ts + timedelta(minutes=1) for ts in remade]
+                what.append(
+                    f"the forecast was made again by {self._window_label()} at {times(made)}"
+                )
+            if revised:
+                what.append(
+                    ("it was revised" if remade else "the forecast was revised")
+                    + f" at the bars that traded outside it ({times(revised)})"
+                )
+            said = "; ".join(what)
             _log(
                 state,
                 {
                     "type": "analysis",
                     "text": (
                         f"{self.ticker}: caught up on the {len(missed)} bars since "
-                        f"{start:%H:%M}. The forecast was revised at the "
-                        f"bars that traded outside it ({times}); predicted range is now "
-                        f"${float(plan['pred_low']):,.2f} – ${float(plan['pred_high']):,.2f}, "
+                        f"{start:%H:%M}. " + said[0].upper() + said[1:] + "; predicted range "
+                        f"is now ${float(plan['pred_low']):,.2f} – ${float(plan['pred_high']):,.2f}, "
                         f"buy ${plan['buy_level']:,.2f}, sell ${plan['sell_level']:,.2f}."
                     ),
                 },
@@ -3150,14 +3334,37 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         needs positive momentum, or neutral momentum whose change is not
         negative -- flat, or about to rise.
         Without it, the legacy fall gate a stored record replays under
-        (`_refuse_falling`). Either way this bar only: the next is judged again.
+        (`_refuse_falling`). Then, with it on, no buy on a falling,
+        negative-gamma day (`_down_negative_gamma`). Either way this bar only:
+        the next is judged again.
         """
         if not self.config.momentum_confirmation_bars:
-            return self._refuse_falling(state, frame, ts)
+            if self._refuse_falling(state, frame, ts):
+                return True
+            return self._refuse_down_gamma(state, frame, ts)
         read = self._momentum_read(frame)
         if read is not None and read["row"].buy:
-            return False
+            return self._refuse_down_gamma(state, frame, ts)
         why = momentum_words(read) if read is not None else self._momentum_unknown(frame)
+        _log(
+            state,
+            {
+                "type": "status",
+                "text": (
+                    f"The {ts:%H:%M} bar traded down to the "
+                    f"${self.plan['buy_level']:,.2f} buy level, but {why}. Not buying "
+                    "yet; the next bar is judged again."
+                ),
+            },
+        )
+        return True
+
+    def _refuse_down_gamma(self, state: AppState, frame, ts) -> bool:
+        """Log and refuse a buy at the buy level on a falling, negative-gamma
+        day (`_down_negative_gamma`). This bar only, like the confirmation."""
+        why = self._down_negative_gamma(state, frame)
+        if why is None:
+            return False
         _log(
             state,
             {
@@ -3436,10 +3643,17 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         (`session_levels`) and must not invent a second reading of the same
         settings -- but it has no agent log to write to, and a decoration that
         logged would be a decoration with side effects.
+
+        On a HighLow Chain decision bar the window model's forecast made at its
+        close replaces the range whatever the breach rules (`_apply_window`);
+        the returned levels then carry it under `window`.
         """
         config, plan = self.config, self.plan
         if plan is None:
             return None
+        window = self._window_at(ts)
+        if window is not None and ts > plan["opening_end"]:
+            return self._apply_window(window, ts)
         # "off" with containment on still has work to do -- it does not lead
         # the tape, but it does not keep a high the tape has passed either --
         # so the early return is about having *neither*, not about the policy.
@@ -3491,6 +3705,145 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         # broke, which is what was extended.
         before["held_high"], before["held_low"] = held_high, held_low
         return before
+
+    # --- HighLow Chain: the forecast made again every five minutes ----------
+
+    def _window_at(self, ts) -> "dict | None":
+        """The chain's window forecast made at the close of bar `ts`, if it is
+        a decision bar the plan holds one for (`plan["windows"]`, keyed by
+        decision minute: the bar after `ts`)."""
+        windows = (self.plan or {}).get("windows")
+        if not windows:
+            return None
+        return windows.get(_chain().bar_minute(ts) + 1)
+
+    def _apply_window(self, row: dict, ts) -> dict:
+        """Replace the range with a window model's forecast made at the close
+        of bar `ts`, and rebuild the levels from it; the levels as they were.
+
+        The forecast is of the bars *after* `ts` -- from the decision minute to
+        13:30 (HighLow_1h) or the close (HighLow_4h) -- so the session's extremes
+        are read afresh from the next bar, starting from the price it was made
+        at, which is inside it: a breach is a bar trading outside this
+        forecast, not outside what the morning printed. A breach in progress
+        under "conditional" is dropped with the forecast it broke, and the
+        width a breach keeps (`forecast_width`) is this forecast's own.
+        """
+        plan = self.plan
+        self._set_levels(ts)
+        before = {k: float(plan[k]) for k in ("pred_high", "pred_low", "buy_level", "sell_level")}
+        high, low, price = float(row["pred_high"]), float(row["pred_low"]), float(row["price"])
+        plan["pred_high"], plan["pred_low"] = high, low
+        plan["forecast_width"] = high - low
+        plan["held"] = {}
+        plan["seen_high"] = plan["seen_low"] = price
+        plan["seen_to"] = ts
+        plan["window"] = {
+            "head": str(row["head"]),
+            "minute": int(row["minute"]),
+            "end": int(row["window_end"]),
+            "price": price,
+            "width": high - low,
+            "at": pd.Timestamp(ts).isoformat(),
+        }
+        plan["range_updates"] = int(plan.get("range_updates", 0)) + 1
+        self._set_levels(ts)
+        before["window"] = dict(plan["window"])
+        return before
+
+    def _window_label(self, window: "dict | None" = None) -> str:
+        """Which window model made the current forecast (or the chain's two)."""
+        from .highlow_window_model import HEADS
+
+        window = window or (self.plan or {}).get("window")
+        if window and window.get("head") in HEADS:
+            return HEADS[window["head"]].label
+        return "HighLow_1h / HighLow_4h"
+
+    def _extend_windows(self, state: AppState, bundle: dict, frame) -> None:
+        """HighLow Chain: take in the window forecasts made since the last cycle.
+
+        The chain's forecast is HighLow2's until 10:30, then the window model's
+        latest (`highlow_chain_model`). Each is asked for once its decision
+        bar has closed and kept in the plan; `_move_range` swaps it in at that
+        bar, which is also how a restart's catch-up and the chart's walk place
+        it. Nothing for any other model.
+
+        A decision that cannot be forecast -- no option table yet for the
+        afternoon model, a gap in the tape -- is said once (again only when the
+        reason changes), and the range stays where the last forecast, moved by
+        the breach rules, left it. A session the window models cannot forecast
+        at all (a 13:00 half day, a history too short) keeps HighLow2's all day,
+        said once; a failed fetch is tried again at the next bar.
+        """
+        plan = self.plan
+        if plan is None or (bundle or {}).get("kind") != "highlow_chain" or not len(frame):
+            return
+        chain = _chain()
+        through = chain.bar_minute(frame.index[-1])
+        windows = plan.setdefault("windows", {})
+        refused = plan.setdefault("window_problems", {})
+        due = [m for m in chain.decisions() if m - 1 <= through and m not in windows and m not in refused]
+        if not due or plan.get("windows_off"):
+            return
+        key, secret = ff_credentials(state)
+        try:
+            rows, problems = chain.window_forecasts(bundle, self.ticker, plan["date"], through, key, secret)
+        except ValueError as exc:
+            plan["windows_off"] = str(exc)
+            _log(state, {"type": "error", "text": (
+                f"{self.ticker}: HighLow Chain makes no HighLow_1h / HighLow_4h forecasts today, so "
+                f"HighLow2's 9:35 forecast stands all session, moved only by the breach rules: {exc}"
+            )})
+            return
+        except Exception as exc:  # noqa: BLE001 -- a fetch that failed; the next bar asks again
+            if plan.get("window_error") != str(exc):
+                plan["window_error"] = str(exc)
+                _log(state, {"type": "error", "text": (
+                    f"{self.ticker}: HighLow Chain could not fetch the window forecast "
+                    f"({exc}); the range stays as it is and the next bar asks again."
+                )})
+            return
+        plan.pop("window_error", None)
+        windows.update({m: rows[m] for m in due if m in rows})
+        fresh = {m: why for m, why in problems.items() if m in due}
+        refused.update(fresh)
+        for m, why in sorted(fresh.items()):
+            if why == plan.get("window_problem_said"):
+                continue
+            plan["window_problem_said"] = why
+            from .highlow_window_model import head_at
+
+            head = head_at(m)
+            made = (pd.Timestamp("09:30") + timedelta(minutes=m)).strftime("%H:%M")
+            _log(state, {"type": "status", "text": (
+                f"{self.ticker}: {head.label if head else 'the window model'} could not forecast at "
+                f"{made} — {why} The range stays where the last forecast, moved by the breach "
+                "rules, left it."
+            )})
+
+    def _prewarm_windows(self, state: AppState, bundle: dict) -> None:
+        """HighLow Chain, live only: fill what the window forecasts read -- the
+        minute tape, last night's option table, on an FOMC day every FOMC
+        session since 2024 -- in the background at 9:35, rather than holding
+        the 10:30 and 13:30 bars for it. A failure is not reported: the
+        forecast makes the same reads and reports its own."""
+        if (bundle or {}).get("kind") != "highlow_chain" or getattr(state, "bar_tape_override", ""):
+            return
+        plan = self.plan
+        if plan is None or plan.get("windows_warmed"):
+            return
+        plan["windows_warmed"] = True
+        chain, ticker, day = _chain(), self.ticker, plan["date"]
+        key, secret = ff_credentials(state)
+
+        def work() -> None:
+            try:
+                chain.warm_history(bundle, ticker, day, key, secret)
+            except Exception:  # noqa: BLE001 -- the forecast retries and reports
+                pass
+
+        threading.Thread(target=clock.inherit(work), name=f"highlow-chain-warm-{ticker}", daemon=True).start()
 
     def _held_breaches(self, frame, ts) -> "tuple[float | None, float | None]":
         """Which breaches "conditional" extends on this bar: for the high and
@@ -3605,6 +3958,10 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         revision `_read_extremes` does not count. (A run that holds its
         forecast through anything -- `off`, no containment -- reads no extremes
         at all.)
+
+        A HighLow Chain row made under a window forecast (`row["window"]`) takes
+        that forecast back with it: its width, and the session read from the
+        bar it was made at, as `_apply_window` left them.
         """
         plan = self.plan
         ts = _market_ts(row["t"], frame.index.tz)
@@ -3615,6 +3972,14 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         )
         plan["pred_high"], plan["pred_low"] = float(row["pred_high"]), float(row["pred_low"])
         plan["held"] = {side: dict(run) for side, run in (row.get("held") or {}).items()}
+        window = row.get("window")
+        if window:
+            at = _market_ts(window["at"], frame.index.tz)
+            plan["window"] = dict(window)
+            plan["forecast_width"] = float(window["width"])
+            if at <= ts:
+                plan["seen_high"] = plan["seen_low"] = float(window["price"])
+                plan["seen_to"] = at
         high, low = self._read_extremes(frame[frame.index <= ts], ts)
         plan["seen_high"] = min(high, plan["pred_high"])
         plan["seen_low"] = max(low, plan["pred_low"])
@@ -3632,7 +3997,12 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         that reported levels that had not changed (or missed ones that had)
         would be the reader's problem on every grinding session, which is
         exactly when it matters.
+
+        A HighLow Chain forecast made again by a window model writes its own
+        line (`_window_summary`).
         """
+        if before.get("window"):
+            return self._window_summary(ts, before)
         plan, config = self.plan, self.config
         moved = []
         breached_high = before.get("breached_high", plan["pred_high"] != before["pred_high"])
@@ -3702,9 +4072,18 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             # Containment alone, with nothing breached this bar, cannot move a
             # side -- but say something true rather than nothing if it ever does.
             moved.append("the forecast was widened to hold the session so far")
+        return (
+            f"{self.ticker} forecast updated at {ts:%H:%M}: {', and '.join(moved)}. "
+            f"Predicted range is now ${float(plan['pred_low']):,.2f} – "
+            f"${float(plan['pred_high']):,.2f} ({how}). {self._levels_moved(before)}"
+        )
+
+    def _levels_moved(self, before: dict) -> str:
+        """What a moved forecast did to the two levels, from the levels themselves."""
+        plan, config = self.plan, self.config
         if config.sells_above_fill and self.entry is not None:
             # The sell hangs off the open position, which no forecast moves.
-            levels = (
+            return (
                 f"The buy level is built from the predicted high: ${plan['buy_level']:,.2f}"
                 + (
                     "" if plan["buy_level"] == before["buy_level"]
@@ -3712,22 +4091,30 @@ class DayRangeTrader(_SitsOut, BaseTrader):
                 )
                 + f". The sell stays {sell_phrase(config)}, at ${plan['sell_level']:,.2f}."
             )
-        elif plan["buy_level"] == before["buy_level"]:
+        if plan["buy_level"] == before["buy_level"]:
             # Only the low moved. Nothing this strategy rests on hangs off it.
-            levels = (
+            return (
                 f"The buy and sell levels are built from the predicted high, so they stay "
                 f"at ${plan['buy_level']:,.2f} and ${plan['sell_level']:,.2f}."
             )
-        else:
-            levels = (
-                f"Both levels are rebuilt from it: buy ${plan['buy_level']:,.2f} (was "
-                f"${before['buy_level']:,.2f}), sell ${plan['sell_level']:,.2f} (was "
-                f"${before['sell_level']:,.2f})."
-            )
         return (
-            f"{self.ticker} forecast updated at {ts:%H:%M}: {', and '.join(moved)}. "
-            f"Predicted range is now ${float(plan['pred_low']):,.2f} – "
-            f"${float(plan['pred_high']):,.2f} ({how}). {levels}"
+            f"Both levels are rebuilt from it: buy ${plan['buy_level']:,.2f} (was "
+            f"${before['buy_level']:,.2f}), sell ${plan['sell_level']:,.2f} (was "
+            f"${before['sell_level']:,.2f})."
+        )
+
+    def _window_summary(self, ts, before: dict) -> str:
+        """The line a HighLow Chain decision writes: which window model made
+        the forecast again, for which stretch, from what price."""
+        plan, window = self.plan, before["window"]
+        made = ts + timedelta(minutes=1)
+        until = "13:30" if int(window["end"]) < 390 else "the close"
+        return (
+            f"{self.ticker} forecast made again at {made:%H:%M} by {self._window_label(window)}: "
+            f"the high and low from now to {until}, from ${float(window['price']):,.2f}, are "
+            f"${float(plan['pred_low']):,.2f} – ${float(plan['pred_high']):,.2f} (was "
+            f"${before['pred_low']:,.2f} – ${before['pred_high']:,.2f}). "
+            f"{self._levels_moved(before)}"
         )
 
     # --- the check on an open position -------------------------------------
@@ -4515,13 +4902,36 @@ class DayRangeTrader(_SitsOut, BaseTrader):
             else f"sell at ${plan['sell_level']:,.2f} (ref − {config.sell_k:g} × "
             f"{config.unit_phrase})"
         )
+        chain = ""
+        if plan.get("chain"):
+            # HighLow Chain: the predicted high is flat only until 10:30.
+            rests = (
+                f"The {'buy level rests' if above else 'levels rest'} under the predicted high."
+            )
+            chain = (
+                " From 10:30 the forecast is made again every five minutes, and the levels "
+                "rebuilt from it: by HighLow_1h (the high and low from then to 13:30) to 13:25, "
+                "then by HighLow_4h (from then to the close)."
+            )
+        median = plan.get("median_move")
+        if median:
+            # MedianMove: where the two numbers came from, since no model made them.
+            made = pd.Timestamp(plan["opening_end"]) + timedelta(minutes=1)
+            chain += (
+                f" No model: the high is the {made:%H:%M} price "
+                f"${float(median['price']):,.2f} plus the median move up of the last "
+                f"{int(median['sessions'])} sessions ({float(median['up']):.2f} × the 14-day "
+                f"range), the low that price less the median move down "
+                f"({float(median['down']):.2f} ×), each widened where needed to the opening "
+                "minutes' high and low."
+            )
         return (
             f"{self.ticker} forecast for {span}, from the first "
             f"{plan['opening_end']:%H:%M} minutes: high ${plan['pred_high']:,.2f}, low "
             f"${plan['pred_low']:,.2f}{day} (yesterday's average ${plan['prev_avg']:,.2f}, "
             f"14-day average range ${plan['adr14_abs']:,.2f}). {rests} Buy at "
             f"${plan['buy_level']:,.2f} (ref − {config.buy_k:g} × {config.unit_phrase}), "
-            f"{sell}. {held}"
+            f"{sell}. {held}{chain}"
         )
 
     def _read_summary(self, bar, ts, position: float, frame=None) -> str:
@@ -4534,9 +4944,15 @@ class DayRangeTrader(_SitsOut, BaseTrader):
         ]
         updates = int(plan.get("range_updates") or 0)
         if updates:
-            # So a level read off this line is never mistaken for the 9:35 one.
+            # So a level read off this line is never mistaken for the 9:35 one
+            # -- or, under HighLow Chain, for another window model's.
+            window = plan.get("window")
+            made = (
+                f" ({self._window_label(window)} {pd.Timestamp(window['at']) + timedelta(minutes=1):%H:%M})"
+                if window else ""
+            )
             parts.append(
-                f"H ${plan['pred_high']:,.2f} / L ${plan['pred_low']:,.2f}, "
+                f"H ${plan['pred_high']:,.2f} / L ${plan['pred_low']:,.2f}{made}, "
                 f"updated ×{updates}"
             )
         if self.config.momentum_confirmation_bars and frame is not None:
@@ -4649,7 +5065,9 @@ def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
     mid-session (`_adopt_form_model`). `held`, only while "conditional" is
     counting a breach towards its extension, is that count
     (`DayRangeTrader._held_breaches`), so a restart from this row goes on
-    counting."""
+    counting. `window`, under HighLow Chain from 10:30, is the window forecast
+    the range hangs off (`DayRangeTrader._apply_window`), so a restart takes
+    that back too."""
     row = {
         "t": ts,
         "model_key": config.model_key,
@@ -4662,6 +5080,8 @@ def _levels_row(config: AppleTraderConfig, plan: dict, ts) -> dict:
     }
     if plan.get("held"):
         row["held"] = {side: dict(run) for side, run in plan["held"].items()}
+    if plan.get("window"):
+        row["window"] = dict(plan["window"])
     return row
 
 
@@ -4725,6 +5145,14 @@ def session_levels(
         ),
         **forecast,
     }
+    if forecast.get("chain"):
+        # HighLow Chain: the window forecasts made through the last bar, each
+        # swapped in at its decision bar as the running agent swaps it in.
+        windows = forecast.get("windows")
+        if windows is None:
+            windows = chain_windows(config.ticker, session)
+        trader.plan["windows"] = {int(m): row for m, row in (windows or {}).items()}
+
     def row(ts) -> dict:
         return _levels_row(config, trader.plan, ts)
 
@@ -4744,6 +5172,28 @@ def session_levels(
         trader._set_levels(ts)
         out.append(row(ts))
     return out
+
+
+def chain_windows(ticker: str, session) -> "dict[int, dict]":
+    """HighLow Chain's window forecasts made through the last bar of `session`
+    (a day's minute frame), for a walk that has none in hand -- or {} when
+    there are none to be had. Read with the environment's Alpaca keys, and
+    without waiting for a bar IEX has not published: a drawing takes what is
+    there. The forecasts a running agent has made are memoised, so a chart
+    beside it asks Alpaca for nothing."""
+    if not len(session):
+        return {}
+    try:
+        bundle = apple_models.load(apple_models.HIGHLOW_CHAIN_KEY, ticker)
+        if bundle is None:
+            return {}
+        chain = _chain()
+        last = session.index[-1]
+        day = pd.Timestamp(last).tz_convert(market_hours.MARKET_TZ).normalize().tz_localize(None)
+        rows, _ = chain.window_forecasts(bundle, ticker, day, chain.bar_minute(last), wait=False)
+    except Exception:  # noqa: BLE001 -- a drawing without the windows is HighLow2's alone
+        return {}
+    return rows
 
 
 # --- Fast&Furious's rules (`FastFuriousTrader`) -------------------------------
@@ -5289,7 +5739,7 @@ def _session_clock(minute: int) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-class GoodMomentsTrader(_SitsOut, BaseTrader):
+class GoodMomentsTrader(_DownGammaRule, _SitsOut, BaseTrader):
     """GoodMoments' rules: the chance of a +0.2 ADR rise, at every bar.
 
     At the close of every bar the model says how likely it is that a later bar
@@ -5382,6 +5832,11 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         # The last reason the confirmation refused an entry, so a stretch of
         # refused bars is logged once.
         self._momentum_note: "str | None" = None
+        # Whether the last bar was refused as a falling, negative-gamma one, for
+        # the same reason; and the day a net gamma not known was last said to
+        # let a buy through (`_down_negative_gamma`).
+        self._gamma_note = False
+        self._gamma_unknown_noted = None
         # The raised entry last said to have refused one (the circuit breaker),
         # for the same reason.
         self._breaker_note: "float | None" = None
@@ -5410,6 +5865,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
             return rule_agent.NO_DATA
         self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
+        self._warm_chain(sym_state)
         if self.blocked is not None:
             return rule_agent.NO_DATA
         if self.session is None:
@@ -5538,6 +5994,8 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             return sold
         if self._refuse_on_momentum(state, frame, ts):
             return sold
+        if self._refuse_on_gamma(state, frame, ts):
+            return sold
         if self.entry_refused(state, ts):
             return sold
         return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else sold
@@ -5576,7 +6034,7 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         ))
         return True
 
-    # --- what a hybrid adds (`HighLow2GoodMomentsTrader`) ---------------------
+    # --- what a hybrid adds (`HybridGoodMomentsTrader`) ----------------------
 
     def _after_forecast(self, bundle: dict, state: AppState, frame, today, ts) -> None:
         """What else a new bar is read for once its forecast is in, before it
@@ -5675,6 +6133,22 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
             _log(state, {"type": "status", "text": (
                 f"The edge calls for a buy at {ts:%H:%M}, but {why}. Not buying yet; each "
                 "bar is judged again."
+            )})
+        return True
+
+    def _refuse_on_gamma(self, state: AppState, frame, ts) -> bool:
+        """Whether a falling, negative-gamma day refuses an entry the edge
+        calls for (`_down_negative_gamma`). Said once per stretch of refused
+        bars; the next bar is judged again."""
+        why = self._down_negative_gamma(state, frame)
+        if why is None:
+            self._gamma_note = False
+            return False
+        if not self._gamma_note:
+            self._gamma_note = True
+            _log(state, {"type": "status", "text": (
+                f"The edge calls for a buy at {ts:%H:%M}, but {why}. Not buying while both "
+                "are; each bar is judged again."
             )})
         return True
 
@@ -6009,65 +6483,93 @@ class GoodMomentsTrader(_SitsOut, BaseTrader):
         return " · ".join(parts)
 
 
-# --- HighLow2 + GoodMoments --------------------------------------------------
+# --- the hybrids: GoodMoments' rules, a day-range model voting ----------------
 
 
-class HighLow2GoodMomentsTrader(GoodMomentsTrader):
-    """GoodMoments' rules, with HighLow2's buy level as a second vote.
+class HybridGoodMomentsTrader(GoodMomentsTrader):
+    """GoodMoments' rules, with a day-range model's buy level as a second vote.
 
-    The user's design (2026-10-21):
+    The user's design (2026-10-21, on HighLow2; on HighLow 2026-11-05):
 
-    * **the opening window** (09:30-09:34, the bars HighLow2's forecast is made
-      from, before it exists): a buy is GoodMoments' alone -- the edge at the
-      entry, as `GoodMomentsTrader` buys;
+    * **the opening window** (09:30-09:34, the bars the levels model's forecast
+      is made from, before it exists): a buy is GoodMoments' alone -- the edge
+      at the entry, as `GoodMomentsTrader` buys;
     * **from the 09:35 bar on**: a buy needs both -- the edge at the entry *and*
-      the bar's close at or under HighLow2's buy level, `H - buy_k x unit`
-      under its predicted high, the price a HighLow2 run would rest its buy
-      at. The close rather than the bar's low because the order here is sent
-      once the bar has closed, at the market, and HighLow2's own buy is a limit
-      at its level: a bar that dipped to the level and closed back above it
-      would not have filled HighLow2 either;
+      the bar's close at or under the levels model's buy level, `H - buy_k x
+      unit` under its predicted high, the price a run of that model would rest
+      its buy at. The close rather than the bar's low because the order here
+      is sent once the bar has closed, at the market, and the day-range buy is
+      a limit at its level: a bar that dipped to the level and closed back
+      above it would not have filled that run either;
     * **every exit is GoodMoments'**: the take and the stop in ADRs from the
       fill (and the take's fall with the intraday volatility curve), the pause
       after a stop, the optional sale on a fading edge and the momentum hold,
       the flatten.
 
-    HighLow2's level is the one a HighLow2 run would rest, walked by the same
-    code: a `DayRangeTrader` whose plan is made from the same opening window by
-    `session_forecast`, moved through a breach under this configuration's
-    `breach_update`, `keep_width` and `contain_range` (`_move_range`). It only
-    votes. It rests nothing, and nothing of HighLow2's exit applies -- the sell
-    level, its stop, the momentum take, the breaker and the ladder are the
-    day-range rules', not HighLow2's model, and this trades GoodMoments'.
+    Which model votes is the registry's (`apple_models.levels_of`), and its
+    bundle rides in GoodMoments' under that key. Its level is the one a run of
+    it would rest, walked by the same code: a `DayRangeTrader` whose plan is
+    made from the same opening window by `session_forecast`, moved through a
+    breach under this configuration's `breach_update`, `keep_width` and
+    `contain_range` (`_move_range`). It only votes. It rests nothing, and
+    nothing of the day-range exit applies -- the sell level, its stop, the
+    momentum take, the breaker and the ladder are the day-range rules', not
+    the model's, and this trades GoodMoments'.
 
-    A session HighLow2 cannot forecast is traded on GoodMoments alone through
-    the opening window and buys nothing after it -- there is no second vote to
-    agree -- which is logged once; a position held then keeps its exits.
+    A restart the same day takes back the forecast today's earlier run voted
+    with (its record's memory, `levels_seed`) rather than making it again, as
+    `DayRangeTrader._plan_session` does and for its reason: HighLow made again
+    after 09:50 reads SIP's windows where 9:35 had IEX's, and comes out
+    different. The range is walked again from it over the session so far.
+
+    A session the levels model cannot forecast is traded on GoodMoments alone
+    through the opening window and buys nothing after it -- there is no second
+    vote to agree -- which is logged once; a position held then keeps its exits.
     """
 
+    #: The hybrid a trader built without a configuration runs.
+    DEFAULT_KEY = apple_models.HIGHLOW2_GOODMOMENTS_KEY
+
     def __init__(self, config: "AppleTraderConfig | None" = None) -> None:
-        super().__init__(
-            config or AppleTraderConfig(model_key=apple_models.HIGHLOW2_GOODMOMENTS_KEY)
-        )
-        # HighLow2's levels as a HighLow2 run would rest them, the plan set at
-        # the close of the opening window; None before it, or with no forecast.
+        super().__init__(config or AppleTraderConfig(model_key=self.DEFAULT_KEY))
+        # The levels model's levels as a run of it would rest them, the plan
+        # set at the close of the opening window; None before it, or with no
+        # forecast.
         self.levels: "DayRangeTrader | None" = None
-        # Why HighLow2 has no forecast today, once it is known.
+        # Why the levels model has no forecast today, once it is known.
         self.levels_problem: "str | None" = None
         self._levels_day = None
-        # How many bars the opening window is: read off HighLow2's bundle at
-        # the first bar, the 5 every HighLow2 bundle carries until then.
+        # The forecast today's earlier run voted with, taken back on a restart
+        # (`_resume`); None otherwise.
+        self._levels_seed: "dict | None" = None
+        # How many bars the opening window is: read off the levels model's
+        # bundle at the first bar, the 5 every HighLow bundle carries until then.
         self.window_minutes = 5
         # The bar the vote last refused a buy on, so a run of refusals is
         # logged once.
         self._levels_refused_at = None
 
-    # --- HighLow2's levels -------------------------------------------------
+    @property
+    def levels_key(self) -> str:
+        """The model whose buy level votes, and its bundle's key."""
+        return apple_models.levels_of(self.config.model_key) or apple_models.HIGHLOW2_KEY
+
+    @property
+    def levels_name(self) -> str:
+        """What the log calls it: "HighLow", "HighLow2"."""
+        return apple_models.get(self.levels_key).label.replace(" model", "")
+
+    # --- the levels model's levels -------------------------------------------
+
+    def _roll_session(self, today) -> None:
+        if self.session is not None and self.session["date"] != today:
+            self._levels_seed = None
+        super()._roll_session(today)
 
     def _after_forecast(self, bundle: dict, state: AppState, frame, today, ts) -> None:
-        """Make HighLow2's forecast once its window has closed, and move its
-        levels with every bar after it."""
-        part = bundle.get(apple_models.HIGHLOW2_KEY)
+        """Make the levels model's forecast once its window has closed, and
+        move its levels with every bar after it."""
+        part = bundle.get(self.levels_key)
         self.window_minutes = day_range.opening_minutes(part)
         if self._levels_day != today:
             self.levels, self.levels_problem, self._levels_day = None, None, today
@@ -6079,36 +6581,53 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
             self._move_levels(state, frame, ts)
 
     def _plan_levels(self, part: "dict | None", state: AppState, frame, today) -> None:
-        """HighLow2's 9:35 forecast and its buy level, walked on through every
-        bar since -- a run started late reads the session as one up since
-        9:35 would have. A failure is the day's: logged once, and every buy
-        after the window refused (`_refuse_on_levels`)."""
-        try:
-            if part is None:
-                raise ValueError("the bundle carries no HighLow2 model")
-            opening, _tape = fetch_opening_window(state, frame, self.window_minutes, ticker=self.ticker)
-            # A replay's state carries placeholder keys, as `DayRangeTrader` says.
-            replayed = bool(getattr(state, "bar_tape_override", ""))
-            forecast, open_price = session_forecast(
-                part, self.ticker, opening, today,
-                key=None if replayed else state.api_key,
-                secret=None if replayed else state.api_secret,
-            )
-        except Exception as exc:  # noqa: BLE001 -- the day's second vote, not the run
-            self.levels_problem = str(exc)
-            _log(state, {"type": "error", "text": (
-                f"HighLow2 cannot forecast today's {self.ticker} range ({exc}), so after the "
-                "opening window nothing is bought — the two models have to agree there. "
-                "Positions keep GoodMoments' exits."
-            )})
-            return
+        """The levels model's 9:35 forecast and its buy level, walked on
+        through every bar since -- a run started late reads the session as one
+        up since 9:35 would have. A restart takes the earlier run's forecast
+        back (`_taken_back_seed`). A failure is the day's: logged once, and
+        every buy after the window refused (`_refuse_on_levels`)."""
+        name = self.levels_name
+        seed = self._taken_back_seed(frame, today)
+        if seed is not None:
+            forecast = dict(seed["forecast"])
+            opening_end = _market_ts(seed["opening_end"], frame.index.tz)
+            open_price = float(seed["open_price"])
+        else:
+            try:
+                if part is None:
+                    raise ValueError(f"the bundle carries no {name} model")
+                opening, _tape = fetch_opening_window(state, frame, self.window_minutes, ticker=self.ticker)
+                # A replay's state carries placeholder keys, as `DayRangeTrader` says.
+                replayed = bool(getattr(state, "bar_tape_override", ""))
+                forecast, open_price = session_forecast(
+                    part, self.ticker, opening, today,
+                    key=None if replayed else state.api_key,
+                    secret=None if replayed else state.api_secret,
+                )
+            except Exception as exc:  # noqa: BLE001 -- the day's second vote, not the run
+                self.levels_problem = str(exc)
+                _log(state, {"type": "error", "text": (
+                    f"{name} cannot forecast today's {self.ticker} range ({exc}), so after the "
+                    "opening window nothing is bought — the two models have to agree there. "
+                    "Positions keep GoodMoments' exits."
+                )})
+                return
+            opening_end = opening.index[-1]
+            open_price = float(open_price or opening["open"].iloc[0])
         walker = DayRangeTrader(self.config)
-        opening_end = opening.index[-1]
         walker.plan = {
             "date": today,
             "opening_end": opening_end,
-            "open_price": float(open_price or opening["open"].iloc[0]),
+            "open_price": open_price,
             **forecast,
+        }
+        # What the vote started from, kept in the record's memory so a restart
+        # votes with the same forecast.
+        walker.plan["seed"] = {
+            "forecast": dict(forecast),
+            "opening_end": opening_end,
+            "open_price": open_price,
+            "model_key": self.config.model_key,
         }
         walker._set_levels(opening_end)
         for ts in frame.index:
@@ -6118,8 +6637,9 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
         self.levels = walker
         plan = walker.plan
         _log(state, {"type": "analysis", "text": (
-            f"HighLow2's forecast for {self.ticker} at the {opening_end:%H:%M} bar: high "
-            f"${float(plan['pred_high']):,.2f}, low ${float(plan['pred_low']):,.2f}"
+            f"{name}'s forecast for {self.ticker} at the {opening_end:%H:%M} bar"
+            + (" (taken back from today's earlier run)" if seed is not None else "")
+            + f": high ${float(plan['pred_high']):,.2f}, low ${float(plan['pred_low']):,.2f}"
             + (f" (moved since: buy level now ${plan['buy_level']:,.2f})"
                if plan.get("range_updates") else "")
             + f". From the bar after it a buy also needs the close at or under its buy level, "
@@ -6130,17 +6650,26 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
             + "."
         )})
 
+    def _taken_back_seed(self, frame, today) -> "dict | None":
+        """The forecast today's earlier run on this hybrid voted with, when this
+        run is its restart (`_resume`), else None."""
+        seed = self._levels_seed
+        if not seed or seed.get("model_key") != self.config.model_key:
+            return None
+        made_at = _market_ts(seed["opening_end"], frame.index.tz)
+        return seed if pd.Timestamp(made_at.date()) == pd.Timestamp(today) else None
+
     def _move_levels(self, state: AppState, frame, ts) -> None:
         """This bar's breach, if it made one: the forecast and the buy level
-        moved as a HighLow2 run would move them, said in one line."""
+        moved as a run of the levels model would move them, said in one line."""
         before = self.levels._move_range(frame, ts)
         self.levels._set_levels(ts)
         if before is None:
             return
         plan = self.levels.plan
         _log(state, {"type": "analysis", "text": (
-            f"HighLow2's forecast for {self.ticker} moved at {ts:%H:%M}, the session having "
-            f"traded outside it: range now ${float(plan['pred_low']):,.2f} – "
+            f"{self.levels_name}'s forecast for {self.ticker} moved at {ts:%H:%M}, the session "
+            f"having traded outside it: range now ${float(plan['pred_low']):,.2f} – "
             f"${float(plan['pred_high']):,.2f}, buy level ${plan['buy_level']:,.2f} "
             f"(was ${before['buy_level']:,.2f})."
         )})
@@ -6152,27 +6681,28 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
     # --- the vote ------------------------------------------------------------
 
     def _refuse_on_levels(self, state: AppState, frame, ts, bar, minute: int) -> bool:
-        """Whether HighLow2 refuses the buy the edge calls for: never inside
-        the opening window; after it, unless the bar closed at or under its buy
-        level. Said once per run of refused bars; the next bar is judged
-        again."""
+        """Whether the levels model refuses the buy the edge calls for: never
+        inside the opening window; after it, unless the bar closed at or under
+        its buy level. Said once per run of refused bars; the next bar is
+        judged again."""
         if minute < self.window_minutes:
             return False
         level, close = self._buy_level(), float(bar["close"])
         if level is not None and close <= level:
             self._levels_refused_at = None
             return False
+        name = self.levels_name
         if level is None:
             why = (
-                f"HighLow2 has no forecast today ({self.levels_problem})"
+                f"{name} has no forecast today ({self.levels_problem})"
                 if self.levels_problem else
-                f"HighLow2's forecast is not made yet (it needs the first {self.window_minutes} "
+                f"{name}'s forecast is not made yet (it needs the first {self.window_minutes} "
                 "bars of the session)"
             )
         else:
             plan = self.levels.plan
             why = (
-                f"${close:,.2f} is above HighLow2's ${level:,.2f} buy level "
+                f"${close:,.2f} is above {name}'s ${level:,.2f} buy level "
                 f"({self.config.buy_k:g} × the {self.config.unit_phrase} under its predicted high "
                 f"${float(plan['pred_high']):,.2f})"
             )
@@ -6188,11 +6718,11 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
     def _entry_note(self, bar, minute: int) -> str:
         if minute < self.window_minutes:
             return (
-                "Inside the opening window, before HighLow2's forecast: GoodMoments' "
+                f"Inside the opening window, before {self.levels_name}'s forecast: GoodMoments' "
                 "signal alone. "
             )
         return (
-            f"HighLow2 agrees: the ${float(bar['close']):,.2f} close is at or under its "
+            f"{self.levels_name} agrees: the ${float(bar['close']):,.2f} close is at or under its "
             f"${self._buy_level():,.2f} buy level. "
         )
 
@@ -6201,18 +6731,28 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
     def _plan_session(self, bundle: dict, state: AppState, today) -> bool:
         planned = super()._plan_session(bundle, state, today)
         if planned:
+            name = self.levels_name
             _log(state, {"type": "analysis", "text": (
-                f"Hybrid with HighLow2: through the opening window (its first "
+                f"Hybrid with {name}: through the opening window (its first "
                 f"{self.window_minutes} bars) a buy is GoodMoments' alone; from the bar after "
-                f"it, it also needs the close at or under HighLow2's buy level, "
+                f"it, it also needs the close at or under {name}'s buy level, "
                 f"{self.config.buy_k:g} × the {self.config.unit_phrase} under its predicted "
                 "high. Every exit is GoodMoments'."
             )})
         return planned
 
+    def _resume(self, state: AppState, memory: "dict | None") -> None:
+        super()._resume(state, memory)
+        self._levels_seed = dict((memory or {}).get("levels_seed") or {}) or None
+
+    def memory(self) -> dict:
+        """GoodMoments' memory, with the forecast the vote was made with."""
+        plan = self.levels.plan if self.levels is not None else None
+        return {**super().memory(), "levels_seed": dict(plan["seed"]) if plan else None}
+
     def _row(self, ts, bar) -> dict:
-        """GoodMoments' row, with HighLow2's levels from the bar after its
-        window: what the chart draws the buy level from."""
+        """GoodMoments' row, with the levels model's levels from the bar after
+        its window: what the chart draws the buy level from."""
         row = super()._row(ts, bar)
         plan = self.levels.plan if self.levels is not None else None
         after = plan is not None and ts > plan["opening_end"]
@@ -6225,13 +6765,32 @@ class HighLow2GoodMomentsTrader(GoodMomentsTrader):
 
     def _read_summary(self, bar, ts, position: float, minute: int, frame=None) -> str:
         text = super()._read_summary(bar, ts, position, minute, frame)
-        level = self._buy_level()
+        level, name = self._buy_level(), self.levels_name
         if minute < self.window_minutes:
-            return text + " · HighLow2: opening window, GoodMoments alone"
+            return text + f" · {name}: opening window, GoodMoments alone"
         if level is None:
-            return text + " · no HighLow2 buy level"
+            return text + f" · no {name} buy level"
         side = "at or under" if float(bar["close"]) <= level else "above"
-        return text + f" · HighLow2 buy ${level:,.2f} (close {side})"
+        return text + f" · {name} buy ${level:,.2f} (close {side})"
+
+
+class HighLow2GoodMomentsTrader(HybridGoodMomentsTrader):
+    """HighLow2 + GoodMoments (2026-10-21, AAPL): HighLow2 votes."""
+
+    DEFAULT_KEY = apple_models.HIGHLOW2_GOODMOMENTS_KEY
+
+
+class HighLowGoodMomentsTrader(HybridGoodMomentsTrader):
+    """HighLow + GoodMoments (2026-11-05: AMD, AAPL, NVDA, MU): HighLow votes."""
+
+    DEFAULT_KEY = apple_models.HIGHLOW_GOODMOMENTS_KEY
+
+
+# Which trader each hybrid runs on (`build_trader`).
+HYBRID_TRADERS = {
+    apple_models.HIGHLOW2_GOODMOMENTS_KEY: HighLow2GoodMomentsTrader,
+    apple_models.HIGHLOW_GOODMOMENTS_KEY: HighLowGoodMomentsTrader,
+}
 
 
 def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
@@ -6245,8 +6804,8 @@ def build_trader(config: AppleTraderConfig, bundle: "dict | None" = None):
     """
     if config.strategy == apple_models.STRATEGY_MOMENTUM:
         return FastFuriousTrader(config)
-    if config.model_key == apple_models.HIGHLOW2_GOODMOMENTS_KEY:
-        return HighLow2GoodMomentsTrader(config)
+    if config.model_key in HYBRID_TRADERS:
+        return HYBRID_TRADERS[config.model_key](config)
     if config.strategy == apple_models.STRATEGY_PROBABILITY:
         return GoodMomentsTrader(config)
     return DayRangeTrader(config)
@@ -6342,7 +6901,7 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         "chance on the clock and today's volatility alone, and buys when the first is at least "
         f"{config.gm_enter:+g} over the second (no new entry after 15:30). It sells "
         + (f"{', '.join(exits[:-1])}, or {exits[-1]}." if len(exits) > 1 else f"{exits[0]}.")
-        + confirm
+        + confirm + _down_gamma_sentence(config)
     )
 
 
@@ -6456,7 +7015,7 @@ def _armed_summary(
             f"{config.sell_gain_k:g} × the {config.unit_phrase} above the price it fills at"
             if config.sells_above_fill else f"{config.sell_k:g} below it"
         )
-        + f", until the closing flatten.{breach}{no_fall}"
+        + f", until the closing flatten.{breach}{no_fall}{_down_gamma_sentence(config)}"
         f"{managed}{breaker}"
     )
 

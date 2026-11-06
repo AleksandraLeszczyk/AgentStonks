@@ -211,9 +211,9 @@ class TestLiveOptionWalls:
         return sym_state
 
     def _stub_fetch(self, monkeypatch, calls, release=None):
-        from agent_stonks import ui
-        monkeypatch.setattr(ui, "_option_fetch_tried", {})
-        monkeypatch.setattr(ui, "_option_fetch_running", set())
+        from agent_stonks import gamma_history
+        monkeypatch.setattr(gamma_history, "_fetch_tried", {})
+        monkeypatch.setattr(gamma_history, "_fetch_running", set())
 
         def fetch(sym, spot=None):
             calls.append(sym)
@@ -221,7 +221,7 @@ class TestLiveOptionWalls:
                 release.wait(2)
             return self.CHAIN
 
-        monkeypatch.setattr(ui, "fetch_options_walls_data", fetch)
+        monkeypatch.setattr(gamma_history, "fetch_options_walls_data", fetch)
 
     def test_nothing_selected_fetches_nothing(self, monkeypatch):
         from agent_stonks.ui import _live_option_walls
@@ -240,7 +240,7 @@ class TestLiveOptionWalls:
 
     def test_gamma_flip_is_where_net_gamma_changes_sign_nearest_the_last_trade(self, monkeypatch):
         from agent_stonks.options import gamma_flip, net_gamma_exposure
-        from agent_stonks import ui
+        from agent_stonks import gamma_history
         from agent_stonks.ui import _live_option_walls
         self._stub_fetch(monkeypatch, [])
         # Puts at 90 and 110, calls at 100: net gamma flips near 95 and 105.
@@ -251,7 +251,7 @@ class TestLiveOptionWalls:
             "calls_iv": [0.3] * 3, "puts_iv": [0.3] * 3, "t_years": 5 / 365, "spot": 100.0,
         }
         # The background refresh hands back this chain, not the class's.
-        monkeypatch.setattr(ui, "fetch_options_walls_data", lambda sym, spot=None: chain)
+        monkeypatch.setattr(gamma_history, "fetch_options_walls_data", lambda sym, spot=None: chain)
         sym_state = self._sym_state(chain)
         sym_state.last_price = 106.0
         levels = _live_option_walls(sym_state, ["gamma_flip"])

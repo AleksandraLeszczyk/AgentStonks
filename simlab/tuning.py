@@ -920,10 +920,12 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
     A run with days off (`skip_events`) also reads the days-off calendar, the
     symbol's kept earnings dates and the briefing verdicts of its own sessions
     (`event_days`): a row added to the calendar can take a session out of it.
+    One with the negative-gamma rule (`no_buy_down_negative_gamma`) reads the
+    net gamma the live app kept for each session (`gamma_history`).
     """
     from . import data as sim_data
     from .session_context import EARNINGS_DIR
-    from agent_stonks import apple_models, event_days
+    from agent_stonks import apple_models, event_days, gamma_history
 
     symbol = config.ticker.upper()
     paths = [sim_data.market_path(), sim_data.stored_daily_path(symbol, feed)]
@@ -935,12 +937,13 @@ def _replay_inputs(config: AppleTraderConfig, days, feed) -> "list[Path]":
         # so the momentum confirmation's neutral band) is measured from.
         for prior in minute_momentum.prior_week_days(stamp):
             paths.append(sim_data.stored_bars_path(symbol, prior, feed))
-    # The saved model the run reads.
-    bundle = apple_models.get(config.model_key).path(symbol)
-    paths.extend(sorted(bundle.parent.glob(f"{bundle.stem}*")))
+    # The saved model the run reads (all three of HighLow Chain's).
+    paths.extend(apple_models.bundle_files(config.model_key, symbol))
     if config.skip_events:
         paths += [event_days.CALENDAR_PATH, EARNINGS_DIR / f"{symbol}.json"]
         paths += [event_days.verdicts_path(date.fromisoformat(str(d)[:10])) for d in days or ()]
+    if config.no_buy_down_negative_gamma:
+        paths += [gamma_history.kept_path(symbol, "1Min", str(d)[:10]) for d in days or ()]
     return paths
 
 
