@@ -487,9 +487,9 @@ def render_agents_tab() -> None:
 # ---------------------------------------------------------------------------
 
 def _incomplete_note(item: "sim_data.IncompleteFile") -> str:
-    """What happens next to a stored day that is not whole."""
-    if datetime.now(timezone.utc) < sim_data.day_final_at(item.day):
-        return "re-downloaded once the day is over"
+    """What happens next to a stored day that is short of its session."""
+    if datetime.now(timezone.utc) < sim_data.session_final_at(item.day):
+        return "re-downloaded once the session is over (16:30 ET)"
     if item.fixable:
         return "re-download pending (retried automatically)"
     return "no longer downloadable on this feed"
@@ -537,7 +537,15 @@ def render_datasets_tab() -> None:
         symbols_raw = st.text_input("Symbols (comma-separated)", placeholder="NVDA, AAPL")
         col_start, col_end, col_feed = st.columns(3)
         start = col_start.date_input("Start", value=date.today() - timedelta(days=7))
-        end = col_end.date_input("End", value=date.today() - timedelta(days=1))
+        end = col_end.date_input(
+            "End",
+            value=sim_data.last_final_day(datetime.now(timezone.utc), sim_data.session_final_at),
+            help=(
+                "Today can be included from 16:30 ET, once its regular session has settled. "
+                "Its after-hours minutes (to 20:00 ET) are downloaded automatically after "
+                "20:30 ET, which makes the runs that read the day stale once."
+            ),
+        )
         # Read from the environment only, never drawn: a password field still
         # sends its value to the browser.
         api_key = os.getenv("ALPACA_API_KEY", "")
@@ -601,8 +609,11 @@ def render_datasets_tab() -> None:
     size_mb = sim_data.store_size_bytes() / 1e6
     st.markdown(f"##### Stored datasets — shared store {size_mb:.1f} MB")
     # What the automatic repair (`_repair_incomplete_store`) could not fix yet:
-    # a day still trading, or one Yahoo no longer serves.
-    incomplete = [f for f in sim_data.incomplete_files() if f.kind == "bars"]
+    # a day still trading, or one Yahoo no longer serves. A day whose session
+    # is whole is not one of them -- only its after-hours tape is to come.
+    incomplete = [
+        f for f in sim_data.incomplete_files() if f.kind == "bars" and not f.session_whole
+    ]
     for ds in datasets:
         with st.container(border=True, horizontal=True, vertical_alignment="center"):
             st.markdown(
@@ -7096,7 +7107,8 @@ TAB_STATE_KEY = "simlab_tab"
 # How often the app re-downloads stored files that were fetched before their
 # day was over and can now be had whole (`sim_data.repair_incomplete`). Once per
 # process at start, then at most this often -- a day that finishes while the
-# app is open (today's, after 20:30 ET) is picked up on a later rerun.
+# app is open is picked up on a later rerun (today's session after 16:30 ET,
+# its after-hours tape after 20:30 ET).
 _REPAIR_EVERY = timedelta(minutes=10)
 _repair_lock = threading.Lock()
 _last_repair: "dict[str, datetime]" = {}

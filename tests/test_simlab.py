@@ -847,14 +847,85 @@ class TestIncompleteDays:
         _written(sim_data.bars_path("TEST", self.SESSION, "iex"), self.NEXT_MORNING)
         assert sim_data.stored_day_complete("TEST", self.SESSION, "iex")
 
-    def test_the_post_market_counts_the_day_is_over_only_after_the_stored_window(self, store):
-        """The stored window runs to 20:00 ET; a 16:30 download misses the
-        after-hours tape the store promises."""
+    AFTER_CLOSE = datetime(2026, 6, 16, 20, 31, tzinfo=timezone.utc)  # 16:31 EDT
+    EVENING = datetime(2026, 6, 16, 23, 0, tzinfo=timezone.utc)  # 19:00 EDT
+
+    def test_a_download_after_the_close_holds_the_whole_session(self, store):
+        """A replay trades the regular session only, so a 16:30 download is
+        whole for it -- the after-hours tape to 20:00 ET is still to come."""
         path = self._store_partial()
-        _written(path, datetime(2026, 6, 16, 20, 30, tzinfo=timezone.utc))  # 16:30 EDT
+        _written(path, datetime(2026, 6, 16, 20, 29, tzinfo=timezone.utc))  # 16:29 EDT
+        assert "before the day was over" in sim_data.incomplete_reason(
+            "TEST", self.SESSION, "iex", session_only=True,
+        )
+
+        _written(path, self.AFTER_CLOSE)
+        assert sim_data.incomplete_reason("TEST", self.SESSION, "iex", session_only=True) is None
+        assert "after-hours" in sim_data.incomplete_reason("TEST", self.SESSION, "iex")
         assert not sim_data.stored_day_complete("TEST", self.SESSION, "iex")
         _written(path, sim_data.day_final_at(self.SESSION))
         assert sim_data.stored_day_complete("TEST", self.SESSION, "iex")
+
+    def test_the_after_hours_tape_is_fetched_once_it_is_over(self, store):
+        _written(self._store_partial(), self.AFTER_CLOSE)
+
+        [item] = sim_data.incomplete_files(feed="iex", now=self.EVENING)
+        assert item.session_whole and not item.fixable
+        [item] = sim_data.incomplete_files(feed="iex", now=sim_data.day_final_at(self.SESSION))
+        assert item.session_whole and item.fixable
+
+    def test_a_day_short_of_its_session_is_fetched_once_the_session_is_over(self, store):
+        self._store_partial()  # 10:29 EDT
+
+        [item] = sim_data.incomplete_files(feed="iex", now=self.MID_SESSION + timedelta(hours=1))
+        assert not item.session_whole and not item.fixable
+        [item] = sim_data.incomplete_files(feed="iex", now=self.AFTER_CLOSE)
+        assert not item.session_whole and item.fixable
+
+    def test_create_dataset_keeps_a_whole_session_until_the_after_hours_are_over(self, store):
+        """Downloading it again before 20:30 ET would add only part of the
+        after-hours tape and retire every run that read the day."""
+        _written(self._store_partial(), self.AFTER_CLOSE)
+        progress = []
+
+        assert not sim_data._needs_download("TEST", self.SESSION, "iex", progress.append, now=self.EVENING)
+        assert sim_data._needs_download(
+            "TEST", self.SESSION, "iex", progress.append, now=sim_data.day_final_at(self.SESSION),
+        )
+
+    def test_create_dataset_downloads_a_day_short_of_its_session_again(self, store):
+        self._store_partial()
+        assert sim_data._needs_download("TEST", self.SESSION, "iex", [].append, now=self.EVENING)
+
+    def _freeze(self, monkeypatch, moment: datetime) -> None:
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment.astimezone(tz) if tz else moment
+
+        monkeypatch.setattr(sim_data, "datetime", Frozen)
+
+    def test_todays_sip_window_is_held_back_to_what_a_free_plan_serves(self, monkeypatch):
+        """A free/basic plan answers 403 for a SIP window reaching into the
+        trailing 15 minutes -- today's 20:00 ET end included -- and the 403
+        failed the whole dataset."""
+        asked = []
+        monkeypatch.setattr(sim_data, "_paged_get", lambda url, params, *a: asked.append(params) or [])
+        self._freeze(monkeypatch, self.AFTER_CLOSE)
+
+        sim_data.fetch_minute_bars_day("TEST", self.SESSION, "k", "s", "sip")
+        sim_data.fetch_minute_bars_day("TEST", self.SESSION, "k", "s", "iex")
+        sim_data.fetch_minute_bars_day("TEST", DAY, "k", "s", "sip")
+
+        sip_today, iex_today, sip_before = (datetime.fromisoformat(p["end"]) for p in asked)
+        assert sip_today == self.AFTER_CLOSE - timedelta(minutes=sim_data.SIP_DELAY_MIN)
+        assert iex_today == datetime(2026, 6, 17, 0, 0, tzinfo=timezone.utc)  # 20:00 EDT
+        assert sip_before == datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+
+    def test_a_sip_day_not_begun_is_not_asked_for(self, monkeypatch):
+        monkeypatch.setattr(sim_data, "_paged_get", lambda *a: pytest.fail("nothing to ask for yet"))
+        self._freeze(monkeypatch, self.AFTER_CLOSE)
+        assert sim_data.fetch_minute_bars_day("TEST", date(2026, 6, 17), "k", "s", "sip") == []
 
     def test_create_dataset_downloads_a_partial_day_again(self, store, monkeypatch):
         calls = []
@@ -972,6 +1043,17 @@ class TestIncompleteDays:
         _written(path, self.MID_SESSION)
         assert sim_data._daily_covers("TEST", date(2026, 3, 2), self.SESSION)
 
+    def test_a_daily_history_fetched_after_the_close_covers_that_day(self, store):
+        """A daily bar is the regular session: nothing after 16:00 ET changes it."""
+        path = sim_data.daily_path("TEST")
+        meta = sim_data._read_gz(path)
+        meta.update(start="2025-01-01", end=self.SESSION.isoformat(), fetched_at=self.AFTER_CLOSE.isoformat())
+        meta["bars"].append(_bar(datetime(2026, 6, 16, tzinfo=timezone.utc), 99.0))
+        sim_data._write_gz(path, meta)
+
+        assert sim_data._daily_covers("TEST", date(2026, 3, 2), self.SESSION)
+        assert [f for f in sim_data.incomplete_files() if f.kind == "daily"] == []
+
     def test_a_weekend_end_is_covered_by_fridays_close(self, store):
         path = sim_data.daily_path("TEST")
         meta = sim_data._read_gz(path)
@@ -985,7 +1067,7 @@ class TestIncompleteDays:
         sim_data._write_gz(sim_data.market_path(), {"spy": rows, "vix": rows, "vix3m": rows})
         _written(sim_data.market_path(), self.MID_SESSION)
         assert not sim_data._market_covers(date(2026, 3, 2), self.SESSION)
-        _written(sim_data.market_path(), self.NEXT_MORNING)
+        _written(sim_data.market_path(), self.AFTER_CLOSE)
         assert sim_data._market_covers(date(2026, 3, 2), self.SESSION)
 
     def test_a_day_stored_before_it_began_joins_its_dataset_once_whole(self, store, monkeypatch):

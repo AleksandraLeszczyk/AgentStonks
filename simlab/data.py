@@ -50,15 +50,20 @@ before it began stored empty and read as a holiday (2026-08-21, fetched 08-20).
 Both were then "already stored" for every later dataset and never fetched again.
 
 A bar file does not say when it was fetched, but its mtime does: `_write_gz` is
-the only writer and replaces a file whole. So a stored day counts as stored
-only when it was written after `day_final_at(day)`; earlier is *premature*,
-and is re-downloaded by `create_dataset` and by `repair_incomplete` (run by the
-SimLab app, the experiment runner and tuning jobs) once the day can be had
-whole. A day stored empty although its daily history shows a session is
-incomplete too (a failed fetch reads as `[]`). A re-download never replaces a
-stored day with fewer bars, so a day Yahoo no longer serves keeps the part it
-has. The daily history and the market indicators follow the same rule through
-their own fetch time.
+the only writer and replaces a file whole. So a stored day counts as whole
+only when it was written after `day_final_at(day)` (20:30 ET). One written
+before `session_final_at(day)` (16:30 ET) is *premature*, and is re-downloaded
+by `create_dataset` and by `repair_incomplete` (run by the SimLab app, the
+experiment runner and tuning jobs) once its session can be had whole. One
+written between the two holds the whole regular session -- everything a replay
+trades -- and only part of the after-hours tape, so a dataset can take today
+straight after the close: it is used as it is, and `repair_incomplete` fetches
+the after-hours rest once that is over too. A day stored empty although its
+daily history shows a session is incomplete too (a failed fetch reads as `[]`).
+A re-download never replaces a stored day with fewer bars, so a day Yahoo no
+longer serves keeps the part it has. The daily history and the market
+indicators are regular-session values (daily bars, closes), whole once
+`session_final_at` has passed by their own fetch time.
 """
 from __future__ import annotations
 
@@ -74,8 +79,8 @@ from typing import Callable, Iterable, Optional
 import requests
 
 from agent_stonks import minute_momentum
-from agent_stonks.config import DATA_REST
-from agent_stonks.market_hours import MARKET_TZ
+from agent_stonks.config import DATA_REST, SIP_DELAY_MIN
+from agent_stonks.market_hours import MARKET_CLOSE, MARKET_TZ
 
 SIMLAB_DIR = Path(__file__).resolve().parent.parent / "data" / "simlab"
 STORE_DIR = SIMLAB_DIR / "store"
@@ -136,9 +141,11 @@ LEGACY_FEED = "iex"
 # an older window.
 YF_MINUTE_WINDOW_DAYS = 30
 
-# How long after the stored window closes (20:00 ET) a day's tape is taken as
-# final -- the vendors' own lag (Alpaca withholds the last 15 minutes of SIP
-# from a free plan) with room to spare. A file written before then is a prefix.
+# How long after a close a tape is taken as final -- the vendors' own lag
+# (Alpaca withholds the last 15 minutes of SIP from a free plan) with room to
+# spare. Two closes count: the regular session's (16:00 ET, `session_final_at`),
+# which is all a replay trades and all a daily bar or a close holds, and the
+# stored window's (20:00 ET, `day_final_at`), which adds the after-hours tape.
 DAY_SETTLE = timedelta(minutes=30)
 
 _manifest_lock = threading.Lock()
@@ -288,15 +295,24 @@ def day_final_at(day: date) -> datetime:
     return datetime.combine(day, DAY_END_ET, tzinfo=MARKET_TZ) + DAY_SETTLE
 
 
+def session_final_at(day: date) -> datetime:
+    """When `day`'s regular session (to 16:00 ET) can be downloaded whole --
+    what a replay trades, and what its daily bar and closes hold."""
+    return datetime.combine(day, MARKET_CLOSE, tzinfo=MARKET_TZ) + DAY_SETTLE
+
+
 def news_final_at(day: date) -> datetime:
     """The same for a news file, which holds a UTC day (`fetch_news_day`)."""
     return datetime.combine(day + timedelta(days=1), time(0, 0), tzinfo=timezone.utc) + DAY_SETTLE
 
 
-def last_final_day(moment: datetime) -> date:
-    """The newest day whose tape was whole at `moment`."""
+def last_final_day(
+    moment: datetime, final_at: Callable[[date], datetime] = day_final_at
+) -> date:
+    """The newest day whose tape was whole at `moment` -- or, with
+    `final_at=session_final_at`, whose regular session was."""
     day = moment.astimezone(MARKET_TZ).date()
-    return day if moment >= day_final_at(day) else day - timedelta(days=1)
+    return day if moment >= final_at(day) else day - timedelta(days=1)
 
 
 def _last_weekday(day: date) -> date:
@@ -328,13 +344,26 @@ def _premature(written: datetime) -> str:
     return f"downloaded {written.astimezone(MARKET_TZ):%Y-%m-%d %H:%M} ET, before the day was over"
 
 
-def incomplete_reason(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Optional[str]:
+def _before_after_hours_end(written: datetime) -> str:
+    return (
+        f"downloaded {written.astimezone(MARKET_TZ):%Y-%m-%d %H:%M} ET: the session is whole, "
+        "the after-hours tape to 20:00 ET is not"
+    )
+
+
+def incomplete_reason(
+    symbol: str, day: date, feed: str = DEFAULT_FEED, session_only: bool = False
+) -> Optional[str]:
     """Why the stored (symbol, day, feed) is not the whole day, or None when it
     is -- or is not stored at all, which `stored_bars_path(...).exists()` says.
-    On the `live` feed, the first of its tapes that is not whole."""
+    On the `live` feed, the first of its tapes that is not whole.
+
+    With `session_only`, only the regular session counts: a copy downloaded
+    after it settled is whole for a replay, which trades nothing later, though
+    its after-hours minutes are still to come."""
     if feed == LIVE_FEED:
         for tape in minute_tapes(feed):
-            reason = incomplete_reason(symbol, day, tape)
+            reason = incomplete_reason(symbol, day, tape, session_only)
             if reason:
                 return f"{tape}: {reason}"
         return None
@@ -342,8 +371,10 @@ def incomplete_reason(symbol: str, day: date, feed: str = DEFAULT_FEED) -> Optio
     written = written_at(path)
     if written is None:
         return None
-    if written < day_final_at(day):
+    if written < session_final_at(day):
         return _premature(written)
+    if written < day_final_at(day) and not session_only:
+        return _before_after_hours_end(written)
     if _stored_empty(path) and any(
         str(bar.get("t", ""))[:10] == day.isoformat()
         for bar in load_daily_bars(symbol, feed)
@@ -360,11 +391,14 @@ def stored_day_complete(symbol: str, day: date, feed: str = DEFAULT_FEED) -> boo
     )
 
 
-def refetchable(day: date, feed: str = DEFAULT_FEED, now: Optional[datetime] = None) -> bool:
-    """Whether downloading `day` now would bring it back whole: it is over, and
-    on yfinance still inside Yahoo's 1-minute window."""
+def refetchable(
+    day: date, feed: str = DEFAULT_FEED, now: Optional[datetime] = None, session_only: bool = False
+) -> bool:
+    """Whether downloading `day` now would bring it back whole -- or, with
+    `session_only`, its regular session: that is over, and on yfinance still
+    inside Yahoo's 1-minute window."""
     now = now or datetime.now(timezone.utc)
-    if now < day_final_at(day):
+    if now < (session_final_at(day) if session_only else day_final_at(day)):
         return False
     if feed == "yfinance":
         horizon = now.astimezone(MARKET_TZ).date() - timedelta(days=YF_MINUTE_WINDOW_DAYS)
@@ -388,10 +422,12 @@ def _daily_fetched_at(path: Path, meta: dict) -> Optional[datetime]:
 
 def _daily_whole_through(path: Path, meta: dict) -> date:
     """The last day a daily-history file holds whole: its requested end, unless
-    it was fetched before that day was over (its row is then a partial bar)."""
+    it was fetched before that day's session was over (its row is then a
+    partial bar). A daily bar is the regular session, so after-hours is not
+    waited for."""
     end = date.fromisoformat(meta["end"])
     fetched = _daily_fetched_at(path, meta)
-    return min(end, last_final_day(fetched)) if fetched is not None else end
+    return min(end, last_final_day(fetched, session_final_at)) if fetched is not None else end
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +504,24 @@ def _paged_get(url: str, params: dict, key: str, secret: str, item_key: str, sym
             return out
 
 
+def _alpaca_end(end: datetime, feed: str) -> datetime:
+    """`end`, held back to what the plan serves. A free/basic plan refuses any
+    SIP window reaching into the trailing 15 minutes -- a future end included,
+    which is every request for today's 04:00-20:00 window before 20:15 ET --
+    with 403 "subscription does not permit querying recent SIP data". IEX and
+    news have no such window."""
+    if feed != "sip":
+        return end
+    return min(end, datetime.now(timezone.utc) - timedelta(minutes=SIP_DELAY_MIN))
+
+
 def _fetch_minute_bars_day_alpaca(
     symbol: str, day: date, key: str, secret: str, feed: str
 ) -> list[dict]:
     start = datetime.combine(day, DAY_START_ET, tzinfo=MARKET_TZ).astimezone(timezone.utc)
-    end = datetime.combine(day, DAY_END_ET, tzinfo=MARKET_TZ).astimezone(timezone.utc)
+    end = _alpaca_end(datetime.combine(day, DAY_END_ET, tzinfo=MARKET_TZ).astimezone(timezone.utc), feed)
+    if end <= start:
+        return []
     return _paged_get(
         f"{DATA_REST}/v2/stocks/bars",
         dict(
@@ -499,7 +548,7 @@ def _fetch_daily_bars_range_alpaca(
             symbols=symbol,
             timeframe="1Day",
             start=datetime.combine(start, time(0, 0), tzinfo=timezone.utc).isoformat(),
-            end=datetime.combine(end, time(23, 59), tzinfo=timezone.utc).isoformat(),
+            end=_alpaca_end(datetime.combine(end, time(23, 59), tzinfo=timezone.utc), feed).isoformat(),
             limit=10000,
             feed=feed,
         ),
@@ -740,17 +789,28 @@ def _market_covers(start: date, end: date) -> bool:
         dates[0] <= (start - timedelta(days=DAILY_LOOKBACK_DAYS)).isoformat()
         and dates[-1] >= (end - timedelta(days=4)).isoformat()
         # Fetched mid-session, the last close is a price, not a close.
-        and fetched is not None and last_final_day(fetched) >= _last_weekday(end)
+        and fetched is not None
+        and last_final_day(fetched, session_final_at) >= _last_weekday(end)
     )
 
 
-def _needs_download(symbol: str, day: date, feed: str, progress: ProgressCb) -> bool:
+def _needs_download(
+    symbol: str, day: date, feed: str, progress: ProgressCb, now: Optional[datetime] = None
+) -> bool:
     """Whether `create_dataset` should fetch this day: not stored, or stored but
-    not whole and still within reach."""
+    not whole and still within reach -- except a day whose session is whole
+    while its after-hours tape is still trading."""
     if not stored_bars_path(symbol, day, feed).exists():
         return True
     reason = incomplete_reason(symbol, day, feed)
     if reason is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if now < day_final_at(day) and incomplete_reason(symbol, day, feed, session_only=True) is None:
+        # What a replay trades is all there. A download now would add only
+        # part of the after-hours tape and rewrite the file, which retires the
+        # runs that read it (`tuning.run_is_stale`); the repair fetches the
+        # rest once it is over.
         return False
     if feed == "yfinance" and day < date.today() - timedelta(days=YF_MINUTE_WINDOW_DAYS):
         progress(
@@ -1035,7 +1095,12 @@ class IncompleteFile:
     symbol: str  # "" for the market indicators
     day: Optional[date]  # the day that is not whole
     reason: str
-    fixable: bool  # a download now would bring it back whole
+    # A download now would bring back what is missing: the session for a copy
+    # short of it, the after-hours tape once that is over too.
+    fixable: bool
+    # Minute bars only: the regular session is all there and only the
+    # after-hours tape is to come -- whole for a replay, nothing to warn about.
+    session_whole: bool = False
 
     def label(self) -> str:
         if self.kind == "bars":
@@ -1093,9 +1158,10 @@ def incomplete_files(
             continue
         reason = incomplete_reason(symbol, day, tape)
         if reason:
+            session_whole = incomplete_reason(symbol, day, tape, session_only=True) is None
             found.append(IncompleteFile(
                 "bars", stored_bars_path(symbol, day, tape), tape, symbol, day,
-                reason, refetchable(day, tape, now),
+                reason, refetchable(day, tape, now, session_only=not session_whole), session_whole,
             ))
 
     news_root = STORE_DIR / "news"
@@ -1131,21 +1197,21 @@ def incomplete_files(
         except (OSError, ValueError, KeyError, IndexError, TypeError):
             continue
         fetched = _daily_fetched_at(path, meta)  # type: ignore[arg-type]
-        if fetched is not None and fetched < day_final_at(last):
+        if fetched is not None and fetched < session_final_at(last):
             found.append(IncompleteFile(
                 "daily", path, tape, symbol, last,
-                f"its {last} bar is partial ({_premature(fetched)})", now >= day_final_at(last),
+                f"its {last} bar is partial ({_premature(fetched)})", now >= session_final_at(last),
             ))
 
     spy = load_market_indicators().get("spy") or []
     written = written_at(market_path())
     if spy and written is not None:
         last = date.fromisoformat(spy[-1]["date"])
-        if written < day_final_at(last):
+        if written < session_final_at(last):
             found.append(IncompleteFile(
                 "market", market_path(), "", "", last,
                 f"its {last} close is a price, not a close ({_premature(written)})",
-                now >= day_final_at(last),
+                now >= session_final_at(last),
             ))
     return found
 
