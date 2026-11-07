@@ -21,12 +21,21 @@ import logging
 import math
 import uuid
 
+import requests
+
 from .config import ORDER_FILL_TIMEOUT_SEC
 from . import trading_rest
 from .rest import fetch_latest_trade
 from .trading_rest import TradingCredentials, TradingError
 
 logger = logging.getLogger(__name__)
+
+# What an account *read* can fail with: Alpaca refusing (TradingError) or the
+# request never getting an answer -- a timeout or dropped connection raises
+# requests' own exceptions, which TradingError does not cover. Orders are left
+# out on purpose: a POST that timed out may still have reached Alpaca, so it is
+# not the same thing as a rejection.
+_ACCOUNT_READ_FAILURES = (TradingError, requests.RequestException)
 
 
 class Broker(abc.ABC):
@@ -157,7 +166,7 @@ class AlpacaBroker(Broker):
         try:
             account = trading_rest.get_account(self.creds)
             positions = trading_rest.positions_by_symbol(self.creds)
-        except TradingError as exc:
+        except _ACCOUNT_READ_FAILURES as exc:
             # A failed read must not be mistaken for "the account is empty":
             # returning None leaves the ledger on its last known values rather
             # than zeroing cash and every position.
@@ -190,7 +199,7 @@ class AlpacaBroker(Broker):
         """
         try:
             account = trading_rest.get_account(self.creds)
-        except TradingError as exc:
+        except _ACCOUNT_READ_FAILURES as exc:
             # Same reasoning as account_snapshot: a failed read is not "the
             # account is worth nothing". The caller keeps its last good value.
             logger.warning("%s: account value read failed: %s", self.venue, exc)

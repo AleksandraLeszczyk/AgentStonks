@@ -8,6 +8,7 @@ import threading
 import time
 
 import pytest
+import requests
 
 from agent_stonks import trading_mode, trading_rest
 from agent_stonks.broker import AlpacaBroker, PaperBroker
@@ -157,6 +158,28 @@ class TestAlpacaBroker:
         # A zero would read as "the account is empty" on screen.
         requests_mock.get(f"{PAPER_URL}/v2/account", status_code=500, json={})
         assert self._broker().account_value() is None
+
+    @pytest.mark.parametrize(
+        "exc", [requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError],
+    )
+    def test_an_account_read_that_never_gets_an_answer_is_a_failed_read(self, requests_mock, exc):
+        # 2026-11-06: on a bad Wi-Fi link the timeout escaped as requests' own
+        # exception, so the portfolio panel showed a traceback -- and the read
+        # right after a fill would have dropped the fill from the ledger.
+        requests_mock.get(f"{PAPER_URL}/v2/account", exc=exc)
+        assert self._broker().account_value() is None
+        assert self._broker().account_snapshot() is None
+
+    def test_a_timed_out_refresh_keeps_the_last_value_on_screen(self, requests_mock):
+        # The portfolio panel's own path: a blocking refresh once a minute.
+        requests_mock.get(f"{PAPER_URL}/v2/account", json={"equity": "53210.75"})
+        tracker = DecisionTracker(starting_cash=1000.0, broker=self._broker())
+        tracker.refresh_venue_value()
+
+        requests_mock.get(f"{PAPER_URL}/v2/account", exc=requests.exceptions.ConnectTimeout)
+        assert tracker.refresh_venue_value() is None
+        assert tracker.snapshot()["venue_value"] == 53210.75
 
     def test_paper_and_live_values_come_from_their_own_accounts(self, requests_mock):
         # The whole point of two hosts and two key pairs. A paper balance shown
