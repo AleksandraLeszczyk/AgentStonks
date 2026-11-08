@@ -238,6 +238,91 @@ class TestWindows:
         ]
 
 
+def counts(**buys: int) -> dict:
+    """A replay's `day_counts`, buys by day ("d05" = 2026-10-05)."""
+    return {f"2026-10-{day[1:]}": {"buys": n, "sells": n, "round_trips": 1, "wins": 1}
+            for day, n in buys.items()}
+
+
+class TestTradesPerSession:
+    """Buy fills a session (`pair_metrics`' trades_per_session), every session
+    counted, traded or not, like the profit a session."""
+
+    def test_a_replays_own_counts_session_by_session(self):
+        counted = job("a", {**WEEK1, **WEEK2})
+        counted["baseline"]["w"]["day_counts"] = counts(d05=2, d12=3, d13=1)
+        [s] = ms.base_series([counted], bases={})
+        assert ms.pair_metrics(s, ms.window([s], ms.WEEK))["trades_per_session"] == 1.33
+        assert ms.pair_metrics(s, ms.window([s], ms.ALL))["trades_per_session"] == 1.0
+
+    def test_an_older_replays_total_is_shared_over_the_sessions_it_traded(self):
+        """Exact over its whole dataset; a window cutting it gets each traded
+        session's share."""
+        old = job("a", WEEK1)
+        old["baseline"]["w"].update(trades=4, days_traded=2)  # 10-07 made nothing
+        [s] = ms.base_series([old], bases={})
+        assert s.buys == {"2026-10-05": 2.0, "2026-10-06": 2.0, "2026-10-07": 0.0}
+        assert ms.pair_metrics(s, ms.window([s], ms.ALL))["trades_per_session"] == 1.33
+        assert ms.pair_metrics(s, ("2026-10-06", "2026-10-07"))["trades_per_session"] == 1.0
+
+    def test_with_traded_sessions_it_cannot_tell_apart_every_session_shares(self):
+        old = job("a", WEEK1)
+        old["baseline"]["w"].update(trades=6, days_traded=3)  # 3 traded, 2 made money
+        [s] = ms.base_series([old], bases={})
+        assert set(s.buys.values()) == {2.0}
+
+    def test_a_newer_replay_brings_its_counts(self):
+        old = job("old", WEEK1, created="2026-10-01T00:00", grid={0.5: {**WEEK1, **WEEK2}})
+        new = job("new", WEEK2, created="2026-10-20T00:00", grid={0.5: WEEK2})
+        new["cells"]["w"][0]["day_counts"] = counts(d12=5)
+        [s] = ms.base_series([old, new], bases=stored(0.5))
+        assert s.buys["2026-10-12"] == 5.0 and s.buys["2026-10-13"] == 0.0
+        assert s.buys["2026-10-05"] == pytest.approx(1 / 6)  # the old one's buy, shared
+
+    def test_a_session_with_no_count_leaves_the_rate_unknown(self):
+        unknown = job("a", WEEK1)
+        unknown["baseline"]["w"]["trades"] = None
+        [s] = ms.base_series([unknown], bases={})
+        assert ms.pair_metrics(s, ms.window([s], ms.ALL))["trades_per_session"] is None
+
+
+def _open_job() -> None:
+    import streamlit as st
+
+    from simlab import app as sim_app
+
+    sim_app._ml_open_job("ml_pairs_0", st.session_state["jobs"])
+
+
+class TestOpenTuningJob:
+    """A click on the pairs table's Tuning jobs cell (simlab/app.py)."""
+
+    def run(self, cell):
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_function(_open_job, default_timeout=60)
+        app.session_state["jobs"] = [["a"], ["new", "old"]]
+        app.session_state["ml_pairs_0"] = {
+            "selection": {"rows": [], "columns": [], "cells": [cell]}
+        }
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_it_opens_the_rows_newest_job_in_the_tuning_tab(self):
+        from simlab import app as sim_app
+
+        app = self.run((1, "jobs"))
+        assert app.session_state["tune_selected_job"] == "new"
+        assert app.session_state[sim_app.TAB_STATE_KEY] == sim_app.TAB_TUNING
+        assert app.session_state["ml_pairs_opened"] == 1
+
+    def test_a_click_on_another_column_opens_nothing(self):
+        app = self.run((1, "ticker"))
+        assert "tune_selected_job" not in app.session_state
+        assert "ml_pairs_opened" not in app.session_state
+
+
 def _best_table() -> None:
     import streamlit as st
 
@@ -401,6 +486,8 @@ class TestLeftOutDays:
         assert row["profit"] == pytest.approx(400.0) and row["sessions"] == 3
         assert row["per_session"] == pytest.approx(400.0 / 3, abs=0.01)
         assert row["sat_out"] == 1 and row["worst_day"] == 0.0
+        # Its one buy shared over the three sessions, and none on the CPI day.
+        assert row["trades_per_session"] == pytest.approx(2 / 9, abs=0.01)
         [week] = ms.weekly([s], ms.window([s], ms.ALL))
         assert week["per_session"] == pytest.approx(400.0 / 3, abs=0.01)
 

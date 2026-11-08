@@ -6677,6 +6677,10 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         "Tuning job", ids, index=ids.index(wanted) if wanted in ids else 0,
         format_func=labels.get,
     )
+    # The job shown, whoever picked it: the box has no key, so it moves to a
+    # job named elsewhere (a new run, the ML summary's links) only when that
+    # changes `wanted` -- and one picked here would otherwise stay on screen.
+    st.session_state["tune_selected_job"] = job_id
     job = next(j for j in jobs if j["job_id"] == job_id)
     spec = job["spec"]
     axes = spec["axes"]
@@ -7141,6 +7145,11 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
     )
     st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(rows) + 120)))
 
+    by_profit = sorted(rows, key=lambda r: r["per_session"], reverse=True)
+    table_jobs = [r["job_ids"] for r in by_profit]
+    # Keyed on a count each opened job raises, so the table comes back with
+    # nothing selected and the same job can be clicked again.
+    table_key = f"ml_pairs_{st.session_state.get(_ML_PAIRS_OPENED, 0)}"
     st.dataframe(pd.DataFrame([
         {
             "ticker": r["ticker"],
@@ -7150,19 +7159,17 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "session_std": r["session_std"],
             "sharpe": r["sharpe"],
             "sessions": r["sessions"],
+            "trades": r["trades_per_session"],
             "days": f"{r['days_up']} up · {r['days_down']} down",
             "best_day": r["best_day"],
             "worst_day": r["worst_day"],
             "skips": ", ".join(ml_summary.event_label(c) for c in r["skip_events"]) or "—",
-            "signature": r["signature"],
-            "source": (
-                f"base set {r['base_set_at'][:10]}" if r["source"] == ml_summary.FROM_BASE
-                else "job's base" + (" (stored base not replayed)" if r["base_set_at"] else "")
-            ),
             "jobs": ", ".join(r["job_ids"]),
         }
-        for r in sorted(rows, key=lambda r: r["per_session"], reverse=True)
-    ]), hide_index=True, placeholder="—", column_config={
+        for r in by_profit
+    ]), hide_index=True, placeholder="—", key=table_key, selection_mode="single-cell",
+        on_select=lambda: _ml_open_job(table_key, table_jobs),
+        column_config={
         "ticker": "Instrument",
         "model": "Model",
         "per_session": money("Profit a session ($)", format="%+.2f"),
@@ -7175,6 +7182,14 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
         ),
         "sharpe": _ml_sharpe_column("The pair's "),
         "sessions": "Sessions",
+        "trades": money(
+            "Trades a session", format="%.1f",
+            help="Buy fills a session, every rung of a ladder counted, as the Tuning tab's "
+            "Trades counts them — every session counted, traded or not. A replay scored "
+            "before its fills were counted session by session (before 2026-10-27) has its "
+            "dataset's total shared over the sessions it traded: exact over its whole week, "
+            "near it where the window starts mid-week.",
+        ),
         "days": "Days",
         "best_day": money("Best day ($)", format="%+.2f"),
         "worst_day": money("Worst day ($)", format="%+.2f"),
@@ -7184,17 +7199,16 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "those count as flat sessions above. Where a tuning job replayed the base trading "
             "them anyway, the event table below shows what they made, marked *left out*.",
         ),
-        "signature": st.column_config.TextColumn("Configuration", width="medium"),
-        "source": st.column_config.TextColumn(
-            "Read as",
-            help="`base set …` — the pair's stored base configuration, wherever a tuning job "
-            "replayed it. `job's base` — no base stored (or none replayed), so the base of "
-            "the pair's job reaching the latest session.",
-        ),
         "jobs": st.column_config.TextColumn(
-            "Tuning jobs", help="The jobs whose replays were read, newest first.",
+            "Tuning jobs",
+            help="The jobs whose replays were read, newest first. Click one to open its "
+            "results in the Tuning tab (the newest, where there are several).",
         ),
     })
+    st.caption(
+        ":material/ads_click: Click a job under **Tuning jobs** to open its results in the "
+        "Tuning tab."
+    )
 
     weeks = sorted({w["week"] for w in weekly})
     if len(weeks) > 1:
@@ -7213,6 +7227,24 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
         ))
         fig.update_layout(title="Week by week: profit a session ($)")
         st.plotly_chart(_chart_layout(fig, height=max(280, 32 * len(pairs) + 120)))
+
+
+# How many jobs the pairs table has opened, which keys the table afresh.
+_ML_PAIRS_OPENED = "ml_pairs_opened"
+
+
+def _ml_open_job(table_key: str, jobs: "list[list[str]]") -> None:
+    """Open the job of the pairs-table cell just clicked under Tuning jobs
+    (its row's newest, `jobs` in the table's order) in the Tuning tab -- a
+    callback for the reason `_open_run_in_results` is one. A click on any other
+    column does nothing."""
+    state = st.session_state.get(table_key) or {}
+    for row, column in (state.get("selection") or {}).get("cells") or ():
+        if column == "jobs" and 0 <= row < len(jobs) and jobs[row]:
+            st.session_state["tune_selected_job"] = jobs[row][0]
+            st.session_state[_ML_PAIRS_OPENED] = st.session_state.get(_ML_PAIRS_OPENED, 0) + 1
+            st.session_state[TAB_STATE_KEY] = TAB_TUNING
+            return
 
 
 # What "Set Orchestra" just did, for the rerun its click causes to say so.

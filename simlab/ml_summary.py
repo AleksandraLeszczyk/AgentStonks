@@ -95,6 +95,9 @@ class BaseSeries:
     # with a looser rule traded, and the kinds of session why: `daily` holds
     # what they made, `profit` the nothing the rule makes of them.
     left_out: "dict[str, tuple[str, ...]]" = field(default_factory=dict)
+    # Buy fills a session, as the replay read for it counted them
+    # (`_session_buys`); a session missing has no count.
+    buys: "dict[str, float]" = field(default_factory=dict)
 
     @property
     def last_day(self) -> str:
@@ -110,6 +113,11 @@ class BaseSeries:
         session it leaves out, whatever the replay that traded it made."""
         return 0.0 if day in self.left_out else self.daily[day]
 
+    def trades(self, day: str) -> "float | None":
+        """The buys the configuration made on `day` by its own rule, as
+        `profit` reads it; None where the replay kept no count."""
+        return 0.0 if day in self.left_out else self.buys.get(day)
+
     def add(self, cell: dict, left_out: "dict[str, tuple[str, ...]] | None" = None) -> None:
         """One replay's sessions, over whatever an earlier one said of them --
         except that a session it sat out never replaces one an earlier replay
@@ -118,11 +126,16 @@ class BaseSeries:
         (`_stored_base`)."""
         sat = {str(d) for d in cell.get("sat_out_days") or ()}
         unforecast = {str(d) for d in cell.get("no_forecast_days") or ()}
+        buys = _session_buys(cell)
         for day, made in (cell.get("daily") or {}).items():
             day = str(day)
             if day in sat and day in self.daily and day not in self.sat_out:
                 continue
             self.daily[day] = float(made)
+            if buys is None:
+                self.buys.pop(day, None)
+            else:
+                self.buys[day] = buys[day]
             for found, days in ((self.sat_out, sat), (self.no_forecast, unforecast)):
                 if day in days:
                     found.add(day)
@@ -132,6 +145,27 @@ class BaseSeries:
                 self.left_out[day] = left_out[day]
             else:
                 self.left_out.pop(day, None)
+
+
+def _session_buys(cell: dict) -> "dict[str, float] | None":
+    """{ISO day: buy fills} for every session of one replay, every rung of a
+    ladder counted, as the Tuning tab's Trades counts them: its own
+    per-session counts (`day_counts`), or for a replay scored before those
+    were kept, its total shared out evenly over the sessions it traded -- those
+    with a profit or a loss when as many as it says it traded, else every
+    session -- so a window holding the whole dataset counts it exactly. None
+    with no total either."""
+    daily = {str(d): float(p) for d, p in (cell.get("daily") or {}).items()}
+    counts = cell.get("day_counts")
+    if counts is not None:
+        return {day: float((counts.get(day) or {}).get("buys") or 0) for day in daily}
+    if cell.get("trades") is None or not daily:
+        return None
+    traded = {day for day, made in daily.items() if made != 0.0}
+    if not traded or len(traded) != cell.get("days_traded"):
+        traded = set(daily)
+    share = float(cell["trades"]) / len(traded)
+    return {day: share if day in traded else 0.0 for day in daily}
 
 
 def _new_series(config, job: dict, source: str) -> BaseSeries:
@@ -376,6 +410,7 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
     if not days:
         return None
     profits = [s.profit(d) for d in days]
+    buys = [s.trades(d) for d in days]
     total = sum(profits)
     per_session = total / len(days)
     std = statistics.stdev(profits) if len(profits) > 1 else None
@@ -393,6 +428,11 @@ def pair_metrics(s: BaseSeries, span: "tuple[str, str]") -> "dict | None":
         "session_std": round(std, 2) if std is not None else None,
         "sharpe": round(sharpe, 2) if sharpe is not None else None,
         "return_pct": round(100.0 * per_session / s.starting_cash, 4) if s.starting_cash else None,
+        # Buy fills a session, every session counted like the profit; None
+        # once a session in the window has no count.
+        "trades_per_session": (
+            round(sum(buys) / len(days), 2) if all(b is not None for b in buys) else None
+        ),
         "days_up": sum(1 for p in profits if p > flat),
         "days_down": sum(1 for p in profits if p < -flat),
         "best_day": max(profits),
