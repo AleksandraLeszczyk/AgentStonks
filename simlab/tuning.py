@@ -22,7 +22,9 @@ A job grows. Tuning is a weekly chore -- a new week of tape arrives, and the
 question is whether the pick still holds with it -- so a finished job takes a
 new dataset (`add_dataset`): the same base configuration and axes are swept
 over it, and the sum and the pick are re-read. A dataset can be dropped again
-(`remove_dataset`), which costs no replay at all.
+(`remove_dataset`), which costs no replay at all. The same chore over every job
+at once is a *sweep* (`start_sweep`): one detached process adds the datasets
+each job lacks and runs the jobs one after another.
 
 Jobs written before this (2026-09-26) had exactly two datasets, a *tune* and a
 *test* one, under `spec.tune_dataset` / `spec.test_dataset`. `_upgrade` reads
@@ -61,6 +63,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -1999,13 +2002,21 @@ def log_path(job_id: str) -> Path:
     return TUNING_DIR / f"{job_id}.log"
 
 
-def _write(record: dict) -> None:
-    """Temp file + rename, so the UI never reads a half-written record."""
-    TUNING_DIR.mkdir(parents=True, exist_ok=True)
-    path = _path(record["job_id"])
-    tmp = path.with_suffix(".tmp")
+def _replace(path: Path, record: dict) -> None:
+    """Temp file + rename, so a reader never sees a half-written record.
+
+    The temp name is the writer's own: the app and a worker (or the sweep) may
+    write one record at once -- a Stop, a reaped worker -- and with a shared
+    name the first rename takes the other writer's file away from under it.
+    """
+    tmp = path.with_name(f"{path.stem}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(record, indent=2, default=str))
     tmp.replace(path)
+
+
+def _write(record: dict) -> None:
+    TUNING_DIR.mkdir(parents=True, exist_ok=True)
+    _replace(_path(record["job_id"]), record)
 
 
 def get_job(job_id: str) -> "dict | None":
@@ -2165,8 +2176,9 @@ def _seed(record: dict, runs: "list[dict] | None", datasets: "list[dict]") -> in
     return filled
 
 
-def _launch(record: dict) -> dict:
-    """Start the detached worker for this record, and write it."""
+def _spawn(record: dict) -> subprocess.Popen:
+    """Start the detached worker for this record, write it, and hand back the
+    process -- for a caller that waits on it (`run_sweep`)."""
     TUNING_DIR.mkdir(parents=True, exist_ok=True)
     log = open(log_path(record["job_id"]), "ab")
     proc = subprocess.Popen(
@@ -2176,6 +2188,12 @@ def _launch(record: dict) -> dict:
     )
     record["pid"] = proc.pid
     _write(record)
+    return proc
+
+
+def _launch(record: dict) -> dict:
+    """Start the detached worker for this record, and write it."""
+    _spawn(record)
     return record
 
 
@@ -2247,15 +2265,24 @@ def add_dataset(
     own, so the new heatmap is directly comparable with the ones already there.
     Cells the run store answers are filled in first, as at submit.
     """
+    return add_datasets(job_id, [dataset], runs, launch)
+
+
+def add_datasets(
+    job_id: str, datasets: "list[dict]", runs: "list[dict] | None" = None,
+    launch: bool = True,
+) -> dict:
+    """`add_dataset` for several datasets at once: one restart sweeps them all."""
     record = _editable(job_id)
-    spec = {**record["spec"], "datasets": [*record["spec"]["datasets"], dataset]}
+    spec = {**record["spec"], "datasets": [*record["spec"]["datasets"], *datasets]}
     problem = validate(spec)
     if problem:
         raise ValueError(problem)
     record["spec"] = spec
-    record["cells"][dataset["name"]] = []
-    record["baseline"][dataset["name"]] = None
-    return _restart(record, _seed(record, runs, [dataset]), launch)
+    for dataset in datasets:
+        record["cells"][dataset["name"]] = []
+        record["baseline"][dataset["name"]] = None
+    return _restart(record, _seed(record, runs, datasets), launch)
 
 
 def resume(job_id: str, runs: "list[dict] | None" = None, launch: bool = True) -> dict:
@@ -2344,6 +2371,256 @@ def last_log_line(job_id: str) -> str:
         return lines[-1] if lines else ""
     except OSError:
         return ""
+
+
+# --- sweeping missing datasets over every job -------------------------------
+#
+# `add_dataset` one job at a time is the weekly chore times the number of jobs.
+# A sweep is that chore as one queue: for each job, the datasets it lacks are
+# added and the job is run to the end, then the next job. One after another,
+# not side by side -- every job already fans out over its own pool, and twenty
+# pools at once would be some hundred processes each importing torch.
+#
+# The queue is one record (`_sweep_path`), run by a detached process
+# (`python -m simlab.tuning --sweep`) that starts each job's ordinary worker
+# and waits for it. Each job keeps its own process group, so stopping a job
+# from its card stops that job and the sweep moves on; stopping the sweep stops
+# the job it is on and starts no more. A job the sweep never reached is left as
+# it was, so its datasets are still missing and the next sweep offers them.
+
+#: A sweep item not started yet; one the sweep will not run, and why.
+SWEEP_WAITING = "waiting"
+SWEEP_SKIPPED = "skipped"
+
+#: How often the sweep looks again while another job is running.
+SWEEP_POLL_SECONDS = 15.0
+
+
+def missing_datasets(job: dict, datasets: "list[dict]") -> "list[dict]":
+    """Those of `datasets` this job could take and does not have, oldest first:
+    they carry the job's ticker and the job holds no dataset of that name."""
+    spec = job["spec"]
+    ticker = spec["base"]["ticker"]
+    have = set(dataset_names(spec))
+    return chronological(
+        d for d in datasets if d["name"] not in have and ticker in (d.get("symbols") or [])
+    )
+
+
+def sweep_plan(jobs: "list[dict]", datasets: "list[dict]") -> "list[dict]":
+    """`[{"job_id", "datasets"}]`: every stored job that lacks one of `datasets`.
+
+    Derived grids are no stored job -- there is nothing to add a dataset to.
+    """
+    plan = []
+    for job in jobs:
+        if is_derived(job):
+            continue
+        todo = missing_datasets(job, datasets)
+        if todo:
+            plan.append({"job_id": job["job_id"], "datasets": todo})
+    return plan
+
+
+def sweep_cost(job: dict, datasets: "list[dict]", prior: "dict | None" = None) -> dict:
+    """What sweeping `datasets` into this job replays: `{"replays", "reused", "seconds"}`.
+
+    `prior` is `prior_cells`' answer for those datasets. A stopped job's own
+    holes are replayed by the same restart, so they count too -- but not a
+    running job's, which its worker fills before the sweep gets to it.
+    """
+    spec = job["spec"]
+    prior = prior or {}
+    cells = len(grid(spec["axes"]))
+    reused = sum(len(prior.get(d["name"]) or ()) for d in datasets)
+    replays = (cells + 1) * len(datasets) - reused
+    seconds = estimated_seconds(spec, prior, datasets)
+    if job.get("status") != RUNNING:
+        keys = [overrides_key(c) for c in grid(spec["axes"])]
+        workers = max(1, int(spec.get("workers") or 1))
+        for dataset in spec["datasets"]:
+            have = _cells_by_key(job, dataset["name"])
+            holes = sum(1 for key in keys if key not in have)
+            holes += (job.get("baseline") or {}).get(dataset["name"]) is None
+            replays += holes
+            seconds += SECONDS_PER_SESSION * holes * len(dataset["days"]) / workers
+    return {"replays": replays, "reused": reused, "seconds": seconds}
+
+
+def _sweep_path() -> Path:
+    # A subdirectory, so `list_jobs`' glob never reads the queue as a job.
+    return TUNING_DIR / "sweep" / "queue.json"
+
+
+def sweep_log_path() -> Path:
+    return TUNING_DIR / "sweep" / "queue.log"
+
+
+def _write_sweep(queue: dict) -> None:
+    _sweep_path().parent.mkdir(parents=True, exist_ok=True)
+    _replace(_sweep_path(), queue)
+
+
+def get_sweep() -> "dict | None":
+    """The latest sweep, with a dead sweep process marked failed (as `_reap`)."""
+    try:
+        queue = json.loads(_sweep_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if queue.get("status") == RUNNING and queue.get("pid") and not _pid_alive(queue["pid"]):
+        queue.update(status=FAILED, error="sweep process died", finished_at=_now_iso())
+        _write_sweep(queue)
+    return queue
+
+
+def sweep_active(queue: "dict | None") -> bool:
+    return bool(queue) and queue.get("status") == RUNNING
+
+
+def sweep_current(queue: "dict | None") -> "str | None":
+    """The job a running sweep is on now, or None."""
+    if not sweep_active(queue):
+        return None
+    return next((i["job_id"] for i in queue["items"] if i["status"] == RUNNING), None)
+
+
+def start_sweep(plan: "list[dict]", launch: bool = True) -> dict:
+    """Queue `plan` (`sweep_plan`'s shape) and start the sweep process.
+
+    Raises ValueError while another sweep runs -- two would run their jobs side
+    by side, which is what a sweep is there to avoid -- or for an empty plan.
+    """
+    if sweep_active(get_sweep()):
+        raise ValueError("A sweep is already running — wait for it, or stop it.")
+    if not plan:
+        raise ValueError("No job lacks any of these datasets.")
+    queue = {
+        "created_at": _now_iso(),
+        "finished_at": None,
+        "status": RUNNING,
+        "pid": None,
+        "error": None,
+        "items": [
+            {"job_id": item["job_id"], "datasets": list(item["datasets"]),
+             "status": SWEEP_WAITING, "detail": None}
+            for item in plan
+        ],
+    }
+    _write_sweep(queue)
+    if not launch:
+        return queue
+    log = open(sweep_log_path(), "ab")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "simlab.tuning", "--sweep"],
+        cwd=_PROJECT_ROOT, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    queue["pid"] = proc.pid
+    _write_sweep(queue)
+    return queue
+
+
+def stop_sweep() -> "dict | None":
+    """Stop the sweep process, then the job it is on (its finished cells kept).
+
+    The sweep goes first, so it cannot start the next job when this one dies.
+    Jobs not reached stay as they were.
+    """
+    queue = get_sweep()
+    if not sweep_active(queue):
+        return queue
+    if _pid_alive(queue.get("pid")):
+        try:
+            os.killpg(os.getpgid(int(queue["pid"])), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    for item in queue["items"]:
+        if item["status"] == RUNNING:
+            stop(item["job_id"])
+            item.update(status=FAILED, detail=STOPPED_ERROR)
+    queue.update(status=FAILED, error=STOPPED_ERROR, finished_at=_now_iso())
+    _write_sweep(queue)
+    return queue
+
+
+def _run_spawned(record: dict) -> None:
+    """Run one job in its own worker and wait for it."""
+    _spawn(record).wait()
+
+
+def run_sweep(
+    progress: "Callable[[str], None]" = print,
+    run: "Callable[[dict], None] | None" = None,
+    sleep: "Callable[[float], None]" = time.sleep,
+) -> dict:
+    """Work through the stored sweep, one job at a time, writing it as it goes.
+
+    Before each job it waits while any tuning job runs -- one started by hand
+    keeps its pool, and the sweep adds none beside it. What a job still lacks is read
+    again at its turn: a dataset added by hand meanwhile is not added twice,
+    and a job that has them all, or was deleted, is skipped with the reason.
+
+    The queue is read again before every step, and a sweep stopped meanwhile
+    (`stop_sweep`) starts nothing more -- the stop kills this process, and this
+    is what holds if the kill missed. `run` (default `_run_spawned`) and
+    `sleep` are the tests' way in.
+    """
+    run = run or _run_spawned
+    if get_sweep() is None:
+        raise RuntimeError("no sweep queued")
+    while True:
+        queue = get_sweep()
+        if not sweep_active(queue):
+            return queue
+        index = next(
+            (n for n, i in enumerate(queue["items"]) if i["status"] == SWEEP_WAITING), None
+        )
+        if index is None:
+            break
+        if any(j.get("status") == RUNNING for j in list_jobs()):
+            sleep(SWEEP_POLL_SECONDS)
+            continue
+        item = queue["items"][index]
+        job = get_job(item["job_id"])
+        todo = missing_datasets(job, item["datasets"]) if job else []
+        if not todo:
+            item.update(
+                status=SWEEP_SKIPPED,
+                detail="the job was deleted" if job is None else "it has these datasets already",
+            )
+            _write_sweep(queue)
+            progress(f"{item['job_id']}: skipped, {item['detail']}")
+            continue
+        try:
+            record = add_datasets(item["job_id"], todo, launch=False)
+        except ValueError as exc:
+            item.update(status=SWEEP_SKIPPED, detail=str(exc))
+            _write_sweep(queue)
+            progress(f"{item['job_id']}: skipped, {exc}")
+            continue
+        item.update(status=RUNNING, datasets=todo, started_at=_now_iso())
+        _write_sweep(queue)
+        progress(f"{item['job_id']}: sweeping {', '.join(d['name'] for d in todo)}")
+        run(record)
+        queue = get_sweep()
+        if not sweep_active(queue):
+            return queue  # stopped while the job ran, and marked so by the stop
+        item = queue["items"][index]
+        after = get_job(item["job_id"])
+        after = _reap(after) if after else None
+        if after and after.get("status") == FINISHED:
+            item.update(status=FINISHED, detail=None)
+        else:
+            error = (after or {}).get("error") or "the job did not finish"
+            item.update(status=FAILED, detail=error)
+        item["finished_at"] = _now_iso()
+        _write_sweep(queue)
+        detail = f" ({item['detail']})" if item["detail"] else ""
+        progress(f"{item['job_id']}: {item['status']}{detail}")
+    queue.update(status=FINISHED, finished_at=_now_iso())
+    _write_sweep(queue)
+    progress("Sweep finished.")
+    return queue
 
 
 # --- the worker -------------------------------------------------------------
@@ -2443,7 +2720,17 @@ def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
 
 def main(argv: "list[str]") -> None:
     if len(argv) != 2:
-        raise SystemExit("usage: python -m simlab.tuning <job_id>")
+        raise SystemExit("usage: python -m simlab.tuning <job_id> | --sweep")
+    if argv[1] == "--sweep":
+        try:
+            run_sweep(progress=lambda m: print(m, flush=True))
+        except Exception as exc:
+            queue = get_sweep()
+            if queue is not None:
+                queue.update(status=FAILED, error=str(exc), finished_at=_now_iso())
+                _write_sweep(queue)
+            raise
+        return
     job_id = argv[1]
     try:
         run_job(job_id, progress=lambda m: print(m, flush=True))

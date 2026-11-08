@@ -4086,7 +4086,7 @@ def render_tuning_tab() -> None:
         "a session, every session counted, traded or not, and under it (±) the standard "
         "deviation of its sessions' profits. A finished job takes a "
         "new dataset (a new week, say) with the same settings, and datasets can be "
-        "dropped again."
+        "dropped again — or added to every job at once under **Sweep missing datasets**."
     )
     _render_tuning_jobs()
     submitted = sim_tuning.list_jobs()
@@ -4097,6 +4097,15 @@ def render_tuning_tab() -> None:
         key=f"tune_new_job{_tuning_form_suffix()}",
     ):
         _render_tuning_form()
+    # Drawn only while open: costing the plan scores every job's grid against
+    # the run store, a couple of seconds over twenty jobs.
+    sweep = st.expander(
+        "Sweep missing datasets", icon=":material/playlist_add:",
+        key="tune_sweep_missing", on_change="rerun",
+    )
+    with sweep:
+        if sweep.open:
+            _render_tuning_sweep(submitted)
     # Derived grids are offered beside the submitted jobs rather than in their
     # own section: they answer the same question in the same shape, and the
     # useful comparison is between a grid somebody swept and a grid the store
@@ -4116,21 +4125,37 @@ def _derived_jobs(signature: tuple) -> list[dict]:
 
 
 def _render_tuning_jobs() -> None:
-    # Refreshes itself while a job runs, like the experiment pipeline, and
-    # renders statically once nothing is running.
-    auto_refresh = any(j["status"] == sim_tuning.RUNNING for j in sim_tuning.list_jobs())
+    # Refreshes itself while a job or a sweep runs, like the experiment
+    # pipeline, and renders statically once nothing is running. A sweep counts
+    # on its own: between two of its jobs nothing else is running.
+    auto_refresh = any(
+        j["status"] == sim_tuning.RUNNING for j in sim_tuning.list_jobs()
+    ) or sim_tuning.sweep_active(sim_tuning.get_sweep())
     st.fragment(run_every=3.0 if auto_refresh else None)(
         lambda: _render_tuning_jobs_body(auto_refresh)
     )()
 
 
 def _render_tuning_jobs_body(auto_refresh: bool) -> None:
-    active = [j for j in sim_tuning.list_jobs() if j["status"] == sim_tuning.RUNNING]
-    if auto_refresh and not active:
+    jobs = sim_tuning.list_jobs()
+    active = [j for j in jobs if j["status"] == sim_tuning.RUNNING]
+    queue = sim_tuning.get_sweep()
+    sweeping = sim_tuning.sweep_active(queue)
+    running = sorted(j["job_id"] for j in active)
+    before = st.session_state.get("tune_running_ids")
+    st.session_state["tune_running_ids"] = running
+    if auto_refresh and not active and not sweeping:
         st.rerun()  # the last job just finished -- redraw its results below
-    if not active:
+    if before is not None and set(before) - set(running):
+        st.rerun()  # one of several, or one of a sweep's, finished -- likewise
+    if not active and not sweeping:
         return
     st.markdown("##### :material/grid_on: Running")
+    if sweeping:
+        _render_tuning_sweep_card(
+            queue, {j["job_id"]: _tuning_short_label(j) for j in jobs}, active,
+        )
+    current = sim_tuning.sweep_current(queue)
     for job in sorted(
         active, key=lambda j: _tuning_job_label(j, markdown=False, best=False).casefold()
     ):
@@ -4150,11 +4175,303 @@ def _render_tuning_jobs_body(auto_refresh: bool) -> None:
                     st.caption(line)
                 if st.button(
                     "Stop", key=f"tune_stop_{job['job_id']}", icon=":material/stop_circle:",
-                    help="Kill the worker and its pool. The cells finished so far are kept.",
+                    help="Kill the worker and its pool. The cells finished so far are kept."
+                    + (" The sweep then moves on to its next job."
+                       if job["job_id"] == current else ""),
                 ):
                     sim_tuning.stop(job["job_id"])
                     st.toast("Tuning job stopped", icon=":material/stop_circle:")
                     st.rerun()
+
+
+_TUNE_SWEEP_STATUS = {
+    sim_tuning.SWEEP_WAITING: "Waiting",
+    sim_tuning.RUNNING: "Sweeping",
+    sim_tuning.FINISHED: "Done",
+    sim_tuning.SWEEP_SKIPPED: "Skipped",
+    sim_tuning.FAILED: "Did not finish",
+}
+
+
+def _tuning_duration(seconds: float, short: bool = False) -> str:
+    """A rough duration: "roughly 6 min", "roughly 2 h 05 min" (`short`: "6 min")."""
+    minutes = max(seconds, 0.0) / 60.0
+    if minutes < 1:
+        return "<1 min" if short else "under a minute"
+    if minutes < 90:
+        text = f"{minutes:.0f} min"
+    else:
+        hours, rest = divmod(round(minutes), 60)
+        text = f"{hours} h {rest:02d} min"
+    return text if short else f"roughly {text}"
+
+
+def _tuning_short_label(job: dict) -> str:
+    """Ticker, model and start time: a job in a table whose swept parameters
+    have a column of their own (a full label is cut off before its start time,
+    and two grids of one model then read the same)."""
+    spec = job["spec"]
+    model = _apple_model_label(spec["base"].get("model_key", ""))
+    started = (job.get("created_at") or "")[:16].replace("T", " ")
+    return f"{spec['base']['ticker']} · {model} · {started}"
+
+
+def _tuning_sweep_rows(queue: dict, labels: dict[str, str]) -> list[dict]:
+    return [
+        {
+            "Status": _TUNE_SWEEP_STATUS.get(item["status"], item["status"]),
+            "Job": labels.get(item["job_id"], f"{item['job_id']} (deleted)"),
+            "Datasets": ", ".join(d["name"] for d in item["datasets"]),
+            "Note": item.get("detail") or "",
+        }
+        for item in queue["items"]
+    ]
+
+
+def _render_tuning_sweep_card(queue: dict, labels: dict[str, str], active: list[dict]) -> None:
+    """The running sweep, in the Running list: how far, which job now, Stop."""
+    items = queue["items"]
+    left = (sim_tuning.SWEEP_WAITING, sim_tuning.RUNNING)
+    done = sum(1 for item in items if item["status"] not in left)
+    current = next((item for item in items if item["status"] == sim_tuning.RUNNING), None)
+    started = (queue.get("created_at") or "")[:16].replace("T", " ")
+    with st.container(border=True):
+        st.markdown(
+            f"**Sweeping missing datasets** · {len(items)} job{'s' if len(items) != 1 else ''}, "
+            f"one at a time · started {started} UTC"
+        )
+        st.progress(min(done / max(len(items), 1), 1.0), text=f"{done} of {len(items)} jobs done")
+        with st.container(horizontal=True, vertical_alignment="center"):
+            if current is not None:
+                names = ", ".join(d["name"] for d in current["datasets"])
+                st.caption(f"Now {labels.get(current['job_id'], current['job_id'])} — {names}")
+            elif active:
+                st.caption("Waiting for the running tuning job to finish before the next one.")
+            else:
+                st.caption("Starting the next job…")
+            if st.button(
+                "Stop the sweep", key="tune_sweep_stop", icon=":material/stop_circle:",
+                help="Stops the job it is sweeping now — its finished cells are kept, and "
+                "**Sweep missing** on its results replays the rest — and starts no more. "
+                "Jobs it has not reached are left as they were, so their datasets are still "
+                "missing.",
+            ):
+                sim_tuning.stop_sweep()
+                st.toast("Sweep stopped", icon=":material/stop_circle:")
+                st.rerun()
+        with st.expander(f"Sweep queue ({len(items)} jobs)", icon=":material/list:"):
+            st.dataframe(_tuning_sweep_rows(queue, labels), hide_index=True)
+
+
+def _tuning_sweep_summary(queue: dict, labels: dict[str, str]) -> str:
+    """The last sweep: when, how its jobs ended, and which did not finish --
+    those have their datasets now, so this section no longer offers them."""
+    started = (queue.get("created_at") or "")[:16].replace("T", " ")
+    counts: dict[str, int] = {}
+    for item in queue["items"]:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    parts = [
+        f"{counts[status]} {word}"
+        for status, word in (
+            (sim_tuning.FINISHED, "swept"),
+            (sim_tuning.SWEEP_SKIPPED, "skipped"),
+            (sim_tuning.FAILED, "did not finish"),
+            (sim_tuning.SWEEP_WAITING, "not reached"),
+        )
+        if counts.get(status)
+    ]
+    ended = "stopped" if queue.get("error") == sim_tuning.STOPPED_ERROR else (
+        f"failed ({queue['error']})" if queue.get("error") else "finished"
+    )
+    unfinished = [
+        f"{labels.get(i['job_id'], i['job_id'])} ({i.get('detail') or 'did not finish'})"
+        for i in queue["items"] if i["status"] == sim_tuning.FAILED
+    ]
+    return (
+        f"Last sweep, started {started} UTC, {ended}: " + " · ".join(parts) + "."
+        + (f" Not finished: {'; '.join(unfinished)} — **Sweep missing** on its results "
+           "replays the rest." if unfinished else "")
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=256)
+def _tuning_sweep_cost(key: str, datasets_json: str, signature: tuple, _job: dict) -> dict:
+    """`tuning.sweep_cost` plus the row's note, for one job of the sweep table.
+
+    `key` stands in for `_job`, which the cache leaves out of its key (hashing
+    a record's cells costs more than the work): it is the job's spec, status
+    and progress, so it moves whenever the answer can. `signature` is the run
+    store's -- the cache key, deliberately unused, as in `_load_runs`.
+    """
+    datasets = json.loads(datasets_json)
+    prior = sim_tuning.prior_cells(_job["spec"], _runs(), datasets)
+    return {
+        **sim_tuning.sweep_cost(_job, datasets, prior),
+        "note": _tuning_sweep_note(_job, datasets),
+    }
+
+
+def _tuning_sweep_note(job: dict, datasets: list[dict]) -> str:
+    """What to know before sweeping `datasets` into this job, or ""."""
+    spec = job["spec"]
+    notes = []
+    if job["status"] == sim_tuning.RUNNING:
+        notes.append("running now — swept once it finishes")
+    else:
+        holes = sim_tuning.missing_replays(job)
+        if holes:
+            notes.append(f"also replays the {holes:,} it lacks already")
+    for added in datasets:
+        for have in spec["datasets"]:
+            shared = sim_tuning.overlapping_days(added["days"], have["days"])
+            if shared:
+                notes.append(
+                    f"{added['name']} shares {len(shared)} session"
+                    f"{'s' if len(shared) != 1 else ''} with {have['name']} (counted twice)"
+                )
+    feeds = sorted({d["feed"] for d in spec["datasets"]})
+    for added in datasets:
+        if feeds and added["feed"] not in feeds:
+            notes.append(
+                f"{added['name']} reads the {added['feed']} tape, the job {', '.join(feeds)}"
+            )
+    return "; ".join(notes)
+
+
+def _render_tuning_sweep(jobs: list[dict]) -> None:
+    """Add the datasets stored jobs lack to all of them at once, then sweep them.
+
+    Each job takes the chosen datasets that carry its ticker and that it does
+    not have, swept with its own configuration, grid and cash -- what "Add and
+    sweep" does for one job. The jobs run one after another (`tuning.run_sweep`).
+    """
+    st.caption(
+        "Adds datasets the tuning jobs don't have yet to every job that can take them — "
+        "a dataset goes to the jobs whose ticker it carries — and sweeps each with its own "
+        "configuration, grid and cash, as **Add and sweep** on a job's results does. "
+        "The jobs run one at a time, each on its own workers."
+    )
+    queue = sim_tuning.get_sweep()
+    if sim_tuning.sweep_active(queue):
+        st.info(
+            "A sweep is running — its progress is under **Running** at the top of the tab.",
+            icon=":material/hourglass_top:",
+        )
+        return
+    if queue is not None and queue.get("items"):
+        st.caption(_tuning_sweep_summary(
+            queue, {j["job_id"]: _tuning_short_label(j) for j in jobs},
+        ))
+    # In the results picker's order, without the best combination's numbers:
+    # summing every job's grid for them is most of a second.
+    stored = sorted(
+        (j for j in jobs if not sim_tuning.is_derived(j)),
+        key=lambda j: _tuning_job_label(j, markdown=False, best=False).casefold(),
+    )
+    by_name = {d.name: d for d in sim_data.list_datasets()}
+    specs = {name: _tuning_dataset_spec(d) for name, d in by_name.items()}
+    lacking = {
+        d["name"] for item in sim_tuning.sweep_plan(stored, list(specs.values()))
+        for d in item["datasets"]
+    }
+    if not lacking:
+        st.caption("Every tuning job has every stored dataset that carries its ticker.")
+        return
+    # Newest first, the newest picked: the weekly case is one new week.
+    options = sorted(lacking, key=lambda n: (str(by_name[n].end), n), reverse=True)
+    chosen = st.multiselect(
+        "Datasets", options, default=options[:1],
+        format_func=lambda n: _tuning_describe_dataset(by_name[n]),
+        # A new set of options draws a fresh widget, back on the newest.
+        key="tune_sweep_datasets_" + hashlib.sha1("|".join(options).encode()).hexdigest()[:8],
+        help="Every stored dataset at least one job lacks. A job takes those of them that "
+        "carry its ticker.",
+    )
+    if not chosen:
+        st.caption("Pick a dataset to sweep.")
+        return
+    plan = sim_tuning.sweep_plan(stored, [specs[n] for n in chosen])
+    by_id = {j["job_id"]: j for j in stored}
+    signature = sim_results.store_signature()
+    costs = {}
+    for item in plan:
+        job = by_id[item["job_id"]]
+        key = json.dumps(
+            [job["job_id"], job["status"], job.get("progress"), job["spec"]],
+            sort_keys=True, default=str,
+        )
+        costs[item["job_id"]] = _tuning_sweep_cost(
+            key, json.dumps(item["datasets"], sort_keys=True), signature, job,
+        )
+    frame = pd.DataFrame(
+        [
+            {
+                "job_id": item["job_id"],
+                "Sweep": True,
+                "Job": _tuning_short_label(by_id[item["job_id"]]),
+                "Tunes": " × ".join(
+                    _tuning_param_label(a["name"]) for a in by_id[item["job_id"]]["spec"]["axes"]
+                ),
+                "Adds": ", ".join(d["name"] for d in item["datasets"]),
+                "Replays": costs[item["job_id"]]["replays"],
+                "Time": _tuning_duration(costs[item["job_id"]]["seconds"], short=True),
+                "Note": costs[item["job_id"]]["note"],
+            }
+            for item in plan
+        ]
+    ).set_index("job_id")
+    digest = hashlib.sha1(
+        json.dumps([[i["job_id"], [d["name"] for d in i["datasets"]]] for i in plan]).encode()
+    ).hexdigest()[:8]
+    edited = st.data_editor(
+        frame, key=f"tune_sweep_jobs_{digest}", hide_index=True,
+        disabled=[c for c in frame.columns if c != "Sweep"],
+        column_config={
+            "Sweep": st.column_config.CheckboxColumn(
+                "Sweep", help="Untick a job to leave it out of this sweep.", width="small",
+            ),
+            "Job": st.column_config.TextColumn(
+                "Job", help="Ticker, model and when it started (UTC).",
+            ),
+            "Tunes": st.column_config.TextColumn("Tunes"),
+            "Adds": st.column_config.TextColumn("Adds"),
+            "Replays": st.column_config.NumberColumn(
+                "Replays", format="%d",
+                help="Its grid plus the baseline on every added dataset, less what the run "
+                "store already answers; a stopped job's own holes too.",
+            ),
+            "Time": st.column_config.TextColumn("Time", help="A rough guide, not a promise."),
+            "Note": st.column_config.TextColumn("Note"),
+        },
+    )
+    picked = [item for item in plan if bool(edited["Sweep"].get(item["job_id"]))]
+    replays = sum(costs[i["job_id"]]["replays"] for i in picked)
+    reused = sum(costs[i["job_id"]]["reused"] for i in picked)
+    seconds = sum(costs[i["job_id"]]["seconds"] for i in picked)
+    waiting = any(j["status"] == sim_tuning.RUNNING for j in stored)
+    if picked:
+        st.caption(
+            f"{replays:,} replays over {len(picked)} job{'s' if len(picked) != 1 else ''}"
+            + (f", {reused:,} more already in the run store" if reused else "")
+            + f" · {_tuning_duration(seconds)}, one job after another."
+            + (" It starts once the tuning job running now finishes." if waiting else "")
+        )
+    if st.button(
+        f"Sweep {len(picked)} job{'s' if len(picked) != 1 else ''}",
+        icon=":material/play_arrow:", type="primary", key="tune_sweep_go",
+        disabled=not picked,
+    ):
+        try:
+            sim_tuning.start_sweep(picked)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.toast(
+                f"Sweeping {', '.join(chosen)} over {len(picked)} job"
+                f"{'s' if len(picked) != 1 else ''}",
+                icon=":material/playlist_add:",
+            )
+            st.rerun()
 
 
 def _tuning_dataset_spec(dataset) -> dict:

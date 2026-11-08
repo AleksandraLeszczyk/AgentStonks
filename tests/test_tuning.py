@@ -2270,6 +2270,295 @@ class TestJob:
         assert cell["profit"] == round(result.final_value - 10_000.0, 2)
 
 
+# --- sweeping missing datasets over every job -------------------------------
+
+
+def stored_job(job_id: str, names, ticker: str = TICKER, **fields) -> dict:
+    """A finished job over `names`, every cell answered, written to the store."""
+    record = job_record({n: [scored({"buy_k": 0.3}, 1.0), scored({"buy_k": 0.5}, 2.0)]
+                         for n in names})
+    record["spec"]["base"]["ticker"] = ticker
+    record["spec"]["datasets"] = [dataset(n, symbols=[ticker]) for n in names]
+    record.update(job_id=job_id, progress={"done": 3 * len(names), "total": 3 * len(names)},
+                  **fields)
+    tu._write(record)
+    return record
+
+
+def finish(record: dict) -> None:
+    """A stand-in worker: answers every cell the record lacks at $1."""
+    record = tu.get_job(record["job_id"])
+    for name in tu.dataset_names(record["spec"]):
+        have = tu._cells_by_key(record, name)
+        record["cells"][name] += [scored(c, 1.0) for c in tu.grid(record["spec"]["axes"])
+                                  if tu.overrides_key(c) not in have]
+        record["baseline"][name] = record["baseline"].get(name) or scored({}, 1.0)
+    record.update(status=tu.FINISHED)
+    tu._write(record)
+
+
+class TestSweep:
+    """"Sweep missing datasets": every job takes the datasets it lacks, one job
+    after another."""
+
+    def test_each_job_is_planned_the_datasets_it_lacks_and_whose_ticker_they_carry(
+        self, tuning_dir
+    ):
+        jobs = [
+            stored_job("a", ["w1"]),
+            stored_job("b", ["w1", "w2"]),
+            stored_job("c", ["w1"], ticker="INTC"),
+            {**stored_job("d", ["w1"]), "status": tu.DERIVED},
+        ]
+        offered = [dataset("w3", symbols=[TICKER]), dataset("w2", symbols=[TICKER, "INTC"])]
+        plan = tu.sweep_plan(jobs, offered)
+        assert [(i["job_id"], [d["name"] for d in i["datasets"]]) for i in plan] == [
+            ("a", ["w2", "w3"]), ("b", ["w3"]), ("c", ["w2"]),
+        ]
+
+    def test_several_datasets_are_added_in_one_restart(self, tuning_dir):
+        stored_job("a", ["w1"])
+        record = tu.add_datasets("a", [dataset("w2"), dataset("w3")], runs=[], launch=False)
+        assert tu.dataset_names(record["spec"]) == ["w1", "w2", "w3"]
+        assert record["status"] == tu.RUNNING and tu.missing_replays(record) == 6
+
+    def test_the_cost_is_the_added_grids_less_the_run_store_plus_a_stopped_jobs_holes(
+        self, tuning_dir
+    ):
+        job = stored_job("a", ["w1"])
+        added = [dataset("w2")]
+        prior = {"w2": {tu.overrides_key({}): scored({}, 1.0)}}
+        cost = tu.sweep_cost(job, added, prior)
+        assert (cost["replays"], cost["reused"]) == (2, 1)
+        assert cost["seconds"] == pytest.approx(tu.estimated_seconds(job["spec"], prior, added))
+        job["cells"]["w1"].pop()
+        assert tu.sweep_cost(job, added, prior)["replays"] == 3
+        # A running job's worker fills its own holes before the sweep reaches it.
+        assert tu.sweep_cost({**job, "status": tu.RUNNING}, added, prior)["replays"] == 2
+
+    def test_the_jobs_run_one_after_another_and_each_gets_its_datasets(self, tuning_dir):
+        stored_job("a", ["w1"])
+        stored_job("b", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        order = []
+
+        def run(record):
+            # Nothing else is running when a job starts: the one before is done.
+            assert [j["job_id"] for j in tu.list_jobs() if j["status"] == tu.RUNNING] == [
+                record["job_id"]
+            ]
+            order.append(record["job_id"])
+            finish(record)
+
+        queue = tu.run_sweep(progress=lambda m: None, run=run, sleep=lambda s: None)
+        assert sorted(order) == ["a", "b"]
+        assert queue["status"] == tu.FINISHED
+        assert [i["status"] for i in queue["items"]] == [tu.FINISHED, tu.FINISHED]
+        for job_id in order:
+            job = tu.get_job(job_id)
+            assert tu.dataset_names(job["spec"]) == ["w1", "w2"]
+            assert job["status"] == tu.FINISHED and tu.missing_replays(job) == 0
+        assert tu.get_sweep()["status"] == tu.FINISHED
+
+    def test_it_waits_while_another_job_runs(self, tuning_dir):
+        stored_job("a", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        stored_job("busy", ["w2"], status=tu.RUNNING, pid=os.getpid())
+        naps = []
+
+        def sleep(seconds):
+            naps.append(seconds)
+            record = tu.get_job("busy")
+            record.update(status=tu.FINISHED)
+            tu._write(record)
+
+        tu.run_sweep(progress=lambda m: None, run=finish, sleep=sleep)
+        assert naps == [tu.SWEEP_POLL_SECONDS]
+        assert tu.get_job("a")["status"] == tu.FINISHED
+
+    def test_a_job_that_has_them_by_its_turn_or_is_gone_is_skipped(self, tuning_dir):
+        stored_job("a", ["w1"])
+        stored_job("b", ["w1"])
+        stored_job("c", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        tu.add_dataset("b", dataset("w2"), runs=[], launch=False)
+        finish(tu.get_job("b"))
+        tu.delete_job("c")
+        ran = []
+        queue = tu.run_sweep(
+            progress=lambda m: None, run=lambda r: (ran.append(r["job_id"]), finish(r)),
+            sleep=lambda s: None,
+        )
+        items = {i["job_id"]: i for i in queue["items"]}
+        assert ran == ["a"]
+        assert items["b"]["status"] == tu.SWEEP_SKIPPED and "already" in items["b"]["detail"]
+        assert items["c"]["status"] == tu.SWEEP_SKIPPED and "deleted" in items["c"]["detail"]
+        assert tu.dataset_names(tu.get_job("b")["spec"]) == ["w1", "w2"]
+
+    def test_a_job_that_does_not_finish_is_reported_and_the_sweep_moves_on(self, tuning_dir):
+        stored_job("a", ["w1"])
+        stored_job("b", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+
+        def run(record):
+            if record["job_id"] == tu.get_sweep()["items"][0]["job_id"]:
+                tu.stop(record["job_id"])  # its Stop button, mid-sweep
+            else:
+                finish(record)
+
+        queue = tu.run_sweep(progress=lambda m: None, run=run, sleep=lambda s: None)
+        first, second = queue["items"]
+        assert (first["status"], first["detail"]) == (tu.FAILED, tu.STOPPED_ERROR)
+        assert second["status"] == tu.FINISHED and queue["status"] == tu.FINISHED
+
+    def test_stopping_the_sweep_stops_its_job_and_leaves_the_rest_as_they_were(
+        self, tuning_dir
+    ):
+        stored_job("a", ["w1"])
+        stored_job("b", ["w1"])
+        queue = tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        now, later = (i["job_id"] for i in queue["items"])
+        tu.add_dataset(now, dataset("w2"), runs=[], launch=False)
+        queue["items"][0]["status"] = tu.RUNNING
+        tu._write_sweep(queue)
+        assert tu.sweep_current(tu.get_sweep()) == now
+
+        stopped = tu.stop_sweep()
+        assert (stopped["status"], stopped["error"]) == (tu.FAILED, tu.STOPPED_ERROR)
+        assert [i["status"] for i in stopped["items"]] == [tu.FAILED, tu.SWEEP_WAITING]
+        assert tu.get_job(now)["error"] == tu.STOPPED_ERROR
+        assert tu.dataset_names(tu.get_job(later)["spec"]) == ["w1"]
+        # Not running any more, so another sweep may start.
+        assert not tu.sweep_active(tu.get_sweep())
+
+    def test_a_sweep_stopped_while_its_job_ran_starts_nothing_more(self, tuning_dir):
+        """What holds if the stop's kill missed the sweep process."""
+        stored_job("a", ["w1"])
+        stored_job("b", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        ran = []
+        queue = tu.run_sweep(
+            progress=lambda m: None, run=lambda r: (ran.append(r), tu.stop_sweep()),
+            sleep=lambda s: None,
+        )
+        assert len(ran) == 1 and queue["error"] == tu.STOPPED_ERROR
+        assert [i["status"] for i in tu.get_sweep()["items"]] == [tu.FAILED, tu.SWEEP_WAITING]
+
+    def test_one_sweep_at_a_time_and_never_an_empty_one(self, tuning_dir):
+        stored_job("a", ["w1"])
+        plan = tu.sweep_plan(tu.list_jobs(), [dataset("w2")])
+        with pytest.raises(ValueError, match="No job"):
+            tu.start_sweep([], launch=False)
+        queue = tu.start_sweep(plan, launch=False)
+        queue["pid"] = os.getpid()
+        tu._write_sweep(queue)
+        with pytest.raises(ValueError, match="already running"):
+            tu.start_sweep(plan, launch=False)
+        assert tu.sweep_current(tu.get_sweep()) is None  # still waiting on its first
+
+    def test_a_sweep_whose_process_is_gone_is_failed_not_stuck(self, tuning_dir):
+        stored_job("a", ["w1"])
+        queue = tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        queue["pid"] = 2 ** 22 + 12345  # no such process
+        tu._write_sweep(queue)
+        assert tu.get_sweep()["status"] == tu.FAILED and "died" in tu.get_sweep()["error"]
+
+    def test_the_sweep_process_runs_the_queue_and_a_crash_marks_it_failed(
+        self, tuning_dir, monkeypatch
+    ):
+        stored_job("a", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        monkeypatch.setattr(tu, "_run_spawned", finish)
+        tu.main(["simlab.tuning", "--sweep"])
+        assert tu.get_sweep()["status"] == tu.FINISHED
+
+        stored_job("b", ["w1"])
+        tu.start_sweep(tu.sweep_plan([tu.get_job("b")], [dataset("w2")]), launch=False)
+
+        def crash(record):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(tu, "_run_spawned", crash)
+        with pytest.raises(RuntimeError):
+            tu.main(["simlab.tuning", "--sweep"])
+        assert (tu.get_sweep()["status"], tu.get_sweep()["error"]) == (tu.FAILED, "boom")
+
+    def test_the_queue_is_never_listed_as_a_job(self, tuning_dir):
+        stored_job("a", ["w1"])
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+        assert [j["job_id"] for j in tu.list_jobs()] == ["a"]
+
+    def test_a_real_sweep_replays_the_added_dataset(self, store, stub_model, tuning_dir):
+        record = tu.submit(TestJob().job_spec(datasets=[dataset("d")]), launch=False)
+        tu.run_job(record["job_id"], progress=lambda m: None)
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("e", TEST_DAY)]), launch=False)
+        tu.run_sweep(
+            progress=lambda m: None,
+            run=lambda r: tu.run_job(r["job_id"], progress=lambda m: None),
+            sleep=lambda s: None,
+        )
+        done = tu.get_job(record["job_id"])
+        assert done["status"] == tu.FINISHED and tu.missing_replays(done) == 0
+        # The same tape on both days, so the new week's cells repeat the old ones.
+        assert [c.get("profit") for c in done["cells"]["e"]] == [
+            c.get("profit") for c in done["cells"]["d"]
+        ]
+
+
+def _sweep_app() -> None:
+    from simlab import app as sim_app
+    from simlab import tuning as tuning
+
+    sim_app._render_tuning_sweep(tuning.list_jobs())
+
+
+class TestSweepSection:
+    @pytest.fixture
+    def app(self, tuning_dir, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        from simlab import app as sim_app
+
+        stored = [
+            SimpleNamespace(name=name, days=[str(day)], feed=sim_data.DEFAULT_FEED,
+                            symbols=[TICKER], start=str(day), end=str(day))
+            for name, day in (("w1", TUNE_DAY), ("w2", TEST_DAY), ("w3", TEST_DAY))
+        ]
+        monkeypatch.setattr(sim_app.sim_data, "list_datasets", lambda: stored)
+        monkeypatch.setattr(sim_app, "_runs", lambda: [])
+        stored_job("a", ["w1"])
+        stored_job("b", ["w1", "w3"])
+        started = []
+        monkeypatch.setattr(tu, "start_sweep", lambda plan, launch=True: started.append(plan))
+        app = AppTest.from_function(_sweep_app, default_timeout=30)
+        app.started = started
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    def test_the_newest_missing_dataset_is_offered_over_every_job_lacking_it(self, app):
+        [chosen] = app.multiselect
+        # Newest first (by its last session, then name), the newest picked.
+        assert chosen.value == ["w3"]
+        assert [o.split(" · ")[0] for o in chosen.options] == ["w3", "w2"]
+        app.button(key="tune_sweep_go").click().run()
+        assert not app.exception, app.exception
+        [plan] = app.started
+        assert [(i["job_id"], [d["name"] for d in i["datasets"]]) for i in plan] == [
+            ("a", ["w3"]),
+        ]
+
+    def test_both_datasets_go_to_the_jobs_that_lack_them(self, app):
+        app.multiselect[0].set_value(["w2", "w3"]).run()
+        assert not app.exception, app.exception
+        assert app.button(key="tune_sweep_go").label == "Sweep 2 jobs"
+        app.button(key="tune_sweep_go").click().run()
+        [plan] = app.started
+        assert {i["job_id"]: [d["name"] for d in i["datasets"]] for i in plan} == {
+            "a": ["w2", "w3"], "b": ["w2"],
+        }
+
+
 # --- cells a stored run already answers -------------------------------------
 
 
