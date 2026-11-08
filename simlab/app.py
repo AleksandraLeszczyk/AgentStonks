@@ -3924,6 +3924,42 @@ def _tuning_fill_refusal(spec: dict) -> "str | None":
         return f"Its configuration does not decode ({exc})."
 
 
+def _tuning_fill_spec(spec: dict) -> dict:
+    """What "Fill new job form" fills: the job as submitted, a merged one over
+    its newest ranges (`tuning.merge_jobs`) -- the union of its ranges is
+    mostly combinations none of its jobs swept, and the form would sweep them."""
+    if not spec.get("grids"):
+        return spec
+    return {**{k: v for k, v in spec.items() if k != "grids"}, "axes": spec["grids"][-1]}
+
+
+def _tuning_ranges_text(axes: list[dict]) -> str:
+    """One grid's ranges, "Buy 0.30–0.85 × Sell 0.05–0.45"."""
+    parts = []
+    for axis in axes:
+        ticks = [sim_tuning.axis_tick(axis["name"], v) for v in axis["values"]]
+        shown = (
+            "/".join(ticks) if axis["name"] in sim_tuning.CHOICES or len(ticks) < 3
+            else f"{ticks[0]}–{ticks[-1]}"
+        )
+        parts.append(f"{_tuning_param_label(axis['name'])} {shown}")
+    return " × ".join(parts)
+
+
+def _tuning_merged_note(job: dict) -> str:
+    """A merged job's caption: what it was merged from, and why some squares
+    are blank (`tuning.merge_jobs`)."""
+    spec = job["spec"]
+    ranges = "; ".join(_tuning_ranges_text(g) for g in spec.get("grids") or [spec["axes"]])
+    others = ", ".join(f"`{m['job_id']}`" for m in job["merged"])
+    return (
+        f":material/merge: Merged with {others} — the same configuration, datasets and "
+        f"cash over other ranges: {ranges}. A combination of values from different "
+        "ranges was never swept, so its square is blank; an added dataset is swept over "
+        "these ranges only. Where they overlap, the oldest job's replays are kept."
+    )
+
+
 def _tuning_filled_range(name: str, values: "list | None") -> tuple:
     """A past job's values of one numeric axis as from/to/step, inside what the
     boxes take; the axis's default range without them."""
@@ -4090,6 +4126,18 @@ def render_tuning_tab() -> None:
     )
     _render_tuning_jobs()
     submitted = sim_tuning.list_jobs()
+    # Jobs that are one grid in several ranges, finished before a worker
+    # merged its own as it finished (`tuning.merge_jobs`; nothing while a job
+    # or a sweep runs).
+    merges = sim_tuning.merge_jobs(submitted)
+    for merge in merges:
+        st.toast(
+            f"Merged {', '.join(merge['merged'])} into {merge['into']}: the same "
+            "configuration over other ranges.",
+            icon=":material/merge:",
+        )
+    if merges:
+        submitted = sim_tuning.list_jobs()
     # Keyed by the fill, so a fill opens the form even if it was collapsed.
     with st.expander(
         "New tuning job", icon=":material/tune:",
@@ -4789,6 +4837,10 @@ def _tuning_current_place(spec: dict, axes: list[dict]) -> "dict | None":
     off = [(a["name"], found[a["name"]]) for a in axes if found[a["name"]] not in a["values"]]
     if off:
         return {"overrides": found, "off": off, "differ": []}
+    members = sim_tuning.grid_members(spec)
+    if members is not None and sim_tuning.overrides_key(found) not in members:
+        # Every value is on an axis, but from ranges of different merged jobs.
+        return {"overrides": found, "off": [], "between": True, "differ": []}
     try:
         on_grid = sim_tuning.make_config(spec["base"], found)
     except (TypeError, ValueError):
@@ -4803,7 +4855,7 @@ def _tuning_current_marks(spec: dict, axes: list[dict]) -> dict:
     grid. "Current configuration*" when it differs in a setting the grid
     does not sweep: the frame marks its values, the squares stay the job's."""
     place = _tuning_current_place(spec, axes)
-    if place is None or place["off"]:
+    if place is None or place["off"] or place.get("between"):
         return {}
     label = "Current configuration" + ("*" if place["differ"] else "")
     return {label: place["overrides"]}
@@ -4822,6 +4874,11 @@ def _tuning_current_note(place: "dict | None") -> str:
         return (
             f" The current configuration is not on this grid: its {values} is not among "
             "the values swept."
+        )
+    if place.get("between"):
+        return (
+            " The current configuration is not on this grid: its values come from the "
+            "ranges of different merged jobs, a combination none of them swept."
         )
     if not place["differ"]:
         return ""
@@ -4997,7 +5054,7 @@ def _tuning_chosen(job: dict) -> "dict | None":
     if not chosen:
         return None
     key = sim_tuning.overrides_key(chosen)
-    if key not in {sim_tuning.overrides_key(o) for o in sim_tuning.grid(job["spec"]["axes"])}:
+    if key not in {sim_tuning.overrides_key(o) for o in sim_tuning.combos(job["spec"])}:
         return None
     return chosen
 
@@ -5064,10 +5121,11 @@ def _tuning_view_picker(axes: list[dict], marks: dict, key: str) -> list:
 
 def _tuning_view_heatmap(
     cells: list[dict], axes: list[dict], marks: dict, title: str, view,
-    clickable: bool = False,
+    clickable: bool = False, members: "set[str] | None" = None,
 ) -> go.Figure:
     """`_tuning_heatmap` for a grid of any size, a third and a fourth axis
-    drawn as `view` says (`tuning.slice_views`).
+    drawn as `view` says (`tuning.slice_views`) -- a merged job's collapsed
+    over each square's own combinations (`members`, `tuning.grid_members`).
 
     Every mark is outlined wherever it sits on the first two axes, whatever
     the view (since 2026-10-28, the user's: the best Sharpe ratio and win
@@ -5114,7 +5172,7 @@ def _tuning_view_heatmap(
             **cell["overrides"], **held, **(cell.get("best_of") or {}).get("values", {}),
         }
     return _tuning_heatmap(
-        sim_tuning.slice_cells(cells, axes, views, _TUNING_HEAT_METRIC), axes[:2], shown,
+        sim_tuning.slice_cells(cells, axes, views, _TUNING_HEAT_METRIC, members), axes[:2], shown,
         " · ".join(titles), metric_label=metric_label, config_of=config_of,
     )
 
@@ -6194,8 +6252,10 @@ def _render_tuning_special_days(job: dict) -> dict:
     one switch per kind; returns the job as the rest of its results read it.
 
     Each session shows what was expected, what came and the surprise
-    (`special_days.outcome_cells`), and what the selected configuration made
-    on it as replayed. A kind switched off is left out of everything under it:
+    (`special_days.outcome_cells`), and what each option of the table under
+    it (`_tuning_options`) -- the current configuration, the bests and the
+    one selected -- made on it as replayed, so the sessions read with nothing
+    selected too. A kind switched off is left out of everything under it:
     the job comes back as if every configuration had sat those sessions out
     (`tuning.without_days`) -- profits, heatmaps and best options -- with the
     kind in the job's days-off rule, so the selected configuration, and the
@@ -6235,17 +6295,28 @@ def _render_tuning_special_days(job: dict) -> dict:
     left_out = [k for k in measured if not st.session_state[_tuning_special_key(job_id, k)]]
     days_out = {r["day"] for r in rows if r["category"] in left_out}
     read = sim_tuning.without_days(job, days_out, [*left_out, *unmet])
-    chosen = _tuning_chosen(read)
+    # A column per option rather than the selected one's alone (since
+    # 2026-11-07, the user's: nothing is selected for them, so the column
+    # read None until a square was clicked). The options are the read job's,
+    # as the table under this one lists them; what each made is the stored
+    # job's, so a session left out still shows what it made as replayed.
+    options = _tuning_options(read, _tuning_chosen(read))
 
-    def made(cell: "dict | None", day: str) -> "float | None":
-        if not sim_tuning.is_scored(cell) or day in (cell.get("sat_out_days") or ()):
-            return None
-        return (cell.get("daily") or {}).get(day)
+    def made(overrides: dict, row: dict) -> "float | None":
+        # The first dataset that has the session scored: one not swept yet
+        # leaves the session to the next that shares it.
+        for name in row["datasets"]:
+            cell = sim_tuning.cell_at(job, name, overrides)
+            if sim_tuning.is_scored(cell) and row["day"] not in (cell.get("sat_out_days") or ()):
+                found = (cell.get("daily") or {}).get(row["day"])
+                if found is not None:
+                    return found
+        return None
 
     table, impact = [], {}
     for row in rows:
-        name, day, kind = row["datasets"][0], row["day"], row["category"]
-        mine = made(sim_tuning.cell_at(job, name, chosen), day) if chosen else None
+        day, kind = row["day"], row["category"]
+        mine = {f"option_{i}": made(overrides, row) for i, (_, overrides) in enumerate(options)}
         status = (
             "never traded" if kind in sat_out
             else "left out" if day in days_out else "counted"
@@ -6256,10 +6327,12 @@ def _render_tuning_special_days(job: dict) -> dict:
             "kind": event_days.LABELS[kind], "event": row["what"],
             **sim_special.outcome_cells(row, earnings),
             "source": ((release or {}).get("sources") or [None])[0],
-            "shown": mine, "status": status,
+            **mine, "status": status,
         })
-        if kind in measured and chosen:
-            impact[kind] = impact.get(kind, 0.0) + (mine or 0.0)
+        if kind in measured:
+            for column, profit in mine.items():
+                by_kind = impact.setdefault(column, {})
+                by_kind[kind] = by_kind.get(kind, 0.0) + (profit or 0.0)
 
     sessions = len({r["day"] for r in rows})
     with st.expander(
@@ -6294,12 +6367,13 @@ def _render_tuning_special_days(job: dict) -> dict:
                         "configuration below sits these sessions out, and so does the "
                         "selected one.",
                     )
+        labels = {f"option_{i}": " · ".join(roles) for i, (roles, _) in enumerate(options)}
         money = st.column_config.NumberColumn
         st.dataframe(
-            pd.DataFrame(table), hide_index=True,
+            pd.DataFrame(table), hide_index=True, placeholder="—",
             # What the session made first; where it came from last.
             column_order=[
-                "day", "kind", "shown", "status", "measure", "expected", "actual",
+                "day", "kind", *labels, "status", "measure", "expected", "actual",
                 "surprise", "more", "event", "datasets", "source",
             ],
             column_config={
@@ -6313,16 +6387,28 @@ def _render_tuning_special_days(job: dict) -> dict:
                     "Source", display_text="page",
                     help="The first page the lookup read, for a CPI or jobs release.",
                 ),
-                "shown": money("Selected ($)", format="%+.2f"),
+                **{
+                    column: money(
+                        f"{label} ($)", format="%+.2f",
+                        help="What this option — a row of the table below — made on the "
+                        "session as replayed, a session left out too. — where it never "
+                        "traded the session or has not replayed it yet.",
+                    )
+                    for column, label in labels.items()
+                },
                 "status": "Counted",
             },
         )
         if impact:
             st.caption(
-                "As replayed, these sessions made the selected configuration — "
+                "As replayed, these sessions made — "
                 + "; ".join(
-                    f"{event_days.LABELS[kind]}: {_tuning_usd(mine)}"
-                    for kind, mine in impact.items()
+                    f"{labels[column]}: "
+                    + ", ".join(
+                        f"{event_days.LABELS[kind]} {_tuning_usd(profit)}"
+                        for kind, profit in by_kind.items()
+                    )
+                    for column, by_kind in impact.items()
                 )
                 + ". Taking a session out leaves the days after it as replayed: sitting it "
                 "out would have sized them from slightly different cash."
@@ -6561,7 +6647,7 @@ def _render_tuning_dataset_controls(job: dict) -> None:
         minutes = sim_tuning.estimated_seconds(spec, prior, [added]) / 60.0
         found = len(prior[added["name"]])
         st.caption(
-            f"Adding `{chosen.name}` is {len(sim_tuning.grid(spec['axes'])) + 1} replays"
+            f"Adding `{chosen.name}` is {len(sim_tuning.combos(spec)) + 1} replays"
             + (f", {found} of them already in the run store" if found else "")
             + " · " + ("under a minute" if minutes < 1 else f"roughly {minutes:.0f} min")
             + f" with {spec.get('workers') or 1} worker"
@@ -6572,6 +6658,9 @@ def _render_tuning_dataset_controls(job: dict) -> None:
 def _render_tuning_results(jobs: list[dict]) -> None:
     st.markdown("##### :material/grid_on: Tuning results")
     wanted = st.session_state.get("tune_selected_job")
+    if wanted and all(j["job_id"] != wanted for j in jobs):
+        # Merged, as it finished, into the job whose ranges it continues.
+        wanted = sim_tuning.merged_into(wanted, jobs) or wanted
     detail = _derived_discriminators(jobs)
     labels = {
         j["job_id"]: _tuning_job_label(j, markdown=False, detail=detail.get(j["job_id"], ""))
@@ -6604,6 +6693,8 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         )
     elif sim_tuning.is_derived(job):
         _render_derived_header(job)
+    if job.get("merged"):
+        st.caption(_tuning_merged_note(job))
 
     share = float(spec.get("min_traded_share") or 0)
     st.caption(
@@ -6693,6 +6784,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             _tuning_view_heatmap(
                 sim_tuning.summed_cells(job), axes, marks,
                 f"Sum of all {len(names)} datasets", view, clickable=clickable,
+                members=sim_tuning.grid_members(spec),
             ),
         )
     else:
@@ -6700,7 +6792,7 @@ def _render_tuning_results(jobs: list[dict]) -> None:
             f"tune_heat_{job_id}_0",
             _tuning_view_heatmap(
                 job["cells"].get(names[0]) or [], axes, marks, f"{prefix}{names[0]}", view,
-                clickable=clickable,
+                clickable=clickable, members=sim_tuning.grid_members(spec),
             ),
         )
     _render_tuning_charts([heat], job_id=job_id if clickable else None)
@@ -6799,11 +6891,12 @@ def _render_tuning_results(jobs: list[dict]) -> None:
         refusal = _tuning_fill_refusal(spec)
         st.button(
             "Fill new job form", icon=":material/edit_note:", key=f"tune_form_from_{job_id}",
-            on_click=_tuning_fill_form, args=(job_id, labels[job_id], spec),
+            on_click=_tuning_fill_form, args=(job_id, labels[job_id], _tuning_fill_spec(spec)),
             disabled=bool(refusal),
             help=refusal or "Fill the **New tuning job** form at the top of the tab with "
             "this job's settings — its configuration, the parameters it swept and their "
             "ranges, its datasets and run settings — to change what you want to compare. "
+            "A merged job fills its newest ranges. "
             "The days off are the job's own, not the special days switched off here. "
             "Nothing runs until **Run tuning**.",
         )

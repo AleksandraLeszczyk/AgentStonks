@@ -2505,6 +2505,225 @@ class TestSweep:
         ]
 
 
+# --- one grid asked for in several goes -------------------------------------
+
+
+AXES_A = [{"name": "buy_k", "values": [0.3, 0.5]}, {"name": "sell_k", "values": [0.1, 0.2]}]
+AXES_B = [{"name": "buy_k", "values": [0.5, 0.7]}, {"name": "sell_k", "values": [0.2, 0.3]}]
+EARLIER, LATER = "2026-11-01T10:00:00+00:00", "2026-11-02T10:00:00+00:00"
+
+
+def ranged_job(job_id: str, axes, names=("w1",), created=EARLIER, profit=1.0, **fields) -> dict:
+    """A finished job over `axes`, every combination answered at `profit`,
+    written to the store."""
+    record = job_record({n: [scored(o, profit) for o in tu.grid(axes)] for n in names},
+                        axes=axes)
+    record.update(job_id=job_id, created_at=created, finished_at=created, **fields)
+    record["progress"] = {"done": tu._answered(record), "total": tu.total_replays(record["spec"])}
+    tu._write(record)
+    return record
+
+
+class TestMergedJobs:
+    """Finished jobs of one configuration over other ranges of the same
+    parameters are one job (`merge_jobs`)."""
+
+    def test_its_combinations_are_each_grids_in_the_order_of_their_union(self):
+        merged = {
+            "axes": [{"name": "buy_k", "values": [0.3, 0.5, 0.7]},
+                     {"name": "sell_k", "values": [0.1, 0.2, 0.3]}],
+            "grids": [AXES_A, AXES_B],
+        }
+        assert tu.combos(merged) == [
+            {"buy_k": 0.3, "sell_k": 0.1}, {"buy_k": 0.3, "sell_k": 0.2},
+            {"buy_k": 0.5, "sell_k": 0.1}, {"buy_k": 0.5, "sell_k": 0.2},
+            {"buy_k": 0.5, "sell_k": 0.3},
+            {"buy_k": 0.7, "sell_k": 0.2}, {"buy_k": 0.7, "sell_k": 0.3},
+        ]
+        assert len(tu.grid_members(merged)) == 7
+        assert tu.grid_members({"axes": AXES_A}) is None
+        assert tu.combos({"axes": AXES_A}) == tu.grid(AXES_A)
+
+    def test_a_job_over_other_ranges_is_merged_into_the_older(self, tuning_dir):
+        ranged_job("a", AXES_A, profit=1.0)
+        ranged_job("b", AXES_B, created=LATER, profit=2.0)
+        assert tu.merge_jobs() == [{"into": "a", "merged": ["b"]}]
+        [job] = tu.list_jobs()
+        assert job["job_id"] == "a" and job["status"] == tu.FINISHED
+        assert job["spec"]["axes"] == [{"name": "buy_k", "values": [0.3, 0.5, 0.7]},
+                                       {"name": "sell_k", "values": [0.1, 0.2, 0.3]}]
+        assert job["spec"]["grids"] == [AXES_A, AXES_B]
+        # (0.5, 0.2) is on both: the older job's replay stays.
+        assert {tuple(c["overrides"].values()): c["profit"] for c in job["cells"]["w1"]} == {
+            (0.3, 0.1): 1.0, (0.3, 0.2): 1.0, (0.5, 0.1): 1.0, (0.5, 0.2): 1.0,
+            (0.5, 0.3): 2.0, (0.7, 0.2): 2.0, (0.7, 0.3): 2.0,
+        }
+        # In grid order, and the corners nobody swept, (0.3, 0.3) and
+        # (0.7, 0.1), are not missing: they are not combinations of the job.
+        assert [c["overrides"] for c in job["cells"]["w1"]] == tu.combos(job["spec"])
+        assert [c["overrides"] for c in tu.summed_cells(job)] == tu.combos(job["spec"])
+        assert tu.missing_replays(job) == 0
+        assert job["progress"] == {"done": 8, "total": 8, "reused": 0}
+        assert job["best"]["overrides"] == {"buy_k": 0.5, "sell_k": 0.3}
+        assert [m["job_id"] for m in job["merged"]] == ["b"]
+        assert tu.merged_into("b") == "a" and tu.merged_into("a") is None
+        # The newer job is kept as it was, out of the store's way.
+        assert json.loads((tuning_dir / "merged" / "b.json").read_text())["spec"]["axes"] == AXES_B
+        assert "Merged b into this job" in tu.log_path("a").read_text()
+        assert tu.validate(job["spec"]) is None
+
+    def test_axes_in_another_order_merge_in_the_older_jobs_order(self, tuning_dir):
+        ranged_job("a", AXES_A)
+        ranged_job("b", AXES_B[::-1], created=LATER)
+        assert tu.merge_jobs() == [{"into": "a", "merged": ["b"]}]
+        job = tu.get_job("a")
+        assert [a["name"] for a in job["spec"]["axes"]] == ["buy_k", "sell_k"]
+        assert job["spec"]["grids"] == [AXES_A, AXES_B]
+        assert all(list(c["overrides"]) == ["buy_k", "sell_k"] for c in job["cells"]["w1"])
+
+    @pytest.mark.parametrize("change", [
+        lambda r: r["spec"]["base"].update(
+            flatten_before_close_min=r["spec"]["base"]["flatten_before_close_min"] + 1),
+        lambda r: r["spec"].update(starting_cash=20_000.0),
+        lambda r: r["spec"].update(datasets=[dataset("w1", TEST_DAY)]),
+        lambda r: r["spec"].update(datasets=[dataset("w2")], cells={"w2": r["cells"]["w1"]},
+                                   baseline={"w2": r["baseline"]["w1"]}),
+        lambda r: r["spec"].update(axes=[AXES_B[0], {"name": "stop_gain_fraction",
+                                                      "values": [0.2, 0.3]}]),
+        lambda r: r.update(status=tu.FAILED, error=tu.STOPPED_ERROR),
+    ], ids=["setting", "cash", "sessions", "dataset", "parameters", "stopped"])
+    def test_a_job_that_differs_in_anything_else_is_left_apart(self, tuning_dir, change):
+        ranged_job("a", AXES_A)
+        other = ranged_job("b", AXES_B, created=LATER)
+        change(other)
+        tu._write(other)
+        assert tu.merge_jobs() == []
+        assert sorted(j["job_id"] for j in tu.list_jobs()) == ["a", "b"]
+
+    def test_the_same_ranges_again_stay_a_job_of_their_own(self, tuning_dir):
+        # Run again after a change to the trader, say: nothing to merge, and
+        # nothing of either may be lost to the other.
+        ranged_job("a", AXES_A, profit=1.0)
+        ranged_job("b", AXES_A, created=LATER, profit=2.0)
+        ranged_job("c", AXES_B, created="2026-11-03T10:00:00+00:00")
+        assert tu.merge_jobs() == [{"into": "a", "merged": ["c"]}]
+        assert sorted(j["job_id"] for j in tu.list_jobs()) == ["a", "b"]
+        assert all(c["profit"] == 2.0 for c in tu.get_job("b")["cells"]["w1"])
+        assert tu.merge_jobs() == []
+
+    def test_nothing_is_merged_while_a_job_runs_but_a_worker_merges_its_own(self, tuning_dir):
+        ranged_job("a", AXES_A)
+        ranged_job("b", AXES_B, created=LATER)
+        ranged_job("busy", AXES_A, names=("w9",), status=tu.RUNNING, pid=os.getpid())
+        assert tu.merge_jobs() == []
+        assert tu.merge_jobs(job_id="busy") == []
+        assert tu.merge_jobs(job_id="b") == [{"into": "a", "merged": ["b"]}]
+
+    def test_nothing_is_merged_while_a_sweep_is_active(self, tuning_dir):
+        ranged_job("a", AXES_A)
+        ranged_job("b", AXES_B, created=LATER)
+        queue = tu.start_sweep([{"job_id": "a", "datasets": [dataset("w2")]}], launch=False)
+        queue["pid"] = os.getpid()
+        tu._write_sweep(queue)
+        assert tu.merge_jobs() == []
+
+    def test_an_added_dataset_is_swept_over_the_ranges_only(self, tuning_dir):
+        ranged_job("a", AXES_A)
+        ranged_job("b", AXES_B, created=LATER)
+        tu.merge_jobs()
+        record = tu.add_datasets("a", [dataset("w2")], runs=[], launch=False)
+        assert tu.missing_replays(record) == 7 + 1
+        assert record["progress"]["total"] == 2 * (7 + 1)
+
+    def test_each_merged_grid_is_held_to_the_size_limit_not_their_union(self):
+        low = [{"name": "buy_k", "values": [i / 100 for i in range(1, 41)]},
+               {"name": "sell_k", "values": [i / 100 for i in range(1, 31)]}]
+        high = [{"name": "buy_k", "values": [i / 100 for i in range(41, 81)]},
+                {"name": "sell_k", "values": [i / 100 for i in range(31, 61)]}]
+        assert tu.cell_count(low) == tu.cell_count(high) == tu.MAX_CELLS
+        union = [{"name": a["name"], "values": a["values"] + b["values"]}
+                 for a, b in zip(low, high)]
+        assert tu.validate(spec(axes=union, grids=[low, high])) is None
+        assert "more than" in tu.validate(spec(axes=union))
+        off = [low[0], {"name": "sell_k", "values": [0.99]}]
+        assert "does not lie" in tu.validate(spec(axes=union, grids=[low, off]))
+
+    def test_a_collapsed_square_is_over_its_own_combinations(self):
+        stop = "stop_gain_fraction"
+        job = {
+            "axes": [{"name": "buy_k", "values": [0.3, 0.5]}, {"name": "sell_k", "values": [0.1]},
+                     {"name": stop, "values": [0.5, 0.6, 0.7, 0.8]}],
+            "grids": [
+                [{"name": "buy_k", "values": [0.3]}, {"name": "sell_k", "values": [0.1]},
+                 {"name": stop, "values": [0.5, 0.7]}],
+                [{"name": "buy_k", "values": [0.5]}, {"name": "sell_k", "values": [0.1]},
+                 {"name": stop, "values": [0.6, 0.8]}],
+            ],
+        }
+        profit = {0.5: 10, 0.7: 30, 0.6: 50, 0.8: 20}
+        cells = [scored(o, profit[o[stop]]) for o in tu.combos(job)]
+        members = tu.grid_members(job)
+
+        def by_buy(view, members=members):
+            out = tu.slice_cells(cells, job["axes"], view, members=members)
+            return {c["overrides"]["buy_k"]: c for c in out}
+
+        best = by_buy(tu.SLICE_BEST)
+        assert {k: c["profit"] for k, c in best.items()} == {0.3: 30, 0.5: 50}
+        assert best[0.5]["best_of"] == {"values": {stop: 0.6}, "count": 2}
+        mean = by_buy(tu.SLICE_MEAN)
+        assert {k: c["profit"] for k, c in mean.items()} == {0.3: 20.0, 0.5: 35.0}
+        assert mean[0.3]["mean_of"]["of"] == 2
+        # Held at a stop only one range swept, the other's square is blank.
+        assert list(by_buy(0)) == [0.3]
+        # Read as a whole product, every square waits for stops it never swept.
+        assert by_buy(tu.SLICE_BEST, members=None) == {}
+
+    def test_a_worker_merges_its_job_as_it_finishes(self, store, stub_model, tuning_dir):
+        first = tu.submit(TestJob().job_spec(), launch=False)
+        tu.run_job(first["job_id"], progress=lambda m: None)
+        more = [{"name": "buy_k", "values": [1.0, 1.25]}, {"name": "sell_k", "values": [0.10, 0.60]}]
+        second = tu.submit({**TestJob().job_spec(), "axes": more}, launch=False)
+        kept = {tu.overrides_key(c["overrides"]): c for c in tu.get_job(first["job_id"])["cells"]["d"]}
+        lines = []
+        done = tu.run_job(second["job_id"], progress=lines.append)
+        assert lines[-1] == f"Merged {second['job_id']} into {first['job_id']}."
+        assert done["job_id"] == first["job_id"] and done["status"] == tu.FINISHED
+        assert [j["job_id"] for j in tu.list_jobs()] == [first["job_id"]]
+        assert done["spec"]["axes"][0]["values"] == [0.5, 0.75, 1.0, 1.25]
+        assert len(tu.combos(done["spec"])) == 8 and tu.missing_replays(done) == 0
+        for cell in done["cells"]["d"]:
+            key = tu.overrides_key(cell["overrides"])
+            if key in kept:
+                assert cell == kept[key]
+
+    def test_a_sweep_reports_a_job_merged_as_it_finished(self, tuning_dir):
+        ranged_job("a", AXES_A, names=("w1", "w2"))
+        ranged_job("b", AXES_B, created=LATER)
+        tu.start_sweep(tu.sweep_plan(tu.list_jobs(), [dataset("w2")]), launch=False)
+
+        def run(record):  # what the worker does: finish, then merge its job
+            finish(record)
+            tu.merge_jobs(job_id=record["job_id"])
+
+        queue = tu.run_sweep(progress=lambda m: None, run=run, sleep=lambda s: None)
+        [item] = queue["items"]
+        assert (item["job_id"], item["status"], item["detail"]) == (
+            "b", tu.FINISHED, "merged into a",
+        )
+        assert tu.dataset_names(tu.get_job("a")["spec"]) == ["w1", "w2"]
+
+    def test_the_form_fills_a_merged_job_over_its_newest_ranges(self, tuning_dir):
+        from simlab import app as sim_app
+
+        ranged_job("a", AXES_A)
+        ranged_job("b", AXES_B, created=LATER)
+        tu.merge_jobs()
+        filled = sim_app._tuning_fill_spec(tu.get_job("a")["spec"])
+        assert filled["axes"] == AXES_B and "grids" not in filled
+        assert sim_app._tuning_fill_spec(spec()) == spec()
+
+
 def _sweep_app() -> None:
     from simlab import app as sim_app
     from simlab import tuning as tuning

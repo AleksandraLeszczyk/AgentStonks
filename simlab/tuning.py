@@ -530,7 +530,7 @@ def estimated_seconds(
     replays are already on disk and the job skips them, so they cost nothing
     but still count towards its total.
     """
-    cells = len(grid(spec["axes"]))
+    cells = len(combos(spec))
     prior = prior or {}
     datasets = spec["datasets"] if datasets is None else datasets
     sessions = sum(
@@ -578,6 +578,40 @@ def grid(axes: "list[dict]") -> "list[dict]":
         return [{}]
     names = [axis["name"] for axis in axes]
     return [dict(zip(names, combo)) for combo in product(*(axis["values"] for axis in axes))]
+
+
+def combos(spec: dict) -> "list[dict]":
+    """Every combination a job sweeps, as override dicts in grid order.
+
+    A job's grid is the product of its axes -- unless it is several jobs
+    merged (`merge_jobs`): then `spec["grids"]` holds the grid each of them
+    swept, `spec["axes"]` the union of their values, and the job is those
+    grids' combinations together, in the order of the product of the union.
+    The rest of that product -- a buy level from one range with a stop from
+    the other -- is no combination of the job: nobody asked for it, so it is
+    not replayed, counted missing or swept onto a dataset the job adds, and
+    its square is blank.
+    """
+    axes = spec["axes"]
+    grids = spec.get("grids")
+    if not grids:
+        return grid(axes)
+    found: "dict[str, dict]" = {}
+    for part in grids:
+        for overrides in grid(part):
+            found.setdefault(overrides_key(overrides), overrides)
+    places = [{value: i for i, value in enumerate(axis["values"])} for axis in axes]
+    names = [axis["name"] for axis in axes]
+    ordered = sorted(
+        found.values(), key=lambda o: tuple(p[o[n]] for p, n in zip(places, names))
+    )
+    return [{n: o[n] for n in names} for o in ordered]
+
+
+def grid_members(spec: dict) -> "set[str] | None":
+    """The `overrides_key`s of a merged job's combinations (`combos`), or None
+    for a job whose grid is the whole product of its axes."""
+    return {overrides_key(o) for o in combos(spec)} if spec.get("grids") else None
 
 
 def make_config(base: dict, overrides: dict) -> AppleTraderConfig:
@@ -1125,7 +1159,7 @@ def prior_cells(
     index = index_runs(runs)
     if not index:
         return found
-    cells = grid(spec["axes"])
+    cells = combos(spec)
     for dataset in datasets:
         for overrides in [*cells, {}]:
             cell = prior_cell(index, spec, dataset, overrides)
@@ -1559,7 +1593,8 @@ def _averaged(parts: "list[dict]", names: "list[str]", metric: str) -> dict:
 
 
 def slice_cells(
-    cells: "list[dict]", axes: "list[dict]", view, metric: str = PICK_METRIC
+    cells: "list[dict]", axes: "list[dict]", view, metric: str = PICK_METRIC,
+    members: "set[str] | None" = None,
 ) -> "list[dict]":
     """A grid of three or four axes as a grid over its first two.
 
@@ -1590,6 +1625,11 @@ def slice_cells(
     whose every combination is refused is refused; one with nothing scored and
     a replay that errored is errored.
 
+    `members` is a merged job's combinations (`grid_members`): a square then
+    collapses over the combinations of its own that are on the job, and one
+    with none is not drawn. A best value with none of its averaged
+    combinations there is not a candidate.
+
     The cells come back with only the first two axes in their overrides, so
     they draw as any two-axis grid. A grid of fewer than three axes is
     returned as it is.
@@ -1610,16 +1650,20 @@ def slice_cells(
         # axes, each averaged over the averaged ones; None once one is missing.
         groups: "list[tuple[dict, dict]] | None" = []
         for chosen in grid(best):
-            parts = [
-                by_key.get(overrides_key({**overrides, **held, **chosen, **over}))
-                for over in grid(averaged)
+            keys = [
+                overrides_key({**overrides, **held, **chosen, **over}) for over in grid(averaged)
             ]
+            if members is not None:
+                keys = [key for key in keys if key in members]
+                if not keys:
+                    continue
+            parts = [by_key.get(key) for key in keys]
             if any(p is None for p in parts):
                 groups = None
                 break
             groups.append((chosen, _averaged(parts, [a["name"] for a in averaged], metric)
                            if averaged else parts[0]))
-        if groups is None:
+        if not groups:
             continue
         if not best:
             [(_, cell)] = groups
@@ -1828,7 +1872,7 @@ def summed_cells(record: dict) -> "list[dict]":
     names = dataset_names(record["spec"])
     by_name = [_cells_by_key(record, name) for name in names]
     out = []
-    for overrides in grid(record["spec"]["axes"]):
+    for overrides in combos(record["spec"]):
         key = overrides_key(overrides)
         cell = combine(overrides, [cells.get(key) for cells in by_name])
         if cell is not None:
@@ -1978,7 +2022,7 @@ def refresh_pick(record: dict) -> dict:
 
 def missing_replays(record: dict) -> int:
     """How many replays the record still has no answer for, over all datasets."""
-    keys = [overrides_key(c) for c in grid(record["spec"]["axes"])]
+    keys = [overrides_key(c) for c in combos(record["spec"])]
     missing = 0
     for name in dataset_names(record["spec"]):
         have = _cells_by_key(record, name)
@@ -2110,7 +2154,7 @@ def delete_job(job_id: str) -> None:
 
 def total_replays(spec: dict) -> int:
     """How many replays a job runs: the grid plus the baseline, on every dataset."""
-    return (len(grid(spec["axes"])) + 1) * len(spec.get("datasets") or ())
+    return (len(combos(spec)) + 1) * len(spec.get("datasets") or ())
 
 
 def validate(spec: dict) -> "str | None":
@@ -2134,7 +2178,15 @@ def validate(spec: dict) -> "str | None":
             unknown = [v for v in axis["values"] if v not in choice.options]
             if unknown:
                 return f"{choice.label}: {', '.join(map(str, unknown))} is not an option."
-    cells = len(grid(axes))
+    # A merged job's grids are guarded one by one: each was a job of its own,
+    # and together they replay no more than they did apart.
+    grids = spec.get("grids") or [axes]
+    for part in grids:
+        if [a["name"] for a in part] != [a["name"] for a in axes] or any(
+            v not in whole["values"] for a, whole in zip(part, axes) for v in a["values"]
+        ):
+            return "A merged grid does not lie on the job's parameters."
+    cells = max(cell_count(part) for part in grids)
     if cells > MAX_CELLS:
         return f"{cells} combinations is more than the {MAX_CELLS} one job may sweep."
     datasets = spec.get("datasets") or []
@@ -2324,6 +2376,217 @@ def remove_dataset(job_id: str, name: str) -> dict:
     return record
 
 
+# --- one grid asked for in several goes -------------------------------------
+#
+# The same configuration tuned again over other ranges of the same parameters
+# -- the buy level up to 0.90 where the first job stopped at 0.85, to see past
+# its edge -- is one grid asked for in two goes. Kept apart, neither job's best
+# options know of the other's squares. So finished jobs that differ only in
+# those ranges are merged (since 2026-11-07, the user's): the oldest keeps its
+# id and takes every cell it lacks from the others, each of which is moved, as
+# it was, under `merged/`. Where the ranges overlap, the oldest's replays stay.
+#
+# A worker merges its own job as it finishes (`run_job`); the Tuning tab
+# merges what is left -- jobs finished before this existed -- once nothing
+# runs.
+
+#: Where a job merged into another is kept, with its log -- a subdirectory,
+#: because `list_jobs` reads every `*.json` of the tuning dir as a job.
+MERGED_DIR = "merged"
+
+
+def merge_key(job: dict) -> "str | None":
+    """What jobs must share to be merged (`merge_jobs`), or None for one that
+    merges with nothing: running, stopped, failed or derived, or with a
+    configuration that does not decode.
+
+    Everything a replay reads -- the configuration apart from the swept
+    fields, each dataset's sessions and tape, the starting cash -- and the
+    names of the swept fields, in any order. The configuration is compared
+    decoded, as `prior_cell` compares a stored run, so a job saved before a
+    field existed matches one saved with the field at what its absence meant.
+    How results are read and run (the minimum share of days traded, workers,
+    reuse) is not part of it: the merged job keeps the oldest's.
+    """
+    if job.get("status") != FINISHED:
+        return None
+    spec = job["spec"]
+    names = sorted(a["name"] for a in spec["axes"])
+    try:
+        config = asdict(make_config(spec["base"], {}))
+    except (KeyError, TypeError, ValueError):
+        return None
+    settings = {k: v for k, v in config.items() if k not in names}
+    datasets = sorted(
+        (d["name"], sorted(d.get("days") or ()), d.get("feed")) for d in spec["datasets"]
+    )
+    return json.dumps(
+        [settings, names, float(spec.get("starting_cash") or 0.0), datasets],
+        sort_keys=True, default=str,
+    )
+
+
+def _grids(spec: dict, order: "list[str]") -> "list[list[dict]]":
+    """A job's grids (`combos`), each axis in `order`."""
+    out = []
+    for part in spec.get("grids") or [spec["axes"]]:
+        by_name = {a["name"]: a for a in part}
+        out.append([{"name": n, "values": list(by_name[n]["values"])} for n in order])
+    return out
+
+
+def _union_values(name: str, lists: "list[list]") -> list:
+    """One axis's values over several grids: numbers in order, rules in the
+    order the form lists them."""
+    seen: list = []
+    for values in lists:
+        seen += [v for v in values if v not in seen]
+    choice = CHOICES.get(name)
+    if choice is None:
+        return sorted(seen)
+    return sorted(seen, key=lambda v: (v not in choice.options,
+                                       choice.options.index(v) if v in choice.options else 0))
+
+
+def _merged(survivor: dict, others: "list[dict]") -> dict:
+    """`survivor` over its grids and the others', with every cell it lacks
+    taken from them. Its own cells and baselines stay where it has them --
+    its baseline is a replay of its own base, which may set a swept field
+    otherwise -- except a cell whose replay errored, for one that did not."""
+    spec = survivor["spec"]
+    order = [a["name"] for a in spec["axes"]]
+    grids: "list[list[dict]]" = []
+    for job in (survivor, *others):
+        grids += [g for g in _grids(job["spec"], order) if g not in grids]
+    axes = [
+        {**axis, "values": _union_values(axis["name"], [g[i]["values"] for g in grids])}
+        for i, axis in enumerate(spec["axes"])
+    ]
+    merged_spec = {k: v for k, v in spec.items() if k != "grids"}
+    merged_spec["axes"] = axes
+    if len(grids) > 1:
+        merged_spec["grids"] = grids
+    names = dataset_names(spec)
+    cells = {name: list(survivor["cells"].get(name) or ()) for name in names}
+    baseline = dict(survivor.get("baseline") or {})
+    for other in others:
+        for name in names:
+            at = {overrides_key(c["overrides"]): i for i, c in enumerate(cells[name])}
+            for cell in other["cells"].get(name) or ():
+                # In the survivor's axis order, which the tables list them in.
+                cell = {**cell, "overrides": {
+                    **{n: cell["overrides"][n] for n in order if n in cell["overrides"]},
+                    **cell["overrides"],
+                }}
+                key = overrides_key(cell["overrides"])
+                if key not in at:
+                    at[key] = len(cells[name])
+                    cells[name].append(cell)
+                elif is_scored(cell) and not is_scored(cells[name][at[key]]) \
+                        and "invalid" not in cells[name][at[key]]:
+                    cells[name][at[key]] = cell
+            if baseline.get(name) is None:
+                baseline[name] = (other.get("baseline") or {}).get(name)
+    position = {overrides_key(o): i for i, o in enumerate(combos(merged_spec))}
+    for name in names:
+        cells[name].sort(key=lambda c: position.get(overrides_key(c["overrides"]), len(position)))
+    history: "list[dict]" = []
+    for entry in [
+        *(survivor.get("merged") or ()),
+        *(e for o in others for e in (
+            {"job_id": o["job_id"], "created_at": o.get("created_at"),
+             "axes": _grids({"axes": o["spec"]["axes"]}, order)[0]},
+            *(o.get("merged") or ()),
+        )),
+    ]:
+        if all(entry["job_id"] != e["job_id"] for e in history):
+            history.append(entry)
+    record = {
+        **survivor,
+        "spec": merged_spec, "cells": cells, "baseline": baseline, "merged": history,
+        "finished_at": max((j.get("finished_at") or "") for j in (survivor, *others)) or None,
+    }
+    record["progress"] = {
+        "done": _answered(record), "total": total_replays(merged_spec),
+        "reused": reused_count(record),
+    }
+    return refresh_pick(record)
+
+
+def _move_aside(job: dict) -> None:
+    """A job merged into another, kept as it was under `MERGED_DIR` with its log."""
+    folder = TUNING_DIR / MERGED_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    _replace(folder / f"{job['job_id']}.json", job)
+    log = log_path(job["job_id"])
+    if log.exists():
+        log.replace(folder / log.name)
+    _path(job["job_id"]).unlink(missing_ok=True)
+
+
+def merge_jobs(jobs: "list[dict] | None" = None, job_id: "str | None" = None) -> "list[dict]":
+    """Merge finished jobs that are one grid in several ranges (`merge_key`)
+    into the oldest of each such set; `[{"into": its id, "merged": [ids]}]`.
+
+    A job whose every grid the older ones of its set already have -- the
+    same ranges run again, after a change to the trader, say -- adds no range
+    and is left as it is, a job of its own.
+
+    With `job_id` (a worker, its job just written finished), only that job's
+    set, whatever else runs. Without, every set -- but nothing while a job
+    runs, whose worker may be merging the same records, or while a sweep is
+    active, which adds datasets to jobs between two of them. `jobs` is the
+    listed store when the caller has it (`list_jobs`).
+    """
+    jobs = list_jobs() if jobs is None or job_id is not None else jobs
+    if job_id is None and (
+        any(j.get("status") == RUNNING for j in jobs) or sweep_active(get_sweep())
+    ):
+        return []
+    sets: "dict[str, list[dict]]" = {}
+    for job in jobs:
+        key = merge_key(job)
+        if key is not None:
+            sets.setdefault(key, []).append(job)
+    done = []
+    for found in sets.values():
+        if len(found) < 2 or (job_id is not None and all(j["job_id"] != job_id for j in found)):
+            continue
+        found.sort(key=lambda j: (j.get("created_at") or "", j["job_id"]))
+        survivor = found[0]
+        order = [a["name"] for a in survivor["spec"]["axes"]]
+        have = _grids(survivor["spec"], order)
+        others = []
+        for job in found[1:]:
+            grids = _grids(job["spec"], order)
+            if any(g not in have for g in grids):
+                others.append(job)
+                have += [g for g in grids if g not in have]
+        if not others:
+            continue
+        record = _merged(survivor, others)
+        _write(record)
+        for other in others:
+            _move_aside(other)
+        ids = [o["job_id"] for o in others]
+        with open(log_path(record["job_id"]), "a") as log:
+            log.write(
+                f"Merged {', '.join(ids)} into this job at {_now_iso()}: "
+                f"{len(combos(record['spec']))} combinations over "
+                f"{len(record['spec'].get('grids') or [None])} grids.\n"
+            )
+        done.append({"into": record["job_id"], "merged": ids})
+    return done
+
+
+def merged_into(job_id: str, jobs: "list[dict] | None" = None) -> "str | None":
+    """The job a merged job's cells went to (`merge_jobs`), or None."""
+    for job in list_jobs() if jobs is None else jobs:
+        if any(m.get("job_id") == job_id for m in job.get("merged") or ()):
+            return job["job_id"]
+    return None
+
+
 def _pid_alive(pid) -> bool:
     if not pid:
         return False
@@ -2431,12 +2694,12 @@ def sweep_cost(job: dict, datasets: "list[dict]", prior: "dict | None" = None) -
     """
     spec = job["spec"]
     prior = prior or {}
-    cells = len(grid(spec["axes"]))
+    cells = len(combos(spec))
     reused = sum(len(prior.get(d["name"]) or ()) for d in datasets)
     replays = (cells + 1) * len(datasets) - reused
     seconds = estimated_seconds(spec, prior, datasets)
     if job.get("status") != RUNNING:
-        keys = [overrides_key(c) for c in grid(spec["axes"])]
+        keys = [overrides_key(c) for c in combos(spec)]
         workers = max(1, int(spec.get("workers") or 1))
         for dataset in spec["datasets"]:
             have = _cells_by_key(job, dataset["name"])
@@ -2584,9 +2847,11 @@ def run_sweep(
         job = get_job(item["job_id"])
         todo = missing_datasets(job, item["datasets"]) if job else []
         if not todo:
+            into = merged_into(item["job_id"]) if job is None else None
             item.update(
                 status=SWEEP_SKIPPED,
-                detail="the job was deleted" if job is None else "it has these datasets already",
+                detail="it has these datasets already" if job is not None
+                else f"it was merged into {into}" if into else "the job was deleted",
             )
             _write_sweep(queue)
             progress(f"{item['job_id']}: skipped, {item['detail']}")
@@ -2608,7 +2873,11 @@ def run_sweep(
         item = queue["items"][index]
         after = get_job(item["job_id"])
         after = _reap(after) if after else None
-        if after and after.get("status") == FINISHED:
+        # Merged, as it finished, into a job over other ranges (`merge_jobs`).
+        into = merged_into(item["job_id"]) if after is None else None
+        if into is not None:
+            item.update(status=FINISHED, detail=f"merged into {into}")
+        elif after and after.get("status") == FINISHED:
             item.update(status=FINISHED, detail=None)
         else:
             error = (after or {}).get("error") or "the job did not finish"
@@ -2668,7 +2937,7 @@ def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
     if record is None:
         raise RuntimeError(f"unknown tuning job {job_id}")
     spec = record["spec"]
-    cells = grid(spec["axes"])
+    cells = combos(spec)
     workers = max(1, int(spec.get("workers") or 1))
 
     def on_done(name: str, kind: str, result: dict) -> None:
@@ -2708,13 +2977,21 @@ def run_job(job_id: str, progress: "Callable[[str], None]" = print) -> dict:
             )
     _run_tasks(tasks, spec, workers, on_done)
 
-    order = [overrides_key(c) for c in cells]
+    order = {overrides_key(c): i for i, c in enumerate(cells)}
     for name in dataset_names(spec):
-        record["cells"][name].sort(key=lambda c: order.index(overrides_key(c["overrides"])))
+        record["cells"][name].sort(key=lambda c: order[overrides_key(c["overrides"])])
     refresh_pick(record)
     record.update(status=FINISHED, finished_at=_now_iso())
     _write(record)
     progress(f"Tuning job {job_id} finished.")
+    try:
+        merges = merge_jobs(job_id=job_id)
+    except Exception as exc:  # noqa: BLE001 -- two jobs left apart, not a failed one
+        progress(f"Not merged with a job over other ranges: {exc}")
+        return record
+    for merge in merges:
+        progress(f"Merged {', '.join(merge['merged'])} into {merge['into']}.")
+        return get_job(merge["into"]) or record
     return record
 
 
