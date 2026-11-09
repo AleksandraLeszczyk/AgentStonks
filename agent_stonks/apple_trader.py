@@ -193,32 +193,115 @@ def _market_day() -> str:
     return str(day_range.market_date().date())
 
 
+def _ask(state: AppState, asks: str, key: str, **extra) -> None:
+    """Put today's ask for pair `key` in `state.<asks>`."""
+    with state.lock:
+        table = dict(getattr(state, asks, None) or {})
+        table[key] = {"day": _market_day(), "at": time.time(), **extra}
+        # Replaced rather than mutated, like the published records.
+        setattr(state, asks, table)
+
+
+def _asked(state: AppState, asks: str, key: str, today=None) -> "dict | None":
+    """Pair `key`'s ask in `state.<asks>`, if it was made on `today` (the
+    market's day by default)."""
+    asked = (getattr(state, asks, None) or {}).get(key)
+    if not asked:
+        return None
+    day = _market_day() if today is None else str(pd.Timestamp(today).date())
+    return asked if asked.get("day") == day else None
+
+
+def _take(state: AppState, asks: str, key: str, today) -> bool:
+    """Whether pair `key` was asked on `today`. The ask is used up either
+    way: one from an earlier day has nothing left to do."""
+    if key not in (getattr(state, asks, None) or {}):
+        return False
+    with state.lock:
+        table = dict(getattr(state, asks))
+        asked = table.pop(key, None)
+        setattr(state, asks, table)
+    return bool(asked) and asked.get("day") == str(pd.Timestamp(today).date())
+
+
 def ask_breaker_lift(state: AppState, key: str) -> None:
     """Ask the trader of pair `key` to lift its circuit breaker on its next bar."""
-    with state.lock:
-        lifts = dict(getattr(state, "breaker_lifts", None) or {})
-        lifts[key] = {"day": _market_day(), "at": time.time()}
-        # Replaced rather than mutated, like the published records.
-        state.breaker_lifts = lifts
+    _ask(state, "breaker_lifts", key)
 
 
 def breaker_lift_asked(state: AppState, key: str) -> "dict | None":
     """Today's ask to lift pair `key`'s breaker, while its trader has not
     taken it yet."""
-    asked = (getattr(state, "breaker_lifts", None) or {}).get(key)
-    return asked if asked and asked.get("day") == _market_day() else None
+    return _asked(state, "breaker_lifts", key)
 
 
 def take_breaker_lift(state: AppState, key: str, today) -> bool:
-    """Whether pair `key`'s breaker was asked to be lifted on `today`. The ask
-    is used up either way: one from an earlier day has nothing left to lift."""
-    if key not in (getattr(state, "breaker_lifts", None) or {}):
-        return False
+    """Whether pair `key`'s breaker was asked to be lifted on `today`."""
+    return _take(state, "breaker_lifts", key, today)
+
+
+# --- a pair sold or stopped by hand ---------------------------------------------
+#
+# The Portfolio tab's other two buttons per pair. "Sell" asks the pair's trader
+# to sell what it holds at market. Its trader does that, as it lifts a breaker,
+# because the position, the ladder and Orchestra's holders are its to keep; the
+# ask wakes the loop (`AppState.trader_wake_event`), so that is seconds after
+# the click rather than at the next bar. With no agent running there is no
+# trader to ask, and the tab sells the symbol itself (`ui._sell_pair_now`).
+#
+# "Stop trading" keeps the pair from buying for the rest of the day -- no entry,
+# no add -- while what it holds keeps its exits. It lives in the state rather
+# than in the trader's plan, so it holds from the click on, through a stopped
+# agent and a restart (the session file keeps it), and its trader only says
+# once that it has seen it (`seen`). "Trade again" ends it. Good only for the
+# day it was made, like a lift.
+
+
+def wake_trader(state: AppState) -> None:
+    """Run the rule loop's next cycle now rather than at the next bar."""
+    state_mod.trader_wake_event(state).set()
+
+
+def ask_hand_sell(state: AppState, key: str) -> None:
+    """Ask the trader of pair `key` to sell what it holds, now."""
+    _ask(state, "hand_sells", key)
+    wake_trader(state)
+
+
+def hand_sell_asked(state: AppState, key: str) -> "dict | None":
+    """Today's ask to sell pair `key`, while its trader has not taken it yet."""
+    return _asked(state, "hand_sells", key)
+
+
+def take_hand_sell(state: AppState, key: str, today) -> bool:
+    """Whether pair `key` was asked to sell on `today`."""
+    return _take(state, "hand_sells", key, today)
+
+
+def stop_by_hand(state: AppState, key: str) -> None:
+    """Stop pair `key` buying for the rest of today."""
+    _ask(state, "hand_stops", key, seen=False)
+    wake_trader(state)
+
+
+def stopped_by_hand(state: AppState, key: str, today=None) -> "dict | None":
+    """Today's hand stop on pair `key`, or None while it may buy."""
+    return _asked(state, "hand_stops", key, today)
+
+
+def end_hand_stop(state: AppState, key: str) -> None:
+    """Let pair `key` buy again ("Trade again")."""
+    if key in (getattr(state, "hand_stops", None) or {}):
+        _take(state, "hand_stops", key, _market_day())
+
+
+def _see_hand_stop(state: AppState, key: str) -> None:
+    """Mark pair `key`'s hand stop as seen by its trader."""
     with state.lock:
-        lifts = dict(state.breaker_lifts)
-        asked = lifts.pop(key, None)
-        state.breaker_lifts = lifts
-    return bool(asked) and asked.get("day") == str(pd.Timestamp(today).date())
+        table = dict(getattr(state, "hand_stops", None) or {})
+        if key in table:
+            table[key] = {**table[key], "seen": True}
+            state.hand_stops = table
 
 
 def record_config_field(record: "dict | None", name: str):
@@ -2212,6 +2295,70 @@ class _SitsOut:
         return False
 
 
+class _ByHand:
+    """The Portfolio tab's "Sell" and "Stop trading" for this pair
+    (`ask_hand_sell`, `stop_by_hand`), the same for every rule set. Expects
+    `config`, `ticker`, `entry` and `sell` on the trader."""
+
+    #: The exit a sale by hand is logged with.
+    EXIT_BY_HAND = "hand"
+
+    #: Whether trading this pair was stopped by hand, as of this cycle -- for
+    #: the status line and Orchestra's board, which have no state to read.
+    hand_stopped = False
+    #: The stop last said to have been seen (its `at`), so it is said once.
+    _hand_stop_noted = None
+
+    def _hand_key(self) -> str:
+        return breaker_key(self.ticker, self.config.model_key)
+
+    def _stopped_by_hand(self, state: AppState, today=None) -> bool:
+        """Whether this pair may not buy: stopped by hand today."""
+        self.hand_stopped = stopped_by_hand(state, self._hand_key(), today) is not None
+        return self.hand_stopped
+
+    def _by_hand(self, state: AppState, tracker: DecisionTracker, today) -> bool:
+        """Take this pair's asks from the Portfolio tab, early in a cycle: say
+        once that trading it was stopped, and sell what it holds when asked.
+        Whether it sold -- the cycle ends there."""
+        key = self._hand_key()
+        stop = stopped_by_hand(state, key, today)
+        self.hand_stopped = stop is not None
+        if stop is None and self._hand_stop_noted is not None:
+            self._hand_stop_noted = None
+            _log(state, {"type": "analysis", "text": (
+                f"{self.ticker}: no longer stopped by hand — it may buy again."
+            )})
+        if stop is not None and stop.get("at") != self._hand_stop_noted:
+            self._hand_stop_noted = stop.get("at")
+            _see_hand_stop(state, key)
+            held = tracker.position_for(self.ticker)
+            _log(state, {"type": "analysis", "text": (
+                f"{self.ticker}: trading stopped by hand from the Portfolio tab — no new "
+                "buys today"
+                + (f"; the {held:g} sh held keep their exits." if held > 0 else ".")
+                + " Trade again lets it buy."
+            )})
+        if not take_hand_sell(state, key, today):
+            return False
+        position = tracker.position_for(self.ticker)
+        if position <= 0:
+            _log(state, {"type": "status", "text": (
+                f"{self.ticker}: sell by hand from the Portfolio tab, but nothing is held."
+            )})
+            return False
+        entry = dict(self.entry) if self.entry is not None else None
+        decision = self.sell(
+            state, tracker, position,
+            "Sold by hand from the Portfolio tab: the whole position at market.",
+            log_extra={"exit": self.EXIT_BY_HAND},
+        )
+        if decision.status == "filled" and self.entry is None and tracker.position_for(self.ticker) > 0:
+            # Partly filled: what is left is the same position.
+            self.entry = entry
+        return decision.status == "filled"
+
+
 def _compact_dollars(value: float) -> str:
     """A signed dollar amount the way the Net Gamma card writes it: -$1.23B."""
     sign = "+" if value >= 0 else "-"
@@ -2285,7 +2432,7 @@ class _DownGammaRule:
         return gamma_history.at_close(self.ticker, timeframe, ts, close, chain)
 
 
-class DayRangeTrader(_DownGammaRule, _SitsOut, BaseTrader):
+class DayRangeTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
     """The day-range rules: one forecast at 9:35, then two resting levels.
 
     The model (HighLow or HighLow2) says where the session's high and low will
@@ -2428,6 +2575,8 @@ class DayRangeTrader(_DownGammaRule, _SitsOut, BaseTrader):
             return rule_agent.WAITING, f"Agent sits today out ({labels})"
         if outcome == rule_agent.WARMING_UP and self.plan is None and self.blocked is None:
             return rule_agent.WAITING, "Agent waiting for the opening forecast"
+        if outcome != rule_agent.CLOSED and self.hand_stopped and tracker.position_for(self.ticker) <= 0:
+            return rule_agent.WAITING, f"Agent stopped trading {self.ticker} by hand"
         if (
             outcome != rule_agent.CLOSED
             and self.plan is not None
@@ -2463,6 +2612,10 @@ class DayRangeTrader(_DownGammaRule, _SitsOut, BaseTrader):
                 {"type": "status", "text": f"No {self.ticker} bars yet today."},
             )
             return "no_data"
+        # Before anything that can end the cycle early: a sale by hand needs
+        # no forecast.
+        if self._by_hand(state, tracker, today):
+            return "sold"
         self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
         self._warm_chain(sym_state)
 
@@ -2573,6 +2726,7 @@ class DayRangeTrader(_DownGammaRule, _SitsOut, BaseTrader):
                 fresh_bar
                 and self._can_add()
                 and float(last["low"]) <= self.plan["buy_level"]
+                and not self._stopped_by_hand(state, today)
             ):
                 if self._above_last_fill(state, last):
                     return "hold"
@@ -2591,6 +2745,9 @@ class DayRangeTrader(_DownGammaRule, _SitsOut, BaseTrader):
         # (`breaker_until_revised`): the same, until the tape trades through a
         # predicted boundary.
         if self._pause_holds(state, ts):
+            return "hold"
+        # Or stopped by hand from the Portfolio tab, until "Trade again".
+        if self._stopped_by_hand(state, today):
             return "hold"
 
         if fresh_bar and float(last["low"]) <= self.plan["buy_level"]:
@@ -5243,7 +5400,7 @@ def ff_threshold_words(
     )
 
 
-class FastFuriousTrader(_SitsOut, BaseTrader):
+class FastFuriousTrader(_ByHand, _SitsOut, BaseTrader):
     """Fast&Furious's rules: a forecast of the next 30 minutes at every bar.
 
     The model answers one question at the close of every bar from 09:31 to
@@ -5324,6 +5481,8 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
             return rule_agent.WAITING, f"Agent sits today out ({labels})"
         if outcome == rule_agent.WARMING_UP and self.session is None and self.blocked is None:
             return rule_agent.WAITING, "Agent waiting for the first forecast"
+        if outcome != rule_agent.CLOSED and self.hand_stopped and tracker.position_for(self.ticker) <= 0:
+            return rule_agent.WAITING, f"Agent stopped trading {self.ticker} by hand"
         return super().activity(outcome, tracker)
 
     # --- one cycle --------------------------------------------------------
@@ -5341,6 +5500,8 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
         if not len(frame):
             _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
             return rule_agent.NO_DATA
+        if self._by_hand(state, tracker, today):
+            return rule_agent.SOLD
         if self.blocked is not None:
             return rule_agent.NO_DATA
         if self.session is None:
@@ -5415,6 +5576,8 @@ class FastFuriousTrader(_SitsOut, BaseTrader):
                 return rule_agent.SOLD
             return rule_agent.HOLD
         if want != 1:
+            return rule_agent.HOLD
+        if self._stopped_by_hand(state, today):
             return rule_agent.HOLD
         if self.entry_refused(state, ts):
             return rule_agent.HOLD
@@ -5739,7 +5902,7 @@ def _session_clock(minute: int) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-class GoodMomentsTrader(_DownGammaRule, _SitsOut, BaseTrader):
+class GoodMomentsTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
     """GoodMoments' rules: the chance of a +0.2 ADR rise, at every bar.
 
     At the close of every bar the model says how likely it is that a later bar
@@ -5847,6 +6010,8 @@ class GoodMomentsTrader(_DownGammaRule, _SitsOut, BaseTrader):
             return rule_agent.WAITING, f"Agent sits today out ({labels})"
         if outcome == rule_agent.WARMING_UP and self.session is None and self.blocked is None:
             return rule_agent.WAITING, "Agent waiting for the first forecast"
+        if outcome != rule_agent.CLOSED and self.hand_stopped and tracker.position_for(self.ticker) <= 0:
+            return rule_agent.WAITING, f"Agent stopped trading {self.ticker} by hand"
         return super().activity(outcome, tracker)
 
     # --- one cycle --------------------------------------------------------
@@ -5864,6 +6029,8 @@ class GoodMomentsTrader(_DownGammaRule, _SitsOut, BaseTrader):
         if not len(frame):
             _log(state, {"type": "status", "text": f"No {self.ticker} bars yet today."})
             return rule_agent.NO_DATA
+        if self._by_hand(state, tracker, today):
+            return rule_agent.SOLD
         self.minute_move = getattr(sym_state, "abs_mean_minute_momentum", None)
         self._warm_chain(sym_state)
         if self.blocked is not None:
@@ -5982,6 +6149,8 @@ class GoodMomentsTrader(_DownGammaRule, _SitsOut, BaseTrader):
             if self._time_limit(state, tracker, position, last, ts):
                 return rule_agent.SOLD
             return rule_agent.HOLD
+        if self._stopped_by_hand(state, today):
+            return sold
         if fc is None or fc["edge"] < self.config.gm_enter:
             return sold
         if minute > APPLE_TRADER_GM_LAST_ENTRY_MINUTE:

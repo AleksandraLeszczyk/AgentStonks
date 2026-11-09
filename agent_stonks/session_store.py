@@ -264,6 +264,7 @@ def capture(state) -> dict:
         "apple_trader_levels": _levels_record(getattr(state, "apple_trader_levels", None)),
         "orchestra_levels": _orchestra_levels_record(getattr(state, "orchestra_levels", None)),
         "orchestra": _orchestra_record(getattr(state, "orchestra", None)),
+        "hand_stops": dict(getattr(state, "hand_stops", None) or {}),
         "run": _run_record(state),
     }
 
@@ -416,6 +417,11 @@ def restore(state, record: "dict | None" = None) -> "dict | None":
     if record.get("orchestra"):
         # Not running: only ▶ Start (or the restart resume) runs it again.
         state.orchestra = {**record["orchestra"], "running": False}
+    # A pair stopped by hand stays stopped (`apple_trader.stop_by_hand`): its
+    # trader says so again, being a new one.
+    state.hand_stops = {
+        str(key): {**stop, "seen": False} for key, stop in (record.get("hand_stops") or {}).items()
+    }
     _claim_if_free(state, day)
     tracker = state.decision_tracker
     summary = {
@@ -504,6 +510,8 @@ def _signature(state) -> tuple:
         tuple(race.get("holders") or ()),
         repr(race.get("budget")),
         (race.get("selection") or {}).get("date"),
+        # A stop by hand, like the agent's, must not wait for a fill to be saved.
+        tuple(sorted(getattr(state, "hand_stops", None) or {})),
         # A stop has to reach the file promptly, or a crash right after it
         # would start the stopped run again.
         bool(state.agent_running),

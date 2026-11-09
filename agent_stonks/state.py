@@ -388,6 +388,17 @@ class AppState:
         # ("MU:highlow" -> {"day", "at"}), until the pair's trader takes the
         # ask on its next bar (`apple_trader.ask_breaker_lift`).
         self.breaker_lifts: dict = {}
+        # A pair the Portfolio tab asked to sell what it holds ("MU:highlow" ->
+        # {"day", "at"}), until its trader takes the ask
+        # (`apple_trader.ask_hand_sell`).
+        self.hand_sells: dict = {}
+        # A pair the Portfolio tab stopped buying for the day ("MU:highlow" ->
+        # {"day", "at", "seen"}) until "Trade again" (`apple_trader.stop_by_hand`).
+        # Kept in the session file.
+        self.hand_stops: dict = {}
+        # Set by those asks: the rule loop runs its next cycle now rather than
+        # at the next bar (`rule_agent.run_loop`).
+        self.trader_wake_event: threading.Event = threading.Event()
         self.api_key: str = ""
         self.api_secret: str = ""
         self.status: str = "Idle"
@@ -718,6 +729,20 @@ def agent_log_tagged(target, **fields):
             return target(*args, **kwargs)
 
     return run
+
+
+def trader_wake_event(state: "AppState") -> threading.Event:
+    """The event that wakes the rule loop for a hand ask from the Portfolio
+    tab (`AppState.trader_wake_event`), made on first use: a page's state made
+    before a code save is an instance of the old class, which has none."""
+    event = getattr(state, "trader_wake_event", None)
+    if event is None:
+        with state.lock:
+            event = getattr(state, "trader_wake_event", None)
+            if event is None:
+                event = threading.Event()
+                state.trader_wake_event = event
+    return event
 
 
 def append_agent_log(state: "AppState", entry: dict) -> None:

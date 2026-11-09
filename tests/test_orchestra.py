@@ -717,6 +717,70 @@ class TestStopOut:
         assert race.halt is None and race.holder == "INTC:highlow"
 
 
+class TestByHand:
+    """The Portfolio tab's "Sell" and "Stop trading" per pair (2026-11-09, the
+    user's request), in a race."""
+
+    def _race(self, monkeypatch):
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL", "INTC"], broker)
+        state = make_state(["AAPL", "INTC"])
+        race = make_race(racer("AAPL"), racer("INTC"))
+        race.run_cycle(state, tracker)
+        return state, tracker, tapes, race
+
+    def test_a_stopped_pair_sits_out_and_the_others_race_on(self, market_open, monkeypatch):
+        state, tracker, tapes, race = self._race(monkeypatch)
+        at.stop_by_hand(state, "AAPL:highlow")
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "hold"
+        statuses = {row["key"]: row["status"] for row in state.orchestra["board"]}
+        assert statuses == {"AAPL:highlow": "stopped by hand", "INTC:highlow": "racing"}
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01), INTC=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "bought"
+        assert [f[:2] for f in fills(tracker)] == [("INTC", "buy")]
+        at.end_hand_stop(state, "AAPL:highlow")
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        race.run_cycle(state, tracker)
+        assert race.holders() == ["AAPL:highlow", "INTC:highlow"]
+
+    def test_sell_frees_the_symbol_for_the_race(self, market_open, monkeypatch):
+        state, tracker, tapes, race = self._race(monkeypatch)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "bought"
+        assert race.holder == "AAPL:highlow"
+        at.ask_hand_sell(state, "AAPL:highlow")
+        # The cycle the wake runs, on the same bar.
+        assert race.run_cycle(state, tracker) == "sold"
+        assert tracker.position_for("AAPL") == 0
+        assert race.holder is None and state.orchestra["holders"] == []
+        assert [f[:2] for f in fills(tracker)] == [("AAPL", "buy"), ("AAPL", "sell")]
+
+    def test_a_pair_on_a_symbol_another_holds_sells_nothing(self, market_open, monkeypatch):
+        broker = Broker2()
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tapes = Tapes(monkeypatch, ["AAPL"], broker)
+        state = make_state(["AAPL"])
+        race = make_race(racer("AAPL"), racer("AAPL", model_key="highlow2"))
+        race.run_cycle(state, tracker)
+        tapes.bar(AAPL=(103.0, BUY_LEVEL - 0.01))
+        assert race.run_cycle(state, tracker) == "bought"
+        assert race.holder == "AAPL:highlow"
+        at.ask_hand_sell(state, "AAPL:highlow2")
+        race.run_cycle(state, tracker)
+        assert tracker.position_for("AAPL") > 0
+        assert at.hand_sell_asked(state, "AAPL:highlow2") is None
+
+    def test_every_pair_stopped(self, market_open, monkeypatch):
+        state, tracker, tapes, race = self._race(monkeypatch)
+        at.stop_by_hand(state, "AAPL:highlow")
+        at.stop_by_hand(state, "INTC:highlow")
+        tapes.bar()
+        outcome = race.run_cycle(state, tracker)
+        assert race.activity(outcome, tracker) == ("🟠", "Agent stopped trading by hand")
+
+
 class TestARaceOfOneIsASingleRun:
     """The race adds nothing to one racer: same decisions, same log."""
 

@@ -5684,3 +5684,163 @@ class TestDownNegativeGammaForm:
         app.selectbox(key="t_model_AAPL").select(apple_models.FASTFURIOUS_KEY).run()
         assert not app.exception, app.exception
         assert self._box(app) == []
+
+
+class TestByHand:
+    """The Portfolio tab's "Sell" and "Stop trading" per pair (2026-11-09, the
+    user's request), as the day-range trader takes them."""
+
+    KEY = at.breaker_key(TICKER, "highlow")
+
+    def _setup(self, monkeypatch, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        trader = at.DayRangeTrader(dayrange_config(**kwargs))
+        return trader, tracker, Tape(monkeypatch, broker)
+
+    @staticmethod
+    def _texts(state):
+        return [e.get("text") or "" for e in state.agent_log]
+
+    def test_a_stopped_pair_buys_nothing_and_says_so_once(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+        tape.append(104.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        at.stop_by_hand(state, self.KEY)
+        assert state.trader_wake_event.is_set()
+        assert at.stopped_by_hand(state, self.KEY)["seen"] is False
+        for _ in range(3):
+            tape.append(103.0, low=BUY_LEVEL - 0.01)
+            assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        said = [t for t in self._texts(state) if "trading stopped by hand" in t]
+        assert said == [
+            f"{TICKER}: trading stopped by hand from the Portfolio tab — no new buys today. "
+            "Trade again lets it buy."
+        ]
+        assert at.stopped_by_hand(state, self.KEY)["seen"] is True
+        assert trader.activity("hold", tracker) == ("🟠", f"Agent stopped trading {TICKER} by hand")
+
+    def test_trade_again_lets_it_buy(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+        at.stop_by_hand(state, self.KEY)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        at.end_hand_stop(state, self.KEY)
+        assert at.stopped_by_hand(state, self.KEY) is None
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert f"{TICKER}: no longer stopped by hand — it may buy again." in self._texts(state)
+
+    def test_what_is_held_keeps_its_exits_but_is_not_added_to(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch, scale_in=True, position_pct=50.0)
+        tape.append(BUY_LEVEL)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        held = tracker.position_for(TICKER)
+        rung = trader.plan["buy_level"]
+        at.stop_by_hand(state, self.KEY)
+        tape.append(rung - 0.05)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == held
+        assert any(f"the {held:g} sh held keep their exits" in t for t in self._texts(state))
+        tape.append(SELL_LEVEL, high=SELL_LEVEL + 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+
+    def test_sell_sells_the_whole_position_at_once(self, state, market_open, monkeypatch):
+        """On the bar it was asked on, too -- the wake runs a cycle mid-bar --
+        and outside the rules: no minimum-win stand-down judges it, and the
+        pair may buy again."""
+        trader, tracker, tape = self._setup(monkeypatch, min_win_k=0.5)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        at.ask_hand_sell(state, self.KEY)
+        assert at.hand_sell_asked(state, self.KEY) is not None
+        assert state.trader_wake_event.is_set()
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert at.hand_sell_asked(state, self.KEY) is None
+        sale = [e for e in state.agent_log if e.get("type") == "decision"][-1]
+        assert sale["action"] == "sell" and sale["exit"] == "hand"
+        assert sale["reasoning"] == "Sold by hand from the Portfolio tab: the whole position at market."
+        assert not trader.plan.get("stand_down") and not trader.plan.get("paused")
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_a_sale_asked_with_nothing_held_is_used_up(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+        tape.append(104.0)
+        at.ask_hand_sell(state, self.KEY)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert at.hand_sell_asked(state, self.KEY) is None
+        assert f"{TICKER}: sell by hand from the Portfolio tab, but nothing is held." in self._texts(state)
+
+    def test_asks_from_another_day_do_nothing(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(monkeypatch)
+        at.stop_by_hand(state, self.KEY)
+        state.hand_stops[self.KEY]["day"] = "2026-07-20"
+        assert at.stopped_by_hand(state, self.KEY) is None
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        at.ask_hand_sell(state, self.KEY)
+        state.hand_sells[self.KEY]["day"] = "2026-07-20"
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) > 0
+        assert state.hand_sells == {}
+
+    def test_the_session_file_keeps_a_stop(self, state, market_open):
+        from agent_stonks import session_store
+
+        at.stop_by_hand(state, self.KEY)
+        state.hand_stops = {self.KEY: {**state.hand_stops[self.KEY], "seen": True}}
+        before = session_store._signature(state)
+        record = session_store.capture(state)
+        assert record["hand_stops"][self.KEY]["day"] == "2026-07-21"
+        fresh = AppState()
+        session_store.restore(fresh, session_store.loads(session_store.dumps(record)))
+        # A new trader says so again.
+        assert at.stopped_by_hand(fresh, self.KEY)["seen"] is False
+        at.end_hand_stop(state, self.KEY)
+        assert session_store._signature(state) != before
+
+
+class TestWake:
+    """`rule_agent._wait_for_next_bar`: a hand ask cuts the wait short."""
+
+    def test_a_wake_ends_the_wait_and_is_used_up(self):
+        import time
+
+        state = AppState()
+        state.trader_wake_event.set()
+        started = time.monotonic()
+        rule_agent._wait_for_next_bar(state, threading.Event(), 60)
+        assert time.monotonic() - started < 0.5
+        assert not state.trader_wake_event.is_set()
+
+    def test_a_stop_ends_it_too(self):
+        import time
+
+        state, stop = AppState(), threading.Event()
+        threading.Timer(0.2, stop.set).start()
+        started = time.monotonic()
+        rule_agent._wait_for_next_bar(state, stop, 60)
+        assert time.monotonic() - started < 2.0
+
+    def test_a_wake_mid_wait(self):
+        import time
+
+        state = AppState()
+        threading.Timer(0.2, state.trader_wake_event.set).start()
+        started = time.monotonic()
+        rule_agent._wait_for_next_bar(state, threading.Event(), 60)
+        assert time.monotonic() - started < 2.0
+
+    def test_a_state_from_before_a_code_save_gets_one(self):
+        """A page's state made before the save has no event: the ask and the
+        refreshed loop must still share one."""
+        state = AppState()
+        del state.__dict__["trader_wake_event"]
+        at.wake_trader(state)
+        assert state.trader_wake_event.is_set()
+        rule_agent._wait_for_next_bar(state, threading.Event(), 60)
+        assert not state.trader_wake_event.is_set()

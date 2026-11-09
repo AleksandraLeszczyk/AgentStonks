@@ -1622,6 +1622,54 @@ def stop_agent_and_wait(state: "AppState", timeout: float) -> bool:
     return not thread.is_alive()
 
 
+def agent_loop_alive(state: "AppState") -> bool:
+    """Whether an agent loop runs for this state -- one started before a code
+    save included, which `agent_running` alone may not show."""
+    return bool(state.agent_running) or _loop_thread(state.agent_stop_event) is not None
+
+
+def _sell_at_market(
+    state: "AppState", tracker, symbol: str, quantity: float, reasoning: str,
+) -> "tuple[object, str | None]":
+    """Sell `quantity` of `symbol` at market and log it: the decision, or
+    `(None, message)` when the order could not even be sent."""
+    try:
+        decision = tracker.record_trade(
+            symbol, "sell", quantity, reasoning, state.api_key, state.api_secret, state.feed,
+        )
+    except Exception as exc:
+        _log(state, {"type": "error", "text": f"Could not sell {symbol}: {exc}"})
+        return None, f"{symbol}: {exc}"
+    _log(
+        state,
+        {
+            "type": "decision",
+            "action": decision.action,
+            "symbol": decision.symbol,
+            "status": decision.status,
+            "price": decision.price,
+            "quantity": decision.filled_quantity,
+            "reasoning": decision.reasoning,
+        },
+    )
+    return decision, None
+
+
+def sell_symbol(state: "AppState", symbol: str, reasoning: str) -> "tuple[object, str | None]":
+    """Sell all of `symbol` the ledger holds, at market -- for when no agent
+    runs to do it. On a real account the position is read from the account
+    first. `(None, None)` when nothing is held."""
+    tracker = state.decision_tracker
+    if tracker is None:
+        return None, None
+    if not tracker.broker.is_simulated:
+        tracker.sync_from_broker()
+    quantity = tracker.position_for(symbol)
+    if quantity <= 0:
+        return None, None
+    return _sell_at_market(state, tracker, symbol, quantity, reasoning)
+
+
 def sell_everything_and_stop(state: "AppState") -> "tuple[list, list[str]]":
     """Stop the agent, then sell every open position at market.
 
@@ -1648,29 +1696,14 @@ def sell_everything_and_stop(state: "AppState") -> "tuple[list, list[str]]":
     for symbol, quantity in sorted(tracker.snapshot()["positions"].items()):
         if quantity <= 0:
             continue
-        try:
-            decision = tracker.record_trade(
-                symbol, "sell", quantity,
-                "Sell everything and stop: closing the whole position at market on request.",
-                state.api_key, state.api_secret, state.feed,
-            )
-        except Exception as exc:
-            errors.append(f"{symbol}: {exc}")
-            _log(state, {"type": "error", "text": f"Could not sell {symbol}: {exc}"})
-            continue
-        decisions.append(decision)
-        _log(
-            state,
-            {
-                "type": "decision",
-                "action": decision.action,
-                "symbol": decision.symbol,
-                "status": decision.status,
-                "price": decision.price,
-                "quantity": decision.filled_quantity,
-                "reasoning": decision.reasoning,
-            },
+        decision, error = _sell_at_market(
+            state, tracker, symbol, quantity,
+            "Sell everything and stop: closing the whole position at market on request.",
         )
+        if error is not None:
+            errors.append(error)
+        else:
+            decisions.append(decision)
 
     attempted = len(decisions) + len(errors)
     sold = sum(1 for d in decisions if d.status == "filled")

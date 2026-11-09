@@ -753,6 +753,31 @@ class TestCircuitBreaker:
         assert set(line["values"]) == {2.0} and "+0.05 more after each stop" in line["note"]
 
 
+class TestByHand:
+    """The Portfolio tab's "Sell" and "Stop trading" (2026-11-09), on GoodMoments."""
+
+    def test_a_stopped_pair_buys_nothing_until_trade_again(self, monkeypatch, state):
+        trader, tracker, tape = _setup(monkeypatch, state)
+        key = at.breaker_key(TICKER, trader.config.model_key)
+        at.stop_by_hand(state, key)
+        tape.append(100.0, edge=0.2)
+        assert cycle(trader, state, tracker) == "hold"
+        assert trader.activity("hold", tracker) == ("🟠", f"Agent stopped trading {TICKER} by hand")
+        at.end_hand_stop(state, key)
+        tape.append(100.0, edge=0.2)
+        assert cycle(trader, state, tracker) == "bought"
+
+    def test_sell_sells_on_the_same_bar(self, monkeypatch, state):
+        trader, tracker, tape = _setup(monkeypatch, state)
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+        at.ask_hand_sell(state, at.breaker_key(TICKER, trader.config.model_key))
+        assert cycle(trader, state, tracker) == "sold"
+        assert tracker.position_for(TICKER) == 0
+        assert _exits(state) == ["hand"]
+        assert trader.entry is None
+
+
 class TestMomentumConfirmation:
     """HighLow's behaviour table on GoodMoments' rules (`gm_confirm_bars`): no
     entry the table does not allow, and a reached take held while momentum is

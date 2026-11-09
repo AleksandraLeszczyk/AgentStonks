@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from . import market_hours
@@ -41,7 +42,7 @@ from . import scoring
 from . import clock
 from .clock import now as _now
 from .config import APPLE_TRADER_BAR_LAG_SEC, APPLE_TRADER_CYCLE_SEC
-from .state import agent_log_tagged
+from .state import agent_log_tagged, trader_wake_event
 from .state import append_agent_log as _log
 
 if TYPE_CHECKING:
@@ -328,9 +329,29 @@ def run_loop(
             _log(state, {"type": "error", "text": f"{agent_name} cycle failed: {exc}"})
             state.agent_activity = (FAILED, "Agent cycle failed — see the log")
         scoring.maybe_score_day(state, tracker)
-        stop_event.wait(seconds_to_next_bar(cycle_sec))
+        _wait_for_next_bar(state, stop_event, cycle_sec)
 
     end_session(state, tracker, f"{agent_name} stopped")
+
+
+# How often a loop waiting for its next bar looks for a wake.
+WAKE_POLL_SEC = 0.5
+
+
+def _wait_for_next_bar(state: "AppState", stop_event: threading.Event, cycle_sec: int) -> None:
+    """Wait for the next bar, or until stopped, or until the Portfolio tab
+    wakes the loop (`AppState.trader_wake_event`): a sale asked for by hand is
+    made on a cycle run at once, not at the next bar. A wake set while the
+    cycle ran ends the wait at once, since that cycle may have read the state
+    before the ask was made."""
+    wake = trader_wake_event(state)
+    deadline = time.monotonic() + seconds_to_next_bar(cycle_sec)
+    while not stop_event.is_set() and not wake.is_set():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        stop_event.wait(min(left, WAKE_POLL_SEC))
+    wake.clear()
 
 
 def end_session(state: "AppState", tracker: "DecisionTracker", text: "str | None") -> None:

@@ -34,9 +34,11 @@ from .notifications_ui import notifications_panel
 from .agent import (
     AGENT_PERSONALITIES,
     DEFAULT_PERSONALITY,
+    agent_loop_alive,
     launch_agent,
     selectable_personalities,
     sell_everything_and_stop,
+    sell_symbol,
     stop_agent,
     stop_agent_and_wait,
 )
@@ -46,11 +48,17 @@ from .apple_trader import (
     APPLE_TRADER_LABEL,
     AppleTraderConfig,
     ask_breaker_lift,
+    ask_hand_sell,
     breaker_hold,
     breaker_key,
     breaker_lift_asked,
+    end_hand_stop,
+    hand_sell_asked,
     launch_apple_trader,
     record_config_field,
+    stop_by_hand,
+    stopped_by_hand,
+    take_hand_sell,
 )
 from .apple_trader import DEFAULT_TICKER as APPLE_TRADER_TICKER
 from .orchestra import (
@@ -2973,6 +2981,19 @@ def _breaker_pairs(state: AppState) -> "list[tuple[str, str, dict]]":
     return []
 
 
+# An agent started before the app was last updated runs the old trader code,
+# which never takes an ask from these buttons.
+_OLD_AGENT = (
+    "An agent started before the app was last updated cannot take it: 🔄 Refresh "
+    "Agent (keeps today's ledger) restarts it on the new code, which does."
+)
+
+
+def _untaken(asked: dict) -> bool:
+    """Whether an ask has waited longer than a running trader would take."""
+    return market_hours.is_market_open() and time.time() - float(asked["at"]) > _LIFT_UNTAKEN_SEC
+
+
 def _breaker_status(state: AppState, hold: "str | None", asked: "dict | None") -> str:
     """One pair's breaker line: trading, held back and why, or lifted and
     waiting for its trader to take it."""
@@ -2983,41 +3004,143 @@ def _breaker_status(state: AppState, hold: "str | None", asked: "dict | None") -
         return f":material/block: {held}."
     if not state.agent_running:
         return f":material/schedule: {held} — lifted when ▶ Start Agent starts it again."
-    if market_hours.is_market_open() and time.time() - float(asked["at"]) > _LIFT_UNTAKEN_SEC:
-        return (
-            f":material/schedule: {held} — the lift has not been taken yet. An agent "
-            "started before the app was last updated cannot take it: 🔄 Refresh Agent "
-            "(keeps today's ledger) restarts it on the new code, which does."
-        )
+    if _untaken(asked):
+        return f":material/schedule: {held} — the lift has not been taken yet. {_OLD_AGENT}"
     return f":material/schedule: {held} — lifted on its trader's next bar."
 
 
+def _pair_status(
+    state: AppState, hold: "str | None", lift: "dict | None", stop: "dict | None",
+    sell: "dict | None", shares: float,
+) -> str:
+    """One pair's line: a sale by hand on its way, a stop by hand, else its
+    circuit breaker (`_breaker_status`)."""
+    if sell is not None:
+        if not state.agent_running:
+            return ":material/schedule: Sale asked — made when ▶ Start Agent starts it again."
+        if _untaken(sell):
+            return f":material/schedule: Selling — the sale has not been made yet. {_OLD_AGENT}"
+        return f":material/schedule: Selling its {shares:g} sh at market, now."
+    if stop is not None:
+        if state.agent_running and not stop.get("seen") and _untaken(stop):
+            return f":material/schedule: Stopped by hand — its trader has not seen it yet. {_OLD_AGENT}"
+        kept = f"; the {shares:g} sh held keep their exits" if shares > 0 else ""
+        return f":material/pan_tool: Stopped by hand — no new buys today{kept}."
+    return _breaker_status(state, hold, lift)
+
+
+def _pair_shares(state: AppState, key: str, ticker: str) -> float:
+    """What pair `key` holds of its symbol: the ledger's position on a single
+    run, and in a race once the pair is a holder; under a split, its account's
+    shares, never more than the ledger's."""
+    tracker = state.decision_tracker
+    held = float(tracker.position_for(ticker)) if tracker is not None else 0.0
+    if state.llm_personality != ORCHESTRA_KEY:
+        return held
+    race = getattr(state, "orchestra", None) or {}
+    if key not in (race.get("holders") or []):
+        return 0.0
+    account = ((race.get("budget") or {}).get("accounts") or {}).get(key)
+    return min(held, float(account.get("shares") or 0.0)) if account else held
+
+
+def _sell_pair_now(state: AppState, key: str, ticker: str) -> None:
+    """Sell what the ledger holds of `ticker` from here, with no agent running
+    to be asked, and say how it went."""
+    take_hand_sell(state, key, clock.now().astimezone(market_hours.MARKET_TZ).date())
+    decision, error = sell_symbol(
+        state, ticker, "Sold by hand from the Portfolio tab: the whole position at market."
+    )
+    # At once, as the sidebar's Sell all: the ledger has changed.
+    session_store.save(state)
+    if error is not None:
+        st.toast(f"Not sold: {error}", icon=":material/error:")
+    elif decision is None:
+        st.toast(f"No {ticker} held to sell.", icon=":material/info:")
+    elif decision.status == "filled":
+        st.toast(
+            f"Sold {decision.filled_quantity:g} {ticker} @ ${decision.price:,.2f}.",
+            icon=":material/check_circle:",
+        )
+    else:
+        st.toast(f"Not sold: {ticker} ({decision.reasoning})", icon=":material/error:")
+
+
 def _breaker_controls(state: AppState) -> None:
-    """Per pair the rule agent trades today, whether a circuit breaker holds it
-    back -- a stand-down, a pause until the forecast is revised, a raised
-    entry -- and a button that lifts it. The trader does the lifting, on its
-    next bar (`apple_trader.ask_breaker_lift`); a stopped agent's, when it is
-    next started."""
+    """Per pair the rule agent trades today, what holds it back -- a circuit
+    breaker (a stand-down, a pause until the forecast is revised, a raised
+    entry) or a stop by hand -- and three buttons:
+
+    * **Trade again** lifts both. The trader lifts its breaker itself, on its
+      next bar (`apple_trader.ask_breaker_lift`); a stopped agent's, when it
+      is next started.
+    * **Sell** sells what the pair holds, at market: its trader does, on a
+      cycle the ask runs at once (`apple_trader.ask_hand_sell`); with no agent
+      running, this tab does (`_sell_pair_now`).
+    * **Stop trading** stops the pair buying for the rest of today; what it
+      holds keeps its exits (`apple_trader.stop_by_hand`).
+    """
     pairs = _breaker_pairs(state)
     if not pairs:
         return
     st.markdown("**Circuit breakers**")
+    alive = agent_loop_alive(state)
     for key, label, record in pairs:
+        ticker = str(record.get("ticker") or key.split(":")[0])
         hold = breaker_hold(record)
-        asked = breaker_lift_asked(state, key)
-        name, status, action = st.columns([2, 6, 2], vertical_alignment="center")
+        lift = breaker_lift_asked(state, key)
+        stop = stopped_by_hand(state, key)
+        sell = hand_sell_asked(state, key)
+        shares = _pair_shares(state, key, ticker)
+        name, status, again, sell_col, stop_col = st.columns(
+            [2.2, 4, 2, 1.6, 2], vertical_alignment="center"
+        )
         name.markdown(label)
-        status.caption(_breaker_status(state, hold, asked))
-        if action.button(
+        status.caption(_pair_status(state, hold, lift, stop, sell, shares))
+        if again.button(
             "Trade again",
             key=f"breaker_lift_{key}",
             icon=":material/play_arrow:",
-            disabled=hold is None or asked is not None,
+            disabled=stop is None and (hold is None or lift is not None),
             width="stretch",
-            help="Lift this pair's circuit breaker for the rest of today: its "
-            "entries are armed again. It can trip again on a later trade.",
+            help="Let this pair trade again for the rest of today: a stop by hand "
+            "ends, a circuit breaker is lifted and its entries are armed again. "
+            "The breaker can trip again on a later trade.",
         ):
-            ask_breaker_lift(state, key)
+            end_hand_stop(state, key)
+            if hold is not None and lift is None:
+                ask_breaker_lift(state, key)
+            session_store.save(state)
+            st.rerun(scope="fragment")
+        if sell_col.button(
+            "Sell",
+            key=f"hand_sell_{key}",
+            icon=":material/sell:",
+            disabled=shares <= 0 or (sell is not None and alive),
+            width="stretch",
+            help=f"Sell every {ticker} share this pair holds, at market, now. It may "
+            "buy again on its rules; Stop trading keeps it from that.",
+        ):
+            if alive:
+                ask_hand_sell(state, key)
+                st.rerun(scope="fragment")
+            else:
+                # Without a rerun, which would take the toast away; the next
+                # refresh draws the row flat.
+                _sell_pair_now(state, key, ticker)
+        if stop_col.button(
+            "Stop trading",
+            key=f"hand_stop_{key}",
+            icon=":material/pan_tool:",
+            disabled=stop is not None,
+            width="stretch",
+            help="No new buys of this pair for the rest of today, entries and adds "
+            "alike. What it holds keeps its stop, take and closing flatten; Sell "
+            "sells it now. Trade again undoes it.",
+        ):
+            stop_by_hand(state, key)
+            # At once: a crash right after must not trade it again.
+            session_store.save(state)
             st.rerun(scope="fragment")
 
 

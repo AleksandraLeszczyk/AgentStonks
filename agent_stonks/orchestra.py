@@ -1325,6 +1325,8 @@ class Orchestra:
     @staticmethod
     def _armed(racer: Racer) -> bool:
         trader = racer.trader
+        if getattr(trader, "hand_stopped", False):
+            return False
         if is_signal(racer.config):
             # Reading its edge, and not past the last minute it may buy in.
             minute = getattr(trader, "last_minute", None)
@@ -1397,6 +1399,8 @@ class Orchestra:
             return "holding"
         if self._benched(racer):
             return f"sits out today ({self.benched[racer.key]})"
+        if getattr(trader, "hand_stopped", False):
+            return "stopped by hand"
         if self.selection is not None and self._selected_day != self._day:
             return "waiting for 09:34"
         if (trader.blocked or {}).get("sit_out"):
@@ -1548,6 +1552,8 @@ class Orchestra:
             return rule_agent.FAILED, "Agent cannot trade today — see the log"
         if all(row["status"].startswith("sits out") for row in board):
             return rule_agent.WAITING, "Agent found no candidates today"
+        if all(row["status"] == "stopped by hand" for row in board):
+            return rule_agent.WAITING, "Agent stopped trading by hand"
         return rule_agent.WAITING, "Agent stood down for the day"
 
 

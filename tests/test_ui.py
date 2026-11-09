@@ -969,3 +969,109 @@ class TestPortfolioFormatting:
     def test_et_clock(self):
         assert _et_clock("2024-01-15T14:00:30+00:00") == "09:00:30"
         assert _et_clock("2024-07-15T14:00:30") == "10:00:30"  # naive = UTC
+
+
+def _breaker_controls_app():
+    from agent_stonks import ui
+    ui._breaker_controls(ui._get_state())
+
+
+class TestPairButtons:
+    """The Portfolio tab's per-pair Trade again / Sell / Stop trading
+    (2026-11-09, the user's request)."""
+
+    KEY = "AAPL:highlow"
+
+    def _setup(self, monkeypatch, running=False):
+        from datetime import datetime, timezone
+
+        from agent_stonks import clock, ui
+        from agent_stonks.apple_trader import APPLE_TRADER_KEY
+        from agent_stonks.broker import Broker
+        from agent_stonks.decisions import DecisionTracker
+
+        class Fills(Broker):
+            def get_current_price(self, symbol, key, secret, feed="iex"):
+                return 100.0
+
+            def submit_order(self, symbol, side, quantity, price):
+                return {"status": "filled", "filled_qty": quantity, "filled_price": price}
+
+        clock.set_simulated(datetime(2026, 7, 21, 14, 30, tzinfo=timezone.utc))
+        state = AppState()
+        state.set_symbols(["AAPL"])
+        state.llm_personality = APPLE_TRADER_KEY
+        state.apple_trader_levels = {
+            "date": "2026-07-21", "ticker": "AAPL", "config": {"model_key": "highlow"},
+            "memory": {"entry": None, "stand_down": None, "paused": None},
+        }
+        state.decision_tracker = DecisionTracker(starting_cash=10_000.0, broker=Fills())
+        state.decision_tracker.record_trade("AAPL", "buy", 10, "test", "k", "s")
+        state.agent_running = running
+        monkeypatch.setattr(ui, "_get_state", lambda: state)
+        # The holdings panel's fragment rerun, which AppTest cannot run: the
+        # next `run()` draws what it would.
+        self.reruns = []
+        monkeypatch.setattr(ui.st, "rerun", lambda **kw: self.reruns.append(kw))
+        return state
+
+    def test_stop_then_trade_again(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks import apple_trader as at, clock
+
+        state = self._setup(monkeypatch)
+        try:
+            app = AppTest.from_function(_breaker_controls_app).run()
+            assert not app.exception
+            assert app.button(key=f"breaker_lift_{self.KEY}").disabled
+            app.button(key=f"hand_stop_{self.KEY}").click().run()
+            assert self.reruns == [{"scope": "fragment"}]
+            assert at.stopped_by_hand(state, self.KEY) is not None
+            app.run()
+            assert app.button(key=f"hand_stop_{self.KEY}").disabled
+            assert not app.button(key=f"breaker_lift_{self.KEY}").disabled
+            assert any(
+                "Stopped by hand — no new buys today; the 10 sh held keep their exits." in c.value
+                for c in app.caption
+            )
+            app.button(key=f"breaker_lift_{self.KEY}").click().run()
+            assert at.stopped_by_hand(state, self.KEY) is None
+            app.run()
+            assert app.button(key=f"breaker_lift_{self.KEY}").disabled
+            assert state.breaker_lifts == {}
+        finally:
+            clock.clear()
+
+    def test_sell_with_no_agent_running_sells_here(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks import clock
+
+        state = self._setup(monkeypatch)
+        try:
+            app = AppTest.from_function(_breaker_controls_app).run()
+            app.button(key=f"hand_sell_{self.KEY}").click().run()
+            assert not app.exception
+            assert state.decision_tracker.position_for("AAPL") == 0
+            assert app.toast[0].value == "Sold 10 AAPL @ $100.00."
+            assert self.reruns == []
+            app.run()
+            assert app.button(key=f"hand_sell_{self.KEY}").disabled
+        finally:
+            clock.clear()
+
+    def test_sell_with_the_agent_running_asks_its_trader(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+        from agent_stonks import apple_trader as at, clock
+
+        state = self._setup(monkeypatch, running=True)
+        try:
+            app = AppTest.from_function(_breaker_controls_app).run()
+            app.button(key=f"hand_sell_{self.KEY}").click().run()
+            assert not app.exception
+            assert state.decision_tracker.position_for("AAPL") == 10
+            assert at.hand_sell_asked(state, self.KEY) is not None
+            app.run()
+            assert app.button(key=f"hand_sell_{self.KEY}").disabled
+            assert any("Selling its 10 sh at market, now." in c.value for c in app.caption)
+        finally:
+            clock.clear()
