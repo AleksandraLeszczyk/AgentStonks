@@ -7160,7 +7160,7 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "sharpe": r["sharpe"],
             "sessions": r["sessions"],
             "trades": r["trades_per_session"],
-            "days": f"{r['days_up']} up · {r['days_down']} down",
+            "days": 100.0 * r["days_up"] / r["sessions"],
             "best_day": r["best_day"],
             "worst_day": r["worst_day"],
             "skips": ", ".join(ml_summary.event_label(c) for c in r["skip_events"]) or "—",
@@ -7190,7 +7190,11 @@ def _render_ml_models(rows: "list[dict]", weekly: "list[dict]", window: str) -> 
             "dataset's total shared over the sessions it traded: exact over its whole week, "
             "near it where the window starts mid-week.",
         ),
-        "days": "Days",
+        "days": money(
+            "Days up", format="%.0f%%",
+            help="The share of the window's sessions that made money, every session "
+            "counted: one it made no trade on, or sat out by rule, is not up.",
+        ),
         "best_day": money("Best day ($)", format="%+.2f"),
         "worst_day": money("Worst day ($)", format="%+.2f"),
         "skips": st.column_config.TextColumn(
