@@ -52,6 +52,7 @@ from agent_stonks.apple_trader import (
     default_config,
 )
 from agent_stonks import apple_trader_ui
+from agent_stonks.state import agent_log_text, collapse_held_statuses
 from agent_stonks.orchestra import ORCHESTRA_KEY, racer_label
 from agent_stonks.orchestra import MODE_RACE as ORCHESTRA_MODE_RACE
 from agent_stonks.orchestra import all_pairs as orchestra_all_pairs
@@ -1237,12 +1238,12 @@ def _render_run(record: dict) -> None:
             ],
             height=300,
         )
-    log = record.get("agent_log") or []
+    log = collapse_held_statuses(record.get("agent_log") or [])
     with st.expander(f"Agent log ({len(log)} entries)"):
         for entry in log[-400:]:
             ts = str(entry.get("ts", ""))[11:19]
             kind = entry.get("type", "")
-            text = entry.get("text") or entry.get("reasoning") or entry.get("name") or ""
+            text = agent_log_text(entry) or entry.get("reasoning") or entry.get("name") or ""
             st.markdown(f"`{ts}` **{kind}** {text}")
 
 

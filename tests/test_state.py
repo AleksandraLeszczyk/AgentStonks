@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import threading
 
 from agent_stonks.config import MAX_BARS, PAPER_STARTING_CASH
@@ -330,3 +331,83 @@ def test_a_tagged_thread_target_stamps_its_agent_on_every_line():
     append_agent_log(app, {"type": "status", "text": "manual"})
 
     assert [e.get("agent") for e in app.agent_log] == ["automatic", "momentum", None]
+
+
+class TestHeldStatus:
+    """A status said again every cycle is one line that says since when."""
+
+    CLOSED = {"type": "status", "text": "Market closed -- Orchestra is not watching bars."}
+
+    def _say(self, app, minute, entry, **tag):
+        from agent_stonks import clock
+        from agent_stonks.state import agent_log_tag, append_agent_log
+
+        clock.set_simulated(datetime(2026, 11, 13, 6, minute, 5, tzinfo=timezone.utc))
+        try:
+            with agent_log_tag(**tag):
+                append_agent_log(app, dict(entry))
+        finally:
+            clock.clear()
+
+    def test_repeats_collapse_into_the_newest_with_the_first_time(self):
+        from agent_stonks.state import HELD_SINCE, agent_log_text
+
+        app = AppState()
+        for minute in (33, 34, 35):
+            self._say(app, minute, self.CLOSED, agent="orchestra")
+        assert len(app.agent_log) == 1
+        line = app.agent_log[0]
+        assert line["ts"].startswith("2026-11-13T06:35:05")
+        assert line[HELD_SINCE].startswith("2026-11-13T06:33:05")
+        assert agent_log_text(line) == (
+            "Market closed -- Orchestra is not watching bars. "
+            "This status holds since 06:33:05"
+        )
+
+    def test_a_single_saying_reads_as_it_was_written(self):
+        from agent_stonks.state import agent_log_text
+
+        app = AppState()
+        self._say(app, 33, self.CLOSED)
+        assert agent_log_text(app.agent_log[0]) == self.CLOSED["text"]
+
+    def test_only_back_to_back_statuses_from_the_same_writer_collapse(self):
+        app = AppState()
+        self._say(app, 33, self.CLOSED, agent="orchestra")
+        self._say(app, 34, self.CLOSED, agent="apple_trader")  # another writer
+        self._say(app, 35, {"type": "analysis", "text": "x"})
+        self._say(app, 36, {"type": "analysis", "text": "x"})  # not a status
+        self._say(app, 37, self.CLOSED, agent="orchestra")  # not back to back
+        assert [e.get("agent") for e in app.agent_log] == [
+            "orchestra", "apple_trader", None, None, "orchestra",
+        ]
+        assert all("held_since" not in e for e in app.agent_log)
+
+    def test_since_another_day_names_the_date(self):
+        from agent_stonks.state import agent_log_text
+
+        entry = {
+            "ts": "2026-11-13T06:35:05+00:00",
+            "held_since": "2026-11-12T21:00:05+00:00",
+            "type": "status",
+            "text": "Market closed",
+        }
+        assert agent_log_text(entry) == (
+            "Market closed. This status holds since 2026-11-12 21:00:05"
+        )
+
+
+def test_lines_written_before_the_collapse_read_as_one():
+    """A day file from before, or an agent thread on the old code: the log
+    views collapse its repeats themselves."""
+    from agent_stonks.state import agent_log_text, collapse_held_statuses
+
+    said = lambda minute, text="Market closed -- Orchestra is not watching bars.": {
+        "ts": f"2026-11-13T06:{minute:02d}:05+00:00", "agent": "orchestra",
+        "type": "status", "text": text,
+    }
+    log = [said(30, "Orchestra watching 3 pairs."), said(33), said(34), said(35)]
+    lines = collapse_held_statuses(log)
+    assert [line["ts"][11:16] for line in lines] == ["06:30", "06:35"]
+    assert agent_log_text(lines[-1]).endswith("This status holds since 06:33:05")
+    assert len(log) == 4  # the log itself is left as it is

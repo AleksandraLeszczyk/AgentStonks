@@ -29,6 +29,50 @@ def _decision_positions(decision: dict) -> dict[str, float]:
     return {symbol: float(decision.get("position_after") or 0.0)} if symbol else {}
 
 
+# What a live equity point reads (`append_live_point`): everything but its time.
+_LIVE_READING = ("cash", "position", "value")
+
+
+def append_live_point(history: list[dict], point: dict, session_open) -> None:
+    """Add a live reading of the portfolio to `history`, the Portfolio value
+    chart's once-a-minute points (`AppState.agent_equity_history`);
+    `session_open(ts)` says whether the session was open at a point's time.
+
+    Outside the session the portfolio seldom moves, and a dot a minute all
+    night at the same value says nothing the first one did not. While the
+    reading stays the same there, a stretch keeps two points: its first, and
+    its newest, which each new reading moves to its own time -- so the line
+    still reaches now. In the session every reading is kept, and a night's
+    stretch starts after the session's last one.
+    """
+    def reading(p: dict) -> tuple:
+        return tuple(p.get(k) for k in _LIVE_READING)
+
+    def closed(p: dict) -> bool:
+        return not session_open(pd.Timestamp(p["ts"]))
+
+    if (
+        len(history) >= 2
+        and reading(history[-2]) == reading(history[-1]) == reading(point)
+        and closed(point)
+        and closed(history[-1])
+        and closed(history[-2])
+    ):
+        history[-1] = point
+    else:
+        history.append(point)
+
+
+def thin_live_points(points: list[dict], session_open) -> list[dict]:
+    """`points` as `append_live_point` keeps them -- for readings recorded
+    before it thinned them (an earlier day file, a page still on the code
+    from before)."""
+    kept: list[dict] = []
+    for point in points:
+        append_live_point(kept, point, session_open)
+    return kept
+
+
 def _bar_events(
     bars_by_symbol: dict[str, list[dict]], session_start: datetime
 ) -> list[tuple[pd.Timestamp, str, float]]:

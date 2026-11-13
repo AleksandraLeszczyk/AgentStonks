@@ -14,7 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from .config import PALETTE
-from .state import format_alert, format_tool_kv
+from .state import agent_log_text, collapse_held_statuses, format_alert, format_tool_kv
 
 _CSS = f"""
 body {{
@@ -167,7 +167,7 @@ def _agent_log_html(log: list[dict]) -> str:
     if not log:
         return '<p class="empty-note">No agent activity recorded.</p>'
     cards = []
-    for entry in log:
+    for entry in collapse_held_statuses(log):
         etype = entry.get("type", "status")
         label = etype
         color = PALETTE["muted"]
@@ -240,7 +240,7 @@ def _agent_log_html(log: list[dict]) -> str:
             )
         else:
             color = PALETTE["down"] if etype == "error" else PALETTE["text"]
-            body = f"<div>{html.escape(entry.get('text', ''))}</div>"
+            body = f"<div>{html.escape(agent_log_text(entry))}</div>"
         try:
             ts_fmt = pd.to_datetime(entry.get("ts", "")).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:

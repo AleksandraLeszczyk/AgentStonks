@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 import pytest
 
 from agent_stonks.performance import (
+    append_live_point,
     compute_equity_curve,
+    thin_live_points,
     compute_symbol_curves,
     decision_markers,
     holdings,
@@ -297,3 +299,54 @@ class TestComputeSymbolCurves:
         curves = compute_symbol_curves(self.BARS_BY_SYMBOL, [], 10_000.0, SESSION_START)
         assert all(p["pnl"] == {} and p["market_value"] == {} for p in curves["points"])
         assert curves["fills"] == []
+
+
+class TestAppendLivePoint:
+    """The Portfolio value chart's once-a-minute live reading."""
+
+    @staticmethod
+    def _never_open(ts):
+        return False
+
+    @staticmethod
+    def _point(minute, value=4001.8, cash=4001.8, position=0):
+        return {
+            "ts": f"2026-11-13T06:{minute:02d}:24+00:00",
+            "price": None, "cash": cash, "position": position, "value": value,
+        }
+
+    def test_an_unchanged_night_keeps_its_first_and_newest_point(self):
+        history = []
+        for minute in range(33, 40):
+            append_live_point(history, self._point(minute), self._never_open)
+        assert [p["ts"][11:16] for p in history] == ["06:33", "06:39"]
+
+    def test_a_change_starts_a_new_stretch(self):
+        history = []
+        for minute in (33, 34, 35):
+            append_live_point(history, self._point(minute), self._never_open)
+        for minute in (36, 37, 38):
+            append_live_point(history, self._point(minute, value=4005.0), self._never_open)
+        assert [(p["ts"][11:16], p["value"]) for p in history] == [
+            ("06:33", 4001.8), ("06:35", 4001.8), ("06:36", 4005.0), ("06:38", 4005.0),
+        ]
+
+    def test_in_the_session_every_reading_is_kept(self):
+        history = []
+        for minute in range(33, 37):
+            append_live_point(history, self._point(minute), lambda ts: True)
+        assert len(history) == 4
+
+    def test_points_recorded_before_are_thinned_the_same_way(self):
+        from agent_stonks import market_hours
+
+        night = [self._point(minute) for minute in range(33, 40)]
+        session = [
+            {**self._point(minute), "ts": f"2026-11-12T15:{minute:02d}:24+00:00"}
+            for minute in range(0, 3)
+        ]
+        kept = thin_live_points(session + night, market_hours.is_market_open)
+        assert [p["ts"][:16] for p in kept] == [
+            "2026-11-12T15:00", "2026-11-12T15:01", "2026-11-12T15:02",
+            "2026-11-13T06:33", "2026-11-13T06:39",
+        ]

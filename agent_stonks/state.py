@@ -745,6 +745,24 @@ def trader_wake_event(state: "AppState") -> threading.Event:
     return event
 
 
+# Entry types whose back-to-back repeats are one line (`append_agent_log`).
+# A status is said again every cycle while it is true -- "Market closed --
+# Orchestra is not watching bars." once a minute all night -- and a copy a
+# minute says nothing the first one did not.
+_HELD_ENTRY_TYPES = frozenset({"status"})
+# The field a collapsed line keeps its first saying's time in.
+HELD_SINCE = "held_since"
+
+
+def _same_line(a: dict, b: dict) -> bool:
+    """Whether two log entries say the same thing from the same writer (its
+    tag fields included): every field but when."""
+    when = ("ts", HELD_SINCE)
+    return {k: v for k, v in a.items() if k not in when} == {
+        k: v for k, v in b.items() if k not in when
+    }
+
+
 def append_agent_log(state: "AppState", entry: dict) -> None:
     """Timestamp an agent-log entry and append it under the state's lock.
 
@@ -752,10 +770,64 @@ def append_agent_log(state: "AppState", entry: dict) -> None:
     same log -- the LLM personalities, the rule-based traders and the Strategist
     all do -- and the UI panel reads it back. It is a property of
     the state, not of whoever happens to be running.
+
+    A status that repeats the log's newest line is not added again: that line
+    takes the new time and remembers when it was first said (`HELD_SINCE`),
+    which the log shows as "This status holds since …" (`agent_log_text`).
     """
     tag = _LOG_TAG.get()
+    line = {"ts": clock.now().isoformat(), **(tag or {}), **entry}
     with state.lock:
-        state.agent_log.append({"ts": clock.now().isoformat(), **(tag or {}), **entry})
+        log = state.agent_log
+        held = _held_line(log[-1] if log else None, line)
+        if held is not None:
+            log[-1] = held
+        else:
+            log.append(line)
+
+
+def _held_line(last: "dict | None", line: dict) -> "dict | None":
+    """`line` as the one line it and `last` make when it repeats `last`'s
+    status: its own time, holding since `last`'s first. None when it is a line
+    of its own."""
+    if line.get("type") not in _HELD_ENTRY_TYPES or last is None or not _same_line(last, line):
+        return None
+    return {**line, HELD_SINCE: last.get(HELD_SINCE) or last.get("ts")}
+
+
+def collapse_held_statuses(log: Iterable[dict]) -> list[dict]:
+    """`log` with each run of back-to-back repeats of a status as one line, as
+    `append_agent_log` writes them -- for lines written before it did: a day
+    file from earlier, or an agent thread still running the code it was
+    started with when the app's files were saved under it."""
+    lines: list[dict] = []
+    for entry in log:
+        held = _held_line(lines[-1] if lines else None, entry)
+        if held is not None:
+            lines[-1] = held
+        else:
+            lines.append(entry)
+    return lines
+
+
+def agent_log_text(entry: dict) -> str:
+    """A log entry's text as the log shows it: a status that has been said
+    again since (`append_agent_log`) ends with when it was first said -- in
+    the clock the card's own time is in, with the date when that is another
+    day."""
+    text = str(entry.get("text", ""))
+    since = entry.get(HELD_SINCE)
+    if not since:
+        return text
+    try:
+        start = datetime.fromisoformat(str(since))
+        end = datetime.fromisoformat(str(entry.get("ts", "")))
+        when = start.strftime("%H:%M:%S" if start.date() == end.date() else "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        when = str(since)
+    text = text.rstrip()
+    sep = " " if text.endswith((".", "!", "?")) else ". "
+    return f"{text}{sep}This status holds since {when}"
 
 
 def momentum_pct(state: "SymbolState", window_min: int = TACTICS_MOMENTUM_WINDOW_MIN) -> "float | None":

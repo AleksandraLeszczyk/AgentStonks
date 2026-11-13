@@ -131,6 +131,8 @@ from .options import (
     net_gamma_exposure,
 )
 from .performance import (
+    append_live_point,
+    thin_live_points,
     compute_equity_curve,
     compute_symbol_curves,
     decision_markers,
@@ -144,7 +146,9 @@ from .state import (
     PRICE_AXIS_ALERT_FIELDS,
     AppState,
     SymbolState,
+    agent_log_text,
     append_agent_log,
+    collapse_held_statuses,
     format_alert,
     format_tool_kv,
     momentum_pct,
@@ -2281,7 +2285,7 @@ def _agent_entry_body(entry: dict) -> str:
             f"<div style='margin-top:4px;color:{PALETTE['muted']}'>{reasoning}</div>"
         )
     if etype == "status":
-        return _long_text_html(entry.get("text", ""))
+        return _long_text_html(agent_log_text(entry))
     if etype in ("analysis", "error", "cycle_start", "news_alert"):
         return f"<div>{html.escape(entry.get('text', ''))}</div>"
     return ""
@@ -2613,7 +2617,7 @@ def _agent_log_panel() -> None:
         _orchestra_board(state)
     with state.lock:
         log = list(state.agent_log)
-    agent_log_view(_agent_log_html(log[-50:]), key="agent_log")
+    agent_log_view(_agent_log_html(collapse_held_statuses(log)[-50:]), key="agent_log")
 
 
 def _orchestra_board(state: AppState) -> None:
@@ -2710,21 +2714,25 @@ def _orchestra_board(state: AppState) -> None:
 def _record_live_equity_point(state: AppState) -> None:
     """Append a snapshot of the agent's current total value (all positions marked
     to their live prices), so the chart keeps advancing every poll instead of
-    waiting on a full bar to close (bars can lag a minute or more behind)."""
+    waiting on a full bar to close (bars can lag a minute or more behind).
+    Outside the session an unchanged value is not a new point
+    (`append_live_point`)."""
     value = state.mark_to_market()
     if value is None:
         return
     tracker = state.decision_tracker
     snap = tracker.snapshot() if tracker else {"cash": 0.0, "positions": {}}
+    now = clock.now()
+    point = {
+        "ts": pd.Timestamp(now).isoformat(),
+        "price": None,
+        "cash": snap["cash"],
+        "position": sum(snap["positions"].values()),
+        "value": value,
+    }
     with state.lock:
-        state.agent_equity_history.append(
-            {
-                "ts": pd.Timestamp(clock.now()).isoformat(),
-                "price": None,
-                "cash": snap["cash"],
-                "position": sum(snap["positions"].values()),
-                "value": value,
-            }
+        append_live_point(
+            state.agent_equity_history, point, market_hours.is_market_open
         )
         if len(state.agent_equity_history) > AGENT_EQUITY_HISTORY_MAXLEN:
             state.agent_equity_history = state.agent_equity_history[-AGENT_EQUITY_HISTORY_MAXLEN:]
@@ -2733,6 +2741,7 @@ def _record_live_equity_point(state: AppState) -> None:
 def _merge_live_history(state: AppState, points: list[dict], agent_start: datetime) -> list[dict]:
     with state.lock:
         history = [h for h in state.agent_equity_history if pd.Timestamp(h["ts"]) > pd.Timestamp(agent_start)]
+    history = thin_live_points(history, market_hours.is_market_open)
     return sorted(points + history, key=lambda p: p["ts"])
 
 
