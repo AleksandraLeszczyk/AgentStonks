@@ -910,19 +910,21 @@ def _chart_redraw_app():
 
     from agent_stonks import ui
 
-    st.session_state.setdefault("chart_runs", 0)
+    st.session_state.setdefault("chart_runs", {"AAPL": 0, "MU": 0})
 
     @st.fragment
-    def chart():
-        ui._remember_chart_fragment()
-        st.session_state.chart_runs += 1
+    def chart(symbol):
+        ui._remember_chart_fragment(symbol)
+        st.session_state.chart_runs[symbol] += 1
 
     @st.fragment
     def form():
         if st.button("edit", key="edit"):
             ui._redraw_live_chart()
 
-    chart()
+    # One chart per symbol, as the Live tab draws them.
+    chart("AAPL")
+    chart("MU")
     form()
 
 
@@ -933,13 +935,66 @@ def test_an_edit_in_a_rules_form_draws_the_live_chart_again():
 
     app = AppTest.from_function(_chart_redraw_app).run()
     assert not app.exception
-    assert app.session_state["chart_runs"] == 1
+    assert app.session_state["chart_runs"] == {"AAPL": 1, "MU": 1}
     app.run()
-    assert app.session_state["chart_runs"] == 2
+    assert app.session_state["chart_runs"] == {"AAPL": 2, "MU": 2}
     app.button(key="edit").click().run()
     assert not app.exception
-    # The click's own run, then the chart alone.
-    assert app.session_state["chart_runs"] == 4
+    # The click's own run, then every symbol's chart alone.
+    assert app.session_state["chart_runs"] == {"AAPL": 4, "MU": 4}
+
+
+def _live_layout_app():
+    from agent_stonks import ui
+    ui._live_panel()
+
+
+class TestLiveLayout:
+    """Each symbol's quote cards right above its own chart."""
+
+    def _setup(self, monkeypatch, symbols):
+        import streamlit as st
+
+        from agent_stonks import ui
+
+        state = AppState()
+        state.set_symbols(symbols)
+        monkeypatch.setattr(ui, "_get_state", lambda: state)
+        monkeypatch.setattr(ui, "_live_chart_controls", lambda: None)
+        # The two fragments as markers: the quote card is a component AppTest
+        # cannot mount, and the chart is its own tests' business.
+        monkeypatch.setattr(ui, "_price_ticker", lambda sym: st.markdown(f"quote {sym}"))
+        monkeypatch.setattr(ui, "_chart_panel", lambda sym: st.markdown(f"chart {sym}"))
+        return state
+
+    def test_every_quote_sits_on_its_own_chart(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        self._setup(monkeypatch, ["AAPL", "MU", "AMD"])
+        app = AppTest.from_function(_live_layout_app).run()
+        assert not app.exception
+        assert [m.value for m in app.markdown] == [
+            "quote AAPL", "chart AAPL", "quote MU", "chart MU", "quote AMD", "chart AMD",
+        ]
+
+    def test_new_symbols_lay_the_tab_out_again(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        state = self._setup(monkeypatch, ["AAPL"])
+        app = AppTest.from_function(_live_layout_app).run()
+        state.set_symbols(["MU", "AMD"])
+        app.run()
+        assert not app.exception
+        assert [m.value for m in app.markdown] == ["quote MU", "chart MU", "quote AMD", "chart AMD"]
+
+    def test_nothing_streamed_is_one_empty_chart(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        self._setup(monkeypatch, [])
+        app = AppTest.from_function(_live_layout_app).run()
+        assert not app.exception
+        assert not app.markdown
+        assert len(app.get("plotly_chart")) == 1
 
 
 def test_no_chart_drawn_yet_means_nothing_to_redraw(monkeypatch):

@@ -822,44 +822,49 @@ def _day_range_lines(symbol: str, daily_bars: list[dict], bars: list[dict]) -> "
 
 
 @st.fragment(run_every=POLL_SEC)
-def _price_ticker() -> None:
-    state = _get_state()
-    for sym_state in state.iter_symbol_states():
-        with sym_state.lock:
-            last_price = sym_state.last_price
-            prev_close = sym_state.prev_close
-            bid_price = sym_state.bid_price
-            bid_size = sym_state.bid_size
-            ask_price = sym_state.ask_price
-            ask_size = sym_state.ask_size
-            bars = list(sym_state.bars)
-        today_low, today_high, today_open = _today_range(sym_state.daily_bars, bars)
-        current_momentum = momentum_pct(sym_state)
-        daily_momentum = (
-            (last_price / today_open - 1.0) * 100.0
-            if last_price is not None and today_open
-            else None
-        )
-        day_lines = _day_lines_shown(sym_state.symbol)
-        quote = _quote_html(
-            last_price, prev_close, bid_price, bid_size, ask_price, ask_size,
-            sym_state.symbol,
-            today_low=today_low, today_high=today_high,
-            current_momentum=current_momentum, daily_momentum=daily_momentum,
-            net_gamma=_live_net_gamma(sym_state, last_price),
-            day_lines=day_lines,
-        )
-        if not quote:
-            continue
-        clicked = quote_card(quote, key=f"live_quote_{sym_state.symbol}")
-        if clicked in _DAY_LINE_KEYS:
-            st.session_state[_DAY_LINES_STATE_KEY] = {
-                **st.session_state.get(_DAY_LINES_STATE_KEY, {}),
-                sym_state.symbol: day_lines ^ {clicked},
-            }
-            # The chart fragment only polls every CHART_POLL_SEC; rerun the
-            # whole app so the line appears (or goes) straight away.
-            st.rerun(scope="app")
+def _price_ticker(symbol: str) -> None:
+    """`symbol`'s quote -- price, bid / ask, day range, momentum, net gamma --
+    drawn right above its chart (`_live_panel`)."""
+    sym_state = _get_state().sym(symbol)
+    if sym_state is None:
+        # Stopped and started on other symbols since the tab was laid out;
+        # `_live_symbols_watch` lays it out again.
+        return
+    with sym_state.lock:
+        last_price = sym_state.last_price
+        prev_close = sym_state.prev_close
+        bid_price = sym_state.bid_price
+        bid_size = sym_state.bid_size
+        ask_price = sym_state.ask_price
+        ask_size = sym_state.ask_size
+        bars = list(sym_state.bars)
+    today_low, today_high, today_open = _today_range(sym_state.daily_bars, bars)
+    current_momentum = momentum_pct(sym_state)
+    daily_momentum = (
+        (last_price / today_open - 1.0) * 100.0
+        if last_price is not None and today_open
+        else None
+    )
+    day_lines = _day_lines_shown(symbol)
+    quote = _quote_html(
+        last_price, prev_close, bid_price, bid_size, ask_price, ask_size,
+        symbol,
+        today_low=today_low, today_high=today_high,
+        current_momentum=current_momentum, daily_momentum=daily_momentum,
+        net_gamma=_live_net_gamma(sym_state, last_price),
+        day_lines=day_lines,
+    )
+    if not quote:
+        return
+    clicked = quote_card(quote, key=f"live_quote_{symbol}")
+    if clicked in _DAY_LINE_KEYS:
+        st.session_state[_DAY_LINES_STATE_KEY] = {
+            **st.session_state.get(_DAY_LINES_STATE_KEY, {}),
+            symbol: day_lines ^ {clicked},
+        }
+        # The chart fragment only polls every CHART_POLL_SEC; rerun the
+        # whole app so the line appears (or goes) straight away.
+        st.rerun(scope="app")
 
 
 # How far before the 09:30 open the live chart starts, unless pre-market is on.
@@ -889,8 +894,14 @@ def _chart_start(bars: list[dict], pre_market: bool) -> datetime:
     return start.tz_convert("UTC").to_pydatetime()
 
 
-# Where `_chart_panel` keeps its own fragment id, for `_redraw_live_chart`.
-_CHART_FRAGMENT_KEY = "_live_chart_fragment_id"
+# Where each symbol's `_chart_panel` keeps its own fragment id, for
+# `_redraw_live_chart`: {symbol: fragment id}.
+_CHART_FRAGMENT_KEY = "_live_chart_fragment_ids"
+
+
+def _chart_fragment_ids() -> "dict[str, str]":
+    ids = st.session_state.get(_CHART_FRAGMENT_KEY)
+    return dict(ids) if isinstance(ids, dict) else {}
 
 
 def _redraw_live_chart() -> None:
@@ -905,8 +916,8 @@ def _redraw_live_chart() -> None:
     fragment, so this goes through its runtime; anything unexpected there
     leaves the chart to its poll.
     """
-    fragment_id = st.session_state.get(_CHART_FRAGMENT_KEY)
-    if not fragment_id:
+    fragment_ids = list(_chart_fragment_ids().values())
+    if not fragment_ids:
         return
     try:
         from streamlit.runtime.scriptrunner import RerunData, get_script_run_ctx
@@ -914,147 +925,172 @@ def _redraw_live_chart() -> None:
         ctx = get_script_run_ctx()
         if ctx is None or ctx.script_requests is None:
             return
-        ctx.script_requests.request_rerun(RerunData(
-            query_string=ctx.query_string,
-            page_script_hash=ctx.page_script_hash,
-            fragment_id=fragment_id,
-            cached_message_hashes=ctx.cached_message_hashes,
-            context_info=ctx.context_info,
-        ))
+        # One chart per symbol, each its own fragment; Streamlit queues the
+        # requests one after the other.
+        for fragment_id in fragment_ids:
+            ctx.script_requests.request_rerun(RerunData(
+                query_string=ctx.query_string,
+                page_script_hash=ctx.page_script_hash,
+                fragment_id=fragment_id,
+                cached_message_hashes=ctx.cached_message_hashes,
+                context_info=ctx.context_info,
+            ))
     except Exception:
         logging.getLogger(__name__).debug("Queuing the live chart's redraw failed", exc_info=True)
 
 
-def _remember_chart_fragment() -> None:
-    """Keep the running fragment's id for `_redraw_live_chart`."""
+def _remember_chart_fragment(symbol: str) -> None:
+    """Keep the running fragment's id as `symbol`'s chart's, for
+    `_redraw_live_chart`."""
+    ids = _chart_fragment_ids()
     try:
         from streamlit.runtime.scriptrunner_utils.script_run_context import ThreadState
 
-        st.session_state[_CHART_FRAGMENT_KEY] = ThreadState.get().fragment_id
+        fragment_id = ThreadState.get().fragment_id
     except Exception:
-        st.session_state.pop(_CHART_FRAGMENT_KEY, None)
+        fragment_id = None
+    if fragment_id:
+        ids[symbol] = fragment_id
+    else:
+        ids.pop(symbol, None)
+    st.session_state[_CHART_FRAGMENT_KEY] = ids
+
+
+def _first_with_no_bars_anywhere(state: AppState, symbol: str) -> bool:
+    """Whether `symbol` is the first streamed symbol and no symbol has a bar
+    yet -- where the tab's one empty chart goes."""
+    states = list(state.iter_symbol_states())
+    if not states or states[0].symbol != symbol:
+        return False
+    for sym_state in states:
+        with sym_state.lock:
+            if sym_state.bars:
+                return False
+    return True
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
-def _chart_panel() -> None:
-    _remember_chart_fragment()
+def _chart_panel(symbol: str) -> None:
+    """`symbol`'s price chart, under its quote (`_live_panel`)."""
+    _remember_chart_fragment(symbol)
     state = _get_state()
     tracker = state.decision_tracker
-    rendered = False
-    for sym_state in state.iter_symbol_states():
-        sym = sym_state.symbol
-        with sym_state.lock:
-            bars = list(sym_state.bars)
-            # Only price-axis alerts (price/bid/ask/day high/low) can be drawn as
-            # horizontal lines; volume/spread/portfolio alerts have no price level.
-            price_alerts = [
-                a for a in sym_state.alerts if a.get("field") in PRICE_AXIS_ALERT_FIELDS
-            ]
+    sym_state = state.sym(symbol)
+    if sym_state is None:
+        return
+    sym = sym_state.symbol
+    with sym_state.lock:
+        bars = list(sym_state.bars)
+        # Only price-axis alerts (price/bid/ask/day high/low) can be drawn as
+        # horizontal lines; volume/spread/portfolio alerts have no price level.
+        price_alerts = [
+            a for a in sym_state.alerts if a.get("field") in PRICE_AXIS_ALERT_FIELDS
+        ]
 
-        if not bars:
-            continue
-        rendered = True
-        chart_start = _chart_start(bars, state.show_pre_market)
-        if pd.Timestamp(bars[-1]["t"]) <= pd.Timestamp(chart_start):
-            st.plotly_chart(
-                empty_chart(
-                    f"{sym}: pre-market — the chart starts at "
-                    f"{pd.Timestamp(chart_start).tz_convert(market_hours.MARKET_TZ):%H:%M} ET "
-                    "(Chart Settings → Pre-market shows it now)"
-                ),
-                width='stretch', key=f"live_chart_{sym}",
-            )
-            continue
+    if not bars:
+        if _first_with_no_bars_anywhere(state, sym):
+            # Nothing streamed yet: one empty chart for the tab, not one each.
+            st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
+        return
+    chart_start = _chart_start(bars, state.show_pre_market)
+    if pd.Timestamp(bars[-1]["t"]) <= pd.Timestamp(chart_start):
+        st.plotly_chart(
+            empty_chart(
+                f"{sym}: pre-market — the chart starts at "
+                f"{pd.Timestamp(chart_start).tz_convert(market_hours.MARKET_TZ):%H:%M} ET "
+                "(Chart Settings → Pre-market shows it now)"
+            ),
+            width='stretch', key=f"live_chart_{sym}",
+        )
+        return
 
-        # Price levels at which armed tactics (standing conditional orders) execute.
-        tactic_levels = tactic_price_levels(sym_state.tactics)
-        decisions = tracker.trade_markers(symbol=sym) if tracker else None
-        window_buy = getattr(state, "chart_window_buy", "")
-        view_from = _buy_time(decisions, chart_start, window_buy) if window_buy else None
+    # Price levels at which armed tactics (standing conditional orders) execute.
+    tactic_levels = tactic_price_levels(sym_state.tactics)
+    decisions = tracker.trade_markers(symbol=sym) if tracker else None
+    window_buy = getattr(state, "chart_window_buy", "")
+    view_from = _buy_time(decisions, chart_start, window_buy) if window_buy else None
 
-        predicted_profile = (
-            predicted_open_profile(sym_state, bars)
-            if state.show_predicted_profile
-            else None
+    predicted_profile = (
+        predicted_open_profile(sym_state, bars)
+        if state.show_predicted_profile
+        else None
+    )
+    overlays = model_overlays.live_overlays(
+        sym_state, bars, state.model_overlay_keys
+    )
+    option_walls = _live_option_walls(sym_state, state.option_walls)
+    prior_profile_levels = _live_prior_profile(sym_state, bars, state.prior_profile)
+    day_range_lines = _day_range_lines(sym, sym_state.daily_bars, bars)
+    net_gamma = (
+        _live_gamma_series(sym_state, bars, state.timeframe)
+        if state.show_net_gamma else None
+    )
+    # getattr: like window_minutes below.
+    aggressiveness_series = (
+        aggressiveness.series(
+            sym, state.timeframe, bars, state.api_key, state.api_secret,
         )
-        overlays = model_overlays.live_overlays(
-            sym_state, bars, state.model_overlay_keys
-        )
-        option_walls = _live_option_walls(sym_state, state.option_walls)
-        prior_profile_levels = _live_prior_profile(sym_state, bars, state.prior_profile)
-        day_range_lines = _day_range_lines(sym, sym_state.daily_bars, bars)
-        net_gamma = (
-            _live_gamma_series(sym_state, bars, state.timeframe)
-            if state.show_net_gamma else None
-        )
+        if getattr(state, "show_aggressiveness", False) else None
+    )
+
+    fig = build_chart(
+        bars,
+        sym_state.news,
+        sym_state.trades,
+        sym,
+        chart_start,
+        ma_periods=state.ma_periods,
+        show_fib=state.show_fib,
+        show_7d_avg=state.show_7d_avg,
+        show_28d_avg=state.show_28d_avg,
+        show_1y_avg=state.show_1y_avg,
+        mixture_distribution=state.mixture_distribution,
+        mixture_max_components=state.mixture_max_components,
+        predicted_profile=predicted_profile,
+        mixture_fit_target=state.mixture_fit_target,
+        daily_bars=sym_state.daily_bars,
+        vwap_style=state.vwap_style,
+        show_candle_body=state.show_candle_body,
+        show_percentile_body=state.show_percentile_body,
+        show_whiskers=state.show_whiskers,
+        decisions=decisions,
+        price_alerts=price_alerts,
+        tactic_levels=tactic_levels,
+        news_impacts=sym_state.news_impacts,
+        fill_gaps=state.fill_gaps,
+        model_overlays=overlays["items"],
+        candle_patterns=_live_candle_patterns(state, sym_state, bars),
+        show_momentum=state.show_momentum,
         # getattr: like window_minutes below.
-        aggressiveness_series = (
-            aggressiveness.series(
-                sym, state.timeframe, bars, state.api_key, state.api_secret,
+        show_momentum_change=getattr(state, "show_momentum_change", True),
+        minute_momentum_profile=sym_state.minute_momentum_profile,
+        minute_momentum_change_profile=sym_state.minute_momentum_change_profile,
+        **_agent_momentum_kwargs(state, sym_state),
+        volume_baseline=_volume_baseline(sym, bars, state),
+        option_walls=option_walls,
+        day_range_lines=day_range_lines,
+        net_gamma=net_gamma,
+        aggressiveness=aggressiveness_series,
+        prior_profile=prior_profile_levels,
+        # getattr: an AppState built before this setting existed and kept
+        # across a code save falls back to the old class's defaults,
+        # which don't have it.
+        window_minutes=getattr(state, "chart_window_min", 0),
+        view_from=view_from,
+    )
+    st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
+    if window_buy and view_from is None:
+        st.caption(f":material/info: {sym} — no buy yet today, so the whole session is shown.")
+    for note in overlays["notes"]:
+        st.caption(f":material/info: {sym} — {note}")
+    if not state.show_momentum:
+        for key in dict.fromkeys(
+            item["key"] for item in overlays["items"] if item.get("kind") == "series"
+        ):
+            st.caption(
+                f":material/info: {sym} — {model_overlays.label(key)}: the forecast line is "
+                "drawn on the momentum panel, which is hidden (Chart Settings → Panels → Momentum)."
             )
-            if getattr(state, "show_aggressiveness", False) else None
-        )
-
-        fig = build_chart(
-            bars,
-            sym_state.news,
-            sym_state.trades,
-            sym,
-            chart_start,
-            ma_periods=state.ma_periods,
-            show_fib=state.show_fib,
-            show_7d_avg=state.show_7d_avg,
-            show_28d_avg=state.show_28d_avg,
-            show_1y_avg=state.show_1y_avg,
-            mixture_distribution=state.mixture_distribution,
-            mixture_max_components=state.mixture_max_components,
-            predicted_profile=predicted_profile,
-            mixture_fit_target=state.mixture_fit_target,
-            daily_bars=sym_state.daily_bars,
-            vwap_style=state.vwap_style,
-            show_candle_body=state.show_candle_body,
-            show_percentile_body=state.show_percentile_body,
-            show_whiskers=state.show_whiskers,
-            decisions=decisions,
-            price_alerts=price_alerts,
-            tactic_levels=tactic_levels,
-            news_impacts=sym_state.news_impacts,
-            fill_gaps=state.fill_gaps,
-            model_overlays=overlays["items"],
-            candle_patterns=_live_candle_patterns(state, sym_state, bars),
-            show_momentum=state.show_momentum,
-            # getattr: like window_minutes below.
-            show_momentum_change=getattr(state, "show_momentum_change", True),
-            minute_momentum_profile=sym_state.minute_momentum_profile,
-            minute_momentum_change_profile=sym_state.minute_momentum_change_profile,
-            **_agent_momentum_kwargs(state, sym_state),
-            volume_baseline=_volume_baseline(sym, bars, state),
-            option_walls=option_walls,
-            day_range_lines=day_range_lines,
-            net_gamma=net_gamma,
-            aggressiveness=aggressiveness_series,
-            prior_profile=prior_profile_levels,
-            # getattr: an AppState built before this setting existed and kept
-            # across a code save falls back to the old class's defaults,
-            # which don't have it.
-            window_minutes=getattr(state, "chart_window_min", 0),
-            view_from=view_from,
-        )
-        st.plotly_chart(fig, width='stretch', key=f"live_chart_{sym}")
-        if window_buy and view_from is None:
-            st.caption(f":material/info: {sym} — no buy yet today, so the whole session is shown.")
-        for note in overlays["notes"]:
-            st.caption(f":material/info: {sym} — {note}")
-        if not state.show_momentum:
-            for key in dict.fromkeys(
-                item["key"] for item in overlays["items"] if item.get("kind") == "series"
-            ):
-                st.caption(
-                    f":material/info: {sym} — {model_overlays.label(key)}: the forecast line is "
-                    "drawn on the momentum panel, which is hidden (Chart Settings → Panels → Momentum)."
-                )
-    if not rendered:
-        st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
 
 
 # The look-back drawn over the momentum panels when the selected agent decides
@@ -1884,10 +1920,40 @@ def _news_panel(symbols: list[str]) -> None:
         st.info("Start the Live stream to load news for your symbols.")
 
 
+# The symbols `_live_panel` last laid out a quote and a chart for.
+_LIVE_SYMBOLS_KEY = "_live_panel_symbols"
+
+
+def _live_symbols() -> "list[str]":
+    return [sym_state.symbol for sym_state in _get_state().iter_symbol_states()]
+
+
 def _live_panel() -> None:
+    """The chart settings, then every symbol's quote right above its own
+    chart. Two fragments a symbol, since the quote polls every POLL_SEC and
+    the chart every CHART_POLL_SEC."""
     _live_chart_controls()
-    _price_ticker()
-    _chart_panel()
+    symbols = _live_symbols()
+    st.session_state[_LIVE_SYMBOLS_KEY] = symbols
+    st.session_state[_CHART_FRAGMENT_KEY] = {
+        sym: fid for sym, fid in _chart_fragment_ids().items() if sym in symbols
+    }
+    _live_symbols_watch()
+    if not symbols:
+        st.plotly_chart(empty_chart(), width='stretch', key="live_chart_empty")
+        return
+    for symbol in symbols:
+        _price_ticker(symbol)
+        _chart_panel(symbol)
+
+
+@st.fragment(run_every=POLL_SEC)
+def _live_symbols_watch() -> None:
+    """Lay the tab out again when the streamed symbols are no longer the ones
+    it has a quote and a chart for. A full run does that by itself; this is
+    for a change no full run follows. Draws nothing."""
+    if _live_symbols() != st.session_state.get(_LIVE_SYMBOLS_KEY):
+        st.rerun(scope="app")
 
 
 @st.fragment(run_every=CHART_POLL_SEC)
