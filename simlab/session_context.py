@@ -2,7 +2,8 @@
 open, and a pre-market briefing's bullish / neutral / bearish call.
 
 Read by the Tuning tab's "The pick, session by session" chart, so a day the
-pick lost money can be set against what the morning looked like. The cached
+pick lost money can be set against what the morning looked like -- read only:
+the Tuning tab never writes a briefing (`cached_biases`). The cached
 briefings are also the one input a replay takes from here: Orchestra's 09:34
 candidate selection reads them (`ReplaySources`), together with each symbol's
 earnings calendar, kept here too. A replay only ever reads a cached briefing
@@ -310,6 +311,27 @@ def briefing_coverage(
         if not briefing_path(symbol, day, provider, model).exists()
     ]
     return len(symbols) * len(days) - len(missing), missing
+
+
+def cached_biases(
+    symbol: str, days: list[str], prefer: Optional[tuple[str, str]] = None
+) -> tuple[Optional[tuple[str, str]], dict[str, dict]]:
+    """((provider, model), {day: briefing record}) from the cached briefings of
+    `symbol` that cover the most of `days` -- `prefer` first on a tie, then the
+    most-cached overall. Only reads: nothing is written and no LLM is called.
+    (None, {}) when none of the days has one."""
+    models = cached_briefing_models()
+    if prefer in models:
+        models = [prefer] + [pm for pm in models if pm != prefer]
+    best, best_records = None, {}
+    for provider, model in models:
+        records = {
+            day: record for day in days
+            if (record := cached_briefing(symbol, day, provider, model)) is not None
+        }
+        if len(records) > len(best_records):
+            best, best_records = (provider, model), records
+    return best, best_records
 
 
 def earnings_dates(symbol: str, fetch: Optional[Callable[[str], list]] = None) -> Optional[list[str]]:

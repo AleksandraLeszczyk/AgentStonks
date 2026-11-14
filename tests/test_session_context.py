@@ -143,6 +143,73 @@ class TestSessionBiases:
         assert sc.cached_briefing("AAPL", "2026-09-14", "anthropic", "m") == record
 
 
+class TestCachedBiases:
+    @staticmethod
+    def _keep(symbol, day, provider, model, bias):
+        path = sc.briefing_path(symbol, day, provider, model)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'{{"day": "{day}", "bias": "{bias}"}}')
+
+    def test_reads_the_model_covering_most_days_and_writes_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            sc, "generate_briefing", lambda *a, **k: pytest.fail("a briefing was written")
+        )
+        self._keep("AAPL", "2026-09-14", "gemini", "g", "bearish")
+        self._keep("AAPL", "2026-09-14", "openai", "o", "bullish")
+        self._keep("AAPL", "2026-09-15", "openai", "o", "neutral")
+        before = sorted(sc.BRIEFING_DIR.rglob("*.json"))
+        source, records = sc.cached_biases(
+            "AAPL", ["2026-09-14", "2026-09-15", "2026-09-16"], prefer=("gemini", "g")
+        )
+        assert source == ("openai", "o")
+        assert {d: r["bias"] for d, r in records.items()} == {
+            "2026-09-14": "bullish", "2026-09-15": "neutral",
+        }
+        assert sorted(sc.BRIEFING_DIR.rglob("*.json")) == before
+
+    def test_a_tie_goes_to_the_preferred_model(self):
+        self._keep("AAPL", "2026-09-14", "gemini", "g", "bearish")
+        self._keep("AAPL", "2026-09-14", "openai", "o", "bullish")
+        assert sc.cached_biases("AAPL", ["2026-09-14"], prefer=("gemini", "g"))[0] == (
+            "gemini", "g"
+        )
+
+    def test_nothing_cached_is_no_source(self):
+        assert sc.cached_biases("AAPL", ["2026-09-14"]) == (None, {})
+
+
+class TestTuningContextWritesNoBriefing:
+    def test_the_tuning_tab_reads_cached_briefings_only(self, monkeypatch):
+        from simlab import app as sim_app
+
+        monkeypatch.setattr(
+            sim_app.sim_session, "session_biases",
+            lambda *a, **k: pytest.fail("the Tuning tab wrote a briefing"),
+        )
+        monkeypatch.setattr(
+            sim_app.sim_session, "generate_briefing",
+            lambda *a, **k: pytest.fail("the Tuning tab wrote a briefing"),
+        )
+        monkeypatch.setattr(sim_app.sim_session, "vix_opens", lambda days: {})
+        monkeypatch.setattr(
+            sim_app.sim_session, "briefing_provider", lambda: ("openai", "o", "key")
+        )
+        TestCachedBiases._keep("AAPL", "2026-09-14", "openai", "o", "bearish")
+        cell = {"overrides": {}, "profit": 1.0,
+                "daily": {"2026-09-14": 1.0, "2026-09-15": 0.0}}
+        job = {
+            "spec": {"base": {"ticker": "AAPL"}, "datasets": [{"name": "wk", "feed": "sip"}]},
+            "cells": {"wk": [cell]},
+            "best": cell,
+        }
+        monkeypatch.setattr(sim_app.sim_tuning, "is_scored", lambda c: bool(c))
+        monkeypatch.setattr(sim_app, "_tuning_shown_cell", lambda job, name, chosen: cell)
+        context = sim_app._tuning_session_context(job, chosen={})
+        assert context["provider"] == "openai · o"
+        assert context["biases"]["2026-09-14"]["bias"] == "bearish"
+        assert context["missing"] == ["2026-09-15"]
+
+
 class TestSessionChart:
     def test_each_session_label_carries_its_bias_and_vix(self, monkeypatch):
         from simlab import app as sim_app

@@ -6,7 +6,6 @@ only reads the local dataset store and replays agents against it.
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import math
@@ -5788,45 +5787,24 @@ def _tuning_session_context(job: dict, chosen: "dict | None" = None) -> dict:
     """The VIX open and the pre-market bias of every session the selected
     configuration (`chosen`) was scored on.
 
-    Briefings are LLM calls, made once per session and cached on disk
-    (`session_context`); a day that failed is remembered for this browser
-    session so a rerun does not ask again, and "Retry" clears that.
+    The biases are only read from the briefings already cached
+    (`session_context`), from the provider/model that covers the most of these
+    sessions; the Tuning tab never writes one -- a briefing is an LLM call. A
+    session without a cached briefing shows "no bias".
     """
     symbol = job["spec"]["base"]["ticker"]
-    by_feed = _tuning_shown_days(job, chosen)
-    days = sorted({d for ds in by_feed.values() for d in ds})
-    context = {"vix": sim_session.vix_opens(days), "biases": {}, "errors": {}, "provider": None}
+    days = sorted({d for ds in _tuning_shown_days(job, chosen).values() for d in ds})
+    # On a tie, the briefings this tab used to write: the env's provider.
     briefer = sim_session.briefing_provider()
-    if briefer is None:
-        return context
-    provider, model, api_key = briefer
-    context["provider"] = f"{provider} · {model}"
-    failed = st.session_state.setdefault("tune_briefing_failed", {})
-    wanted = {
-        feed: [d for d in ds if (symbol, d, provider, model) not in failed]
-        for feed, ds in by_feed.items()
-    }
-    uncached = sum(
-        1 for ds in wanted.values() for d in ds
-        if sim_session.cached_briefing(symbol, d, provider, model) is None
+    source, biases = sim_session.cached_biases(
+        symbol, days, prefer=briefer[:2] if briefer else None
     )
-    with st.spinner(
-        f"Writing {uncached} pre-market briefing{'s' if uncached != 1 else ''} "
-        f"({provider} · {model})…",
-        show_time=True,
-    ) if uncached else contextlib.nullcontext():
-        biases, errors = sim_session.session_biases(
-            symbol, wanted, provider, model, api_key,
-            os.getenv("ALPACA_API_KEY", ""), os.getenv("ALPACA_SECRET", ""),
-        )
-    for day, error in errors.items():
-        failed[(symbol, day, provider, model)] = error
-    context["biases"] = biases
-    context["errors"] = {
-        day: error for (sym, day, prov, mod), error in failed.items()
-        if sym == symbol and prov == provider and mod == model and day in days
+    return {
+        "vix": sim_session.vix_opens(days),
+        "biases": biases,
+        "provider": f"{source[0]} · {source[1]}" if source else None,
+        "missing": [d for d in days if d not in biases],
     }
-    return context
 
 
 @st.cache_data(show_spinner="Forecasting each session's day range…")
@@ -6172,23 +6150,18 @@ def _render_tuning_session_context(
 ) -> None:
     """Under the chart: where the labels come from, and each morning's briefing,
     beside the selected configuration's (`chosen`'s) profit that day."""
-    if context["provider"] is None:
-        st.caption(
-            ":material/info: No LLM key in the environment (GEMINI_API_KEY, OPENAI_API_KEY "
-            "or ANTHROPIC_API_KEY), so the sessions carry no pre-market bias."
-        )
-    if context["errors"]:
-        first_day = min(context["errors"])
-        col_msg, col_retry = st.columns([5, 1], vertical_alignment="center")
-        col_msg.warning(
-            f"No pre-market briefing for {len(context['errors'])} session(s) — "
-            f"{first_day}: {context['errors'][first_day]}"
-        )
-        if col_retry.button("Retry", key=f"tune_briefing_retry_{job['job_id']}"):
-            st.session_state["tune_briefing_failed"] = {}
-            st.rerun()
     if not context["biases"]:
+        st.caption(
+            ":material/info: No cached pre-market briefing for these sessions, so they "
+            "carry no bias. The Tuning tab only reads briefings, it never writes them."
+        )
         return
+    if context["missing"]:
+        st.caption(
+            f":material/info: {len(context['missing'])} session(s) have no cached "
+            f"{context['provider']} briefing and show no bias — the Tuning tab only reads "
+            "briefings, it never writes them."
+        )
     profit = {}
     for name in sim_tuning.dataset_names(job["spec"]):
         cell = _tuning_shown_cell(job, name, chosen)
@@ -6212,9 +6185,10 @@ def _render_tuning_session_context(
             "Written as of 09:25 ET each session from what was known then — the daily "
             "closes and SPY/VIX/VIX3M closes before that day, the week's news up to "
             "09:25, and the earnings schedule; no fundamentals, analyst targets or "
-            "alternative data, which have no point-in-time history. One LLM call per "
-            "session, cached: the first answer is the one kept. VIX open is ^VIX's "
-            "opening print that day."
+            "alternative data, which have no point-in-time history. Read from the cache "
+            "(`data/simlab/session_context/briefings/`), never written here: the first "
+            "answer cached for a session is the one kept. VIX open is ^VIX's opening "
+            "print that day."
         )
         st.dataframe(pd.DataFrame(rows), hide_index=True, column_config={
             "day": "Session",
