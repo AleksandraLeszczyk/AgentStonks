@@ -1890,7 +1890,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
         "dayrange": (
             "Two knobs, and they are the whole strategy.\n\n"
             "- At 9:35 the model forecasts where today's high **H** will land.\n"
-            "- The buy rests `buy × unit` below it, the sell `sell × unit` below it.\n"
+            "- The buy rests `buy × unit` below it; the sell, first of the Exits, "
+            "`sell × unit` below it or a distance above the fill.\n"
             "- Each distinct pair is its own configuration in Results — sweeping them is "
             "the intended use.\n"
             "- The defaults are each model and instrument's Tuning-tab pick: in sample, "
@@ -2110,27 +2111,30 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "Where the exit rests below the same predicted high.\n\n"
             "- **{sell_k}** on {ticker} for this model, from the same tuning job.\n"
             "- The smaller of the two numbers, since it is the higher price.\n"
-            "- A day that never reaches it is held to the closing flatten.\n"
-            "- Greyed out while the sell rests above the fill instead."
+            "- A day that never reaches it is held to the closing flatten."
         ),
-        "sell_above_fill": (
-            "Rest the sell a fixed distance above the fill instead of under the "
-            "predicted high.\n\n"
-            "- Signs as `sell=E+0.5A` rather than `sell=H-0.15A`.\n"
-            "- Above the average cost after a buy again lower.\n"
-            "- The stop's share of the predicted gain becomes a share of this distance.\n"
-            "- Sweep it on the Tuning tab as \"Sell above the fill\": its 0 is the sell "
-            "under H, so one axis compares the two."
+        "sell_mode": (
+            "Where the sell rests; the box beside it says how far.\n\n"
+            "- **Below H** — `sell × unit` under the predicted high, in the buy's unit "
+            "(`sell=H-0.15R`).\n"
+            "- **Above the fill** — a fixed distance above the fill (the average cost "
+            "after an add), in the predicted range (`sell=E+0.5R`) or in ADRs "
+            "(`sell=E+0.5A`), whichever the buy is counted in.\n"
+            "- The stop's share of the predicted gain becomes a share of this distance, "
+            "in its unit.\n"
+            "- Sweep it on the Tuning tab as \"Sell above the fill\", in the unit picked "
+            "here: its 0 is the sell under H, so one axis compares the two."
         ),
         "sell_gain_k": (
-            "How far above the fill the sell rests, in the levels' unit.\n\n"
-            "- Opens on **{sell_gain_k}**, the gap between {ticker}'s two levels: the "
-            "same target for a fill at the buy level.\n"
+            "How far above the fill the sell rests, in the unit the list names.\n\n"
+            "- Opens on **{sell_gain_k}**, the gap between {ticker}'s two levels: in "
+            "the buy's unit, the same target for a fill at the buy level.\n"
             "- Under the predicted range, the unit at the first fill.\n"
             "- Drawn this far above the buy level before a fill."
         ),
         "level_unit": (
-            "The yardstick `buy` and `sell` are counted in.\n\n"
+            "The yardstick `buy` and `sell` are counted in (a sell above the fill can "
+            "name its own).\n\n"
             "- **ADR** — this symbol's trailing 14-day average daily range.\n"
             "- **Predicted range** — `predicted high − predicted low` from the forecast itself.\n"
             "- Sweep it as a pair with the two distances: a k is a different number of "
@@ -2222,7 +2226,7 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- **At or above the sell level**, sell unless momentum is still positive "
             "— then hold on while the price keeps rising. The breach exit likewise.\n"
             "- **Below the sell level**, in profit or at a loss (`+loss`; in profit "
-            "only before 2026-10-06): sell the *Take on negative momentum* share while "
+            "only before 2026-10-06): sell the *Momentum fade: take* share while "
             "momentum is negative and its change neutral or negative (still dropping, "
             "or dropping faster).\n"
             "- Never gates the stop loss, the runner's breakeven or the closing "
@@ -2238,8 +2242,8 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "forming-zone exit needs no momentum read and stays on."
         ),
         "zone_min_bars": (
-            "The forming-zone exit: the last *Zone length* bars all closed inside a band "
-            "*Zone band* × the day's typical minute move wide (the week before's mean "
+            "The forming-zone exit: the last *length* bars all closed inside a band of "
+            "*band* × the day's typical minute move wide (the week before's mean "
             "|1-minute move|), and the zone reached that length after the last buy. "
             "Sells the momentum fade's share, after its wait.\n\n"
             "- The same zone Results' **Stall-zone levels** pattern boxes grey; 20 is its "
@@ -4733,17 +4737,12 @@ def _render_tuning_form() -> None:
     st.markdown("**Best options**")
     st.caption(
         "Read off the sum of every dataset's heatmap: the combinations with the best "
-        "total profit, Sharpe ratio and win rate, among those that trade often enough."
+        "total profit, Sharpe ratio and win rate."
     )
-    col_share, col_cash = st.columns(2)
-    min_share = col_share.slider(
-        "Must trade on at least", 0, 100,
-        min(100, max(0, round(100 * float(filled.get("min_traded_share", 0.5))))),
-        step=5, format="%d%% of days",
-        key=f"tune_min_traded{suffix}",
-        help="Counted over every session of every dataset. A deep entry that filled on "
-        "one lucky day cannot be a best option.",
-    ) / 100.0
+    # No minimum share of days traded since 2026-11-14 (the user's ask; it
+    # was a "Must trade on at least" slider): a new job stores 0, and an older
+    # one keeps the share it was saved with (`bests`).
+    col_cash, _ = st.columns(2)
     starting_cash = col_cash.number_input(
         "Starting cash", value=float(filled.get("starting_cash") or 100_000.0), step=10_000.0,
         key=f"tune_cash{suffix}",
@@ -4772,7 +4771,7 @@ def _render_tuning_form() -> None:
         "axes": axes,
         "datasets": [_tuning_dataset_spec(d) for d in picked],
         "starting_cash": float(starting_cash),
-        "min_traded_share": float(min_share),
+        "min_traded_share": 0.0,
         "reuse_runs": bool(reuse_runs),
         "workers": int(workers),
     }
@@ -6675,12 +6674,13 @@ def _render_tuning_results(jobs: list[dict]) -> None:
     if job.get("merged"):
         st.caption(_tuning_merged_note(job))
 
+    # Only a job saved before the minimum went (2026-11-14) can carry one.
     share = float(spec.get("min_traded_share") or 0)
     st.caption(
         "Best options read off "
         + (f"the sum of {len(names)} datasets" if len(names) > 1 else "the grid")
-        + f", among combinations trading on at least {share:.0%} of days "
-        f"· starting cash \\${float(spec['starting_cash']):,.0f} per dataset."
+        + (f", among combinations trading on at least {share:.0%} of days" if share else "")
+        + f" · starting cash \\${float(spec['starting_cash']):,.0f} per dataset."
     )
     if job["status"] not in (sim_tuning.RUNNING, sim_tuning.DERIVED):
         _render_tuning_dataset_controls(job)

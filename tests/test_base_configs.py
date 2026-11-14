@@ -16,11 +16,13 @@ from agent_stonks.apple_trader import AppleTraderConfig
 
 def _base(**changes) -> AppleTraderConfig:
     """A HighLow AAPL configuration unlike the shipped one in the levels, the
-    stop, the breaker, a shared knob and a field the form has no knob for."""
+    stop, the breaker, a shared knob and a field the form has no knob for --
+    and without the ladder, which the form writes off since 2026-11-14."""
     config = AppleTraderConfig(ticker="AAPL", model_key="highlow")
     return replace(config, **{
         "buy_k": 0.85, "sell_k": 0.15, "stop_gain_fraction": 0.7, "min_win_k": 0.05,
-        "momentum_confirmation_bars": 7, "limit_entry": False, **changes,
+        "momentum_confirmation_bars": 7, "limit_entry": False, "scale_in": False,
+        **changes,
     })
 
 
@@ -185,7 +187,17 @@ class TestForm:
         assert app.number_input(key="t_buy_k_highlow_AAPL").value == pytest.approx(
             at.dayrange_levels("AAPL", "highlow")[0]
         )
-        assert app.session_state["out"] == AppleTraderConfig(ticker="AAPL", model_key="highlow")
+        # The shipped ladder is on; the form has had no box for it since
+        # 2026-11-14 and writes it off.
+        assert app.session_state["out"] == AppleTraderConfig(
+            ticker="AAPL", model_key="highlow", scale_in=False
+        )
+
+    def test_enter_has_the_buy_and_no_ladder(self, form):
+        app = self._pick_highlow(form)
+        assert not [c for c in app.checkbox if "scale_in" in c.key]
+        assert not [n for n in app.number_input if "buy_step_k" in n.key]
+        assert "Enter" in [m.value.strip("*") for m in app.markdown]
 
     def test_the_conditional_extension_brings_its_two_numbers(self, form):
         """Only under "conditional", the one policy that reads them."""
@@ -221,36 +233,55 @@ class TestForm:
         assert not app.exception
         assert app.session_state["out"] == _base()
 
-    def test_the_sell_above_the_fill_opens_on_the_gap_between_the_levels(self, form):
-        """Off, its distance waits greyed out at the pair's buy − sell, so
-        ticking the box keeps the target of a fill at the buy level; the sell
-        under H is greyed out instead, and comes back as it was."""
+    def test_the_sell_list_and_its_one_distance(self, form):
+        """Three choices and one distance (2026-11-14): under H opens on the
+        pair's sell; above the fill on the gap between the two levels, in the
+        predicted range (the levels' own unit, written as "") or in ADRs."""
         app = self._pick_highlow(form)
         buy, sell = at.dayrange_levels("AAPL", "highlow")
-        gain = app.number_input(key="t_sell_gain_k_highlow_AAPL")
-        assert gain.disabled and gain.value == pytest.approx(round(buy - sell, 2))
+        mode = app.selectbox(key="t_sell_mode_highlow_AAPL")
+        assert mode.value == "below_h"
+        assert list(mode.options) == [
+            "Sell (× Predicted Range below H)",
+            "Sell (× Predicted Range above the fill)",
+            "Sell (× ADR above the fill)",
+        ]
+        assert app.number_input(key="t_sell_k_highlow_AAPL").value == pytest.approx(sell)
         assert app.session_state["out"].sell_gain_k == 0.0
 
-        app.checkbox(key="t_sell_above_fill_highlow_AAPL").check().run()
+        mode.select("pred_range").run()
         assert not app.exception
-        assert app.number_input(key="t_sell_k_highlow_AAPL").disabled
+        assert not [n for n in app.number_input if n.key == "t_sell_k_highlow_AAPL"]
         out = app.session_state["out"]
-        assert out.sell_gain_k == pytest.approx(round(buy - sell, 2))
-        assert out.target_gain_k == pytest.approx(round(buy - sell, 2))
+        assert (out.sell_gain_k, out.sell_gain_unit) == (pytest.approx(round(buy - sell, 2)), "")
+        assert out.sell_k == pytest.approx(sell)
 
-        app.number_input(key="t_sell_gain_k_highlow_AAPL").set_value(0.5).run()
-        assert app.session_state["out"].sell_gain_k == pytest.approx(0.5)
-        app.checkbox(key="t_sell_above_fill_highlow_AAPL").uncheck().run()
+        app.selectbox(key="t_sell_mode_highlow_AAPL").select("adr").run()
+        app.number_input(key="t_sell_gain_k_adr_highlow_AAPL").set_value(0.5).run()
         out = app.session_state["out"]
-        assert (out.sell_gain_k, out.sell_k) == (0.0, pytest.approx(sell))
+        assert (out.sell_gain_k, out.sell_gain_unit, out.sell_unit) == (0.5, "adr", "adr")
+        assert "sell=E+0.5A" in at.config_signature(out)
 
-    def test_a_base_selling_above_the_fill_opens_ticked(self, form):
+        app.selectbox(key="t_sell_mode_highlow_AAPL").select("below_h").run()
+        out = app.session_state["out"]
+        assert (out.sell_gain_k, out.sell_gain_unit, out.sell_k) == (0.0, "", pytest.approx(sell))
+
+    def test_a_base_selling_above_the_fill_opens_on_it(self, form):
         base_configs.set_base(asdict(_base(sell_gain_k=0.4)))
         app = self._pick_highlow(form)
         suffix = base_configs.key_suffix("highlow", "AAPL")
-        assert app.checkbox(key=f"t_sell_above_fill_highlow_AAPL{suffix}").value
-        assert app.number_input(key=f"t_sell_gain_k_highlow_AAPL{suffix}").value == 0.4
+        assert app.selectbox(key=f"t_sell_mode_highlow_AAPL{suffix}").value == "pred_range"
+        assert app.number_input(
+            key=f"t_sell_gain_k_pred_range_highlow_AAPL{suffix}"
+        ).value == 0.4
         assert app.session_state["out"] == _base(sell_gain_k=0.4)
+
+    def test_a_base_selling_adrs_above_the_fill_opens_on_it(self, form):
+        base_configs.set_base(asdict(_base(sell_gain_k=0.3, sell_gain_unit="adr")))
+        app = self._pick_highlow(form)
+        suffix = base_configs.key_suffix("highlow", "AAPL")
+        assert app.selectbox(key=f"t_sell_mode_highlow_AAPL{suffix}").value == "adr"
+        assert app.session_state["out"] == _base(sell_gain_k=0.3, sell_gain_unit="adr")
 
     def test_other_pairs_keep_the_form_as_it_was(self, form):
         base_configs.set_base(asdict(_base()))

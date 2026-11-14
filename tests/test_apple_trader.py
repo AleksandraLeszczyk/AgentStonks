@@ -790,6 +790,80 @@ class TestSellAboveTheFill:
         )
 
 
+class TestSellInItsOwnUnit:
+    """The sell above the fill in ADRs beside levels in the predicted range
+    (`sell_gain_unit`, 2026-11-14, the form's "Sell (× ADR above the fill)").
+
+    Range $15, ADR $10: buy 0.5 × the range = $102.50; sell 0.4 ADR = $4.00
+    over the fill -- $106.50 while flat, $107.00 once filled at $103 -- and the
+    half-the-gain stop $2.00 under it. In the levels' unit the sell would be
+    $6.00 over and the stop $3.00 under.
+    """
+
+    def _config(self, **kwargs):
+        kwargs = {
+            "level_unit": UNIT_PRED_RANGE, "buy_k": 0.5, "sell_gain_k": 0.4,
+            "sell_gain_unit": UNIT_ADR, "stop_gain_fraction": 0.5, **kwargs,
+        }
+        return dayrange_config(**kwargs)
+
+    def test_a_unit_equal_to_the_levels_or_a_sell_under_h_is_written_empty(self):
+        """So everything that could already be written signs as it did."""
+        assert self._config().sell_gain_unit == UNIT_ADR
+        assert self._config().sell_unit == UNIT_ADR
+        assert self._config(sell_gain_unit=UNIT_PRED_RANGE).sell_gain_unit == ""
+        assert self._config(sell_gain_k=0.0).sell_gain_unit == ""
+        assert config_signature(self._config(sell_gain_unit=UNIT_PRED_RANGE)) == (
+            config_signature(self._config(sell_gain_unit=""))
+        )
+        with pytest.raises(ValueError, match="sell_gain_unit"):
+            self._config(sell_gain_unit="points")
+
+    def test_it_signs_and_reads_in_its_own_unit(self):
+        config = self._config()
+        signed = config_signature(config)
+        assert "buy=H-0.5R,sell=E+0.4A," in signed
+        rows = {name: value for _, name, value in at.config_settings(config)}
+        assert rows["Sell distance"] == "0.4 × ADR above the fill"
+        assert "(= 0.2 × ADR)" in rows["Stop loss"]
+        assert at.sell_phrase(config) == "0.4 × ADR above the fill"
+
+    def test_the_sell_and_the_stop_are_counted_in_adrs(self, state, market_open, monkeypatch):
+        broker = FakeBroker(103.0)
+        tracker, tape = DecisionTracker(starting_cash=10_000.0, broker=broker), Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(self._config())
+        state.apple_trader_config = trader.config
+        tape.append(108.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.plan["buy_level"] == pytest.approx(BUY_LEVEL)
+        assert trader.plan["sell_level"] == pytest.approx(BUY_LEVEL + 4.0)
+
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert trader.plan["sell_level"] == pytest.approx(107.0)
+        assert trader._stop_price() == pytest.approx(101.0)
+        assert trader.memory()["entry"]["gain_unit"] == pytest.approx(10.0)
+        entry = tracker.snapshot()["decisions"][-1].reasoning
+        assert "a resting sell 0.4 × ADR above the fill ($4.00)" in entry
+
+    def test_a_sidebar_switch_of_unit_freezes_the_new_one(self, state, market_open, monkeypatch):
+        broker = FakeBroker(103.0)
+        tracker, tape = DecisionTracker(starting_cash=10_000.0, broker=broker), Tape(monkeypatch, broker)
+        trader = at.DayRangeTrader(self._config())
+        state.apple_trader_config = trader.config
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        state.apple_trader_config = self._config(sell_gain_unit=UNIT_PRED_RANGE)
+        tape.append(104.0)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert trader.config.sell_unit == UNIT_PRED_RANGE
+        assert trader.plan["sell_level"] == pytest.approx(103.0 + 0.4 * 15.0)
+        changed = [e["text"] for e in state.agent_log if "from the sidebar" in e.get("text", "")]
+        assert (
+            "sell 0.4 × ADR above the fill → 0.4 × predicted range above the fill" in changed[-1]
+        )
+
+
 class TestDayRangeMomentumTake:
     """Banking gains short of the target once momentum has been negative for long enough.
 

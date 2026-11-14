@@ -129,7 +129,9 @@ def params(
     caller gives them keys of their own (`copy.prefix`).
     """
     start = template if template is not None else AppleTraderConfig()
-    ticker = instrument_row(start, symbols, copy)
+    # The instrument and the model in one row (the user's ask, 2026-11-14).
+    instrument_col, model_col = st.columns(2, vertical_alignment="bottom")
+    ticker = instrument_row(start, symbols, copy, instrument_col)
     keys = apple_models.keys_for(ticker)
     default_key = start.model_key if start.model_key in keys else keys[0]
     # Scoped to the instrument: the models on offer change with it, and a
@@ -138,7 +140,7 @@ def params(
     model_widget = f"{copy.prefix}_model_{ticker}"
     shown = st.session_state.get(model_widget, default_key)
     model_key = str(
-        st.selectbox(
+        model_col.selectbox(
             "Model",
             keys,
             index=keys.index(default_key),
@@ -412,18 +414,20 @@ def momentum_params(
 
 
 def instrument_row(
-    defaults: AppleTraderConfig, symbols: "list[str] | None", copy: FormCopy
+    defaults: AppleTraderConfig, symbols: "list[str] | None", copy: FormCopy,
+    column=None,
 ) -> str:
     """The symbol this run trades, out of the ones a model exists for.
 
     Not a free-text field: the model *is* the strategy, so the list is exactly
-    `apple_models.tickers()`.
+    `apple_models.tickers()`. `column` is where it is drawn -- beside the
+    model since 2026-11-14 -- the page by default.
     """
     options = apple_models.tickers()
     available = {str(s).strip().upper() for s in (symbols or [])}
     current = st.session_state.get(copy.key("ticker")) or defaults.ticker
     ticker = str(
-        st.selectbox(
+        (column or st).selectbox(
             "Instrument",
             options,
             index=options.index(current) if current in options else 0,
@@ -523,12 +527,12 @@ def config_changes(new: AppleTraderConfig, old: AppleTraderConfig, word: str) ->
 def as_form_writes(config: AppleTraderConfig) -> AppleTraderConfig:
     """`config` as `exit_params` writes it back: both takes under "either",
     a zone "momentum" never read at 0, and no stand-down after a take under the
-    buy level."""
+    buy level -- and, from `dayrange_params` since 2026-11-14, no ladder."""
     zone = int(config.zone_min_bars) if config.take_trigger != TAKE_MOMENTUM else 0
     try:
         return replace(
             config, take_trigger=TAKE_EITHER, zone_min_bars=zone,
-            take_under_buy_stands_down=False,
+            take_under_buy_stands_down=False, scale_in=False,
         )
     except ValueError:
         # A legacy momentum take beside a zone: no form writes it, so as it is.
@@ -552,31 +556,33 @@ def dayrange_params(
     defaults: AppleTraderConfig, model_key: str, ticker: str, copy: FormCopy,
     seed: "AppleTraderConfig | None" = None,
 ) -> AppleTraderConfig:
-    """The day-range rules: two resting levels below the predicted high.
+    """The day-range rules: a resting buy below the predicted high under
+    **Enter**, and the sell at the top of the **Exits** (`sell_params`) --
+    the layout since 2026-11-14 (the user's ask), when the section was still
+    "Levels" and held both distances, the sell-above-the-fill box and the
+    ladder ("Buy again lower while cash allows", no box since: written off).
 
-    Both start from the model and instrument's own tuned pair, and the widget
-    keys carry both so that switching either re-seeds them with that pair
-    rather than carrying the last one's numbers across. So does the stop, which
-    was tuned with them.
-
-    The sell can instead rest a distance above the fill (`sell_gain_k`): a box
-    and its distance under the two, the sell under H greyed out while it is
-    ticked -- and the other way round, so either comes back where it was.
-    Off a pair whose defaults sell under H, the distance opens on the gap
-    between its two levels: the same target, for a fill at the buy level.
+    Both distances start from the model and instrument's own tuned pair, and
+    the widget keys carry both so that switching either re-seeds them with
+    that pair rather than carrying the last one's numbers across. So does the
+    stop, which was tuned with them.
     """
-    section("Levels", copy.sections.get("dayrange"))
+    section("Enter", copy.sections.get("dayrange"))
     default_buy, default_sell = float(defaults.buy_k), float(defaults.sell_k)
     default_gain = float(defaults.sell_gain_k) or round(default_buy - default_sell, 2)
     levels = dict(
         ticker=ticker, buy_k=f"{default_buy:g}", sell_k=f"{default_sell:g}",
         sell_gain_k=f"{default_gain:g}",
     )
-    # Before the two distances, because it decides what they are counted in and
+    # Before the buy distance, because it decides what it is counted in and
     # a label that named the wrong unit would be worse than no label at all.
-    level_unit = level_unit_param(defaults, copy)
+    # The unit beside the confirmation period (the user's ask, 2026-11-14),
+    # bottom-aligned as their labels wrap differently.
+    unit_col, confirm_col = st.columns(2, vertical_alignment="bottom")
+    level_unit = level_unit_param(defaults, copy, unit_col)
     unit_label = UNIT_FORM_LABELS[level_unit]
-    start_buy, start_sell, start_gain = default_buy, default_sell, float(defaults.sell_gain_k)
+    start_buy, start_sell = default_buy, default_sell
+    start_gain, start_unit = float(defaults.sell_gain_k), defaults.sell_unit
     same_pair = (
         seed is not None
         and (seed.ticker or "").upper() == ticker
@@ -586,63 +592,44 @@ def dayrange_params(
         start_buy, start_sell = float(seed.buy_k), float(seed.sell_k)
         # By name: a run started before a code save carries the class as it was.
         start_gain = float(getattr(seed, "sell_gain_k", 0.0))
+        start_unit = getattr(seed, "sell_gain_unit", "") or seed.level_unit
     # A share of the gap between the levels, so it does not depend on the unit.
     stop_seed = float(seed.stop_gain_fraction) if same_pair else None
-    # Read before the sell under H renders, which it greys out.
-    above_key = copy.key(f"sell_above_fill_{model_key}_{ticker}")
-    above = bool(st.session_state.get(above_key, start_gain > 0))
-    col_a, col_b = st.columns(2)
+    col_a, col_b = st.columns(2, vertical_alignment="bottom")
     buy_k = col_a.number_input(
         f"Buy distance (× {unit_label} below H)",
         min_value=0.05, max_value=3.0, value=start_buy, step=0.05, format="%.2f",
         key=copy.key(f"buy_k_{model_key}_{ticker}"),
         help=copy.help.get("buy_k", "").format(**levels),
     )
-    sell_k = col_b.number_input(
-        f"Sell distance (× {unit_label} below H)",
-        min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
-        key=copy.key(f"sell_k_{model_key}_{ticker}"),
-        help=copy.help.get("sell_k", "").format(**levels),
-        disabled=above,
-    )
-    col_a, col_b = st.columns(2)
-    above = col_a.checkbox(
-        "Sell above the fill instead",
-        value=start_gain > 0,
-        key=above_key,
-        help=copy.help.get("sell_above_fill", "").format(**levels) or None,
-    )
-    sell_gain_k = col_b.number_input(
-        f"Sell distance (× {unit_label} above the fill)",
-        min_value=0.05, max_value=3.0, value=min(3.0, max(0.05, start_gain or default_gain)),
-        step=0.05, format="%.2f",
-        key=copy.key(f"sell_gain_k_{model_key}_{ticker}"),
-        help=copy.help.get("sell_gain_k", "").format(**levels) or None,
-        disabled=not above,
-    )
-    col_a, col_b = st.columns(2)
-    sizing = position_params(defaults, unit_label, copy, col_a, col_b)
-    # Above the fill the sell under H is not read, so not repaired either:
-    # the config keeps it valid itself.
-    sell_k = float(sell_k) if above else repaired_sell(float(buy_k), float(sell_k))
-    sell_gain_k = float(sell_gain_k) if above else 0.0
-    gain = sell_gain_k or float(buy_k) - sell_k
+    sizing = position_params(defaults, unit_label, copy, col_b, confirm_col, ladder=False)
+
+    def sell():
+        return sell_params(
+            model_key, ticker, copy, level_unit, float(buy_k),
+            start_sell, start_gain, start_unit, default_gain, levels,
+        )
+
     rules = rule_params(
-        defaults, gain, unit_label, copy,
+        defaults, float(buy_k) - start_sell, unit_label, copy,
         take_on=bool(sizing["momentum_confirmation_bars"]),
         stop_scope=f"{model_key}_{ticker}", stop_seed=stop_seed, breach_scope=ticker,
+        sell=sell,
     )
-    min_win_k = min_win_param(
-        ticker, gain, unit_label, copy, float(defaults.min_win_k)
+    sell_gain_k = float(rules["sell_gain_k"])
+    gain = sell_gain_k or float(buy_k) - float(rules["sell_k"])
+    # The breaker is in the levels' unit; a gain counted in another cannot be
+    # set beside it.
+    same_unit = not sell_gain_k or rules["sell_gain_unit"] in ("", level_unit)
+    min_win_k, until_revised = min_win_param(
+        ticker, gain if same_unit else None, unit_label, copy, float(defaults.min_win_k),
+        config=defaults, rules=rules,
     )
-    until_revised = breaker_until_param(defaults, copy, rules)
     return replace(
         defaults,
         model_key=model_key,
         ticker=ticker,
         buy_k=float(buy_k),
-        sell_k=sell_k,
-        sell_gain_k=sell_gain_k,
         level_unit=level_unit,
         min_win_k=min_win_k,
         breaker_until_revised=until_revised,
@@ -651,40 +638,118 @@ def dayrange_params(
     )
 
 
+#: The sell under the predicted high, in `sell_params`' list; the other two
+#: entries are the unit of the sell above the fill (`sell_gain_unit`).
+SELL_BELOW_H = "below_h"
+SELL_MODES = (SELL_BELOW_H, UNIT_PRED_RANGE, UNIT_ADR)
+
+
+def sell_mode_label(mode: str, level_unit: str) -> str:
+    """One entry of the sell list: "Sell (× Predicted Range below H)" -- in
+    the levels' own unit, the one the buy is counted in -- or "Sell (× ADR
+    above the fill)"."""
+    if mode == SELL_BELOW_H:
+        return f"Sell (× {UNIT_FORM_LABELS[level_unit]} below H)"
+    return f"Sell (× {UNIT_FORM_LABELS[mode]} above the fill)"
+
+
+def sell_params(
+    model_key: str, ticker: str, copy: FormCopy, level_unit: str, buy_k: float,
+    start_sell: float, start_gain: float, start_unit: str, default_gain: float,
+    levels: dict,
+) -> "tuple[dict, float, str]":
+    """The sell, first of the Exits: a list of where it rests -- under the
+    predicted high, or above the fill in the predicted range or in ADRs -- and
+    the one distance (2026-11-14, in place of two distances and a box).
+
+    Returns the config fields (`sell_k`, `sell_gain_k`, `sell_gain_unit`),
+    what a target exit pays in its own unit, and that unit's label -- which
+    the stop's `?` reads.
+
+    Each choice's distance has a widget of its own, keyed by the choice, so
+    switching opens on that choice's number: the sell under H on the pair's
+    (or the running agent's) `sell_k`, the sell above the fill on its
+    `sell_gain_k` in that unit, else on the gap between the two levels. The
+    sell under H is kept while another is picked (the config wants a valid
+    pair), from the widget's last value or the start.
+    """
+    # The list and its distance in one row (the user's ask, 2026-11-14), the
+    # list wider: its entries are long, the distance is a short number.
+    col_a, col_b = st.columns([3, 2], vertical_alignment="bottom")
+    start_mode = start_unit if start_gain > 0 else SELL_BELOW_H
+    mode = col_a.selectbox(
+        "Sell level",
+        SELL_MODES,
+        index=SELL_MODES.index(start_mode),
+        format_func=lambda m: sell_mode_label(m, level_unit),
+        key=copy.key(f"sell_mode_{model_key}_{ticker}"),
+        help=copy.help.get("sell_mode", "").format(**levels) or None,
+    )
+    sell_key = copy.key(f"sell_k_{model_key}_{ticker}")
+    if mode == SELL_BELOW_H:
+        distance = col_b.number_input(
+            "Sell distance",
+            min_value=0.0, max_value=3.0, value=start_sell, step=0.05, format="%.2f",
+            key=sell_key,
+            help=copy.help.get("sell_k", "").format(**levels) or None,
+        )
+        sell_k = repaired_sell(buy_k, float(distance))
+        fields = {"sell_k": sell_k, "sell_gain_k": 0.0, "sell_gain_unit": ""}
+        return fields, buy_k - sell_k, UNIT_FORM_LABELS[level_unit]
+    opens_on = start_gain if start_gain > 0 and start_unit == mode else default_gain
+    distance = float(col_b.number_input(
+        "Sell distance",
+        min_value=0.05, max_value=3.0, value=min(3.0, max(0.05, opens_on)),
+        step=0.05, format="%.2f",
+        key=copy.key(f"sell_gain_k_{mode}_{model_key}_{ticker}"),
+        help=copy.help.get("sell_gain_k", "").format(**levels) or None,
+    ))
+    # Not read above the fill, so not repaired either: the config keeps it
+    # valid itself.
+    sell_k = float(st.session_state.get(sell_key, start_sell))
+    fields = {"sell_k": sell_k, "sell_gain_k": distance, "sell_gain_unit": mode}
+    return fields, distance, UNIT_FORM_LABELS[mode]
+
+
 def position_params(
     defaults: AppleTraderConfig, unit_label: str, copy: FormCopy, col_a, col_b,
-    confirmation: bool = True,
+    confirmation: bool = True, ladder: bool = True,
 ) -> dict:
     """How much is bought and when a buy waits for momentum: the size, the
     ladder and the confirmation period. Shared by every instrument (and every
-    racer), so none of it is keyed by ticker. `col_a` and `col_b` are the two
-    columns the levels sit in, which the size and the period continue.
+    racer), so none of it is keyed by ticker. `col_a` takes the size and
+    `col_b` the period.
     Without `confirmation` the period is left out: Orchestra sets one per pair
-    (`orchestra_params`)."""
+    (`orchestra_params`). Without `ladder` there is no "Buy again lower" box
+    and the ladder is written off, its step kept as the defaults had it --
+    Apple Trader's form since 2026-11-14 (the user's ask); Orchestra keeps it."""
     position_pct = col_a.number_input(
         "Position size (% of cash)",
         min_value=1.0, max_value=100.0, value=defaults.position_pct, step=5.0,
         key=copy.key("dayrange_size"),
         help=copy.help.get("position_pct"),
     )
-    # Disabled rather than hidden at 100%: the setting is still what the run
-    # would do with spare cash, there just is none -- and the config ignores it
-    # there too (`can_scale_in`), so the two cannot disagree.
-    scale_in = st.checkbox(
-        "Buy again lower while cash allows",
-        value=defaults.scale_in,
-        key=copy.key("dayrange_scale_in"),
-        disabled=float(position_pct) >= 100,
-        help=copy.help.get("scale_in"),
-    )
-    buy_step_k = st.number_input(
-        f"Next buy step (× {unit_label} lower per buy, 0 = half-way to the bottom)",
-        min_value=0.0, max_value=1.0, value=float(defaults.buy_step_k), step=0.05,
-        format="%.2f",
-        key=copy.key("dayrange_buy_step_k"),
-        disabled=not scale_in or float(position_pct) >= 100,
-        help=copy.help.get("buy_step_k"),
-    )
+    if ladder:
+        # Disabled rather than hidden at 100%: the setting is still what the run
+        # would do with spare cash, there just is none -- and the config ignores it
+        # there too (`can_scale_in`), so the two cannot disagree.
+        scale_in = st.checkbox(
+            "Buy again lower while cash allows",
+            value=defaults.scale_in,
+            key=copy.key("dayrange_scale_in"),
+            disabled=float(position_pct) >= 100,
+            help=copy.help.get("scale_in"),
+        )
+        buy_step_k = st.number_input(
+            f"Next buy step (× {unit_label} lower per buy, 0 = half-way to the bottom)",
+            min_value=0.0, max_value=1.0, value=float(defaults.buy_step_k), step=0.05,
+            format="%.2f",
+            key=copy.key("dayrange_buy_step_k"),
+            disabled=not scale_in or float(position_pct) >= 100,
+            help=copy.help.get("buy_step_k"),
+        )
+    else:
+        scale_in, buy_step_k = False, defaults.buy_step_k
     sizing = {
         "position_pct": float(position_pct),
         "scale_in": bool(scale_in),
@@ -725,6 +790,7 @@ def rule_params(
     defaults: AppleTraderConfig, gain: float, unit_label: str,
     copy: FormCopy, take_on: bool, stop_scope: str = "",
     stop_seed: "float | None" = None, breach_scope: str = "", stop: bool = True,
+    sell=None,
 ) -> dict:
     """The forecast-breach rules and the managed exit: shared by every
     instrument, but for the stop -- see `exit_params` for `stop_scope`,
@@ -732,13 +798,14 @@ def rule_params(
     `breach_scope`).
     `gain` -- what a target exit pays, in level units (`target_gain_k`) --
     only feeds the stop's `?`, which says what the stop fraction comes to
-    against it."""
+    against it -- unless `sell` draws the sell at the top of the Exits
+    (`exit_params`), which then says what the gain is."""
     breach_update = breach_param(defaults, copy, scope=breach_scope)
     held = held_params(defaults, breach_update, copy)
     contain_range, breach_exit = containment_params(defaults, breach_update, copy)
     exits = exit_params(
         defaults, gain, unit_label, copy, take_on=take_on,
-        stop_scope=stop_scope, stop_seed=stop_seed, stop=stop,
+        stop_scope=stop_scope, stop_seed=stop_seed, stop=stop, sell=sell,
     )
     skip_events = skip_param(defaults, copy)
     return {
@@ -786,10 +853,14 @@ def down_gamma_param(defaults: AppleTraderConfig, copy: FormCopy) -> bool:
 
 
 def min_win_param(
-    ticker: str, gain: float, unit_label: str, copy: FormCopy,
+    ticker: str, gain: "float | None", unit_label: str, copy: FormCopy,
     default: "float | None" = None,
-) -> float:
-    """The session circuit breaker, and the one thing worth checking it against.
+    config: "AppleTraderConfig | None" = None, rules: "dict | None" = None,
+) -> "tuple[float, bool]":
+    """The session circuit breaker, and the one thing worth checking it against
+    -- with what it holds the entries for (`breaker_until_param`, from
+    `config` and `rules`), whose box sits beside its own since 2026-11-14
+    (the user's ask). Returns `min_win_k` and `breaker_until_revised`.
 
     The most a target exit can net is `gain` level units a share
     (`target_gain_k`: `buy_k - sell_k`, or the sell above the fill), so a
@@ -810,31 +881,37 @@ def min_win_param(
     (`breaker_opens_on` reads an old 0 as the box off).
     """
     section("Circuit breaker", copy.sections.get("dayrange_breaker"))
+    weak_col, until_col = st.columns(2)
     default = min_win_for(ticker) if default is None else float(default)
     min_win_k = min_win_inputs(
         copy, unit_label, default, min_win_for(ticker), scope=f"_{ticker}", ticker=ticker,
+        box_column=weak_col,
     )
-    if min_win_k and min_win_k >= gain:
+    # None: the gain is counted in another unit (a sell in ADRs above the
+    # fill beside levels in the predicted range), so there is no comparing.
+    if gain is not None and min_win_k and min_win_k >= gain:
         st.warning(
             f"At or above the {gain:.2f} a target exit pays, every trade stands "
             f"the session down — one trade a day. Set it below {gain:.2f} to stop "
             "only after weak trades.",
             icon=":material/warning:",
         )
-    return min_win_k
+    until = breaker_until_param(config or AppleTraderConfig(), copy, rules or {}, until_col)
+    return min_win_k, until
 
 
 def min_win_inputs(
     copy: FormCopy, unit_label: str, default: float, fallback: float,
-    scope: str = "", ticker: str = "",
+    scope: str = "", ticker: str = "", box_column=None,
 ) -> float:
     """The weak-trade breaker's box and threshold, as the `min_win_k` they
     set: 0 while the box is unticked. `scope` ends both widget keys -- a
     single run's are per ticker, Orchestra's one setting has none. `fallback`
     is what the threshold opens on in place of a 0 (`breaker_opens_on`).
-    `ticker` fills the threshold's `?`."""
+    `ticker` fills the threshold's `?`. `box_column` takes the box (the
+    threshold stays full width, under it), beside `breaker_until_param`'s."""
     number_key = copy.key(f"min_win_k{scope}")
-    on = st.checkbox(
+    on = (box_column or st).checkbox(
         "Stand down after a weak trade",
         value=breaker_opens_on(number_key, default, fallback),
         key=copy.key(f"min_win_on{scope}"),
@@ -852,22 +929,26 @@ def min_win_inputs(
     return float(min_win_k) if on else 0.0
 
 
-def breaker_until_param(defaults: AppleTraderConfig, copy: FormCopy, rules: dict) -> bool:
+def breaker_until_param(
+    defaults: AppleTraderConfig, copy: FormCopy, rules: dict, column=None,
+) -> bool:
     """What a circuit breaker -- a weak trade, or a take at or under the buy
     level -- holds the entries for: the rest of the session, or only until
     the session trades through a predicted boundary and the forecast is
     revised (`breaker_until_revised`). One rule for every instrument, and for
     every racer, so not keyed by ticker. `rules` is the breach rules the form
     holds: with the forecast held all day nothing revises it, which the
-    caption says."""
-    until = st.checkbox(
+    caption says. `column` takes the box and the caption -- beside the
+    weak-trade box since 2026-11-14."""
+    place = column or st
+    until = place.checkbox(
         "Only until the forecast is revised (the session trades outside it)",
         value=bool(defaults.breaker_until_revised),
         key=copy.key("breaker_until_revised"),
         help=copy.help.get("breaker_until_revised"),
     )
     if until and rules.get("breach_update") == BREACH_OFF and not rules.get("contain_range"):
-        st.caption(
+        place.caption(
             "With the 9:35 forecast held all day and nothing containing it, it is never "
             "revised: a breaker still holds for the rest of the session."
         )
@@ -897,7 +978,7 @@ UNIT_FORM_LABELS = {
 }
 
 
-def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
+def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy, column=None) -> str:
     """What one k is worth: the ADR, or the model's own predicted range.
 
     Not keyed by ticker, unlike the levels and the reference: it is a statement
@@ -912,8 +993,12 @@ def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
     which is a real change to what a position is playing for and is not
     something the swept pairs were chosen under.
     """
+    # In a `column` (half a sidebar, beside the confirmation period since
+    # 2026-11-14) the short names: the long ones do not fit, and its `?` says
+    # what each is.
+    labels = LEVEL_UNIT_LABELS if column is None else UNIT_FORM_LABELS
     choice = str(
-        st.selectbox(
+        (column or st).selectbox(
             "Distances counted in",
             LEVEL_UNITS,
             index=(
@@ -921,7 +1006,7 @@ def level_unit_param(defaults: AppleTraderConfig, copy: FormCopy) -> str:
                 if defaults.level_unit in LEVEL_UNITS
                 else 0
             ),
-            format_func=lambda key: LEVEL_UNIT_LABELS[key],
+            format_func=lambda key: labels[key],
             key=copy.key("level_unit"),
             help=copy.help.get("level_unit"),
         )
@@ -1027,9 +1112,18 @@ def exit_params(
     stop_scope: str = "",
     stop_seed: "float | None" = None,
     stop: bool = True,
+    sell=None,
 ) -> dict:
-    """The managed exit as three exits, each under its own small heading and
-    each switched off by a 0 in its first box -- as the config fields they set.
+    """The managed exit as four exits under the one "Exits" heading, each
+    switched off by a 0 in its first box -- as the config fields they set.
+
+    `sell` (Apple Trader's single-pair form, since 2026-11-14) draws the sell
+    level above them (`sell_params`) and returns its fields, the gain and the
+    gain's unit label, which replace `gain` and `unit_label`.
+
+    Each box carries its exit's name ("Stop loss: below the fill …") rather
+    than sitting under a small heading of its own: two levels, not three (the
+    user's ask, 2026-11-14).
 
     - **Stop loss** -- a share of the predicted gain under the fill.
     - **Momentum fade** -- the take: its share of the position, sold once the
@@ -1039,6 +1133,7 @@ def exit_params(
     - **Sell at forming zone** -- a stall zone forming after the last fill,
       its length and band. It sells the momentum fade's share after its
       wait (the user's choice, 2026-10-27), so a share of 0 turns it off too.
+    - **Time limit** -- `time_limit_param`.
 
     Both takes are on at once, whichever fires first (`take_trigger`
     "either", written whatever the defaults carried). The share of 0 and the
@@ -1067,9 +1162,11 @@ def exit_params(
     the *fraction* travels between symbols and the distance does not.
     """
     section("Exits", copy.sections.get("dayrange_exits"))
+    sold = {}
+    if sell is not None:
+        sold, gain, unit_label = sell()
     stopped = {}
     if stop:
-        exit_heading("Stop loss")
         col_a, _ = st.columns(2)
         stop_key = copy.key(
             f"stop_gain_fraction_{stop_scope}" if stop_scope else "stop_gain_fraction"
@@ -1077,7 +1174,7 @@ def exit_params(
         start_stop = defaults.stop_gain_fraction if stop_seed is None else stop_seed
         shown = float(st.session_state.get(stop_key, start_stop))
         stopped["stop_gain_fraction"] = float(col_a.number_input(
-            "Below the fill (× the predicted gain)",
+            "Stop loss: below the fill (× the predicted gain)",
             min_value=0.0, max_value=3.0, value=start_stop, step=0.05,
             format="%.2f",
             key=stop_key,
@@ -1097,10 +1194,11 @@ def exit_params(
     zone_seed = int(defaults.zone_min_bars) if defaults.take_trigger != TAKE_MOMENTUM else 0
     zone_shown = int(st.session_state.get(zone_key, zone_seed))
 
-    exit_heading("Momentum fade")
-    col_a, col_b = st.columns(2)
+    # Bottom-aligned: with the exit's name in every label, the two labels of a
+    # row wrap to different heights in a narrow sidebar.
+    col_a, col_b = st.columns(2, vertical_alignment="bottom")
     take_pct = col_a.number_input(
-        "Take on negative momentum (% of shares)",
+        "Momentum fade: take (% of shares)",
         min_value=0.0, max_value=100.0, value=defaults.take_fraction * 100, step=5.0,
         key=copy.key("take_pct"),
         help=copy.help.get("take_fraction", "").format(
@@ -1110,24 +1208,23 @@ def exit_params(
     selling = float(take_pct) > 0
     zone_on = selling and zone_shown > 0
     take_after_minutes = col_b.number_input(
-        "Take only after time (min)",
+        "Momentum fade: take only after (min)",
         min_value=0, max_value=390, value=int(defaults.take_after_minutes), step=1,
         key=copy.key("take_after_minutes"),
         help=copy.help.get("take_after_minutes"),
         disabled=not (selling and (take_on or zone_on)),
     )
 
-    exit_heading("Sell at forming zone")
-    col_a, col_b = st.columns(2)
+    col_a, col_b = st.columns(2, vertical_alignment="bottom")
     zone_min_bars = col_a.number_input(
-        "Zone length (bars)",
+        "Sell at forming zone: length (bars)",
         min_value=0, max_value=120, value=zone_seed, step=1,
         key=zone_key,
         help=copy.help.get("zone_min_bars"),
         disabled=not selling,
     )
     zone_width = col_b.number_input(
-        "Zone band (× minute move)",
+        "Sell at forming zone: band (× minute move)",
         min_value=0.5, max_value=10.0, value=float(defaults.zone_width), step=0.5,
         format="%.1f",
         key=copy.key("zone_width"),
@@ -1135,14 +1232,15 @@ def exit_params(
         disabled=not zone_on,
     )
     if zone_min_bars == 1:
-        col_a.warning(
+        # Under the row, not in its column: the row is bottom-aligned.
+        st.warning(
             "A zone is at least 2 bars long — 1 reads as 0, the zone off.",
             icon=":material/warning:",
         )
-    exit_heading("Time limit")
     col_a, _ = st.columns(2)
     time_limit = time_limit_param(defaults, copy, col_a)
     return {
+        **sold,
         **stopped,
         "time_limit_minutes": time_limit,
         "take_trigger": TAKE_EITHER,
@@ -1158,19 +1256,14 @@ def time_limit_param(defaults: AppleTraderConfig, copy: FormCopy, column) -> int
     """The time limit (`time_limit_minutes`): minutes after the first buy from
     which a position that has not reached its sell level -- or GoodMoments'
     take -- is sold on the first bar above its fill. 0 is off. One box for
-    every rule set that reads it, and in Orchestra for every pair."""
+    every rule set that reads it, and in Orchestra for every pair. Named
+    "Time limit: …" wherever it sits, as the day-range exits name theirs."""
     return int(column.number_input(
-        "Sell in profit after (min, 0 = off)",
+        "Time limit: sell in profit after (min, 0 = off)",
         min_value=0, max_value=390, value=int(defaults.time_limit_minutes), step=5,
         key=copy.key("time_limit_minutes"),
         help=copy.help.get("time_limit_minutes"),
     ))
-
-
-def exit_heading(title: str) -> None:
-    """One exit's name under the "Exits" heading, smaller than a section's:
-    what each exit does is on its boxes' `?` and the heading's."""
-    st.caption(f"**{title}**")
 
 
 def stop_note(stop_gain_fraction: float, gain: float, unit_label: str) -> str:
@@ -1409,11 +1502,14 @@ def orchestra_params(
             stop=False,
         )
         section("Circuit breaker", copy.sections.get("dayrange_breaker"))
+        # The two boxes side by side, as on Apple Trader's form.
+        weak_col, until_col = st.columns(2)
         # One threshold for every pair (the user's call, 2026-10-26; it was
         # set per pair, beside the levels), opening on the shipped one rather
         # than on any one pair's base.
         min_win_k = min_win_inputs(
             copy, unit_label, APPLE_TRADER_MIN_WIN_K, APPLE_TRADER_MIN_WIN_K,
+            box_column=weak_col,
         )
         weak = [
             racer_label(key) for key in ranged
@@ -1426,7 +1522,7 @@ def orchestra_params(
                 "one trade a day.",
                 icon=":material/warning:",
             )
-        until_revised = breaker_until_param(defaults, copy, rules)
+        until_revised = breaker_until_param(defaults, copy, rules, until_col)
     else:
         # GoodMoments pairs alone: what every pair shares is the size, the
         # time limit, the days off and the negative-gamma rule

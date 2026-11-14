@@ -1386,7 +1386,8 @@ class TestFillForm:
         # The dataset no longer stored is named and left out.
         assert app.multiselect(key="tune_datasets_AAPL_from1").value == ["w1"]
         assert any("`gone`" in c.value for c in app.caption)
-        assert app.slider(key="tune_min_traded_from1").value == 20
+        # No minimum share of days traded on the form since 2026-11-14.
+        assert not [w for w in app.slider if w.key.startswith("tune_min_traded")]
         assert app.number_input(key="tune_cash_from1").value == pytest.approx(50_000.0)
         assert app.checkbox(key="tune_reuse_runs_from1").value is False
         assert app.number_input(key="tune_workers_from1").value == 1

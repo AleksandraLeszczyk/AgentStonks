@@ -3502,13 +3502,13 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
     ),
     sections={
         "dayrange": (
-            "At 9:35 the model forecasts where today's high **H** will land, and two "
-            "levels are set below it.\n\n"
-            "- **Buy** — rests well under H, so it fills on a dip.\n"
-            "- **Sell** — rests just beneath H.\n"
-            "- **Unit** — both distances are counted in the trailing 14-day ADR (they "
-            "scale with how wide recent sessions were) or in the forecast's own "
-            "predicted range (they scale with how wide the model thinks *today* will be)."
+            "At 9:35 the model forecasts where today's high **H** will land, and the buy "
+            "rests well under it, so it fills on a dip.\n\n"
+            "- **Unit** — the buy distance is counted in the trailing 14-day ADR (it "
+            "scales with how wide recent sessions were) or in the forecast's own "
+            "predicted range (it scales with how wide the model thinks *today* will be).\n"
+            "- **Sell** — the first of the Exits below: just beneath H, or a distance "
+            "above the fill."
         ),
         "dayrange_breach": (
             "**H** is a forecast, and the day can trade straight through it.\n\n"
@@ -3859,31 +3859,33 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "Where the exit rests, below the same predicted high.\n\n"
             "- {ticker} starts at **{sell_k}** on this model, from the same sweep.\n"
             "- It must be the smaller of the two numbers — the higher price.\n"
-            "- A day that never reaches it is held to the closing flatten.\n"
-            "- Greyed out while the sell rests above the fill instead."
+            "- A day that never reaches it is held to the closing flatten."
         ),
-        "sell_above_fill": (
-            "Rest the sell a fixed distance above the price actually paid, instead of "
-            "under the predicted high.\n\n"
-            "- The target is then the same for every trade, however deep the fill — "
-            "under the predicted high it is whatever the gap to H happens to be.\n"
-            "- After a buy again lower it sits above the average cost, so it moves "
-            "down with each add.\n"
-            "- The stop, a share of the predicted gain, becomes a share of this distance.\n"
-            "- A breach of the forecast moves the buy level, not this sell.\n"
-            "- Never swept on {ticker}: compare it on SimLab's Tuning tab first."
+        "sell_mode": (
+            "Where the sell rests; the box beside it says how far.\n\n"
+            "- **Below H** — under the same predicted high as the buy, in the buy's unit.\n"
+            "- **Above the fill** — a fixed distance above the price actually paid, so "
+            "the target is the same for every trade however deep the fill. Counted in the "
+            "predicted range or in ADRs, whichever the buy is counted in — in ADRs it does "
+            "not depend on how wide the model calls the day.\n"
+            "- Above the fill a breach of the forecast moves the buy level, not the sell.\n"
+            "- The stop, a share of the predicted gain, is a share of this distance, in "
+            "its unit.\n"
+            "- Above the fill was never swept on {ticker}: compare it on SimLab's Tuning "
+            "tab first."
         ),
         "sell_gain_k": (
-            "How far above the fill the sell rests, in the same unit as the buy.\n\n"
-            "- With the box ticked it replaces the sell distance under H.\n"
-            "- It opens on **{sell_gain_k}**, the gap between {ticker}'s two levels, so "
-            "a fill at the buy level has the same target either way.\n"
+            "How far above the fill the sell rests, in the unit the list names.\n\n"
+            "- It opens on **{sell_gain_k}**, the gap between {ticker}'s two levels — in "
+            "the buy's unit, the same target as the sell under H for a fill at the buy "
+            "level.\n"
             "- Under the predicted range the unit is the one at the first fill: a "
             "breach widening the range later does not move it.\n"
             "- Before a fill the chart draws it this far above the buy level."
         ),
         "level_unit": (
-            "What one unit of `buy` and `sell` is worth in dollars.\n\n"
+            "What one unit of the buy distance — and of the sell, unless it names its "
+            "own — is worth in dollars.\n\n"
             "- **ADR** — this symbol's trailing 14-day average daily range. Fixed for "
             "the session, and no part of the model's output.\n"
             "- **Predicted range** — `predicted high − predicted low` from the same "
