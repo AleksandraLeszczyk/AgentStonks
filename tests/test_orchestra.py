@@ -2397,6 +2397,33 @@ class TestTimeLimitIsShared:
         assert ",time=" not in off
 
 
+class TestSpyFallRuleIsShared:
+    """One SPY rule for every pair (2026-11-18), GoodMoments pairs too."""
+
+    def test_every_pair_gets_it(self):
+        base = replace(at.AppleTraderConfig(), no_buy_spy_fall_k=3.0)
+        race = ar.build_orchestra_config(["MU:highlow", "AAPL:goodmoments"], base)
+        assert {r.no_buy_spy_fall_k for r in race.racers} == {3.0}
+
+    def test_signed_once_with_the_shared_rules(self):
+        base = replace(at.AppleTraderConfig(), no_buy_spy_fall_k=3.0)
+        for pairs in (["MU:highlow", "AAPL:goodmoments"], ["AAPL:goodmoments"]):
+            sig = ar.orchestra_signature(ar.build_orchestra_config(pairs, base))
+            assert sig.count(",nobuy=spy<-3xusual") == 1
+
+    def test_the_form_number_reaches_every_pair(self):
+        from streamlit.testing.v1 import AppTest
+
+        for pairs in (["AAPL:highlow", "AMD:goodmoments"], ["AAPL:goodmoments", "AMD:goodmoments"]):
+            app = AppTest.from_function(_orchestra_form, default_timeout=30)
+            app.session_state["o_pairs"] = pairs
+            app.run()
+            [number] = [n for n in app.number_input if n.label == at.SPY_FALL_LABEL]
+            number.set_value(3.0).run()
+            assert not app.exception, app.exception
+            assert {r.no_buy_spy_fall_k for r in app.session_state["out"].racers} == {3.0}
+
+
 class TestDownGammaRuleIsShared:
     """One negative-gamma rule for every pair (2026-11-05), GoodMoments pairs too."""
 

@@ -983,3 +983,29 @@ class TestDownNegativeGamma:
         sig = config_signature(gm_config(no_buy_down_negative_gamma=True))
         assert sig.index(",nobuy=day<0&gamma<0") > sig.index(",size=")
         assert "nobuy" not in config_signature(gm_config())
+
+
+class TestSpyFall:
+    """GoodMoments reads the SPY rule too: an edge at the entry while SPY is
+    falling more than usual buys nothing."""
+
+    def test_refused_while_spy_falls_and_said_once(self, monkeypatch, state):
+        move = at.market_fall.SpyMove(35, 600.0, 594.0, -1.0, 0.25)
+        monkeypatch.setattr(at.market_fall, "read", lambda *a, **k: self.move)
+        self.move = move
+        trader, tracker, tape = _setup(monkeypatch, state, no_buy_spy_fall_k=3)
+        tape.append(100.0)
+        assert cycle(trader, state, tracker) == "hold"
+        for _ in range(2):
+            tape.append(100.0, edge=ENTER)
+            assert cycle(trader, state, tracker) == "hold"
+        refused = [e for e in state.agent_log if "it usually moves" in (e.get("text") or "")]
+        assert len(refused) == 1                      # once per stretch
+        self.move = at.market_fall.SpyMove(36, 600.0, 599.0, -0.17, 0.25)
+        tape.append(100.0, edge=ENTER)
+        assert cycle(trader, state, tracker) == "bought"
+
+    def test_signed_after_the_size(self):
+        sig = config_signature(gm_config(no_buy_spy_fall_k=3))
+        assert sig.index(",nobuy=spy<-3xusual") > sig.index(",size=")
+        assert "spy" not in config_signature(gm_config())

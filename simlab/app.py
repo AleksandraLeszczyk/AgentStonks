@@ -2289,6 +2289,16 @@ _APPLE_TRADER_COPY_FIELDS = dict(
             "- In the signature as `nobuy=day<0&gamma<0`; a record from before it replays "
             "without it."
         ),
+        "no_buy_spy_fall_k": (
+            "No buy while SPY is down from its open by more than this many times its usual move "
+            "for that minute: the median size of the move from the open over the 20 sessions "
+            "before.\n\n"
+            "- A replay reads SPY as the live app would have at that bar: SIP 15 minutes back, "
+            "IEX up to the bar (Alpaca, cached under `data/fastfurious/`).\n"
+            "- In the signature as `nobuy=spy<-3xusual`; a record from before it replays "
+            "without it.\n"
+            "- 0 switches it off."
+        ),
         "take_after_minutes": (
             "The take fires only once this many minutes of bars have passed "
             "since the last buy; a buy lower down starts the wait again.\n\n"

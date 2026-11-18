@@ -18,7 +18,7 @@ import pytest
 
 from agent_stonks import momentum_regime
 from agent_stonks.apple_trader import (
-    APPLE_TRADER_KEY, DOWN_GAMMA_LABEL, AppleTraderConfig, config_settings,
+    APPLE_TRADER_KEY, DOWN_GAMMA_LABEL, SPY_FALL_LABEL, AppleTraderConfig, config_settings,
 )
 from agent_stonks.config import UNIT_ADR
 from agent_stonks.market_hours import MARKET_TZ
@@ -3436,4 +3436,4 @@ class TestCompareSettings:
         step = next(r for r in rows if r["setting"] == "Next buy")
         assert step["base"] is None and step["changed"]
         assert names.index("Next buy") == names.index("Buy again lower while cash allows") + 1
-        assert names[-2:] == ["Sit out these sessions", DOWN_GAMMA_LABEL]
+        assert names[-3:] == ["Sit out these sessions", DOWN_GAMMA_LABEL, SPY_FALL_LABEL]

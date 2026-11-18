@@ -266,6 +266,9 @@ _APPLE_LEGACY = {
     # 2026-11-05). False is that rule, also today's default, kept here so it
     # means the same if the default moves; it is left out of the signature.
     "no_buy_down_negative_gamma": False,
+    # And none for SPY falling more than usual (before 2026-11-18). 0 is that
+    # rule, also today's default; it is left out of the signature.
+    "no_buy_spy_fall_k": 0.0,
     # And GoodMoments' take was one distance all day, whatever the time of
     # day's volatility (before 2026-10-21). None is that rule, also today's
     # default, kept here so it means the same if the default moves; a flat take

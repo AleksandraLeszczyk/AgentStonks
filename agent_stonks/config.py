@@ -451,6 +451,12 @@ APPLE_TRADER_TIME_LIMIT_MINUTES = 0
 # live app never kept one for) lets the buy through. Off by default, the rule
 # before it existed, which every SimLab record written before then replays as.
 APPLE_TRADER_NO_BUY_DOWN_NEGATIVE_GAMMA = False
+# No buy while SPY is falling more than usual (2026-11-18, the user's request:
+# the pre-market shock check cannot see a market that turns after the open).
+# The number is how many times its usual move from the open, at that minute of
+# the session, SPY has to be down (`market_fall`). 0 is off, the rule before it
+# existed, which every SimLab record written before then replays as.
+APPLE_TRADER_NO_BUY_SPY_FALL_K = 0.0
 # Whether the momentum take also fires on a position under its fill (2026-10-06,
 # at the user's request: "remove only in profit -- it should trigger on momentum
 # once the timer has passed"). Before then it banked gains only and left a

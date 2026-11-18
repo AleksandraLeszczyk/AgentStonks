@@ -48,7 +48,8 @@ from . import agent as agent_mod
 from . import state as state_mod
 from . import (
     apple_models, bar_history, base_configs, candle_patterns, clock, day_range, event_days,
-    gamma_history, historical, intraday_vol_model, market_hours, momentum_regime, rule_agent,
+    gamma_history, historical, intraday_vol_model, market_fall, market_hours, momentum_regime,
+    rule_agent,
 )
 from .agent import stop_agent
 from .rule_agent import BaseTrader
@@ -90,6 +91,7 @@ from .config import (
     APPLE_TRADER_NEGATIVE_FOR_BARS,
     APPLE_TRADER_NEGATIVE_MOMENTUM_BARS,
     APPLE_TRADER_NO_BUY_DOWN_NEGATIVE_GAMMA,
+    APPLE_TRADER_NO_BUY_SPY_FALL_K,
     APPLE_TRADER_POSITION_PCT,
     MOMENTUM_NEUTRAL_FRACTION,
     APPLE_TRADER_SCALE_IN,
@@ -822,6 +824,12 @@ class AppleTraderConfig:
     # GoodMoments rules; False, what every record made before 2026-11-05
     # replays as, buys whatever the day and the gamma.
     no_buy_down_negative_gamma: bool = APPLE_TRADER_NO_BUY_DOWN_NEGATIVE_GAMMA
+    # No buy -- first entry or add -- on a bar at whose close SPY is down from
+    # its open by more than this many times its usual move for that minute of
+    # the session (`market_fall`, `_SpyFallRule`). SPY not known lets the buy
+    # through. Read by the day-range and GoodMoments rules; 0, what every record
+    # made before 2026-11-18 replays as, buys whatever SPY is doing.
+    no_buy_spy_fall_k: float = APPLE_TRADER_NO_BUY_SPY_FALL_K
     # Fast&Furious's rules (`FastFuriousTrader`, the momentum strategy), read by
     # no other model. Every day-range field above is ignored under it, and
     # these are ignored under the day-range models. See the block in `config`.
@@ -891,6 +899,7 @@ class AppleTraderConfig:
             "negative_momentum_bars", "hold_min_gain_k", "min_win_k", "max_fall_k",
             "momentum_confirmation_bars", "take_min_gain_fraction", "buy_step_k",
             "take_after_minutes", "breach_hold_k", "sell_gain_k", "time_limit_minutes",
+            "no_buy_spy_fall_k",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(
@@ -934,6 +943,7 @@ class AppleTraderConfig:
         # handed over, so the same days always sign the same way.
         self.skip_events = event_days.normalise(self.skip_events)
         self.no_buy_down_negative_gamma = bool(self.no_buy_down_negative_gamma)
+        self.no_buy_spy_fall_k = float(self.no_buy_spy_fall_k)
         # A streak of no bars would fire on the first bar in profit, which is
         # not "negative for long enough" but no rule at all.
         if self.negative_momentum_bars and self.negative_for_bars < 1:
@@ -1573,7 +1583,7 @@ def config_signature(config: "AppleTraderConfig | None" = None) -> str:
     # so every record written before it existed keeps its filed signature.
     if c.momentum_confirmation_bars:
         adds += f",confirm={c.momentum_confirmation_bars}b"
-    adds += _down_gamma_token(c)
+    adds += _down_gamma_token(c) + _spy_fall_token(c)
     breach = "" if c.breach_update == BREACH_OFF else f",breach={c.breach_update}"
     breach += _held_token(c)
     # Both appear only while switched on, like every rule added since the
@@ -1644,7 +1654,7 @@ def _probability_signature(c: AppleTraderConfig) -> str:
     return (
         f"{c.model_key}_{c.ticker}(enter={c.gm_enter:+g},exit={exit_},take={take},stop={stop}"
         f"{raise_}{confirm}{levels},size={c.position_pct:g}%{_time_limit_token(c)}"
-        f"{_down_gamma_token(c)}{skip})"
+        f"{_down_gamma_token(c)}{_spy_fall_token(c)}{skip})"
     )
 
 
@@ -1678,6 +1688,28 @@ def _down_gamma_sentence(c: AppleTraderConfig) -> str:
         " No buy while the price is under the session's open and net gamma is negative "
         "as well; with no net gamma known, the buy is not stopped."
     )
+
+
+def _spy_fall_token(c: AppleTraderConfig) -> str:
+    """No buy while SPY is falling more than usual in signature form,
+    `,nobuy=spy<-3xusual`. Nothing while off, so every record made before it
+    keeps its filed signature."""
+    return f",nobuy=spy<-{c.no_buy_spy_fall_k:g}xusual" if c.no_buy_spy_fall_k else ""
+
+
+def _spy_fall_sentence(c: AppleTraderConfig) -> str:
+    """The same for the log's opening line: a sentence, or nothing while off."""
+    if not c.no_buy_spy_fall_k:
+        return ""
+    return (
+        f" No buy while SPY is down from its open by more than {c.no_buy_spy_fall_k:g} × its "
+        "usual move for that time of day; with SPY not known, the buy is not stopped."
+    )
+
+
+def _spy_fall_words(c: AppleTraderConfig) -> str:
+    """The same in words, for the settings table."""
+    return f"{c.no_buy_spy_fall_k:g} × its usual move" if c.no_buy_spy_fall_k else "off"
 
 
 def _hybrid_levels_signature(c: AppleTraderConfig) -> str:
@@ -1739,11 +1771,13 @@ def config_settings(config: "AppleTraderConfig | None" = None) -> "list[tuple[st
     rows.append(("Days off", "Sit out these sessions", days))
     if c.strategy != apple_models.STRATEGY_MOMENTUM:
         rows.append(("Days off", DOWN_GAMMA_LABEL, _yes(c.no_buy_down_negative_gamma)))
+        rows.append(("Days off", SPY_FALL_LABEL, _spy_fall_words(c)))
     return rows
 
 
 # The rule's name wherever it is shown: the form's box, the settings table.
 DOWN_GAMMA_LABEL = "No buys while the day is down and net gamma is negative"
+SPY_FALL_LABEL = "No buys while SPY is down more than (× its usual move, 0 = off)"
 
 
 def _yes(flag: bool) -> str:
@@ -2480,7 +2514,42 @@ class _DownGammaRule:
         return gamma_history.at_close(self.ticker, timeframe, ts, close, chain)
 
 
-class DayRangeTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
+class _SpyFallRule:
+    """No buy while SPY is falling more than usual (`no_buy_spy_fall_k`), the
+    same for every rule set that reads it: the market's tape, whatever this
+    ticker's levels or edge say. Each bar is judged on its own, so buying
+    resumes once SPY has recovered; sells are never held back. SPY not known
+    (`market_fall.Unavailable`) lets the buy through, said once a session."""
+
+    #: The day SPY not being known was last said to let a buy through.
+    _spy_unknown_noted = None
+
+    def _spy_falling(self, state: AppState, ts) -> "str | None":
+        """Why SPY rules out a buy on the bar at `ts`, or None to let it go."""
+        limit = float(self.config.no_buy_spy_fall_k)
+        if not limit:
+            return None
+        stamp = pd.Timestamp(ts).tz_convert(market_hours.MARKET_TZ)
+        key, secret = ff_credentials(state)
+        try:
+            move = market_fall.read(stamp.date(), market_fall.minute_of(stamp), key, secret)
+        except market_fall.Unavailable as exc:
+            if self._spy_unknown_noted != stamp.date():
+                self._spy_unknown_noted = stamp.date()
+                _log(state, {"type": "status", "text": (
+                    f"SPY's move could not be read at {stamp:%H:%M} ({exc}), so the SPY rule "
+                    "does not stop a buy until it can."
+                )})
+            return None
+        if not move.is_fall_over(limit):
+            return None
+        return (
+            f"SPY is {move.move_pct:+.2f}% from its ${move.open:,.2f} open, more than "
+            f"{limit:g} × the {move.usual_pct:.2f}% it usually moves by this time of day"
+        )
+
+
+class DayRangeTrader(_ByHand, _DownGammaRule, _SpyFallRule, _SitsOut, BaseTrader):
     """The day-range rules: one forecast at 9:35, then two resting levels.
 
     The model (HighLow or HighLow2) says where the session's high and low will
@@ -3559,16 +3628,17 @@ class DayRangeTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
         negative -- flat, or about to rise.
         Without it, the legacy fall gate a stored record replays under
         (`_refuse_falling`). Then, with it on, no buy on a falling,
-        negative-gamma day (`_down_negative_gamma`). Either way this bar only:
-        the next is judged again.
+        negative-gamma day (`_down_negative_gamma`) and none while SPY is falling
+        more than usual (`_spy_falling`). Either way this bar only: the next is
+        judged again.
         """
         if not self.config.momentum_confirmation_bars:
             if self._refuse_falling(state, frame, ts):
                 return True
-            return self._refuse_down_gamma(state, frame, ts)
+            return self._refuse_on_market(state, frame, ts)
         read = self._momentum_read(frame)
         if read is not None and read["row"].buy:
-            return self._refuse_down_gamma(state, frame, ts)
+            return self._refuse_on_market(state, frame, ts)
         why = momentum_words(read) if read is not None else self._momentum_unknown(frame)
         _log(
             state,
@@ -3583,10 +3653,11 @@ class DayRangeTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
         )
         return True
 
-    def _refuse_down_gamma(self, state: AppState, frame, ts) -> bool:
+    def _refuse_on_market(self, state: AppState, frame, ts) -> bool:
         """Log and refuse a buy at the buy level on a falling, negative-gamma
-        day (`_down_negative_gamma`). This bar only, like the confirmation."""
-        why = self._down_negative_gamma(state, frame)
+        day (`_down_negative_gamma`) or while SPY is falling more than usual
+        (`_spy_falling`). This bar only, like the confirmation."""
+        why = self._down_negative_gamma(state, frame) or self._spy_falling(state, ts)
         if why is None:
             return False
         _log(
@@ -5970,7 +6041,7 @@ def _session_clock(minute: int) -> str:
     return f"{total // 60:02d}:{total % 60:02d}"
 
 
-class GoodMomentsTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
+class GoodMomentsTrader(_ByHand, _DownGammaRule, _SpyFallRule, _SitsOut, BaseTrader):
     """GoodMoments' rules: the chance of a +0.2 ADR rise, at every bar.
 
     At the close of every bar the model says how likely it is that a later bar
@@ -6068,6 +6139,9 @@ class GoodMomentsTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
         # let a buy through (`_down_negative_gamma`).
         self._gamma_note = False
         self._gamma_unknown_noted = None
+        # Whether the last bar was refused because SPY is falling, for the same
+        # reason.
+        self._spy_fall_note = False
         # The raised entry last said to have refused one (the circuit breaker),
         # for the same reason.
         self._breaker_note: "float | None" = None
@@ -6233,6 +6307,8 @@ class GoodMomentsTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
             return sold
         if self._refuse_on_gamma(state, frame, ts):
             return sold
+        if self._refuse_on_spy(state, ts):
+            return sold
         if self.entry_refused(state, ts):
             return sold
         return rule_agent.BOUGHT if self._buy(state, tracker, last, ts, minute) else sold
@@ -6386,6 +6462,22 @@ class GoodMomentsTrader(_ByHand, _DownGammaRule, _SitsOut, BaseTrader):
             _log(state, {"type": "status", "text": (
                 f"The edge calls for a buy at {ts:%H:%M}, but {why}. Not buying while both "
                 "are; each bar is judged again."
+            )})
+        return True
+
+    def _refuse_on_spy(self, state: AppState, ts) -> bool:
+        """Whether SPY falling more than usual refuses an entry the edge calls
+        for (`_spy_falling`). Said once per stretch of refused bars; the next
+        bar is judged again."""
+        why = self._spy_falling(state, ts)
+        if why is None:
+            self._spy_fall_note = False
+            return False
+        if not self._spy_fall_note:
+            self._spy_fall_note = True
+            _log(state, {"type": "status", "text": (
+                f"The edge calls for a buy at {ts:%H:%M}, but {why}. Not buying while it is; "
+                "each bar is judged again."
             )})
         return True
 
@@ -7138,7 +7230,7 @@ def _probability_armed_summary(config: AppleTraderConfig, model, bundle: dict) -
         "chance on the clock and today's volatility alone, and buys when the first is at least "
         f"{config.gm_enter:+g} over the second (no new entry after 15:30). It sells "
         + (f"{', '.join(exits[:-1])}, or {exits[-1]}." if len(exits) > 1 else f"{exits[0]}.")
-        + confirm + _down_gamma_sentence(config)
+        + confirm + _down_gamma_sentence(config) + _spy_fall_sentence(config)
     )
 
 
@@ -7253,6 +7345,7 @@ def _armed_summary(
             if config.sells_above_fill else f"{config.sell_k:g} below it"
         )
         + f", until the closing flatten.{breach}{no_fall}{_down_gamma_sentence(config)}"
+        f"{_spy_fall_sentence(config)}"
         f"{managed}{breaker}"
     )
 

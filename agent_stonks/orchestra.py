@@ -173,11 +173,11 @@ DAYRANGE_PAIR_FIELDS = ("buy_k", "sell_k", "stop_gain_fraction", "momentum_confi
 PER_RACER_FIELDS = ("ticker", "model_key", "min_win_k") + DAYRANGE_PAIR_FIELDS
 # The fields every racer must share, whatever its rule set: Orchestra's sizing,
 # its closing flatten, its time limit (one for every pair, the user's request
-# of 2026-11-02), the sessions it sits out and the no-buy rule on a falling,
-# negative-gamma day (2026-11-05).
+# of 2026-11-02), the sessions it sits out, the no-buy rule on a falling,
+# negative-gamma day (2026-11-05) and the one while SPY is falling (2026-11-18).
 SHARED_BY_ALL = (
     "position_pct", "flatten_before_close_min", "time_limit_minutes", "skip_events",
-    "no_buy_down_negative_gamma",
+    "no_buy_down_negative_gamma", "no_buy_spy_fall_k",
 )
 # What Orchestra sets on a GoodMoments racer, over its pair's own configuration
 # (`build_orchestra_config`): the edge a buy needs, the take, the stop and the

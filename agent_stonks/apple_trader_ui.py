@@ -40,7 +40,7 @@ import streamlit as st
 
 from . import apple_models, base_configs, event_days, intraday_vol_model
 from .apple_trader import (
-    DOWN_GAMMA_LABEL, AppleTraderConfig, base_record, confirmation_for, dayrange_levels,
+    DOWN_GAMMA_LABEL, SPY_FALL_LABEL, AppleTraderConfig, base_record, confirmation_for, dayrange_levels,
     default_config, min_win_for, shipped_config, stop_for,
 )
 
@@ -282,6 +282,7 @@ def probability_params(
     )
     skip_events = skip_param(defaults, copy)
     down_gamma = down_gamma_param(defaults, copy)
+    spy_fall = spy_fall_param(defaults, copy)
     return replace(
         defaults,
         model_key=model_key,
@@ -297,6 +298,7 @@ def probability_params(
         time_limit_minutes=time_limit,
         skip_events=skip_events,
         no_buy_down_negative_gamma=down_gamma,
+        no_buy_spy_fall_k=spy_fall,
         **levels,
     )
 
@@ -816,6 +818,7 @@ def rule_params(
         **exits,
         "skip_events": skip_events,
         "no_buy_down_negative_gamma": down_gamma_param(defaults, copy),
+        "no_buy_spy_fall_k": spy_fall_param(defaults, copy),
     }
 
 
@@ -841,14 +844,27 @@ def down_gamma_param(defaults: AppleTraderConfig, copy: FormCopy) -> bool:
     """No buy on a falling, negative-gamma day (`no_buy_down_negative_gamma`):
     under the days off, as the other "not today" rule, and like them one box
     for every rule set that reads it -- in Orchestra for every pair. With no
-    days off drawn it has a heading of its own, not the section above's."""
+    days off drawn it and the SPY rule under it have a heading of their own, not
+    the section above's."""
     if not copy.days_off:
-        section("Net gamma", copy.sections.get("down_gamma"))
+        section("Market", copy.sections.get("down_gamma"))
     return bool(st.checkbox(
         DOWN_GAMMA_LABEL,
         value=bool(defaults.no_buy_down_negative_gamma),
         key=copy.key("no_buy_down_negative_gamma"),
         help=copy.help.get("no_buy_down_negative_gamma"),
+    ))
+
+
+def spy_fall_param(defaults: AppleTraderConfig, copy: FormCopy) -> float:
+    """No buy while SPY is falling more than usual (`no_buy_spy_fall_k`): beside
+    the negative-gamma rule, the other "not while the tape looks like this"
+    rule, and like it one number for every pair of an Orchestra. 0 is off."""
+    return float(st.number_input(
+        SPY_FALL_LABEL,
+        min_value=0.0, value=float(defaults.no_buy_spy_fall_k), step=0.5, format="%g",
+        key=copy.key("no_buy_spy_fall_k"),
+        help=copy.help.get("no_buy_spy_fall_k"),
     ))
 
 
@@ -1539,6 +1555,7 @@ def orchestra_params(
         rules = {
             "skip_events": skip_param(defaults, copy),
             "no_buy_down_negative_gamma": down_gamma_param(defaults, copy),
+            "no_buy_spy_fall_k": spy_fall_param(defaults, copy),
         }
         until_revised = defaults.breaker_until_revised
     base = replace(

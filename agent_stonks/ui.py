@@ -4041,6 +4041,20 @@ _APPLE_TRADER_COPY = apple_trader_ui.FormCopy(
             "is not stopped, and the log says so once.\n"
             "- Sells are never held back."
         ),
+        "no_buy_spy_fall_k": (
+            "No buy — the first or one lower down — on a bar at whose close SPY is down from "
+            "its open by more than this many times its **usual move** for that time of day. "
+            "It catches a market that turns after the open, which the pre-market shock check "
+            "cannot see.\n\n"
+            "- The usual move is the median size of SPY's move from the open at that minute "
+            "over the last 20 sessions.\n"
+            "- Over the last year **3** was reached at some point on about 22% of sessions, "
+            "**2** on about 44%.\n"
+            "- Each bar is judged again, so buying resumes once SPY has recovered. Sells are "
+            "never held back.\n"
+            "- If SPY cannot be read the buy is not stopped, and the log says so once.\n"
+            "- **0** switches it off."
+        ),
         "time_limit_minutes": (
             "A position still open this many minutes after the first buy — the sell level "
             "(on GoodMoments, the take) not reached — is sold on the first bar that closes "

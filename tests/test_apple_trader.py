@@ -5760,6 +5760,147 @@ class TestDownNegativeGammaForm:
         assert self._box(app) == []
 
 
+class TestSpyFall:
+    """No buy while SPY is down from its open by more than the configured
+    multiple of its usual move (2026-11-18): the market turning after the open,
+    which the pre-market shock check cannot see."""
+
+    FALLING = at.market_fall.SpyMove(35, 600.0, 594.0, -1.0, 0.25)   # 4 x usual
+    MILD = at.market_fall.SpyMove(35, 600.0, 598.8, -0.2, 0.25)      # under 1 x usual
+
+    def _setup(self, state, monkeypatch, move, **kwargs):
+        broker = FakeBroker(103.0)
+        tracker = DecisionTracker(starting_cash=10_000.0, broker=broker)
+        tape = Tape(monkeypatch, broker)
+        self.asked = []
+        self.move = move
+
+        def read(day, minute, key=None, secret=None):
+            self.asked.append((day, minute))
+            if isinstance(self.move, Exception):
+                raise self.move
+            return self.move
+
+        monkeypatch.setattr(at.market_fall, "read", read)
+        return at.DayRangeTrader(dayrange_config(**kwargs)), tracker, tape
+
+    @staticmethod
+    def _refusals(state):
+        return [e["text"] for e in state.agent_log if "it usually moves" in (e.get("text") or "")]
+
+    def test_off_by_default_and_signed_only_while_on(self):
+        config = AppleTraderConfig()
+        assert config.no_buy_spy_fall_k == 0
+        assert "spy" not in config_signature(config)
+        on = config_signature(replace(config, no_buy_spy_fall_k=3))
+        assert ",nobuy=spy<-3xusual" in on and on.index(",nobuy=") > on.index(",size=")
+
+    def test_a_negative_limit_is_refused(self):
+        with pytest.raises(ValueError, match="no_buy_spy_fall_k"):
+            dayrange_config(no_buy_spy_fall_k=-1)
+
+    def test_spy_falling_buys_nothing_until_it_recovers(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, self.FALLING, no_buy_spy_fall_k=3)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == 0
+        [refused] = self._refusals(state)
+        assert "SPY is -1.00% from its $600.00 open, more than 3 × the 0.25%" in refused
+        assert "Not buying yet; the next bar is judged again." in refused
+        # The bar it was asked about is the newest one, in minutes past 09:30.
+        stamp = tape.index[-1]
+        assert self.asked[-1] == (stamp.date(), at.market_fall.minute_of(stamp))
+        self.move = self.MILD
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+
+    def test_a_fall_inside_the_limit_buys(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, self.MILD, no_buy_spy_fall_k=3)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert self._refusals(state) == []
+
+    def test_off_it_never_reads_spy(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, self.FALLING)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        assert self.asked == []
+
+    def test_spy_not_known_buys_and_says_so_once(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, at.market_fall.Unavailable("no bars"), no_buy_spy_fall_k=3,
+            scale_in=True, position_pct=50.0, buy_step_k=0.1,
+        )
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        tape.append(99.9, low=99.8)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        said = [e for e in state.agent_log if "could not be read" in (e.get("text") or "")]
+        assert len(said) == 1 and "no bars" in said[0]["text"]
+
+    def test_an_add_is_refused_too(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(
+            state, monkeypatch, self.MILD, no_buy_spy_fall_k=3,
+            scale_in=True, position_pct=50.0, buy_step_k=0.1,
+        )
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        first = tracker.position_for(TICKER)
+        self.move = self.FALLING
+        tape.append(101.0, low=100.9)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "hold"
+        assert tracker.position_for(TICKER) == first
+        assert len(self._refusals(state)) == 1
+
+    def test_a_sell_is_never_held_back(self, state, market_open, monkeypatch):
+        trader, tracker, tape = self._setup(state, monkeypatch, self.MILD, no_buy_spy_fall_k=3)
+        tape.append(103.0, low=BUY_LEVEL - 0.01)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "bought"
+        self.move = self.FALLING
+        tape.append(SELL_LEVEL + 0.1, high=SELL_LEVEL + 0.2)
+        assert trader.run_cycle(DAYRANGE_BUNDLE, state, tracker) == "sold"
+
+    def test_the_settings_table_and_the_opening_line_say_it(self):
+        config = dayrange_config(no_buy_spy_fall_k=2.5)
+        assert ("Days off", at.SPY_FALL_LABEL, "2.5 × its usual move") in at.config_settings(config)
+        assert ("Days off", at.SPY_FALL_LABEL, "off") in at.config_settings(dayrange_config())
+        assert "more than 2.5 × its usual move" in at._spy_fall_sentence(config)
+        assert at._spy_fall_sentence(dayrange_config()) == ""
+
+
+class TestSpyFallForm:
+    """The number under the negative-gamma box: the day-range rules and
+    GoodMoments write it, Fast&Furious has none."""
+
+    @pytest.fixture
+    def app(self, monkeypatch):
+        from streamlit.testing.v1 import AppTest
+
+        monkeypatch.setattr(apple_models, "load", lambda *a, **k: {"model": "stub"})
+        app = AppTest.from_function(_down_gamma_form, default_timeout=30)
+        app.run()
+        assert not app.exception, app.exception
+        return app
+
+    @staticmethod
+    def _inputs(app):
+        return [n for n in app.number_input if n.label == at.SPY_FALL_LABEL]
+
+    @pytest.mark.parametrize("model_key", ["highlow", apple_models.GOODMOMENTS_KEY])
+    def test_off_and_set_it_is_on(self, app, model_key):
+        app.selectbox(key="t_model_AAPL").select(model_key).run()
+        [number] = self._inputs(app)
+        assert number.value == 0 and app.session_state["out"].no_buy_spy_fall_k == 0
+        number.set_value(3.0).run()
+        assert not app.exception, app.exception
+        assert app.session_state["out"].no_buy_spy_fall_k == 3.0
+
+    def test_fast_and_furious_has_none(self, app):
+        app.selectbox(key="t_model_AAPL").select(apple_models.FASTFURIOUS_KEY).run()
+        assert not app.exception, app.exception
+        assert self._inputs(app) == []
+
+
 class TestByHand:
     """The Portfolio tab's "Sell" and "Stop trading" per pair (2026-11-09, the
     user's request), as the day-range trader takes them."""

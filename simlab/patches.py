@@ -72,6 +72,10 @@ cache), last night's option table from the shared option cache, cut at the
 previous close, and Yahoo's analyst table filtered to the notes stamped before
 each bar's close.
 
+``market_fall`` (Apple Trader's "no buys while SPY is falling" rule) is not
+patched either: a past session is read whole from the same tape cache and cut
+at the bar it is asked about, SIP 15 bars back and IEX through the bar.
+
 Keeping every patch point in this one module means a new live fetch added to
 the app fails loudly here (the setattr asserts the attribute exists) instead
 of silently leaking real-time data into simulated sessions.
